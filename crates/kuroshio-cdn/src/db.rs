@@ -470,6 +470,20 @@ impl Db {
         for mut d in f.domains {
             if seed {
                 d.last_seen = now;
+                // 種子裡「通過」的結果是別台機器在別的網路驗證的：有效期限一律設成現在，
+                // 這台機器自己驗證過才換節點（每小時的複驗會處理，第一次查詢也會觸發）。
+                // 以前種子匯出後 24 小時內（跨 CDN 是 3 天）安裝，會直接照種子的結果改寫
+                for v in [&mut d.v4, &mut d.v6].into_iter().flatten() {
+                    if v.is("ok") && v.valid(now) {
+                        v.until = Some(now);
+                    }
+                }
+                if let Some(e) = d.ecs.as_mut().filter(|e| e.is("ok") && e.until.unwrap_or(0) > now) {
+                    e.until = Some(now);
+                }
+                if let Some(x) = d.cross4.as_mut().filter(|x| x.is("ok") && x.until.unwrap_or(0) > now) {
+                    x.until = Some(now);
+                }
             }
             self.domains.insert(d.name.clone(), d);
         }

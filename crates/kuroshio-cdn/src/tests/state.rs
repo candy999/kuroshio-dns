@@ -152,6 +152,15 @@ fn seed_used_when_state_empty() {
         st.db.domains.values().all(|e| e.last_seen >= before),
         "匯入時把最後出現時間設成現在"
     );
+    // 種子裡「通過」的結果是別台機器驗證的：匯入後都不在有效期內，自己驗證過才換節點
+    let now = now_ms() + 1;
+    for e in st.db.domains.values() {
+        for v in [&e.v4, &e.v6].into_iter().flatten() {
+            assert!(!(v.is("ok") && v.valid(now)), "{} 的種子判定不能直接生效", e.name);
+        }
+        assert!(!e.ecs.as_ref().is_some_and(|x| x.is("ok") && x.until.unwrap_or(0) > now));
+        assert!(!e.cross4.as_ref().is_some_and(|x| x.is("ok") && x.until.unwrap_or(0) > now));
+    }
     assert!(!st.pools.serve_ips("cloudflare", 4).is_empty());
     // 種子的節點也會被分類成 Cloudflare 台灣節點（data/cdn 的範圍與分類）
     let first = st.pools.serve_ips("cloudflare", 4)[0];
