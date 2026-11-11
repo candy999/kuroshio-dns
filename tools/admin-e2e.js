@@ -1,11 +1,11 @@
 'use strict';
 // CI：Windows 本機設定頁（data/admin）端對端測試。自己啟動 kuroshio（暫存設定檔、空著的埠號），用 Playwright 實際操作：
-// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
+// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、網域與憑證 / 多網卡 / 多位址監聽 / 存放位置、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
 //
 //   cargo build -p kuroshio && node tools/admin-e2e.js
 //   KUROSHIO_BIN=path/to/kuroshio SHOTS=screenshots-admin node tools/admin-e2e.js
 const { chromium } = require('playwright');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
@@ -172,7 +172,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.goto(`${BASE}/#settings`);
         await page.waitForSelector('#cfg-groups button');
         const groups = await page.$$eval('#cfg-groups button', bs => bs.map(b => b.textContent));
-        check(['服務與監聽', '上游', '過濾', 'CDN', 'DDNS', '憑證', '公開頁', '社群', '系統', '日誌'].every(g => groups.some(x => x.includes(g))), '設定分類齊全', groups.join(' / '));
+        check(['服務與監聽', '網域與憑證', '上游', '過濾', 'CDN', 'DDNS', '憑證', '公開頁', '社群', '系統', '日誌'].every(g => groups.some(x => x.includes(g))), '設定分類齊全', groups.join(' / '));
         check(!groups.some(x => x.includes('原始 JSON')), '簡易模式沒有原始 JSON');
         check(await page.isVisible('[data-key="listen.doh.windowsMode"]'), '服務與監聽：Windows 443 模式');
         check(await page.isVisible('[data-key="listen.plain.port"]') && !(await page.isVisible('[data-key="listen.doh.trustProxy"]')), '簡易模式隱藏專業欄位');
@@ -239,6 +239,157 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.click('#btn-discard');
         check(/沒有未儲存的變更/.test(await page.textContent('#save-msg')), '放棄變更');
         await shot('06-settings-raw');
+
+        console.log('網域與憑證、多網卡、多位址監聽、存放位置');
+        // 測試憑證：有 openssl 才產生（沒有時只檢查「找不到檔案」的顯示）
+        const certFile = path.join(dir, 'own', 'fullchain.pem'), keyFile = path.join(dir, 'own', 'privkey.pem');
+        fs.mkdirSync(path.dirname(certFile), { recursive: true });
+        let haveCert = false;
+        try {
+            execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-days', '30', '-subj', '/CN=dns.example.com',
+                '-addext', 'subjectAltName=DNS:dns.example.com', '-addext', 'basicConstraints=critical,CA:FALSE', '-keyout', keyFile, '-out', certFile], { stdio: 'ignore' });
+            haveCert = fs.existsSync(certFile) && fs.existsSync(keyFile);
+        } catch (e) { /* 沒有 openssl */ }
+        const ifApi = await page.evaluate(() => fetch('/api/interfaces').then(r => r.json()));
+        check(Array.isArray(ifApi.interfaces), '/api/interfaces 回網卡清單');
+        // 網卡清單換成固定的內容（每台機器的網卡不一樣）
+        const fakeIfaces = { interfaces: [
+            { name: 'lo', label: 'lo', up: true, addrs: [{ ip: '127.0.0.1', family: 4, scope: 'loopback' }] },
+            { name: 'eth0', label: '乙太網路', up: true, addrs: [{ ip: '203.0.113.25', family: 4, scope: 'public' }, { ip: '2001:db8::25', family: 6, scope: 'public' },
+                { ip: '2001:db8::a1b2', family: 6, scope: 'public', temporary: true, deprecated: true }, { ip: 'fe80::1', family: 6, scope: 'linklocal' }] },
+            { name: 'eth1', label: '乙太網路 2', up: true, addrs: [{ ip: '192.168.1.10', family: 4, scope: 'private' }] },
+            { name: 'wlan0', label: 'Wi-Fi', up: false, addrs: [] }
+        ] };
+        await page.route('**/api/interfaces', r => r.fulfill({ contentType: 'application/json', body: JSON.stringify(fakeIfaces) }));
+        await page.reload();
+        await page.waitForSelector('#cfg-groups button');
+        const field = k => `[data-key="${k}"]`;
+
+        await page.click('#cfg-groups button[data-group=domain]');
+        await page.waitForSelector('#panel-paths[data-ready]');
+        const pathsText = await page.textContent('#panel-paths');
+        check(pathsText.includes(cfgFile) && pathsText.includes(path.join(dir, 'state')) && /設定檔/.test(pathsText) && /憑證檔/.test(pathsText) && /私鑰檔/.test(pathsText) && /社群金鑰/.test(pathsText),
+            '存放位置：列出設定檔、學習資料、憑證、金鑰的位置', pathsText.slice(0, 300));
+        check(/含密鑰/.test(pathsText) && pathsText.includes(path.join(dir, 'admin.token')) && !pathsText.includes(token), '存放位置：只有路徑，沒有密鑰內容');
+        check(await page.locator('#panel-paths button.copy').count() >= 6, '存放位置：每個路徑有複製按鈕');
+        await ctx.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+        await page.locator('#panel-paths button.copy').first().click();
+        await page.waitForSelector('#toast:not([hidden])');
+        check((await page.textContent('#toast')).includes('已複製：' + cfgFile), '存放位置：複製按鈕', await page.textContent('#toast'));
+        check(/還沒有設定憑證/.test(await page.textContent('#panel-cert')) && /還沒有填憑證檔/.test(await page.textContent('#cert-hint')), '憑證：還沒設定時的說明');
+
+        await page.fill(`${field('domain')} input`, 'https://dns.example.com/');
+        check(await page.isVisible(`${field('domain')} .err-text`) && await page.isDisabled('#btn-save'), '綁定網域：格式錯誤不能儲存');
+        await page.fill(`${field('domain')} input`, 'DNS.Example.com.');
+        check(!(await page.isVisible(`${field('domain')} .err-text`)), '綁定網域：格式正確');
+        check(await page.isChecked(`${field('ddns.enabled')} input[type=radio] >> nth=0`), 'DDNS 預設是「固定網域，不需要更新」');
+        check(await page.isChecked(`${field('acme.enabled')} input[type=radio] >> nth=0`), '憑證預設是「使用我自己的憑證檔」');
+        await page.fill(`${field('tls.cert')} input`, certFile);
+        check(/要一起填/.test(await page.textContent(`${field('tls.key')} .err-text`)) && await page.isDisabled('#btn-save'), '憑證檔與私鑰檔要一起填');
+        await page.fill(`${field('tls.key')} input`, keyFile);
+        check(!(await page.isVisible(`${field('tls.key')} .err-text`)) && !(await page.isDisabled('#btn-save')), '兩個都填了就可以儲存');
+        await page.check(`${field('acme.enabled')} input[type=radio] >> nth=1`);
+        check(/會覆蓋/.test(await page.textContent('#cert-hint')), '改成自動申請而且填了憑證檔：提醒會被覆蓋');
+        await page.check(`${field('acme.enabled')} input[type=radio] >> nth=0`);
+        check(!(await page.locator('#cert-hint .msg').count()), '改回自己的憑證檔：提醒消失');
+
+        // 多位址監聽（專業模式）、DoH 的 TLS 模式、IIS 站台名稱
+        await page.click('#cfg-groups button[data-group=listen]');
+        await page.waitForSelector('#panel-listeners[data-ready]');
+        check(/沒有開啟任何加密協議/.test(await page.textContent('#panel-listeners')), '監聽狀態：沒有加密協議時的說明');
+        const dotPort = await freePort();
+        await page.fill(`${field('listen.dot.binds')} textarea`, '127.0.0.1\n999.1.1.1');
+        check(/第 2 行/.test(await page.textContent(`${field('listen.dot.binds')} .err-text`)) && await page.isDisabled('#btn-save'), '監聽位址：不是 IP 不能儲存');
+        await page.fill(`${field('listen.dot.binds')} textarea`, '127.0.0.1\n[::1]:853');
+        check(await page.isVisible(`${field('listen.dot.binds')} .err-text`), '監聽位址：不接受中括號與埠號');
+        await page.fill(`${field('listen.dot.binds')} textarea`, '127.0.0.1');
+        const pickerOpts = await page.$$eval(`${field('listen.dot.binds')} select.picker option`, os => os.map(o => o.value));
+        check(pickerOpts.includes('0.0.0.0') && pickerOpts.includes('::') && pickerOpts.includes('203.0.113.25') && pickerOpts.includes('192.168.1.10') && !pickerOpts.includes('fe80::1'),
+            '監聽位址：可以從網卡位址挑選（不列鏈路本地位址）', pickerOpts.join(' '));
+        // 192.0.2.1 不是這台機器的位址：綁定會失敗，用來檢查失敗原因的顯示
+        await page.fill(`${field('listen.dot.binds')} textarea`, '127.0.0.1\n192.0.2.1');
+        await page.selectOption(`${field('listen.doh.binds')} select.picker`, '192.168.1.10');
+        await page.selectOption(`${field('listen.doh.binds')} select.picker`, '203.0.113.25');
+        await page.selectOption(`${field('listen.doh.binds')} select.picker`, '192.168.1.10');
+        check(await page.inputValue(`${field('listen.doh.binds')} textarea`) === '192.168.1.10\n203.0.113.25', '監聽位址：挑選的位址加到清單（不重複）');
+        await page.fill(`${field('listen.dot.port')} input`, String(dotPort));
+        if (haveCert) await page.check(`${field('listen.dot.enabled')} input[type=checkbox]`);
+        await page.selectOption(`${field('listen.doh.tls')} select`, 'false');
+        check(await page.isHidden(field('listen.doh.iisSite')), 'IIS 站台名稱：不是 IIS 反向代理模式時不顯示');
+        await page.selectOption(`${field('listen.doh.windowsMode')} select`, 'iis-proxy');
+        check(await page.isVisible(field('listen.doh.iisSite')) && /自動匯入/.test(await page.textContent(field('listen.doh.iisSite'))), 'IIS 站台名稱：IIS 反向代理模式才顯示，說明憑證會自動匯入並綁定');
+        await page.fill(`${field('listen.doh.iisSite')} input`, 'bad/site"name');
+        check(await page.isVisible(`${field('listen.doh.iisSite')} .err-text`), 'IIS 站台名稱：不允許的字元');
+        await page.fill(`${field('listen.doh.iisSite')} input`, 'Default Web Site');
+
+        // DDNS：出口（網卡）多選、IPv6 預設不發布
+        await page.click('#cfg-groups button[data-group=ddns]');
+        await page.waitForSelector(`${field('ddns.interfaces')} .iface`);
+        const ifText = await page.textContent(field('ddns.interfaces'));
+        check(/eth0/.test(ifText) && /乙太網路 2/.test(ifText) && /203\.0\.113\.25/.test(ifText) && /暫時位址/.test(ifText) && /已停用/.test(ifText) && /未連線/.test(ifText) && !/fe80::1/.test(ifText),
+            'DDNS 出口：列出網卡與位址（標示暫時 / 已停用 / 未連線）', ifText.slice(0, 300));
+        check(!(await page.locator(`${field('ddns.interfaces')} input[value=lo]`).count()), 'DDNS 出口：不列迴路介面');
+        check(!(await page.isChecked(`${field('ddns.ipv6')} input[type=checkbox]`)) && /IPv6/.test(await page.textContent(`${field('ddns.ipv6')} .help`)) && /擋/.test(await page.textContent(`${field('ddns.ipv6')} .help`)),
+            'DDNS：IPv6 預設不發布，並說明原因');
+        await page.check(`${field('ddns.ipv6')} input[type=checkbox]`);
+        await page.check(`${field('ddns.interfaces')} input[value=eth0]`);
+        await page.check(`${field('ddns.interfaces')} input[value=eth1]`);
+        await page.fill(`${field('ddns.records')} textarea`, 'not a domain');
+        check(await page.isVisible(`${field('ddns.records')} .err-text`), 'DDNS 記錄：格式錯誤');
+        await page.fill(`${field('ddns.records')} textarea`, '');
+        check(/DDNS 沒有啟用（固定網域）/.test(await page.textContent('#panel-ddns')), 'DDNS 結果：固定網域時說明不會更新記錄');
+        await shot('06b-ddns-edited');
+        await page.click('#btn-save');
+        await page.waitForFunction(() => /已儲存並套用|失敗|沒有在 30 秒/.test(document.getElementById('save-msg').textContent) || !document.getElementById('login').hidden, null, { timeout: 40000 });
+        check(/已儲存並套用/.test(await page.textContent('#save-msg')), '儲存網域、憑證、出口、監聽位址', await page.textContent('#save-msg'));
+        const cfg2 = (await page.evaluate(() => fetch('/api/config').then(r => r.json())));
+        const u2 = cfg2.user;
+        check(u2.domain === 'dns.example.com', '設定：domain = dns.example.com（整理成小寫、去掉結尾的點）', JSON.stringify(u2.domain));
+        check(u2.tls && u2.tls.cert === certFile && u2.tls.key === keyFile, '設定：tls.cert / tls.key（自己的憑證檔）', JSON.stringify(u2.tls));
+        check(u2.acme === undefined && !(u2.ddns && 'enabled' in u2.ddns) && cfg2.effective.acme.enabled === false && cfg2.effective.ddns.enabled === false, '設定：固定網域、自備憑證（不開 DDNS、不開 ACME）');
+        check(u2.ddns && u2.ddns.ipv6 === true && JSON.stringify(u2.ddns.interfaces) === '["eth0","eth1"]' && !('records' in u2.ddns), '設定：ddns.ipv6 = true、ddns.interfaces = [eth0, eth1]', JSON.stringify(u2.ddns));
+        check(JSON.stringify(u2.listen.dot.binds) === '["127.0.0.1","192.0.2.1"]' && JSON.stringify(u2.listen.doh.binds) === '["192.168.1.10","203.0.113.25"]', '設定：listen.dot.binds / listen.doh.binds', JSON.stringify(u2.listen));
+        check(u2.listen.doh.tls === false && u2.listen.doh.windowsMode === 'iis-proxy' && u2.listen.doh.iisSite === 'Default Web Site', '設定：listen.doh.tls = false（布林）、iisSite', JSON.stringify(u2.listen.doh));
+        check(JSON.stringify(cfg2.effective.acme.domains) === '["dns.example.com"]' && cfg2.effective.site.hostname === 'dns.example.com', '綁定網域自動帶到憑證與公開頁');
+        const paths2 = await page.evaluate(() => fetch('/api/paths').then(r => r.json()));
+        check(paths2.tls.source === 'manual' && paths2.tls.cert === certFile && paths2.tls.exists === haveCert, '/api/paths：憑證來源是自備憑證', JSON.stringify(paths2.tls));
+
+        await page.click('#cfg-groups button[data-group=domain]');
+        await page.waitForSelector('#panel-cert[data-ready]');
+        const certText = await page.textContent('#panel-cert');
+        check(/自己的憑證檔/.test(certText) && certText.includes(certFile), '憑證狀態：來源與位置', certText.slice(0, 200));
+        if (haveCert) check(/有效（剩 \d+ 天）/.test(certText) && /CN=dns\.example\.com/.test(certText) && /有涵蓋 dns\.example\.com/.test(certText), '憑證狀態：主體、到期、有涵蓋綁定網域', certText);
+        else check(/找不到檔案/.test(certText), '憑證狀態：檔案不存在時顯示（這台機器沒有 openssl，略過憑證內容檢查）', certText);
+        check(await page.inputValue(`${field('domain')} input`) === 'dns.example.com', '重新讀取後顯示綁定網域');
+        await shot('06c-domain');
+        await page.click('#cfg-groups button[data-group=ddns]');
+        await page.waitForSelector(`${field('ddns.interfaces')} .iface`);
+        check(await page.isChecked(`${field('ddns.interfaces')} input[value=eth0]`) && await page.isChecked(`${field('ddns.interfaces')} input[value=eth1]`) && !(await page.isChecked(`${field('ddns.interfaces')} input[value=wlan0]`)),
+            '重新讀取後出口的勾選狀態保留');
+        if (haveCert) {
+            await page.click('#cfg-groups button[data-group=listen]');
+            await page.waitForSelector('#panel-listeners[data-ready]');
+            const lt = await page.textContent('#panel-listeners');
+            check(/DoT/.test(lt) && lt.includes(String(dotPort)) && /執行中/.test(lt) && /綁定失敗/.test(lt) && /192\.0\.2\.1/.test(lt), '監聽狀態：每個位址一列，綁定失敗列出原因', lt);
+            await shot('06d-listeners');
+            await page.goto(`${BASE}/#status`);
+            await page.waitForFunction(() => /綁定失敗/.test(document.getElementById('st-listen').textContent), null, { timeout: 8000 }).catch(() => {});
+            const sl = await page.textContent('#st-listen');
+            check(/綁定失敗/.test(sl) && /192\.0\.2\.1/.test(sl) && /127\.0\.0\.1/.test(sl), '狀態分頁：監聽表格列出綁定失敗的位址與原因', sl);
+            await page.goto(`${BASE}/#settings`);
+            await page.waitForSelector('#cfg-groups button');
+        } else ok('（沒有 openssl：略過加密監聽的綁定結果檢查）');
+        // 390 px：新面板不能把頁面撐寬
+        await page.setViewportSize({ width: 390, height: 800 });
+        for (const g of ['domain', 'ddns', 'listen']) {
+            await page.click(`#cfg-groups button[data-group=${g}]`);
+            await page.waitForTimeout(600);
+            const w = await page.evaluate(() => document.documentElement.scrollWidth);
+            check(w <= 391, `390 px 寬沒有水平捲動：設定 → ${g}`, `scrollWidth = ${w}`);
+            await shot(`06e-mobile-${g}`);
+        }
+        await page.setViewportSize({ width: 1280, height: 900 });
+        await page.unroute('**/api/interfaces');
 
         console.log('工具');
         await page.goto(`${BASE}/#tools`);

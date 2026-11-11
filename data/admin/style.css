@@ -228,6 +228,45 @@ td.mono { font-family: var(--mono); font-size: 13px; }
 .field.wide > .lab { padding-top: 0; }
 .field .multi { display: flex; flex-wrap: wrap; gap: 6px 16px; padding-top: 7px; }
 
+.field .choice { display: flex; flex-direction: column; gap: 6px; }
+.field select.picker { margin-top: 6px; color: var(--muted); }
+
+/* 勾選網卡（DDNS 出口） */
+.ifaces { display: flex; flex-direction: column; gap: 6px; }
+.ifaces > p { margin: 0; }
+.iface {
+  display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+}
+.iface:hover { border-color: var(--accent); }
+.iface.missing { border-style: dashed; }
+.iface input[type=checkbox] { margin-top: 2px; }
+.iface-body { min-width: 0; flex: 1; }
+.iface-name { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+.addrs { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
+.addr { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; }
+.addr .mono { overflow-wrap: anywhere; }
+
+/* 唯讀面板：監聽狀態、憑證、DDNS 結果、存放位置 */
+.panel { margin-top: 10px; }
+.section .field + .panel, .section .field + div > .panel { border-top: 1px solid var(--border); padding-top: 10px; }
+.panel h4 { font-size: 14px; margin: 12px 0 6px; }
+.panel h4:first-child { margin-top: 0; }
+.panel > .muted { margin: 0 0 6px; }
+.panel .kv th { width: 28%; }
+/* 結果表格：窄螢幕在框內左右捲動，不把字擠成一行一個字 */
+.panel table:not(.kv):not(.paths) { min-width: 440px; }
+.panel table:not(.kv):not(.paths) td { overflow-wrap: break-word; }
+.cell-err { color: var(--err); font-size: 13px; margin-top: 3px; }
+.path { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
+.path + .path { margin-top: 4px; }
+.path .mono { overflow-wrap: anywhere; min-width: 0; padding-top: 4px; }
+.path .copy { flex: none; }
+table.paths th[scope], table.paths tbody th { background: none; font-size: 13px; color: var(--text); white-space: nowrap; width: 9em; }
+table.paths td.use { color: var(--muted); font-size: 13px; width: 34%; }
+table.paths .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.offscreen { position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; }
+
 .tbl-edit td { padding: 4px 6px; }
 .tbl-edit input[type=text], .tbl-edit select { min-height: 32px; padding: 4px 8px; font-size: 13px; }
 .tbl-edit td.c { text-align: center; vertical-align: middle; }
@@ -314,6 +353,14 @@ pre.log { max-height: 70vh; min-height: 200px; font-size: 12px; }
   .field { grid-template-columns: minmax(0, 1fr); }
   .field > .lab { padding-top: 0; }
   .field.bool > .ctl { padding-top: 0; }
+  /* 存放位置：窄螢幕一列一項，欄位上下排 */
+  table.paths thead { display: none; }
+  table.paths, table.paths tbody, table.paths tr, table.paths th, table.paths td { display: block; width: auto; }
+  table.paths tbody th { border-bottom: 0; padding-bottom: 0; width: auto; }
+  table.paths td { border-bottom: 0; padding-top: 2px; padding-bottom: 2px; }
+  table.paths td.use { width: auto; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  table.paths tr:last-child td.use { border-bottom: 0; }
+  .panel .kv th { width: 34%; }
   .tools { grid-template-columns: minmax(0, 1fr); }
   .about { grid-template-columns: minmax(0, 1fr); }
 }

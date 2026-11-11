@@ -115,6 +115,76 @@
 	}
 	function pretty(v) { return typeof v === 'string' ? v : JSON.stringify(v, null, 2); }
 
+	// ---------------------------------------------------------------- 格式檢查（後端不接受的值不寫進設定）
+	/** IPv4 位址（不接受前面補 0，跟後端的解析一致） */
+	function isIPv4(s) {
+		var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+		return !!m && m.slice(1).every(function (x) { return +x <= 255 && (x.length === 1 || x.charAt(0) !== '0'); });
+	}
+	/** IPv6 位址（不含 %網卡、不含中括號） */
+	function isIPv6(s) {
+		if (!/^[0-9a-fA-F:.]+$/.test(s) || s.indexOf(':') < 0) return false;
+		var dbl = s.split('::');
+		if (dbl.length > 2) return false;
+		var groups = function (part) { return part === '' ? [] : part.split(':'); };
+		var all = groups(dbl[0]).concat(dbl.length === 2 ? groups(dbl[1]) : []), n = 0;
+		for (var i = 0; i < all.length; i++) {
+			var g = all[i];
+			if (g.indexOf('.') >= 0) {
+				if (i !== all.length - 1 || !isIPv4(g)) return false;
+				n += 2;
+			} else {
+				if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return false;
+				n++;
+			}
+		}
+		return dbl.length === 2 ? n <= 7 : n === 8;
+	}
+	function isIP(s) { return isIPv4(s) || isIPv6(s); }
+	/** 完整網域名稱（至少兩段；不是 IP） */
+	function isDomain(s) {
+		if (!s || s.length > 253) return false;
+		var ls = s.split('.');
+		if (ls.length < 2 || /^\d+$/.test(ls[ls.length - 1])) return false;
+		return ls.every(function (l) { return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i.test(l); });
+	}
+	/** validate → 檢查一個值：回 { val }（整理過的值）或 { err } */
+	var VALID = {
+		domain: function (s) {
+			var d = s.replace(/\.$/, '').toLowerCase();
+			return isDomain(d) ? { val: d } : { err: '請輸入完整的網域名稱，例如 dns.example.com（不含 https:// 與路徑）' };
+		},
+		record: function (s) {
+			var d = s.replace(/\.$/, '').toLowerCase();
+			return isDomain(d.replace(/^\*\./, '')) ? { val: d } : { err: '請輸入完整的網域名稱，例如 home.example.com' };
+		},
+		ip: function (s) {
+			return isIP(s) ? { val: s } : { err: '請輸入 IP 位址，例如 0.0.0.0、192.168.1.10 或 ::（不含埠號、中括號與 %網卡）' };
+		},
+		iisSite: function (s) {
+			// 跟後端 iiscert::valid_site 一樣：文字、數字、空白與 . _ - ( )，最多 128 位元組
+			var bytes = window.TextEncoder ? new TextEncoder().encode(s).length : s.length * 3;
+			return /^[\p{L}\p{N} ._()-]+$/u.test(s) && bytes <= 128 ? { val: s } : { err: '站台名稱只能有文字、數字、空白與 . _ - ( )' };
+		}
+	};
+	function validate(f, s) { return f.validate && VALID[f.validate] ? VALID[f.validate](s) : { val: s }; }
+
+	/** 複製文字到剪貼簿（設定頁在 127.0.0.1，可以用 Clipboard API；不行時退回舊方法） */
+	function copyText(text) {
+		var legacy = function () {
+			var ta = el('textarea', { class: 'offscreen', readonly: true, 'aria-hidden': 'true' });
+			ta.value = text;
+			document.body.appendChild(ta);
+			ta.select();
+			var okc = false;
+			try { okc = document.execCommand('copy'); } catch (e) { okc = false; }
+			document.body.removeChild(ta);
+			return okc ? Promise.resolve() : Promise.reject(new Error('copy'));
+		};
+		var p = navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(text).catch(legacy) : legacy();
+		return p.then(function () { toast('已複製：' + text); }, function () { toast('無法複製，請手動選取文字', true); });
+	}
+
 	var toastTimer;
 	function toast(text, isErr) {
 		var t = $('toast');
@@ -172,7 +242,9 @@
 		group: null,
 		tab: null,
 		saving: false,
-		rawDirty: false
+		rawDirty: false,
+		ifaces: null,       // GET /api/interfaces 的 Promise（網卡清單，整個頁面共用）
+		live: []            // 目前這個分類裡，欄位一改就要重畫的面板
 	};
 	var isPro = function () { return store.get(MODE_KEY) === 'pro'; };
 
@@ -472,10 +544,15 @@
 				pe ? badge('執行中', 'ok') : badge('未開啟', 'off')
 			]);
 		}
-		rows.push(row('DoH（TCP）', ls.doh, ls.doh != null, 'listen.doh.enabled'));
-		rows.push(row('DoH3（UDP）', ls.doh3, ls.doh3 != null, 'listen.doh.http3'));
-		rows.push(row('DoT（TCP）', ls.dot, ls.dot != null, 'listen.dot.enabled'));
-		rows.push(row('DoQ（UDP）', ls.doq, ls.doq != null, 'listen.doq.enabled'));
+		// 加密協議：有每個位址的結果（listenersDetail）就一個位址一列，綁定失敗時列出原因
+		var detail = [].concat(st.listenersDetail || []);
+		[['doh', 'listen.doh.enabled'], ['doh3', 'listen.doh.http3'], ['dot', 'listen.dot.enabled'], ['doq', 'listen.doq.enabled']].forEach(function (p) {
+			var ds = detail.filter(function (x) { return x && x.proto === p[0]; });
+			if (!ds.length) { rows.push(row(PROTO[p[0]], ls[p[0]], ls[p[0]] != null, p[1])); return; }
+			ds.forEach(function (x) {
+				rows.push([PROTO[p[0]], { text: x.port + '（' + x.bind + '）', cls: 'num' }, listenerState(x)]);
+			});
+		});
 		rows.push(row('DDR 自動發現', null, !!ls.ddr, 'listen.ddr'));
 		rows.push(['設定頁', { text: location.port || '80', cls: 'num' }, badge('執行中', 'ok')]);
 		tableRows($('st-listen').tBodies[0], rows, 3);
@@ -508,6 +585,13 @@
 		}
 	}
 
+	/** 一個監聽位址的狀態（/api/status 的 listenersDetail） */
+	function listenerState(x) {
+		if (x.ok) return badge(x.proto === 'doh' ? (x.tls ? '執行中（TLS）' : '執行中（純 HTTP）') : '執行中', 'ok');
+		return el('div', {}, [badge('綁定失敗', 'err'), el('div', { class: 'cell-err', text: x.error || '原因不明（請看日誌）' })]);
+	}
+	var PROTO = { doh: 'DoH（TCP）', doh3: 'DoH3（UDP）', dot: 'DoT（TCP）', doq: 'DoQ（UDP）' };
+
 	// ---------------------------------------------------------------- 設定分頁
 	function defOf(f) {
 		var d = S.cfg ? getPath(S.cfg.defaults, f.key) : undefined;
@@ -515,6 +599,24 @@
 	}
 	function userOf(key) { return getPath(S.work, key); }
 	function effOf(f) { var u = userOf(f.key); return u === undefined ? defOf(f) : u; }
+	/** 兩個欄位要一起填（憑證檔與私鑰檔）：只填一個時後端會當成沒有設定 */
+	function pairErrors() {
+		var out = {};
+		if (!S.fields) return out;
+		(S.fields.groups || []).forEach(function (g) {
+			groupFields(g).forEach(function (f) {
+				if (!f.pairWith) return;
+				var a = userOf(f.key), b = userOf(f.pairWith);
+				if ((a === undefined || a === '') && b !== undefined && b !== '') out[f.key] = '這一欄也要填（憑證檔與私鑰檔要一起填）';
+			});
+		});
+		return out;
+	}
+	function allErrors() {
+		var out = pairErrors();
+		Object.keys(S.errors).forEach(function (k) { out[k] = S.errors[k]; });
+		return out;
+	}
 	function isDirty() {
 		if (!S.cfg) return false;
 		return !deepEqual(prune(S.work, S.cfg.defaults), S.orig) || S.rawDirty;
@@ -586,6 +688,7 @@
 
 	function renderGroup() {
 		var box = clear($('cfg-group'));
+		S.live = [];
 		var g = visibleGroups().filter(function (x) { return x.id === S.group; })[0];
 		if (!g) return;
 		box.appendChild(el('h3', { text: g.title }));
@@ -595,10 +698,12 @@
 		(g.sections || []).forEach(function (sec) {
 			if (sec.pro && !pro) return;
 			var fs = (sec.fields || []).filter(function (f) { return pro || !f.pro; });
-			if (!fs.length) return;
+			if (!fs.length && !sec.widget) return;
 			var card = el('div', { class: 'card section' }, [el('h3', { text: sec.title })]);
+			if (sec.widget) card.setAttribute('data-widget', sec.widget);
 			if (sec.desc) card.appendChild(el('p', { class: 'desc', text: sec.desc }));
 			fs.forEach(function (f) { card.appendChild(renderField(f)); });
+			if (sec.widget && WIDGETS[sec.widget]) card.appendChild(WIDGETS[sec.widget]());
 			box.appendChild(card);
 		});
 		if (!pro && (g.sections || []).some(function (s) { return s.pro || (s.fields || []).some(function (f) { return f.pro; }); })) {
@@ -618,6 +723,15 @@
 	/** 欄位改變後：更新「已修改」標示、分類的小圓點、儲存列 */
 	function changed(f, row) {
 		if (row) refreshMeta(f, row);
+		// 其他欄位的錯誤訊息也可能跟著變（要一起填的欄位）
+		var errs = allErrors();
+		document.querySelectorAll('#cfg-group .field[data-key]').forEach(function (r) {
+			var et = r.querySelector('.err-text'), k = r.getAttribute('data-key');
+			if (!et) return;
+			et.textContent = errs[k] || '';
+			et.hidden = !errs[k];
+		});
+		S.live.forEach(function (fn) { fn(); });
 		applyDepends();
 		renderGroupNav();
 		updateSaveBar();
@@ -626,10 +740,11 @@
 	function defText(f, d) {
 		if (d === undefined) return null;
 		if (f.type === 'bool') return d ? '開啟' : '關閉';
-		if (f.type === 'select') {
+		if (f.type === 'select' || f.type === 'choice') {
 			var o = (f.options || []).filter(function (x) { return x.value === d; })[0];
 			return o ? o.label : String(d);
 		}
+		if (f.type === 'ifaces') return [].concat(d || []).length ? [].concat(d).join('、') : '自動';
 		if (f.type === 'password') return d ? '（已設定）' : '空白';
 		if (f.type === 'multi') return [].concat(d || []).join('、') || '無';
 		if (f.type === 'list') return [].concat(d || []).length ? [].concat(d).join('、') : '無';
@@ -659,9 +774,9 @@
 				}
 			}));
 		}
-		var et = row.querySelector('.err-text');
-		et.textContent = S.errors[f.key] || '';
-		et.hidden = !S.errors[f.key];
+		var et = row.querySelector('.err-text'), err = allErrors()[f.key];
+		et.textContent = err || '';
+		et.hidden = !err;
 	}
 
 	function isNum(f) { return f.type === 'int' || f.type === 'float' || f.type === 'port'; }
@@ -690,8 +805,8 @@
 	function renderField(f) {
 		var id = 'f' + (++uid);
 		var ctl = el('div', { class: 'ctl' });
-		var row = el('div', { class: 'field' + (f.type === 'bool' ? ' bool' : ''), 'data-key': f.key }, [
-			el('label', { class: 'lab', for: id }, [f.label, el('span', { class: 'key', text: f.key })]),
+		var row = el('div', { class: 'field' + (f.type === 'bool' || f.type === 'choice' ? ' bool' : ''), 'data-key': f.key }, [
+			el('label', { class: 'lab', for: f.type === 'ifaces' ? null : id }, [f.label, el('span', { class: 'key', text: f.key })]),
 			ctl
 		]);
 		if (f.dependsOn) row.setAttribute('data-dep', JSON.stringify(f.dependsOn));
@@ -712,13 +827,31 @@
 			input.appendChild(el('option', { value: '', text: dl != null ? '預設（' + dl + '）' : '預設' }));
 			var opts = (f.options || []).slice();
 			if (u !== undefined && !opts.some(function (o) { return o.value === u; })) opts.push({ value: u, label: String(u) });
-			opts.forEach(function (o) { input.appendChild(el('option', { value: o.value, text: o.label })); });
-			input.value = u === undefined ? '' : u;
+			// typed：值照 JSON 型別存（true / false / 字串），選項的 value 用 JSON 表示
+			var enc = function (v) { return f.typed ? JSON.stringify(v) : v; };
+			opts.forEach(function (o) { input.appendChild(el('option', { value: enc(o.value), text: o.label })); });
+			input.value = u === undefined ? '' : enc(u);
 			input.addEventListener('change', function () {
-				setValue(f, input.value === '' ? undefined : input.value);
+				setValue(f, input.value === '' ? undefined : (f.typed ? JSON.parse(input.value) : input.value));
 				changed(f, row);
 			});
 			ctl.appendChild(input);
+		} else if (f.type === 'choice') {
+			// 單選：值可以是布林（例如 ddns.enabled）；選到預設值就不寫進設定檔
+			var grp = el('div', { class: 'choice', role: 'radiogroup', 'aria-label': f.label });
+			var curC = effOf(f);
+			(f.options || []).forEach(function (o, i) {
+				var r = el('input', { type: 'radio', name: id, id: i === 0 ? id : null, value: String(i), checked: o.value === curC });
+				r.addEventListener('change', function () {
+					if (!r.checked) return;
+					setValue(f, d !== undefined && o.value === d ? undefined : o.value);
+					changed(f, row);
+				});
+				grp.appendChild(el('label', { class: 'chk' }, [r, el('span', { text: o.label })]));
+			});
+			ctl.appendChild(grp);
+		} else if (f.type === 'ifaces') {
+			ctl.appendChild(renderIfaces(f, row, id));
 		} else if (f.type === 'list') {
 			var lines = u === undefined ? [] : [].concat(u);
 			var dlist = [].concat(d || []);
@@ -729,10 +862,19 @@
 			input.value = lines.join('\n');
 			input.addEventListener('input', function () {
 				var arr = input.value.split(/\r?\n/).map(function (x) { return x.trim(); }).filter(Boolean);
+				input.classList.remove('invalid');
+				var bad = null;
+				arr = arr.map(function (x, i) {
+					var c = validate(f, x);
+					if (c.err && !bad) bad = '第 ' + (i + 1) + ' 行「' + x + '」：' + c.err;
+					return c.err ? x : c.val;
+				});
+				if (bad) { S.errors[f.key] = bad; input.classList.add('invalid'); changed(f, row); return; }
 				setValue(f, arr.length ? arr : undefined);
 				changed(f, row);
 			});
 			ctl.appendChild(input);
+			if (f.picker === 'addrs') ctl.appendChild(addrPicker(input));
 			if (dlist.length) {
 				ctl.appendChild(el('button', {
 					type: 'button', class: 'linkbtn', text: '把預設值填進來再修改',
@@ -794,7 +936,14 @@
 						changed(f, row);
 						return;
 					}
-					setValue(f, s);
+					var c = validate(f, s);
+					if (c.err) {
+						S.errors[f.key] = c.err;
+						input.classList.add('invalid');
+						changed(f, row);
+						return;
+					}
+					setValue(f, c.val);
 				}
 				changed(f, row);
 			});
@@ -819,6 +968,260 @@
 		refreshMeta(f, row);
 		return row;
 	}
+
+	// ---------------------------------------------------------------- 網卡（/api/interfaces）
+	var SCOPE = { public: '公網', private: '私有', cgnat: '電信商 CGNAT', linklocal: '鏈路本地', ula: '區網 IPv6', loopback: '本機' };
+	/** 網卡清單（整個頁面只問一次；force = 重新讀取）。失敗時回 null */
+	function loadIfaces(force) {
+		if (!S.ifaces || force) {
+			S.ifaces = api('/api/interfaces').then(function (r) {
+				return r.ok && r.data && Array.isArray(r.data.interfaces) ? r.data.interfaces : null;
+			});
+		}
+		return S.ifaces;
+	}
+	function addrNode(a) {
+		return el('span', { class: 'addr' }, [
+			el('span', { class: 'mono', text: a.ip }),
+			badge(SCOPE[a.scope] || a.scope || '', a.scope === 'public' ? 'ok' : 'off'),
+			a.temporary ? badge('暫時位址', 'warn') : null,
+			a.deprecated ? badge('已停用', 'warn') : null
+		]);
+	}
+
+	/** 勾選網卡（ddns.interfaces）：列出每張網卡的位址；設定裡有、但這台電腦找不到的網卡也列出來（可以取消勾選） */
+	function renderIfaces(f, row, id) {
+		var box = el('div', { class: 'ifaces', id: id, role: 'group', 'aria-label': f.label }, el('p', { class: 'muted', text: '讀取網卡中…' }));
+		var d = defOf(f);
+		var commit = function () {
+			var arr = [].slice.call(box.querySelectorAll('input[type=checkbox]')).filter(function (c) { return c.checked; }).map(function (c) { return c.value; });
+			setValue(f, deepEqual(arr, d === undefined ? [] : d) ? undefined : arr);
+			changed(f, row);
+		};
+		var draw = function (list) {
+			clear(box);
+			var cur = [].concat(effOf(f) || []);
+			var item = function (name, body, missing) {
+				var c = el('input', { type: 'checkbox', value: name, checked: cur.indexOf(name) >= 0 });
+				c.addEventListener('change', commit);
+				box.appendChild(el('label', { class: 'iface' + (missing ? ' missing' : '') }, [c, el('div', { class: 'iface-body' }, body)]));
+			};
+			if (!list) box.appendChild(el('p', { class: 'msg warn', text: '讀不到這台電腦的網卡清單（/api/interfaces）。已經設定的出口仍然列在下面。' }));
+			(list || []).forEach(function (i) {
+				// 迴路介面不會是對外的出口
+				if ((i.addrs || []).length && i.addrs.every(function (a) { return a.scope === 'loopback'; }) && cur.indexOf(i.name) < 0) return;
+				var addrs = (i.addrs || []).filter(function (a) { return a.scope !== 'linklocal' && a.scope !== 'loopback'; });
+				item(i.name, [
+					el('div', { class: 'iface-name' }, [el('strong', { text: i.name }), i.label && i.label !== i.name ? el('span', { class: 'muted', text: i.label }) : null,
+						i.up ? null : badge('未連線', 'off')]),
+					addrs.length ? el('div', { class: 'addrs' }, addrs.map(addrNode)) : el('div', { class: 'muted', text: '沒有可用的位址' })
+				]);
+			});
+			cur.forEach(function (name) {
+				if ((list || []).some(function (i) { return i.name === name; })) return;
+				item(name, [el('div', { class: 'iface-name' }, [el('strong', { text: name }), badge('找不到這張網卡', 'warn')]),
+					el('div', { class: 'muted', text: '名稱改了或已經移除。取消勾選就會從設定移除。' })], true);
+			});
+			if (!box.querySelector('input')) box.appendChild(el('p', { class: 'muted', text: '沒有找到可以當出口的網卡。' }));
+			box.appendChild(el('button', { type: 'button', class: 'linkbtn', text: '重新讀取網卡', onclick: function () { loadIfaces(true).then(draw); } }));
+		};
+		loadIfaces().then(draw);
+		return box;
+	}
+
+	/** 清單欄位下方的「從本機位址挑選」：選了就加到清單最後一行 */
+	function addrPicker(input) {
+		var sel = el('select', { class: 'picker', 'aria-label': '從本機位址挑選' }, el('option', { value: '', text: '從本機位址挑選…' }));
+		var add = function (ip, label) { sel.appendChild(el('option', { value: ip, text: ip + '　' + label })); };
+		add('0.0.0.0', '所有 IPv4 位址');
+		add('::', '所有 IPv6 位址');
+		add('127.0.0.1', '只有這台電腦（IPv4）');
+		add('::1', '只有這台電腦（IPv6）');
+		loadIfaces().then(function (list) {
+			(list || []).forEach(function (i) {
+				(i.addrs || []).forEach(function (a) {
+					// 鏈路本地位址要指定網卡才能綁定，後端不接受；迴路位址上面已經有了
+					if (a.scope === 'linklocal' || a.scope === 'loopback') return;
+					add(a.ip, (i.label || i.name) + '（' + (SCOPE[a.scope] || a.scope) + (a.temporary ? '、暫時位址' : '') + (a.deprecated ? '、已停用' : '') + (i.up ? '' : '、未連線') + '）');
+				});
+			});
+		});
+		sel.addEventListener('change', function () {
+			var ip = sel.value;
+			sel.value = '';
+			if (!ip) return;
+			var lines = input.value.split(/\r?\n/).map(function (x) { return x.trim(); }).filter(Boolean);
+			if (lines.indexOf(ip) < 0) lines.push(ip);
+			input.value = lines.join('\n');
+			input.dispatchEvent(new Event('input'));
+		});
+		return sel;
+	}
+
+	// ---------------------------------------------------------------- 唯讀面板（設定分類裡的目前狀態）
+	function kvTable(rows) {
+		return el('div', { class: 'table-wrap' }, el('table', { class: 'kv' }, el('tbody', {}, rows.map(function (r) {
+			return el('tr', {}, [el('th', { text: r[0] }), el('td', {}, r[1])]);
+		}))));
+	}
+	function simpleTable(head, rows, emptyText) {
+		var tb = el('tbody');
+		tableRows(tb, rows, head.length);
+		if (!rows.length && emptyText) tb.firstChild.firstChild.textContent = emptyText;
+		return el('div', { class: 'table-wrap' }, el('table', {}, [el('thead', {}, el('tr', {}, head.map(function (h) { return el('th', { text: h }); }))), tb]));
+	}
+	/** 面板外框：先顯示「讀取中」，load() 的結果交給 draw(box, data, reload) */
+	function panel(name, load, draw) {
+		var box = el('div', { class: 'panel', id: 'panel-' + name }, el('p', { class: 'muted', text: '讀取中…' }));
+		var run = function () {
+			return load().then(function (r) {
+				clear(box);
+				if (!r.ok) { box.appendChild(el('p', { class: 'msg err', text: '讀取失敗：' + errText(r) })); return; }
+				draw(box, r.data || {}, run);
+				box.setAttribute('data-ready', '1');
+			});
+		};
+		run();
+		return box;
+	}
+	/** 憑證（certinfo）有沒有涵蓋這個網域（含萬用字元），跟後端 certinfo::covers 一樣 */
+	function certCovers(info, domain) {
+		var d = String(domain || '').replace(/\.$/, '').toLowerCase();
+		return String(info.san || '').split(', ').some(function (n) {
+			if (n.slice(0, 4) !== 'DNS:') return false;
+			n = n.slice(4).toLowerCase();
+			if (n === d) return true;
+			var i = d.indexOf('.');
+			return n.slice(0, 2) === '*.' && i > 0 && d.slice(i + 1) === n.slice(2);
+		});
+	}
+	function pathCell(p) {
+		if (p == null || p === '') return el('span', { class: 'muted', text: '（沒有）' });
+		return el('div', { class: 'path' }, [el('span', { class: 'mono', text: p }),
+			el('button', { type: 'button', class: 'btn small copy', text: '複製', 'aria-label': '複製 ' + p, onclick: function () { copyText(String(p)); } })]);
+	}
+
+	var DDNS_ACTION = { created: '已新增', updated: '已更新', unchanged: '沒有變', deleted: '已移除', kept: '暫時保留', skip: '略過', error: '失敗' };
+	var WIDGETS = {
+		// 每個加密協議實際綁定的位址
+		listeners: function () {
+			return panel('listeners', function () { return api('/api/status?lite=1'); }, function (box, st) {
+				var rows = [].concat(st.listenersDetail || []).map(function (x) {
+					return [PROTO[x.proto] || x.proto, { text: x.bind, cls: 'mono' }, { text: String(x.port), cls: 'num' }, listenerState(x)];
+				});
+				box.appendChild(simpleTable(['協議', '位址', '埠號', '狀態'], rows, '沒有開啟任何加密協議（DoH / DoT / DoQ）'));
+			});
+		},
+
+		// 憑證目前的狀態（/api/paths 的 tls）＋跟編輯中的設定有關的提醒
+		cert: function () {
+			var hint = el('div', { id: 'cert-hint' });
+			var live = function () {
+				clear(hint);
+				var acme = effOf({ key: 'acme.enabled' }) === true, c = userOf('tls.cert'), k = userOf('tls.key');
+				if (acme && (c || k)) hint.appendChild(el('p', { class: 'msg warn', text: '選擇自動申請時，新憑證會寫到上面填的憑證檔與私鑰檔（會覆蓋原本的檔案）。不想被覆蓋請把這兩欄清空，憑證會放在設定資料夾。' }));
+				else if (!acme && !c && !k) hint.appendChild(el('p', { class: 'msg info', text: '還沒有填憑證檔：DoH（直接對外）、DoT、DoQ 需要憑證才能啟動。只用一般 DNS 可以不填。' }));
+			};
+			S.live.push(live);
+			live();
+			var st = panel('cert', function () { return api('/api/paths'); }, function (box, p) {
+				var t = p.tls || {}, info = t.info, dom = S.cfg ? getPath(S.cfg.effective, 'domain') : '';
+				var src = { acme: '自動申請（內建 ACME）', manual: '自己的憑證檔（只讀取，不會覆蓋）', none: '還沒有設定憑證' }[t.source] || t.source || '-';
+				var rows = [['來源', src]];
+				if (t.cert) rows.push(['憑證檔', pathCell(t.cert)]);
+				if (t.key) rows.push(['私鑰檔', pathCell(t.key)]);
+				if (t.source !== 'none') {
+					var state;
+					if (!t.exists) state = badge(t.source === 'acme' ? '還沒有申請到憑證' : '找不到檔案（憑證檔或私鑰檔不存在）', 'err');
+					else if (!info) state = badge('憑證檔讀不出來（不是 PEM 格式？）', 'err');
+					else if (info.daysLeft < 0) state = badge('已經過期', 'err');
+					else if (info.daysLeft < 14) state = badge('快到期（剩 ' + info.daysLeft + ' 天）', 'warn');
+					else state = badge('有效（剩 ' + info.daysLeft + ' 天）', 'ok');
+					rows.push(['狀態', state]);
+				}
+				if (info) {
+					rows.push(['主體', info.subject || '-']);
+					rows.push(['涵蓋的名稱', info.san || '（沒有 SAN）']);
+					rows.push(['簽發者', info.issuer || '-']);
+					rows.push(['到期', info.validTo || '-']);
+					if (dom) rows.push(['綁定網域', certCovers(info, dom) ? badge('有涵蓋 ' + dom, 'ok') : badge('沒有涵蓋 ' + dom + '（用戶端會出現憑證錯誤）', 'err')]);
+					else rows.push(['綁定網域', el('span', { class: 'muted', text: '還沒有填綁定網域，無法比對' })]);
+				}
+				box.appendChild(el('h4', { text: '目前的憑證（已儲存並套用的設定）' }));
+				box.appendChild(kvTable(rows));
+			});
+			return el('div', {}, [hint, st]);
+		},
+
+		// DDNS：每個出口偵測到的 IP、每筆記錄的結果
+		ddns: function () {
+			return panel('ddns', function () { return api('/api/ddns'); }, function (box, st, reload) {
+				if (st.enabled === false) {
+					box.appendChild(el('p', { class: 'msg info', text: 'DDNS 沒有啟用（固定網域）：黑潮 DNS 不會更新 DNS 記錄。' }));
+					return;
+				}
+				var fam = function (x) { return 'IPv' + x.family; };
+				if (st.error) box.appendChild(el('p', { class: 'msg warn', text: '上次更新有錯誤：' + st.error }));
+				box.appendChild(el('p', { class: 'muted', text: '上次檢查：' + fmtTime(st.lastRun) }));
+				box.appendChild(el('h4', { text: '出口' }));
+				box.appendChild(simpleTable(['出口（網卡）', '類型', '偵測到的 IP', '狀態'], [].concat(st.sources || []).map(function (x) {
+					return [x.interface || '自動（預設路由）', fam(x), { text: x.ip || '-', cls: 'mono' },
+						x.ok ? badge('正常', 'ok') : el('div', {}, [badge('失敗', 'err'), el('div', { class: 'cell-err', text: x.error || '' })])];
+				}), '還沒有偵測結果'));
+				box.appendChild(el('h4', { text: 'DNS 記錄' }));
+				box.appendChild(simpleTable(['名稱', '類型', '內容', '結果'], [].concat(st.records || []).map(function (x) {
+					var act = DDNS_ACTION[x.action] || x.action || '-';
+					return [{ text: x.name, cls: 'mono' }, x.type, { text: x.content || x.ip || '-', cls: 'mono' },
+						x.ok ? badge(act, x.action === 'kept' ? 'warn' : 'ok') : el('div', {}, [badge(act, x.action === 'skip' ? 'warn' : 'err'), el('div', { class: 'cell-err', text: x.error || '' })])];
+				}), '還沒有更新過'));
+				var msg = el('span', { class: 'muted' });
+				box.appendChild(el('div', { class: 'tbl-actions' }, [
+					actBtn('重新整理', 'small', function () { return reload(); }),
+					actBtn('立即更新', 'small', function () {
+						msg.textContent = '更新中…';
+						return api('/api/ddns/update', { method: 'POST' }).then(function (r) {
+							if (!r.ok) { msg.textContent = '失敗：' + errText(r); return; }
+							return reload();
+						});
+					}), msg]));
+			});
+		},
+
+		// 存放位置（/api/paths）：只有路徑，沒有密鑰內容
+		paths: function () {
+			return panel('paths', function () { return api('/api/paths'); }, function (box, p) {
+				var t = p.tls || {}, a = p.acme || {};
+				var share = function () { return badge('其他服務可以讀取', 'ok'); };
+				var secret = function () { return badge('含密鑰，請勿外流', 'warn'); };
+				var rows = [
+					['設定檔', p.configFile, '所有設定（只存跟預設值不同的欄位）。API Token 也在裡面。', [secret()]],
+					['設定資料夾', p.configDir, '設定檔、登入 token、自動申請的憑證所在的資料夾。'],
+					['憑證檔', t.cert, t.source === 'acme' ? '自動申請的憑證（含中繼憑證，PEM）。續期時會更新這個檔案。' : '自己的憑證檔（PEM），黑潮 DNS 只讀取。', t.cert ? [share()] : null],
+					['私鑰檔', t.key, '憑證的私鑰（PEM）。其他服務要共用時，請確認只有需要的帳號讀得到。', t.key ? [share(), secret()] : null],
+					['ACME 帳號', a.enabled ? a.account : null, '自動申請憑證用的帳號金鑰。', a.enabled ? [secret()] : null],
+					['學習資料', p.stateDir, '評測結果、節點池、CDN 網域庫、統計。'],
+					['執行期暫存', p.runtimeDir, '重新開機就可以清掉的暫存資料。'],
+					['程式附帶的資料', p.shareDir, '內建名單與網頁檔，升級時更新。'],
+					['自訂規則', p.customRules, '自己加的過濾規則，用記事本編輯。'],
+					['評測報表', p.benchmarkDir, '每日 DNS 評測的報表。'],
+					['社群金鑰', p.communityKeyDir, '好友社群的身分金鑰。', [secret()]],
+					['設定頁登入 token', p.adminToken, '登入這個設定頁用的 token 檔。', [secret()]],
+					['日誌檔', p.logFile, '以 Windows 服務執行時的日誌；用 cmd 執行時直接顯示在視窗裡。']
+				];
+				var tb = el('tbody');
+				rows.forEach(function (r) {
+					tb.appendChild(el('tr', {}, [
+						el('th', { text: r[0] }),
+						el('td', {}, [].concat(r[1] == null ? [null] : r[1]).map(pathCell)),
+						el('td', { class: 'use' }, [r[2], r[3] ? el('div', { class: 'tags' }, r[3]) : null])
+					]));
+				});
+				box.appendChild(el('div', { class: 'table-wrap' }, el('table', { class: 'paths' }, [
+					el('thead', {}, el('tr', {}, ['項目', '位置', '用途'].map(function (h) { return el('th', { text: h }); }))), tb])));
+				if (a.enabled && [].concat(a.domains || []).length) box.appendChild(el('p', { class: 'muted', text: '自動申請的網域：' + [].concat(a.domains).join('、') }));
+			});
+		}
+	};
 
 	/** 物件陣列（訂閱清單）：每一列的欄位依 columns；不認識的屬性保留 */
 	function renderTable(f, row) {
@@ -960,7 +1363,7 @@
 
 	function updateSaveBar(msg, kind) {
 		var m = $('save-msg');
-		var nErr = Object.keys(S.errors).length;
+		var nErr = Object.keys(allErrors()).length;
 		if (msg) { m.textContent = msg; m.className = 'savebar-msg ' + (kind || ''); }
 		else if (nErr) { m.textContent = '有 ' + nErr + ' 個欄位格式不正確'; m.className = 'savebar-msg err'; }
 		else if (isDirty()) {
@@ -1000,7 +1403,7 @@
 			S.errors = {};
 			S.rawDirty = false;
 		}
-		var nErr = Object.keys(S.errors).length;
+		var nErr = Object.keys(allErrors()).length;
 		if (nErr) { updateSaveBar('請先修正格式不正確的欄位', 'err'); return; }
 		var body = prune(S.work, S.cfg.defaults);
 		var defs = S.cfg.defaults;

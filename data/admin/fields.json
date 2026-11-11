@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "about": "Windows 設定頁的欄位定義（規格 02 第 7.2 節）。key = config.json 的路徑；預設值一律由伺服器提供（/api/config 的 defaults），這裡不重複。type：bool / int / float / port / text / password / path / host / select / list（一行一個）/ multi（多選）/ table（物件陣列）。pro = 只在「專業」模式顯示。fallbackDefault = 伺服器的預設值沒有這個欄位時，程式內建的行為（只用來顯示）。dependsOn = 另一個欄位是指定值時才顯示。",
+  "about": "Windows 設定頁的欄位定義（規格 02 第 7.2 節）。key = config.json 的路徑；預設值一律由伺服器提供（/api/config 的 defaults），這裡不重複。type：bool / int / float / port / text / password / path / host / select / choice（單選，值可以是布林）/ list（一行一個）/ multi（多選）/ ifaces（從 /api/interfaces 勾選網卡）/ table（物件陣列）。validate = 另外檢查格式：domain（網域）/ record（網域，可以用 *. 開頭）/ ip（list 的每一行都要是 IP）/ iisSite；picker = addrs 時 list 下方多一個「從本機位址挑選」；typed = select 的值照 JSON 型別存（true / false / 字串）；pairWith = 兩個欄位要一起填。section 的 widget = 唯讀面板（listeners / cert / ddns / paths）。pro = 只在「專業」模式顯示。fallbackDefault = 伺服器的預設值沒有這個欄位時，程式內建的行為（只用來顯示）。dependsOn = 另一個欄位是指定值時才顯示。",
   "groups": [
     {
       "id": "listen",
       "title": "服務與監聽",
-      "desc": "一般 DNS、DoH、DoH3、DoT、DoQ 的埠號與憑證。儲存後服務會在程式內重新啟動，大約 1 秒。",
+      "desc": "一般 DNS、DoH、DoH3、DoT、DoQ 的埠號與監聽位址。網域與憑證在「網域與憑證」分類。儲存後服務會在程式內重新啟動，大約 1 秒。",
       "notice": true,
       "sections": [
         {
@@ -13,7 +13,7 @@
           "fields": [
             { "key": "listen.plain.enabled", "type": "bool", "label": "啟用一般 DNS", "pro": true },
             { "key": "listen.plain.port", "type": "port", "label": "DNS 埠號", "help": "本程式聽的埠。要讓這台電腦或區網裝置直接把 DNS 指過來，請保持 53。" },
-            { "key": "listen.plain.binds", "type": "list", "label": "監聽位址", "help": "一行一個 IP。127.0.0.1 = 只給這台電腦用；填這台電腦的區網 IP（例如 192.168.1.10）或 0.0.0.0，區網裝置也能使用。", "placeholder": "127.0.0.1" },
+            { "key": "listen.plain.binds", "type": "list", "label": "監聽位址", "help": "一行一個 IP。127.0.0.1 = 只給這台電腦用；填這台電腦的區網 IP（例如 192.168.1.10）或 0.0.0.0，區網裝置也能使用。", "placeholder": "127.0.0.1", "validate": "ip", "picker": "addrs" },
             { "key": "listen.plain.allowFrom", "type": "list", "label": "允許查詢的來源", "help": "區網 DNS 只回答這些網段（空白用預設的私有網段）。", "pro": true, "placeholder": "192.168.0.0/16" }
           ]
         },
@@ -28,9 +28,17 @@
               { "value": "httpsys", "label": "HTTP.sys 共用（有 IIS 時建議，只登記自己的網址）" },
               { "value": "iis-proxy", "label": "IIS 反向代理（沿用 2.x 的 ARR 設定，IIS 轉給本機埠）" }
             ] },
+            { "key": "listen.doh.iisSite", "type": "text", "label": "IIS 站台名稱", "help": "IIS 管理員裡看到的站台名稱。憑證會自動匯入 Windows 憑證存放區並綁定到這個站台的 443，續期後也會自動換上，不用手動處理（服務要以 Windows 服務執行）。", "placeholder": "Default Web Site", "validate": "iisSite", "dependsOn": { "key": "listen.doh.windowsMode", "values": ["iis-proxy"] } },
             { "key": "listen.doh.port", "type": "port", "label": "監聽埠號", "help": "IIS 反向代理模式由 IIS 轉到這個本機埠；沒有 IIS、要直接對外時改成 443。" },
-            { "key": "listen.doh.host", "type": "host", "label": "監聽位址", "help": "127.0.0.1 = 只接受本機（IIS 反向代理用）；直接對外時改成 0.0.0.0。", "placeholder": "0.0.0.0" },
+            { "key": "listen.doh.host", "type": "host", "label": "監聽位址", "help": "127.0.0.1 = 只接受本機（IIS 反向代理用）；直接對外時改成 0.0.0.0。專業模式的「多個監聽位址」有填時不使用這一欄。", "placeholder": "0.0.0.0", "validate": "ip" },
+            { "key": "listen.doh.binds", "type": "list", "label": "多個監聽位址", "help": "一行一個 IP，有填就取代上面的「監聽位址」。IPv4 與 IPv6 可以同時寫（例如 0.0.0.0 與 ::），也可以只聽某幾張網卡的位址。其中一個綁定失敗只記警告，其他照常。", "pro": true, "validate": "ip", "picker": "addrs", "placeholder": "0.0.0.0\n::" },
+            { "key": "listen.doh.tls", "type": "select", "typed": true, "label": "DoH 自己做 TLS", "help": "自動：IIS 反向代理、或只聽本機而且沒有另外指定憑證（前面有反向代理）時用純 HTTP，其他情況找得到憑證就用 TLS。", "pro": true, "options": [
+              { "value": "auto", "label": "自動" },
+              { "value": true, "label": "開啟（一律 TLS）" },
+              { "value": false, "label": "關閉（純 HTTP，TLS 交給前面的反向代理）" }
+            ] },
             { "key": "listen.doh.http3", "type": "bool", "label": "HTTP/3（DoH3）", "help": "同一個埠號的 UDP 也提供 DoH3（QUIC），掉包環境比較穩。DoH 回應會帶 Alt-Svc 告訴用戶端。路由器的埠轉發記得也要加 UDP。" },
+            { "key": "listen.doh.http3Binds", "type": "list", "label": "DoH3 的監聽位址", "help": "一行一個 IP。空白 = 跟 DoH 同樣的位址。IIS 反向代理模式下 DoH 只聽本機，DoH3 要直接對外時在這裡填 0.0.0.0。", "pro": true, "validate": "ip", "picker": "addrs" },
             { "key": "listen.doh.http3Port", "type": "port", "label": "DoH3 改用的 UDP 埠", "help": "UDP 443 被其他程式占用時改用其他埠（例如 8443）。0 = 跟 DoH 同一個埠。", "pro": true, "allowZero": true },
             { "key": "listen.doh.altSvcPort", "type": "port", "label": "Alt-Svc 對外埠號", "help": "外面看到的埠號跟監聽的不同（例如路由器把 443 轉到 8443）時填外面的埠號。0 = 自動。", "pro": true, "allowZero": true },
             { "key": "listen.doh.path", "type": "text", "label": "路徑", "pro": true },
@@ -43,7 +51,8 @@
           "fields": [
             { "key": "listen.dot.enabled", "type": "bool", "label": "啟用" },
             { "key": "listen.dot.port", "type": "port", "label": "監聽埠號" },
-            { "key": "listen.dot.host", "type": "host", "label": "監聽位址", "pro": true }
+            { "key": "listen.dot.host", "type": "host", "label": "監聽位址", "pro": true, "validate": "ip" },
+            { "key": "listen.dot.binds", "type": "list", "label": "多個監聽位址", "help": "一行一個 IP，有填就取代「監聽位址」。IPv4 與 IPv6 可以同時寫。", "pro": true, "validate": "ip", "picker": "addrs", "placeholder": "0.0.0.0\n::" }
           ]
         },
         {
@@ -52,12 +61,19 @@
           "fields": [
             { "key": "listen.doq.enabled", "type": "bool", "label": "啟用" },
             { "key": "listen.doq.port", "type": "port", "label": "監聽埠號（UDP）", "pro": true },
-            { "key": "listen.doq.host", "type": "host", "label": "監聽位址", "pro": true }
+            { "key": "listen.doq.host", "type": "host", "label": "監聽位址", "pro": true, "validate": "ip" },
+            { "key": "listen.doq.binds", "type": "list", "label": "多個監聽位址", "help": "一行一個 IP，有填就取代「監聽位址」。IPv4 與 IPv6 可以同時寫。", "pro": true, "validate": "ip", "picker": "addrs", "placeholder": "0.0.0.0\n::" }
           ]
         },
         {
-          "title": "憑證檔",
-          "desc": "用內建 ACME 自動申請（「憑證」分頁）時保持空白；自己有憑證時填 PEM 檔的完整路徑。",
+          "title": "目前的監聽狀態",
+          "desc": "每個加密協議實際綁定的位址（已儲存並套用的設定）。綁定失敗會列出原因。",
+          "widget": "listeners"
+        },
+        {
+          "title": "個別協議的憑證檔",
+          "desc": "一般不用填：全部協議共用「網域與憑證」分類的憑證。只有某個協議要用不同的憑證時才在這裡指定 PEM 檔的完整路徑。",
+          "pro": true,
           "fields": [
             { "key": "listen.doh.cert", "type": "path", "label": "DoH 憑證檔（含中繼憑證）", "placeholder": "C:\\ProgramData\\kuroshio\\cert.pem" },
             { "key": "listen.doh.key", "type": "path", "label": "DoH 私鑰檔", "placeholder": "C:\\ProgramData\\kuroshio\\key.pem" },
@@ -72,6 +88,41 @@
             { "key": "listen.proxyProtocol", "type": "bool", "label": "PROXY protocol v2", "help": "前面有支援 PROXY protocol 的負載平衡器時才打開，用來取得真實的用戶端 IP。", "pro": true },
             { "key": "admin.port", "type": "port", "label": "設定頁埠號", "help": "這個設定頁與管理 API 的埠號，只綁 127.0.0.1。改了之後要用新的網址開啟設定頁。", "pro": true }
           ]
+        }
+      ]
+    },
+    {
+      "id": "domain",
+      "title": "網域與憑證",
+      "desc": "對外用的網域、憑證從哪裡來，以及各種檔案放在哪裡（其他服務要共用憑證時看這裡）。只在這台電腦或區網使用一般 DNS 的話可以全部留空。",
+      "sections": [
+        {
+          "title": "綁定網域",
+          "fields": [
+            { "key": "domain", "type": "host", "label": "綁定網域", "help": "固定網域或 DDNS 名稱，例如 dns.example.com。公開頁、社群、憑證、DDNS 記錄沒有另外填時都用它。", "placeholder": "dns.example.com", "validate": "domain" },
+            { "key": "ddns.enabled", "type": "choice", "label": "網域的 IP 由誰更新", "help": "固定網域：IP 不會變，或已經由路由器、其他 DDNS 服務在更新，黑潮 DNS 不會動 DNS 記錄。選擇自動更新時，到「DDNS」分類填 Cloudflare API Token 與出口設定。", "options": [
+              { "value": false, "label": "固定網域，不需要更新" },
+              { "value": true, "label": "由黑潮 DNS 自動更新（DDNS，Cloudflare）" }
+            ] }
+          ]
+        },
+        {
+          "title": "憑證",
+          "desc": "DoH、DoH3、DoT、DoQ 共用同一份憑證（PEM 格式）。",
+          "widget": "cert",
+          "fields": [
+            { "key": "acme.enabled", "type": "choice", "label": "憑證來源", "help": "自己的憑證檔：黑潮 DNS 只讀取，不會申請、也不會覆蓋；檔案更新後會自動換上。自動申請：到「憑證」分類填聯絡信箱與 Cloudflare API Token。", "options": [
+              { "value": false, "label": "使用我自己的憑證檔" },
+              { "value": true, "label": "自動申請（Let’s Encrypt）" }
+            ] },
+            { "key": "tls.cert", "type": "path", "label": "憑證檔（含中繼憑證）", "help": "PEM 檔的完整路徑，例如其他服務已經在維護的 fullchain.pem。", "placeholder": "C:\\certs\\dns.example.com\\fullchain.pem", "pairWith": "tls.key" },
+            { "key": "tls.key", "type": "path", "label": "私鑰檔", "help": "PEM 檔的完整路徑。", "placeholder": "C:\\certs\\dns.example.com\\privkey.pem", "pairWith": "tls.cert" }
+          ]
+        },
+        {
+          "title": "存放位置",
+          "desc": "各種檔案實際放在哪裡（已儲存並套用的設定）。其他服務要共用憑證時，直接讀取下面的憑證檔與私鑰檔即可。這裡只顯示路徑，不會顯示密鑰內容。",
+          "widget": "paths"
         }
       ]
     },
@@ -264,24 +315,36 @@
         {
           "title": "DDNS（Cloudflare）",
           "fields": [
-            { "key": "ddns.enabled", "type": "bool", "label": "啟用" },
+            { "key": "ddns.enabled", "type": "bool", "label": "啟用", "help": "關閉 = 固定網域，不更新 DNS 記錄。" },
             { "key": "ddns.apiToken", "type": "password", "label": "Cloudflare API Token", "help": "DDNS 與憑證申請共用。" },
-            { "key": "ddns.records", "type": "list", "label": "要更新的記錄", "help": "完整網域名稱，一行一個。記錄不存在會自動建立。", "placeholder": "home.example.com" },
-            { "key": "ddns.ipv4", "type": "bool", "label": "更新 IPv4（A）" },
-            { "key": "ddns.ipv6", "type": "bool", "label": "更新 IPv6（AAAA）" },
-            { "key": "ddns.ipSource", "type": "select", "label": "IP 來源", "options": [
-              { "value": "web", "label": "問 Cloudflare（推薦，在其他路由器後面也正確）" },
-              { "value": "interface", "label": "讀取網路介面" }
-            ] },
-            { "key": "ddns.iface4", "type": "text", "label": "IPv4 介面", "help": "網路介面名稱，例如「乙太網路」。", "dependsOn": { "key": "ddns.ipSource", "values": ["interface"] } },
-            { "key": "ddns.iface6", "type": "text", "label": "IPv6 介面", "help": "空白 = 同 IPv4 介面", "dependsOn": { "key": "ddns.ipSource", "values": ["interface"] } },
+            { "key": "ddns.records", "type": "list", "label": "要更新的記錄", "help": "完整網域名稱，一行一個。空白 = 用「網域與憑證」的綁定網域。記錄不存在會自動建立。", "placeholder": "home.example.com", "validate": "record" },
             { "key": "ddns.intervalMin", "type": "int", "label": "檢查間隔（分鐘）", "min": 1, "max": 1440 },
             { "key": "ddns.proxied", "type": "bool", "label": "經過 Cloudflare 代理（橘色雲朵）", "help": "DoT 不能經過代理，給 DoH / DoT 用的記錄請保持關閉。", "pro": true },
             { "key": "ddns.ttl", "type": "int", "label": "TTL（秒）", "help": "1 = 自動", "pro": true, "min": 1 },
-            { "key": "ddns.zone", "type": "host", "label": "Zone", "help": "空白 = 從記錄名稱自動判斷", "pro": true, "placeholder": "example.com" },
+            { "key": "ddns.zone", "type": "host", "label": "Zone", "help": "空白 = 從記錄名稱自動判斷", "pro": true, "placeholder": "example.com", "validate": "domain" },
             { "key": "ddns.forceHours", "type": "int", "label": "強制確認間隔（小時）", "help": "IP 沒變時多久重新向 Cloudflare 確認一次記錄。", "pro": true, "min": 0 },
             { "key": "ddns.httpsRecord", "type": "bool", "label": "發布 HTTPS 記錄（DoH3）", "help": "DoH3 開啟時自動在網域發布 HTTPS 記錄（alpn=\"h3,h2\"），瀏覽器第一次連線就直接用 HTTP/3。", "pro": true, "fallbackDefault": true }
           ]
+        },
+        {
+          "title": "出口與 IP",
+          "desc": "這台電腦有好幾張網卡、好幾條對外線路時，選擇要發布哪幾個出口的 IP。同一個名稱可以同時發布多個 IP。",
+          "fields": [
+            { "key": "ddns.ipSource", "type": "select", "label": "IP 來源", "help": "上網查：從每個出口各自連出去問公網 IP（在路由器後面也正確）。讀網卡：直接用網卡上的公網位址（網卡要直接拿到公網 IP）。", "options": [
+              { "value": "web", "label": "上網查公網 IP（推薦）" },
+              { "value": "interface", "label": "讀網卡上的位址" }
+            ] },
+            { "key": "ddns.interfaces", "type": "ifaces", "label": "要發布的出口（網卡）", "help": "都不勾 = 自動（系統預設路由走的那一個出口）。勾好幾個 = 每個出口各發布一筆記錄。" },
+            { "key": "ddns.ipv4", "type": "bool", "label": "發布 IPv4（A）" },
+            { "key": "ddns.ipv6", "type": "bool", "label": "發布 IPv6（AAAA）", "help": "預設關閉：不少線路（例如中華電信）會擋外面連進來的 IPv6，發布了別人反而連不上。確定外面連得進來再打開；關閉時會移除自己建立的 AAAA 記錄。" },
+            { "key": "ddns.iface4", "type": "text", "label": "IPv4 介面（舊欄位）", "help": "舊版設定。上面有勾選出口時不使用。", "pro": true, "dependsOn": { "key": "ddns.ipSource", "values": ["interface"] } },
+            { "key": "ddns.iface6", "type": "text", "label": "IPv6 介面（舊欄位）", "help": "舊版設定。空白 = 同 IPv4 介面。", "pro": true, "dependsOn": { "key": "ddns.ipSource", "values": ["interface"] } }
+          ]
+        },
+        {
+          "title": "目前發布的結果",
+          "desc": "上一次檢查時每個出口偵測到的 IP，以及每筆 DNS 記錄的處理結果。",
+          "widget": "ddns"
         }
       ]
     },
@@ -294,7 +357,7 @@
           "title": "憑證（Let’s Encrypt）",
           "fields": [
             { "key": "acme.enabled", "type": "bool", "label": "自動申請憑證" },
-            { "key": "acme.domains", "type": "list", "label": "網域", "help": "一行一個。空白 = 用公開頁的網域，再不然用 DDNS 的第一筆記錄。", "placeholder": "dns.example.com" },
+            { "key": "acme.domains", "type": "list", "label": "網域", "help": "一行一個。空白 = 用「網域與憑證」的綁定網域，再不然用公開頁的網域或 DDNS 的第一筆記錄。", "placeholder": "dns.example.com", "validate": "record" },
             { "key": "acme.email", "type": "text", "label": "聯絡信箱", "help": "憑證到期通知用，可留空。", "placeholder": "admin@example.com" },
             { "key": "acme.apiToken", "type": "password", "label": "Cloudflare API Token", "help": "空白 = 跟 DDNS 共用同一個 Token。" },
             { "key": "acme.server", "type": "select", "label": "憑證機構", "pro": true, "options": [
@@ -304,7 +367,7 @@
             { "key": "acme.renewDays", "type": "int", "label": "到期前幾天續期", "pro": true, "min": 1 },
             { "key": "acme.zone", "type": "host", "label": "Zone", "help": "空白 = 跟 DDNS 相同，或從網域自動判斷", "pro": true, "placeholder": "example.com" },
             { "key": "acme.propagationSec", "type": "int", "label": "加 TXT 記錄後等幾秒再驗證", "pro": true, "min": 0, "fallbackDefault": 15 },
-            { "key": "acme.certFile", "type": "path", "label": "憑證存放位置", "help": "空白 = 用上面「服務與監聽」的 DoT / DoH 憑證檔，再不然是設定資料夾的 cert.pem。", "pro": true },
+            { "key": "acme.certFile", "type": "path", "label": "憑證存放位置", "help": "空白 = 用「網域與憑證」填的憑證檔位置，再不然是設定資料夾的 cert.pem。實際位置看「網域與憑證 → 存放位置」。", "pro": true },
             { "key": "acme.keyFile", "type": "path", "label": "私鑰存放位置", "pro": true }
           ]
         }
