@@ -545,6 +545,57 @@ impl Db {
         .unwrap_or_default()
     }
 
+    /// 分段寫 `cdn-domains.json` 的第一步（拿著鎖）：整理、定出「開頭」與「結尾」，列出要寫的網域。
+    /// 回傳（開頭，結尾，（查詢次數，名稱）——還沒排序）。接著放開鎖排序，再分批呼叫 `dump_chunk`。
+    /// 內容跟 `domains_json()` 一樣，只是不必整個過程都拿著鎖（20 萬筆要半秒，期間所有 CDN 回應都卡住）
+    pub fn dump_begin(&mut self) -> (Vec<u8>, Vec<u8>, Vec<(u32, Arc<str>)>) {
+        if self.domains.len() > self.max_entries {
+            self.prune();
+        }
+        self.saved_at = Some(util::iso(now_ms()));
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Out<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            saved_at: &'a Option<String>,
+            domains: [u8; 0],
+            #[serde(flatten)]
+            extra: &'a Extra,
+        }
+        // 外框跟 `domains_json()` 用同一種寫法產生，再從空陣列的地方切開
+        let frame = serde_json::to_vec(&Out {
+            saved_at: &self.saved_at,
+            domains: [],
+            extra: &self.extra,
+        })
+        .unwrap_or_default();
+        const MARK: &[u8] = b"\"domains\":[";
+        let at = frame
+            .windows(MARK.len())
+            .position(|w| w == MARK)
+            .map(|i| i + MARK.len())
+            .unwrap_or(0);
+        let keys = self.domains.values().map(|d| (d.hits, d.name.clone())).collect();
+        (frame[..at].to_vec(), frame[at..].to_vec(), keys)
+    }
+
+    /// 排序方式同 `domains_json()`：查詢次數多到少，同次數依名稱
+    pub fn dump_sort(keys: &mut [(u32, Arc<str>)]) {
+        keys.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
+
+    /// 把這一批網域接到 `out` 後面（期間被刪掉的略過）
+    pub fn dump_chunk(&self, keys: &[(u32, Arc<str>)], out: &mut Vec<u8>, first: &mut bool) {
+        for (_, name) in keys {
+            let Some(d) = self.domains.get(name) else { continue };
+            if !*first {
+                out.push(b',');
+            }
+            *first = false;
+            let _ = serde_json::to_writer(&mut *out, d);
+        }
+    }
+
     pub fn harvest_json(&self) -> Vec<u8> {
         // 保持加入順序（淘汰依這個順序），不能經過會排序的 serde_json::Map
         #[derive(Serialize)]
@@ -574,11 +625,17 @@ impl Db {
 
     /// 刪掉最久沒出現的，降到上限的 90%（手動設定策略的保留）
     pub fn prune(&mut self) {
-        self.shrink_to((self.max_entries as f64 * 0.9) as usize);
+        self.drop_oldest((self.max_entries as f64 * 0.9) as usize);
     }
 
     /// 刪到剩 `keep` 筆（記憶體不足時也用這個）
     pub fn shrink_to(&mut self, keep: usize) {
+        self.drop_oldest(keep);
+        // 把空出來的記憶體還回去（要重排整個表：只有記憶體不足時才做，平常的整理不做——反正馬上又會長回來）
+        self.domains.shrink_to_fit();
+    }
+
+    fn drop_oldest(&mut self, keep: usize) {
         if self.domains.len() <= keep {
             return;
         }
@@ -588,12 +645,14 @@ impl Db {
             .filter(|d| d.policy() == Policy::Auto)
             .map(|d| (d.last_seen, d.name.clone()))
             .collect();
-        arr.sort();
-        let drop = self.domains.len() - keep;
+        let drop = (self.domains.len() - keep).min(arr.len());
+        // 只需要「最舊的 drop 筆」，不必整個排序
+        if drop > 0 && drop < arr.len() {
+            arr.select_nth_unstable(drop - 1);
+        }
         for (_, n) in arr.into_iter().take(drop) {
             self.domains.remove(&n);
         }
-        self.domains.shrink_to_fit();
         self.dirty = true;
     }
 

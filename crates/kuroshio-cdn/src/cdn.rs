@@ -199,6 +199,12 @@ thread_local! {
 
 type LowPoolFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 拿狀態鎖之前先空轉試幾次（一次幾奈秒；單核心的機器上最多白等幾微秒）
+const SPIN_TRIES: u32 = 200;
+
+/// 寫網域資料庫的快照時，每拿一次鎖寫幾筆（一筆約 0.5 KB、幾微秒）
+const DUMP_CHUNK: usize = 256;
+
 /// 狀態檔（相對於狀態目錄）
 pub const STATE_FILES: [&str; 5] = [pools::FILE, v6store::FILE, db::FILE, db::HARVEST_FILE, pools::ZONE_FILE];
 
@@ -353,8 +359,18 @@ impl Cdn {
 
     /// 取得狀態（不要拿著鎖做網路操作）
     pub fn state(&self) -> StateGuard<'_> {
+        // 鎖通常只被拿幾微秒：先空轉試幾次再排隊睡覺。多核心同時查 CDN 網域時，
+        // 每次都睡覺、叫醒（各幾十微秒）比等鎖本身還久
+        let mut g = None;
+        for _ in 0..SPIN_TRIES {
+            if let Ok(x) = self.state.try_lock() {
+                g = Some(x);
+                break;
+            }
+            std::hint::spin_loop();
+        }
         StateGuard {
-            g: self.state.lock().unwrap(),
+            g: g.unwrap_or_else(|| self.state.lock().unwrap()),
             cdn: self,
             mutated: false,
         }
@@ -415,34 +431,56 @@ impl Cdn {
     // ------------------------------------------------------------ 快照
 
     fn collect(&self, all: bool) -> Vec<(String, Vec<u8>)> {
-        let mut st = self.state();
-        let st = &mut *st;
         let mut out = Vec::new();
-        if all || st.pools.dirty {
-            st.pools.dirty = false;
-            out.push((pools::FILE.to_string(), st.pools.to_json()));
+        // 網域資料庫（可能有 20 萬筆、上百 MB）分批寫：每批只拿一下鎖，查詢不會被整個擋住
+        let mut dump = None;
+        {
+            let mut st = self.state();
+            let st = &mut *st;
+            if all || st.pools.dirty {
+                st.pools.dirty = false;
+                out.push((pools::FILE.to_string(), st.pools.to_json()));
+            }
+            if all || st.v6.dirty {
+                st.v6.dirty = false;
+                out.push((v6store::FILE.to_string(), st.v6.to_json()));
+            }
+            if all {
+                // 關機：一次寫完（已經沒有查詢了，內容也要是同一個時間點的）
+                st.db.dirty = false;
+                out.push((db::FILE.to_string(), st.db.domains_json()));
+            } else if st.db.dirty {
+                st.db.dirty = false;
+                dump = Some((out.len(), st.db.dump_begin()));
+            }
+            if all || st.db.harvest_dirty {
+                st.db.harvest_dirty = false;
+                out.push((db::HARVEST_FILE.to_string(), st.db.harvest_json()));
+            }
+            if all || st.pools.zone_dirty {
+                st.pools.zone_dirty = false;
+                out.push((pools::ZONE_FILE.to_string(), st.pools.zone_json()));
+            }
         }
-        if all || st.v6.dirty {
-            st.v6.dirty = false;
-            out.push((v6store::FILE.to_string(), st.v6.to_json()));
-        }
-        if all || st.db.dirty {
-            st.db.dirty = false;
-            out.push((db::FILE.to_string(), st.db.domains_json()));
-        }
-        if all || st.db.harvest_dirty {
-            st.db.harvest_dirty = false;
-            out.push((db::HARVEST_FILE.to_string(), st.db.harvest_json()));
-        }
-        if all || st.pools.zone_dirty {
-            st.pools.zone_dirty = false;
-            out.push((pools::ZONE_FILE.to_string(), st.pools.zone_json()));
+        if let Some((at, (mut buf, tail, mut keys))) = dump {
+            Db::dump_sort(&mut keys); // 不拿鎖
+            let mut first = true;
+            for chunk in keys.chunks(DUMP_CHUNK) {
+                self.state().db.dump_chunk(chunk, &mut buf, &mut first);
+                // 鎖已經放開：停一下讓等著的查詢先拿到鎖。只 yield 不夠——等的人被叫醒要幾十微秒，
+                // 這邊馬上又把鎖拿走，查詢會一路等到整份寫完（實測 20 萬筆還是被擋 400 ms）
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            buf.extend_from_slice(&tail);
+            out.insert(at, (db::FILE.to_string(), buf)); // 順序跟一次寫完時一樣
         }
         out
     }
 
     /// 上次取出之後有變動的狀態檔：（相對於狀態目錄的路徑，內容）。
-    /// 內容是 2.x 相容的 JSON（不縮排）。網域資料庫可能很大，序列化時會拿著鎖，不要太常呼叫（幾分鐘一次就好）。
+    /// 內容是 2.x 相容的 JSON（不縮排）。網域資料庫可能很大（20 萬筆約 110 MB、要半秒）：分批序列化，
+    /// 每批只拿一下鎖，查詢不會被擋住；但還是要花那麼多 CPU 與記憶體，不要太常呼叫（幾分鐘一次就好）。
+    /// 分批期間有變動的網域，內容以寫到它的那一刻為準，下次呼叫會再寫一次。
     pub fn snapshots(&self) -> Vec<(String, Vec<u8>)> {
         self.collect(false)
     }

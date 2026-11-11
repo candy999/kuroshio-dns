@@ -206,3 +206,49 @@ fn load_with_custom_reader() {
     assert_eq!(got, want);
     assert!(c.state().pools.zone_hit("fastly", ip("151.101.1.1")));
 }
+
+#[test]
+fn chunked_domains_snapshot_matches_single_pass() {
+    // snapshots() 分批寫的網域資料庫，內容要跟一次寫完（snapshots_all()，關機時用）完全一樣
+    let d = tmpdir("chunked");
+    let paths = Paths::new(d.join("state"), repo().join("data"));
+    let c = Cdn::load(&full_cfg(), paths, MockNet::new());
+    c.with_state(|st| {
+        assert!(st.db.domains.len() > 1000, "種子要夠多筆才會分好幾批");
+        st.db.dirty = true;
+        st.db.harvest_dirty = true;
+        st.pools.dirty = true;
+        st.pools.zone_dirty = true;
+        st.v6.dirty = true;
+    });
+    let part = c.snapshots();
+    let order: Vec<&str> = part.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(order, crate::cdn::STATE_FILES, "檔案順序不變");
+    let part: HashMap<String, Vec<u8>> = part.into_iter().collect();
+    let all: HashMap<String, Vec<u8>> = c.snapshots_all().into_iter().collect();
+    let strip = |b: &[u8]| -> String {
+        // savedAt 是寫入時間，兩次不會一樣：拿掉再逐字比對
+        let s = String::from_utf8(b.to_vec()).unwrap();
+        let i = s.find("\"domains\":[").unwrap();
+        assert!(s.starts_with("{\"savedAt\":\""));
+        s[i..].to_string()
+    };
+    assert_eq!(strip(&part["cdn-domains.json"]), strip(&all["cdn-domains.json"]));
+    // 不認識的最上層欄位也要原樣留著（外框跟一次寫完時相同）
+    c.with_state(|st| {
+        st.db
+            .load_domains(
+                br#"{"savedAt":"x","domains":[{"name":"a.test","hits":2},{"name":"b.test","hits":5}],"future":{"k":[1,2]}}"#,
+                false,
+            )
+            .unwrap();
+        st.db.dirty = true;
+    });
+    let part: HashMap<String, Vec<u8>> = c.snapshots().into_iter().collect();
+    let v: Value = serde_json::from_slice(&part["cdn-domains.json"]).unwrap();
+    assert_eq!(v["future"], json!({"k": [1, 2]}));
+    assert_eq!(v["domains"][0]["name"], "b.test");
+    assert_eq!(v["domains"].as_array().unwrap().len(), 2);
+    let all: HashMap<String, Vec<u8>> = c.snapshots_all().into_iter().collect();
+    assert_eq!(strip(&part["cdn-domains.json"]), strip(&all["cdn-domains.json"]));
+}
