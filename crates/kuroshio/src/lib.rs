@@ -13,6 +13,7 @@ pub mod community_bridge;
 pub mod compare;
 pub mod console;
 pub mod ddns;
+pub mod dnr;
 pub mod encrypted;
 pub mod filtering;
 pub mod logring;

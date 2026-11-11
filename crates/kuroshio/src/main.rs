@@ -145,6 +145,16 @@ enum Cmd {
         #[arg(long)]
         open: bool,
     },
+    /// DNR（RFC 9463）要發給區網裝置的內容（JSON）；OpenWrt 的接管腳本用它寫進 DHCP / RA 設定
+    Dnr {
+        /// 路由器的區網位址（逗號分隔，例如 192.168.1.1,fd00::1）
+        #[arg(long, value_delimiter = ',')]
+        lan: Vec<std::net::IpAddr>,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
     /// 輸出完整預設設定
     Defaults {
         /// JSON 格式（目前只有這一種）
@@ -661,6 +671,11 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             } else {
                 r?;
             }
+        }
+        Cmd::Dnr { lan, config, uci } => {
+            let (cfg, ..) = effective(&config, uci)?;
+            let base = kuroshio::app::persist_dir(&cfg).parent().map(PathBuf::from).unwrap_or_default();
+            println!("{}", kuroshio::dnr::plan(&cfg, &lan, &base).json());
         }
         Cmd::Url { config, uci, open } => {
             let (cfg, ..) = effective(&config, uci)?;

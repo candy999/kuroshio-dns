@@ -56,6 +56,7 @@ reset_dnsmasq() {
 		server) uci -q del_list "$DNSMASQ.server=$v" ;;
 		dhcp_option) uci -q del_list "dhcp.lan.dhcp_option=$v" ;;
 		dhcp_dns) uci -q del_list "dhcp.lan.dns=$v" ;;
+		dnr) uci -q del_list "dhcp.lan.dnr=$v" ;;
 		esac
 	done < "$APPLIED"
 	rm -f "$APPLIED"
@@ -226,8 +227,31 @@ apply() {
 		fi
 	fi
 
+	apply_dnr "$ip" "$ula"
+
 	commit_if_changed dhcp restart_dhcp
 	commit_if_changed firewall reload_fw
+}
+
+# DNR（RFC 9463）：用 DHCP / RA 告訴區網裝置「這裡有加密 DNS」，裝置會自動改用 DoH / DoT / DoQ。
+# 要有網域、涵蓋網域的有效憑證、而且加密監聽聽得到區網位址才會發（kuroshio dnr 判斷）；寧可不發，也不發連不上的。
+#   IPv4：dnsmasq 的 DHCP 選項 162（原始位元組）
+#   IPv6：odhcpd 的 list dnr（RA 與 DHCPv6；OpenWrt 25.12 起支援，舊版會忽略這個設定）
+apply_dnr() { # apply_dnr <區網 IPv4> <區網 ULA>
+	local lan out hex line
+	bool "$(get main.dnr || echo 1)" || return 0
+	lan=$(echo "$1,$2" | sed 's/^,//; s/,$//')
+	[ -n "$lan" ] || return 0
+	out=$(/usr/bin/kuroshio dnr --uci --lan "$lan" 2>/dev/null) || return 0
+	if [ "$(echo "$out" | jsonfilter -e '@.ok')" != true ]; then
+		logger -t kuroshio "DNR 沒有發：$(echo "$out" | jsonfilter -e '@.reason')"
+		return 0
+	fi
+	hex=$(echo "$out" | jsonfilter -e '@.dhcpv4')
+	[ -n "$hex" ] && add_list_once dhcp.lan.dhcp_option "162,$hex" dhcp_option
+	echo "$out" | jsonfilter -e '@.odhcpd[*]' | while IFS= read -r line; do
+		[ -n "$line" ] && add_list_once dhcp.lan.dnr "$line" dnr
+	done
 }
 
 revert() {

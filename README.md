@@ -35,9 +35,14 @@
 | DoH（HTTP/1.1、HTTP/2） | ✓ | ✓ |
 | **DoH3**（HTTP/3） | ✓ | ✓ |
 | **DoQ**（DNS over QUIC） | ✓ | ✓ |
-| DNSCrypt / `sdns://` | — | ✓ |
 
-另外支援 **DDR**（裝置自動升級到加密連線）、EDNS Padding、DNS Cookies、DNSSEC 驗證（選用）。
+另外支援：
+- **DDR**（RFC 9462）：裝置來問「這台有沒有加密 DNS」時，告訴它 DoH / DoT / DoQ 的位址，自動升級成加密連線
+- **DNR**（RFC 9463，OpenWrt）：路由器直接用 DHCP / RA 通告加密 DNS，裝置不用手動設定。
+  需要網域、涵蓋網域的有效憑證、加密監聽聽得到區網位址才會發（寧可不發，也不發連不上的）
+- EDNS Padding、EDE（說明為什麼被攔截）；DNSSEC 的 DO 位元照實轉送給上游（不在本機驗證：改寫成台灣節點的答案本來就無法帶簽章）
+
+DNSCrypt 不支援：採用的伺服器少，而且都同時提供 DoH / DoT。
 
 ### 好友互助（社群共享）
 - 跟朋友的路由器互加好友，交換台灣節點、網站驗證結果、好用的上游。
@@ -88,8 +93,8 @@
 | 過濾引擎（緊湊結構、自訂規則優先、存檔 3 秒生效、與 2.x 對照 5,548 筆一致） | ✅ 可用 |
 | CDN 台灣節點（驗證、ECS、跨 CDN、IPv6 永久節點、尖峰時段加權）、每日評測、每週範圍 / 網段工作 | ✅ 可用（與 2.x 對照一致） |
 | DoT / DoH / DoQ / DoH3 伺服器與上游 | ✅ 可用 |
-| DDR 自動發現、EDNS Padding、EDE | ✅ 可用 |
-| DNSCrypt 上游 | ⬜ |
+| DDR 自動發現、DNR 通告（OpenWrt）、EDNS Padding、EDE | ✅ 可用 |
+| DNSCrypt | — 不做（伺服器都同時提供 DoH / DoT） |
 | 社群共享 v2（簽章、三種管道、資料品質分數、2.x 好友遷移） | ✅ 可用（實機兩節點待測） |
 | Cloudflare DDNS（含 HTTPS 記錄）、內建 ACME（Windows）/ acme.sh（OpenWrt） | ✅ 可用 |
 | OpenWrt 正式套件與 LuCI（沿用 2.x 介面） | ✅ 可用 |

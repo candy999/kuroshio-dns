@@ -45,6 +45,8 @@ issue() {
 	"$ACME" --home "$HOME_DIR" --config-home "$HOME_DIR" --install-cert -d "$domain" $ecc \
 		--fullchain-file "$CERT" --key-file "$KEY" --reloadcmd "chmod 600 $KEY" || return 1
 	echo "完成：$CERT"
+	# 有了有效憑證：重新判斷要不要用 DNR 通告加密 DNS
+	/usr/libexec/kuroshio/takeover.sh apply >/dev/null 2>&1
 }
 
 issue_bg() {

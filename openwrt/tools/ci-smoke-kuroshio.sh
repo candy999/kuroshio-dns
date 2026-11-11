@@ -163,6 +163,8 @@ uci set kuroshio.dot.enabled='1'
 uci set kuroshio.doq.enabled='1'
 uci set kuroshio.filter.enabled='0'
 uci set kuroshio.system.profile='small'
+# 測試憑證的網域是 localhost：DNR 需要網域與涵蓋它的有效憑證
+uci set kuroshio.tls.domain='localhost'
 uci commit kuroshio
 mkdir -p /var/run/kuroshio
 ubus call uci get '{"config":"kuroshio"}' > /var/run/kuroshio/uci.json
@@ -186,6 +188,13 @@ ubus call kuroshio api '{"path":"/api/trace","query":"name=example.com&type=A"}'
 ubus call kuroshio api '{"path":"/api/sysinfo"}' | grep -q '"tier": "small"' && ok "硬體等級（UCI 指定）" || bad "硬體等級（UCI 指定）"
 ubus call kuroshio defaults | grep -q '"resolver"' && ok "kuroshio.defaults（不用 node）" || bad "kuroshio.defaults（不用 node）"
 ubus call kuroshio acme_status | grep -q '"daysLeft"' && ok "憑證狀態（不用 node）" || bad "憑證狀態（不用 node）"
+# DNR（RFC 9463）：網域 + 有效憑證 + 加密監聽 → 用 DHCP 選項 162 通告
+DNR=$(/usr/bin/kuroshio dnr --uci --lan 192.168.1.1)
+[ "$(echo "$DNR" | jsonfilter -e '@.ok')" = true ] && ok "DNR：有網域與有效憑證時會發" || bad "DNR：沒有發（$DNR）"
+$T apply
+uci -q get dhcp.lan.dhcp_option | tr ' ' '\n' | grep -q '^162,' && ok "DNR：接管時寫入 DHCP 選項 162" || bad "DNR：沒有寫入 DHCP 選項 162"
+$T revert
+uci -q get dhcp.lan.dhcp_option | tr ' ' '\n' | grep -q '^162,' && bad "DNR：還原後應該移除選項 162" || ok "DNR：還原時移除選項 162"
 # 備份與分享：匯出分享檔，再當成上傳的檔案匯入（服務在程式內重新啟動後合併）
 ubus call kuroshio backup_export '{"kind":"share"}' | grep -q '"ok": true' && [ -s /tmp/kuroshio-backup.kuroshio ] && ok "備份：匯出分享檔" || bad "備份：匯出分享檔"
 cp /tmp/kuroshio-backup.kuroshio /tmp/kuroshio-import.kuroshio 2>/dev/null
