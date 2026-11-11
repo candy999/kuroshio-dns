@@ -11,6 +11,13 @@
 //! 服務執行中時，記憶體裡的狀態在關機時會寫回檔案、蓋掉合併結果，所以管理 API 只把檔案放到
 //! `import-pending.kuroshio`，再讓服務在程式內重新啟動：舊的一輪先把記憶體寫出，新的一輪在
 //! 讀取任何狀態之前（`app::start` 最前面）合併，結果存在 `import-last.json`。
+//!
+//! 分享檔是別人給的，內容不能直接相信（規格 07 的社群提示也是同一個原則）：
+//! - 網域：只留「名稱、業者、哪個家族曾經驗證通過」，驗證結果本身（IP、期限、跨 CDN、ECS）全部丟掉，
+//!   寫成「已過期的通過」→ 本機每小時的複驗 / 第一次查詢時自己重新驗證，通過才會改寫答案。本機已有的網域不動。
+//! - 節點池、永久 IPv6 節點：只有落在該業者官方範圍內的 IP 會放進候選名單（`cdn/harvest.json`），
+//!   由每日節點池工作在本機量測後才進節點池；不會直接寫進 `cdn/pools.json` / `cdn/v6-nodes.json`。
+//! - 上游評測結果、黑名單：不匯入。上游 DNS 能決定所有答案，只能由本機自己評測；別人的黑名單可以把好的上游全部排除。
 
 use crate::persist::write_atomic;
 use anyhow::{anyhow, bail, Context, Result};
@@ -181,6 +188,8 @@ pub struct Locations {
     pub key_dir: PathBuf,
     /// 自訂規則（`filter.customRules` 的第一個）
     pub custom_rules: Option<PathBuf>,
+    /// 程式附帶資料的根目錄（底下的 `cdn/ranges/` 是各家 CDN 的官方範圍；狀態目錄沒有時用）
+    pub data: PathBuf,
 }
 
 fn rel(base: &Path, p: &str) -> PathBuf {
@@ -212,6 +221,7 @@ impl Locations {
                 .and_then(Value::as_str)
                 .filter(|p| !p.is_empty())
                 .map(|p| rel(&base, p)),
+            data: crate::app::share_dir(cfg),
             state,
         }
     }
@@ -223,6 +233,7 @@ impl Locations {
             upstreams: state.join(UPSTREAMS),
             key_dir: state.join("community"),
             custom_rules: Some(state.join(CUSTOM)),
+            data: state.join("data"),
         }
     }
 
@@ -796,10 +807,217 @@ fn merge_custom(local: Option<String>, incoming: &str, now: u64, it: &mut Item) 
     }
 }
 
+// ---------------------------------------------------------------- 分享檔（不信任的來源）
+
+/// 分享檔一次最多帶進幾個新網域（匯出時依查詢次數排序，前面的是常用的）
+const SHARE_MAX_DOMAINS: usize = 5000;
+/// 分享檔每家 CDN、每個家族最多帶進幾個候選節點
+const SHARE_MAX_NODES: usize = 500;
+
+/// 正常的網域名稱（小寫、長度、字元）
+fn host_ok(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 253
+        && n.contains('.')
+        && n.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+        })
+}
+
+/// 分享檔的一個網域 → 候選：只留名稱、業者，以及「哪個家族曾經通過」。
+/// `until: 0` = 已過期，改寫答案前本機一定會重新驗證（`Cdn::vstate` 只認還沒過期的結果）；
+/// 不帶 IP，所以驗證通過前不會回任何分享檔指定的位址。
+fn share_candidate(d: &Value, now: u64) -> Option<Value> {
+    let name = d.get("name")?.as_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if !host_ok(&name) {
+        return None;
+    }
+    let provider = d.get("provider")?.as_str()?;
+    kuroshio_cdn::providers::get(provider)?;
+    let mut o = Map::new();
+    for fam in ["v4", "v6"] {
+        if d.get(fam).and_then(|v| v.get("verdict")).and_then(Value::as_str) == Some("ok") {
+            o.insert(fam.into(), json!({ "verdict": "ok", "until": 0 }));
+        }
+    }
+    if o.is_empty() {
+        // 沒有通過的紀錄：沒有東西可以學，本機第一次查到時自己會驗證
+        return None;
+    }
+    o.insert("name".into(), json!(name));
+    o.insert("provider".into(), json!(provider));
+    o.insert("firstSeen".into(), json!(now));
+    o.insert("lastSeen".into(), json!(now));
+    Some(Value::Object(o))
+}
+
+/// 分享檔的網域：本機已有的一律不動，沒有的加成候選
+fn merge_share_domains(local: Option<Value>, incoming: &Value, now: u64, it: &mut Item) -> Value {
+    let mut base = local
+        .filter(|l| l.get("domains").is_some_and(Value::is_array))
+        .unwrap_or_else(|| json!({ "domains": [] }));
+    let list = base["domains"].as_array_mut().unwrap();
+    let mut have: HashSet<String> = list.iter().filter_map(|d| d.get("name")?.as_str().map(str::to_string)).collect();
+    for d in incoming.get("domains").and_then(Value::as_array).into_iter().flatten() {
+        let Some(c) = share_candidate(d, now) else {
+            it.skipped += 1;
+            continue;
+        };
+        let name = c["name"].as_str().unwrap_or_default().to_string();
+        if have.contains(&name) {
+            it.kept += 1;
+        } else if it.added as usize >= SHARE_MAX_DOMAINS {
+            it.skipped += 1;
+        } else {
+            have.insert(name);
+            list.push(c);
+            it.added += 1;
+        }
+    }
+    if it.added > 0 {
+        it.note = Some("分享檔的驗證結果不直接使用：先記成候選，本機重新驗證通過才會改寫".into());
+    }
+    base
+}
+
+/// 這家 CDN 的官方 IP 範圍（狀態目錄每週更新的優先，沒有就用程式附帶的；再加上內建的）
+fn official_ranges(loc: &Locations, provider: &str) -> Option<kuroshio_cdn::cidr::CidrSet> {
+    let prov = kuroshio_cdn::providers::get(provider).filter(|p| p.alias)?;
+    let paths = kuroshio_cdn::Paths::new(loc.state.clone(), &loc.data);
+    let mut s = kuroshio_cdn::cidr::CidrSet::new();
+    for fam in ["ipv4", "ipv6"] {
+        if let Some(t) = paths.read_cdn_text(&format!("ranges/{provider}-{fam}.txt")) {
+            s.add_text(&t);
+        }
+    }
+    s.add_many(prov.extra_v4.iter().copied());
+    s.add_many(prov.extra_v6.iter().copied());
+    let s = s.done();
+    (!s.is_empty()).then_some(s)
+}
+
+/// 分享檔的節點（節點池或永久 IPv6）：在官方範圍內的放進候選名單 `cdn/harvest.json`，其他丟掉。
+/// `nodes` 是（業者，IP 字串）；回傳要寫回的 harvest 內容（沒有新增時 None）
+fn merge_share_nodes(loc: &Locations, nodes: Vec<(String, String)>, now: u64, it: &mut Item) -> Option<Value> {
+    let hp = loc.state.join(HARVEST);
+    let mut harvest = read_json(&hp).filter(Value::is_object).unwrap_or_else(|| json!({}));
+    // 本機節點池已經有的不必再當候選
+    let pools = read_json(&loc.state.join(POOLS));
+    let in_pool = |p: &str, fam: &str, ip: &str| {
+        pools
+            .as_ref()
+            .and_then(|v| v.get("providers")?.get(p)?.get(fam)?.as_array())
+            .is_some_and(|a| a.iter().any(|n| n.get("ip").and_then(Value::as_str) == Some(ip)))
+    };
+    let mut ranges: HashMap<String, Option<kuroshio_cdn::cidr::CidrSet>> = HashMap::new();
+    let mut taken: HashMap<(String, &'static str), usize> = HashMap::new();
+    for (p, raw) in nodes {
+        let set = ranges.entry(p.clone()).or_insert_with(|| official_ranges(loc, &p));
+        let ip = raw.parse::<std::net::IpAddr>().ok();
+        let Some(ip) = ip.filter(|ip| set.as_ref().is_some_and(|s| s.contains(*ip))) else {
+            it.skipped += 1;
+            continue;
+        };
+        let fam = if ip.is_ipv6() { "v6" } else { "v4" };
+        let key = ip.to_string();
+        if in_pool(&p, fam, &key) {
+            it.kept += 1;
+            continue;
+        }
+        let n = taken.entry((p.clone(), fam)).or_default();
+        let Some(m) = harvest
+            .as_object_mut()
+            .map(|h| h.entry(p.clone()).or_insert_with(|| json!({})))
+            .and_then(Value::as_object_mut)
+            .map(|h| h.entry(fam).or_insert_with(|| json!({})))
+            .and_then(Value::as_object_mut)
+        else {
+            it.skipped += 1;
+            continue;
+        };
+        if m.contains_key(&key) {
+            it.kept += 1;
+        } else if *n >= SHARE_MAX_NODES || m.len() >= kuroshio_cdn::db::HARVEST_MAX {
+            it.skipped += 1;
+        } else {
+            m.insert(key, json!(now));
+            *n += 1;
+            it.added += 1;
+        }
+    }
+    if it.skipped > 0 || it.added > 0 {
+        it.note = Some("分享檔的節點只當候選（限官方範圍內），每日節點池工作在本機測過才會使用".into());
+    }
+    (it.added > 0).then_some(harvest)
+}
+
+/// 分享檔裡的節點（業者，IP）
+fn share_nodes(key: &str, v: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (p, e) in v.get("providers").and_then(Value::as_object).into_iter().flatten() {
+        if key == POOLS {
+            for fam in ["v4", "v6"] {
+                for n in e.get(fam).and_then(Value::as_array).into_iter().flatten() {
+                    if let Some(ip) = n.get("ip").and_then(Value::as_str) {
+                        out.push((p.clone(), ip.to_string()));
+                    }
+                }
+            }
+        } else if let Some(m) = e.as_object() {
+            out.extend(m.keys().map(|ip| (p.clone(), ip.clone())));
+        }
+    }
+    out
+}
+
+/// 合併分享檔（不信任的來源）
+fn merge_share(loc: &Locations, b: &Bundle, now: u64, items: &mut Vec<Item>) {
+    if let Some(Data::Json(inc)) = b.files.get(DOMAINS) {
+        let mut it = Item::new(DOMAINS);
+        let p = loc.state.join(DOMAINS);
+        let merged = merge_share_domains(read_json(&p), inc, now, &mut it);
+        if it.added > 0 {
+            if let Err(e) = write_json(&p, &merged) {
+                it.error = Some(format!("{e:#}"));
+            }
+        }
+        items.push(it);
+    }
+    for key in [POOLS, V6] {
+        if let Some(Data::Json(inc)) = b.files.get(key) {
+            let mut it = Item::new(key);
+            if let Some(h) = merge_share_nodes(loc, share_nodes(key, inc), now, &mut it) {
+                if let Err(e) = write_json(&loc.state.join(HARVEST), &h) {
+                    it.error = Some(format!("{e:#}"));
+                }
+            }
+            items.push(it);
+        }
+    }
+    for (key, note) in [
+        (UPSTREAMS, "分享檔的上游評測結果不匯入：上游 DNS 由這台機器自己評測"),
+        (BLACKLIST, "分享檔的黑名單不匯入：汙染的 DNS 由這台機器自己評測判定"),
+    ] {
+        if let Some(d) = b.files.get(key) {
+            let mut it = Item::new(key);
+            it.skipped = count(key, d).0.max(1);
+            it.note = Some(note.into());
+            items.push(it);
+        }
+    }
+}
+
 /// 合併到磁碟上的檔案（服務要先停下來，或在啟動最前面呼叫）；回傳結果報告
 pub fn merge(loc: &Locations, b: &Bundle) -> Value {
     let now = now_ms();
     let mut items: Vec<Item> = Vec::new();
+    if b.kind == Kind::Share {
+        merge_share(loc, b, now, &mut items);
+        return merge_report(b, now, &items);
+    }
     let mut put = |it: Item| items.push(it);
     let path = |k: &str| loc.path_of(k).unwrap_or_else(|| loc.state.join(k));
     let write = |it: &mut Item, p: &Path, bytes: &[u8]| {
@@ -934,6 +1152,10 @@ pub fn merge(loc: &Locations, b: &Bundle) -> Value {
             put(it);
         }
     }
+    merge_report(b, now, &items)
+}
+
+fn merge_report(b: &Bundle, now: u64, items: &[Item]) -> Value {
     let ok = items.iter().all(|i| i.error.is_none());
     json!({
         "ok": ok,
@@ -1323,6 +1545,154 @@ mod tests {
         std::fs::remove_dir_all(&dst).unwrap();
     }
 
+    /// 分享檔是別人給的：裡面的驗證結果、節點、上游、黑名單都不能不經本機驗證就生效
+    #[test]
+    fn share_import_is_untrusted() {
+        let dst = tmp("evil");
+        let loc = Locations::in_dir(&dst);
+        // 本機：a 已驗證、節點池一個節點、自己的評測與黑名單、官方範圍
+        let local_a = json!({ "name": "a.example", "provider": "cloudflare", "hits": 9, "lastSeen": 5,
+            "v4": { "verdict": "ok", "ip": "104.16.0.1", "until": 9_999_999_999_999u64, "at": 100 } });
+        wj(&dst.join(DOMAINS), json!({ "domains": [local_a.clone()] }));
+        let local_pools = json!({ "providers": { "cloudflare": { "v4": [{ "ip": "104.16.0.1", "ms": 3 }] } } });
+        wj(&dst.join(POOLS), local_pools.clone());
+        let local_up = json!({ "generatedAt": "2026-01-01T00:00:00.000Z", "selected": ["udp://192.0.2.53"] });
+        wj(&dst.join(UPSTREAMS), local_up.clone());
+        std::fs::write(dst.join(BLACKLIST), "198.51.100.1\n").unwrap();
+        std::fs::create_dir_all(dst.join("cdn/ranges")).unwrap();
+        std::fs::write(dst.join("cdn/ranges/cloudflare-ipv4.txt"), "104.16.0.0/13\n").unwrap();
+        std::fs::write(dst.join("cdn/ranges/cloudflare-ipv6.txt"), "2606:4700::/32\n").unwrap();
+
+        let far = 9_999_999_999_999u64;
+        let evil = json!({ "domains": [
+            // 本機已有：比較「新」也不能蓋掉
+            { "name": "a.example", "provider": "cloudflare", "policy": "always",
+              "v4": { "verdict": "ok", "ip": "203.0.113.66", "until": far, "at": far } },
+            // 新網域：帶了攻擊者的 IP、跨 CDN、ECS、手動策略、best
+            { "name": "Bank.Example.", "provider": "cloudflare", "policy": "always", "best": "cross", "hits": 99999,
+              "ips4": ["203.0.113.66"],
+              "v4": { "verdict": "ok", "ip": "203.0.113.66", "ips": ["203.0.113.67"], "until": far, "at": far },
+              "v6": { "verdict": "fail", "until": far },
+              "cross4": { "verdict": "ok", "to": "akamai", "ips": ["203.0.113.68"], "until": far, "recheckAt": far },
+              "ecs": { "verdict": "ok", "ips4": ["203.0.113.69"], "until": far },
+              "base": { "ip": "203.0.113.70", "ok": true } },
+            // 沒有通過的紀錄、不認識的業者、不像網域的名稱、不是物件 → 丟掉
+            { "name": "nothing.example", "provider": "cloudflare", "v4": { "verdict": "fail", "until": far } },
+            { "name": "x.example", "provider": "evil-cdn", "v4": { "verdict": "ok" } },
+            { "name": "../../etc/passwd", "provider": "cloudflare", "v4": { "verdict": "ok" } },
+            { "name": "localhost", "provider": "cloudflare", "v4": { "verdict": "ok" } },
+            "junk", { "provider": "cloudflare" },
+        ] });
+        let mut files = BTreeMap::new();
+        files.insert(DOMAINS.to_string(), Data::Json(evil));
+        files.insert(
+            POOLS.to_string(),
+            Data::Json(json!({ "providers": {
+                "cloudflare": { "v4": [{ "ip": "203.0.113.66", "ms": 0.1, "pop": "TPE" }, { "ip": "104.16.0.1" },
+                                       { "ip": "104.17.5.5", "ms": 0.1 }, { "ip": "192.168.1.1" }, { "ip": "nope" }, {}],
+                                "v6": [{ "ip": "2001:db8::66" }, { "ip": "2606:4700::6810:1" }],
+                                "prefixes": { "TPE": ["203.0.113.0"] }, "tw48": ["2001:db8::/48"] },
+                "evil-cdn": { "v4": [{ "ip": "104.16.9.9" }] } } })),
+        );
+        files.insert(
+            V6.to_string(),
+            Data::Json(json!({ "providers": { "cloudflare": { "2001:db8::67": { "ms": 1, "pop": "TPE" }, "2606:4700::6810:2": {} } } })),
+        );
+        files.insert(
+            UPSTREAMS.to_string(),
+            Data::Json(json!({ "generatedAt": "2099-01-01T00:00:00.000Z", "selected": ["https://evil.example/dns-query"] })),
+        );
+        files.insert(BLACKLIST.to_string(), Data::Text("192.0.2.53\n1.1.1.1\n8.8.8.8\n".into()));
+        let b = Bundle {
+            kind: Kind::Share,
+            exported_at: 1,
+            core: "x".into(),
+            files,
+        };
+        let b = Bundle::decode(&b.encode()).unwrap();
+        let r = merge(&loc, &b);
+        assert_eq!(r["ok"], true, "{r}");
+
+        // 網域：本機的 a 原封不動；新網域只剩名稱、業者與「已過期的通過」
+        let doms = read_json(&dst.join(DOMAINS)).unwrap();
+        let list = doms["domains"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "{doms}");
+        assert_eq!(list[0], local_a);
+        let bank = list[1].as_object().unwrap();
+        assert_eq!(bank["name"], "bank.example");
+        assert_eq!(bank["v4"], json!({ "verdict": "ok", "until": 0 }));
+        let mut keys: Vec<&str> = bank.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["firstSeen", "lastSeen", "name", "provider", "v4"]);
+        assert!(
+            !serde_json::to_string(&doms).unwrap().contains("203.0.113."),
+            "攻擊者的 IP 不能留下來"
+        );
+        let di = item_of(&r, DOMAINS);
+        assert_eq!(
+            (di["added"].as_u64(), di["kept"].as_u64(), di["skipped"].as_u64()),
+            (Some(1), Some(1), Some(6))
+        );
+
+        // CDN 讀進來之後：這個網域是「還沒驗證」，不是「通過」
+        let mut db = kuroshio_cdn::db::Db::new(1000);
+        db.load_domains(&std::fs::read(dst.join(DOMAINS)).unwrap(), false).unwrap();
+        let e = db.get("bank.example").unwrap();
+        let v = e.verdict(4).unwrap();
+        assert!(v.is("ok") && !v.valid(now_ms()) && v.ip.is_none() && v.ips.is_none());
+        assert!(e.verdict(6).is_none() && e.cross4.is_none() && e.ecs.is_none() && e.best.is_none());
+        assert_eq!(e.policy(), kuroshio_cdn::db::Policy::Auto);
+        assert!(e.ips4.is_empty());
+
+        // 節點：節點池、永久 v6 不動；官方範圍內的才進候選名單
+        assert_eq!(read_json(&dst.join(POOLS)).unwrap(), local_pools);
+        assert!(!dst.join(V6).exists());
+        let h = read_json(&dst.join(HARVEST)).unwrap();
+        assert_eq!(
+            h,
+            json!({ "cloudflare": { "v4": { "104.17.5.5": h["cloudflare"]["v4"]["104.17.5.5"] },
+            "v6": { "2606:4700::6810:1": h["cloudflare"]["v6"]["2606:4700::6810:1"],
+                    "2606:4700::6810:2": h["cloudflare"]["v6"]["2606:4700::6810:2"] } } })
+        );
+        let mut db2 = kuroshio_cdn::db::Db::new(10);
+        db2.load_harvest(&std::fs::read(dst.join(HARVEST)).unwrap()).unwrap();
+        assert_eq!(db2.harvest_of("cloudflare", false).len(), 1);
+        assert_eq!(db2.harvest_of("cloudflare", true).len(), 2);
+        let pi = item_of(&r, POOLS);
+        assert_eq!(
+            (pi["added"].as_u64(), pi["kept"].as_u64(), pi["skipped"].as_u64()),
+            (Some(2), Some(1), Some(5))
+        );
+        let vi = item_of(&r, V6);
+        assert_eq!((vi["added"].as_u64(), vi["skipped"].as_u64()), (Some(1), Some(1)));
+
+        // 上游與黑名單：完全不動
+        assert_eq!(read_json(&dst.join(UPSTREAMS)).unwrap(), local_up);
+        assert_eq!(std::fs::read_to_string(dst.join(BLACKLIST)).unwrap(), "198.51.100.1\n");
+        assert_eq!(item_of(&r, UPSTREAMS)["added"], 0);
+        assert_eq!(item_of(&r, BLACKLIST)["skipped"], 3);
+        assert!(report_text(&r).contains("不匯入"));
+
+        // 沒有官方範圍可以對照的機器：節點一個都不收
+        let dst2 = tmp("evil2");
+        let r2 = merge(&Locations::in_dir(&dst2), &b);
+        assert_eq!(item_of(&r2, POOLS)["added"], 0);
+        assert!(!dst2.join(HARVEST).exists() && !dst2.join(POOLS).exists());
+
+        // 新網域有上限
+        let many: Vec<Value> = (0..SHARE_MAX_DOMAINS + 10)
+            .map(|i| json!({ "name": format!("d{i}.example"), "provider": "cloudflare", "v4": { "verdict": "ok" } }))
+            .collect();
+        let mut b3 = b.clone();
+        b3.files = BTreeMap::from([(DOMAINS.to_string(), Data::Json(json!({ "domains": many })))]);
+        let r3 = merge(&Locations::in_dir(&dst2), &b3);
+        assert_eq!(item_of(&r3, DOMAINS)["added"], SHARE_MAX_DOMAINS as u64);
+        assert_eq!(item_of(&r3, DOMAINS)["skipped"], 10);
+        for d in [dst, dst2] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
     fn item_of(r: &Value, f: &str) -> Value {
         r["items"].as_array().unwrap().iter().find(|i| i["file"] == f).unwrap().clone()
     }
@@ -1352,6 +1722,9 @@ mod tests {
         assert!(doms["domains"][0]["lastSeen"].as_u64().unwrap() > 1_000_000_000_000);
         assert!(doms["domains"][0].get("hits").is_none());
         assert!(!dst3.join(STATS).exists() && !dst3.join("community").exists() && !dst3.join(CUSTOM).exists());
+        // 分享檔的節點池、上游、黑名單不會直接變成本機的
+        assert!(!dst3.join(POOLS).exists() && !dst3.join(V6).exists());
+        assert!(!dst3.join(UPSTREAMS).exists() && !dst3.join(BLACKLIST).exists());
 
         // 等著合併的檔案：合併後刪掉、結果存起來
         let dst4 = tmp("dst4");

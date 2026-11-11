@@ -120,7 +120,7 @@ async fn export_import_through_running_service() {
     assert_eq!(fj["domains"][0]["hits"], 5);
     assert_eq!(http(admin, "GET", "/api/backup/export?kind=nope", &[], b"").await.0, 400);
 
-    // 朋友給的分享檔：a 的驗證比較新、多一個 b、多一筆黑名單
+    // 朋友給的分享檔（不信任）：a 的驗證「比較新」、多一個 b、多一筆黑名單
     let mut friend = share.clone();
     friend.files.insert(
         "cdn-domains.json".into(),
@@ -169,20 +169,24 @@ async fn export_import_through_running_service() {
             item("cdn-domains.json")["added"].as_u64(),
             item("cdn-domains.json")["updated"].as_u64()
         ),
-        (Some(1), Some(1))
+        (Some(1), Some(0))
     );
-    assert_eq!(item("blacklist.txt")["added"], 1);
+    assert_eq!(item("cdn-domains.json")["kept"], 1);
+    assert_eq!(item("blacklist.txt")["added"], 0, "分享檔的黑名單不匯入");
 
     let cdn = again.resolver.cdn().unwrap();
     let a = cdn.domain("a.example").unwrap();
-    assert_eq!(a["v4"]["at"], 999, "比較新的驗證結果：{a}");
+    assert_eq!(a["v4"]["at"], 100, "本機的驗證結果不會被分享檔蓋掉：{a}");
     assert_eq!(a["policy"], "never", "本機在記憶體裡的設定沒有被蓋掉");
     assert_eq!(a["hits"], 5, "本機的次數");
-    assert!(cdn.domain("b.example").is_some(), "新網域");
-    let bl = std::fs::read_to_string(state.join("blacklist.txt")).unwrap();
-    assert!(
-        bl.starts_with("# 本機\n203.0.113.9\n") && bl.contains("198.51.100.7") && bl.matches("203.0.113.9").count() == 1,
-        "{bl}"
+    // 新網域只是候選：沒有分享檔給的 IP、驗證已過期（本機重新驗證通過才會改寫）
+    let b = cdn.domain("b.example").expect("新網域");
+    assert_eq!(b["v4"]["verdict"], "ok");
+    assert!(b["v4"].get("ip").is_none() && b["v4"].get("at").is_none(), "{b}");
+    assert_eq!(b["v4"]["until"], 0, "{b}");
+    assert_eq!(
+        std::fs::read_to_string(state.join("blacklist.txt")).unwrap(),
+        "# 本機\n203.0.113.9\n"
     );
 
     // 服務停著時：直接合併到磁碟
