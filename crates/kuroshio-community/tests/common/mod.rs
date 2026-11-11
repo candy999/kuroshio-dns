@@ -452,9 +452,10 @@ pub async fn sync(n: &Node, d: &str) -> Value {
     panic!("{} 一直在同步 {d}", n.domain);
 }
 
-/// 等到條件成立（最多 5 秒）
+/// 等到條件成立（最多 15 秒，用實際時間算：Windows 的計時器精度約 15 ms，CI 也比較慢）
 pub async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..250 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
         if f() {
             return;
         }
