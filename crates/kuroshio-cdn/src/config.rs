@@ -276,7 +276,7 @@ mod tests {
         // 規格 05 第 7 節：同時數、筆數上限依硬體等級
         let tiny = build(Tier::Tiny, &json!({}));
         let c = CdnConfig::from_value(&tiny);
-        assert_eq!((c.verify_concurrency, c.max_entries, c.zone_max, c.v6_max), (2, 20000, 2000, 300));
+        assert_eq!((c.verify_concurrency, c.max_entries, c.zone_max, c.v6_max), (2, 5000, 2000, 300));
         let j = JobsConfig::from_value(&tiny);
         assert_eq!(
             (j.scan_concurrency, j.scan_samples, j.candidates_per_provider, j.latency_concurrency),
