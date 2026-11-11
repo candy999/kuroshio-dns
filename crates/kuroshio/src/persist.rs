@@ -350,6 +350,11 @@ impl Persister {
         Some(l.data)
     }
 
+    /// 這一份還有沒寫出去的內容（記憶體控制移出 CDN 冷資料之前確認分片已經在磁碟上）
+    pub fn is_pending(&self, name: &str) -> bool {
+        self.entries.get(name).is_some_and(|e| e.pending.is_some())
+    }
+
     /// 登記最新內容（還不寫）；內容跟已寫入的一樣就什麼都不做
     pub fn stage(&mut self, name: &str, data: Vec<u8>) {
         self.stage_with(name, Snapshot::Bytes(data), Opts::default(), now_secs());

@@ -35,6 +35,9 @@ pub struct Entry {
     pub hits: AtomicU32,
 }
 
+/// 記憶體控制縮快取時，查詢次數每多一倍加的分數（0.1 秒為單位：5 分鐘）
+const HOT_BONUS_DS: u64 = 3000;
+
 /// 單調時鐘（0.1 秒為單位，u32 可以撐 13 年）。32 位元 MIPS 沒有 64 位元原子操作，所以用 u32
 fn mono_ds(base: Instant, t: Instant) -> u32 {
     (t.saturating_duration_since(base).as_millis() / 100).min(u32::MAX as u128) as u32
@@ -199,6 +202,31 @@ impl Cache {
         }
     }
 
+    /// 記憶體控制（規格 09）：縮到剩 `target` 筆，留下熱門的。
+    /// 分數 = 上次使用時間 + 每多一倍的查詢次數加 5 分鐘：常用的名稱就算剛好幾分鐘沒人查也留著，
+    /// 只查過一兩次、很久沒用的先刪。回傳（刪掉幾筆，估計釋出的 bytes）
+    pub fn shed_to(&mut self, target: usize) -> (usize, usize) {
+        if self.map.len() <= target {
+            return (0, 0);
+        }
+        let score = |e: &Entry| {
+            let hits = e.hits.load(Ordering::Relaxed);
+            u64::from(e.last_access.load(Ordering::Relaxed)) + HOT_BONUS_DS * u64::from(32 - hits.leading_zeros())
+        };
+        let mut v: Vec<(u64, &String)> = self.map.iter().map(|(k, e)| (score(e), k)).collect();
+        let n = v.len() - target;
+        v.select_nth_unstable_by_key(n - 1, |x| x.0);
+        let drop: Vec<String> = v[..n].iter().map(|x| x.1.clone()).collect();
+        let mut bytes = 0;
+        for k in drop {
+            if let Some(e) = self.map.remove(&k) {
+                bytes += k.len() + 48 + e.approx_bytes();
+            }
+        }
+        self.map.shrink_to_fit();
+        (n, bytes)
+    }
+
     /// 最常被查的 n 個鍵（開機預熱用）；失敗與被擋的不算，也只列一般查詢（預熱只會重問 `類型|名稱`）
     pub fn hot_keys(&self, n: usize) -> Vec<String> {
         let mut v: Vec<(&String, u32)> = self
@@ -269,6 +297,36 @@ mod tests {
         assert_eq!(c.len(), 18);
         c.sweep(t0 + Duration::from_secs(61 + 61), 60);
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn shed_keeps_hot_entries() {
+        // 記憶體控制：縮到 10 筆時，常用的（查很多次）就算比較久沒用也留著；只查過一次的先刪
+        let mut c = Cache::new(1000);
+        let t0 = Instant::now();
+        for i in 0..100 {
+            c.insert(format!("1|n{i}.test"), entry(600, false), t0);
+        }
+        // n0–n4：熱門（各查 64 次），之後就沒人查
+        for i in 0..5 {
+            for _ in 0..64 {
+                c.get(&format!("1|n{i}.test"), t0 + Duration::from_secs(1));
+            }
+        }
+        // n50–n99：比較晚查過一次
+        for i in 50..100 {
+            c.get(&format!("1|n{i}.test"), t0 + Duration::from_secs(120));
+        }
+        let (removed, bytes) = c.shed_to(10);
+        assert_eq!((removed, c.len()), (90, 10));
+        assert!(bytes > 90 * 100, "{bytes}");
+        for i in 0..5 {
+            assert!(c.peek(&format!("1|n{i}.test")).is_some(), "熱門的 n{i} 要留著");
+        }
+        // 其餘 5 筆是最近用過的
+        let recent = (50..100).filter(|i| c.peek(&format!("1|n{i}.test")).is_some()).count();
+        assert_eq!(recent, 5);
+        assert_eq!(c.shed_to(10), (0, 0), "已經在目標以下");
     }
 
     #[test]

@@ -61,6 +61,83 @@ pub fn rss_kb() -> Option<u64> {
     t.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// 自己的常駐記憶體（bytes）。Linux：/proc/self/statm 的第二欄 × 頁大小；Windows：GetProcessMemoryInfo 的 WorkingSetSize
+pub fn rss_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        win::rss()
+    }
+    #[cfg(unix)]
+    {
+        let t = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = t.split_whitespace().nth(1)?.parse().ok()?;
+        // SAFETY: sysconf 只讀系統設定
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        Some(pages * if page > 0 { page as u64 } else { 4096 })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// 系統實體記憶體與可用記憶體（bytes）。Linux：/proc/meminfo；Windows：GlobalMemoryStatusEx
+pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
+    #[cfg(windows)]
+    {
+        win::mem()
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::read_to_string("/proc/meminfo") {
+            Ok(t) => {
+                let field = |name: &str| {
+                    t.lines()
+                        .find(|l| l.starts_with(name))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|kb| kb.parse::<u64>().ok())
+                        .map(|kb| kb * 1024)
+                };
+                (field("MemTotal:"), field("MemAvailable:"))
+            }
+            Err(_) => (None, None),
+        }
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    pub fn rss() -> Option<u64> {
+        // SAFETY: 結構由我們配置、大小正確；GetCurrentProcess 是虛擬代碼，不用關閉
+        unsafe {
+            let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+                Some(c.WorkingSetSize as u64)
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn mem() -> (Option<u64>, Option<u64>) {
+        // SAFETY: 結構由我們配置、dwLength 已設定
+        unsafe {
+            let mut m: MEMORYSTATUSEX = std::mem::zeroed();
+            m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut m) != 0 {
+                (Some(m.ullTotalPhys), Some(m.ullAvailPhys))
+            } else {
+                (None, None)
+            }
+        }
+    }
+}
+
 /// 讀 /proc/meminfo：(MemTotal, MemAvailable)，單位 MB
 pub fn meminfo() -> (Option<u64>, Option<u64>) {
     match std::fs::read_to_string("/proc/meminfo") {

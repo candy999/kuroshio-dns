@@ -18,7 +18,9 @@
     "maxTlsConnections": 2048,
     "maxQuicConnections": 512,
     "queryLogRing": 20000,
-    "memoryWatchdog": true
+    "memoryWatchdog": true,
+    "memoryGovernor": true,
+    "memoryBudgetMB": 0
   },
   "listen": {
     "doh": {

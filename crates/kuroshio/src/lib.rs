@@ -20,6 +20,7 @@ pub mod httpsys;
 pub mod iiscert;
 pub mod ipfilter;
 pub mod logring;
+pub mod memgov;
 pub mod netif;
 pub mod persist;
 pub mod presence;

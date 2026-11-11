@@ -2,11 +2,34 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 const MAX_LINES: usize = 500;
+/// 記憶體吃緊時（規格 09）只留這麼多行
+pub const SHED_LINES: usize = 50;
+/// 目前的上限（記憶體控制可以調低）
+static CAP: AtomicUsize = AtomicUsize::new(MAX_LINES);
 
 static RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+/// 記憶體控制（規格 09）：`shed` = 只留最近 [`SHED_LINES`] 行；false = 恢復 500 行（之後自然長回來）。
+/// 回傳估計釋出的 bytes
+pub fn shed(on: bool) -> usize {
+    let cap = if on { SHED_LINES } else { MAX_LINES };
+    CAP.store(cap, Ordering::Relaxed);
+    let mut r = RING.lock().unwrap();
+    let mut freed = 0;
+    while r.len() > cap {
+        if let Some(l) = r.pop_front() {
+            freed += l.capacity() + std::mem::size_of::<String>();
+        }
+    }
+    if on {
+        r.shrink_to_fit();
+    }
+    freed
+}
 
 /// 最近 n 行（舊到新）
 pub fn lines(n: usize) -> Vec<String> {
@@ -99,7 +122,7 @@ pub fn redact(line: &str) -> String {
 fn push(text: &str) {
     let mut r = RING.lock().unwrap();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        if r.len() >= MAX_LINES {
+        while r.len() >= CAP.load(Ordering::Relaxed).max(1) {
             r.pop_front();
         }
         r.push_back(redact(line));

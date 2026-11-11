@@ -183,6 +183,8 @@ struct Inner {
     sites: HashMap<Box<str>, Anon>,
     blocked_sites: HashMap<Box<str>, Anon>,
     limits: Limits,
+    /// 記憶體控制縮小排行之前的上限（恢復用）
+    saved_top_max: Option<usize>,
 }
 
 impl Default for Inner {
@@ -199,6 +201,7 @@ impl Default for Inner {
             sites: HashMap::new(),
             blocked_sites: HashMap::new(),
             limits: Limits::default(),
+            saved_top_max: None,
         }
     }
 }
@@ -702,6 +705,44 @@ impl Stats {
     /// 調整記憶體上限（小記憶體機器用 [`Limits::tiny`]）
     pub fn set_limits(&self, l: Limits) {
         self.inner.lock().unwrap().limits = l;
+    }
+
+    /// 記憶體控制（規格 09）：`Some(n)` = 熱門網域 / 被擋網域 / 用戶端排行只留前 n 名，之後也最多 n 筆
+    /// （公開頁的匿名網站排行不動）；`None` = 恢復原本的上限（之後自然長回來）。回傳估計釋出的 bytes
+    pub fn shed_tops(&self, keep: Option<usize>) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        let i = &mut *g;
+        match keep {
+            Some(n) => {
+                if i.saved_top_max.is_none() {
+                    i.saved_top_max = Some(i.limits.top_max);
+                }
+                i.limits.top_max = n.max(4);
+                let before = i.top_domains.len() + i.top_blocked.len() + i.top_clients.len();
+                let name_bytes = |m: &HashMap<Box<str>, u64>| m.keys().map(|k| k.len()).sum::<usize>();
+                let bytes_before = name_bytes(&i.top_domains) + name_bytes(&i.top_blocked);
+                for m in [&mut i.top_domains, &mut i.top_blocked] {
+                    if m.len() > n {
+                        trim(m, n);
+                    }
+                    m.shrink_to_fit();
+                }
+                if i.top_clients.len() > n {
+                    trim(&mut i.top_clients, n);
+                }
+                i.top_clients.shrink_to_fit();
+                let after = i.top_domains.len() + i.top_blocked.len() + i.top_clients.len();
+                let bytes_after = name_bytes(&i.top_domains) + name_bytes(&i.top_blocked);
+                // 每筆：雜湊表一格（鍵 + 次數）約 48 bytes，加上名稱
+                (before - after) * 48 + bytes_before.saturating_sub(bytes_after)
+            }
+            None => {
+                if let Some(m) = i.saved_top_max.take() {
+                    i.limits.top_max = m;
+                }
+                0
+            }
+        }
     }
 
     pub fn uptime_sec(&self) -> u64 {
