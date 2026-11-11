@@ -23,6 +23,19 @@ const MAX_NEST: u32 = 200;
 /// 253 個字元的網域名稱，一般的樣式每個字元大約兩層，用不到這個數字的一半。
 const MAX_DEPTH: u32 = 1200;
 
+/// 比對時最多用掉多少堆疊。每層遞迴實際占多少位元組依編譯模式與 CPU 而不同
+/// （除錯版大好幾倍），只靠層數上限不保險；這裡直接量堆疊位址的差距。
+/// 執行緒堆疊是 2 MiB（Rust / tokio 預設）：正式版給 512 KiB（最長的網域名稱配一般樣式用不到一半），
+/// 除錯版的堆疊框大很多，給 1.5 MiB。
+const STACK_BUDGET: usize = if cfg!(debug_assertions) { 1536 * 1024 } else { 512 * 1024 };
+
+/// 目前的堆疊位置（區域變數的位址）
+#[inline(always)]
+fn stack_pos() -> usize {
+    let x = 0u8;
+    std::hint::black_box(&x) as *const u8 as usize
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegexError {
     /// node 版也會失敗的語法錯誤
@@ -533,6 +546,8 @@ struct Matcher<'a> {
     s: &'a [char],
     steps: Cell<u32>,
     depth: Cell<u32>,
+    /// 開始比對時的堆疊位置
+    base: usize,
 }
 
 impl Matcher<'_> {
@@ -548,7 +563,7 @@ impl Matcher<'_> {
     /// 進入一層遞迴；太深就把步數設成用完（整次比對當作沒命中）
     fn enter(&self) -> bool {
         let d = self.depth.get();
-        if d >= MAX_DEPTH {
+        if d >= MAX_DEPTH || stack_pos().abs_diff(self.base) > STACK_BUDGET {
             self.steps.set(STEP_LIMIT);
             return false;
         }
@@ -755,6 +770,7 @@ impl Regex {
             s,
             steps: Cell::new(0),
             depth: Cell::new(0),
+            base: stack_pos(),
         };
         let last = if self.anchored { 0 } else { s.len() };
         for start in 0..=last {
@@ -854,7 +870,8 @@ mod tests {
     /// 在小堆疊（1 MiB，比 tokio 工作執行緒的 2 MiB 還小）的執行緒裡跑：堆疊用完會讓整個測試程序當掉
     fn small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
-            .stack_size(1024 * 1024)
+            // 跟正式執行時的執行緒一樣大（Rust / tokio 預設 2 MiB）
+            .stack_size(2 * 1024 * 1024)
             .spawn(f)
             .unwrap()
             .join()
