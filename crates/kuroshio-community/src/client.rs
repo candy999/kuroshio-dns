@@ -1026,6 +1026,7 @@ impl Community {
         for d in st.store.expire_stale(cfg.stale_days, now) {
             st.remote.remove(&d);
         }
+        st.store.expire_auto_blocks(now);
         let mut evs = vec![];
         let mut drop_peers = vec![];
         for p in st.store.peers.values_mut() {

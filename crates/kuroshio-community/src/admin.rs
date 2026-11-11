@@ -126,7 +126,7 @@ impl Community {
             .map(|k| json!({ "kid": k.kid, "fingerprint": unb64(&k.public).map(|b| fingerprint(&b)), "since": k.since, "until": k.until }))
             .collect();
         json!({
-            "domain": p.domain, "rel": p.rel.as_str(), "myBlock": p.my_block, "theirBlock": p.their_block,
+            "domain": p.domain, "rel": p.rel.as_str(), "myBlock": p.my_block, "autoBlockAt": (p.auto_block_at > 0).then_some(p.auto_block_at), "theirBlock": p.their_block,
             "rejectedUntil": nz(p.rejected_until), "theirRejectUntil": nz(p.their_reject_until), "deletedAt": nz(p.deleted_at),
             "fingerprint": current.and_then(|c| unb64(&c)).map(|b| fingerprint(&b)),
             "endpoint": p.endpoints.first(), "endpoints": p.endpoints, "channel": p.channel, "preferChannel": p.prefer_channel,

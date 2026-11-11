@@ -102,6 +102,7 @@ rotate body { t:"rotate", from, ts, nonce, old: kid, new: { kid, pub, since } }
 | `myBlock` | 我封鎖對方：永遠不能再請求 |
 | `theirBlock` | 對方封鎖我：不再請求 |
 | `rejectedUntil` | 我拒絕對方：7 天內不能再請求，提早重送 3 次自動封鎖 |
+| `autoBlockAt` | 自動封鎖（提早重送 3 次、自動規則封鎖）的時間；沒有這個欄位 = 使用者封鎖。自動封鎖最多 300 筆（滿了先清最舊的）、30 天後解除；使用者封鎖永遠不清 |
 | `theirRejectUntil` | 對方拒絕我：這之前不再請求 |
 | `deletedAt` | 我刪除過對方：之後一律人工審核，不套用自動同意 |
 | `pairId` | 配對編號：刪除後清空，舊配對的訊息一律忽略 |

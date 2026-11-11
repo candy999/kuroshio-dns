@@ -135,6 +135,11 @@ pub struct Peer {
     pub rel: Rel,
     #[serde(default)]
     pub my_block: bool,
+    /// 自動封鎖（拒絕期間一直重送請求、自動規則）的時間；0 = 不是自動封鎖。
+    /// 自動封鎖有數量上限、30 天後解除（見 `MAX_AUTO_BLOCKS`）；使用者自己封鎖的永遠不會被清掉。
+    /// 舊版的檔案沒有這個欄位：既有的封鎖一律當成使用者封鎖
+    #[serde(default, skip_serializing_if = "is_zero", deserialize_with = "lenient_u64")]
+    pub auto_block_at: u64,
     #[serde(default)]
     pub their_block: bool,
     #[serde(default, deserialize_with = "lenient_u64")]
@@ -202,6 +207,7 @@ impl Peer {
             prefer_channel: None,
             rel: Rel::None,
             my_block: false,
+            auto_block_at: 0,
             their_block: false,
             rejected_until: 0,
             their_reject_until: 0,
@@ -236,6 +242,7 @@ impl Peer {
         self.out_req_id = None;
         self.in_req_id = None;
         self.my_block = false;
+        self.auto_block_at = 0;
         self.their_block = false;
         self.rejected_until = 0;
         self.their_reject_until = 0;
@@ -307,6 +314,12 @@ pub fn joint_pair_id(a: &str, b: &str) -> String {
 
 /// 不是好友、也不是我主動加的網域（待確認、已拒絕、已刪除）最多留幾筆
 pub const MAX_STRANGERS: usize = 300;
+
+/// 自動封鎖（陌生人在拒絕期間一直重送請求、自動規則封鎖）最多留幾筆：滿了先清最舊的自動封鎖。
+/// 任何人只要有網域就能觸發（一小時十幾筆），不設上限的話紀錄會一直長
+pub const MAX_AUTO_BLOCKS: usize = 300;
+/// 自動封鎖幾天後解除（紀錄整筆刪掉；對方再送請求就重新照規則處理）
+pub const AUTO_BLOCK_DAYS: u64 = 30;
 
 pub struct PeerStore {
     pub peers: BTreeMap<String, Peer>,
@@ -414,6 +427,7 @@ impl PeerStore {
         }
         if manual && p.my_block {
             p.my_block = false;
+            p.auto_block_at = 0;
             evs.push(("解除封鎖", ""));
         }
         if manual {
@@ -532,7 +546,7 @@ impl PeerStore {
         if p.rejected_until > now {
             p.early_retries += 1;
             if p.early_retries >= 3 {
-                return self.block(&d, "拒絕期間重複請求");
+                return self.auto_block(&d, "拒絕期間重複請求", now);
             }
             return View {
                 status: "rejected".into(),
@@ -585,7 +599,7 @@ impl PeerStore {
         match action {
             crate::rules::Action::Accept => self.accept(&d, "自動同意", now),
             crate::rules::Action::Reject => self.reject(&d, "自動拒絕", now),
-            crate::rules::Action::Block => self.block(&d, "自動封鎖"),
+            crate::rules::Action::Block => self.auto_block(&d, "自動封鎖", now),
             crate::rules::Action::Manual => View::of("pending"),
         }
     }
@@ -623,16 +637,69 @@ impl PeerStore {
         }
     }
 
+    /// 使用者（或對方行為不當的好友）封鎖：永遠不會被自動清掉。原本是自動封鎖的改成使用者封鎖
     pub fn block(&mut self, domain: &str, why: &str) -> View {
-        let p = self.ensure(domain, now_ms());
+        self.block_inner(domain, why, None)
+    }
+
+    /// 自動封鎖（陌生人）：有數量上限，`AUTO_BLOCK_DAYS` 天後解除。已經是使用者封鎖的維持原樣
+    pub fn auto_block(&mut self, domain: &str, why: &str, now: u64) -> View {
+        let v = self.block_inner(domain, why, Some(now));
+        self.cap_auto_blocks(&domain.to_ascii_lowercase());
+        v
+    }
+
+    fn block_inner(&mut self, domain: &str, why: &str, auto: Option<u64>) -> View {
+        let p = self.ensure(domain, auto.unwrap_or_else(now_ms));
         p.rel = Rel::None;
         p.in_req_id = None;
         p.out_req_id = None;
         p.pair_id = None;
+        p.auto_block_at = match auto {
+            // 使用者已經封鎖的：不降級成自動封鎖
+            Some(_) if p.my_block && p.auto_block_at == 0 => 0,
+            Some(t) => t.max(1),
+            None => 0,
+        };
         p.my_block = true;
         let d = p.domain.clone();
-        self.event(&d, "已封鎖", why);
+        self.event(&d, if auto.is_some() { "已自動封鎖" } else { "已封鎖" }, why);
         View::of("blocked")
+    }
+
+    /// 自動封鎖的紀錄（不會是好友或我送出的請求：封鎖時已經清掉關係）
+    fn is_auto_blocked(p: &Peer) -> bool {
+        p.my_block && p.auto_block_at > 0 && matches!(p.rel, Rel::None | Rel::In)
+    }
+
+    /// 自動封鎖超過上限：刪掉最舊的（`keep` 是剛封鎖的這一筆，不刪）
+    fn cap_auto_blocks(&mut self, keep: &str) {
+        let mut list: Vec<(u64, String)> = self
+            .peers
+            .values()
+            .filter(|p| Self::is_auto_blocked(p))
+            .map(|p| (p.auto_block_at, p.domain.clone()))
+            .collect();
+        if list.len() <= MAX_AUTO_BLOCKS {
+            return;
+        }
+        list.sort();
+        let n = list.len() - MAX_AUTO_BLOCKS;
+        for (_, d) in list.into_iter().filter(|(_, d)| d != keep).take(n) {
+            self.peers.remove(&d);
+        }
+    }
+
+    /// 每小時：自動封鎖超過 `AUTO_BLOCK_DAYS` 天的解除（整筆刪掉）。回傳刪掉幾筆
+    pub fn expire_auto_blocks(&mut self, now: u64) -> usize {
+        let limit = now.saturating_sub(AUTO_BLOCK_DAYS * DAY);
+        let before = self.peers.len();
+        self.peers.retain(|_, p| !(Self::is_auto_blocked(p) && p.auto_block_at < limit));
+        let n = before - self.peers.len();
+        if n > 0 {
+            info!("社群：{n} 筆自動封鎖已滿 {AUTO_BLOCK_DAYS} 天，解除");
+        }
+        n
     }
 
     pub fn unblock(&mut self, domain: &str) -> bool {
@@ -640,6 +707,7 @@ impl PeerStore {
             return false;
         };
         p.my_block = false;
+        p.auto_block_at = 0;
         p.early_retries = 0;
         let d = p.domain.clone();
         self.event(&d, "解除封鎖", "");
@@ -898,6 +966,70 @@ mod tests {
                 .pair_id,
             a.pair_id
         );
+    }
+
+    #[test]
+    fn auto_blocks_are_capped_and_expire() {
+        let mut s = store();
+        let now = 1_000 * DAY;
+        s.block("user.test", "手動");
+        // 使用者封鎖過的再被自動封鎖：仍是使用者封鎖
+        s.auto_block("user.test", "自動封鎖", now);
+        assert_eq!(s.get("user.test").unwrap().auto_block_at, 0);
+        // 拒絕期間重送三次 → 自動封鎖（有標記）
+        s.on_request("r.test", "r1", vec![], PeerInfo::default(), now, |_, _| Action::Manual);
+        s.reject("r.test", "手動拒絕", now);
+        for _ in 0..3 {
+            s.on_request("r.test", "r1", vec![], PeerInfo::default(), now + 1, |_, _| Action::Accept);
+        }
+        let r = s.get("r.test").unwrap();
+        assert!(r.my_block);
+        assert_eq!(r.auto_block_at, now + 1);
+        // 自動規則封鎖也有標記；洪水般的自動封鎖只留最新的 MAX_AUTO_BLOCKS 筆
+        for i in 0..(MAX_AUTO_BLOCKS + 20) {
+            let v = s.on_request(
+                &format!("a{i}.flood.test"),
+                "r",
+                vec![],
+                PeerInfo::default(),
+                now + 10 + i as u64,
+                |_, _| Action::Block,
+            );
+            assert_eq!(v.status, "blocked");
+        }
+        let auto = s.peers.values().filter(|p| p.my_block && p.auto_block_at > 0).count();
+        assert_eq!(auto, MAX_AUTO_BLOCKS);
+        assert!(s.get("r.test").is_none(), "最舊的自動封鎖先清");
+        assert!(s.get("a0.flood.test").is_none());
+        assert!(s.get(&format!("a{}.flood.test", MAX_AUTO_BLOCKS + 19)).unwrap().my_block);
+        assert!(s.get("user.test").unwrap().my_block, "使用者封鎖不會被清掉");
+
+        // 存檔讀回：標記保留；舊版檔案（沒有這個欄位）的封鎖當成使用者封鎖
+        let (back, _) = load_peers(&save_peers(&s.peers, now), now);
+        assert_eq!(
+            back[&format!("a{}.flood.test", MAX_AUTO_BLOCKS + 19)].auto_block_at,
+            now + 10 + (MAX_AUTO_BLOCKS + 19) as u64
+        );
+        assert_eq!(back["user.test"].auto_block_at, 0);
+        let user_json = serde_json::to_value(&s.peers["user.test"]).unwrap();
+        assert!(user_json.get("autoBlockAt").is_none(), "使用者封鎖的格式跟舊版一樣");
+
+        // 30 天後自動封鎖解除，使用者封鎖留著
+        assert_eq!(s.expire_auto_blocks(now + 29 * DAY), 0);
+        assert_eq!(s.expire_auto_blocks(now + AUTO_BLOCK_DAYS * DAY + 10_000), MAX_AUTO_BLOCKS);
+        assert!(s.get("user.test").unwrap().my_block);
+        assert_eq!(
+            s.on_request("a5.flood.test", "r", vec![], PeerInfo::default(), now + 31 * DAY, |_, _| {
+                Action::Manual
+            })
+            .status,
+            "pending",
+            "解除後重新照規則處理"
+        );
+        // 使用者手動封鎖自動封鎖的對象：改成使用者封鎖
+        s.auto_block("x.test", "自動封鎖", now);
+        s.block("x.test", "手動");
+        assert_eq!(s.get("x.test").unwrap().auto_block_at, 0);
     }
 
     #[test]
