@@ -384,8 +384,7 @@ impl Resolver {
                 };
             }
         }
-        self.stats.count(StatKind::Query);
-        self.stats.query_name(&qname, ctx.client);
+        self.stats.query(&qname, ctx.client);
         if let Some(p) = self.presence.get() {
             p.record(ctx.proto, ctx.client, &qname);
         }
@@ -431,7 +430,6 @@ impl Resolver {
                 if stale || (remain <= threshold && (recent || popular)) {
                     self.refresh(key.clone(), query.clone());
                 }
-                self.stats.count(StatKind::Hit);
                 if stale {
                     self.stats.count(StatKind::Stale);
                 }
@@ -440,7 +438,7 @@ impl Resolver {
                     self.stats.blocked_name(&qname, ctx.client, cat);
                 }
                 let out = self.serve(&query, &e, if stale { Some(10) } else { None });
-                self.stats.latency(true, t0.elapsed().as_secs_f64() * 1000.0);
+                self.stats.hit(t0.elapsed().as_secs_f64() * 1000.0);
                 return msg(out);
             }
         }

@@ -316,20 +316,26 @@ fn is_ipv4_literal(n: &str) -> bool {
 /// 網域 → 主網域（`www.video.example` → `video.example`、`www.shop.example.com.tw` → `example.com.tw`）；
 /// IP、反查、區網名稱回 None（同 2.x `siteOf`）
 pub fn site_of(name: &str) -> Option<String> {
-    let n = name.trim_end_matches('.').to_ascii_lowercase();
-    if n.is_empty() || !n.contains('.') || is_ipv4_literal(&n) {
+    let n = name.trim_end_matches('.');
+    if n.bytes().any(|b| b.is_ascii_uppercase()) {
+        return site_slice(&n.to_ascii_lowercase()).map(str::to_string);
+    }
+    site_slice(n).map(str::to_string)
+}
+
+/// [`site_of`] 的本體：`n` 已經是小寫、結尾沒有點；回傳的是 `n` 的一段（每次查詢都會呼叫，不配置記憶體）
+fn site_slice(n: &str) -> Option<&str> {
+    if n.is_empty() || !n.contains('.') || is_ipv4_literal(n) {
         return None;
     }
     if [".arpa", ".local", ".lan", ".home", ".internal"].iter().any(|s| n.ends_with(s)) {
         return None;
     }
-    let parts: Vec<&str> = n.split('.').collect();
-    if parts.len() <= 2 {
-        return Some(n);
-    }
-    let last2 = parts[parts.len() - 2..].join(".");
-    if MULTI_SUFFIX.contains(&last2.as_str()) {
-        return Some(parts[parts.len() - 3..].join("."));
+    // 從右邊數第 k 個點之後的部分（沒有那麼多層就是整個名稱）
+    let tail = |k: usize| n.rmatch_indices('.').nth(k - 1).map_or(n, |(i, _)| &n[i + 1..]);
+    let last2 = tail(2);
+    if MULTI_SUFFIX.contains(&last2) {
+        return Some(tail(3));
     }
     Some(last2)
 }
@@ -631,17 +637,26 @@ impl Inner {
         self.minutes.back_mut().expect("剛加入")
     }
 
-    fn anon(&mut self, blocked: bool, site: String, client: IpAddr) {
+    fn query_name(&mut self, name: &str, client: IpAddr) {
+        let max = self.limits.top_max;
+        bump(&mut self.top_domains, name, max);
+        *self.top_clients.entry(client.to_canonical()).or_default() += 1;
+        if self.top_clients.len() > max {
+            trim(&mut self.top_clients, max / 4);
+        }
+    }
+
+    fn anon(&mut self, blocked: bool, site: &str, client: IpAddr) {
         let h = self.salt.hash_one(client) as u32;
         let max = self.limits.anon_sites;
         let map = if blocked { &mut self.blocked_sites } else { &mut self.sites };
-        let e = match map.get_mut(site.as_str()) {
+        let e = match map.get_mut(site) {
             Some(e) => e,
             None => {
                 if map.len() >= max {
                     return;
                 }
-                map.entry(site.into_boxed_str()).or_default()
+                map.entry(site.into()).or_default()
             }
         };
         e.n += 1;
@@ -711,6 +726,23 @@ impl Stats {
         })
     }
 
+    /// 一次查詢：等於 `count(Kind::Query)` 加 [`Stats::query_name`]，只鎖一次、只看一次時鐘
+    pub fn query(&self, name: &str, client: IpAddr) {
+        self.with(|i| {
+            i.day.query += 1;
+            i.minute(Self::now_min()).q += 1;
+            i.query_name(name, client);
+        })
+    }
+
+    /// 快取命中的回應：等於 `count(Kind::Hit)` 加 `latency(true, ms)`，只鎖一次
+    pub fn hit(&self, ms: f64) {
+        self.with_day(|d| {
+            d.hit += 1;
+            d.lat_hit.record(ms);
+        })
+    }
+
     /// 回應時間（快取命中 / 問上游分開）
     pub fn latency(&self, hit: bool, ms: f64) {
         self.with_day(|d| if hit { d.lat_hit.record(ms) } else { d.lat_miss.record(ms) })
@@ -733,19 +765,20 @@ impl Stats {
 
     /// 每次查詢（跟 `count(Kind::Query)` 同一個地方呼叫）：熱門網域、用戶端（詳細頁用）
     pub fn query_name(&self, name: &str, client: IpAddr) {
-        self.with(|i| {
-            let max = i.limits.top_max;
-            bump(&mut i.top_domains, name, max);
-            *i.top_clients.entry(client.to_canonical()).or_default() += 1;
-            if i.top_clients.len() > max {
-                trim(&mut i.top_clients, max / 4);
-            }
-        })
+        self.with(|i| i.query_name(name, client))
     }
 
     /// 公開頁網站排行：只算 A 查詢（避免 A / AAAA / HTTPS 重複計算），沒被過濾擋下的才算（同 2.x `stats.site`）
     pub fn site(&self, name: &str, client: IpAddr) {
-        let Some(site) = site_of(name) else { return };
+        let n = name.trim_end_matches('.');
+        let lower;
+        let n = if n.bytes().any(|b| b.is_ascii_uppercase()) {
+            lower = n.to_ascii_lowercase();
+            lower.as_str()
+        } else {
+            n
+        };
+        let Some(site) = site_slice(n) else { return };
         self.with(|i| i.anon(false, site, client.to_canonical()))
     }
 
@@ -756,7 +789,7 @@ impl Stats {
             let max = i.limits.top_max;
             bump(&mut i.top_blocked, name, max);
             if let Some(s) = site {
-                i.anon(true, s, client.to_canonical());
+                i.anon(true, &s, client.to_canonical());
             }
         })
     }
@@ -1003,6 +1036,12 @@ mod tests {
         assert_eq!(site_of("4.3.2.1.in-addr.arpa"), None);
         assert_eq!(site_of("nas.lan"), None);
         assert_eq!(site_of("localhost"), None);
+        assert_eq!(site_of("WWW.Example.COM.").as_deref(), Some("example.com"));
+        assert_eq!(site_of("com.tw").as_deref(), Some("com.tw"));
+        assert_eq!(site_of("example.com.tw").as_deref(), Some("example.com.tw"));
+        assert_eq!(site_of("a.b.c.d.example.org").as_deref(), Some("example.org"));
+        assert_eq!(site_of(""), None);
+        assert_eq!(site_of("."), None);
     }
 
     #[test]
@@ -1083,8 +1122,8 @@ mod tests {
         let mut i = Inner::default();
         i.roll("2001-01-01");
         i.day.query = 3;
-        i.anon(false, "example.com".into(), "192.0.2.1".parse().unwrap());
-        i.anon(false, "example.com".into(), "192.0.2.2".parse().unwrap());
+        i.anon(false, "example.com", "192.0.2.1".parse().unwrap());
+        i.anon(false, "example.com", "192.0.2.2".parse().unwrap());
         i.roll("2001-01-02");
         assert_eq!(i.history.len(), 1);
         assert_eq!(i.history[0].query, 3);

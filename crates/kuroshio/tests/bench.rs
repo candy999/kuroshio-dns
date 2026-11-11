@@ -1,4 +1,5 @@
-//! 效能量測（預設不跑）：`cargo test -p kuroshio --test bench -- --ignored --nocapture`
+//! 效能量測（預設不跑）：`cargo test -p kuroshio --test bench -- --ignored --nocapture --test-threads=1`
+//! （配置次數是整個行程一起算的，兩個量測同時跑會互相干擾）
 //!
 //! 印出每次操作的奈秒數與配置次數，改動熱路徑前後各跑一次比較。
 //! 除錯組建的時間沒有參考價值，要看時間請加 `CARGO_PROFILE_TEST_OPT_LEVEL=2`；配置次數跟最佳化等級無關。
@@ -133,6 +134,13 @@ fn bench_stats_and_presence() {
         stats.site("www.video.example.com", client);
         stats.count(kuroshio::stats::Kind::Hit);
         stats.latency(true, 0.02);
+    }
+    report("stats per cached query (old calls)", n, t0, a0);
+    let (a0, t0) = (ALLOCS.load(Ordering::Relaxed), Instant::now());
+    for _ in 0..n {
+        stats.query("www.video.example.com", client);
+        stats.site("www.video.example.com", client);
+        stats.hit(0.02);
     }
     report("stats per cached query", n, t0, a0);
     let (a0, t0) = (ALLOCS.load(Ordering::Relaxed), Instant::now());
