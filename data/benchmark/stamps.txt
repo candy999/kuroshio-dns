@@ -1,0 +1,54 @@
+# DNSCrypt 候選名單：每日評測用（評測程式目前尚未實作 DNSCrypt，會先略過；名單先備好）
+# 格式：一行一個 sdns:// stamp；# 開頭是註解，stamp 後面的文字會被忽略（這裡註明解析器名稱與 IP）
+# 只收 stamp 標示「不過濾」(no filter) 的 IPv4 端點，以亞太與美西節點為主
+# 來源（2026-11 整理）：DNSCrypt 專案 public-resolvers.md（github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md），
+#   stamp 原樣照抄；dnscry.pt 節點另以 www.dnscry.pt/public-resolvers/<代號> 核對
+
+# 大型 anycast（不過濾）；quad9 nofilter-ecs 支援 ECS
+sdns://AQcAAAAAAAAAEjk0LjE0MC4xNC4xNDA6NTQ0MyC16ETWuDo-PhJo62gfvqcN48X6aNvWiBQdvy7AZrLa-iUyLmRuc2NyeXB0LnVuZmlsdGVyZWQubnMxLmFkZ3VhcmQuY29t  # adguard-dns-unfiltered 94.140.14.140:5443
+sdns://AQcAAAAAAAAAEjk0LjE0MC4xNC4xNDE6NTQ0MyC16ETWuDo-PhJo62gfvqcN48X6aNvWiBQdvy7AZrLa-iUyLmRuc2NyeXB0LnVuZmlsdGVyZWQubnMxLmFkZ3VhcmQuY29t  # adguard-dns-unfiltered 94.140.14.141:5443
+sdns://AQcAAAAAAAAADTkuOS45LjEyOjg0NDMgZ8hHuMh1jNEgJFVDvnVnRt803x2EwAuMRwNo34Idhj4ZMi5kbnNjcnlwdC1jZXJ0LnF1YWQ5Lm5ldA  # quad9-dnscrypt-ip4-nofilter-ecs-pri 9.9.9.12:8443
+sdns://AQcAAAAAAAAAEzE0OS4xMTIuMTEyLjEyOjg0NDMgZ8hHuMh1jNEgJFVDvnVnRt803x2EwAuMRwNo34Idhj4ZMi5kbnNjcnlwdC1jZXJ0LnF1YWQ5Lm5ldA  # quad9-dnscrypt-ip4-nofilter-ecs-pri 149.112.112.12:8443
+sdns://AQcAAAAAAAAADTkuOS45LjEwOjg0NDMgZ8hHuMh1jNEgJFVDvnVnRt803x2EwAuMRwNo34Idhj4ZMi5kbnNjcnlwdC1jZXJ0LnF1YWQ5Lm5ldA  # quad9-dnscrypt-ip4-nofilter-pri 9.9.9.10:8443
+sdns://AQcAAAAAAAAAEzE0OS4xMTIuMTEyLjEwOjg0NDMgZ8hHuMh1jNEgJFVDvnVnRt803x2EwAuMRwNo34Idhj4ZMi5kbnNjcnlwdC1jZXJ0LnF1YWQ5Lm5ldA  # quad9-dnscrypt-ip4-nofilter-pri 149.112.112.10:8443
+
+# dnscry.pt 亞太與美西節點（不過濾、不記錄）
+sdns://AQcAAAAAAAAADzEwMy4xMzEuMTg5LjE5MSAl1jOdIay4Ch7r2CgrehwgnU1olQWj8A7t2WAMmoGbMxkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-taipeh-ipv4 103.131.189.191
+sdns://AQcAAAAAAAAACzk2LjkuMjI4LjI3ICMJK8RA3cOKDpDZjSR9PqVXj2mGf43CHMa6fO7ZzCWmGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-hongkong-ipv4 96.9.228.27
+sdns://AQcAAAAAAAAADjIxNi4yNTAuOTcuMTQ4IE051A_5owd3KFF0cKbFZ57YasyL72DAOxmbF3SJUX2kGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-hongkong02-ipv4 216.250.97.148
+sdns://AQcAAAAAAAAADjQ1LjEyMy4xODguMTI5IAtxIfzDy0d11GLJHr7HPkdtPwGbimmNUM0gUa0gfjHIGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-hongkong03-ipv4 45.123.188.129
+sdns://AQcAAAAAAAAADDQ1LjY3Ljg2LjEyMyBDK5aRHZnKfdd6Q9ufEJY83WAQ9X5z7OAQa5CeptBCYBkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-tokyo-ipv4 45.67.86.123
+sdns://AQcAAAAAAAAADDEwMy4xNzkuNDUuNiDfai5sp1im-BPHwbM1GCnTqn20FIbQfuvvybKsGf0pjhkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-tokyo02-ipv4 103.179.45.6
+sdns://AQcAAAAAAAAADzE1MS4yNDUuMTA2LjE4MSBwVhEso4MPh30F1CUaDbHgxoo6R_u5SkGxPgsGUYTi4hkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-seoul02-ipv4 151.245.106.181
+sdns://AQcAAAAAAAAADjE1Ny4yMC4xMDUuMTE1IF-A7YB2q_Cn7QZ946XHFuDvAUNlRXLcIcLv6zH5glrGGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-singapore-ipv4 157.20.105.115
+sdns://AQcAAAAAAAAADTEwMy4xNzkuNDQuNzMgICxK5c5XamgK_BNMTtSKyEnZM4D44NPAIHddngTPbGUZMi5kbnNjcnlwdC1jZXJ0LmRuc2NyeS5wdA  # dnscry.pt-singapore02-ipv4 103.179.44.73
+sdns://AQcAAAAAAAAADTQ1LjI0OS45MS4xNTAgHONiOhMA1VOPBBcvrkvy9IW-Q0dhA1aY-g5rKbpy9noZMi5kbnNjcnlwdC1jZXJ0LmRuc2NyeS5wdA  # dnscry.pt-johor-ipv4 45.249.91.150
+sdns://AQcAAAAAAAAADjE1MS4yNDMuMjIyLjk0IMp-kt2QTVeHxfHuzsBm8Y-j_LnTTldhKbHfA61KITsfGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-jakarta-ipv4 151.243.222.94
+sdns://AQcAAAAAAAAADTEwMy4xOTkuMTYuOTMg6iF-oJet7zyL2odP--IayA5Wrz6t94RPc7PXF53V82cZMi5kbnNjcnlwdC1jZXJ0LmRuc2NyeS5wdA  # dnscry.pt-hanoi-ipv4 103.199.16.93
+sdns://AQcAAAAAAAAADTE2NS45OS4xMzEuOTUg7B186ItTKGEYyZyKq9XgSnChmigBrnFCxeTBzRfaWOsZMi5kbnNjcnlwdC1jZXJ0LmRuc2NyeS5wdA  # dnscry.pt-hochiminhcity-ipv4 165.99.131.95
+sdns://AQcAAAAAAAAADzEwMy4yMjguMTAxLjE3OCDsBgKLhj_vw4R4VLAYAe0lINIZEMImGhQboH6ssbjp4xkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-vientiane-ipv4 103.228.101.178
+sdns://AQcAAAAAAAAADzE2MC4xOTEuMTgyLjIxNiDM3lhIXzCtFbHampFM4K_NDUnKalgxd72L-5ye1X4qExkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-bengaluru-ipv4 160.191.182.216
+sdns://AQcAAAAAAAAADDE1Ny4yMC4yNy43OSCWqeT_u1nn0f3mZBAXCN7K40kyMWyMgma2VqLqJhijIhkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-mumbai02-ipv4 157.20.27.79
+sdns://AQcAAAAAAAAADTEwMy4xNzQuNTEuNzEgJb3-qelH318uGaZ6Kh3u586eQ6d1Szyyr8fo_lm78kAZMi5kbnNjcnlwdC1jZXJ0LmRuc2NyeS5wdA  # dnscry.pt-dhaka-ipv4 103.174.51.71
+sdns://AQcAAAAAAAAADTE5NS4xMTQuMTQuNzQgfD7v3z2SLbLGuO4Wo8-HYVxwRz44PitWMFgp81gvSjUZMi5kbnNjcnlwdC1jZXJ0LmRuc2NyeS5wdA  # dnscry.pt-sydney02-ipv4 195.114.14.74
+sdns://AQcAAAAAAAAADjEwMy4xMDguMjI4LjE1ILAWh1FyQgZtjFxK9KuFzaJfUBQpjrxnlDNMaUiEo5UWGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-melbourne-ipv4 103.108.228.15
+sdns://AQcAAAAAAAAADjQzLjIyNC4xODAuMTM3IB3DhQdApTRyuMIvRSQEdBBZ3zMUZPTPK9hsuS3Nq7c5GTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-brisbane-ipv4 43.224.180.137
+sdns://AQcAAAAAAAAADjIwMy4yOS4yNDAuMjQ5IA7UI7_5dEF7rldqU_Pw_R_ZqCjOI5CRHcdKI8hWLfF5GTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-perth-ipv4 203.29.240.249
+sdns://AQcAAAAAAAAADjE3NS40NS4xODIuMTc5INrqhBrttZo1M0gvzeimP08i_dgL6qmBxe5EeP8lJ-1yGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-adelaide-ipv4 175.45.182.179
+sdns://AQcAAAAAAAAADjE4NS45OS4xMzMuMTEyIBWQZQSuMzmL_YANsdr26wFOHmJCYEtA2P2JI6w1-0ezGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-auckland-ipv4 185.99.133.112
+sdns://AQcAAAAAAAAADjEwNC4xNTYuMTU0LjExIED6lUqafS2hgKJM7y56Ban4s50FPfMiamoZXHGKqfhBGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-losangeles-ipv4 104.156.154.11
+sdns://AQcAAAAAAAAADjEwNC4yMDAuNjcuMTk0IIhxeSuGQHwchZdstQqcoKD_RAuV4w8Qr_1XmXFZucGEGTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-losangeles02-ipv4 104.200.67.194
+sdns://AQcAAAAAAAAADjE4NS4xMDYuOTYuMjEwIKy8EjwvpVvM65kKWYoFFmszWMa4PjE_LRLkUiKeZHk0GTIuZG5zY3J5cHQtY2VydC5kbnNjcnkucHQ  # dnscry.pt-sanjose-ipv4 185.106.96.210
+sdns://AQcAAAAAAAAADzE3Ni4xMTEuMjIzLjE2NyCmqAI-1fpR1qtHZyAx3vJJ7SpKXkdmPAnZZ5ga25JckxkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-santaclara-ipv4 176.111.223.167
+sdns://AQcAAAAAAAAADDE2Ny44OC40OC4xOCDXa6t5njAKDHZ2JWPfQ-9XAbho3aZHomYynHy8m3QnThkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-fremont02-ipv4 167.88.48.18
+sdns://AQcAAAAAAAAADzIwOS4xODIuMjI1LjEwMyAbREpgYMxYxNqglLJnR6df63qELMlAVMwxGlsjPMMThhkyLmRuc2NyeXB0LWNlcnQuZG5zY3J5LnB0  # dnscry.pt-seattle-ipv4 209.182.225.103
+
+# 其他亞太（不過濾）：salDNS 東京、CryptoStorm、deffer-dns.au 雪梨
+sdns://AQcAAAAAAAAAFDE2My40NC4xMjQuMjA0OjUwNDQzIGvWmxvhx79edG-xPZxrQR1g9jFOofVRDbPFCGWVGV1PIjIuZG5zY3J5cHQtY2VydC5zYWxkbnMwMS50eXBlcS5vcmc  # saldns01-conoha-ipv4 163.44.124.204:50443
+sdns://AQcAAAAAAAAAFTE2MC4yNTEuMjE0LjE3Mjo1MDQ0MyB7SI0q4_Ff8lFRUCbjPtcAQ3HfdWlLxyGDUUNc3NUZdiIyLmRuc2NyeXB0LWNlcnQuc2FsZG5zMDIudHlwZXEub3Jn  # saldns02-conoha-ipv4 160.251.214.172:50443
+sdns://AQcAAAAAAAAAFDE2MC4yNTEuMTY4LjI1OjUwNDQzIFl1NfOwMd24kRlr0mXR4rKo-c_jMV7DBUVooDEY1xFeIjIuZG5zY3J5cHQtY2VydC5zYWxkbnMwMy50eXBlcS5vcmc  # saldns03-conoha-ipv4 160.251.168.25:50443
+sdns://AQcAAAAAAAAADDE0Ni43MC4zMS40MyAxM3KtWVYywkFrhy8Jj4Ub3bllKExsvppPGQlkMNupWh4yLmRuc2NyeXB0LWNlcnQuY3J5cHRvc3Rvcm0uaXM  # cs-tokyo 146.70.31.43
+sdns://AQcAAAAAAAAADTM3LjEyMC4xNTEuMTEgMTNyrVlWMsJBa4cvCY-FG925ZShMbL6aTxkJZDDbqVoeMi5kbnNjcnlwdC1jZXJ0LmNyeXB0b3N0b3JtLmlz  # cs-singapore 37.120.151.11
+sdns://AQcAAAAAAAAADjM3LjEyMC4yMzQuMjUxIDEzcq1ZVjLCQWuHLwmPhRvduWUoTGy-mk8ZCWQw26laHjIuZG5zY3J5cHQtY2VydC5jcnlwdG9zdG9ybS5pcw  # cs-sydney 37.120.234.251
+sdns://AQcAAAAAAAAADzE5NS4yMDYuMTA0LjIwMyAxM3KtWVYywkFrhy8Jj4Ub3bllKExsvppPGQlkMNupWh4yLmRuc2NyeXB0LWNlcnQuY3J5cHRvc3Rvcm0uaXM  # cs-la 195.206.104.203
+sdns://AQcAAAAAAAAADTUyLjY1LjIzNS4xMjkg5Q00RDDBkwx3fUaa0_etjz4iH3lLBOqsg95bYDmV07MdMi5kbnNjcnlwdC1jZXJ0LmRlZmZlci1kbnMuYXU  # deffer-dns.au 52.65.235.129

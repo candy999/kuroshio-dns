@@ -1,4 +1,11 @@
-﻿quic://dns.adguard-dns.com
+﻿# DoQ（DNS over QUIC，RFC 9250）候選名單：每日評測用
+# 格式：一行一個 quic://主機[:埠]（預設 853 埠）；# 開頭是註解，網址後面的文字會被忽略
+# 新增只收「不過濾」端點；標 ECS 的會把用戶網段帶給 CDN，較容易導到台灣節點
+# 來源（2026-11 整理）：AdGuard「Known DNS Providers」、Quad9 DoQ 公告（quad9.net/news/blog/quad9-enables-dns-over-http-3-and-dns-over-quic）
+#   與 docs.quad9.net/services、docs.controld.com/docs/free-dns、digitale-gesellschaft.ch/dns、dns.hostux.net
+# 目前公開且有官方文件的 DoQ 不多（Google、Cloudflare、DNS.SB、DNSPod、HiNet、Quad101 都沒有）
+
+quic://dns.adguard-dns.com
 quic://dns.alidns.com:853
 quic://dns.caliph.dev:853
 quic://dns.comss.one
@@ -15,3 +22,10 @@ quic://router.comss.one
 quic://rx.techomespace.com
 quic://unfiltered.adguard-dns.com
 quic://wurzn.hagezi.org
+
+# 2026-11 新增（不過濾）
+quic://dns10.quad9.net  # Quad9 不擋威脅
+quic://dns12.quad9.net  # Quad9 不擋威脅 + ECS
+quic://p0.freedns.controld.com  # Control D 不過濾
+quic://dns.digitale-gesellschaft.ch  # Digitale Gesellschaft（瑞士）
+quic://dns.hostux.net  # Hostux 標準版（不過濾）

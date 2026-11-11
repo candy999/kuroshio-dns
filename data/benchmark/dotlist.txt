@@ -1,0 +1,77 @@
+# DoT（DNS over TLS，RFC 7858）候選名單：每日評測用
+# 格式：一行一個，寫 tls://主機[:埠] 或只寫主機（預設 853 埠）；# 開頭是註解，網址後面的文字會被忽略
+# 只收「不過濾」的端點（過濾版會在評測被淘汰，只是浪費路由器時間）；標 ECS 的會把用戶網段帶給 CDN，較容易導到台灣節點
+# 來源（2026-11 整理）：AdGuard「Known DNS Providers」(adguard-dns.io/kb/general/dns-providers)、
+#   dnsprivacy.org Public Resolvers、各家官方頁（docs.quad9.net/services、docs.controld.com/docs/free-dns、
+#   developers.google.com/speed/public-dns、dns.sb/dot、applied-privacy.net、digitale-gesellschaft.ch/dns、
+#   joindns4.eu/for-public、dns.hostux.net）、dnscry.pt 各節點頁（www.dnscry.pt/public-resolvers/<代號>）
+# 中華電信 HiNet 官方沒有公開 DoT 端點，查無可驗證來源故未收
+
+# 台灣
+tls://101.101.101.101  # TWNIC Quad101（AdGuard 名單只列 IP 版）
+tls://tpe01.dnscry.pt  # dnscry.pt 台北
+
+# 大型 anycast
+tls://one.one.one.one  # Cloudflare
+tls://dns.google  # Google Public DNS，ECS
+tls://dns10.quad9.net  # Quad9 不擋威脅
+tls://dns12.quad9.net  # Quad9 不擋威脅 + ECS
+tls://unfiltered.adguard-dns.com  # AdGuard 不過濾
+tls://p0.freedns.controld.com  # Control D 不過濾
+tls://dns.nextdns.io  # NextDNS 公開不過濾（低延遲）
+tls://anycast.dns.nextdns.io  # NextDNS 公開不過濾（anycast）
+tls://dns.opendns.com  # Cisco OpenDNS Standard
+tls://ordns.he.net  # Hurricane Electric
+tls://wikimedia-dns.org  # Wikimedia
+tls://dns.surfsharkdns.com  # Surfshark DNS
+tls://max.rethinkdns.com  # RethinkDNS 不過濾
+
+# 亞太其他業者
+tls://dot.sb  # DNS.SB
+tls://dot.pub  # 騰訊 DNSPod
+tls://dns.alidns.com  # 阿里 AliDNS
+tls://dot.360.cn  # 360 安全 DNS
+tls://dot-pure.onedns.net  # OneDNS 純淨版
+tls://public.dns.iij.jp  # 日本 IIJ
+tls://dot.seby.io  # Seby DNS（澳洲）
+tls://unfiltered.dns.bebasid.com  # BebasDNS 不過濾（印尼）
+tls://common.dot.dns.yandex.net  # Yandex 基本版
+
+# dnscry.pt 亞太與美西節點（不過濾、不記錄）
+tls://hkg01.dnscry.pt  # 香港
+tls://hkg02.dnscry.pt  # 香港
+tls://hkg03.dnscry.pt  # 香港
+tls://tyo02.dnscry.pt  # 東京
+tls://tyo03.dnscry.pt  # 東京
+tls://sel02.dnscry.pt  # 首爾
+tls://sin02.dnscry.pt  # 新加坡
+tls://sin03.dnscry.pt  # 新加坡
+tls://jhb01.dnscry.pt  # 柔佛
+tls://jkt01.dnscry.pt  # 雅加達
+tls://han01.dnscry.pt  # 河內
+tls://sgn01.dnscry.pt  # 胡志明市
+tls://blr01.dnscry.pt  # 班加羅爾
+tls://bom02.dnscry.pt  # 孟買
+tls://dac01.dnscry.pt  # 達卡
+tls://syd02.dnscry.pt  # 雪梨
+tls://mel01.dnscry.pt  # 墨爾本
+tls://bne01.dnscry.pt  # 布里斯本
+tls://per01.dnscry.pt  # 伯斯
+tls://akl01.dnscry.pt  # 奧克蘭
+tls://lax01.dnscry.pt  # 洛杉磯
+tls://lax02.dnscry.pt  # 洛杉磯
+tls://sjc01.dnscry.pt  # 聖塔克拉拉
+tls://sjc02.dnscry.pt  # 聖荷西
+tls://sea01.dnscry.pt  # 西雅圖
+
+# 歐美（不過濾）
+tls://dot1.applied-privacy.net  # Applied Privacy（奧地利）
+tls://dns.digitale-gesellschaft.ch  # Digitale Gesellschaft（瑞士）
+tls://dot.libredns.gr  # LibreDNS
+tls://unfiltered.joindns4.eu  # DNS4EU 不過濾
+tls://odvr.nic.cz  # CZ.NIC ODVR
+tls://private.canadianshield.cira.ca  # CIRA Canadian Shield Private
+tls://anycast.censurfridns.dk  # UncensoredDNS
+tls://open.dns.dremaxx.com  # Dremaxx 不過濾
+tls://dns.hostux.net  # Hostux 標準版（不過濾）
+tls://dot.ffmuc.net  # Freifunk München
