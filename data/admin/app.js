@@ -532,12 +532,27 @@
 		var ms = function (x) { return x && x.p50 != null ? x.p50 + ' / ' + (x.p95 != null ? x.p95 : '>1000') + ' ms' : '-'; };
 		var routeAcc = 0, routeN = 0;
 		Object.keys(d.route || {}).forEach(function (k) { routeAcc += d.route[k].acc || 0; routeN += d.route[k].n || 0; });
-		var f = st.filter, per = sys.persist || {};
+		var f = st.filter, per = sys.persist || {}, mem = sys.memory || {};
+		// 記憶體控制（規格 09）：釋出中的項目、停用中的過濾清單（停用期間少了這些保護，要明顯）
+		var shed = mem.shed || [], mb = $('st-mem');
+		if (mb) {
+			clear(mb);
+			mb.hidden = !(shed.length || (f && f.notice));
+			if (!mb.hidden) {
+				append(mb, [
+					el('h3', { text: '記憶體控制' }),
+					f && f.notice ? el('p', { class: 'msg warn', text: f.notice }) : null,
+					el('p', { class: 'muted', text: '目前：' + (mem.stateLabel || mem.state || '-') + '（常駐 ' + (mem.rssKB != null ? (mem.rssKB / 1024).toFixed(1) : '-') + ' MB / 預算 ' + (mem.budgetKB != null ? fmtNum(Math.round(mem.budgetKB / 1024)) : '-') + ' MB）' + (mem.waiting ? ' · ' + mem.waiting : '') }),
+					shed.length ? el('ul', {}, shed.map(function (x) { return el('li', { text: x.label + ' ' + (x.detail || '') + '（約 ' + fmtBytes(x.freedBytes) + '，' + fmtTime(x.at) + '）' }); })) : null
+				].filter(Boolean));
+			}
+		}
 		clear($('st-tiles'));
 		append($('st-tiles'), [
 			tile('版本', st.version || s.version || '-', (s.mode === 'service' ? 'Windows 服務' : 'cmd 直接執行') + ' · ' + (s.os || '')),
 			tile('硬體等級', sys.tier || '-', [sys.memTotalMB ? fmtNum(sys.memTotalMB) + ' MB' : '', sys.cores ? sys.cores + ' 核' : '', sys.arch || ''].filter(Boolean).join(' · ')),
-			tile('記憶體', sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', '系統可用 ' + (sys.memAvailableMB != null ? fmtNum(sys.memAvailableMB) + ' MB' : '-') + (sys.pressure && sys.pressure !== 'normal' ? ' · 記憶體偏低' : '')),
+			tile('記憶體', sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', '系統可用 ' + (sys.memAvailableMB != null ? fmtNum(sys.memAvailableMB) + ' MB' : '-') +
+				(mem.enabled ? ' · 預算 ' + fmtNum(Math.round(mem.budgetKB / 1024)) + ' MB · ' + (mem.stateLabel || mem.state) : (sys.pressure && sys.pressure !== 'normal' ? ' · 記憶體偏低' : ''))),
 			tile('已執行', fmtUptime(st.stats && st.stats.uptimeSec), '今天：' + (d.date || '-')),
 			tile('今天查詢', fmtNum(d.query), '快取命中率 ' + (d.hitRate != null ? d.hitRate + '%' : '-')),
 			tile('攔截', fmtNum(d.blocked), '廣告 ' + fmtNum(d.blockedAds) + ' · 遙測 ' + fmtNum(d.blockedTelemetry) + ' · 惡意 ' + fmtNum(d.blockedMalware)),
@@ -1410,7 +1425,9 @@
 
 	/** 物件陣列（訂閱清單）：每一列的欄位依 columns；不認識的屬性保留 */
 	function renderTable(f, row) {
-		var cols = f.columns || [];
+		var pro = isPro();
+		// 進階欄位（pro）只在專業模式顯示；沒顯示的欄位值原樣保留
+		var cols = (f.columns || []).filter(function (c) { return pro || !c.pro; });
 		var d = defOf(f);
 		var rows = clone(userOf(f.key) !== undefined ? userOf(f.key) : (d || [])) || [];
 		var wrap = el('div');
@@ -1445,10 +1462,16 @@
 						});
 					} else if (c.type === 'select') {
 						inp = el('select', { 'aria-label': c.label });
-						(c.options || []).forEach(function (o) { inp.appendChild(el('option', { value: o.value, text: o.label })); });
+						(c.options || []).forEach(function (o) { inp.appendChild(el('option', { value: String(o.value), text: o.label })); });
 						if (cur && !(c.options || []).some(function (o) { return o.value === cur; })) inp.appendChild(el('option', { value: cur, text: cur }));
-						inp.value = cur || '';
-						inp.addEventListener('change', function () { r[c.key] = inp.value; commit(); });
+						inp.value = cur == null ? '' : String(cur);
+						// 選項的值照原本的型別存（例如 true / false）；空白 = 不寫（用預設）
+						inp.addEventListener('change', function () {
+							var o = (c.options || []).filter(function (x) { return String(x.value) === inp.value; })[0];
+							var v = o ? o.value : inp.value;
+							if (v === '') delete r[c.key]; else r[c.key] = v;
+							commit();
+						});
 					} else {
 						inp = el('input', { type: 'text', class: c.key === 'url' ? 'url' : '', placeholder: c.placeholder || '', 'aria-label': c.label, spellcheck: 'false' });
 						inp.value = cur == null ? '' : String(cur);

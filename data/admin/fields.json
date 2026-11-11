@@ -272,6 +272,11 @@
                 { "value": "ads", "label": "廣告 / 追蹤" },
                 { "value": "telemetry", "label": "遙測 / 驗證" },
                 { "value": "malware", "label": "惡意 / 詐騙" }
+              ] },
+              { "key": "protect", "type": "select", "label": "保護", "pro": true, "options": [
+                { "value": "", "label": "自動（惡意 / 詐騙保護）" },
+                { "value": true, "label": "保護" },
+                { "value": false, "label": "不保護" }
               ] }
             ] }
           ]
@@ -505,6 +510,8 @@
             { "key": "system.maxTlsConnections", "type": "int", "label": "TLS 同時連線上限", "pro": true, "min": 1 },
             { "key": "system.maxQuicConnections", "type": "int", "label": "QUIC 同時連線上限", "pro": true, "min": 1 },
             { "key": "system.memoryWatchdog", "type": "bool", "label": "記憶體不足時自動縮減快取", "pro": true },
+            { "key": "system.memoryGovernor", "type": "bool", "label": "記憶體控制", "help": "記憶體吃緊時依序縮小診斷緩衝、DNS 快取，把 CDN 冷資料移出記憶體（磁碟保留）；記憶體不足時最後才暫時停用優先順序最低的過濾清單（自訂規則與保護清單不停用），寬裕後自動恢復。狀態頁看得到釋出了什麼。", "pro": true },
+            { "key": "system.memoryBudgetMB", "type": "int", "label": "記憶體預算（MB）", "help": "黑潮 DNS 自己最多用多少記憶體；超過就開始釋出。0 = 依等級自動（tiny 24、small 48、standard 128 MB；large 為實體記憶體的 1/8，256–1024 MB）。", "pro": true, "min": 0, "placeholder": "0" },
             { "key": "about.sourceUrl", "type": "text", "label": "原始碼網址", "help": "顯示在頁尾、「關於」與公開頁。GPL-3.0：散布修改過的版本時要提供對應的原始碼，改過程式的話請填自己的原始碼網址（http:// 或 https:// 開頭）；空白 = 官方網址。", "pro": true, "pattern": "^https?://\\S+$", "patternMsg": "請輸入 http:// 或 https:// 開頭的網址", "placeholder": "https://example.com/my-fork" },
             { "key": "system.allowHeavy", "type": "bool", "label": "低階硬體也開啟重功能", "help": "tiny / small 等級預設不開 QUIC、不掃網段；打開後照樣開啟，記憶體不夠時可能變慢。", "pro": true }
           ]
