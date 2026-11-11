@@ -265,6 +265,109 @@ jobs:
           $ssl.Dispose(); $tcp.Dispose()
           if ($served -ne $thumb) { throw "IIS 回應的憑證是 $served，不是 $thumb" }
           Write-Host "IIS 用 $thumb 回應 https://localhost"
+      - name: HTTP.sys 共用（模式 B）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+          if (!(Test-Path $appcmd)) { Write-Host "::warning::這台 runner 沒有 IIS，略過 HTTP.sys 共用測試"; exit 0 }
+          $exe = (Resolve-Path ./target/release/kuroshio.exe).Path
+          $dir = Join-Path $env:RUNNER_TEMP 'httpsys'
+          New-Item -ItemType Directory $dir | Out-Null
+          # IIS 要在執行、而且有 localhost:443 的 HTTPS 繫結（上一步建立的），這樣才是真的跟 IIS 共用 443
+          Start-Service W3SVC
+          $b = & $appcmd list site 'Default Web Site' /text:bindings
+          if ("$b" -notmatch 'https/\*:443:localhost') {
+            & $appcmd set site /site.name:'Default Web Site' "/+bindings.[protocol='https',bindingInformation='*:443:localhost',sslFlags='1']" | Out-Null
+          }
+          & $appcmd start site 'Default Web Site' | Out-Null
+          # 另一張測試憑證（跟 IIS 那一步不同），確認綁定換成黑潮 DNS 的
+          & 'C:\Program Files\Git\usr\bin\openssl.exe' req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost -addext 'subjectAltName=DNS:localhost' -addext 'basicConstraints=critical,CA:FALSE' -keyout "$dir\key.pem" -out "$dir\cert.pem"
+          $want = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile("$dir\cert.pem", "$dir\key.pem").Thumbprint
+          $cfg = @{
+            domain = 'localhost'
+            tls = @{ cert = "$dir\cert.pem"; key = "$dir\key.pem" }
+            listen = @{ plain = @{ binds = @('127.0.0.1'); port = 5338 }; doh = @{ enabled = $true; windowsMode = 'httpsys'; host = '0.0.0.0'; port = 443 } }
+            upstream = @{ pinned = @('udp://8.8.8.8', 'udp://1.1.1.1') }
+            admin = @{ port = 18055; auth = $false }
+            system = @{ persistDir = "$dir\state" }
+          } | ConvertTo-Json -Depth 6
+          Set-Content -Encoding utf8 -Path "$dir\config.json" -Value $cfg
+          $p = Start-Process -PassThru -NoNewWindow $exe -ArgumentList 'run','-c',"$dir\config.json" -RedirectStandardOutput "$dir\out.log" -RedirectStandardError "$dir\err.log"
+          function Show-Log { Get-Content "$dir\out.log", "$dir\err.log" -ErrorAction SilentlyContinue | Write-Host }
+          function Get-Status { Invoke-RestMethod http://127.0.0.1:18055/api/status }
+          try {
+            # 等到網址登記好、憑證綁上（自動同步啟動時就跑一次）
+            $st = $null
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep 1
+              try { $st = Get-Status } catch { continue }
+              if ($st.dohMode.mode -eq 'httpsys' -and (Test-Path "$dir\state\httpsys-cert.json")) { break }
+            }
+            if ($st.dohMode.mode -ne 'httpsys') { Show-Log; throw "模式應該是 httpsys，實際 $($st.dohMode | ConvertTo-Json -Depth 5)" }
+            Write-Host ($st.dohMode | ConvertTo-Json -Depth 5)
+            Write-Host ($st.doh3Provider | ConvertTo-Json)
+            if (@($st.dohMode.urls | Where-Object { -not $_.ok }).Count -gt 0) { Show-Log; throw '有網址沒登記成功' }
+            $d = @($st.listenersDetail | Where-Object { $_.proto -eq 'doh' -and $_.bind -eq 'httpsys' })
+            if ($d.Count -ne 1 -or -not $d[0].ok) { throw "listenersDetail 沒有 doh / httpsys：$($st.listenersDetail | ConvertTo-Json)" }
+            $reg = netsh http show servicestate view=requestq | Out-String
+            if ($reg -notmatch '(?i)https://localhost:443/dns-query/') { Write-Host $reg; throw 'HTTP.sys 沒有 /dns-query/ 的登記' }
+            # 憑證：存放區、netsh 綁定、實際 TLS 回應都是這一張
+            $thumb = (Get-Content "$dir\state\httpsys-cert.json" | ConvertFrom-Json).thumbprint
+            if ($thumb -ne $want) { throw "綁定紀錄是 $thumb，不是 $want" }
+            if (!(Test-Path "Cert:\LocalMachine\My\$thumb")) { throw "憑證存放區裡沒有 $thumb" }
+            $show = (netsh http show sslcert hostnameport=localhost:443 | Out-String) -replace ' ', ''
+            if ($show -notmatch $thumb) { Write-Host $show; throw 'netsh 的綁定不是這張憑證' }
+            $tcp = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 443)
+            $ssl = [System.Net.Security.SslStream]::new($tcp.GetStream(), $false, { $true })
+            $ssl.AuthenticateAsClient('localhost')
+            $served = ([System.Security.Cryptography.X509Certificates.X509Certificate2]$ssl.RemoteCertificate).Thumbprint
+            $ssl.Dispose(); $tcp.Dispose()
+            if ($served -ne $thumb) { throw "HTTP.sys 回應的憑證是 $served，不是 $thumb" }
+            # 真的 DoH 查詢（example.com A，RFC 8484 GET 與 POST）
+            $b64 = 'AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE'
+            [IO.File]::WriteAllBytes("$dir\q.bin", [Convert]::FromBase64String('AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE='))
+            function Test-Dns($file, $meta, $what) {
+              if ($meta -notmatch '^200 application/dns-message') { Show-Log; throw "$what：$meta" }
+              $r = [IO.File]::ReadAllBytes($file)
+              if ($r.Length -lt 12) { throw "$what：回應太短（$($r.Length) bytes）" }
+              if (($r[2] -band 0x80) -eq 0) { throw "$what：不是 DNS 回應" }
+              if (($r[3] -band 0x0f) -ne 0) { throw "$what：RCODE $($r[3] -band 0x0f)" }
+              if (($r[6] * 256 + $r[7]) -lt 1) { throw "$what：沒有答案" }
+              Write-Host "$what：$meta，$($r.Length) bytes，$($r[6] * 256 + $r[7]) 筆答案"
+            }
+            $m = curl.exe -sk --http1.1 -o "$dir\r1.bin" -w '%{http_code} %{content_type}' "https://localhost/dns-query?dns=$b64"
+            Test-Dns "$dir\r1.bin" $m 'DoH GET（HTTP/1.1）'
+            $m = curl.exe -sk -o "$dir\r2.bin" -w '%{http_code} %{content_type}' "https://localhost/dns-query?dns=$b64"
+            Test-Dns "$dir\r2.bin" $m 'DoH GET（curl 預設）'
+            $m = curl.exe -sk -o "$dir\r3.bin" -w '%{http_code} %{content_type}' -H 'content-type: application/dns-message' --data-binary "@$dir\q.bin" 'https://localhost/dns-query'
+            Test-Dns "$dir\r3.bin" $m 'DoH POST'
+            # IIS 自己的站台照常回應 /（不是黑潮 DNS 回的）
+            $h = curl.exe -sk -o NUL -D - 'https://localhost/' | Out-String
+            Write-Host $h
+            if ($h -notmatch 'HTTP/[0-9.]+ 200' -or $h -notmatch '(?i)server: Microsoft-IIS') { throw 'IIS 的 / 沒有照常回應' }
+            # 重新載入（設定頁存檔）：舊的登記移除、新的一輪重新登記，查詢照常
+            $u = (Invoke-RestMethod http://127.0.0.1:18055/api/config).user
+            $null = Invoke-RestMethod -Method Put http://127.0.0.1:18055/api/config -ContentType 'application/json' -Body ($u | ConvertTo-Json -Depth 20)
+            $ok = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep 1
+              $m = curl.exe -sk -o "$dir\r4.bin" -w '%{http_code} %{content_type}' "https://localhost/dns-query?dns=$b64"
+              if ($m -match '^200 application/dns-message') { $ok = $true; break }
+            }
+            if (-not $ok) { Show-Log; throw "重新載入後查詢失敗：$m" }
+            Test-Dns "$dir\r4.bin" $m '重新載入後 DoH GET'
+          } finally {
+            Stop-Process $p -ErrorAction SilentlyContinue
+            Start-Sleep 2
+          }
+          Show-Log
+          # 結束後 HTTP.sys 不再有黑潮 DNS 的網址
+          $reg = netsh http show servicestate view=requestq | Out-String
+          if ($reg -match '(?i)https://localhost:443/dns-query/') { Write-Host $reg; throw '結束後 /dns-query/ 還登記在 HTTP.sys' }
+          $m = curl.exe -sk -o NUL -w '%{http_code}' "https://localhost/dns-query?dns=$b64"
+          if ($m -eq '200') { throw '結束後 /dns-query 還有回應' }
+          Write-Host "結束後 /dns-query 由 IIS 回 $m，登記已移除"
       - name: 打包
         shell: pwsh
         run: |
