@@ -13,8 +13,7 @@
 | `deny` | `[]` | 自訂封鎖的 IP / CIDR：勝過一切（迴路位址除外） |
 | `applyTo` | `["dot","doh","doq","doh3","site"]` | 套用在哪些服務：`dot`、`doh`、`doq`、`doh3`、`site`（公開頁）、`community`（社群共享）、`plain`（區網 DNS 53 埠） |
 | `log` | `true` | 拒絕時記錄（每分鐘最多一行，含這一分鐘的次數） |
-| `autoUpdate` | `false` | 每天下載新的台灣 IP 資料（見第 5 節） |
-| `updateUrl` | 本專案 GitHub 上的 `data/geo/tw-ip.json` | 自動更新的來源 |
+| `autoUpdate` | `true` | 每月在本機重新產生台灣 IP 資料（排程工作 `tw-ip`，見第 5 節）；`false` = 只用隨程式附帶的公版 |
 | `dataFile` | `""` | 指定資料檔；空白 = 唯讀資料目錄的 `geo/tw-ip.json` |
 
 **行為改變（3.0）**：沒有 `access` 區段的舊設定檔也會套用預設值，也就是「只開放台灣」。
@@ -69,7 +68,7 @@ accept 時只有在「這個埠上的每個服務都有套用而且都不允許�
 - DoH / DoH3：每個請求依路徑判斷（社群共享的路徑、DoH 路徑、其他 = 公開頁），不允許回 `403`。
   反向代理（`trustProxy`，對方是本機）時用 `X-Forwarded-For` 的真正來源判斷
 
-規則可以在執行中換掉（好友 IP、自動更新的資料、網卡位址變動），不用重新啟動監聽；設定變更照現有流程整輪重新載入。
+規則可以在執行中換掉（好友 IP、每月在本機產生的新清單、網卡位址變動），不用重新啟動監聽；設定變更照現有流程整輪重新載入。
 
 ### 查詢效率與記憶體
 
@@ -128,19 +127,86 @@ ASN 與持有者名稱對照 RIPE NCC 的 ASN 名稱表（`ftp.ripe.net/ripe/asn
 合併的業者（台灣之星 → 台灣大、亞太 → 遠傳）網段會陸續移到併購方的 ASN；資料裡兩組都保留，大小是 0 表示已經全部移過去。
 2026-11-11 的資料裡台灣之星（AS24157）已經沒有宣告任何網段。
 
-## 5. 自動更新（`access.autoUpdate`）
+## 5. 每月在本機重新產生（排程工作 `tw-ip`）
 
-啟動 10 分鐘後第一次、之後每 24 小時下載 `updateUrl`：格式正確、`generatedAt` 比目前的新、IPv4 總量跟目前的差在 ±20% 以內才換上，
-否則保留舊的並記錄原因。新資料經過快照寫入器存到快照目錄的 `tw-ip.json`（受 Flash 寫入間隔與每日上限限制，規格 05），
-另外寫一份到執行期目錄（記憶體），再執行 `KUROSHIO_ACCESS_HOOK apply`（OpenWrt：重新產生核心層的集合）。
-啟動時快照目錄裡的資料比內建的新（而且大小合理）就用它。
+**沒有中央伺服器**：本專案不架設、也不依賴任何共用伺服器。裝置上的程式不會從本專案（GitHub 或其他地方）下載清單，
+而是由排程工作 `tw-ip` 直接向公開資料來源查詢、在本機算出清單。隨程式附帶的 `data/geo/tw-ip.json` 是「公版」預設值，
+由 GitHub Actions 每月用同一份程式（指令列 `tw-ip`，`.github/workflows/tw-ip.yml`）產生、跟著版本發布；它不是執行期的相依。
+
+### 5.1 資料來源與做法
+
+- 五個 RIR 的 `delegated-*-extended-latest`（APNIC、ARIN、RIPE NCC、LACNIC、AFRINIC），每個好幾 MB：
+  **一次抓一個、邊下載邊一行一行解析**，只留 cc=TW 的 IPv4 / IPv6 配發，整份檔案不放進記憶體；最後用標頭的筆數確認檔案完整。
+- RIPEstat `announced-prefixes`：每個 ASN 一個請求（第 4 節的對照表，共 65 個），帶 `sourceapp=kuroshio-dns`（RIPEstat 對 API 使用者的要求），
+  回應也是邊收邊掃，只留網段。
+- 群組的算法跟第 4 節一樣（ISP 宣告 ∩ 台灣網段，`other` = 台灣 − 所有 ISP）；同樣的輸入一定得到同樣的輸出，
+  排程工作與指令列共用 `kuroshio_jobs::twip`，輸出一模一樣（有測試釘住）。
+
+### 5.2 排程與禮貌
+
+| 設定（`jobs.tw-ip.*`） | 預設 | 說明 |
+|---|---|---|
+| `enabled` | `true` | 也可以用 `access.autoUpdate`（預設 `true`）：兩個都開才會跑；舊設定檔的 `access.autoUpdate: false` = 停用 |
+| `at`、`monthDays` | `"00:50"`、`[1]` | 每月 1 日 00:50（台北時間）… |
+| `jitterDays`、`jitterMin` | `27`、`180` | …再依這台裝置的亂數種子往後挪 0–27 天、0–180 分鐘（種子存在 `jobs.json`，之後固定）：大家不會同時去打同一個來源 |
+| `minAgeDays` | `20` | 排程或補跑時，目前的清單（公版或本機產生）不到 20 天就不跑；「立即執行」照跑 |
+| `pauseSec` | `[5, 30]` | 每個 RIPEstat 請求之間隨機停 5–30 秒；HTTP 429 / 503 照 `Retry-After` 等（2 分鐘以內原地等，更久就暫停稍後續跑） |
+| `retrySec` | `300` | 網路錯誤或資源不夠時多久再試，之後每次加倍（網路錯誤最多 6 小時、資源不夠最多 2 小時） |
+| `maxFailures` | `6` | 連續失敗（含 429）幾次就放棄這一輪 |
+| `deadlineHours` | `72` | 從開始算 3 天還沒完成就放棄這一輪 |
+| `maxMemKB` | `2048` | 進度資料超過就放棄（實測峰值見下） |
+| `maxLoadPerCore` | `2` | 每個核心的 1 分鐘平均負載超過就暫停（讀 `/proc/loadavg`；Windows 不檢查） |
+| `timeoutMin` | `120` | 一次執行最久多久；超過時進度保留，10 分鐘後續跑 |
+
+整輪通常花幾十分鐘（65 個 ASN × 平均 17.5 秒的停頓），慢是故意的。執行中如果有別的排程工作在排隊，會先讓出來，等一下再續跑。
+
+### 5.3 暫停、續跑與放棄（資源不夠時的停止機制）
+
+- 每一步之前檢查：期限、記憶體（主程式的記憶體壓力，集中在 `app::job_memory_short`）、CPU 負載、進度資料的大小、有沒有別的工作在等。
+- 資源不夠或網路錯誤：**暫停**，進度留在記憶體裡（不寫 Flash），過一陣子由排程器續跑，已經抓過的不會重抓；重開機就丟掉，等下次排程從頭來。
+- 超過期限、連續失敗太多次、進度資料太大、驗證沒通過：**放棄這一輪**，丟掉進度、繼續用目前的清單（公版或上次成功的），記錄原因。
+
+### 5.4 換上之前的驗證
+
+格式正確（每個群組都在）、`generatedAt` 比目前的新、台灣 IPv4 總量跟目前的差在 ±20% 以內、
+每個 ISP 群組都有網段（目前就已經是空的除外，例如台灣之星）。不通過就保留目前的清單並記錄原因。
+網段跟目前的完全一樣（只差日期）時什麼都不寫。
+
+### 5.5 換上
+
+規則立刻換上（`Access::set_data`）；經快照寫入器存成快照目錄的 `tw-ip.json.zst`（壓縮、內容沒變不寫，所以 Flash 大約每月寫一次）；
+另外放一份到執行期目錄（記憶體）給指令列用，再執行 `KUROSHIO_ACCESS_HOOK apply`（OpenWrt：重新產生核心層的集合）。
+啟動時快照目錄裡本機產生的資料比公版新（而且大小合理）就用它；程式升級帶來較新的公版時用公版。
+
+### 5.6 實測
+
+計數配置器量「比開始時多用了多少」的峰值（`crates/kuroshio-jobs/tests/twip_mem.rs`）：
+2026-11-11 的真實資料（五個 RIR 檔共 44.7 MB + 65 個 RIPEstat 回應）峰值多用約 365 KB，不含禮貌停頓的處理時間約 1.5 秒（x86 除錯版）；
+產生的清單跟同一份資料用指令列產生的完全一樣。
+
+### 5.7 狀態
+
+`/api/jobs` 的 `detail.tw-ip`、`/api/access` 的 `update`：
+
+| 欄位 | 說明 |
+|---|---|
+| `state` | `idle` / `running` / `paused` / `aborted` / `done` / `skipped` |
+| `reason` | 暫停或放棄的原因 |
+| `progress`、`step` | 例如 `RIR 3/5`、`ASN 41/65`；`{ phase: "rir"\|"asn"\|"build", done, total }` |
+| `startedAt`、`eta`、`resumeAt`、`lastEnd`、`lastSuccess` | Unix 毫秒 |
+| `lastResult` | 上次結果的說明 |
+| `listDate`、`source` | 目前清單的日期；`公版` 或 `本機產生` |
+| `peakMemKB` | 工作自己估計的進度資料峰值 |
+| `text` | 給介面顯示的一句話 |
+
+`/api/access` 另外多 `dataOrigin`（`公版` / `本機產生`）。舊的 `access.updateUrl` 不再使用（記一行說明後略過）。
 
 ## 6. 管理 API 與指令
 
 - `/api/status` 多一個 `access`：`mode`、`applyTo`、`active`、`dataOk`、`failOpen`、`warning`、`generatedAt`、`ranges`、`memoryBytes`、`dataBytes`、
   `denied: { total, byListener: { dot, doh, doq, doh3, site, community, plain } }`、`topDenied: [{ net: "a.b.c.0/24" | "x:y:z::/48", count }]`（前 10）
 - `GET /api/access`：上面全部，加上 `groups: [{ id, name, note, asns, size: { v4, v6_48 }, cidrs: { v4, v6 }, enabled, checked }]`、
-  `selected`（設定的 `groups`）、`allow`、`deny`、`log`、`autoUpdate`、`dataSource`、`total`、`topDenied`（前 50）
+  `selected`（設定的 `groups`）、`allow`、`deny`、`log`、`autoUpdate`、`dataSource`、`dataOrigin`、`update`（第 5.7 節）、`total`、`topDenied`（前 50）
 - `GET /api/access?ip=1.2.3.4`：`{ ip, allowed, reason, mode, applyTo }`
 - rpcd 的 `api` 白名單加了 `/api/access`
 - `kuroshio access check <IP> [--json]`、`kuroshio access groups`：照設定載入（不含好友 IP），不用啟動服務
@@ -161,7 +227,7 @@ ASN 與持有者名稱對照 RIPE NCC 的 ASN 名稱表（`ftp.ripe.net/ripe/asn
   - `open` 模式只剩 `deny`；資料讀不到時也只剩 `deny`；什麼都不用時兩個檔案都移除
 - 不碰區網（LAN 區域的輸入鏈）與 LuCI 的 22 / 80 / 443（除非 DoH 自己就聽 443）
 - `access.sh apply`：由 `kuroshio access nft` 產生，內容沒變就不寫、不重新載入防火牆；`fw4 check` 失敗就移除，絕不讓防火牆載入失敗。
-  init 啟用時套用、停用 / 停止時移除，設定變更（procd reload）時重新產生；自動更新成功後由 `KUROSHIO_ACCESS_HOOK` 呼叫
+  init 啟用時套用、停用 / 停止時移除，設定變更（procd reload）時重新產生；每月的清單換上後由 `KUROSHIO_ACCESS_HOOK` 呼叫
 
 ## 8. Windows
 
@@ -175,5 +241,5 @@ ASN 與持有者名稱對照 RIPE NCC 的 ASN 名稱表（`ftp.ripe.net/ripe/asn
   這裡能減少的是連線數、握手、查詢造成的 CPU 與記憶體負擔，以及掃描與濫用。
 - 人在國外、漫遊（行動網路漫遊時常從國外的閘道出去）、用 VPN 或國外雲端主機的台灣使用者會被擋：改成 `open` 或加進 `allow`。
 - 台灣網段是 RIR 的登記國別，不是地理位置；少數登記在台灣的網段實際在國外使用，反之亦然。
-- 行動網路與業者合併後的網段會變動，所以資料每月重新產生；裝置上可以開 `autoUpdate`。
+- 行動網路與業者合併後的網段會變動，所以資料每月在裝置上重新產生（`autoUpdate`，預設開）。
 - 好友的 IP 每 10 分鐘更新一次，好友剛換 IP 時可能有幾分鐘連不上（只影響有套用 `community` 的情況）。
