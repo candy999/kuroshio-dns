@@ -1,4 +1,4 @@
-//! 設定：`community.*`（kuroshio-config 的 defaults.json / profiles.json / UCI 轉換）
+//! 設定：`community.*`（kuroshio-config 的 defaults.json / UCI 轉換）
 
 use serde_json::Value;
 use std::time::Duration;

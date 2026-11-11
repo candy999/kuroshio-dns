@@ -268,22 +268,22 @@ impl JobsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuroshio_config::{build, Tier};
+    use kuroshio_config::{build_for, Host};
     use serde_json::json;
 
     #[test]
-    fn tier_values() {
-        // 規格 05 第 7 節：同時數、筆數上限依硬體等級
-        let tiny = build(Tier::Tiny, &json!({}));
-        let c = CdnConfig::from_value(&tiny);
-        assert_eq!((c.verify_concurrency, c.max_entries, c.zone_max, c.v6_max), (2, 10000, 2000, 300));
-        let j = JobsConfig::from_value(&tiny);
+    fn derived_values() {
+        // 規格 05 第 7 節：同時數依 CPU 核心數換算；筆數上限是安全上限，不分機器（實際用多少記憶體由記憶體控制決定）
+        let one = build_for(&Host { cores: 1 }, &json!({}));
+        let c = CdnConfig::from_value(&one);
+        assert_eq!((c.verify_concurrency, c.max_entries, c.zone_max, c.v6_max), (2, 200000, 8000, 2000));
+        let j = JobsConfig::from_value(&one);
         assert_eq!(
             (j.scan_concurrency, j.scan_samples, j.candidates_per_provider, j.latency_concurrency),
-            (32, 3, 300, 32)
+            (50, 6, 1500, 32)
         );
-        assert_eq!(kuroshio_config::get(&tiny, "jobs.cdn-scan.enabled"), Some(&json!(false)));
-        let large = CdnConfig::from_value(&build(Tier::Large, &json!({})));
+        assert_eq!(kuroshio_config::get(&one, "jobs.cdn-scan.enabled"), Some(&json!(true)));
+        let large = CdnConfig::from_value(&build_for(&Host { cores: 8 }, &json!({})));
         assert_eq!((large.verify_concurrency, large.max_entries), (8, 200000));
         assert_eq!(large.enabled_alias(), ["cloudflare", "cloudfront", "fastly", "gcore", "azure"]);
         assert!(large.ecs_providers().contains(&"akamai"));

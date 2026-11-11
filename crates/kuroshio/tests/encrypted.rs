@@ -60,7 +60,7 @@ async fn dot_and_doh_serve_queries() {
         // 關掉快速回應：第一個回應就是正式結果（快速回應的 TTL 最多 10 秒）
         "resolver": { "lastResort": [], "rankIps": false, "fastPath": false }
     }));
-    let started = kuroshio::app::start(&cfg, kuroshio_config::Tier::Large).await.unwrap();
+    let started = kuroshio::app::start(&cfg).await.unwrap();
     let dot = started.encrypted.dot.expect("DoT 有啟動");
     let doh = started.encrypted.doh.expect("DoH 有啟動");
 
@@ -197,7 +197,7 @@ async fn plain_http_doh_behind_proxy() {
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
         "resolver": { "lastResort": [], "rankIps": false }
     }));
-    let started = kuroshio::app::start(&cfg, kuroshio_config::Tier::Large).await.unwrap();
+    let started = kuroshio::app::start(&cfg).await.unwrap();
     let doh = started.encrypted.doh.unwrap();
     let body = q(3, "p.test");
     let mut s = tokio::net::TcpStream::connect(doh).await.unwrap();

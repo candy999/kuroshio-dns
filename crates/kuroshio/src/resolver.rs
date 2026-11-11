@@ -157,6 +157,8 @@ pub struct Resolver {
     pub ddr: RwLock<Option<(String, Vec<logic::DdrEndpoint>)>>,
     /// CDN 台灣節點（規格 06）：回應前改寫答案
     pub cdn: RwLock<Option<Arc<kuroshio_cdn::Cdn>>>,
+    /// 記憶體控制暫停 CDN 調整（規格 09 的最低限度）
+    pub cdn_suspended: std::sync::atomic::AtomicBool,
     /// 社群共享（加密監聽上的 `/.well-known/kuroshio/v2`、ALPN `kuroshio/2`）
     pub community: crate::community_bridge::Slot,
     /// 公開頁（DoH 監聽上的首頁與公開 API）
@@ -219,6 +221,7 @@ impl Resolver {
             filter: RwLock::new(None),
             ddr: RwLock::new(None),
             cdn: RwLock::new(None),
+            cdn_suspended: Default::default(),
             community: Default::default(),
             site: std::sync::OnceLock::new(),
             presence: std::sync::OnceLock::new(),
@@ -252,6 +255,14 @@ impl Resolver {
 
     pub fn cdn(&self) -> Option<Arc<kuroshio_cdn::Cdn>> {
         self.cdn.read().unwrap().clone().filter(|c| c.enabled())
+    }
+
+    /// 查詢時要不要做 CDN 調整：記憶體控制到了最低限度（只轉送）時暫停（規格 09），答案照上游原樣
+    fn steer_cdn(&self) -> Option<Arc<kuroshio_cdn::Cdn>> {
+        if self.cdn_suspended.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.cdn()
     }
 
     fn filter_check(&self, name: &str, qtype: u16) -> Option<Verdict> {
@@ -498,7 +509,7 @@ impl Resolver {
         r.answers = e.answers.iter().map(|a| Record { ttl, ..a.clone() }).collect();
         // CDN 調整會改寫答案：要 DNSSEC 記錄或類別不是 IN 的查詢不動（同 job() 的 verbatim）
         let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1;
-        if let Some(cdn) = self.cdn().filter(|_| !verbatim) {
+        if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim) {
             let (qname, qtype) = (&query.questions[0].name, query.questions[0].qtype);
             let res = cdn.apply(&mut r, qname, qtype);
             if let Some(cap) = res.ttl_cap {
@@ -596,7 +607,7 @@ impl Resolver {
         };
         let upq = logic::upstream_query(&query, 0, ecs).encode();
         let mut fast_sent = false;
-        let cdn = self.cdn();
+        let cdn = self.steer_cdn();
 
         let active = self.upstreams.active();
         let results = self

@@ -401,8 +401,7 @@ pub fn validate_config(v: &Value) -> Result<(), String> {
     if !v.is_object() {
         return Err("設定必須是 JSON 物件".into());
     }
-    let tier = kuroshio_config::requested_tier(v).unwrap_or(kuroshio_config::Tier::Standard);
-    let full = kuroshio_config::build(tier, v);
+    let full = kuroshio_config::build(v);
     for (k, want) in [("listen.plain.port", "數字"), ("admin.port", "數字")] {
         if let Some(x) = get(&full, k) {
             if !x.is_u64() {

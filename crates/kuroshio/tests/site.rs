@@ -40,9 +40,9 @@ fn state(cfg: &Value) -> Arc<AppState> {
     let resolver = kuroshio::app::build_resolver(cfg).unwrap();
     Arc::new(AppState {
         resolver,
-        persister: Arc::new(Mutex::new(Persister::new(&dir, kuroshio::app::persist_policy(cfg, false)))),
-        tier: kuroshio_config::Tier::Large,
+        persister: Arc::new(Mutex::new(Persister::new(&dir, kuroshio::app::persist_policy(cfg)))),
         info: kuroshio::sysinfo::SysInfo::detect(),
+        reserve: kuroshio::memgov::reserve_from_cfg(cfg),
         persist_dir: dir.clone(),
         warm_names: 0,
         filter: None,
@@ -62,7 +62,7 @@ fn state(cfg: &Value) -> Arc<AppState> {
 
 fn site(cfg: &Value) -> (Arc<Site>, Arc<AppState>, Option<Arc<Presence>>) {
     let st = state(cfg);
-    let p = Presence::from_cfg(cfg, false);
+    let p = Presence::from_cfg(cfg);
     (Site::new(cfg, st.clone(), p.clone()).expect("site.enabled"), st, p)
 }
 
@@ -437,7 +437,8 @@ async fn read_only_api_and_masking() {
     // 本機的資料夾路徑不給外面看
     assert_eq!(v["system"]["persist"].get("dir"), None);
     assert!(!text(&r).contains(&dir.to_string_lossy().to_string()), "回應裡沒有狀態目錄的路徑");
-    assert!(v["system"]["tier"].is_string(), "其他欄位照舊");
+    assert!(v["system"]["cores"].is_u64(), "其他欄位照舊");
+    assert!(v["system"].get("tier").is_none(), "沒有硬體等級");
     // 本機管理 API 不受影響
     let raw = kuroshio::admin::route(&st, "/api/status", &Default::default()).await.body;
     assert_eq!(raw["stats"]["topClients"][0]["name"], "203.0.113.77");

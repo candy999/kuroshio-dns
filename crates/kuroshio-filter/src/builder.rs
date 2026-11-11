@@ -12,11 +12,11 @@ pub struct BuildOptions {
     /// 網域規則總數上限（設定 `filter.maxDomains`）。依清單順序累計，超過的清單整份不載入；自訂規則永遠載入（但會佔額度）。
     pub max_domains: u64,
     /// 複雜規則（正規表示式、萬用字元、`$dnstype`）上限；超過的清單規則丟掉並計數。自訂規則不受限（但會佔額度）。
-    /// 建議值：tiny 2,000、small 5,000、standard 以上 20,000。
+    /// 預設 20,000（安全上限；記憶體由記憶體控制在載入前估計）。
     pub max_complex: u64,
     /// 其中「沒有可用固定字串」（三字元索引用不上、每次查詢都要跑一次）的正規表示式 / 萬用字元規則上限
     /// （設定 `filter.maxUnindexed`）。這種規則每 2,000 條約讓每次查詢多 0.5 ms；超過的清單規則丟掉並計數。
-    /// 自訂規則不受限（但會佔額度）。建議值：tiny 200、small 500、standard 1,000、large 2,000。
+    /// 自訂規則不受限（但會佔額度）。預設依 CPU 核心數換算：單核心 250、雙核心 500、四核心 1,000、八核心以上 2,000。
     pub max_unindexed: u64,
     /// 設定 `filter.relaxedModifiers`：把 `||domain^$third-party` 之類當成整個網域封鎖（只套用在清單層）
     pub relaxed_modifiers: bool,
@@ -302,6 +302,8 @@ pub struct SourceWriter<'b> {
     start_complex: u64,
     start_budget: u64,
     start_dropped: u64,
+    start_unindexed: u64,
+    start_unindexed_dropped: u64,
 }
 
 /// 單行最長保留多少位元組（超過的部分丟掉，避免異常檔案吃光記憶體）
@@ -318,6 +320,8 @@ impl<'b> SourceWriter<'b> {
             start_complex: b.complex,
             start_budget: b.budget_used,
             start_dropped: b.complex_dropped,
+            start_unindexed: b.unindexed,
+            start_unindexed_dropped: b.unindexed_dropped,
             b,
             source,
             custom,
@@ -355,6 +359,35 @@ impl<'b> SourceWriter<'b> {
     fn push_carry(&mut self, bytes: &[u8]) {
         let room = MAX_LINE.saturating_sub(self.carry.len());
         self.carry.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    /// 從頭來：丟掉這個來源到目前為止餵進來的全部規則與統計（例如本機副本讀到一半壞掉，改成重新下載）
+    pub fn reset(&mut self) {
+        if self.ended || self.over {
+            return;
+        }
+        let (r, k, p, bd) = (self.start_raw, self.start_keyed, self.start_patterns, self.start_bad);
+        let t = self.tier();
+        t.raw.truncate(r);
+        t.keyed.truncate(k);
+        t.patterns.truncate(p);
+        t.bad.truncate(bd);
+        self.b.complex = self.start_complex;
+        self.b.budget_used = self.start_budget;
+        self.b.complex_dropped = self.start_dropped;
+        self.b.unindexed = self.start_unindexed;
+        self.b.unindexed_dropped = self.start_unindexed_dropped;
+        self.carry.clear();
+        self.bom_pending = self.custom;
+        let st = &mut self.b.sources[self.source];
+        st.lines = 0;
+        st.domain_rules = 0;
+        st.complex_rules = 0;
+        st.unsupported = 0;
+        st.regex_unsupported = 0;
+        st.complex_dropped = 0;
+        st.unindexed_dropped = 0;
+        st.badfilter = 0;
     }
 
     /// 結束這個來源，回傳它在 [`FilterStats::sources`] 的索引

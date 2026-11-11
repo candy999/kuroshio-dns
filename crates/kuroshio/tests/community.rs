@@ -33,7 +33,7 @@ async fn community_rides_on_encrypted_listeners() {
         "upstream": { "pinned": ["udp://127.0.0.1:9"], "fallback": [] },
         "resolver": { "lastResort": [] }
     }));
-    let started = kuroshio::app::start(&cfg, kuroshio_config::Tier::Large).await.unwrap();
+    let started = kuroshio::app::start(&cfg).await.unwrap();
     assert!(started.state.community.is_some(), "社群有啟動");
     assert!(dir.join("community").join("key.pem").exists(), "第一次啟動產生金鑰");
     let dot = started.encrypted.dot.unwrap();

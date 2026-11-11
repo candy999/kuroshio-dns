@@ -159,16 +159,6 @@ impl Default for Limits {
     }
 }
 
-impl Limits {
-    /// 小記憶體（Tiny 等級）用的上限
-    pub fn tiny() -> Limits {
-        Limits {
-            top_max: 2_000,
-            anon_sites: 2_000,
-        }
-    }
-}
-
 struct Inner {
     day: Day,
     /// `day` 是哪一天（台北時間的日序；每次查詢只比對數字，換日才產生日期字串）
@@ -702,7 +692,7 @@ impl Stats {
         (now_unix() / 60) as u32
     }
 
-    /// 調整記憶體上限（小記憶體機器用 [`Limits::tiny`]）
+    /// 調整記憶體上限（記憶體吃緊時由記憶體控制縮小熱門排行，見 `shed_tops`）
     pub fn set_limits(&self, l: Limits) {
         self.inner.lock().unwrap().limits = l;
     }

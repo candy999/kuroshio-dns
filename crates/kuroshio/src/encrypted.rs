@@ -3,7 +3,8 @@
 //! - 憑證檔變更 10 秒內自動換上（同 2.x 的 watchCerts）；檔案還不存在時等它出現，每 10 分鐘提醒一次
 //! - DoT：一條連線可以同時送多筆查詢，回應不必照順序（RFC 7766）；閒置 30 秒關閉
 //! - DoH：GET `?dns=` 與 POST `application/dns-message`；憑證留空 = 純 HTTP（給 IIS / 反向代理用）
-//! - 連線數上限依硬體等級（`system.maxTlsConnections`）；記憶體不足時拒絕新連線
+//! - 連線數上限 `system.maxTlsConnections`（預設依 CPU 核心數）；記憶體接近保留量時新連線最多到
+//!   [`LOW_MEMORY_CONNS`] 條，低於保留量一半時暫不接受新的加密連線（區網的明文 DNS 照常回答，規格 09）
 
 use crate::resolver::{Ctx, Resolver};
 use anyhow::{anyhow, Context, Result};
@@ -130,21 +131,29 @@ impl ResolvesServerCert for CertStore {
     }
 }
 
+/// 記憶體接近保留量時，加密連線最多幾條（每條約 30–60 KB）
+pub const LOW_MEMORY_CONNS: usize = 32;
+
 /// 連線數上限與記憶體壓力檢查
 #[derive(Clone)]
 pub struct Limits {
     pub conns: Arc<Semaphore>,
+    max: usize,
 }
 
 impl Limits {
     pub fn new(max: usize) -> Limits {
         Limits {
             conns: Arc::new(Semaphore::new(max.max(1))),
+            max: max.max(1),
         }
     }
     pub(crate) fn admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
-            return None;
+        use crate::sysinfo::Pressure;
+        match crate::app::pressure() {
+            Pressure::Critical => return None,
+            Pressure::Low if self.max - self.conns.available_permits() >= LOW_MEMORY_CONNS => return None,
+            _ => {}
         }
         self.conns.clone().try_acquire_owned().ok()
     }

@@ -80,7 +80,7 @@ async fn lists_custom_priority_and_reload() {
             ]
         }
     }));
-    let started = kuroshio::app::start(&cfg, kuroshio_config::Tier::Large).await.unwrap();
+    let started = kuroshio::app::start(&cfg).await.unwrap();
     let r = started.resolver.clone();
     // 自訂規則啟動時就載入；清單 2 秒後下載
     assert_eq!(resolve(&r, "mine.example").await, RData::A(Ipv4Addr::UNSPECIFIED));
@@ -114,9 +114,11 @@ async fn lists_custom_priority_and_reload() {
         .await
         .body;
     assert_eq!(st["filter"]["lists"], 4);
-    // 記憶體控制（規格 09）：預設開啟，large 等級的預算依實體記憶體
+    // 記憶體控制（規格 09）：預設開啟，系統保留量自動決定（至少 16 MB）
     assert_eq!(st["memory"]["enabled"], true);
-    assert!(st["memory"]["budgetKB"].as_u64().unwrap() >= 8 * 1024);
+    assert!(st["memory"]["reserveKB"].as_u64().unwrap() >= 16 * 1024);
+    assert_eq!(st["memory"]["reserveAuto"], true);
+    assert!(st["memory"]["sizes"]["cacheMax"].as_u64().is_some());
     assert!(st["memory"]["shed"].as_array().unwrap().is_empty());
     assert_eq!(st["system"]["memory"]["state"], st["memory"]["state"]);
     assert_eq!(st["filter"]["notice"], serde_json::Value::Null);
@@ -285,4 +287,142 @@ async fn memory_shedding_of_lists() {
     assert_eq!(st["unloaded"][0]["reason"], "budget");
     assert!(f4.lists_bytes() <= full / 2, "{} / {full}", f4.lists_bytes());
     assert!(f4.check("scam1.example", 1).unwrap().block);
+}
+
+/// 清單伺服器：先送出標頭與一部分內容，之後卡住（模擬很慢、很大的清單下載）
+async fn stalled_list_server() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n||slow.example^\n")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn udp_query(addr: SocketAddr, id: u16, name: &str) -> Option<Message> {
+    let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    c.send_to(&kuroshio_proto::build_query(id, name, 1), addr).await.unwrap();
+    let mut buf = [0u8; 1500];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(3), c.recv_from(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    Message::parse(&buf[..n]).ok()
+}
+
+#[tokio::test]
+async fn plain_dns_answers_before_lists_load() {
+    // 啟動順序（規格 09）：明文 DNS 監聽在清單、CDN 資料庫這些大的載入之前；清單還在下載就已經回答查詢
+    let lists = stalled_list_server().await;
+    let up = upstream().await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-early-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("custom-rules.txt"), "||mine.example^\n").unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "system": { "persistDir": dir.join("state").to_string_lossy() },
+        "admin": { "port": 0, "auth": false },
+        "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
+        "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
+        "resolver": { "lastResort": [], "rankIps": false },
+        "filter": { "customRules": ["./custom-rules.txt"], "lists": [{ "name": "慢", "url": format!("http://{lists}/a.txt"), "category": "ads" }] }
+    }));
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    // 清單下載卡在半路：照樣轉送、照樣套用自訂規則
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let f = started.state.filter.clone().unwrap();
+    assert_eq!(f.list_rules(), 0, "清單還沒載入");
+    let m = udp_query(started.bound[0], 11, "www.example.org")
+        .await
+        .expect("清單還在下載就要回答");
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(1, 2, 3, 4)));
+    let m = udp_query(started.bound[0], 12, "mine.example").await.unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::UNSPECIFIED), "自訂規則啟動時就有效");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn deepest_shed_state_still_forwards_plain_dns() {
+    // 底線（規格 09）：記憶體控制做到最深（含保護清單），區網的明文 DNS 照樣轉送到上游、回答
+    let lists = list_server("||ads.example^\n||evil.example^\n").await;
+    let up = upstream().await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-floor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "system": { "persistDir": dir.join("state").to_string_lossy(), "memoryReserveMB": 64 },
+        "admin": { "port": 0, "auth": false },
+        "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
+        "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
+        "resolver": { "lastResort": [], "rankIps": false },
+        "filter": { "lists": [
+            { "name": "廣告", "url": format!("http://{lists}/ads.txt"), "category": "ads" },
+            { "name": "惡意", "url": format!("http://{lists}/mal.txt"), "category": "malware" }
+        ] }
+    }));
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let g = started.state.memgov.clone().expect("記憶體控制預設開啟");
+    let addr = started.bound[0];
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    let f = started.state.filter.clone().unwrap();
+    assert!(f.list_rules() > 0, "清單載入了");
+    let m = udp_query(addr, 1, "ads.example").await.unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::UNSPECIFIED), "清單有效");
+    // 注入：系統可用記憶體只剩 4 MB（保留 64 MB 的 1/16）
+    let low = kuroshio::memgov::Reading {
+        rss: Some(20 << 20),
+        total: Some(128 << 20),
+        avail: Some(4 << 20),
+        psi: None,
+    };
+    g.set_reader(move || low);
+    let mut now = kuroshio::persist::now_secs();
+    for _ in 0..10 {
+        g.tick(low, now).await;
+        now += 10;
+    }
+    let st = g.status_json();
+    assert_eq!(st["state"], "critical");
+    assert_eq!(st["floor"], true, "到了最低限度");
+    assert_eq!(st["protectedSuspended"], true, "連保護清單都暫停（不讓出來連轉送都會失敗）");
+    assert!(f.all_suspended());
+    assert_eq!(f.list_rules(), 0);
+    assert!(started.resolver.cache.lock().unwrap().max <= kuroshio::memgov::FLOOR_CACHE);
+    started.resolver.flush();
+    // 還是要轉送、回答：原本被清單擋的名稱也照上游回答（只剩轉送）
+    for (i, n) in ["www.example.org", "ads.example", "x.evil.example"].iter().enumerate() {
+        let m = udp_query(addr, 100 + i as u16, n)
+            .await
+            .unwrap_or_else(|| panic!("{n}：最深的狀態也要回答"));
+        assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(1, 2, 3, 4)), "{n}");
+    }
+    // TCP 也一樣
+    let mut t = tokio::net::TcpStream::connect(started.bound[1]).await.unwrap();
+    let q = kuroshio_proto::build_query(9, "tcp.example.org", 1);
+    let mut msg = (q.len() as u16).to_be_bytes().to_vec();
+    msg.extend_from_slice(&q);
+    t.write_all(&msg).await.unwrap();
+    let len = t.read_u16().await.unwrap() as usize;
+    let mut r = vec![0u8; len];
+    t.read_exact(&mut r).await.unwrap();
+    assert_eq!(Message::parse(&r).unwrap().answers[0].data, RData::A(Ipv4Addr::new(1, 2, 3, 4)));
+    // 不會比底線更低：再跑一輪也沒有可以釋出的
+    assert!(g.tick(low, now).await.is_none());
+    // 管理 API 看得到
+    let api = kuroshio::admin::route(&started.state, "/api/status", &Default::default())
+        .await
+        .body;
+    assert_eq!(api["memory"]["floor"], true);
+    assert_eq!(api["memory"]["protectedSuspended"], true);
+    let _ = std::fs::remove_dir_all(&dir);
 }

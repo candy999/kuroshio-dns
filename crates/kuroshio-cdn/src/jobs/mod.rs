@@ -3,7 +3,7 @@
 //! | 工作 | 2.x 預設 | 輸出 |
 //! |---|---|---|
 //! | `ranges::run` | 每週日 03:10 | `state/cdn/ranges/<cdn>-ipv4.txt`、`-ipv6.txt`、`.done`（內容沒變不寫） |
-//! | `scan::run` | 每週日 03:20（tiny 停用） | `state/cdn/scan/<cdn>-ipv4-TW/Global/Dead.txt`、`.done`（內容沒變不寫） |
+//! | `scan::run` | 每週日 03:20（記憶體吃緊時延後） | `state/cdn/scan/<cdn>-ipv4-TW/Global/Dead.txt`、`.done`（內容沒變不寫） |
 //! | `pool::run` | 每天 05:30、節點不足時 | 直接換掉記憶體裡的節點池（快照由外層寫） |
 //!
 //! 範圍與分類檔每週才變一次，直接寫檔（先比對內容、暫存檔 + 改名）；寫完會通知 `Cdn` 重新讀取。

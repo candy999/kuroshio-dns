@@ -261,7 +261,7 @@ async fn admin_api() {
     let (up, _) = upstream(0, answer).await;
     let mut c = cfg(&[up], json!({}));
     c["listen"] = json!({ "plain": { "binds": ["127.0.0.1"], "port": 0 } });
-    let started = kuroshio::app::start(&c, kuroshio_config::Tier::Small).await.unwrap();
+    let started = kuroshio::app::start(&c).await.unwrap();
     let admin = started.admin.unwrap();
     started.resolver.handle(&q(1, "www.example.test", 1), &CTX).await.unwrap();
 
@@ -269,7 +269,8 @@ async fn admin_api() {
     assert_eq!(code, 200);
     assert_eq!(st["stats"]["today"]["query"], 1);
     assert_eq!(st["cacheEntries"], 1);
-    assert_eq!(st["system"]["tier"], "small");
+    assert!(st["system"].get("tier").is_none(), "沒有硬體等級");
+    assert!(st["system"]["memory"]["reserveKB"].as_u64().is_some());
     assert!(st["upstreams"].as_array().unwrap().len() == 1);
 
     started.resolver.set_filter(Some(Arc::new(Block)));
@@ -357,7 +358,7 @@ async fn warmup_from_hot_names() {
     let mut c = cfg(&[up], json!({ "resolver": { "warmRate": 50 } }));
     c["system"]["persistDir"] = json!(dir.to_string_lossy());
     c["listen"] = json!({ "plain": { "binds": ["127.0.0.1"], "port": 0 } });
-    let started = kuroshio::app::start(&c, kuroshio_config::Tier::Large).await.unwrap();
+    let started = kuroshio::app::start(&c).await.unwrap();
     tokio::time::sleep(Duration::from_millis(3400)).await;
     assert_eq!(n.load(Ordering::SeqCst), 3, "開機後重新查詢上次最常用的網域");
     // 用戶第一次查就是快取命中

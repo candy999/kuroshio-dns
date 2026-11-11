@@ -1,7 +1,7 @@
 //! UCI 轉換：對照 2.x 的 openwrt/tools/test-uci-config.js 逐條移植
 
 use kuroshio_config::uci::{overrides, parse_text, Env};
-use kuroshio_config::{build, defaults, get, Tier};
+use kuroshio_config::{build, defaults, get};
 use serde_json::{json, Value};
 
 const DEFAULT_RAW: &str = include_str!("fixtures/default.uci");
@@ -19,7 +19,7 @@ fn env() -> Env {
 }
 
 fn load(text: &str, env: &Env) -> Value {
-    build(Tier::Large, &overrides(&parse_text(text).unwrap(), env))
+    build(&overrides(&parse_text(text).unwrap(), env))
 }
 
 fn g<'a>(v: &'a Value, p: &str) -> &'a Value {
@@ -183,7 +183,7 @@ fn community_endpoints_and_rules() {
 }
 
 #[test]
-fn tier_still_applies_and_user_wins() {
+fn old_tier_keys_ignored_and_user_wins() {
     let o = overrides(
         &parse_text(&default_text().replace(
             "config resolver 'resolver'",
@@ -192,14 +192,20 @@ fn tier_still_applies_and_user_wins() {
         .unwrap(),
         &env(),
     );
-    let tiny = build(Tier::Tiny, &o);
-    assert_eq!(g(&tiny, "resolver.cacheMax"), &json!(7777), "UCI 有填的以 UCI 為準");
-    assert_eq!(g(&tiny, "resolver.parallel"), &json!(2), "沒填的由等級決定");
+    let c = build(&o);
+    assert_eq!(g(&c, "resolver.cacheMax"), &json!(7777), "UCI 有填的以 UCI 為準");
+    assert!(g(&c, "resolver.parallel").is_u64(), "沒填的依 CPU 核心數換算");
+    // 舊版的硬體等級、記憶體預算：接受、不帶進設定（也不會失敗）
     let sys = overrides(
-        &parse_text(&(default_text() + "\nconfig system 'system'\n\toption profile 'small'\n\toption allow_heavy '1'\n")).unwrap(),
+        &parse_text(
+            &(default_text()
+                + "\nconfig system 'system'\n\toption profile 'small'\n\toption tier 'tiny'\n\toption memory_budget_mb '40'\n\toption allow_heavy '1'\n"),
+        )
+        .unwrap(),
         &env(),
     );
-    assert_eq!(kuroshio_config::requested_tier(&sys), Some(Tier::Small));
+    assert!(get(&sys, "system.profile").is_none() && get(&sys, "system.tier").is_none());
+    assert!(get(&sys, "system.memoryBudgetMB").is_none());
     assert_eq!(g(&sys, "system.allowHeavy"), &json!(true));
     // 快照：最久未存（小時）、保留空間（KB）
     let ps = overrides(
@@ -213,12 +219,16 @@ fn tier_still_applies_and_user_wins() {
     let mg = overrides(
         &parse_text(
             &(default_text()
-                + "\nconfig system 'system'\n\toption memory_budget_mb '40'\n\toption memory_governor '0'\n\nconfig filter_list\n\toption url 'https://lists.example.com/a.txt'\n\toption category 'ads'\n\toption protect '1'\n"),
+                + "\nconfig system 'system'\n\toption memory_reserve_mb '40'\n\toption memory_reserve_percent '7'\n\toption oom_score_adj '-300'\n\toption storage_reserve_mb '3'\n\toption storage_reserve_percent '12'\n\toption memory_governor '0'\n\nconfig filter_list\n\toption url 'https://lists.example.com/a.txt'\n\toption category 'ads'\n\toption protect '1'\n"),
         )
         .unwrap(),
         &env(),
     );
-    assert_eq!(g(&mg, "system.memoryBudgetMB"), &json!(40));
+    assert_eq!(g(&mg, "system.memoryReserveMB"), &json!(40));
+    assert_eq!(g(&mg, "system.memoryReservePercent"), &json!(7));
+    assert_eq!(g(&mg, "system.oomScoreAdj"), &json!(-300));
+    assert_eq!(g(&mg, "system.storageReserveMB"), &json!(3));
+    assert_eq!(g(&mg, "system.storageReservePercent"), &json!(12));
     assert_eq!(g(&mg, "system.memoryGovernor"), &json!(false));
     let lists = g(&mg, "filter.lists").as_array().unwrap();
     let a = lists.iter().find(|l| l["url"] == "https://lists.example.com/a.txt").unwrap();

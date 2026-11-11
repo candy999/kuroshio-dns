@@ -9,8 +9,11 @@
 //! - 只有計數變動的檔（`Opts::lazy`，例如 CDN 分片裡的查詢次數）不單獨觸發寫入，只在到了最久未存上限時寫。
 //! - 內容沒變不寫；寫入用暫存檔 + fsync + 改名，斷電不會留下半個檔案。
 //! - 大檔可以壓縮（`set_compress`）：存成 `名稱.zst`，讀的時候兩種格式都接受，寫出壓縮檔後刪掉舊的一般 JSON。
-//! - 寫之前看檔案系統還剩多少空間（`space`）：不夠就依序刪日誌、可重建的檔案；
-//!   還是不夠就只寫核心資料，其他的留在記憶體等下次。
+//! - 儲存空間跟記憶體同一個想法（規格 05 第 5.6 節）：檔案系統留一段**保留空間**（[`StorageReserve`]，
+//!   `system.storageReserveMB` / `system.storageReservePercent`，0 = 自動）。空間在「保留 + 遲滯」以上時，
+//!   可重建、可省略的資料（統計、候選 IP、過濾清單的本機副本……）大方留在磁碟上，重開機更快、少重新下載；
+//!   空間掉到「保留 + 遲滯」以下就依序刪日誌 → 可省略 → 可重建（舊的、大的先刪）；還是不夠就只寫核心資料，
+//!   其他的留在記憶體等下次。核心累積的資料絕不自動刪除。
 //! - 關機時 `flush_all()` 不管間隔與上限，把有變動的都寫出去。
 //! - 很大的檔（CDN 網域分片）用串流：登記的只是「怎麼產生內容」，
 //!   要寫的那一刻才邊序列化邊寫進暫存檔，整份內容不會放在記憶體裡（等寫入間隔的期間也不會）。
@@ -34,8 +37,84 @@ pub const MAX_AGE_HOURS_CAP: u64 = 24;
 pub const MEM_PLENTY_MB: u64 = 256;
 /// 記憶體普通（可用 ≥ 這麼多 MB）：間隔拉長到上限的一半
 pub const MEM_MEDIUM_MB: u64 = 96;
-/// 自動判定的保留空間下限
-pub const MIN_FREE_FLOOR: u64 = 1 << 20;
+const MB: u64 = 1 << 20;
+
+/// 儲存空間的保留量（規格 05 第 5.6 節）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageReserve {
+    pub bytes: u64,
+    pub auto: bool,
+    pub how: String,
+}
+
+impl StorageReserve {
+    /// 遲滯：保留量的一半，至少 1 MB。可省略 / 可重建的資料只在「保留 + 遲滯」以上才寫、以下就刪
+    pub fn margin(&self) -> u64 {
+        (self.bytes / 2).max(MB)
+    }
+    /// 可省略 / 可重建的資料要留下的空間（保留 + 遲滯）
+    pub fn keep_line(&self) -> u64 {
+        self.bytes + self.margin()
+    }
+}
+
+/// 決定儲存空間的保留量（純函式）。
+///
+/// 使用者設定：`system.storageReserveMB`、`system.storageReservePercent`（檔案系統大小的百分比，最多 90%）、
+/// 舊的 `system.minFreeKB`，有填的取最大。都沒填（0）就自動：
+/// - Flash（OpenWrt 的 jffs2 / ubifs overlay、SD 卡、eMMC）：max(1 MB, 檔案系統 10%（最多 64 MB）, 最大一份待寫 × 2)。
+///   jffs2 的垃圾回收要有空的抹除區塊才能搬資料（核心預設保留約 5 個區塊給回收，NOR 每塊 64–256 KB），
+///   空間太滿時寫入會越來越慢、甚至失敗；ubifs 回報的可用空間是估計值（壓縮率不定）。另外要留給
+///   `opkg install`（一般套件 100–500 KB）與改設定檔。
+/// - 記憶體（tmpfs）：max(1 MB, 10%（最多 64 MB）, 最大待寫 × 2)——tmpfs 用的是記憶體，記憶體另外由記憶體控制管。
+/// - 硬碟、SSD、Windows：max(256 MB, 2%（最多 1 GB）, 最大待寫 × 2)：系統更新、分頁檔、暫存檔都要空間，
+///   幾 MB 的狀態檔不該跟它們搶。
+/// - 一律不超過檔案系統的一半。
+pub fn storage_reserve(
+    class: StorageClass,
+    total: Option<u64>,
+    user_mb: u64,
+    user_pct: u64,
+    min_free_kb: u64,
+    largest_pending: u64,
+) -> StorageReserve {
+    let pct = user_pct.min(90);
+    let user = (user_mb * MB)
+        .max(total.map(|t| t / 100 * pct).unwrap_or(0))
+        .max(min_free_kb * 1024);
+    if user > 0 {
+        let mut parts = Vec::new();
+        if user_mb > 0 {
+            parts.push(format!("{user_mb} MB"));
+        }
+        if pct > 0 {
+            parts.push(format!("{pct}%"));
+        }
+        if min_free_kb > 0 {
+            parts.push(format!("minFreeKB {min_free_kb}"));
+        }
+        return StorageReserve {
+            bytes: user,
+            auto: false,
+            how: format!("設定：max({})", parts.join(", ")),
+        };
+    }
+    let (floor, pct_of, cap, how) = match class {
+        StorageClass::Flash => (MB, 10, 64 * MB, "自動（Flash）：max(1 MB, 10%, 最大待寫 × 2)"),
+        StorageClass::Ram => (MB, 10, 64 * MB, "自動（tmpfs）：max(1 MB, 10%, 最大待寫 × 2)"),
+        StorageClass::Disk => (256 * MB, 2, 1024 * MB, "自動（硬碟）：max(256 MB, 2%, 最大待寫 × 2)"),
+    };
+    let by_pct = total.map(|t| (t / 100 * pct_of).min(cap)).unwrap_or(0);
+    let mut bytes = floor.max(by_pct).max(largest_pending * 2);
+    if let Some(t) = total.filter(|t| *t > 0) {
+        bytes = bytes.min(t / 2);
+    }
+    StorageReserve {
+        bytes,
+        auto: true,
+        how: how.into(),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -48,15 +127,16 @@ pub struct Policy {
     pub daily_budget: u64,
     /// 有變動的資料最久放多久一定寫出（秒）
     pub max_age: u64,
-    /// 寫入後至少要留下的可用空間（bytes；0 = 自動：最大一份待寫內容的兩倍，至少 1 MB）
-    pub min_free: u64,
+    /// 儲存保留量的使用者設定（MB、百分比、舊的 minFreeKB；全 0 = 自動，見 [`storage_reserve`]）
+    pub reserve_mb: u64,
+    pub reserve_pct: u64,
+    pub min_free_kb: u64,
 }
 
 impl Policy {
-    /// 依設定與儲存類型決定（`interval_min` = 0 表示自動）。最久未存預設 24 小時
-    pub fn new(class: StorageClass, interval_min: u64, budget_kb: u64, tiny: bool) -> Policy {
+    /// 依設定與儲存類型決定（`interval_min` = 0 表示自動，再依記憶體拉長，見 [`effective_interval`]）。最久未存預設 24 小時
+    pub fn new(class: StorageClass, interval_min: u64, budget_kb: u64) -> Policy {
         let auto = match class {
-            StorageClass::Flash if tiny => 12 * 60,
             StorageClass::Flash => 6 * 60,
             StorageClass::Ram | StorageClass::Disk => 10,
         };
@@ -70,7 +150,9 @@ impl Policy {
             auto_interval: interval_min == 0,
             daily_budget: budget_kb * 1024,
             max_age: 0,
-            min_free: 0,
+            reserve_mb: 0,
+            reserve_pct: 0,
+            min_free_kb: 0,
         }
         .with_max_age_hours(MAX_AGE_HOURS_CAP)
     }
@@ -92,46 +174,63 @@ impl Policy {
         self
     }
 
-    /// 寫入後至少要留下的可用空間（KB，`system.minFreeKB`；0 = 自動）
-    pub fn with_min_free_kb(mut self, kb: u64) -> Policy {
-        self.min_free = kb * 1024;
+    /// 儲存保留量（`system.storageReserveMB`、`system.storageReservePercent`、舊的 `system.minFreeKB`；全 0 = 自動）
+    pub fn with_storage_reserve(mut self, mb: u64, pct: u64, min_free_kb: u64) -> Policy {
+        self.reserve_mb = mb;
+        self.reserve_pct = pct;
+        self.min_free_kb = min_free_kb;
         self
     }
 }
 
-/// 記憶體狀況（看門狗量到的）
+/// 記憶體狀況（記憶體監看量到的；保留量見規格 09）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mem {
     pub total_mb: Option<u64>,
     pub avail_mb: Option<u64>,
+    /// 系統記憶體保留量
+    pub reserve_mb: u64,
 }
 
 impl Mem {
     pub const UNKNOWN: Mem = Mem {
         total_mb: None,
         avail_mb: None,
+        reserve_mb: 0,
     };
 
+    /// 依保留量：低於一半 → 不足；保留 + 遲滯以內 → 偏低（同 `memgov::pressure_of`）
     pub fn pressure(&self) -> Pressure {
-        match (self.total_mb, self.avail_mb) {
-            (Some(t), Some(a)) => crate::sysinfo::pressure(t, a),
-            _ => Pressure::Normal,
+        let Some(a) = self.avail_mb else { return Pressure::Normal };
+        let res = self.reserve_mb << 20;
+        let a = a << 20;
+        if a < res / 2 {
+            Pressure::Critical
+        } else if a < res + crate::memgov::margin(res) {
+            Pressure::Low
+        } else {
+            Pressure::Normal
         }
+    }
+
+    /// 保留量以上還有多少（MB）
+    pub fn headroom_mb(&self) -> Option<u64> {
+        self.avail_mb.map(|a| a.saturating_sub(self.reserve_mb))
     }
 }
 
 /// 實際使用的最短間隔（秒）：只看（儲存類型、設定的間隔、最久未存、記憶體）的純函式（規格 05 第 5.3 節）
 ///
-/// - 記憶體不足（`Critical`）：0，下一輪就寫，寫完放掉記憶體裡的待寫內容
-/// - 記憶體偏低（`Low`）：最多 1 小時
-/// - Flash、自動間隔：可用記憶體 ≥ 256 MB → 最久未存上限；≥ 96 MB → 上限的一半（但不短於預設間隔）；其他 → 預設間隔
+/// - 記憶體不足（`Critical`：可用 < 保留量一半）：0，下一輪就寫，寫完放掉記憶體裡的待寫內容
+/// - 記憶體偏低（`Low`：保留 + 遲滯以內）：最多 1 小時
+/// - Flash、自動間隔：保留量以上還有 ≥ 256 MB → 最久未存上限；≥ 96 MB → 上限的一半（但不短於預設間隔）；其他 → 預設間隔
 /// - 使用者自己設定的間隔、硬碟 / 記憶體：照設定
 /// - 一律不超過最久未存上限
 pub fn effective_interval(p: &Policy, mem: Mem) -> u64 {
     let base = match mem.pressure() {
         Pressure::Critical => return 0,
         Pressure::Low => p.min_interval.min(3600),
-        Pressure::Normal if p.class == StorageClass::Flash && p.auto_interval => match mem.avail_mb {
+        Pressure::Normal if p.class == StorageClass::Flash && p.auto_interval => match mem.headroom_mb() {
             Some(a) if a >= MEM_PLENTY_MB => p.max_age,
             Some(a) if a >= MEM_MEDIUM_MB => p.min_interval.max(p.max_age / 2),
             _ => p.min_interval,
@@ -217,8 +316,12 @@ pub struct Persister {
     mem: Mem,
     compress: CompressFn,
     free_probe: FreeProbe,
+    /// 檔案系統大小（bytes；算百分比的保留量用）
+    fs_total: Option<u64>,
     /// 狀態目錄以外、空間不足時可以刪的檔（日誌）
     extra_files: Vec<(PathBuf, Tier)>,
+    /// 最近因為空間不足刪掉的檔（時間，相對路徑，大小；最多 20 筆）
+    deleted: Vec<(u64, String, u64)>,
 }
 
 /// 內容雜湊：分段餵進去跟整份一次餵結果相同（串流寫入時邊寫邊算）
@@ -283,8 +386,21 @@ impl Persister {
             mem: Mem::UNKNOWN,
             compress: Box::new(|_| false),
             free_probe: Box::new(space::free_bytes),
+            fs_total: None,
             extra_files: Vec::new(),
+            deleted: Vec::new(),
         }
+        .with_fs_total()
+    }
+
+    fn with_fs_total(mut self) -> Persister {
+        self.fs_total = space::total_bytes(&self.dir);
+        self
+    }
+
+    /// 測試用：指定檔案系統大小
+    pub fn set_fs_total(&mut self, t: Option<u64>) {
+        self.fs_total = t;
     }
 
     pub fn policy(&self) -> &Policy {
@@ -322,6 +438,11 @@ impl Persister {
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// 這一份快照在磁碟上的路徑（壓縮的是 .zst）
+    pub fn file_path(&self, name: &str) -> PathBuf {
+        self.stored(name)
     }
 
     /// 實際寫在磁碟上的路徑
@@ -420,11 +541,8 @@ impl Persister {
         }
     }
 
-    /// 寫入後至少要留下的空間
-    fn threshold(&self) -> u64 {
-        if self.policy.min_free > 0 {
-            return self.policy.min_free;
-        }
+    /// 儲存空間的保留量（依設定、檔案系統大小、最大一份待寫內容）
+    pub fn reserve(&self) -> StorageReserve {
         let largest = self
             .entries
             .values()
@@ -432,7 +550,44 @@ impl Persister {
             .map(Self::size_of)
             .max()
             .unwrap_or(0);
-        (largest * 2).max(MIN_FREE_FLOOR)
+        let p = &self.policy;
+        storage_reserve(p.class, self.fs_total, p.reserve_mb, p.reserve_pct, p.min_free_kb, largest)
+    }
+
+    /// 可省略 / 可重建的資料現在能不能多寫 `size` bytes（寫完還在保留 + 遲滯以上）。
+    /// 例如過濾清單的本機副本：空間大方時才留
+    pub fn has_room_for_optional(&self, size: u64) -> bool {
+        match (self.free_probe)(&self.dir) {
+            Some(free) => free >= size + 64 * 1024 + self.reserve().keep_line(),
+            None => true,
+        }
+    }
+
+    /// 目前留在磁碟上的可省略 / 可重建資料（狀態頁用）：（檔數，bytes）
+    pub fn optional_on_disk(&self) -> (usize, u64) {
+        let c = space::candidates(&self.dir, &[]);
+        let v: Vec<_> = c.iter().filter(|c| c.tier != Tier::Log).collect();
+        (v.len(), v.iter().map(|c| c.size).sum())
+    }
+
+    /// `/api/status.persist.storage`：總量、可用、保留量（怎麼來的）、保留量以上還有多少、留著的可省略資料、刪掉的
+    pub fn storage_json(&self) -> Value {
+        let r = self.reserve();
+        let free = self.stats.free_bytes;
+        let (n, bytes) = self.optional_on_disk();
+        json!({
+            "totalBytes": self.fs_total,
+            "freeBytes": free,
+            "reserveBytes": r.bytes,
+            "reserveAuto": r.auto,
+            "reserveHow": r.how,
+            "marginBytes": r.margin(),
+            "headroomBytes": free.map(|f| f.saturating_sub(r.bytes)),
+            "optionalFiles": n,
+            "optionalBytes": bytes,
+            "keepingOptional": free.map_or(true, |f| f >= r.keep_line()),
+            "deleted": self.deleted.iter().rev().map(|(at, rel, size)| json!({ "at": at * 1000, "file": rel, "bytes": size })).collect::<Vec<_>>(),
+        })
     }
 
     fn roll_day(&mut self, now: u64) {
@@ -447,19 +602,23 @@ impl Persister {
         }
     }
 
-    /// 定時檢查可用空間（不寫檔也會檢查）：低於保留空間就先刪日誌、可重建的檔
+    /// 定時檢查可用空間（不寫檔也會檢查）：掉到「保留 + 遲滯」以下就依序刪日誌、可省略、可重建的檔，
+    /// 直到回到線上（核心資料不刪）
     pub fn check_space(&mut self) {
-        let threshold = self.threshold();
+        if let Some(t) = space::total_bytes(&self.dir) {
+            self.fs_total = Some(t);
+        }
+        let line = self.reserve().keep_line();
         let free = (self.free_probe)(&self.dir);
         self.stats.free_bytes = free;
         let Some(free) = free else {
             self.stats.low_space = false;
             return;
         };
-        if free < threshold {
-            let freed = self.make_room(threshold - free, None);
+        if free < line {
+            let freed = self.make_room(line - free, None);
             self.stats.free_bytes = (self.free_probe)(&self.dir);
-            self.stats.low_space = free + freed < threshold;
+            self.stats.low_space = free + freed < line;
         } else {
             self.stats.low_space = false;
         }
@@ -471,7 +630,15 @@ impl Persister {
             .into_iter()
             .filter(|c| keep.map_or(true, |k| c.path != k))
             .collect();
+        let sizes: HashMap<String, u64> = list.iter().map(|c| (c.rel.clone(), c.size)).collect();
         let (gone, freed) = space::free_up(list, |f| f >= need);
+        let now = now_secs();
+        for rel in &gone {
+            if self.deleted.len() >= 20 {
+                self.deleted.remove(0);
+            }
+            self.deleted.push((now, rel.clone(), sizes.get(rel).copied().unwrap_or(0)));
+        }
         for rel in gone {
             // 這份快照被刪掉了：下次登記時就算內容沒變也要重寫
             let name = rel.trim_end_matches(".zst");
@@ -484,7 +651,7 @@ impl Persister {
         freed
     }
 
-    /// 寫這一份之前確認空間：核心資料只要放得下（可以用掉保留空間），其他的寫完還要留下保留空間。
+    /// 寫這一份之前確認空間：核心資料只要放得下（可以用掉保留空間），其他的寫完還要在「保留 + 遲滯」以上。
     /// 不夠就先刪日誌、可重建的檔；還是不夠就不寫（留在記憶體，下次再試），不會寫到一半才失敗
     fn room_for(&mut self, name: &str, size: u64) -> bool {
         let Some(free) = (self.free_probe)(&self.dir) else { return true };
@@ -497,8 +664,8 @@ impl Persister {
         let tier = space::tier_of(&rel);
         // 暫存檔寫好才改名：寫的期間新舊兩份並存
         let need = size.max(4096) + 64 * 1024;
-        let threshold = self.threshold();
-        let required = if tier == Tier::Core { need } else { need + threshold };
+        let line = self.reserve().keep_line();
+        let required = if tier == Tier::Core { need } else { need + line };
         if free >= required {
             self.stats.free_bytes = Some(free);
             return true;
@@ -670,7 +837,8 @@ impl Persister {
             "oldestUnsavedSec": self.oldest_unsaved(now),
             "forcedByAge": st.forced_by_age,
             "freeBytes": st.free_bytes,
-            "minFreeBytes": self.threshold(),
+            "minFreeBytes": self.reserve().bytes,
+            "storage": self.storage_json(),
             "lowSpace": st.low_space,
             "freedBytes": st.freed_bytes,
             "skipped": st.skipped,
@@ -773,56 +941,60 @@ mod tests {
 
     #[test]
     fn policy_intervals() {
-        assert_eq!(Policy::new(StorageClass::Flash, 0, 4096, false).min_interval, 6 * 3600);
-        assert_eq!(Policy::new(StorageClass::Flash, 0, 4096, true).min_interval, 12 * 3600);
-        assert_eq!(
-            Policy::new(StorageClass::Flash, 1, 4096, false).min_interval,
-            3600,
-            "Flash 最短 1 小時"
-        );
-        assert_eq!(Policy::new(StorageClass::Disk, 0, 4096, false).min_interval, 600);
+        assert_eq!(Policy::new(StorageClass::Flash, 0, 4096).min_interval, 6 * 3600);
+        assert_eq!(Policy::new(StorageClass::Flash, 0, 4096).min_interval, 6 * 3600, "不分硬體等級");
+        assert_eq!(Policy::new(StorageClass::Flash, 1, 4096).min_interval, 3600, "Flash 最短 1 小時");
+        assert_eq!(Policy::new(StorageClass::Disk, 0, 4096).min_interval, 600);
         // 最久未存：Flash 1–24 小時；硬碟照舊（間隔一到就寫）
-        let f = |h| Policy::new(StorageClass::Flash, 0, 4096, false).with_max_age_hours(h).max_age;
+        let f = |h| Policy::new(StorageClass::Flash, 0, 4096).with_max_age_hours(h).max_age;
         assert_eq!(f(0), 24 * 3600);
         assert_eq!(f(6), 6 * 3600);
         assert_eq!(f(100), 24 * 3600, "Flash 上最多 24 小時");
-        assert_eq!(Policy::new(StorageClass::Disk, 0, 4096, false).with_max_age_hours(24).max_age, 600);
+        assert_eq!(Policy::new(StorageClass::Disk, 0, 4096).with_max_age_hours(24).max_age, 600);
     }
 
     #[test]
     fn interval_follows_memory() {
+        // 保留 16 MB（遲滯 8 MB）
         let mem = |t, a| Mem {
             total_mb: Some(t),
             avail_mb: Some(a),
+            reserve_mb: 16,
         };
-        let flash = Policy::new(StorageClass::Flash, 0, 4096, false);
-        let tiny = Policy::new(StorageClass::Flash, 0, 4096, true);
+        let flash = Policy::new(StorageClass::Flash, 0, 4096);
         let h = 3600;
-        assert_eq!(effective_interval(&flash, mem(1024, 700)), 24 * h, "記憶體充裕：留到最久未存上限");
+        assert_eq!(
+            effective_interval(&flash, mem(1024, 700)),
+            24 * h,
+            "保留量以上很多：留到最久未存上限"
+        );
         assert_eq!(effective_interval(&flash, mem(256, 150)), 12 * h, "普通：上限的一半");
-        assert_eq!(effective_interval(&flash, mem(128, 60)), 6 * h, "不多：預設間隔");
-        assert_eq!(effective_interval(&tiny, mem(128, 60)), 12 * h);
+        assert_eq!(effective_interval(&flash, mem(128, 60)), 6 * h, "不多：預設間隔（不分硬體等級）");
         assert_eq!(effective_interval(&flash, Mem::UNKNOWN), 6 * h, "量不到：預設間隔");
-        assert_eq!(effective_interval(&flash, mem(128, 16)), h, "偏低：最多 1 小時");
-        assert_eq!(effective_interval(&flash, mem(1024, 50)), 0, "不足：馬上寫");
+        assert_eq!(effective_interval(&flash, mem(128, 20)), h, "保留 + 遲滯以內：最多 1 小時");
+        assert_eq!(effective_interval(&flash, mem(1024, 7)), 0, "低於保留量一半：馬上寫");
+        // 保留量大的機器（使用者設 512 MB）：同樣的可用量，間隔短一些
+        let big = |a| Mem {
+            total_mb: Some(4096),
+            avail_mb: Some(a),
+            reserve_mb: 512,
+        };
+        assert_eq!(effective_interval(&flash, big(700)), h, "可用 700 MB 還在保留 + 遲滯（768 MB）以內");
         // 一律不超過最久未存上限
-        let short = Policy::new(StorageClass::Flash, 0, 4096, false).with_max_age_hours(4);
+        let short = Policy::new(StorageClass::Flash, 0, 4096).with_max_age_hours(4);
         assert_eq!(effective_interval(&short, mem(1024, 700)), 4 * h);
         assert_eq!(effective_interval(&short, mem(128, 60)), 4 * h);
         // 使用者自己設的間隔不跟著記憶體拉長
-        let fixed = Policy::new(StorageClass::Flash, 120, 4096, false);
+        let fixed = Policy::new(StorageClass::Flash, 120, 4096);
         assert_eq!(effective_interval(&fixed, mem(1024, 700)), 2 * h);
         // 硬碟：照舊 10 分鐘
-        assert_eq!(
-            effective_interval(&Policy::new(StorageClass::Disk, 0, 4096, false), mem(4096, 3000)),
-            600
-        );
+        assert_eq!(effective_interval(&Policy::new(StorageClass::Disk, 0, 4096), mem(4096, 3000)), 600);
     }
 
     #[test]
     fn interval_unchanged_and_shutdown() {
         let dir = tmpdir("a");
-        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false));
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
         let t0 = 1_000_000;
         p.stage("pools.json", b"v1".to_vec());
         assert_eq!(p.flush(t0).unwrap(), 1, "第一次直接寫");
@@ -842,7 +1014,7 @@ mod tests {
         assert!(!dir.join("pools.tmp").exists(), "沒有留下暫存檔");
 
         // 重開機：讀回快照後，內容沒變就不會重寫
-        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false));
+        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
         assert_eq!(q.load("pools.json").unwrap(), b"v3");
         q.stage("pools.json", b"v3".to_vec());
         assert_eq!(q.flush(t0 + 100 * 86400).unwrap(), 0);
@@ -852,7 +1024,7 @@ mod tests {
     #[test]
     fn daily_budget_defers() {
         let dir = tmpdir("b");
-        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 1, false)); // 每天 1 KB
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 1)); // 每天 1 KB
         let t = 2_000_000 * 86400 / 86400;
         p.stage_with("a", Snapshot::Bytes(vec![1; 800]), Opts::default(), t);
         p.stage_with("b", Snapshot::Bytes(vec![2; 800]), Opts::default(), t);
@@ -861,7 +1033,7 @@ mod tests {
         assert_eq!(p.stats().pending, 1);
         assert_eq!(p.flush(t + 86400).unwrap(), 1, "隔天額度重算");
         // Disk 不受每日上限限制
-        let mut d = Persister::new(dir.join("disk"), Policy::new(StorageClass::Disk, 0, 1, false));
+        let mut d = Persister::new(dir.join("disk"), Policy::new(StorageClass::Disk, 0, 1));
         d.stage("a", vec![1; 4096]);
         d.stage("b", vec![2; 4096]);
         assert_eq!(d.flush(t).unwrap(), 2);
@@ -872,7 +1044,7 @@ mod tests {
     fn max_age_forces_write_over_budget() {
         // (i) 超過每日寫入量也一樣：變動放到最久未存上限就一定寫出
         let dir = tmpdir("age");
-        let pol = Policy::new(StorageClass::Flash, 0, 1, false).with_max_age_hours(24); // 每天 1 KB
+        let pol = Policy::new(StorageClass::Flash, 0, 1).with_max_age_hours(24); // 每天 1 KB
         let mut p = Persister::new(&dir, pol);
         let t0 = 3_000 * 86400 + 3600;
         p.stage_with("big", Snapshot::Bytes(vec![7; 900]), Opts::default(), t0);
@@ -897,7 +1069,7 @@ mod tests {
     #[test]
     fn counters_only_wait_for_max_age() {
         let dir = tmpdir("lazy");
-        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false).with_max_age_hours(24));
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096).with_max_age_hours(24));
         let t0 = 4_000 * 86400;
         let lazy = Opts {
             lazy: true,
@@ -933,7 +1105,7 @@ mod tests {
         // 舊版留下的一般 JSON
         let body = br#"{"providers":{"cloudflare":{"v4":[{"ip":"104.16.0.1"}]}}}"#.repeat(50);
         std::fs::write(dir.join("cdn/pools.json"), &body).unwrap();
-        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false));
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
         p.set_compress(|n| n.starts_with("cdn/"));
         assert_eq!(p.load("cdn/pools.json").unwrap(), body);
         // 內容沒變也要寫一次新格式（只遷移一次）
@@ -944,7 +1116,7 @@ mod tests {
         assert!(z.len() * 10 < body.len(), "壓縮後 {} / {}", z.len(), body.len());
         assert_eq!(p.stats().bytes_today, z.len() as u64, "寫入量算磁碟上的大小");
         // 重開機：讀得回來、內容沒變不重寫
-        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false));
+        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
         q.set_compress(|n| n.starts_with("cdn/"));
         assert_eq!(q.load("cdn/pools.json").unwrap(), body);
         q.stage("cdn/pools.json", body.clone());
@@ -958,7 +1130,7 @@ mod tests {
         let dir = tmpdir("order");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("old.json"), b"legacy").unwrap();
-        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 1, false)); // 每天 1 KB
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 1)); // 每天 1 KB
         let t = 6_000 * 86400;
         p.stage_with("s0", Snapshot::Bytes(vec![1; 600]), Opts::default(), t);
         p.stage_with("s1", Snapshot::Bytes(vec![2; 600]), Opts::default(), t);
@@ -989,7 +1161,7 @@ mod tests {
         let d2 = dir.clone();
         let l2 = log.clone();
         let b2 = base.clone();
-        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false).with_min_free_kb(1024));
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096).with_storage_reserve(0, 0, 1024));
         p.set_free_probe(move |_| {
             let gone = |p: &Path, n: u64| if p.exists() { 0 } else { n };
             Some(b2.load(Ordering::SeqCst) + gone(&d2.join("stats.json"), 300_000) + gone(&l2, 100_000))
@@ -1035,7 +1207,7 @@ mod tests {
     fn stream_generates_at_write_time() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let dir = tmpdir("s");
-        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false));
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
         let calls = Arc::new(AtomicU32::new(0));
         let ver = Arc::new(AtomicU32::new(1));
         let gen = |calls: &Arc<AtomicU32>, ver: &Arc<AtomicU32>| -> StreamFn {
@@ -1079,7 +1251,7 @@ mod tests {
         assert_eq!(p.stats().pending, 1);
 
         // 每日上限用上次寫入的大小估算
-        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4, false)); // 每天 4 KB
+        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4)); // 每天 4 KB
         assert!(q.load("cdn-domains.json").is_some());
         let now = now_secs() + 7 * 3600;
         q.stage_with("a", Snapshot::Bytes(vec![1; 2000]), Opts::default(), now);
@@ -1088,6 +1260,101 @@ mod tests {
         assert_eq!(q.flush(now).unwrap(), 1, "a 先寫，資料庫（約 3 KB）超過今天的上限");
         assert_eq!(calls.load(Ordering::SeqCst), before, "延後的不產生內容");
         assert_eq!(q.stats().deferred, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn storage_reserve_derivation() {
+        let g = 1u64 << 30;
+        // Flash 自動：max(1 MB, 10%（最多 64 MB）, 最大待寫 × 2)，不超過一半
+        let f = |total, largest| storage_reserve(StorageClass::Flash, total, 0, 0, 0, largest);
+        assert_eq!(f(Some(4 * MB), 0).bytes, MB, "4 MB overlay：1 MB");
+        assert_eq!(f(Some(32 * MB), 0).bytes, 32 * MB / 100 * 10);
+        assert_eq!(f(Some(8 * g), 0).bytes, 64 * MB, "大的 eMMC：最多 64 MB");
+        assert_eq!(f(Some(32 * MB), 3 * MB).bytes, 6 * MB, "最大待寫 × 2");
+        assert_eq!(f(Some(MB), 0).bytes, MB / 2, "不超過一半");
+        assert!(f(None, 0).auto);
+        // 硬碟：max(256 MB, 2%（最多 1 GB）)
+        let d = |total| storage_reserve(StorageClass::Disk, total, 0, 0, 0, 0).bytes;
+        assert_eq!(d(Some(25 * g)), 25 * g / 100 * 2);
+        assert_eq!(d(Some(100 * g)), g, "2% 最多 1 GB");
+        assert_eq!(d(Some(5 * g)), 256 * MB);
+
+        // 使用者：MB、百分比、舊的 minFreeKB，取最大
+        let u = storage_reserve(StorageClass::Flash, Some(100 * MB), 3, 0, 0, 0);
+        assert_eq!((u.bytes, u.auto), (3 * MB, false));
+        assert_eq!(
+            storage_reserve(StorageClass::Flash, Some(100 * MB), 3, 5, 0, 0).bytes,
+            5 * MB,
+            "取大的"
+        );
+        assert_eq!(
+            storage_reserve(StorageClass::Flash, Some(100 * MB), 3, 5, 8192, 0).bytes,
+            8 * MB,
+            "minFreeKB 照樣接受"
+        );
+        assert_eq!(
+            storage_reserve(StorageClass::Flash, Some(100 * MB), 0, 99, 0, 0).bytes,
+            90 * MB,
+            "百分比最多 90%"
+        );
+        // 遲滯：一半，至少 1 MB
+        assert_eq!(u.margin(), 1536 * 1024);
+        assert_eq!(u.keep_line(), 3 * MB + 1536 * 1024);
+    }
+
+    #[test]
+    fn optional_kept_above_reserve_and_pruned_below_core_never() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tmpdir("optional");
+        std::fs::create_dir_all(dir.join("filter-lists")).unwrap();
+        std::fs::create_dir_all(dir.join("cdn")).unwrap();
+        // 保留 2 MB（遲滯 1 MB → 線在 3 MB）
+        let free = Arc::new(AtomicU64::new(10 * MB));
+        let f2 = free.clone();
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096).with_storage_reserve(2, 0, 0));
+        p.set_fs_total(Some(100 * MB));
+        let d2 = dir.clone();
+        p.set_free_probe(move |_| {
+            // 刪掉的檔案大小加回可用空間
+            let back: u64 = ["filter-lists/a.txt.zst", "stats.json"]
+                .iter()
+                .filter(|f| !d2.join(f).exists())
+                .map(|_| 500_000)
+                .sum();
+            Some(f2.load(Ordering::SeqCst) + back)
+        });
+        let t = 9_000 * 86400;
+        // 空間大方：可省略的副本照寫
+        assert!(p.has_room_for_optional(500_000));
+        p.stage_with("filter-lists/a.txt.zst", Snapshot::Bytes(vec![1; 500_000]), Opts::default(), t);
+        p.stage_with("stats.json", Snapshot::Bytes(vec![2; 500_000]), Opts::default(), t);
+        p.stage_with("cdn/pools.json", Snapshot::Bytes(vec![3; 500_000]), Opts::default(), t);
+        assert_eq!(p.flush(t).unwrap(), 3);
+        let st = p.storage_json();
+        assert_eq!(st["reserveBytes"], 2 * MB);
+        assert_eq!(st["reserveAuto"], false);
+        assert_eq!(st["optionalFiles"], 2, "副本與統計都留著");
+        assert_eq!(st["keepingOptional"], true);
+        // 別的程式用掉空間：掉到線（3 MB）以下 → 先刪可省略的（副本），還不夠再刪可重建的；核心不刪
+        free.store(2_800_000, Ordering::SeqCst);
+        assert!(!p.has_room_for_optional(100_000), "接近保留量：不再留副本");
+        p.check_space();
+        assert!(!dir.join("filter-lists/a.txt.zst").exists(), "可省略的最先刪");
+        assert!(dir.join("stats.json").exists(), "刪副本就回到線上：可重建的留著");
+        assert!(dir.join("cdn/pools.json").exists());
+        free.store(MB, Ordering::SeqCst);
+        p.check_space();
+        assert!(!dir.join("stats.json").exists(), "再不夠：刪可重建的");
+        assert!(dir.join("cdn/pools.json").exists(), "核心資料絕不自動刪除");
+        assert!(p.stats().low_space, "還是不夠：回報、只寫核心");
+        let st = p.storage_json();
+        assert_eq!(st["deleted"].as_array().unwrap().len(), 2);
+        // 只寫核心：可重建的留在記憶體
+        p.stage_with("stats.json", Snapshot::Bytes(vec![4; 1000]), Opts::default(), t + 7 * 3600);
+        p.stage_with("cdn/pools.json", Snapshot::Bytes(vec![5; 1000]), Opts::default(), t + 7 * 3600);
+        assert_eq!(p.flush(t + 7 * 3600).unwrap(), 1);
+        assert!(p.is_pending("stats.json") && !p.is_pending("cdn/pools.json"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

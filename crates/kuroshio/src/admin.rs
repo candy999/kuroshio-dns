@@ -456,16 +456,17 @@ fn config_api(st: &Arc<AppState>, req: &Req) -> Response {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| json!({}));
-        let tier = kuroshio_config::requested_tier(&user).unwrap_or(st.tier);
-        let mut effective = kuroshio_config::build(tier, &user);
+        let mut effective = kuroshio_config::build(&user);
         // API Token 之類的密碼不送到瀏覽器：換成遮罩，存檔時遮罩 = 沒改
         let mut user = user;
         crate::webui::mask_secrets(&mut user);
         crate::webui::mask_secrets(&mut effective);
         return ok(json!({
-            "file": file, "user": user, "tier": st.tier.name(),
+            "file": file, "user": user,
             "effective": effective,
-            "defaults": kuroshio_config::build(tier, &json!({})),
+            "defaults": kuroshio_config::build(&json!({})),
+            // 依 CPU 核心數換算的欄位（沒填 = auto）
+            "auto": kuroshio_config::PER_CORE.iter().map(|x| x.0).chain(["resolver.parallel"]).collect::<Vec<_>>(),
         }));
     }
     let mut v: Value = match serde_json::from_slice(&req.body) {
@@ -619,7 +620,7 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             (Some(s), Some(n)) => ok(s.request(n, "手動 (管理介面)")),
         },
         // 規格 02 第 6 節
-        "/api/defaults" => ok(kuroshio_config::build(st.tier, &json!({}))),
+        "/api/defaults" => ok(kuroshio_config::build(&json!({}))),
         "/api/protocols" => ok(json!({
             "plain": true,
             "doh": st.encrypted.doh.map(|a| a.port()), "doh3": st.encrypted.doh3.map(|a| a.port()),

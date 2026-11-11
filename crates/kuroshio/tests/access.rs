@@ -71,7 +71,7 @@ async fn start(tag: &str, up: SocketAddr, access: Value, doh_tls: bool) -> (kuro
         "resolver": { "lastResort": [], "rankIps": false, "fastPath": false },
         "access": a,
     }));
-    (kuroshio::app::start(&cfg, kuroshio_config::Tier::Large).await.unwrap(), dir)
+    (kuroshio::app::start(&cfg).await.unwrap(), dir)
 }
 
 /// 純 HTTP 的 DoH POST（反向代理模式），回傳狀態列

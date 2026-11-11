@@ -1,6 +1,5 @@
-//! 硬體偵測（規格 05）：記憶體、CPU、儲存類型 → 硬體等級
+//! 硬體偵測（規格 05）：記憶體、CPU、儲存類型（沒有硬體等級：大小由記憶體控制動態決定，規格 09）
 
-use kuroshio_config::Tier;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -24,11 +23,6 @@ impl SysInfo {
             arch: std::env::consts::ARCH,
             aes: has_aes(),
         }
-    }
-
-    /// 自動判定的等級；偵測不到記憶體（例如 Windows）當成 large
-    pub fn tier(&self) -> Tier {
-        self.mem_total_mb.map(Tier::from_mem_mb).unwrap_or(Tier::Large)
     }
 
     /// tokio 工作執行緒數：單核心用單執行緒 runtime（回傳 1），多核心最多 4
@@ -243,28 +237,14 @@ pub fn classify_fs(dev: &str, fs: &str) -> StorageClass {
     }
 }
 
-/// 記憶體壓力（規格 05 第 3.2 節的看門狗）
+/// 記憶體壓力（規格 09：依系統保留量判斷，見 `memgov::pressure_of`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Pressure {
     Normal = 0,
-    /// 低於 15% 或 24 MB：縮小快取、暫停背景工作
+    /// 接近保留量（保留量 + 遲滯以內）：背景工作延後、記憶體結構不再長大
     Low = 1,
-    /// 低於 8%：拒絕新的加密連線
+    /// 低於保留量的一半：快照立刻寫出、暫不接受新的加密連線（明文 DNS 照常回答）
     Critical = 2,
-}
-
-pub fn pressure(total_mb: u64, available_mb: u64) -> Pressure {
-    if total_mb == 0 {
-        return Pressure::Normal;
-    }
-    let pct = available_mb * 100 / total_mb;
-    if pct < 8 {
-        Pressure::Critical
-    } else if pct < 15 || available_mb < 24 {
-        Pressure::Low
-    } else {
-        Pressure::Normal
-    }
 }
 
 #[cfg(test)]
@@ -296,13 +276,8 @@ overlayfs:/overlay / overlay rw,noatime,lowerdir=/,upperdir=/overlay/upper 0 0
     }
 
     #[test]
-    fn meminfo_and_pressure() {
+    fn meminfo() {
         let (t, a) = parse_meminfo("MemTotal:         123456 kB\nMemFree:  1 kB\nMemAvailable:      61440 kB\n");
         assert_eq!((t, a), (Some(120), Some(60)));
-        assert_eq!(Tier::from_mem_mb(t.unwrap()), Tier::Tiny);
-        assert_eq!(pressure(120, 60), Pressure::Normal);
-        assert_eq!(pressure(120, 20), Pressure::Low, "低於 24 MB");
-        assert_eq!(pressure(4000, 500), Pressure::Low, "低於 15%");
-        assert_eq!(pressure(4000, 300), Pressure::Critical);
     }
 }

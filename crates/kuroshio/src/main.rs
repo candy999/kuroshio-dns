@@ -5,7 +5,6 @@ mod winsvc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kuroshio::sysinfo::SysInfo;
-use kuroshio_config::Tier;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -312,20 +311,13 @@ fn init_log_to(cfg: Option<&serde_json::Value>, file: Option<&std::path::Path>) 
         .init();
 }
 
-/// 工作執行緒數：單核心用單執行緒 runtime，tiny 最多 2 條（規格 05 第 3.2 節）
+/// 工作執行緒數：單核心用單執行緒 runtime，多核心最多 4 條（規格 05 第 3.2 節）
 fn thread_count(config: &std::path::Path, uci: bool) -> usize {
     let user = user_config(config, uci).unwrap_or_default();
     let n = kuroshio_config::get(&user, "system.workerThreads")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let info = SysInfo::detect();
-    let tier = kuroshio_config::requested_tier(&user).unwrap_or_else(|| info.tier());
-    let t = info.worker_threads(n);
-    if tier == Tier::Tiny && n == 0 {
-        t.min(2)
-    } else {
-        t
-    }
+    SysInfo::detect().worker_threads(n)
 }
 
 pub fn build_runtime(threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
@@ -371,15 +363,15 @@ pub async fn serve(
     loop {
         let current = if uci { None } else { std::fs::read(&config).ok() };
         // 每一輪（設定頁存檔後重新載入）都在自己的執行環境裡跑：結束時所有工作與監聽一起關掉
-        let (cfg, tier, auto, info) = effective(&config, uci)?;
+        let (cfg, info, legacy) = effective(&config, uci)?;
         if first {
-            info!(
-                "硬體等級 {}（{}）：{}，{} 條工作執行緒",
-                tier.name(),
-                if auto { "自動偵測" } else { "設定指定" },
-                describe(&info),
-                threads
-            );
+            info!("{}，{} 條工作執行緒", describe(&info), threads);
+            if !legacy.is_empty() {
+                info!(
+                    "設定裡的 {} 已經不用了：沒有硬體等級，記憶體依系統保留量動態調整（system.memoryReserveMB / memoryReservePercent）",
+                    legacy.join("、")
+                );
+            }
         }
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<bool>>();
@@ -388,17 +380,7 @@ pub async fn serve(
         std::thread::Builder::new().name("kuroshio".into()).spawn(move || {
             let r = (|| -> Result<bool> {
                 let rt = build_runtime(threads)?;
-                let r = rt.block_on(generation(
-                    cfg,
-                    tier,
-                    config2,
-                    uci,
-                    mode,
-                    show_url,
-                    interactive,
-                    slot.clone(),
-                    stop_rx,
-                ));
+                let r = rt.block_on(generation(cfg, config2, uci, mode, show_url, interactive, slot.clone(), stop_rx));
                 *slot.lock().unwrap() = None;
                 rt.shutdown_timeout(std::time::Duration::from_secs(3));
                 r
@@ -561,7 +543,6 @@ fn console_info(
 #[allow(clippy::too_many_arguments)]
 async fn generation(
     cfg: serde_json::Value,
-    tier: Tier,
     config: PathBuf,
     uci: bool,
     mode: &'static str,
@@ -570,7 +551,7 @@ async fn generation(
     console: ConsoleSlot,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<bool> {
-    let started = kuroshio::app::start(&cfg, tier).await?;
+    let started = kuroshio::app::start(&cfg).await?;
     let ui = &started.state.webui;
     if !uci {
         let _ = ui
@@ -712,12 +693,12 @@ fn access_cmd(cmd: AccessCmd) -> Result<()> {
     Ok(())
 }
 
-fn effective(config: &std::path::Path, uci: bool) -> Result<(serde_json::Value, Tier, bool, SysInfo)> {
+/// 合併後的設定、偵測到的硬體、設定裡已經不用的舊欄位（硬體等級、記憶體預算）
+fn effective(config: &std::path::Path, uci: bool) -> Result<(serde_json::Value, SysInfo, Vec<String>)> {
     let user = user_config(config, uci)?;
     let info = SysInfo::detect();
-    let requested = kuroshio_config::requested_tier(&user);
-    let tier = requested.unwrap_or_else(|| info.tier());
-    Ok((kuroshio_config::build(tier, &user), tier, requested.is_none(), info))
+    let legacy = kuroshio_config::legacy_keys(&user);
+    Ok((kuroshio_config::build(&user), info, legacy))
 }
 
 fn describe(info: &SysInfo) -> String {
@@ -800,7 +781,7 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
         Cmd::About { qr, config, uci } => {
             let cfg = effective(&config, uci)
                 .map(|e| e.0)
-                .unwrap_or_else(|_| kuroshio_config::build(Tier::Standard, &serde_json::json!({})));
+                .unwrap_or_else(|_| kuroshio_config::build(&serde_json::json!({})));
             let mut v = kuroshio::about::json(&cfg);
             if qr {
                 v["qrSource"] = serde_json::json!(kuroshio::about::qr_svg(v["source"].as_str().unwrap_or("")));
@@ -917,62 +898,47 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
     Ok(())
 }
 
-/// `kuroshio sysinfo`：偵測結果與等級調整
+/// `kuroshio sysinfo`：偵測結果、記憶體 / 儲存保留量、依 CPU 核心數換算的設定
 fn sysinfo_report(config: &std::path::Path, uci: bool) -> Result<()> {
-    let (cfg, tier, auto, info) = effective(config, uci)?;
+    let (cfg, info, legacy) = effective(config, uci)?;
     println!("硬體：{}", describe(&info));
     if let Some(a) = info.mem_available_mb {
         println!("目前可用記憶體：{a} MB");
     }
+    let res = kuroshio::memgov::reserve_from_cfg(&cfg);
     println!(
-        "硬體等級：{}（{}）",
-        tier.name(),
-        if auto { "自動偵測" } else { "設定指定 system.profile" }
+        "記憶體保留量：{} MB（{}）；可用記憶體低於它就讓出記憶體，高於它 + {} MB 才恢復、長大",
+        res.bytes >> 20,
+        res.how,
+        res.margin() >> 20
     );
-    let p = kuroshio::app::persist_policy(&cfg, tier == Tier::Tiny);
+    let p = kuroshio::app::persist_policy(&cfg);
+    let persister = kuroshio::persist::Persister::new(kuroshio::app::persist_dir(&cfg), p.clone());
+    let sr = persister.reserve();
     println!(
-        "快照目錄：{}（{}），最短間隔 {} 分鐘，每天寫入上限 {} KB",
+        "快照目錄：{}（{}），最短間隔 {} 分鐘，每天寫入上限 {} KB；儲存保留 {} KB（{}）",
         kuroshio::app::persist_dir(&cfg).display(),
         p.class.name(),
         p.min_interval / 60,
-        p.daily_budget / 1024
+        p.daily_budget / 1024,
+        sr.bytes / 1024,
+        sr.how
     );
     let user = user_config(config, uci)?;
-    let mut changes = Vec::new();
-    diff(
-        "",
-        &kuroshio_config::profile(tier),
-        &kuroshio_config::defaults(),
-        &user,
-        &mut changes,
-    );
-    if changes.is_empty() {
-        println!("預設值沒有因為硬體調整。");
-    } else {
-        println!("因為硬體等級調整的預設值（你在設定檔寫了的欄位以你的為準）：");
-        for c in changes {
-            println!("  {c}");
-        }
+    println!("依 CPU 核心數換算的設定（你在設定檔寫了的以你的為準）：");
+    let keys = kuroshio_config::PER_CORE.iter().map(|x| x.0).chain(["resolver.parallel"]);
+    for k in keys {
+        let mine = kuroshio_config::num_or_auto(kuroshio_config::get(&user, k)).is_some();
+        println!(
+            "  {k}: {}{}",
+            kuroshio_config::get(&cfg, k).cloned().unwrap_or_default(),
+            if mine { "（你的設定）" } else { "" }
+        );
+    }
+    if !legacy.is_empty() {
+        println!("已經不用的舊欄位（不影響執行）：{}", legacy.join("、"));
     }
     Ok(())
-}
-
-fn diff(path: &str, prof: &serde_json::Value, def: &serde_json::Value, user: &serde_json::Value, out: &mut Vec<String>) {
-    if let serde_json::Value::Object(m) = prof {
-        for (k, v) in m {
-            let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
-            diff(
-                &p,
-                v,
-                def.get(k).unwrap_or(&serde_json::Value::Null),
-                user.get(k).unwrap_or(&serde_json::Value::Null),
-                out,
-            );
-        }
-    } else {
-        let mark = if user.is_null() { "" } else { "（你的設定優先）" };
-        out.push(format!("{path}: {def} → {prof}{mark}"));
-    }
 }
 
 fn qtype_num(t: &str) -> Option<u16> {

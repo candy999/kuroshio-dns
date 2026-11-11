@@ -8,11 +8,17 @@
 //!   恢復時重新下載。自訂規則與標成「保護」（`protect`，惡意 / 反詐騙預設是）的清單絕不停用。
 //!   停用中的清單在狀態裡列得清清楚楚（`unloaded`、`notice`）。
 //! - 每份清單的命中次數（`hits`）經快照寫入器保存，停用順序會參考它
+//! - 本機副本（規格 05 第 5.6 節）：儲存空間在保留量 + 遲滯以上、記憶體也還能長大時，下載的清單壓縮後留一份在
+//!   `filter-lists/`（可省略類，空間不足時最先刪）。內容沒變不重寫；經快照寫入器寫，照樣受寫入間隔與每日寫入量限制。
+//!   開機先用副本建好過濾器（不必等下載）、記憶體控制停用 / 恢復清單時也用副本；下載失敗時拿副本頂著
 
 use crate::fetch::{self, Outcome, Validators};
 use crate::resolver::{FilterCheck, Verdict};
 use kuroshio_filter::{BuildOptions, Category, Filter, FilterBuilder, ListSpec, SourceStatus};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::hash::Hasher;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -56,6 +62,201 @@ pub struct Unloaded {
 /// 記憶體預算：清單層最多可以用多少 bytes（記憶體控制提供；None = 不限制）
 pub type AllowanceFn = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+/// 本機副本的索引檔
+pub const COPY_INDEX: &str = "filter-lists/index.json";
+
+/// 一份副本的紀錄
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyMeta {
+    /// 快照名稱（`filter-lists/<網址雜湊>.txt.zst`，內容已經是 zstd）
+    pub file: String,
+    /// 原始內容的雜湊（內容沒變就不重寫）
+    pub hash: u64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    /// 壓縮後大小
+    pub bytes: u64,
+    /// 存的時間（Unix 秒）
+    pub at: u64,
+}
+
+/// 過濾清單的本機副本（可省略的資料：空間大方時才留）
+pub struct ListCopies {
+    pub persister: Arc<Mutex<crate::persist::Persister>>,
+    index: Mutex<HashMap<String, CopyMeta>>,
+}
+
+fn url_id(url: &str) -> String {
+    // FNV-1a：穩定、不同平台一樣
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("filter-lists/{h:016x}.txt.zst")
+}
+
+/// 下載時邊算內容雜湊、（空間夠時）邊壓縮
+pub struct CopySink {
+    h: std::collections::hash_map::DefaultHasher,
+    n: u64,
+    enc: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>,
+}
+
+impl CopySink {
+    pub fn new(keep: bool) -> CopySink {
+        CopySink {
+            h: Default::default(),
+            n: 0,
+            enc: keep.then(|| kuroshio_cdn::statefile::encoder(Vec::new()).ok()).flatten(),
+        }
+    }
+    pub fn feed(&mut self, c: &[u8]) {
+        use std::io::Write;
+        self.h.write(c);
+        self.n += c.len() as u64;
+        if let Some(e) = &mut self.enc {
+            if e.write_all(c).is_err() {
+                self.enc = None;
+            }
+        }
+    }
+    /// （內容雜湊，壓縮後的內容）
+    pub fn finish(self) -> (u64, Option<Vec<u8>>) {
+        let mut h = self.h;
+        h.write_u64(self.n);
+        (h.finish(), self.enc.and_then(|e| e.finish().ok()))
+    }
+}
+
+impl ListCopies {
+    pub fn new(persister: Arc<Mutex<crate::persist::Persister>>) -> ListCopies {
+        let mut index = HashMap::new();
+        if let Some(b) = persister.lock().unwrap().load(COPY_INDEX) {
+            if let Ok(Value::Object(m)) = serde_json::from_slice::<Value>(&b) {
+                for (url, v) in m {
+                    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+                    let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    let Some(hash) = s("hash").and_then(|h| u64::from_str_radix(&h, 16).ok()) else {
+                        continue;
+                    };
+                    index.insert(
+                        url.clone(),
+                        CopyMeta {
+                            file: url_id(&url),
+                            hash,
+                            etag: s("etag"),
+                            last_modified: s("lastModified"),
+                            bytes: n("bytes"),
+                            at: n("at"),
+                        },
+                    );
+                }
+            }
+        }
+        ListCopies {
+            persister,
+            index: Mutex::new(index),
+        }
+    }
+
+    /// 現在要不要留副本（空間在保留 + 遲滯以上、記憶體還能長大）；`estimate` = 估計的壓縮後大小
+    pub fn wanted(&self, estimate: u64) -> bool {
+        crate::memgov::growth_allowed() && self.persister.lock().unwrap().has_room_for_optional(estimate)
+    }
+
+    pub fn meta(&self, url: &str) -> Option<CopyMeta> {
+        self.index.lock().unwrap().get(url).cloned()
+    }
+
+    /// 副本在磁碟上（或還在等寫出）
+    pub fn available(&self, url: &str) -> bool {
+        let Some(m) = self.meta(url) else { return false };
+        let p = self.persister.lock().unwrap();
+        p.is_pending(&m.file) || p.file_path(&m.file).exists()
+    }
+
+    /// 讀副本（解壓後一段一段交給 `feed`）。回傳有沒有讀到
+    pub fn read(&self, url: &str, feed: &mut dyn FnMut(&[u8])) -> bool {
+        let Some(m) = self.meta(url) else { return false };
+        let path = self.persister.lock().unwrap().file_path(&m.file);
+        let Ok(f) = std::fs::File::open(&path) else { return false };
+        let Ok(mut dec) = zstd::stream::read::Decoder::new(f) else {
+            return false;
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut n = 0u64;
+        loop {
+            match dec.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => {
+                    h.write(&buf[..k]);
+                    n += k as u64;
+                    feed(&buf[..k]);
+                }
+                Err(_) => return false,
+            }
+        }
+        h.write_u64(n);
+        h.finish() == m.hash
+    }
+
+    /// 下載完成：內容有變（雜湊不同）才登記寫出新的副本；驗證資訊有變就更新索引。回傳有沒有登記新的副本
+    pub fn offer(&self, url: &str, hash: u64, compressed: Option<Vec<u8>>, v: &Validators, now: u64) -> bool {
+        let mut idx = self.index.lock().unwrap();
+        let same = idx.get(url).is_some_and(|m| m.hash == hash);
+        let mut staged = false;
+        if !same {
+            let Some(z) = compressed else { return false };
+            let file = url_id(url);
+            idx.insert(
+                url.to_string(),
+                CopyMeta {
+                    file: file.clone(),
+                    hash,
+                    etag: v.etag.clone(),
+                    last_modified: v.last_modified.clone(),
+                    bytes: z.len() as u64,
+                    at: now,
+                },
+            );
+            self.persister.lock().unwrap().stage(&file, z);
+            staged = true;
+        } else if let Some(m) = idx.get_mut(url) {
+            m.etag = v.etag.clone();
+            m.last_modified = v.last_modified.clone();
+        }
+        let body = Self::index_json(&idx);
+        drop(idx);
+        // 索引內容沒變時，快照寫入器不會重寫
+        self.persister.lock().unwrap().stage(COPY_INDEX, body);
+        staged
+    }
+
+    fn index_json(idx: &HashMap<String, CopyMeta>) -> Vec<u8> {
+        let mut keys: Vec<&String> = idx.keys().collect();
+        keys.sort();
+        let m: serde_json::Map<String, Value> = keys
+            .into_iter()
+            .map(|k| {
+                let c = &idx[k];
+                (
+                    k.clone(),
+                    json!({ "hash": format!("{:016x}", c.hash), "etag": c.etag, "lastModified": c.last_modified, "bytes": c.bytes, "at": c.at }),
+                )
+            })
+            .collect();
+        serde_json::to_vec(&Value::Object(m)).unwrap_or_default()
+    }
+
+    /// 狀態頁：副本份數、大小
+    pub fn status(&self) -> Value {
+        let idx = self.index.lock().unwrap();
+        json!({ "count": idx.len(), "bytes": idx.values().map(|c| c.bytes).sum::<u64>() })
+    }
+}
+
 pub struct FilterService {
     opts: BuildOptions,
     custom_paths: Vec<PathBuf>,
@@ -77,6 +278,12 @@ pub struct FilterService {
     /// 同一時間只有一個重建（定時更新、記憶體控制的停用 / 恢復）
     rebuild_lock: tokio::sync::Mutex<()>,
     allowance: OnceLock<AllowanceFn>,
+    /// 記憶體控制到了最低限度、連保護清單都暫停了（只剩自訂規則）
+    suspended: AtomicBool,
+    /// 暫停前清單層佔的記憶體（恢復時要有這麼多空間的 1.3 倍）
+    suspended_bytes: Mutex<u64>,
+    /// 本機副本（快照寫入器設定好才有）
+    copies: OnceLock<ListCopies>,
 }
 
 /// 清單的停用順序（純函式，方便測試）：保護清單、已經停用的不算；
@@ -131,11 +338,56 @@ impl FilterService {
             unloaded: Mutex::new(Vec::new()),
             rebuild_lock: tokio::sync::Mutex::new(()),
             allowance: OnceLock::new(),
+            suspended: AtomicBool::new(false),
+            suspended_bytes: Mutex::new(0),
+            copies: OnceLock::new(),
         }))
     }
 
     pub fn sources(&self) -> &[ListSource] {
         &self.sources
+    }
+
+    /// 本機副本存在快照目錄的 `filter-lists/`（只能設定一次）
+    pub fn set_copies(&self, p: Arc<Mutex<crate::persist::Persister>>) {
+        let _ = self.copies.set(ListCopies::new(p));
+    }
+
+    pub fn copies(&self) -> Option<&ListCopies> {
+        self.copies.get()
+    }
+
+    /// 開機時：每份啟用的清單都有本機副本 → 先用副本建好過濾器（不必等下載），驗證資訊也接上
+    /// （下一次更新只問「有沒有變」）。回傳有沒有建
+    pub async fn build_from_copies(&self) -> bool {
+        let Some(c) = self.copies.get() else { return false };
+        let _g = self.rebuild_lock.lock().await;
+        let ex = self.excluded();
+        let all = (0..self.sources.len())
+            .filter(|&i| !ex[i])
+            .all(|i| c.available(&self.sources[i].url));
+        if self.sources.is_empty() || !all || self.all_suspended() {
+            return false;
+        }
+        match self.rebuild_with(true).await {
+            Ok(_) => {
+                let mut v = self.validators.lock().unwrap();
+                for (i, s) in self.sources.iter().enumerate() {
+                    if let Some(m) = c.meta(&s.url) {
+                        v[i] = Validators {
+                            etag: m.etag,
+                            last_modified: m.last_modified,
+                        };
+                    }
+                }
+                info!("過濾清單：用本機副本建好（不必等下載），稍後檢查有沒有更新");
+                true
+            }
+            Err(e) => {
+                warn!("用本機副本建過濾器失敗：{e:#}，改成下載");
+                false
+            }
+        }
     }
 
     /// 記憶體控制提供的預算（只能設定一次）
@@ -200,6 +452,10 @@ impl FilterService {
     /// 更新訂閱清單；回傳是否重建。`force` = 不管有沒有變都重新下載
     pub async fn update_lists(&self, force: bool) -> anyhow::Result<bool> {
         let _g = self.rebuild_lock.lock().await;
+        if self.all_suspended() {
+            // 記憶體最低限度：清單暫停中，恢復時才重新載入
+            return Ok(false);
+        }
         if self.sources.is_empty() {
             *self.lists.write().unwrap() = Arc::new(Filter::empty());
             return Ok(false);
@@ -279,6 +535,11 @@ impl FilterService {
 
     /// 依目前的停用名單重新下載、建一份清單層（下載失敗而且原本有清單時保留舊的）。回傳（重建前，重建後）的大小
     async fn rebuild(&self) -> anyhow::Result<(u64, u64)> {
+        self.rebuild_with(false).await
+    }
+
+    /// `prefer_copy` = 有本機副本就用副本（記憶體控制停用 / 恢復清單、開機）；否則下載，下載失敗時拿副本頂著
+    async fn rebuild_with(&self, prefer_copy: bool) -> anyhow::Result<(u64, u64)> {
         let timeout = Duration::from_secs(30);
         let have = self.lists.read().unwrap().stats().lists > 0;
         let ex = self.excluded();
@@ -310,18 +571,56 @@ impl FilterService {
                 validators.push(Validators::default());
                 continue;
             }
+            let copies = self.copies.get();
+            if prefer_copy {
+                if let Some(c) = copies.filter(|c| c.available(&s.url)) {
+                    if c.read(&s.url, &mut |b| w.feed(b)) {
+                        w.end();
+                        let m = c.meta(&s.url).unwrap_or_else(|| unreachable!());
+                        validators.push(Validators {
+                            etag: m.etag,
+                            last_modified: m.last_modified,
+                        });
+                        continue;
+                    }
+                    // 副本壞掉：重新下載（這份清單的規則從頭來）
+                    w.reset();
+                }
+            }
+            let estimate = copies.and_then(|c| c.meta(&s.url)).map_or(1 << 20, |m| m.bytes);
+            let mut sink = CopySink::new(copies.is_some_and(|c| c.wanted(estimate)));
             let r = fetch::get(&s.url, &Validators::default(), self.max_bytes, timeout, |c| {
                 w.feed(c);
+                sink.feed(c);
                 Ok(())
             })
             .await;
-            w.end();
             match r {
-                Ok(Outcome::Done { validators: v, .. }) => validators.push(v),
-                Ok(Outcome::NotModified) => validators.push(Validators::default()),
+                Ok(Outcome::Done { validators: v, .. }) => {
+                    w.end();
+                    if let Some(c) = copies {
+                        let (h, z) = sink.finish();
+                        c.offer(&s.url, h, z, &v, crate::persist::now_secs());
+                    }
+                    validators.push(v)
+                }
+                Ok(Outcome::NotModified) => {
+                    w.end();
+                    validators.push(Validators::default())
+                }
                 Err(e) => {
-                    warn!("下載清單「{}」失敗：{e}", s.name);
-                    errors.push(json!({ "name": s.name, "url": s.url, "error": e.to_string() }));
+                    // 下載失敗：有本機副本就拿副本頂著（這份清單不會整份不見）
+                    let fallback = copies.filter(|c| c.available(&s.url)).is_some_and(|c| {
+                        w.reset();
+                        c.read(&s.url, &mut |b| w.feed(b))
+                    });
+                    w.end();
+                    if fallback {
+                        warn!("下載清單「{}」失敗：{e}；先用本機副本", s.name);
+                    } else {
+                        warn!("下載清單「{}」失敗：{e}", s.name);
+                        errors.push(json!({ "name": s.name, "url": s.url, "error": e.to_string() }));
+                    }
                     validators.push(Validators::default());
                 }
             }
@@ -366,6 +665,10 @@ impl FilterService {
         }
         let before = self.lists.read().unwrap().memory_bytes() as u64;
         let after = f.memory_bytes() as u64;
+        if self.all_suspended() {
+            // 建的期間記憶體控制暫停了全部清單：不換上去
+            anyhow::bail!("過濾清單已暫停（記憶體最低限度），這次建好的不使用");
+        }
         *self.lists.write().unwrap() = Arc::new(f);
         *self.validators.lock().unwrap() = validators;
         let mut status = self.status.lock().unwrap();
@@ -400,6 +703,53 @@ impl FilterService {
         self.lists.read().unwrap().memory_bytes() as u64
     }
 
+    /// 清單層目前的規則數
+    pub fn list_rules(&self) -> u64 {
+        self.lists.read().unwrap().stats().lists
+    }
+
+    /// 全部清單（含保護清單）暫停中
+    pub fn all_suspended(&self) -> bool {
+        self.suspended.load(Ordering::Relaxed)
+    }
+
+    /// 暫停前清單層的大小
+    pub fn suspended_bytes(&self) -> u64 {
+        *self.suspended_bytes.lock().unwrap()
+    }
+
+    /// 記憶體控制的最後一步（規格 09）：暫停全部清單，包括保護清單——只在不讓出來連轉送都會失敗時。
+    /// 立刻換成空的清單層（不用重建），自訂規則照樣有效。回傳釋出的 bytes
+    pub fn suspend_all(&self) -> u64 {
+        self.suspended.store(true, Ordering::Relaxed);
+        let bytes = self.lists_bytes();
+        *self.suspended_bytes.lock().unwrap() = bytes;
+        *self.lists.write().unwrap() = Arc::new(Filter::empty());
+        warn!(
+            "記憶體嚴重不足：暫停全部過濾清單（含保護清單，約 {} KB），只剩自訂規則；DNS 轉送照常",
+            bytes / 1024
+        );
+        self.status.lock().unwrap()["suspended"] = json!(true);
+        bytes
+    }
+
+    /// 恢復全部清單（重新載入；有本機副本時不用下載）。失敗時維持暫停
+    pub async fn resume_all(&self) -> anyhow::Result<()> {
+        let _g = self.rebuild_lock.lock().await;
+        self.suspended.store(false, Ordering::Relaxed);
+        match self.rebuild_with(true).await {
+            Ok(_) => {
+                info!("記憶體恢復：重新載入全部過濾清單");
+                self.status.lock().unwrap()["suspended"] = json!(false);
+                Ok(())
+            }
+            Err(e) => {
+                self.suspended.store(true, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
     /// 停用中的清單
     pub fn unloaded(&self) -> Vec<Unloaded> {
         self.unloaded.lock().unwrap().clone()
@@ -427,7 +777,7 @@ impl FilterService {
             at: crate::persist::now_secs() * 1000,
         };
         self.unloaded.lock().unwrap().push(u.clone());
-        match self.rebuild().await {
+        match self.rebuild_with(true).await {
             Ok((before, after)) => {
                 let bytes = before.saturating_sub(after).max(self.sizes.lock().unwrap()[i].0);
                 let mut list = self.unloaded.lock().unwrap();
@@ -451,10 +801,13 @@ impl FilterService {
     /// 記憶體控制：恢復最後停用的清單（重新下載）。下載失敗時維持停用，由呼叫端退避重試
     pub async fn restore_one(&self) -> anyhow::Result<Option<Unloaded>> {
         let _g = self.rebuild_lock.lock().await;
+        if self.all_suspended() {
+            anyhow::bail!("全部清單暫停中，先恢復全部清單");
+        }
         let Some(u) = self.unloaded.lock().unwrap().pop() else {
             return Ok(None);
         };
-        match self.rebuild().await {
+        match self.rebuild_with(true).await {
             Ok(_) => {
                 let loaded = self.lists.read().unwrap().stats().sources.get(u.idx).map(|s| s.status) == Some(SourceStatus::Loaded);
                 if !loaded {
@@ -513,6 +866,10 @@ impl FilterService {
         let me = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            // 有本機副本：先用副本建好，1 分鐘後再問上游有沒有更新（大多是 304，不必重建）
+            if me.build_from_copies().await {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
             loop {
                 // 記憶體吃緊時延後（重建時新舊兩份會同時存在）
                 let wait = if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
@@ -649,6 +1006,75 @@ impl FilterCheck for FilterService {
             "notice": notice,
             "updatedAt": status["updatedAt"], "errors": status["errors"],
         })
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use crate::persist::{Persister, Policy};
+    use crate::sysinfo::StorageClass;
+
+    #[test]
+    fn list_copy_written_only_when_content_changes() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-listcopy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Arc::new(Mutex::new(Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096))));
+        p.lock().unwrap().set_free_probe(|_| Some(10 << 30));
+        let c = ListCopies::new(p.clone());
+        let url = "https://lists.example.com/ads.txt";
+        let body = b"||ads.example.com^\n||track.example.net^\n".repeat(100);
+        let v = Validators {
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let sink = |b: &[u8]| {
+            let mut s = CopySink::new(true);
+            for ch in b.chunks(7) {
+                s.feed(ch);
+            }
+            s.finish()
+        };
+        let (h, z) = sink(&body);
+        assert!(c.offer(url, h, z, &v, 100), "第一次：登記寫出");
+        let now = crate::persist::now_secs();
+        assert_eq!(p.lock().unwrap().flush(now).unwrap(), 2, "副本 + 索引");
+        let file = c.meta(url).unwrap().file;
+        assert!(file.starts_with("filter-lists/") && file.ends_with(".txt.zst"));
+        assert_eq!(crate::space::tier_of(&file), crate::space::Tier::Optional);
+        // 讀回來跟原本一樣（雜湊也對）
+        let mut back = Vec::new();
+        assert!(c.read(url, &mut |b| back.extend_from_slice(b)));
+        assert_eq!(back, body);
+        // 內容沒變（只有 ETag 變了）：不重寫副本
+        let (h2, z2) = sink(&body);
+        let v2 = Validators {
+            etag: Some("\"v2\"".into()),
+            last_modified: None,
+        };
+        assert!(!c.offer(url, h2, z2, &v2, 200));
+        assert!(!p.lock().unwrap().is_pending(&file), "副本沒有重新登記");
+        assert_eq!(c.meta(url).unwrap().etag.as_deref(), Some("\"v2\""));
+        // 內容變了：重寫
+        let mut body2 = body.clone();
+        body2.extend_from_slice(b"||new.example.org^\n");
+        let (h3, z3) = sink(&body2);
+        assert!(c.offer(url, h3, z3, &v2, 300));
+        assert!(p.lock().unwrap().is_pending(&file));
+        // 重開機：索引讀得回來
+        p.lock().unwrap().flush_all(now).unwrap();
+        let p2 = Arc::new(Mutex::new(Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096))));
+        let c2 = ListCopies::new(p2);
+        assert!(c2.available(url));
+        let mut back = Vec::new();
+        assert!(c2.read(url, &mut |b| back.extend_from_slice(b)));
+        assert_eq!(back, body2);
+        // 沒有空間（記憶體不能長大）時不壓縮
+        crate::memgov::set_growth_allowed(false);
+        assert!(!c2.wanted(1000));
+        crate::memgov::set_growth_allowed(true);
+        assert!(c2.wanted(1000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

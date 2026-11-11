@@ -162,6 +162,8 @@ fn coerce(v: &Value, like: Option<&Value>) -> Value {
         _ if v.is_array() => v.clone(),
         Some(Value::Bool(_)) => Value::Bool(truthy(v)),
         Some(Value::Number(_)) => v.as_str().and_then(num).unwrap_or_else(|| like.cloned().unwrap()),
+        // 預設是 "auto"（依 CPU 核心數換算）：填數字就是數字，其他（auto）照原樣
+        Some(Value::String(a)) if a == "auto" => v.as_str().and_then(num).unwrap_or_else(|| v.clone()),
         None => match v.as_str().and_then(|s| {
             (!s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-'))
                 .then(|| num(s))
@@ -617,7 +619,12 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
             sec(name),
             &[
                 ("min_free_kb", Some("minFreeKB")),
-                ("memory_budget_mb", Some("memoryBudgetMB")),
+                // 舊版的記憶體預算、硬體等級：接受但不使用（規格 09）
+                ("memory_budget_mb", None),
+                ("profile", None),
+                ("tier", None),
+                ("memory_reserve_mb", Some("memoryReserveMB")),
+                ("storage_reserve_mb", Some("storageReserveMB")),
                 ("flash_write_budget_kb", Some("flashWriteBudgetKB")),
             ],
         );

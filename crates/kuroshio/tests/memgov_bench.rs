@@ -95,20 +95,17 @@ async fn memory_ladder_realistic() {
     let tmp = std::env::temp_dir().join(format!("kuroshio-memgov-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("state")).unwrap();
-    let cfg = kuroshio_config::build(
-        kuroshio_config::Tier::Small,
-        &json!({
-            "system": { "persistDir": tmp.join("state"), "runtimeDir": tmp.join("run"), "storageClass": "disk", "memoryGovernor": false },
-            "admin": { "enabled": false },
-            "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
-            "upstream": { "pinned": ["udp://127.0.0.1:9"], "fallback": [] },
-            "resolver": { "lastResort": [], "rankIps": false, "warmNames": 0 },
-            "community": { "enabled": false },
-            "filter": { "customRules": [tmp.join("custom-rules.txt")], "lists": lists },
-            "jobs": { "dns-benchmark": { "enabled": false }, "cdn-pool": { "enabled": false }, "cdn-ranges": { "enabled": false }, "cdn-scan": { "enabled": false } },
-        }),
-    );
-    let started = kuroshio::app::start(&cfg, kuroshio_config::Tier::Small).await.unwrap();
+    let cfg = kuroshio_config::build(&json!({
+        "system": { "persistDir": tmp.join("state"), "runtimeDir": tmp.join("run"), "storageClass": "disk", "memoryGovernor": false },
+        "admin": { "enabled": false },
+        "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
+        "upstream": { "pinned": ["udp://127.0.0.1:9"], "fallback": [] },
+        "resolver": { "lastResort": [], "rankIps": false, "warmNames": 0 },
+        "community": { "enabled": false },
+        "filter": { "customRules": [tmp.join("custom-rules.txt")], "lists": lists },
+        "jobs": { "dns-benchmark": { "enabled": false }, "cdn-pool": { "enabled": false }, "cdn-ranges": { "enabled": false }, "cdn-scan": { "enabled": false } },
+    }));
+    let started = kuroshio::app::start(&cfg).await.unwrap();
     let st = started.state.clone();
     let r = started.resolver.clone();
     let f = st.filter.clone().unwrap();

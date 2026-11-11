@@ -57,9 +57,7 @@ fn js(b: &[u8]) -> Value {
 async fn state_changing_routes_need_post_and_same_origin() {
     let dir = tmp("post");
     // 關掉登入（OpenWrt 的預設）：這時候擋跨站請求只能靠方法與來源檢查
-    let started = kuroshio::app::start(&config(&dir, false), kuroshio_config::Tier::Large)
-        .await
-        .unwrap();
+    let started = kuroshio::app::start(&config(&dir, false)).await.unwrap();
     let admin = started.admin.unwrap();
     let origin = format!("http://{admin}");
 
@@ -144,9 +142,7 @@ async fn login_secrets_and_upload_limits() {
     let cfg_file = dir.join("config.json");
     let user_cfg = json!({ "ddns": { "apiToken": "cf-real-token-123", "zone": "example.com" }, "resolver": { "timeoutMs": 1234 } });
     std::fs::write(&cfg_file, serde_json::to_vec_pretty(&user_cfg).unwrap()).unwrap();
-    let started = kuroshio::app::start(&config(&dir, true), kuroshio_config::Tier::Large)
-        .await
-        .unwrap();
+    let started = kuroshio::app::start(&config(&dir, true)).await.unwrap();
     let admin = started.admin.unwrap();
     let ui = &started.state.webui;
     let _ = ui.config_file.set(cfg_file.clone());

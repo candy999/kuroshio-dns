@@ -21,7 +21,7 @@
 //!
 //! 1. 啟動時（`AppState` 建好之後）：
 //!    ```ignore
-//!    let presence = kuroshio::presence::Presence::from_cfg(cfg, tier == Tier::Tiny); // check.enabled=false 時是 None
+//!    let presence = kuroshio::presence::Presence::from_cfg(cfg); // check.enabled=false 時是 None
 //!    let site = kuroshio::site::Site::new(cfg, state.clone(), presence.clone());      // site.enabled=false 時是 None
 //!    if let Some(s) = &site { s.spawn(); }                                            // 每小時查一次網域自己的 IP
 //!    ```
@@ -42,7 +42,7 @@
 //!    - `serve()` 決定 TTL 時：`if let Some(cap) = presence.own_host_ttl(qname) { ttl = ttl.min(cap) }`，
 //!      寫入快取時也一樣壓短（2.x 連 CNAME 過去的 DDNS 名稱一起壓，見 `resolver.js` 的 `isOwnName`）
 //! 4. 統計想跨重開機保留時：`stats.snapshot()` 交給 `Persister`（例如檔名 `stats.json`），啟動時 `stats.restore()`；
-//!    小記憶體等級可以 `stats.set_limits(Limits::tiny())`。管理 API 的 `/api/routing` 可以改回傳
+//!    記憶體吃緊時記憶體控制會縮小熱門排行（`stats.shed_tops`）。管理 API 的 `/api/routing` 可以改回傳
 //!    `stats.routing_json()`（每天一筆，同 2.x）。
 
 use crate::admin::parse_query;

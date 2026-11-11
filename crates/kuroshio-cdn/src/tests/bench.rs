@@ -21,7 +21,7 @@ fn seed_paths(tag: &str) -> Paths {
 
 /// 種子資料載入後，把所有判定的有效期限往後延（模擬「驗證都還有效」的穩定狀態）
 fn seeded() -> Arc<Cdn> {
-    let cfg = kuroshio_config::build(kuroshio_config::Tier::Large, &json!({}));
+    let cfg = kuroshio_config::build(&json!({}));
     let c = Cdn::load(&cfg, seed_paths("bench"), MockNet::new());
     let far = now_ms() + 30 * 86_400_000;
     c.with_state(|st| {

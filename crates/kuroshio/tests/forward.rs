@@ -46,12 +46,9 @@ fn cfg(upstreams: Vec<String>) -> serde_json::Value {
 async fn udp_and_tcp_forwarding() {
     let up = fake_upstream().await;
     // 一個會逾時的上游 + 一個正常的：並行查詢，正常的那個勝出
-    let started = kuroshio::app::start(
-        &cfg(vec!["udp://127.0.0.1:9".into(), format!("udp://{up}")]),
-        kuroshio_config::Tier::Large,
-    )
-    .await
-    .unwrap();
+    let started = kuroshio::app::start(&cfg(vec!["udp://127.0.0.1:9".into(), format!("udp://{up}")]))
+        .await
+        .unwrap();
     let addr = started.bound[0];
 
     let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -81,9 +78,7 @@ async fn udp_and_tcp_forwarding() {
 
 #[tokio::test]
 async fn all_upstreams_down_gives_servfail() {
-    let started = kuroshio::app::start(&cfg(vec!["udp://127.0.0.1:9".into()]), kuroshio_config::Tier::Large)
-        .await
-        .unwrap();
+    let started = kuroshio::app::start(&cfg(vec!["udp://127.0.0.1:9".into()])).await.unwrap();
     let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     c.send_to(&kuroshio_proto::build_query(1, "x.test", 1), started.bound[0])
         .await
@@ -98,7 +93,7 @@ async fn acl_drops_unlisted_sources() {
     let up = fake_upstream().await;
     let mut c = cfg(vec![format!("udp://{up}")]);
     c["listen"]["plain"]["allowFrom"] = json!(["10.0.0.0/8"]);
-    let started = kuroshio::app::start(&c, kuroshio_config::Tier::Large).await.unwrap();
+    let started = kuroshio::app::start(&c).await.unwrap();
     let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     s.send_to(&kuroshio_proto::build_query(1, "x.test", 1), started.bound[0])
         .await
@@ -109,13 +104,13 @@ async fn acl_drops_unlisted_sources() {
 }
 
 #[tokio::test]
-async fn tiny_tier_asks_two_upstreams_then_hedges() {
-    // tiny：只同時問 2 個；前兩個都是會逾時的位址，第三個正常的要在 300 ms 後被加問，仍然拿到答案
+async fn parallel_two_asks_two_upstreams_then_hedges() {
+    // 只同時問 2 個（單核心的自動值）；前兩個都是會逾時的位址，第三個正常的要在 300 ms 後被加問，仍然拿到答案
     let up = fake_upstream().await;
     let mut c = cfg(vec!["udp://127.0.0.1:9".into(), "udp://127.0.0.1:7".into(), format!("udp://{up}")]);
     c["resolver"]["parallel"] = json!(2);
     c["resolver"]["timeoutMs"] = json!(2000);
-    let started = kuroshio::app::start(&c, kuroshio_config::Tier::Tiny).await.unwrap();
+    let started = kuroshio::app::start(&c).await.unwrap();
     let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let t0 = std::time::Instant::now();
     s.send_to(&kuroshio_proto::build_query(3, "hedge.test", 1), started.bound[0])
@@ -137,9 +132,7 @@ async fn tiny_tier_asks_two_upstreams_then_hedges() {
 async fn udp_truncation_follows_client_edns_size() {
     use kuroshio_proto::message::{Message, Opt, FLAG_TC};
     let up = fake_upstream().await;
-    let started = kuroshio::app::start(&cfg(vec![format!("udp://{up}")]), kuroshio_config::Tier::Large)
-        .await
-        .unwrap();
+    let started = kuroshio::app::start(&cfg(vec![format!("udp://{up}")])).await.unwrap();
     let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let ask = |id: u16, size: Option<u16>| {
         let mut m = Message::parse(&kuroshio_proto::build_query(id, "big.test", 1)).unwrap();

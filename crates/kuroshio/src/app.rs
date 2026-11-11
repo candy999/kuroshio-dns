@@ -9,7 +9,7 @@ use crate::sysinfo::{self, Pressure, StorageClass, SysInfo};
 use crate::upstream::Upstream;
 use crate::upstreams::Manager;
 use anyhow::{bail, Result};
-use kuroshio_config::{get, Tier};
+use kuroshio_config::get;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -309,7 +309,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
                 "doq",
                 &hosts,
                 port,
-                "這台硬體的等級不開 QUIC（system.maxQuicConnections = 0），DoQ 沒有啟動；要強制開請設定 system.maxQuicConnections",
+                "設定了 system.maxQuicConnections = 0（不開 QUIC），DoQ 沒有啟動",
             ),
             Some(pair) => {
                 let certs = store_for(pair);
@@ -372,7 +372,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
                     "doh3",
                     &h3_hosts,
                     h3_port,
-                    "這台硬體的等級不開 QUIC（system.maxQuicConnections = 0），DoH3 沒有啟動",
+                    "設定了 system.maxQuicConnections = 0（不開 QUIC），DoH3 沒有啟動",
                 ),
                 Some(pair) => {
                     let certs = store_for(pair);
@@ -766,13 +766,17 @@ fn start_community(
 type BoxFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// CDN 台灣節點：讀狀態（經過快照寫入器，記下雜湊）、接上解析器、啟動定時檢查
-fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<Persister>>) -> Option<Arc<kuroshio_cdn::Cdn>> {
+/// CDN 網域資料庫：在背景執行緒載入（大的分片要解壓、解析），DNS 監聽已經在回答查詢了
+async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<Persister>>) -> Option<Arc<kuroshio_cdn::Cdn>> {
     if !get(cfg, "cdn.enabled").and_then(Value::as_bool).unwrap_or(true) {
         return None;
     }
     let net: Arc<dyn kuroshio_cdn::Net> = Arc::new(kuroshio_cdn::RealNet::new(resolver.iprank.clone()));
     let paths = kuroshio_cdn::Paths::new(persist_dir(cfg), share_dir(cfg));
-    let cdn = kuroshio_cdn::Cdn::load_with(cfg, paths, net, &|rel| persister.lock().unwrap().load(rel));
+    let (c2, p2) = (cfg.clone(), persister.clone());
+    let cdn = tokio::task::spawn_blocking(move || kuroshio_cdn::Cdn::load_with(&c2, paths, net, &|rel| p2.lock().unwrap().load(rel)))
+        .await
+        .ok()?;
     if !cdn.enabled() {
         return None;
     }
@@ -933,8 +937,9 @@ fn spawn_maintenance(r: Arc<Resolver>, legacy: bool) {
 pub struct AppState {
     pub resolver: Arc<Resolver>,
     pub persister: Arc<Mutex<Persister>>,
-    pub tier: Tier,
     pub info: SysInfo,
+    /// 系統記憶體保留量（規格 09）
+    pub reserve: crate::memgov::Reserve,
     pub persist_dir: PathBuf,
     pub warm_names: usize,
     pub filter: Option<Arc<crate::filtering::FilterService>>,
@@ -963,7 +968,19 @@ impl AppState {
     pub fn memory_json(&self) -> Value {
         match &self.memgov {
             Some(g) => g.status_json(),
-            None => json!({ "enabled": false, "rssKB": sysinfo::rss_bytes().map(|b| b / 1024) }),
+            None => {
+                let r = crate::memgov::Reading::now();
+                json!({
+                    "enabled": false,
+                    "rssKB": r.rss.map(|b| b / 1024),
+                    "availKB": r.avail.map(|b| b / 1024),
+                    "totalKB": r.total.map(|b| b / 1024),
+                    "reserveKB": self.reserve.bytes / 1024,
+                    "reserveAuto": self.reserve.auto,
+                    "reserveHow": self.reserve.how,
+                    "headroomKB": crate::memgov::headroom(&r, &self.reserve).map(|b| b / 1024),
+                })
+            }
         }
     }
 
@@ -973,7 +990,6 @@ impl AppState {
         let mut persist = p.status_json(crate::persist::now_secs());
         persist["dir"] = json!(self.persist_dir);
         json!({
-            "tier": self.tier.name(),
             "memTotalMB": total.or(self.info.mem_total_mb),
             "memAvailableMB": avail,
             "rssKB": sysinfo::rss_kb(),
@@ -1016,7 +1032,7 @@ impl Started {
     }
 }
 
-/// 目前的記憶體壓力（看門狗每 30 秒更新）
+/// 目前的記憶體壓力（記憶體監看依系統保留量更新；離保留量近時每 2–3 秒）
 pub static PRESSURE: AtomicU8 = AtomicU8::new(0);
 
 pub fn pressure() -> Pressure {
@@ -1113,43 +1129,55 @@ pub fn storage_class(cfg: &Value) -> StorageClass {
         .unwrap_or_else(|| sysinfo::storage_class(&persist_dir(cfg)))
 }
 
-pub fn persist_policy(cfg: &Value, tiny: bool) -> Policy {
-    let n = |k: &str| get(cfg, k).and_then(Value::as_u64).unwrap_or(0);
+pub fn persist_policy(cfg: &Value) -> Policy {
+    let n = |k: &str| kuroshio_config::num_or_auto(get(cfg, k)).unwrap_or(0);
     Policy::new(
         storage_class(cfg),
         n("system.persistIntervalMin"),
         n("system.flashWriteBudgetKB").max(64),
-        tiny,
     )
     .with_max_age_hours(n("system.persistMaxAgeHours"))
-    .with_min_free_kb(n("system.minFreeKB"))
+    .with_storage_reserve(
+        n("system.storageReserveMB"),
+        n("system.storageReservePercent"),
+        n("system.minFreeKB"),
+    )
 }
 
 /// 快照寫入器：依設定建立，CDN 的檔壓縮
-pub fn new_persister(cfg: &Value, tiny: bool) -> Persister {
-    let mut p = Persister::new(persist_dir(cfg), persist_policy(cfg, tiny));
+pub fn new_persister(cfg: &Value) -> Persister {
+    let mut p = Persister::new(persist_dir(cfg), persist_policy(cfg));
     p.set_compress(compressed_file);
-    p.set_mem(mem_now());
+    p.set_mem(mem_now(&crate::memgov::reserve_from_cfg(cfg)));
     p
 }
 
-fn spawn_watchdog() {
+/// 記憶體監看（規格 09）：依系統保留量更新整個程式的壓力訊號，記憶體控制開著時順便跑一輪控制。
+/// 離保留量近（兩倍以內）或 PSI 看得到等待時每 2–3 秒量一次，遠的時候 30 秒
+fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov::Governor>>) {
+    use crate::memgov::{poll_interval, pressure_of, Reading};
     tokio::spawn(async move {
         let mut last = Pressure::Normal;
         loop {
-            if let (Some(t), Some(a)) = sysinfo::meminfo() {
-                let p = sysinfo::pressure(t, a);
-                PRESSURE.store(p as u8, Ordering::Relaxed);
-                if p != last {
-                    match p {
-                        Pressure::Normal => info!("記憶體恢復正常（可用 {a} / {t} MB）"),
-                        Pressure::Low => warn!("記憶體偏低（可用 {a} / {t} MB）：縮小快取、暫停背景工作"),
-                        Pressure::Critical => warn!("記憶體不足（可用 {a} / {t} MB）：拒絕新的加密連線"),
-                    }
-                    last = p;
+            let r = match &gov {
+                Some(g) => g.read(),
+                None => Reading::now(),
+            };
+            let p = pressure_of(&r, &reserve);
+            PRESSURE.store(p as u8, Ordering::Relaxed);
+            if p != last {
+                let (a, res) = (r.avail.unwrap_or(0) >> 20, reserve.bytes >> 20);
+                match p {
+                    Pressure::Normal => info!("記憶體恢復正常（可用 {a} MB，保留 {res} MB）"),
+                    Pressure::Low => info!("記憶體接近保留量（可用 {a} MB，保留 {res} MB）：背景工作延後、記憶體結構不再長大"),
+                    Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }
+                last = p;
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            if let Some(g) = &gov {
+                g.tick(r, crate::persist::now_secs()).await;
+            }
+            tokio::time::sleep(Duration::from_secs(poll_interval(&r, &reserve))).await;
         }
     });
 }
@@ -1239,75 +1267,69 @@ fn filter_hits_source(f: Arc<crate::filtering::FilterService>) -> SnapSource {
     })
 }
 
-/// 記憶體控制（規格 09）：預算、釋出階梯，每 30 秒量一次
+/// 記憶體控制（規格 09）：系統保留量、釋出階梯（由 [`spawn_monitor`] 依距離調整頻率呼叫）
 fn start_governor(
-    cfg: &Value,
-    tier: Tier,
+    reserve: crate::memgov::Reserve,
     resolver: &Arc<Resolver>,
     persister: &Arc<Mutex<Persister>>,
     sources: &[SnapSource],
     cdn: Option<&Arc<kuroshio_cdn::Cdn>>,
     filter: Option<&Arc<crate::filtering::FilterService>>,
 ) -> Arc<crate::memgov::Governor> {
-    use crate::memgov::{self, Governor, Reading, Step};
-    let total_mb = sysinfo::mem_bytes().0.map(|b| b / memgov::MB);
-    let mb = match get(cfg, "system.memoryBudgetMB").and_then(Value::as_u64).unwrap_or(0) {
-        0 => memgov::auto_budget_mb(tier, total_mb),
-        n => n,
-    };
-    let budget = mb * memgov::MB;
-    let mut steps: Vec<Box<dyn Step>> = vec![
-        Box::new(memgov::DiagStep::new(resolver.clone())),
-        Box::new(memgov::CacheStep::new(resolver.clone())),
-    ];
+    use crate::memgov::{self, Governor, Step};
+    let cache = memgov::CacheStep::new(resolver.clone());
+    let cap = cache.cap.clone();
+    let mut steps: Vec<Box<dyn Step>> = vec![Box::new(memgov::DiagStep::new(resolver.clone())), Box::new(cache)];
     if let Some(c) = cdn {
         steps.push(Box::new(memgov::CdnStep::new(c.clone(), persister.clone(), sources.to_vec())));
     }
     if let Some(f) = filter {
         steps.push(Box::new(memgov::FilterStep { filter: f.clone() }));
-        // 清單載入前的預算：放不下的不載入
-        let w = Arc::downgrade(f);
+    }
+    steps.push(Box::new(memgov::FloorStep::new(
+        resolver.clone(),
+        cap,
+        cdn.map(|c| (c.clone(), persister.clone(), sources.to_vec())),
+    )));
+    if let Some(f) = filter {
+        steps.push(Box::new(memgov::ProtectedStep { filter: f.clone() }));
+    }
+    let g = Arc::new(Governor::new(reserve.clone(), steps, crate::persist::now_secs()));
+    if let Some(f) = filter {
+        // 清單載入前先看空間：可以長大的部分放不下的不載入
+        let (w, gw, res) = (Arc::downgrade(f), Arc::downgrade(&g), reserve.clone());
         f.set_allowance(Arc::new(move || {
             let f = w.upgrade()?;
-            memgov::list_allowance(&Reading::now(), budget, f.lists_bytes())
+            let r = gw.upgrade().map(|g| g.read()).unwrap_or_else(memgov::Reading::now);
+            memgov::list_allowance(&r, &res, f.lists_bytes())
         }));
     }
-    let g = Arc::new(Governor::new(
-        budget,
-        memgov::Thresholds::default(),
-        steps,
-        crate::persist::now_secs(),
-    ));
-    let how = if get(cfg, "system.memoryBudgetMB").and_then(Value::as_u64).unwrap_or(0) == 0 {
-        "依等級自動"
-    } else {
-        "設定值"
-    };
-    info!("記憶體控制：預算 {mb} MB（{how}）");
-    let g2 = g.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            g2.tick(Reading::now(), crate::persist::now_secs()).await;
-        }
-    });
+    info!(
+        "記憶體控制：系統保留 {} MB（{}），可用記憶體低於保留量時依序讓出記憶體",
+        reserve.bytes >> 20,
+        reserve.how
+    );
     g
 }
 
 /// 目前的記憶體狀況（給快照寫入器決定間隔）
-fn mem_now() -> Mem {
+fn mem_now(reserve: &crate::memgov::Reserve) -> Mem {
     let (total_mb, avail_mb) = sysinfo::meminfo();
-    Mem { total_mb, avail_mb }
+    Mem {
+        total_mb,
+        avail_mb,
+        reserve_mb: reserve.bytes >> 20,
+    }
 }
 
-fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>) {
+fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>, reserve: crate::memgov::Reserve) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(300)).await;
             stage_sources(&p, &sources);
             let mut p = p.lock().unwrap();
             // 記憶體越多、留在記憶體越久；記憶體吃緊時提早寫出、放掉待寫內容
-            p.set_mem(mem_now());
+            p.set_mem(mem_now(&reserve));
             p.check_space();
             if let Err(e) = p.flush(crate::persist::now_secs()) {
                 warn!("寫入快照失敗：{e}");
@@ -1316,12 +1338,14 @@ fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>) {
     });
 }
 
-pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
-    let tiny = tier == Tier::Tiny;
+pub async fn start(cfg: &Value) -> Result<Started> {
+    // 記憶用完時核心不優先停掉 DNS（規格 09）：代價是本程式自己要先讓出記憶體
+    crate::memgov::apply_oom_from_cfg(cfg);
+    let reserve = crate::memgov::reserve_from_cfg(cfg);
     // 設定頁 / 指令列匯入的備份：在讀取任何狀態之前合併（上一輪關機時已經把記憶體寫出）
     let backup = crate::backup::Locations::from_cfg(cfg);
     crate::backup::apply_pending(&backup);
-    let persister = Arc::new(Mutex::new(new_persister(cfg, tiny)));
+    let persister = Arc::new(Mutex::new(new_persister(cfg)));
     {
         let p = persister.lock().unwrap();
         if p.policy().class == StorageClass::Ram {
@@ -1330,9 +1354,6 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
                 persist_dir(cfg).display()
             );
         }
-    }
-    if get(cfg, "system.memoryWatchdog").and_then(Value::as_bool).unwrap_or(true) {
-        spawn_watchdog();
     }
     // 第一次啟動：state 還是空的就帶入種子資料（評測結果、節點池、網站驗證紀錄）
     // （apply_seeds 自己會記錄帶入了哪些）
@@ -1347,30 +1368,16 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     let _ = resolver.access.set(access.clone());
     crate::ipfilter::spawn_tasks(access, persister.clone(), runtime_dir(cfg));
     // 統計歷史（公開頁 7 / 30 天）：重開機後接續
-    if tiny {
-        resolver.stats.set_limits(crate::stats::Limits::tiny());
-    }
     if let Some(b) = persister.lock().unwrap().load(STATS_FILE) {
         resolver.stats.restore(&b);
     }
-    if let Some(p) = crate::presence::Presence::from_cfg(cfg, tiny) {
+    if let Some(p) = crate::presence::Presence::from_cfg(cfg) {
         let _ = resolver.presence.set(p);
-    }
-    let cdn = start_cdn(cfg, &resolver, &persister);
-    if cdn.is_none() {
-        spawn_wan_subnet(resolver.clone(), None);
-    }
-    let mut snap_sources: Vec<SnapSource> = Vec::new();
-    {
-        let r = resolver.clone();
-        snap_sources.push(bytes_source(move || vec![(STATS_FILE.to_string(), r.stats.snapshot())]));
-    }
-    if let Some(c) = &cdn {
-        snap_sources.push(cdn_source(c.clone()));
     }
     let governor_on = get(cfg, "system.memoryGovernor").and_then(Value::as_bool).unwrap_or(true);
     spawn_maintenance(resolver.clone(), !governor_on);
-    // 過濾：自訂規則與清單路徑以設定目錄（快照目錄的上一層）為基準
+    // 過濾：自訂規則與清單路徑以設定目錄（快照目錄的上一層）為基準。自訂規則很小，先載入；
+    // 訂閱清單在背景下載 / 讀本機副本（載入期間照樣回答查詢）
     let base_dir = persist_dir(cfg)
         .parent()
         .map(|p| p.to_path_buf())
@@ -1380,14 +1387,11 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         if let Some(b) = persister.lock().unwrap().load(crate::filtering::HITS_FILE) {
             f.restore_hits(&b);
         }
-        snap_sources.push(filter_hits_source(f.clone()));
+        f.set_copies(persister.clone());
         f.spawn();
         resolver.set_filter(Some(f.clone()));
     }
-    let warm_names = get(cfg, "resolver.warmNames").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let warm_rate = get(cfg, "resolver.warmRate").and_then(Value::as_u64).unwrap_or(20);
-    spawn_warmup(resolver.clone(), persister.clone(), warm_rate);
-    spawn_hot_names(resolver.clone(), persister.clone(), warm_names);
+    // 明文 DNS 監聽：越早越好（重新啟動時區網斷線的時間越短）。CDN 網域資料庫、過濾清單等大的載入都在這之後
     let acl_list = strings(get(cfg, "listen.plain.allowFrom"));
     let server = Arc::new(Server {
         resolver: resolver.clone(),
@@ -1417,6 +1421,25 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     if bound.is_empty() {
         bail!("沒有任何監聽位址（listen.plain.binds）");
     }
+    let cdn = start_cdn(cfg, &resolver, &persister).await;
+    if cdn.is_none() {
+        spawn_wan_subnet(resolver.clone(), None);
+    }
+    let mut snap_sources: Vec<SnapSource> = Vec::new();
+    {
+        let r = resolver.clone();
+        snap_sources.push(bytes_source(move || vec![(STATS_FILE.to_string(), r.stats.snapshot())]));
+    }
+    if let Some(c) = &cdn {
+        snap_sources.push(cdn_source(c.clone()));
+    }
+    if let Some(f) = &filter {
+        snap_sources.push(filter_hits_source(f.clone()));
+    }
+    let warm_names = get(cfg, "resolver.warmNames").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let warm_rate = get(cfg, "resolver.warmRate").and_then(Value::as_u64).unwrap_or(20);
+    spawn_warmup(resolver.clone(), persister.clone(), warm_rate);
+    spawn_hot_names(resolver.clone(), persister.clone(), warm_names);
     // 內建 ACME：憑證不存在或快到期就先申請（最多等 3 分鐘），再啟動加密監聽
     let acme = crate::acme::AcmeConfig::from_cfg(cfg, &base_dir, &persist_dir(cfg)).map(crate::acme::Acme::new);
     match &acme {
@@ -1434,8 +1457,11 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         let c = c.clone();
         snap_sources.push(bytes_source(move || c.snapshots()));
     }
-    spawn_persist_loop(persister.clone(), snap_sources.clone());
-    let memgov = governor_on.then(|| start_governor(cfg, tier, &resolver, &persister, &snap_sources, cdn.as_ref(), filter.as_ref()));
+    spawn_persist_loop(persister.clone(), snap_sources.clone(), reserve.clone());
+    let memgov = governor_on.then(|| start_governor(reserve.clone(), &resolver, &persister, &snap_sources, cdn.as_ref(), filter.as_ref()));
+    if governor_on || get(cfg, "system.memoryWatchdog").and_then(Value::as_bool).unwrap_or(true) {
+        spawn_monitor(reserve.clone(), memgov.clone());
+    }
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref()));
     let ddns = crate::ddns::Config::from_cfg(cfg).map(crate::ddns::Ddns::new);
@@ -1446,8 +1472,8 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     let state = Arc::new(AppState {
         resolver: resolver.clone(),
         persister: persister.clone(),
-        tier,
         info: SysInfo::detect(),
+        reserve,
         persist_dir: persist_dir(cfg),
         warm_names,
         filter,

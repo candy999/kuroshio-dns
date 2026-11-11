@@ -19,10 +19,10 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 一般機器記幾個 IP
+/// 最多記幾個 IP（安全上限）
 pub const MAX_ENTRIES: usize = 50_000;
-/// 小記憶體機器記幾個 IP
-pub const MAX_ENTRIES_TINY: usize = 5_000;
+/// 記憶體接近保留量（記憶體控制停止長大）時最多記幾個 IP（規格 09）
+pub const MAX_ENTRIES_TIGHT: usize = 5_000;
 
 /// 比對用的鍵：IPv4 整個位址、IPv6 前 64 位元
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,8 +110,8 @@ impl Presence {
     }
 
     /// 由設定建立（`check.enabled` 為 false 時回 None，同 2.x：公開頁關掉時也可以單獨開）。
-    /// `tiny`：小記憶體等級，最多只記 5 千個 IP
-    pub fn from_cfg(cfg: &Value, tiny: bool) -> Option<Arc<Presence>> {
+    /// 最多記 [`MAX_ENTRIES`] 個 IP；記憶體接近保留量時 [`MAX_ENTRIES_TIGHT`]
+    pub fn from_cfg(cfg: &Value) -> Option<Arc<Presence>> {
         if !get(cfg, "check.enabled").and_then(Value::as_bool).unwrap_or(true) {
             return None;
         }
@@ -122,7 +122,7 @@ impl Presence {
             own_host_ttl: n("check.ownHostTtl", 10).clamp(1, 86_400) as u32,
         };
         let host = get(cfg, "site.hostname").and_then(Value::as_str).unwrap_or("");
-        Some(Arc::new(Presence::new(c, host, if tiny { MAX_ENTRIES_TINY } else { MAX_ENTRIES })))
+        Some(Arc::new(Presence::new(c, host, MAX_ENTRIES)))
     }
 
     /// 公開頁的網域（可能是空字串）
@@ -163,7 +163,13 @@ impl Presence {
             host_at: if own { Some(now) } else { prev.and_then(|p| p.host_at) },
         };
         g.cur.insert(k, e);
-        if g.cur.len() >= self.max / 2 {
+        // 記憶體接近保留量時提早換代（舊的一代整個丟掉），不再長大
+        let max = if crate::memgov::growth_allowed() {
+            self.max
+        } else {
+            self.max.min(MAX_ENTRIES_TIGHT)
+        };
+        if g.cur.len() >= max / 2 {
             g.old = std::mem::take(&mut g.cur);
         }
     }
@@ -263,9 +269,9 @@ mod tests {
         assert_eq!(none.own_host_ttl(""), None, "沒設定網域時永遠不壓 TTL");
         assert_eq!(none.own_host_ttl("."), None);
         let cfg = kuroshio_config::with_overrides(&json!({ "site": { "hostname": "dns.example" }, "check": { "ownHostTtl": 30 } }));
-        assert_eq!(Presence::from_cfg(&cfg, false).unwrap().own_host_ttl("dns.example"), Some(30));
+        assert_eq!(Presence::from_cfg(&cfg).unwrap().own_host_ttl("dns.example"), Some(30));
         let off = kuroshio_config::with_overrides(&json!({ "check": { "enabled": false } }));
-        assert!(Presence::from_cfg(&off, false).is_none());
+        assert!(Presence::from_cfg(&off).is_none());
     }
 
     #[test]

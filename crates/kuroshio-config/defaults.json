@@ -5,7 +5,6 @@
     "key": ""
   },
   "system": {
-    "profile": "auto",
     "allowHeavy": false,
     "persistDir": "",
     "runtimeDir": "",
@@ -14,13 +13,17 @@
     "flashWriteBudgetKB": 4096,
     "persistMaxAgeHours": 24,
     "minFreeKB": 0,
+    "storageReserveMB": 0,
+    "storageReservePercent": 0,
     "workerThreads": 0,
-    "maxTlsConnections": 2048,
-    "maxQuicConnections": 512,
+    "maxTlsConnections": "auto",
+    "maxQuicConnections": "auto",
     "queryLogRing": 20000,
     "memoryWatchdog": true,
     "memoryGovernor": true,
-    "memoryBudgetMB": 0
+    "memoryReserveMB": 0,
+    "memoryReservePercent": 0,
+    "oomScoreAdj": -500
   },
   "listen": {
     "doh": {
@@ -160,17 +163,17 @@
     "stripEch": false,
     "dnssec": false,
     "cookies": false,
-    "parallel": 0,
+    "parallel": "auto",
     "staleIfErrorSec": 86400,
     "warmNames": 2000,
-    "warmRate": 20
+    "warmRate": "auto"
   },
   "iprank": {
     "port": 443,
     "timeoutMs": 800,
     "okTtlSec": 600,
     "failTtlSec": 120,
-    "concurrency": 64
+    "concurrency": "auto"
   },
   "filter": {
     "enabled": true,
@@ -248,7 +251,7 @@
     "relaxedModifiers": false,
     "maxDomains": 10000000,
     "maxComplex": 20000,
-    "maxUnindexed": 2000
+    "maxUnindexed": "auto"
   },
   "cdn": {
     "enabled": true,
@@ -259,7 +262,7 @@
     "verifyFailHours": 6,
     "verifyFailMaxDays": 7,
     "verifyTimeoutMs": 5000,
-    "verifyConcurrency": 8,
+    "verifyConcurrency": "auto",
     "serveCount": 4,
     "minPool": 3,
     "healthIntervalMin": 30,
@@ -435,7 +438,7 @@
   "benchmark": {
     "dir": "./data/benchmark",
     "outDir": "./state/benchmark",
-    "concurrency": 50,
+    "concurrency": "auto",
     "timeoutMs": 1500,
     "maxTimeouts": 2,
     "coverageTarget": 0.97,
@@ -445,7 +448,7 @@
   },
   "scan": {
     "samplesPerSubnet": 6,
-    "concurrency": 400,
+    "concurrency": "auto",
     "timeoutMs": 2000
   },
   "pool": {
@@ -453,8 +456,8 @@
     "poolSize": 12,
     "speedTop": 16,
     "speedSeconds": 5,
-    "latencyConcurrency": 200,
-    "probeConcurrency": 32,
+    "latencyConcurrency": "auto",
+    "probeConcurrency": "auto",
     "nearestProbeTop": 1500,
     "nearestPops": 6,
     "nearestKeepPops": 5

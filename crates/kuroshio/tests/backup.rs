@@ -80,7 +80,7 @@ async fn export_import_through_running_service() {
     std::fs::write(state.join("blacklist.txt"), "# 本機\n203.0.113.9\n").unwrap();
     let cfg = config(&dir);
 
-    let started = kuroshio::app::start(&cfg, kuroshio_config::Tier::Large).await.unwrap();
+    let started = kuroshio::app::start(&cfg).await.unwrap();
     let admin = started.admin.unwrap();
     assert!(started.resolver.cdn().is_some(), "CDN 有啟動");
 
@@ -162,7 +162,7 @@ async fn export_import_through_running_service() {
 
     // 重新載入：舊的一輪寫出記憶體（policy never），新的一輪在讀狀態之前合併
     started.shutdown();
-    let again = kuroshio::app::start(&cfg, kuroshio_config::Tier::Large).await.unwrap();
+    let again = kuroshio::app::start(&cfg).await.unwrap();
     assert!(!state.join(PENDING_FILE).exists(), "合併後刪掉");
     let a2 = again.admin.unwrap();
     let last = get_json(a2, "/api/backup/last-import").await;

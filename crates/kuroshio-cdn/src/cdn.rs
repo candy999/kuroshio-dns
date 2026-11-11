@@ -858,6 +858,11 @@ impl Cdn {
         self.state().stats
     }
 
+    /// 記憶體裡的網域筆數（移出到磁碟的冷資料不算；記憶體控制的狀態用）
+    pub fn domains_in_ram(&self) -> usize {
+        self.state().db.domains.len()
+    }
+
     /// `/api/status` 的 cdn 區塊
     pub fn status_lite(&self) -> Value {
         let st = self.state();

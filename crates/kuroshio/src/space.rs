@@ -1,9 +1,10 @@
 //! 儲存空間（規格 05 第 5.6 節）：寫快照前看狀態目錄所在的檔案系統還剩多少空間，
-//! 不夠時依等級刪掉可以重建的檔案；核心累積的資料絕不自動刪除。
+//! 掉到保留量 + 遲滯以下時依類別刪掉可以重建的檔案；核心累積的資料絕不自動刪除。
 //!
-//! | 等級 | 檔案 | 空間不足時 |
+//! | 類別 | 檔案 | 空間不足時 |
 //! |---|---|---|
 //! | 日誌（`Log`） | 日誌檔、`.log.old`、殘留的暫存檔 | 最先刪 |
+//! | 可省略（`Optional`） | 過濾清單的本機副本（`filter-lists/`） | 其次：只是少了「不用重新下載」 |
 //! | 可重建（`Rebuildable`） | 候選 IP、IP 網段分類、統計、常用網域、評測報表、下載的 CDN 範圍 | 其次（舊的、大的先刪），之後會重新學習 / 下載 |
 //! | 核心（`Core`） | CDN 網域驗證紀錄、節點池、永久 IPv6 節點、社群身分 / 金鑰 / 好友、設定、自訂規則、黑名單、憑證、其他不認識的檔案 | 絕不自動刪除 |
 
@@ -14,16 +15,19 @@ use tracing::{info, warn};
 pub enum Tier {
     /// 最先刪
     Log = 0,
+    /// 空間大方時才留的副本（刪掉只是要重新下載）
+    Optional = 1,
     /// 可以重建
-    Rebuildable = 1,
+    Rebuildable = 2,
     /// 絕不自動刪除
-    Core = 2,
+    Core = 3,
 }
 
 impl Tier {
     pub fn name(self) -> &'static str {
         match self {
             Tier::Log => "log",
+            Tier::Optional => "optional",
             Tier::Rebuildable => "rebuildable",
             Tier::Core => "core",
         }
@@ -36,6 +40,9 @@ pub fn tier_of(rel: &str) -> Tier {
     let base = rel.trim_end_matches(".zst");
     if base.ends_with(".log") || base.ends_with(".log.old") || base.ends_with(".tmp") {
         return Tier::Log;
+    }
+    if base.starts_with("filter-lists/") {
+        return Tier::Optional;
     }
     const REBUILDABLE: [&str; 5] = [
         "cdn/harvest.json",
@@ -62,29 +69,47 @@ pub fn free_bytes(dir: &Path) -> Option<u64> {
     free_impl(&p)
 }
 
-#[cfg(unix)]
+/// 檔案系統的總大小（bytes）；查不到時 None
+pub fn total_bytes(dir: &Path) -> Option<u64> {
+    let mut p = dir.to_path_buf();
+    while !p.exists() {
+        if !p.pop() {
+            return None;
+        }
+    }
+    fs_impl(&p).map(|x| x.1)
+}
+
 fn free_impl(p: &Path) -> Option<u64> {
+    fs_impl(p).map(|x| x.0)
+}
+
+/// （可用，總大小）
+#[cfg(unix)]
+fn fs_impl(p: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: c 是以 NUL 結尾的路徑，s 是可寫的 statvfs 結構
     let r = unsafe { libc::statvfs(c.as_ptr(), &mut s) };
-    (r == 0).then(|| (s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
+    let f = s.f_frsize as u64;
+    (r == 0).then(|| ((s.f_bavail as u64).saturating_mul(f), (s.f_blocks as u64).saturating_mul(f)))
 }
 
 #[cfg(windows)]
-fn free_impl(p: &Path) -> Option<u64> {
+fn fs_impl(p: &Path) -> Option<(u64, u64)> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let w: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let mut avail: u64 = 0;
-    // SAFETY: w 以 0 結尾；其他輸出參數可以是 null
-    let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) };
-    (ok != 0).then_some(avail)
+    let mut total: u64 = 0;
+    // SAFETY: w 以 0 結尾；最後一個輸出參數可以是 null
+    let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, &mut total, std::ptr::null_mut()) };
+    (ok != 0).then_some((avail, total))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn free_impl(_: &Path) -> Option<u64> {
+fn fs_impl(_: &Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -185,7 +210,11 @@ pub fn free_up(list: Vec<Candidate>, mut enough: impl FnMut(u64) -> bool) -> (Ve
             Ok(()) => {
                 info!(
                     "儲存空間不足：刪除{}檔案 {}（{} KB）",
-                    if c.tier == Tier::Log { "日誌" } else { "可重建的" },
+                    match c.tier {
+                        Tier::Log => "日誌",
+                        Tier::Optional => "可省略的",
+                        _ => "可重建的",
+                    },
                     c.rel,
                     c.size.div_ceil(1024)
                 );
@@ -208,6 +237,8 @@ mod tests {
         assert_eq!(tier_of("kuroshio.log.old"), Tier::Log);
         assert_eq!(tier_of("cdn/pools.tmp"), Tier::Log);
         assert_eq!(tier_of("cdn/harvest.json.zst"), Tier::Rebuildable);
+        assert_eq!(tier_of("filter-lists/0a1b2c3d.txt.zst"), Tier::Optional);
+        assert_eq!(tier_of("filter-lists/index.json"), Tier::Optional);
         assert_eq!(tier_of("cdn/ip-zone.json"), Tier::Rebuildable);
         assert_eq!(tier_of("stats.json"), Tier::Rebuildable);
         assert_eq!(tier_of("benchmark/2026-11-11/report.json"), Tier::Rebuildable);
@@ -227,7 +258,7 @@ mod tests {
         ] {
             assert_eq!(tier_of(core), Tier::Core, "{core}");
         }
-        assert!(Tier::Log < Tier::Rebuildable && Tier::Rebuildable < Tier::Core);
+        assert!(Tier::Log < Tier::Optional && Tier::Optional < Tier::Rebuildable && Tier::Rebuildable < Tier::Core);
     }
 
     #[test]

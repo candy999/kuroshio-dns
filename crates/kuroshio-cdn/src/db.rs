@@ -2,7 +2,7 @@
 //! 跨 CDN 結果、手動策略，以及節點池工作用的候選 IP（harvest）。
 //!
 //! 每筆紀錄保持精簡：常見字串（CDN 名稱、判定）共用、選填的子物件放在 `Box` 裡，沒有就只佔一個指標。
-//! 筆數上限 `cdn.maxEntries`（依硬體等級），超過時刪掉最久沒出現的（手動設定策略的不刪）。
+//! 筆數上限 `cdn.maxEntries`（安全上限，不分機器；記憶體由記憶體控制把冷資料移到磁碟），超過時刪掉最久沒出現的（手動設定策略的不刪）。
 
 use crate::util::{
     self, de_arc, de_ips, de_opt_arc, de_opt_bool, de_opt_ip, de_opt_ips, de_opt_string, de_opt_u32, de_opt_u64, de_u32, de_u64, now_ms,
