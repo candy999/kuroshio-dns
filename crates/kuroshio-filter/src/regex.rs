@@ -14,6 +14,15 @@ use std::cell::Cell;
 /// 每次比對最多走幾步（所有起點合計）
 pub(crate) const STEP_LIMIT: u32 = 100_000;
 
+/// 群組最多巢狀幾層。解析是遞迴的：清單裡一行幾萬個 `(` 會把堆疊用完、整個程式當掉，
+/// 超過就當成「不支援」略過（實際的規則不會超過十層）
+const MAX_NEST: u32 = 200;
+
+/// 比對時最多遞迴幾層。回溯是遞迴的，`(?:a?){60000}` 這種「不吃字元也能一直重複」的樣式
+/// 在步數用完之前就會把堆疊用完；超過就當作沒命中（跟步數上限同樣的處理）。
+/// 253 個字元的網域名稱，一般的樣式每個字元大約兩層，用不到這個數字的一半。
+const MAX_DEPTH: u32 = 1200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegexError {
     /// node 版也會失敗的語法錯誤
@@ -141,6 +150,8 @@ impl Node {
 struct Parser {
     p: Vec<char>,
     i: usize,
+    /// 目前巢狀到第幾層（群組、前瞻、後顧）
+    depth: u32,
 }
 
 type R<T> = Result<T, RegexError>;
@@ -157,6 +168,16 @@ impl Parser {
     }
 
     fn alt(&mut self) -> R<Node> {
+        self.depth += 1;
+        if self.depth > MAX_NEST {
+            return Err(RegexError::Unsupported);
+        }
+        let r = self.alt_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn alt_inner(&mut self) -> R<Node> {
         let mut alts = vec![self.concat()?];
         while self.peek() == Some('|') {
             self.i += 1;
@@ -511,6 +532,7 @@ fn concat(items: Vec<Node>) -> Node {
 struct Matcher<'a> {
     s: &'a [char],
     steps: Cell<u32>,
+    depth: Cell<u32>,
 }
 
 impl Matcher<'_> {
@@ -523,10 +545,31 @@ impl Matcher<'_> {
         true
     }
 
-    fn node(&self, n: &Node, i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
-        if !self.tick() {
+    /// 進入一層遞迴；太深就把步數設成用完（整次比對當作沒命中）
+    fn enter(&self) -> bool {
+        let d = self.depth.get();
+        if d >= MAX_DEPTH {
+            self.steps.set(STEP_LIMIT);
             return false;
         }
+        self.depth.set(d + 1);
+        true
+    }
+
+    fn leave(&self) {
+        self.depth.set(self.depth.get() - 1);
+    }
+
+    fn node(&self, n: &Node, i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
+        if !self.tick() || !self.enter() {
+            return false;
+        }
+        let r = self.node_inner(n, i, k);
+        self.leave();
+        r
+    }
+
+    fn node_inner(&self, n: &Node, i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
         let s = self.s;
         match n {
             Node::Empty => k(i),
@@ -609,9 +652,16 @@ impl Matcher<'_> {
 
     #[allow(clippy::too_many_arguments)]
     fn rep(&self, n: &Node, min: u32, max: u32, greedy: bool, count: u32, i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
-        if !self.tick() {
+        if !self.tick() || !self.enter() {
             return false;
         }
+        let r = self.rep_inner(n, min, max, greedy, count, i, k);
+        self.leave();
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rep_inner(&self, n: &Node, min: u32, max: u32, greedy: bool, count: u32, i: usize, k: &mut dyn FnMut(usize) -> bool) -> bool {
         let more = |k: &mut dyn FnMut(usize) -> bool| {
             count < max
                 && self.node(n, i, &mut |j| {
@@ -644,6 +694,7 @@ impl Regex {
         let mut p = Parser {
             p: src.chars().collect(),
             i: 0,
+            depth: 0,
         };
         let root = p.alt()?;
         if p.i != p.p.len() {
@@ -700,7 +751,11 @@ impl Regex {
 
     /// 等同 JS 的 `re.test(s)`（不含 g 旗標）
     pub(crate) fn is_match(&self, s: &[char]) -> bool {
-        let m = Matcher { s, steps: Cell::new(0) };
+        let m = Matcher {
+            s,
+            steps: Cell::new(0),
+            depth: Cell::new(0),
+        };
         let last = if self.anchored { 0 } else { s.len() };
         for start in 0..=last {
             if m.node(&self.root, start, &mut |_| true) {
@@ -794,6 +849,47 @@ mod tests {
         let s: Vec<char> = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab".chars().collect();
         let re = Regex::parse("^(a+)+$").unwrap();
         assert!(!re.is_match(&s));
+    }
+
+    /// 在小堆疊（1 MiB，比 tokio 工作執行緒的 2 MiB 還小）的執行緒裡跑：堆疊用完會讓整個測試程序當掉
+    fn small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new().stack_size(1024 * 1024).spawn(f).unwrap().join().unwrap()
+    }
+
+    #[test]
+    fn deep_nesting_is_rejected_not_a_crash() {
+        // 清單裡一行幾萬個 `(`：以前解析時遞迴到堆疊用完，整個程式當掉
+        let r = small_stack(|| {
+            let src = format!("{}a{}", "(".repeat(30_000), ")".repeat(30_000));
+            Regex::parse(&src).map(|_| ())
+        });
+        assert_eq!(r, Err(RegexError::Unsupported));
+        // 正常的巢狀深度照常解析
+        let ok = format!("{}a{}", "(?:".repeat(50), ")".repeat(50));
+        assert!(t(&ok, "xax"));
+    }
+
+    #[test]
+    fn deep_recursion_is_bounded_not_a_crash() {
+        // 不吃字元也能重複幾萬次：以前在步數上限之前就把堆疊用完
+        for re in ["(?:a?){60000}b", "(?:a*)*b", "(?:|a)+b", "(?:a?){60000}"] {
+            let re = re.to_string();
+            small_stack(move || {
+                let s: Vec<char> = "aaaa.example.com".chars().collect();
+                Regex::parse(&re).unwrap().is_match(&s)
+            });
+        }
+        // adblock 樣式：幾萬個連續的 `*`
+        small_stack(|| {
+            let s: Vec<char> = "ads.example.com".chars().collect();
+            Regex::from_adblock(&format!("a{}z", "*".repeat(60_000)), true, false).is_match(&s)
+        });
+        // 最長的網域名稱（253 個字元）配一般的樣式：不會碰到深度上限
+        let name = format!("{}.example.com", ["abcdefghi"; 24].join("."));
+        assert_eq!(name.len(), 251);
+        assert!(t("^(?:[a-z0-9-]+\\.)*example\\.com$", &name));
+        assert!(t("^.*\\.example\\..*$", &name));
+        assert!(t("(?:[a-z]|[0-9]|\\.)+m$", &name));
     }
 
     #[test]
