@@ -574,3 +574,42 @@ async fn verifier_octet_mode_verifies_backup_ips_for_this_site() {
     assert_eq!(v.ips, Some(ips(&["151.101.76.140", "151.101.77.140"])), "憑證不符的 .78 不列入");
     assert_eq!(net.calls("https 151.101.78.140").len(), 1);
 }
+
+#[tokio::test]
+async fn ecs_probe_only_keeps_ips_validated_for_this_site() {
+    // ECS 找到的節點：要回給用戶端的每一個（含 IPv6）都要用這個網站的名稱驗證過憑證，沒通過的不列入
+    let (c, net) = setup(json!({ "ecs": { "twSubnets": ["1.160.0.0/24"], "resolvers": ["udp://8.8.8.8"] } }));
+    c.with_state(|st| {
+        st.db
+            .touch("multi.ak.test", "akamai", "cname", &ips(&["23.1.1.1"]), &ips(&["2600::1"]), None);
+    });
+    net.on_dns(|_, name, qtype, _| {
+        let mut m = msg(name, qtype, &[], vec![]);
+        if qtype == rtype::A {
+            for a in ["23.9.9.9", "23.9.9.10", "23.9.9.11"] {
+                m.answers.push(Record::a(name, 60, a.parse().unwrap()));
+            }
+        } else {
+            for a in ["2600:9::1", "2600:9::2"] {
+                m.answers.push(Record::aaaa(name, 60, a.parse().unwrap()));
+            }
+        }
+        Some(m)
+    });
+    net.set_cached("23.1.1.1", 60.0);
+    net.set_cached("23.9.9.9", 4.0);
+    net.set_cached("23.9.9.10", 5.0);
+    net.set_cached("23.9.9.11", 6.0);
+    net.set_cached("2600:9::1", 5.0);
+    net.set_cached("2600:9::2", 6.0);
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "23.9.9.10" => ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true),
+        "2600:9::1" => resp(503, &[], ""),
+        _ => resp(200, &[], "ok"),
+    });
+    c.ecs_probe("multi.ak.test", &ips(&["23.1.1.1"]), &ips(&["2600::1"])).await;
+    let e = c.state().db.get("multi.ak.test").unwrap().ecs.clone().unwrap();
+    assert!(e.is("ok"));
+    assert_eq!(e.ips4, Some(ips(&["23.9.9.9", "23.9.9.11"])));
+    assert_eq!(e.ips6, Some(ips(&["2600:9::2"])));
+}

@@ -134,45 +134,58 @@ impl Cdn {
             });
             return;
         }
-        // 驗證：用最快的 IP 連 HTTPS，憑證要對、狀態不能是 5xx
+        // 驗證：憑證要對、狀態不能是 5xx。最快的那個不通過就整個判失敗（同 2.x）；
+        // 其餘要回給用戶端的 IP 也逐一驗證，沒通過的不列入（以前只驗第一個，其餘 3 個與 IPv6 直接照回）
         let mut ips: Vec<IpAddr> = ips4
             .into_iter()
             .filter(|ip| ms.get(ip).map(|m| m.is_finite()).unwrap_or(false))
             .collect();
         ips.sort_by(|a, b| ms[a].partial_cmp(&ms[b]).unwrap_or(std::cmp::Ordering::Equal));
         ips.truncate(4);
-        let v = self
-            .net
-            .https_probe(
-                ips[0],
-                name,
-                "/",
-                HttpsOpts {
-                    timeout: Duration::from_millis(5000),
-                    ..Default::default()
-                },
-            )
-            .await;
-        if !v.ok || v.status >= 500 {
+        let check = |ip: IpAddr| async move {
+            let v = self
+                .net
+                .https_probe(
+                    ip,
+                    name,
+                    "/",
+                    HttpsOpts {
+                        timeout: Duration::from_millis(5000),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if v.ok && v.status < 500 {
+                Ok(())
+            } else if v.ok {
+                Err(format!("HTTP {}", v.status))
+            } else {
+                Err(v.error.clone().unwrap_or_default())
+            }
+        };
+        if let Err(reason) = check(ips[0]).await {
             set(Ecs {
                 verdict: Some(intern("fail")),
-                reason: Some(if v.ok {
-                    format!("HTTP {}", v.status)
-                } else {
-                    v.error.clone().unwrap_or_default()
-                }),
+                reason: Some(reason),
                 subnet: Some(intern(&subnet)),
                 until: Some(now_ms() + ttl),
                 ..Default::default()
             });
             return;
         }
-        // IPv6：同一子網路再問一次 AAAA（取得的是 CDN 自己給台灣用戶的 v6，通常可直接用）
+        let mut good = vec![ips[0]];
+        for &ip in &ips[1..] {
+            if check(ip).await.is_ok() {
+                good.push(ip);
+            }
+        }
+        let ips = good;
+        // IPv6：同一子網路再問一次 AAAA（取得的是 CDN 自己給台灣用戶的 v6），一樣要驗證過才回
         let mut ips6 = Vec::new();
         if !orig6.is_empty() && self.net.v6_usable() != Some(false) {
             let c6 = self.resolve_with_ecs(name, rtype::AAAA, Some(&subnet)).await;
             if !c6.is_empty() {
-                ips6 = self
+                let cand: Vec<IpAddr> = self
                     .net
                     .rank(&c6)
                     .await
@@ -181,6 +194,11 @@ impl Cdn {
                     .take(2)
                     .map(|x| x.0)
                     .collect();
+                for ip in cand {
+                    if check(ip).await.is_ok() {
+                        ips6.push(ip);
+                    }
+                }
             }
         }
         let first = ips[0];
