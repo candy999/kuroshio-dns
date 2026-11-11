@@ -502,6 +502,14 @@ fn append_blacklist(file: &Path, lines: &[String]) {
 
 /// 網站「無法驗證」幾天（不同日期）才列入永久黑名單
 const SUSPECT_DAYS: usize = 3;
+/// 「憑證不符」幾天（不同日期）才列入永久黑名單。當天一律淘汰不用；隔天以後再犯才永久排除——
+/// 正常的 DNS 也可能有一天回了舊位址（網站剛搬家、快取還沒過期），那個位址上的憑證就不是這個網站的。
+/// 永久黑名單要手動編輯才能恢復，不能因為一天的一題就定罪；真的在劫持的 DNS 隔天還是會被抓到
+const CERT_DAYS: usize = 2;
+/// 「憑證不符」在可疑紀錄檔裡的鍵（跟「無法驗證」分開算）
+fn cert_key(id: &str) -> String {
+    format!("cert|{id}")
+}
 /// 網站驗證：每個回答最多驗幾個 IP、同時連線數、逾時
 const VERIFY_IPS: usize = 2;
 const VERIFY_CONC: usize = 16;
@@ -726,7 +734,8 @@ impl Benchmark {
             }
             // 規則判定不在多數業者群組裡的回答：不再只看 IP 屬於哪家業者就定罪，
             // 實際連過去用網域檢查憑證（跟替換台灣節點前的驗證同一個標準）。
-            // 憑證有效 = 規則沒涵蓋的 CDN（保留）；憑證不符 = 確定劫持（永久黑名單）；連不上 = 今天不用，連續多天才定罪
+            // 憑證有效 = 規則沒涵蓋的 CDN（保留）；憑證不符 = 今天淘汰，不同的兩天都這樣才列入永久黑名單；
+            // 連不上 = 今天不用，多天才定罪
             let suspects: Vec<usize> = ok
                 .iter()
                 .zip(&infos)
@@ -780,11 +789,19 @@ impl Benchmark {
                     Some((SiteCheck::Invalid, why)) => {
                         s.kill(format!("汙染 {domain} (判定為 {}，憑證不符 {why})", info.raw));
                         polluted += 1;
-                        if !s.pinned {
-                            info!("   [淘汰] {} -> 汙染 {}：憑證不符 {why}（加入永久黑名單）", s.id, info.raw);
+                        if !s.pinned && strikes.add(&cert_key(&s.id), &today) >= CERT_DAYS {
+                            info!(
+                                "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
+                                s.id, info.raw
+                            );
                             if blacklist.insert(s.id.clone()) {
                                 newly_bl.push(format!("{}  # {today} 汙染：{domain} → {}（憑證不符 {why}）", s.id, info.raw));
                             }
+                        } else if !s.pinned {
+                            info!(
+                                "   [今天不用] {} -> 汙染 {}：憑證不符 {why}（再發生一天就列入永久黑名單）",
+                                s.id, info.raw
+                            );
                         }
                     }
                     Some((SiteCheck::Unverified, why)) => {

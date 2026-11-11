@@ -189,6 +189,13 @@ async fn end_to_end_with_mock_servers() {
     std::fs::write(list.join("stamps.txt"), "sdns://AgcAAAAAAAAAAAAHOS45LjkuOQ\n").unwrap();
     std::fs::write(list.join("web.txt"), "www.alpha.com\ncdn.beta.com\nvideo.gamma.net\ndead.example\n").unwrap();
     std::fs::write(list.join("blacklist.txt"), format!("# 黑名單\n{s10}  # 測試\n")).unwrap();
+    // s3 昨天已經被抓到一次憑證不符：今天是第 2 天 → 列入永久黑名單
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::write(
+        root.join("state/blacklist-suspects.json"),
+        serde_json::to_vec(&json!({ format!("cert|{s3}"): ["2026-11-09"] })).unwrap(),
+    )
+    .unwrap();
     // 舊報表：超過 14 天的刪掉
     let out_root = p.out_root.clone().unwrap();
     std::fs::create_dir_all(out_root.join("2026-10-01")).unwrap();
@@ -389,6 +396,12 @@ async fn pollution_requires_site_verification() {
         _ => plain(n, 1),
     })
     .await;
+    // 第一次被抓到憑證不符：今天淘汰，但還不列入永久黑名單
+    let first_time = mock("127.8.0.21:0", 0, move |n| match n {
+        "www.alpha.com" => Reply::A(vec![ip("96.4.0.9")]),
+        _ => plain(n, 1),
+    })
+    .await;
     let other_cdn = mock("127.5.0.21:0", 0, move |n| match n {
         "www.alpha.com" => Reply::A(vec![ip("97.5.0.9")]),
         _ => plain(n, 1),
@@ -404,16 +417,17 @@ async fn pollution_requires_site_verification() {
     let list = &p.list_dir;
     std::fs::create_dir_all(list).unwrap();
     std::fs::create_dir_all(root.join("state")).unwrap();
-    let ids: Vec<String> = [a, b, c, hijack, other_cdn, quiet, http_diff]
+    let ids: Vec<String> = [a, b, c, hijack, first_time, other_cdn, quiet, http_diff]
         .iter()
         .map(|x| x.to_string())
         .collect();
     std::fs::write(list.join("iplist.txt"), ids.join("\n")).unwrap();
     std::fs::write(list.join("web.txt"), "www.alpha.com\ncdn.beta.com\nhttp.only.net\n").unwrap();
-    // 「無法驗證」已經記了前兩天：今天是第 3 天 → 列入永久黑名單
+    // 「無法驗證」已經記了前兩天：今天是第 3 天 → 列入永久黑名單。
+    // 「憑證不符」昨天記過一次：今天是第 2 天 → 列入永久黑名單
     std::fs::write(
         root.join("state/blacklist-suspects.json"),
-        serde_json::to_vec(&json!({ quiet.to_string(): ["2026-11-08", "2026-11-09"] })).unwrap(),
+        serde_json::to_vec(&json!({ quiet.to_string(): ["2026-11-08", "2026-11-09"], format!("cert|{hijack}"): ["2026-11-09"] })).unwrap(),
     )
     .unwrap();
     let cfg = kuroshio_config::with_overrides(&json!({
@@ -445,14 +459,30 @@ async fn pollution_requires_site_verification() {
         "第 3 天無法驗證：{bl}"
     );
     assert!(!bl.contains(&other_cdn.to_string()), "憑證有效的不是汙染：{bl}");
+    assert!(
+        !bl.contains(&first_time.to_string()),
+        "只有一天憑證不符：今天不用，但不能永久排除：{bl}"
+    );
     let suspects: Value = read(&root.join("state/blacklist-suspects.json"));
     assert_eq!(suspects[quiet.to_string()], json!(["2026-11-08", "2026-11-09", "2026-11-10"]));
+    assert_eq!(suspects[format!("cert|{hijack}")], json!(["2026-11-09", "2026-11-10"]));
+    assert_eq!(
+        suspects[format!("cert|{first_time}")],
+        json!(["2026-11-10"]),
+        "記下來，再發生一天就定罪"
+    );
     // 規則外但驗證通過的 CDN 照常計分，可以被選上
     let elim = std::fs::read_to_string(p.out_root.clone().unwrap().join("2026-11-10/eliminated.csv")).unwrap();
     assert!(elim.contains(&hijack.to_string()) && elim.contains(&quiet.to_string()), "{elim}");
+    assert!(elim.contains(&first_time.to_string()), "憑證不符當天一定淘汰：{elim}");
     assert!(!elim.contains(&other_cdn.to_string()), "規則外但憑證有效的 CDN 不該被淘汰：{elim}");
     assert!(!elim.contains(&http_diff.to_string()), "網域本身無法用憑證判斷時不能淘汰：{elim}");
     assert!(!bl.contains(&http_diff.to_string()), "{bl}");
     let up = read(&p.upstreams_file);
-    assert_eq!(up["counts"]["eliminated"], 2, "{up:#}");
+    assert_eq!(up["counts"]["eliminated"], 3, "{up:#}");
+    let picked = up["selected"].to_string();
+    assert!(
+        !picked.contains(&first_time.to_string()) && !picked.contains(&hijack.to_string()),
+        "{picked}"
+    );
 }
