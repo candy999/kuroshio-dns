@@ -227,6 +227,8 @@ impl Cdn {
             return res;
         };
         let name = normalize(qname);
+        // 記憶體控制移出的冷資料：查到時從磁碟讀回來（沒有移出任何網域時不做任何事）
+        self.ensure_loaded(&name);
         let cname = terminal_name(msg, &name);
         let mut tasks: Vec<Task> = Vec::new();
         {

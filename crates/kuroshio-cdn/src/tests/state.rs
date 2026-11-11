@@ -435,3 +435,95 @@ fn shard_count_change_rewrites_all() {
     let c3 = Cdn::load(&cfg, paths, MockNet::new());
     assert_eq!(c3.state().db.domains.len(), 300);
 }
+
+#[test]
+fn cold_entries_evicted_after_persist_and_lazily_reloaded() {
+    // 記憶體控制（規格 09）：冷資料只移出記憶體，磁碟上保留；查到時讀回來的內容（含驗證結果）跟原本完全一樣；
+    // 這片之後有變動要重寫時，移出的冷資料從舊檔接回去，磁碟上不會少
+    let paths = paths_no_seed("cold");
+    let dir = paths.state_dir.clone();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(repo().join("data/seed/cdn-domains.json"), dir.join(crate::db::FILE)).unwrap();
+    let c = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
+    let n = c.state().db.domains.len();
+    let mut names: Vec<String> = c.state().db.domains.keys().map(|k| k.to_string()).collect();
+    names.sort();
+    // 只有一個是「熱的」（剛查過），其他都一週沒出現
+    let hot = names[0].clone();
+    let now = now_ms();
+    c.with_state(|st| {
+        for d in st.db.domains.values_mut() {
+            d.last_seen = if *d.name == *hot { now } else { now - 7 * 24 * 3600 * 1000 };
+        }
+    });
+    let original = {
+        let st = c.state();
+        st.db.domains.values().find(|d| d.v4.is_some() && *d.name != *hot).unwrap().clone()
+    };
+    let cold = original.name.to_string();
+    // 搬家還沒寫進磁碟：一筆都不能移出
+    assert_eq!(c.evict_cold(3_600_000, &|_| true).entries, 0, "整個資料庫還要重寫時不動");
+    let (_, ch) = c.snapshots_sharded(false);
+    let shards = ch.shards;
+    assert_eq!(c.evict_cold(3_600_000, &|_| false).entries, 0, "快照寫入器還有待寫內容的分片不動");
+    write_changes(&c, &dir, &ch);
+    let shard_bytes = |i: usize| crate::statefile::read(&dir.join(crate::db::shard_file(shards, i))).unwrap();
+    let before: Vec<Vec<u8>> = (0..shards).map(shard_bytes).collect();
+    // 有一個分片之後又有變動（還沒寫）：那片不動
+    let cold_shard = crate::db::shard_of(&cold, shards);
+    let touched = names
+        .iter()
+        .find(|x| crate::db::shard_of(x, shards) != cold_shard && **x != hot)
+        .unwrap()
+        .clone();
+    c.with_state(|st| st.db.set_verdict(&touched, 4, |v| v.verdict = Some(crate::util::intern("fail"))));
+    let r = c.evict_cold(3_600_000, &|_| true);
+    assert!(r.entries > n / 2, "冷資料移出記憶體：{} / {n}", r.entries);
+    assert!(r.bytes > r.entries * 100, "估計釋出的記憶體：{}", r.bytes);
+    assert_eq!(c.evicted_count(), r.entries);
+    {
+        let st = c.state();
+        assert!(st.db.get(&hot).is_some(), "熱的網域不動");
+        assert!(st.db.get(&touched).is_some(), "剛改過（還沒寫）的分片不動");
+        assert!(st.db.get(&cold).is_none());
+    }
+    // 磁碟上的分片完全沒變
+    for (i, b) in before.iter().enumerate() {
+        assert_eq!(&shard_bytes(i), b, "分片 {i}");
+    }
+    // 查到移出的網域：從磁碟讀回來，內容一樣（驗證結果不變）
+    assert!(c.ensure_loaded(&cold));
+    assert_eq!(c.state().db.get(&cold).unwrap(), &original);
+    assert_eq!(c.evicted_count(), r.entries - 1);
+    assert!(!c.ensure_loaded(&cold), "已經在記憶體裡");
+    assert!(!c.ensure_loaded("never-seen.example.com"), "不在資料庫的名稱不讀磁碟");
+    // 有冷資料的分片沒有變動、重寫：一模一樣（冷資料一筆不少）
+    let touched_shard = crate::db::shard_of(&touched, shards);
+    let s = (0..shards)
+        .find(|i| *i != touched_shard && *i != cold_shard && c.state().db.evicted_hashes(shards, *i).len() > 2)
+        .unwrap();
+    let mut raw = Vec::new();
+    c.write_shard(shards, s, &mut raw).unwrap();
+    assert_eq!(raw, before[s], "重寫出來跟磁碟上一樣");
+    // 新增一筆：冷資料都在，多一筆
+    let fresh = (0..)
+        .map(|k| format!("fresh{k}.example.com"))
+        .find(|x| crate::db::shard_of(x, shards) == s)
+        .unwrap();
+    c.with_state(|st| {
+        st.db.touch(&fresh, "cloudflare", "ip", &[], &[], None);
+    });
+    let mut raw = Vec::new();
+    c.write_shard(shards, s, &mut raw).unwrap();
+    let count = |b: &[u8]| {
+        let mut k = 0;
+        crate::db::scan_shard(b, &mut |_| k += 1).unwrap();
+        k
+    };
+    assert_eq!(count(&raw), count(&before[s]) + 1, "新增一筆、冷資料都在");
+    // 記憶體恢復：全部讀回來
+    let back = c.restore_cold();
+    assert_eq!(back.entries, r.entries - 1);
+    assert_eq!(c.evicted_count(), 0);
+    assert_eq!(c.state().db.domains.len(), n + 1);
+}

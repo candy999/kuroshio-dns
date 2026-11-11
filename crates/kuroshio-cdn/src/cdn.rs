@@ -188,6 +188,16 @@ pub struct Cdn {
     pub(crate) cross_sem: Arc<Semaphore>,
     hints: RwLock<Option<Arc<dyn Hints>>>,
     on_low_pool: RwLock<Option<LowPoolFn>>,
+    /// 移出記憶體的冷資料筆數（`Db::evicted_count` 的副本）：0 時查詢路徑完全不必檢查
+    evicted_n: AtomicU32,
+}
+
+/// 冷資料移出 / 讀回的結果（記憶體控制，規格 09）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ColdReport {
+    pub entries: usize,
+    /// 估計的記憶體（bytes）
+    pub bytes: usize,
 }
 
 static NEXT_CLS_ID: AtomicU32 = AtomicU32::new(0);
@@ -344,6 +354,7 @@ impl Cdn {
             bg: Mutex::new(Bg::default()),
             hints: RwLock::new(None),
             on_low_pool: RwLock::new(None),
+            evicted_n: AtomicU32::new(0),
         };
         me.reset_octet_verdicts();
         Arc::new(me)
@@ -528,11 +539,14 @@ impl Cdn {
     /// 分批期間有變動的網域，內容以寫到它的那一刻為準，下次呼叫會再寫一次。
     /// 正式執行時用 `snapshots_stream`（網域資料庫不整份放在記憶體）
     pub fn snapshots(&self) -> Vec<(String, Vec<u8>)> {
+        // 整份寫成單一檔案：移出記憶體的冷資料先讀回來，不然會少
+        self.restore_cold();
         self.collect(false, false).0
     }
 
     /// 全部的狀態檔（關機時）
     pub fn snapshots_all(&self) -> Vec<(String, Vec<u8>)> {
+        self.restore_cold();
         self.collect(true, false).0
     }
 
@@ -544,9 +558,45 @@ impl Cdn {
 
     /// 把第 `i` 個分片（共 `n` 片，相對路徑 `db::shard_file(n, i)`）邊序列化邊寫出：分批拿鎖。
     /// 依名稱排序（內容沒變時寫出來的位元組也一樣）
+    ///
+    /// 這片有移出記憶體的冷資料（記憶體控制）時：從磁碟上的舊檔把它們接回去（依名稱排在一起），
+    /// 所以寫出來的內容跟全部都在記憶體裡時一樣，磁碟上不會少
     pub fn write_shard(&self, n: usize, i: usize, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        let mut keys = self.state().db.shard_keys(n, i);
+        let (mut keys, cold_hashes) = {
+            let mut st = self.state();
+            (st.db.shard_keys(n, i), st.db.evicted_hashes(n, i))
+        };
+        // 冷資料：舊檔裡雜湊對得上、記憶體裡沒有的
+        let mut cold: HashMap<Arc<str>, db::Domain> = HashMap::new();
+        if !cold_hashes.is_empty() {
+            match self.read_shard(n, i) {
+                Some(b) => {
+                    let mut found = Vec::new();
+                    let r = db::scan_shard(&b, &mut |d| {
+                        if cold_hashes.binary_search(&db::name_hash(&d.name)).is_ok() {
+                            found.push(d);
+                        }
+                    });
+                    if let Err(e) = r {
+                        warn!("CDN 網域分片 {} 讀不回來（{e}），移出記憶體的冷資料遺失", db::shard_file(n, i));
+                    }
+                    let st = self.state();
+                    for d in found {
+                        if st.db.get(&d.name).is_none() {
+                            cold.insert(d.name.clone(), d);
+                        }
+                    }
+                }
+                None => {
+                    warn!("CDN 網域分片 {} 不見了，移出記憶體的冷資料遺失", db::shard_file(n, i));
+                    self.state().db.unevict_shard(i);
+                    self.sync_evicted();
+                }
+            }
+            keys.extend(cold.keys().cloned());
+        }
         keys.sort_unstable();
+        keys.dedup();
         let (head, tail) = Db::shard_frame(n, i);
         w.write_all(&head)?;
         let mut first = true;
@@ -557,10 +607,127 @@ impl Cdn {
                 std::thread::sleep(std::time::Duration::from_micros(100));
             }
             buf.clear();
-            self.state().db.dump_names(chunk, &mut buf, &mut first);
+            if cold.is_empty() {
+                self.state().db.dump_names(chunk, &mut buf, &mut first);
+            } else {
+                let st = self.state();
+                for name in chunk {
+                    match cold.get(name) {
+                        Some(d) => {
+                            if !first {
+                                buf.push(b',');
+                            }
+                            first = false;
+                            let _ = serde_json::to_writer(&mut buf, d);
+                        }
+                        None => st.db.dump_names(std::slice::from_ref(name), &mut buf, &mut first),
+                    }
+                }
+            }
             w.write_all(&buf)?;
         }
         w.write_all(tail)
+    }
+
+    // ------------------------------------------------------------ 冷資料（記憶體控制，規格 09）
+
+    /// 磁碟上的分片（一般 JSON 或 .zst）
+    fn read_shard(&self, n: usize, i: usize) -> Option<Vec<u8>> {
+        crate::statefile::read(&self.paths.state_dir.join(db::shard_file(n, i)))
+    }
+
+    fn sync_evicted(&self) {
+        let n = self.state().db.evicted_count();
+        self.evicted_n.store(n.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    }
+
+    /// 移出記憶體的冷資料筆數
+    pub fn evicted_count(&self) -> usize {
+        self.evicted_n.load(Ordering::Relaxed) as usize
+    }
+
+    /// 記憶體吃緊：把最後出現時間早於 `cold_ms` 毫秒以前的網域移出記憶體（磁碟上的分片保留）。
+    /// `persisted(分片相對路徑)` = 這片已經寫進磁碟、沒有待寫內容；呼叫端要先讓快照寫入器把變動寫出去
+    pub fn evict_cold(&self, cold_ms: u64, persisted: &dyn Fn(&str) -> bool) -> ColdReport {
+        let r = {
+            let mut st = self.state();
+            let n = st.db.shards;
+            let cutoff = now_ms().saturating_sub(cold_ms);
+            st.db.evict_cold(cutoff, &|i| persisted(&db::shard_file(n, i)))
+        };
+        self.sync_evicted();
+        ColdReport {
+            entries: r.entries,
+            bytes: r.bytes,
+        }
+    }
+
+    /// 查詢用到移出記憶體的網域：從磁碟的分片把那一筆讀回來（只解析、不保留整片）。回傳有沒有讀回來
+    pub fn ensure_loaded(&self, name: &str) -> bool {
+        if self.evicted_n.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let (n, i) = {
+            let st = self.state();
+            if st.db.get(name).is_some() || !st.db.is_evicted(name) {
+                return false;
+            }
+            (st.db.shards, db::shard_of(name, st.db.shards))
+        };
+        let mut found = None;
+        if let Some(b) = self.read_shard(n, i) {
+            let _ = db::scan_shard(&b, &mut |d| {
+                if found.is_none() && &*d.name == name {
+                    found = Some(d);
+                }
+            });
+        }
+        let loaded = {
+            let mut st = self.state();
+            match found {
+                Some(d) => st.db.insert_reloaded(d),
+                None => {
+                    st.db.unevict(name);
+                    false
+                }
+            }
+        };
+        self.sync_evicted();
+        loaded
+    }
+
+    /// 記憶體恢復：把移出的冷資料全部讀回記憶體（一次一片）。回傳讀回幾筆、多少記憶體
+    pub fn restore_cold(&self) -> ColdReport {
+        let mut out = ColdReport::default();
+        if self.evicted_n.load(Ordering::Relaxed) == 0 {
+            return out;
+        }
+        let (n, shards) = {
+            let st = self.state();
+            (st.db.shards, st.db.evicted_shards())
+        };
+        for i in shards {
+            let hashes = self.state().db.evicted_hashes(n, i);
+            let mut found = Vec::new();
+            if let Some(b) = self.read_shard(n, i) {
+                let _ = db::scan_shard(&b, &mut |d| {
+                    if hashes.binary_search(&db::name_hash(&d.name)).is_ok() {
+                        found.push(d);
+                    }
+                });
+            }
+            let mut st = self.state();
+            for d in found {
+                let bytes = d.approx_bytes();
+                if st.db.insert_reloaded(d) {
+                    out.entries += 1;
+                    out.bytes += bytes;
+                }
+            }
+            st.db.unevict_shard(i);
+        }
+        self.sync_evicted();
+        out
     }
 
     /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，
@@ -741,6 +908,7 @@ impl Cdn {
 
     /// 某個網域的紀錄（`/api/trace` 的 cdnDb）
     pub fn domain(&self, name: &str) -> Option<Value> {
+        self.ensure_loaded(&normalize(name));
         let st = self.state();
         st.db.get(&normalize(name)).map(|d| serde_json::to_value(d).unwrap_or_default())
     }
@@ -748,6 +916,7 @@ impl Cdn {
     /// `/api/cdn/policy`：auto / always / never
     pub fn set_policy(&self, name: &str, policy: &str) -> Option<Value> {
         let p = db::Policy::parse(policy)?;
+        self.ensure_loaded(&normalize(name));
         let mut st = self.state();
         Some(serde_json::to_value(st.db.set_policy(&normalize(name), p)).unwrap_or_default())
     }
@@ -755,6 +924,7 @@ impl Cdn {
     /// `/api/cdn/verify`：立即驗證（網域要先解析過一次）。回傳（結果，網域紀錄）；資料庫沒有這個網域回 None
     pub async fn verify_now(self: &Arc<Self>, name: &str, family: u8) -> Option<(Option<&'static str>, Value)> {
         let name = normalize(name);
+        self.ensure_loaded(&name);
         let (provider, orig) = {
             let st = self.state();
             let e = st.db.get(&name)?;

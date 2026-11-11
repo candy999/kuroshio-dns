@@ -390,6 +390,23 @@ impl Domain {
             self.ips6.first().copied()
         }
     }
+
+    /// 估計佔用的記憶體（bytes；含雜湊表的一格）。只用來估算記憶體控制釋出多少，不必精確
+    pub fn approx_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let boxed = |b: bool, n: usize| if b { n } else { 0 };
+        size_of::<Domain>()
+            + size_of::<Arc<str>>()
+            + 16
+            + self.name.len()
+            + self.cname.val().map_or(0, |c| c.len())
+            + (self.ips4.len() + self.ips6.len()) * size_of::<IpAddr>()
+            + boxed(self.v4.is_some(), size_of::<Verdict>())
+            + boxed(self.v6.is_some(), size_of::<Verdict>())
+            + boxed(self.base.is_some(), size_of::<Base>())
+            + boxed(self.ecs.is_some(), size_of::<Ecs>())
+            + boxed(self.cross4.is_some(), size_of::<Cross>())
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -457,14 +474,64 @@ pub fn shard_file(n: usize, i: usize) -> String {
     format!("{SHARD_DIR}/{n}-{i:03}.json")
 }
 
-/// 網域屬於哪個分片：FNV-1a（各平台、各版本都一樣，不能用 std 的雜湊）
-pub fn shard_of(name: &str, n: usize) -> usize {
+/// 網域名稱的 32 位元雜湊：FNV-1a（各平台、各版本都一樣，不能用 std 的雜湊）。低位元就是分片編號
+pub fn name_hash(name: &str) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for b in name.as_bytes() {
         h ^= *b as u32;
         h = h.wrapping_mul(0x0100_0193);
     }
-    (h as usize) & (n.max(1) - 1)
+    h
+}
+
+/// 網域屬於哪個分片
+pub fn shard_of(name: &str, n: usize) -> usize {
+    (name_hash(name) as usize) & (n.max(1) - 1)
+}
+
+/// 逐筆讀分片檔裡的網域（不把整片解析成一個大陣列：一次只有一筆在記憶體裡）。
+/// 記憶體控制用：冷資料從磁碟找回單一網域、寫分片時把留在磁碟上的冷資料接回去
+pub fn scan_shard(bytes: &[u8], f: &mut dyn FnMut(Domain)) -> Result<(), serde_json::Error> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    struct Top<'a>(&'a mut dyn FnMut(Domain));
+    struct List<'a>(&'a mut dyn FnMut(Domain));
+    impl<'de> Visitor<'de> for Top<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("分片物件")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
+            while let Some(k) = m.next_key::<String>()? {
+                if k == "domains" {
+                    m.next_value_seed(List(&mut *self.0))?;
+                } else {
+                    m.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for List<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+    impl<'de> Visitor<'de> for List<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("網域陣列")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<(), A::Error> {
+            while let Some(d) = s.next_element::<Domain>()? {
+                (self.0)(d);
+            }
+            Ok(())
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    serde::Deserializer::deserialize_map(&mut de, Top(f))?;
+    de.end()
 }
 
 /// 依筆數上限決定分片數（2 的次方）：上限筆數時每片壓縮後約 64–128 KB
@@ -610,6 +677,17 @@ pub struct Db {
     marks: Vec<Mark>,
     /// 要寫分片清單：寫完之後要刪掉的舊檔（相對路徑）
     pub manifest_pending: Option<Vec<String>>,
+    /// 記憶體控制暫時移出記憶體的冷資料（規格 09）：只留名稱的 32 位元雜湊（排序、可重複），內容還在磁碟的分片裡。
+    /// 查到這些網域時從分片讀回來；寫分片時把它們從舊檔接回去，所以磁碟上不會少
+    evicted: Vec<u32>,
+}
+
+/// 冷資料移出記憶體的結果
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Evicted {
+    pub entries: usize,
+    /// 估計釋出的記憶體（bytes）
+    pub bytes: usize,
 }
 
 impl Db {
@@ -625,7 +703,93 @@ impl Db {
             shards: shards_for(max_entries.max(100)),
             marks: vec![Mark::Clean; shards_for(max_entries.max(100))],
             manifest_pending: None,
+            evicted: Vec::new(),
         }
+    }
+
+    // ------------------------------------------------------------ 冷資料（記憶體控制，規格 09）
+
+    /// 把冷資料移出記憶體（磁碟上的分片保留）：只動「已經寫進磁碟、之後沒有任何變動」的分片
+    /// （`persisted(i)` = 快照寫入器裡沒有這片的待寫內容），而且只動最後出現時間早於 `cutoff_ms`、
+    /// 自動策略的網域（手動設定的、最近用到的、剛改過的都不動）。
+    /// 整個資料庫要重寫、分片清單還沒寫時一律不動（磁碟上的內容還不是最新的）
+    pub fn evict_cold(&mut self, cutoff_ms: u64, persisted: &dyn Fn(usize) -> bool) -> Evicted {
+        let mut out = Evicted::default();
+        if self.dirty || self.manifest_pending.is_some() {
+            return out;
+        }
+        let n = self.shards;
+        let ok: Vec<bool> = (0..n).map(|i| self.marks[i] == Mark::Clean && persisted(i)).collect();
+        let cold: Vec<Arc<str>> = self
+            .domains
+            .values()
+            .filter(|d| d.policy() == Policy::Auto && d.last_seen < cutoff_ms && ok[shard_of(&d.name, n)])
+            .map(|d| d.name.clone())
+            .collect();
+        for name in cold {
+            if let Some(d) = self.domains.remove(&name) {
+                out.entries += 1;
+                out.bytes += d.approx_bytes();
+                self.evicted.push(name_hash(&name));
+            }
+        }
+        if out.entries > 0 {
+            self.evicted.sort_unstable();
+            self.evicted.shrink_to_fit();
+            self.domains.shrink_to_fit();
+        }
+        out
+    }
+
+    /// 這個名稱可能在磁碟上（被移出記憶體）
+    pub fn is_evicted(&self, name: &str) -> bool {
+        !self.evicted.is_empty() && self.evicted.binary_search(&name_hash(name)).is_ok()
+    }
+
+    /// 移出記憶體的筆數
+    pub fn evicted_count(&self) -> usize {
+        self.evicted.len()
+    }
+
+    /// 有移出記憶體的網域的分片
+    pub fn evicted_shards(&self) -> Vec<usize> {
+        let n = self.shards;
+        let mut v: Vec<usize> = self.evicted.iter().map(|h| (*h as usize) & (n - 1)).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// 這個分片裡被移出的雜湊（寫分片時比對磁碟上的網域用；`n` 跟目前的分片數不同時是空的）
+    pub fn evicted_hashes(&self, n: usize, i: usize) -> Vec<u32> {
+        if n != self.shards {
+            return Vec::new();
+        }
+        self.evicted.iter().copied().filter(|h| (*h as usize) & (n - 1) == i).collect()
+    }
+
+    /// 從移出名單拿掉一筆（讀回來了，或磁碟上已經找不到）
+    pub fn unevict(&mut self, name: &str) {
+        if let Ok(i) = self.evicted.binary_search(&name_hash(name)) {
+            self.evicted.remove(i);
+        }
+    }
+
+    /// 拿掉這個分片的整個移出名單（全部讀回來了，或分片檔已經不見 / 壞掉）
+    pub fn unevict_shard(&mut self, i: usize) {
+        let n = self.shards;
+        self.evicted.retain(|h| (*h as usize) & (n - 1) != i);
+    }
+
+    /// 從磁碟讀回來的網域：記憶體裡沒有才放進去（記憶體裡的比較新），並從移出名單拿掉。回傳有沒有放進去
+    pub fn insert_reloaded(&mut self, d: Domain) -> bool {
+        let name = d.name.clone();
+        self.unevict(&name);
+        if self.domains.contains_key(&name) {
+            return false;
+        }
+        self.domains.insert(name, d);
+        true
     }
 
     /// 改分片數（測試、量測用；正式執行由筆數上限決定）
