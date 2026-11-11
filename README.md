@@ -54,6 +54,8 @@ DNSCrypt 不支援：採用的伺服器少，而且都同時提供 DoH / DoT。
 - **Windows**：Windows 服務、本機設定頁、一鍵設定網卡 DNS 與防火牆。
 - **公開頁**：可以開一個設定說明頁給親友，依實際開啟的協議產生 iPhone 描述檔、Android 私人 DNS、Windows 設定方式。
 - **憑證與 DDNS**：Let's Encrypt（Cloudflare DNS 驗證，不用開 80 埠）、Cloudflare DDNS。
+- **固定網域與自備憑證**：只填 `domain` 就能用固定網域（不需要 DDNS）；把憑證放在 `tls.cert` / `tls.key` 就不需要 ACME（程式只讀不寫）。`kuroshio paths` 列出設定、狀態、憑證、token 等檔案的位置。
+- **多網卡**：`ddns.interfaces` 選擇要發布的出口，同一個名稱可以有多個 IP；IPv6（AAAA）預設不發布，要用再開 `ddns.ipv6`。`listen.<協議>.binds` 可以同時監聽多個位址。
 - **輕量**：執行檔約 1.2 MB；128 MB 的路由器也能跑（見下方硬體需求）。
 
 ## 硬體需求

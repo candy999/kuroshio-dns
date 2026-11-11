@@ -72,6 +72,12 @@ kuroshio check-config <file>                     檢查設定檔
   | `resolver.cookies` | `false` | DNS Cookies |
   | `upstream.autoTypes` | `['udp','doh','doh3','dot','doq']` | 評測類型 |
   | `acme` | `{ enabled:false, provider:'cloudflare', … }` | Windows 內建 ACME；OpenWrt 預設仍用 acme.sh |
+  | `domain` | `''` | 綁定網域（固定網域或 DDNS 名稱）。`site.hostname`、`community.domain`、`acme.domains` 空白時自動帶入；`ddns.records` 只有 `ddns.enabled` 而且沒寫記錄時才帶入（固定網域不需要 DDNS） |
+  | `tls` | `{ cert:'', key:'' }` | 共用憑證位置（自備憑證放這裡，不需要 ACME）。監聽用的憑證：`listen.<x>.cert/key` → `tls.cert/key` → 內建 ACME 的輸出位置（`acme.enabled` 才算）。ACME 的輸出位置：`acme.certFile/keyFile` → `tls.*` → `listen.dot.*` → `listen.doh.*` → `<設定目錄>/cert.pem`、`key.pem`；`acme.enabled` 關閉時絕不寫入，啟動時只檢查（檔案不存在、過期、沒涵蓋 `domain` 會提醒） |
+  | `listen.doh.tls` | `'auto'` | DoH 的 TCP 要不要自己做 TLS：`auto` / `true` / `false`。auto：`listen.doh.windowsMode = 'iis-proxy'`，或只監聽 loopback 而且沒有明確寫 `listen.doh.cert` → 明文 HTTP（前面有反向代理）；其他情況找得到憑證就 TLS。UCI 轉出來的設定一律有 `listen.doh.cert`，行為不變 |
+  | `listen.<dot\|doq\|doh>.binds` | `[]` | 多位址監聽，有填就取代 `host`；IPv4、IPv6 可以同時寫（IPv6 設 `IPV6_V6ONLY`）。DoH3 跟 DoH 同樣的位址（`listen.doh.http3Binds` 可另外指定）。一個位址綁定失敗只記警告，結果在 `/api/status` 的 `listenersDetail` |
+  | `ddns.ipv6` | `false` | AAAA 預設不發布（不少線路會擋外面連進來的 IPv6）；關掉時會移除自己建立的 AAAA |
+  | `ddns.ipSource`、`ddns.interfaces` | `'web'`、`[]` | 多網卡 / 多出口：`interfaces` 列出要發布的網卡（舊的 `iface4` / `iface6` 併入）；`web` = 從每張網卡各自連出去查公網 IP，`interface` = 讀網卡上的公網位址。同一個名稱、同一種類型的記錄當成一組：只在這一組裡新增 / 更新 / 刪除；偵測失敗不動記錄；消失的出口連續 3 次才移除 |
 
 - **OpenWrt**：核心直接讀 UCI（`ubus call uci get '{"config":"kuroshio"}'` 或 init 先存成 `/var/run/kuroshio/uci.json`），轉換規則照 `uci-config.js` 逐條移植（`snake_case → camelCase`、依預設值型別轉換、空白 = 預設、接管模式決定綁定位址等）。`test-uci-config.js` 的案例全部變成 Rust 測試。
 - **Windows**：`%ProgramData%\kuroshio\config.json`，只存跟預設值不同的欄位；設定頁存檔時整份寫入（先寫暫存檔再改名），核心偵測變更後重新載入（同 2.x 的 UCI reload）。
@@ -127,6 +133,10 @@ kuroshio check-config <file>                     檢查設定檔
 | `/api/defaults` | 同 `kuroshio defaults --json` |
 | `/api/acme`、`/api/acme/issue` | Windows 內建 ACME 狀態與申請 |
 | `/api/log` | 最近的日誌（Windows 設定頁用；OpenWrt 仍走 logread） |
+| `/api/paths` | 存放位置：`configFile`、`configDir`、`stateDir`、`runtimeDir`、`shareDir`、`tls{cert,key,source,exists,info}`（`source`：`manual` / `acme` / `none`）、`acme{enabled,account,domains}`、`adminToken`、`customRules`、`benchmarkDir`、`communityKeyDir`、`logFile`。只有路徑，沒有密鑰內容；命令列：`kuroshio paths [-c CONFIG] [--uci]` |
+| `/api/interfaces` | 本機網卡與位址：`interfaces[] { name, label, up, addrs[] { ip, family, scope, temporary?, deprecated? } }`（DDNS 選出口、選監聽位址用） |
+| `/api/status` 的 `listenersDetail` | 每個加密監聽位址：`{ proto, bind, port, ok, tls, error }` |
+| `/api/ddns` 的 `sources`、`records` | 每個出口偵測到的 IP、每筆記錄的結果 |
 | `/api/community/*` | v2 新增的聲譽、候選統計（見 03） |
 | `/api/backup/export?kind=full\|share`（GET） | 先把記憶體裡的狀態寫出，再下載 `.kuroshio` 備份檔（`application/octet-stream`、`content-disposition: attachment; filename="kuroshio-<種類>-YYYYMMDD.kuroshio"`） |
 | `/api/backup/import`（POST，內容 = 檔案本身，最多 64 MB） | 檢查後存成 `<state>/import-pending.kuroshio`，在程式內重新啟動；回 `{ok, reloading:true, preview}`。新的一輪在讀取任何狀態之前合併（舊的一輪先把記憶體寫出，不會蓋掉合併結果） |
