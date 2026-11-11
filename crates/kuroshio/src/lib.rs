@@ -5,6 +5,7 @@ pub mod acl;
 pub mod acme;
 pub mod admin;
 pub mod app;
+pub mod backup;
 pub mod cache;
 pub mod certinfo;
 pub mod cloudflare;

@@ -1,6 +1,6 @@
 'use strict';
 // CI：Windows 本機設定頁（data/admin）端對端測試。自己啟動 kuroshio（暫存設定檔、空著的埠號），用 Playwright 實際操作：
-// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、工具、日誌、手機寬度、深色模式、登出。
+// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
 //
 //   cargo build -p kuroshio && node tools/admin-e2e.js
 //   KUROSHIO_BIN=path/to/kuroshio SHOTS=screenshots-admin node tools/admin-e2e.js
@@ -64,6 +64,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         xTest: { keep: true }
     };
     fs.writeFileSync(cfgFile, JSON.stringify(initial, null, 2));
+    // 備份用的學習資料（CDN 關閉時服務不會動這些檔案，匯出直接讀磁碟）
+    fs.mkdirSync(path.join(dir, 'state'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'state', 'cdn-domains.json'), JSON.stringify({ domains: [
+        { name: 'a.example', provider: 'cloudflare', hits: 12, firstSeen: 1, lastSeen: 2, policy: 'always', v4: { verdict: 'ok', at: 100 } }] }));
+    fs.writeFileSync(path.join(dir, 'state', 'blacklist.txt'), '# 測試\n203.0.113.9\n');
 
     let out = '';
     const child = spawn(BIN, ['run', '-c', cfgFile], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NO_COLOR: '1' } });
@@ -105,6 +110,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         let fields = null;
         try { fields = JSON.parse(fj.body); } catch (e) { /* 下面報錯 */ }
         check(fields && fields.groups && fields.groups.length >= 8, 'fields.json 可以解析');
+        check((await raw(adminPort, 'GET', '/api/backup/export?kind=full')).status === 401, '沒登入時不能下載備份（401）');
+        const xi = await raw(adminPort, 'POST', '/api/backup/import', { Origin: 'http://evil.example', Authorization: `Bearer ${token}` }, 'x');
+        check(xi.status === 403, '跨站匯入備份（Origin 不是本機）回 403');
         check(!/candy\.moe/.test(js.body + fj.body), '沒有寫死真實網域');
 
         // ---------------- 瀏覽器
@@ -270,6 +278,36 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.waitForFunction(() => /路由/.test(document.querySelector('#tool-view .verdict').textContent), null, { timeout: 5000 }).catch(() => {});
         check(!(await page.isHidden('#tool-view pre')), '查看資料：顯示 JSON');
         await shot('07-tools');
+
+        console.log('備份與分享');
+        await page.waitForSelector('#tool-backup #backup-full');
+        check(/完整備份/.test(await page.textContent('#tool-backup')) && /私鑰/.test(await page.textContent('#tool-backup')), '備份卡片說明兩種檔案（完整備份含私鑰）');
+        const download = async sel => {
+            const [d] = await Promise.all([page.waitForEvent('download', { timeout: 20000 }), page.click(sel)]);
+            const p = path.join(dir, d.suggestedFilename());
+            await d.saveAs(p);
+            return p;
+        };
+        const fullFile = await download('#backup-full');
+        check(/^kuroshio-full-\d{8}\.kuroshio$/.test(path.basename(fullFile)) && fs.statSync(fullFile).size > 0, '下載完整備份（非空的 .kuroshio 檔）', path.basename(fullFile));
+        const shareFile = await download('#backup-share');
+        check(/^kuroshio-share-\d{8}\.kuroshio$/.test(path.basename(shareFile)) && fs.statSync(shareFile).size > 0, '下載分享檔（非空的 .kuroshio 檔）', path.basename(shareFile));
+        const zlib = require('zlib');
+        if (zlib.zstdDecompressSync) {
+            const unpack = f => JSON.parse(zlib.zstdDecompressSync(fs.readFileSync(f)).toString('utf-8'));
+            const fb = unpack(fullFile), sb = unpack(shareFile);
+            check(fb.format === 'kuroshio-backup' && fb.kind === 'full' && fb.files['cdn-domains.json'].json.domains[0].hits === 12, '完整備份內容（含查詢次數）');
+            const sd = sb.files['cdn-domains.json'].json.domains[0];
+            check(sb.kind === 'share' && sd.name === 'a.example' && !('hits' in sd) && !('policy' in sd) && !('lastSeen' in sd) && sb.files['blacklist.txt'], '分享檔內容（沒有次數、時間、手動設定）', JSON.stringify(sd));
+        }
+        await page.setInputFiles('#backup-file', shareFile);
+        await page.click('#tool-backup button');
+        await page.waitForFunction(() => /匯入完成|失敗|沒有在 30 秒|沒有讀到/.test(document.querySelector('#tool-backup .verdict').textContent), null, { timeout: 45000 }).catch(() => {});
+        const bv = await page.textContent('#tool-backup .verdict');
+        const bo = await page.textContent('#tool-backup pre');
+        check(/匯入完成/.test(bv) && /CDN 網域驗證紀錄/.test(bo) && /汙染 DNS 黑名單/.test(bo) && /保留本機/.test(bo), '匯入分享檔 → 服務重新啟動 → 顯示合併結果', bv + '\n     ' + bo);
+        check(/匯入分享檔完成/.test(out), '伺服器記錄匯入結果');
+        await shot('07b-backup');
 
         console.log('關於');
         await page.goto(`${BASE}/#about`);

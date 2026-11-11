@@ -49,6 +49,9 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"], optional = true }
 # 描述檔的固定 UUID（SHA-1）；rustls 已經用到 ring，不會多編一份
 ring = "0.17"
+# 備份檔（.kuroshio）：zstd 壓縮的 JSON，二進位檔用 base64
+zstd = { version = "0.13", default-features = false }
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

@@ -67,18 +67,23 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// 設定頁要不要登入；要的話 token 檔在哪裡（`admin.auth`、`admin.tokenFile`）
+pub fn token_file(cfg: &Value, base_dir: &std::path::Path) -> Option<PathBuf> {
+    let auth = match get(cfg, "admin.auth") {
+        Some(Value::Bool(b)) => *b,
+        _ => cfg!(windows),
+    };
+    auth.then(
+        || match get(cfg, "admin.tokenFile").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            Some(p) => PathBuf::from(p),
+            None => base_dir.join("admin.token"),
+        },
+    )
+}
+
 impl WebUi {
     pub fn new(cfg: &Value, base_dir: &std::path::Path, share_dir: &std::path::Path) -> WebUi {
-        let auth = match get(cfg, "admin.auth") {
-            Some(Value::Bool(b)) => *b,
-            _ => cfg!(windows),
-        };
-        let token_file = auth.then(
-            || match get(cfg, "admin.tokenFile").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                Some(p) => PathBuf::from(p),
-                None => base_dir.join("admin.token"),
-            },
-        );
+        let token_file = token_file(cfg, base_dir);
         let token = token_file
             .as_ref()
             .map(|f| match std::fs::read_to_string(f).map(|t| t.trim().to_string()) {

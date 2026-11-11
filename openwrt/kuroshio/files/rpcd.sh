@@ -9,6 +9,8 @@
 #    acme_status   憑證資訊與申請紀錄
 #    acme_issue    背景申請憑證                                          ← ACL 寫入權限
 #    log           最近的執行紀錄
+#    backup_export 匯出學習資料到 /tmp/kuroshio-backup.kuroshio（LuCI 再下載）  ← ACL 寫入權限
+#    backup_import 匯入 LuCI 上傳的 /tmp/kuroshio-import.kuroshio（合併）       ← ACL 寫入權限
 # =====================================================================
 . /usr/share/libubox/jshn.sh
 
@@ -35,12 +37,16 @@ read_input() {
 	json_get_var P_PATH path
 	json_get_var P_QUERY query
 	json_get_var P_LINES lines
+	json_get_var P_KIND kind
 }
+
+BACKUP_OUT=/tmp/kuroshio-backup.kuroshio
+BACKUP_IN=/tmp/kuroshio-import.kuroshio
 
 case "$1" in
 list)
 	cat <<-'EOF'
-	{"status":{},"api":{"path":"str","query":"str"},"action":{"path":"str","query":"str"},"defaults":{},"acme_status":{},"acme_issue":{},"log":{"lines":64},"about":{}}
+	{"status":{},"api":{"path":"str","query":"str"},"action":{"path":"str","query":"str"},"defaults":{},"acme_status":{},"acme_issue":{},"log":{"lines":64},"about":{},"backup_export":{"kind":"str"},"backup_import":{}}
 	EOF
 	;;
 call)
@@ -88,6 +94,38 @@ call)
 		;;
 	acme_issue)
 		/usr/libexec/kuroshio/acme.sh issue-bg
+		;;
+	backup_export)
+		# 完整備份（預設）或分享檔；完整備份含社群私鑰，檔案只有 root 能讀，LuCI 下載後會刪掉
+		read_input
+		kind=full
+		if [ "$P_KIND" = share ]; then kind=share; set -- --share; else set --; fi
+		rm -f "$BACKUP_OUT"
+		json_init
+		if msg=$(umask 077; /usr/bin/kuroshio export --uci "$@" -o "$BACKUP_OUT" 2>&1) && [ -s "$BACKUP_OUT" ]; then
+			json_add_boolean ok 1
+			json_add_int size "$(wc -c < "$BACKUP_OUT" | tr -d ' ')"
+			json_add_string name "kuroshio-$kind-$(date +%Y%m%d).kuroshio"
+			json_add_string path "$BACKUP_OUT"
+		else
+			rm -f "$BACKUP_OUT"
+			json_add_boolean ok 0
+			json_add_string error "${msg:-匯出失敗}"
+		fi
+		json_dump
+		;;
+	backup_import)
+		# 服務執行中：交給服務、等它重新啟動合併；沒有執行：直接合併。輸出合併結果（JSON）
+		if [ ! -s "$BACKUP_IN" ]; then
+			echo '{"ok":false,"error":"沒有收到檔案"}'
+			exit 0
+		fi
+		out=$(/usr/bin/kuroshio import --uci --json "$BACKUP_IN" 2>/dev/null)
+		rm -f "$BACKUP_IN"
+		case "$out" in
+		'{'*) printf '%s' "$out" ;;
+		*) echo '{"ok":false,"error":"kuroshio 沒有回應"}' ;;
+		esac
 		;;
 	log)
 		read_input

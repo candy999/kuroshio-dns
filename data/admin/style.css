@@ -264,6 +264,11 @@ td.mono { font-family: var(--mono); font-size: 13px; }
 .tool .verdict.err { color: var(--err); }
 .tool .verdict.warn { color: var(--warn); }
 .tool.wide { grid-column: 1 / -1; }
+.tool .notes { margin: 0 0 10px; padding-left: 1.2em; color: var(--muted); font-size: 13px; }
+.tool .notes li { margin: 2px 0; }
+.tool .notes strong { color: var(--text); }
+.tool input[type=file] { flex: 0 1 280px; min-width: 0; max-width: 100%; font: inherit; font-size: 13px; color: var(--text); }
+.sep-v { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
 
 pre.out, pre.log {
   background: var(--code-bg); color: var(--code-text);
@@ -322,4 +327,6 @@ pre.log { max-height: 70vh; min-height: 200px; font-size: 12px; }
   .savebar-btns { width: 100%; }
   .savebar-btns .btn { flex: 1; }
   .log-ctl input[type=search] { width: 100%; }
+  .sep-v { display: none; }
+  #tool-backup .ctl-row .btn { flex: 1 1 auto; }
 }

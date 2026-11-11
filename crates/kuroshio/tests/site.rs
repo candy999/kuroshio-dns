@@ -54,6 +54,7 @@ fn state(cfg: &Value) -> Arc<AppState> {
         reload: Arc::new(tokio::sync::Notify::new()),
         scheduler: None,
         encrypted: Encrypted::default(),
+        backup: kuroshio::backup::Locations::from_cfg(cfg),
     })
 }
 

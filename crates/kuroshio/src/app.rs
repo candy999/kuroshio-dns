@@ -636,6 +636,8 @@ pub struct AppState {
     pub scheduler: Option<Arc<kuroshio_jobs::Scheduler>>,
     /// 實際在監聽的加密協議
     pub encrypted: Encrypted,
+    /// 備份 / 匯入用到的檔案位置
+    pub backup: crate::backup::Locations,
 }
 
 impl AppState {
@@ -787,6 +789,9 @@ fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>) {
 
 pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     let tiny = tier == Tier::Tiny;
+    // 設定頁 / 指令列匯入的備份：在讀取任何狀態之前合併（上一輪關機時已經把記憶體寫出）
+    let backup = crate::backup::Locations::from_cfg(cfg);
+    crate::backup::apply_pending(&backup);
     let persister = Arc::new(Mutex::new(Persister::new(persist_dir(cfg), persist_policy(cfg, tiny))));
     {
         let p = persister.lock().unwrap();
@@ -912,6 +917,7 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         reload: Arc::new(tokio::sync::Notify::new()),
         scheduler,
         encrypted: encrypted.clone(),
+        backup,
     });
     // 公開頁：需要整體狀態（唯讀 API），所以最後才建立；DoH 監聽之後才會開始轉給它
     if let Some(site) = crate::site::Site::new(cfg, state.clone(), resolver.presence.get().cloned()) {

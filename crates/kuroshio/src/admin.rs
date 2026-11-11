@@ -102,11 +102,14 @@ pub fn local_host(host: Option<&str>) -> bool {
     name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
-/// 讀一個 HTTP/1.1 請求（標頭最多 16 KB、內容最多 1 MB）
+/// 匯入備份的路徑（內容上限是備份檔的上限，不是 1 MB）
+const IMPORT_PATH: &str = "/api/backup/import";
+
+/// 讀一個 HTTP/1.1 請求（標頭最多 16 KB、內容最多 1 MB；匯入備份最多 64 MB）
 async fn read_req(s: &mut TcpStream) -> anyhow::Result<Option<Req>> {
     let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 4096];
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut tmp = [0u8; 16384];
+    let mut deadline = Instant::now() + Duration::from_secs(10);
     let head_end = loop {
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break p;
@@ -136,10 +139,17 @@ async fn read_req(s: &mut TcpStream) -> anyhow::Result<Option<Req>> {
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     (req.path, req.query) = (path.to_string(), query.to_string());
     let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if len > 1 << 20 {
+    let max = if req.path == IMPORT_PATH {
+        deadline += Duration::from_secs(50);
+        crate::backup::MAX_BYTES
+    } else {
+        1 << 20
+    };
+    if len > max {
         anyhow::bail!("內容太大");
     }
     let mut body = buf[head_end + 4..].to_vec();
+    body.reserve(len.saturating_sub(body.len()));
     while body.len() < len {
         let n = tokio::time::timeout_at(deadline.into(), s.read(&mut tmp)).await??;
         if n == 0 {
@@ -282,6 +292,8 @@ async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
             }
             match (m, p) {
                 ("GET", "/api/config") | ("PUT", "/api/config") => Out::from_response(config_api(st, req)),
+                ("GET", "/api/backup/export") => backup_export(st, req).await,
+                ("POST", IMPORT_PATH) => Out::from_response(backup_import(st, req).await),
                 ("GET", "/api/log") => {
                     let n = parse_query(&req.query)
                         .get("lines")
@@ -344,6 +356,48 @@ fn config_api(st: &Arc<AppState>, req: &Req) -> Response {
     ok(json!({ "ok": true, "reloading": true }))
 }
 
+/// `GET /api/backup/export?kind=full|share`：先把記憶體裡的狀態寫出，再下載 `.kuroshio` 檔
+async fn backup_export(st: &Arc<AppState>, req: &Req) -> Out {
+    let q = parse_query(&req.query);
+    let Some(kind) = crate::backup::Kind::parse(q.get("kind").map(String::as_str).unwrap_or("full")) else {
+        return Out::from_response(bad("kind 只能是 full 或 share", 400));
+    };
+    let s2 = st.clone();
+    match tokio::task::spawn_blocking(move || crate::backup::export_running(&s2, kind)).await {
+        Ok(body) => {
+            info!("匯出{}（{} KB）", kind.label(), body.len().div_ceil(1024));
+            Out {
+                code: 200,
+                ctype: "application/octet-stream",
+                headers: vec![format!(
+                    "content-disposition: attachment; filename=\"{}\"",
+                    crate::backup::file_name(kind)
+                )],
+                body,
+            }
+        }
+        Err(e) => Out::from_response(bad(&format!("匯出失敗：{e}"), 500)),
+    }
+}
+
+/// `POST /api/backup/import`（內容 = 檔案本身）：檢查後放著，服務在程式內重新啟動時合併
+async fn backup_import(st: &Arc<AppState>, req: &Req) -> Response {
+    if req.body.is_empty() {
+        return bad("沒有收到檔案", 400);
+    }
+    let preview = match crate::backup::stage_pending(&st.backup, &req.body) {
+        Ok(p) => p,
+        Err(e) => return bad(&format!("{e:#}"), 400),
+    };
+    info!("收到{}，重新載入後合併", preview["kindLabel"].as_str().unwrap_or("備份"));
+    let r = st.reload.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.notify_one();
+    });
+    ok(json!({ "ok": true, "reloading": true, "preview": preview }))
+}
+
 fn qtype_num(t: &str) -> Option<u16> {
     Some(match t.to_ascii_uppercase().as_str() {
         "" | "A" => 1,
@@ -397,6 +451,7 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null)),
         "/api/sysinfo" => ok(st.system_json()),
+        "/api/backup/last-import" => ok(crate::backup::last_import(&st.backup)),
         "/api/cache/flush" => {
             r.flush();
             ok(json!({ "ok": true }))

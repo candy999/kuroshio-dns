@@ -111,6 +111,30 @@ enum Cmd {
         #[arg(long)]
         uci: bool,
     },
+    /// 匯出學習資料（.kuroshio）：預設是完整備份（換路由器用，含社群身分，請自己保管）；--share 是給朋友的分享檔
+    Export {
+        /// 分享給朋友：只有 CDN 網域驗證紀錄（不含次數與時間）、節點池、評測結果、汙染黑名單
+        #[arg(long)]
+        share: bool,
+        /// 輸出檔（預設 kuroshio-full-日期.kuroshio，放在目前的資料夾）
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
+    /// 匯入 .kuroshio（合併，不會直接覆蓋本機比較新的資料）；服務執行中時交給服務，重新啟動後合併
+    Import {
+        file: PathBuf,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 只輸出一行 JSON 結果（LuCI 用）
+        #[arg(long)]
+        json: bool,
+    },
     /// 輸出完整預設設定
     Defaults {
         /// JSON 格式（目前只有這一種）
@@ -309,7 +333,7 @@ pub async fn serve(
         if !reload {
             break;
         }
-        info!("設定已變更，重新載入");
+        info!("重新載入（設定變更或匯入備份）");
         first = false;
     }
     info!("結束");
@@ -481,6 +505,19 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
                 v["qrSource"] = serde_json::json!(kuroshio::about::qr_svg(v["source"].as_str().unwrap_or("")));
             }
             println!("{}", serde_json::to_string(&v)?);
+        }
+        Cmd::Export { share, out, config, uci } => export_cmd(share, out, &config, uci).await?,
+        Cmd::Import { file, config, uci, json } => {
+            let r = import_cmd(&file, &config, uci, json).await;
+            if json {
+                let v = r.unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": format!("{e:#}") }));
+                println!("{}", serde_json::to_string(&v)?);
+                if v["ok"] != true {
+                    std::process::exit(1);
+                }
+            } else {
+                r?;
+            }
         }
         Cmd::Run { config, uci } => serve(config, uci, threads, None, shutdown_signal()).await?,
         Cmd::ServiceRun { .. } => unreachable!(),
@@ -706,6 +743,182 @@ async fn compare(
         None => println!("{text}"),
     }
     Ok(if v["pass"] == true { 0 } else { 1 })
+}
+
+/// 正在執行的服務的管理 API（網址、登入 token）；admin.enabled 關掉時沒有
+fn admin_endpoint(cfg: &serde_json::Value) -> Option<(String, Option<String>)> {
+    use kuroshio_config::get;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    if get(cfg, "admin.enabled").and_then(|v| v.as_bool()) == Some(false) {
+        return None;
+    }
+    let host: IpAddr = get(cfg, "admin.host")
+        .and_then(|v| v.as_str())
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    // 聽在 0.0.0.0 / :: 時從本機連
+    let host = match host {
+        IpAddr::V4(a) if a.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(a) if a.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        h => h,
+    };
+    let port = get(cfg, "admin.port").and_then(|v| v.as_u64()).unwrap_or(8054) as u16;
+    let base = kuroshio::app::persist_dir(cfg).parent().map(PathBuf::from).unwrap_or_default();
+    let token = kuroshio::webui::token_file(cfg, &base)
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    Some((format!("http://{}", std::net::SocketAddr::new(host, port)), token))
+}
+
+/// 呼叫管理 API（帶登入 token）
+async fn admin_call(
+    ep: &(String, Option<String>),
+    method: &'static str,
+    path: &str,
+    body: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> Result<(u16, Vec<u8>)> {
+    let mut headers = vec![];
+    if let Some(t) = &ep.1 {
+        headers.push(("Authorization".to_string(), format!("Bearer {t}")));
+    }
+    if body.is_some() {
+        headers.push(("Content-Type".to_string(), "application/octet-stream".to_string()));
+    }
+    let req = kuroshio::fetch::Request { method, headers, body };
+    kuroshio::fetch::request(&format!("{}{path}", ep.0), &req, kuroshio::backup::MAX_BYTES as u64, timeout).await
+}
+
+/// 服務有沒有在執行（管理 API 有回應）
+async fn admin_up(ep: &(String, Option<String>)) -> bool {
+    admin_call(ep, "GET", "/api/session", None, std::time::Duration::from_secs(3))
+        .await
+        .is_ok_and(|(c, _)| c == 200)
+}
+
+fn api_error(code: u16, body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(String::from))
+        .unwrap_or_else(|| format!("HTTP {code}"))
+}
+
+/// `kuroshio export`：服務執行中跟服務拿（先寫出記憶體裡的最新狀態），沒有執行就從磁碟組
+async fn export_cmd(share: bool, out: Option<PathBuf>, config: &std::path::Path, uci: bool) -> Result<()> {
+    use kuroshio::backup::{self, Kind};
+    let (cfg, ..) = effective(config, uci)?;
+    let kind = if share { Kind::Share } else { Kind::Full };
+    let mut data = None;
+    if let Some(ep) = admin_endpoint(&cfg) {
+        if admin_up(&ep).await {
+            let path = format!("/api/backup/export?kind={}", kind.name());
+            match admin_call(&ep, "GET", &path, None, std::time::Duration::from_secs(120)).await {
+                Ok((200, b)) => data = Some(b),
+                Ok((code, b)) => eprintln!("服務沒有給檔案（{}），改從磁碟上的資料匯出", api_error(code, &b)),
+                Err(e) => eprintln!("服務沒有給檔案（{e:#}），改從磁碟上的資料匯出"),
+            }
+        }
+    }
+    let data = match data {
+        Some(d) => d,
+        None => backup::export(&backup::Locations::from_cfg(&cfg), kind).encode(),
+    };
+    let out = out.unwrap_or_else(|| PathBuf::from(backup::file_name(kind)));
+    {
+        use std::io::Write;
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        // 完整備份含社群私鑰：只有自己能讀
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        let mut f = o.open(&out).with_context(|| format!("無法寫入 {}", out.display()))?;
+        f.write_all(&data)?;
+    }
+    let p = backup::Bundle::decode(&data)?.preview();
+    println!("已匯出{}：{}（{} KB）", kind.label(), out.display(), data.len().div_ceil(1024));
+    println!("{}", backup::preview_text(&p));
+    if kind == Kind::Full {
+        println!("完整備份含社群身分（私鑰），請自己保管，不要分享給別人；要給朋友請用 --share。");
+    }
+    Ok(())
+}
+
+/// `kuroshio import`：服務執行中交給服務（重新啟動後合併），沒有執行就直接合併到磁碟
+async fn import_cmd(file: &std::path::Path, config: &std::path::Path, uci: bool, quiet: bool) -> Result<serde_json::Value> {
+    use kuroshio::backup::{self, Bundle};
+    let (cfg, ..) = effective(config, uci)?;
+    let len = std::fs::metadata(file).with_context(|| format!("讀不到 {}", file.display()))?.len();
+    if len > backup::MAX_BYTES as u64 {
+        anyhow::bail!("檔案太大（超過 {} MB）", backup::MAX_BYTES >> 20);
+    }
+    let data = std::fs::read(file).with_context(|| format!("讀不到 {}", file.display()))?;
+    let bundle = Bundle::decode(&data)?;
+    let preview = bundle.preview();
+    if !quiet {
+        println!("{}", backup::preview_text(&preview));
+    }
+    let ep = admin_endpoint(&cfg);
+    let running = match &ep {
+        Some(ep) => admin_up(ep).await,
+        None => false,
+    };
+    let mut report = match (&ep, running) {
+        (Some(ep), true) => {
+            // 上一次的匯入結果：等到出現新的一筆（時間不早於送出前）才算完成
+            let last = |b: &[u8]| {
+                serde_json::from_slice::<serde_json::Value>(b)
+                    .ok()
+                    .and_then(|v| v["importedAt"].as_u64())
+            };
+            let prev = match admin_call(ep, "GET", "/api/backup/last-import", None, std::time::Duration::from_secs(3)).await {
+                Ok((200, b)) => last(&b),
+                _ => None,
+            };
+            let t0 = backup::now_ms();
+            let (code, b) = admin_call(ep, "POST", "/api/backup/import", Some(&data), std::time::Duration::from_secs(120)).await?;
+            if code != 200 {
+                anyhow::bail!("服務拒絕匯入：{}", api_error(code, &b));
+            }
+            if !quiet {
+                println!("已交給執行中的服務，重新啟動後合併…");
+            }
+            // 等服務重新啟動、合併完成（最多 60 秒）
+            let mut done = None;
+            for _ in 0..120 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let r = admin_call(ep, "GET", "/api/backup/last-import", None, std::time::Duration::from_secs(3)).await;
+                if let Ok((200, b)) = r {
+                    let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+                    if v["importedAt"].as_u64().is_some_and(|t| t >= t0 && Some(t) != prev) {
+                        done = Some(v);
+                        break;
+                    }
+                }
+            }
+            done.unwrap_or_else(|| {
+                serde_json::json!({ "ok": true, "pending": true, "items": [],
+                    "note": "服務還沒有重新啟動完成；合併結果之後會記在日誌裡" })
+            })
+        }
+        _ => {
+            if ep.is_none() && !quiet {
+                eprintln!("管理 API 沒有開（admin.enabled）：如果服務正在執行，請先停止服務再匯入，否則關機時會蓋掉匯入的資料。");
+            }
+            let loc = backup::Locations::from_cfg(&cfg);
+            let r = backup::merge(&loc, &bundle);
+            let _ = kuroshio::persist::write_atomic(&loc.last_file(), &serde_json::to_vec(&r)?);
+            r
+        }
+    };
+    if !quiet {
+        match report["note"].as_str() {
+            Some(n) if report["pending"] == true => println!("{n}"),
+            _ => println!("{}", backup::report_text(&report)),
+        }
+    }
+    report["preview"] = preview;
+    Ok(report)
 }
 
 async fn shutdown_signal() {

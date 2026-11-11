@@ -14,13 +14,14 @@
 				"/etc/kuroshio/benchmark/blacklist.txt": [ "read" ],
 				"/etc/kuroshio/benchmark/dotlist.txt": [ "read" ],
 				"/etc/kuroshio/benchmark/doqlist.txt": [ "read" ],
-				"/etc/kuroshio/state/blacklist.txt": [ "read" ]
+				"/etc/kuroshio/state/blacklist.txt": [ "read" ],
+				"/tmp/kuroshio-backup.kuroshio": [ "read" ]
 			},
 			"uci": [ "kuroshio" ]
 		},
 		"write": {
 			"ubus": {
-				"kuroshio": [ "action", "acme_issue" ]
+				"kuroshio": [ "action", "acme_issue", "backup_export", "backup_import" ]
 			},
 			"file": {
 				"/etc/kuroshio/custom-rules.txt": [ "write" ],
@@ -30,7 +31,9 @@
 				"/etc/kuroshio/benchmark/blacklist.txt": [ "write" ],
 				"/etc/kuroshio/benchmark/dotlist.txt": [ "write" ],
 				"/etc/kuroshio/benchmark/doqlist.txt": [ "write" ],
-				"/etc/kuroshio/state/blacklist.txt": [ "write" ]
+				"/etc/kuroshio/state/blacklist.txt": [ "write" ],
+				"/tmp/kuroshio-backup.kuroshio": [ "write" ],
+				"/tmp/kuroshio-import.kuroshio": [ "write" ]
 			},
 			"uci": [ "kuroshio" ]
 		}

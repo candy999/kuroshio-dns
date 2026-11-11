@@ -845,6 +845,7 @@ name = "kuroshio"
 version = "3.0.0-alpha.2"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "h2",
@@ -875,6 +876,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "x509-parser 0.16.0",
+ "zstd",
 ]
 
 [[package]]

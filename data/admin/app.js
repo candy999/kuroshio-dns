@@ -130,7 +130,11 @@
 	function api(path, opts) {
 		opts = opts || {};
 		var init = { method: opts.method || 'GET', credentials: 'same-origin', cache: 'no-store', headers: {} };
-		if (opts.body !== undefined) {
+		if (opts.raw !== undefined) {
+			// 檔案內容（匯入備份）
+			init.headers['content-type'] = 'application/octet-stream';
+			init.body = opts.raw;
+		} else if (opts.body !== undefined) {
 			init.headers['content-type'] = 'application/json';
 			init.body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body);
 		}
@@ -1199,9 +1203,69 @@
 		})]);
 		box.appendChild(vc);
 
+		box.appendChild(backupCard());
+
 		refreshJobs();
 		refreshAcme();
 		refreshDdns();
+	}
+
+	// ---------------------------------------------------------------- 備份與分享
+	/** 匯入結果（/api/backup/last-import）→ 一類一行 */
+	function importLines(r) {
+		var words = [['added', '新增'], ['updated', '更新'], ['kept', '保留本機'], ['skipped', '略過']];
+		return (r.items || []).map(function (i) {
+			var parts = words.filter(function (w) { return i[w[0]] > 0; }).map(function (w) { return w[1] + ' ' + fmtNum(i[w[0]]); });
+			return (i.label || i.file) + '：' + (parts.length ? parts.join('、') : '沒有變動') +
+				(i.note ? '（' + i.note + '）' : '') + (i.error ? '【錯誤：' + i.error + '】' : '');
+		});
+	}
+	function previewText(p) {
+		return (p.kindLabel || '備份') + (p.core ? '，黑潮 DNS ' + p.core : '') + (p.exportedAt ? '，' + fmtTime(p.exportedAt) + ' 匯出' : '') +
+			'：' + (p.files || []).map(function (f) { return f.label + ' ' + fmtNum(f.count) + ' ' + f.unit; }).join('、');
+	}
+	function backupCard() {
+		var bc = toolCard('backup', '備份與分享', '換電腦、重灌，或把學到的資料分享給朋友。匯入是「合併」：本機比較新的資料會留著，不會被蓋掉。', true);
+		bc.insertBefore(el('ul', { class: 'notes' }, [
+			el('li', {}, [el('strong', { text: '完整備份' }), '：全部學習資料、自訂規則、社群身分與好友。含私鑰，請自己保管，不要給別人。']),
+			el('li', {}, [el('strong', { text: '分享給朋友' }), '：CDN 網域驗證紀錄（只有網域名稱與驗證結果，不含查詢次數與時間）、台灣節點池、上游評測結果、汙染 DNS 黑名單。沒有身分、金鑰、統計與自訂規則。'])
+		]), bc.body);
+		var file = el('input', { type: 'file', accept: '.kuroshio', 'aria-label': '選擇要匯入的 .kuroshio 檔', id: 'backup-file' });
+		var imp = actBtn('匯入', '', function () {
+			var f = file.files && file.files[0];
+			if (!f) { bc.show('請先選擇 .kuroshio 檔', 'warn'); return; }
+			bc.show('上傳中…', '');
+			return f.arrayBuffer().then(function (buf) {
+				return api('/api/backup/import', { method: 'POST', raw: buf });
+			}).then(function (r) {
+				if (r.status === 401) return;
+				if (!r.ok) return bc.show('匯入失敗：' + errText(r), 'err');
+				var pv = r.data && r.data.preview ? previewText(r.data.preview) : '';
+				bc.show('檔案沒問題，服務重新啟動並合併中…', '', pv);
+				return waitRestart().then(function (back) {
+					if (!back) return bc.show('服務沒有在 30 秒內回來，請看日誌。', 'err', pv);
+					return api('/api/backup/last-import').then(function (x) {
+						var d = x.data || {};
+						if (!x.ok || d.none) return bc.show('服務已重新啟動，但沒有讀到匯入結果：' + (x.ok ? '請看日誌' : errText(x)), 'warn');
+						if (d.ok === false) return bc.show('匯入失敗：' + (d.error || '部分資料寫入失敗'), 'err', importLines(d).join('\n'));
+						file.value = '';
+						bc.show('匯入完成（' + (d.kindLabel || '') + '）', 'ok', pv + '\n\n' + importLines(d).join('\n'));
+						toast('匯入完成');
+					});
+				});
+			});
+		});
+		append(bc.body, [
+			el('a', { class: 'btn primary', id: 'backup-full', href: '/api/backup/export?kind=full', download: '', text: '下載完整備份' }),
+			el('a', { class: 'btn', id: 'backup-share', href: '/api/backup/export?kind=share', download: '', text: '下載分享檔' }),
+			el('span', { class: 'sep-v', 'aria-hidden': 'true' }),
+			file, imp
+		]);
+		api('/api/backup/last-import').then(function (x) {
+			var d = x.ok && x.data;
+			if (d && !d.none && d.importedAt) bc.show('上次匯入：' + fmtTime(d.importedAt) + (d.ok === false ? '（失敗）' : ''), d.ok === false ? 'warn' : '', importLines(d).join('\n') || undefined);
+		});
+		return bc;
 	}
 
 	function refreshJobs() {

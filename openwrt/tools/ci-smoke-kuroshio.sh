@@ -186,6 +186,11 @@ ubus call kuroshio api '{"path":"/api/trace","query":"name=example.com&type=A"}'
 ubus call kuroshio api '{"path":"/api/sysinfo"}' | grep -q '"tier": "small"' && ok "硬體等級（UCI 指定）" || bad "硬體等級（UCI 指定）"
 ubus call kuroshio defaults | grep -q '"resolver"' && ok "kuroshio.defaults（不用 node）" || bad "kuroshio.defaults（不用 node）"
 ubus call kuroshio acme_status | grep -q '"daysLeft"' && ok "憑證狀態（不用 node）" || bad "憑證狀態（不用 node）"
+# 備份與分享：匯出分享檔，再當成上傳的檔案匯入（服務在程式內重新啟動後合併）
+ubus call kuroshio backup_export '{"kind":"share"}' | grep -q '"ok": true' && [ -s /tmp/kuroshio-backup.kuroshio ] && ok "備份：匯出分享檔" || bad "備份：匯出分享檔"
+cp /tmp/kuroshio-backup.kuroshio /tmp/kuroshio-import.kuroshio 2>/dev/null
+ubus -t 90 call kuroshio backup_import | grep -q '"ok": true' && ok "備份：匯入（重新啟動後合併）" || bad "備份：匯入"
+[ ! -e /tmp/kuroshio-import.kuroshio ] && ok "備份：匯入後刪掉上傳的檔案" || bad "備份：匯入後刪掉上傳的檔案"
 kill "$PID" 2>/dev/null
 sleep 2
 grep -q '結束' /tmp/kuroshio.log && ok "收到 SIGTERM 正常結束（寫出快照）" || bad "收到 SIGTERM 正常結束"

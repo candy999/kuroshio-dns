@@ -128,8 +128,17 @@ kuroshio check-config <file>                     檢查設定檔
 | `/api/acme`、`/api/acme/issue` | Windows 內建 ACME 狀態與申請 |
 | `/api/log` | 最近的日誌（Windows 設定頁用；OpenWrt 仍走 logread） |
 | `/api/community/*` | v2 新增的聲譽、候選統計（見 03） |
+| `/api/backup/export?kind=full\|share`（GET） | 先把記憶體裡的狀態寫出，再下載 `.kuroshio` 備份檔（`application/octet-stream`、`content-disposition: attachment; filename="kuroshio-<種類>-YYYYMMDD.kuroshio"`） |
+| `/api/backup/import`（POST，內容 = 檔案本身，最多 64 MB） | 檢查後存成 `<state>/import-pending.kuroshio`，在程式內重新啟動；回 `{ok, reloading:true, preview}`。新的一輪在讀取任何狀態之前合併（舊的一輪先把記憶體寫出，不會蓋掉合併結果） |
+| `/api/backup/last-import` | 上一次匯入的合併結果（`<state>/import-last.json`；沒有時 `{none:true}`） |
 
-`rpcd.sh` 的允許清單同步加入新路徑。
+`rpcd.sh` 的允許清單同步加入新路徑。備份不走 `api` / `action`：rpcd 另有 `backup_export {kind}`（執行 `kuroshio export --uci`，檔案放在 `/tmp/kuroshio-backup.kuroshio` 讓 LuCI 下載）與 `backup_import {}`（匯入 LuCI 上傳的 `/tmp/kuroshio-import.kuroshio`），兩個都需要 ACL 寫入權限。
+
+**備份檔（`.kuroshio`）**：zstd 壓縮的 JSON `{ format: "kuroshio-backup", version: 1, kind: "full"|"share", exportedAt, core, files: { 相對路徑: {json}|{text}|{b64} } }`。
+`full` 有狀態目錄的學習資料（CDN 網域、節點池、IPv6 節點、候選 IP、網段分類、評測結果、汙染黑名單、統計、常用網域）、自訂規則（`custom-rules.txt`）、社群狀態與金鑰（`community/`、金鑰目錄不同時 `community-keys/`）；
+`share` 只有 CDN 網域（去掉 `hits`、`firstSeen`、`lastSeen`、`policy`）、節點池、IPv6 節點、評測結果、汙染黑名單。
+匯入時拒絕：format 不對、version 大於 1、解壓後超過 64 MB、不認識的路徑、含 `..` / 絕對路徑 / 反斜線的路徑（分享檔只能有上面五個檔案）。
+匯入一律合併：網域以名稱比對，匯入的驗證時間比較新才用，但次數、手動設定、最早 / 最晚出現時間以本機為準；節點池與 IPv6 節點依 IP 聯集（本機優先）；評測結果比較新才用；黑名單依每行第一欄聯集；候選 IP、網段分類、統計、常用網域本機沒有才用；自訂規則本機還是預設內容就換掉，否則只把沒有的規則加在最後；社群身分只在本機沒有金鑰也沒有好友紀錄時還原。
 
 **存取控制**：
 - OpenWrt：只有 rpcd 會呼叫，維持現狀（只聽 127.0.0.1）。
