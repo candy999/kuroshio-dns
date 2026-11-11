@@ -291,6 +291,8 @@ struct Inner {
     shed: Vec<ShedRec>,
     events: VecDeque<Event>,
     next_shed_at: u64,
+    /// 各步驟做不了（例如沒有冷資料、下載失敗）之後，到這個時間之前先跳過、做下一步
+    skip_until: Vec<u64>,
     next_restore_at: u64,
     restore_fails: u32,
     /// 上次恢復的時間：恢復後很快又吃緊 → 下次恢復等久一點
@@ -316,6 +318,7 @@ const MAX_BACKOFF: u64 = 6 * 3600;
 
 impl Governor {
     pub fn new(budget: u64, t: Thresholds, steps: Vec<Box<dyn Step>>, now: u64) -> Governor {
+        let n_steps = steps.len();
         Governor {
             budget,
             t,
@@ -326,6 +329,7 @@ impl Governor {
                 shed: Vec::new(),
                 events: VecDeque::new(),
                 next_shed_at: 0,
+                skip_until: vec![0; n_steps],
                 next_restore_at: 0,
                 restore_fails: 0,
                 last_restore_at: None,
@@ -397,9 +401,11 @@ impl Governor {
                 if now < i.next_shed_at {
                     None
                 } else {
+                    let skip = &i.skip_until;
                     self.steps
                         .iter()
-                        .position(|s| state >= s.min_state() && s.can_shed() && s.wanted(&r, &self.t))
+                        .enumerate()
+                        .position(|(k, s)| now >= skip[k] && state >= s.min_state() && s.can_shed() && s.wanted(&r, &self.t))
                         .map(Plan::Shed)
                 }
             } else if now.saturating_sub(i.hyst.changed_at) >= self.t.dwell && now >= i.next_restore_at {
@@ -455,8 +461,8 @@ impl Governor {
                     Err(e) => {
                         warn!("記憶體控制：{}沒有做：{e:#}", s.label());
                         Self::event(i, now, format!("{}沒有做：{e:#}", s.label()));
-                        // 這一步做不了（例如下載失敗）：等久一點再試
-                        i.next_shed_at = now + self.gap * 10;
+                        // 這一步做不了（例如沒有冷資料、下載失敗）：這一步等久一點再試，下一輪先做下一步
+                        i.skip_until[k] = now + self.gap * 10;
                     }
                 }
                 Some(format!("shed:{}", s.key()))
@@ -887,6 +893,7 @@ mod tests {
         need: u64,
         log: Arc<Mutex<Vec<String>>>,
         fail_restore: AtomicBool,
+        fail_shed: AtomicBool,
     }
 
     impl Fake {
@@ -899,6 +906,7 @@ mod tests {
                 need,
                 log: log.clone(),
                 fail_restore: AtomicBool::new(false),
+                fail_shed: AtomicBool::new(false),
             })
         }
     }
@@ -928,6 +936,10 @@ mod tests {
         }
         fn shed<'a>(&'a self, _r: &'a Reading) -> BoxFut<'a, anyhow::Result<Outcome>> {
             Box::pin(async move {
+                if self.fail_shed.load(Ordering::Relaxed) {
+                    self.log.lock().unwrap().push(format!("fail:{}", self.key));
+                    anyhow::bail!("沒有可以移出的");
+                }
                 self.shed_n.fetch_add(1, Ordering::Relaxed);
                 self.log.lock().unwrap().push(format!("shed:{}", self.key));
                 Ok(Outcome {
@@ -1079,6 +1091,27 @@ mod tests {
         s.restore().await.unwrap();
         assert_eq!(r.cache.lock().unwrap().max, 2000, "恢復上限，之後自然長回來");
         assert!(s.can_shed());
+    }
+
+    #[tokio::test]
+    async fn failing_step_does_not_block_the_ladder() {
+        // 例如 CDN 沒有冷資料可以移出：先跳過它，下一輪做下一步（過濾清單），過一陣子再試它
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cdn = Fake::new("cdn", State::Tight, 1, 0, &log);
+        cdn.fail_shed.store(true, Ordering::Relaxed);
+        let g = Governor::new(100 * MB, T, vec![cdn, Fake::new("filter", State::Critical, 1, 0, &log)], 0);
+        let mut now = 1000;
+        for _ in 0..4 {
+            g.tick(rd(70, 50), now).await;
+            now += 30;
+        }
+        assert_eq!(*log.lock().unwrap(), ["fail:cdn", "shed:filter"]);
+        // 300 秒後再試 CDN
+        for _ in 0..10 {
+            g.tick(rd(70, 50), now).await;
+            now += 30;
+        }
+        assert_eq!(log.lock().unwrap().iter().filter(|x| *x == "fail:cdn").count(), 2);
     }
 
     #[tokio::test]
