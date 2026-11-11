@@ -248,6 +248,25 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
         "doq".into(),
         json!({ "enabled": flag("doq", "enabled", false), "port": port_of("doq", "port", 853) }),
     );
+    // 3.0 新增（沒寫這些選項時輸出跟以前完全一樣）：
+    // - `list binds`：監聽多個位址（取代 host；要收 IPv6 就寫 0.0.0.0 與 ::）
+    // - `doh.http3_binds`：DoH3 另外指定位址；`doh.tls`：auto / 1 / 0（DoH 的 TCP 要不要 TLS）
+    for (uci_sec, opt, key) in [
+        ("doh", "binds", "binds"),
+        ("dot", "binds", "binds"),
+        ("doq", "binds", "binds"),
+        ("doh", "http3_binds", "http3Binds"),
+    ] {
+        let b = list(sec(uci_sec).and_then(|x| x.get(opt)));
+        if !b.is_empty() {
+            listen[uci_sec][key] = json!(b);
+        }
+    }
+    match s("doh", "tls").as_str() {
+        "" => {}
+        "auto" => listen["doh"]["tls"] = json!("auto"),
+        v => listen["doh"]["tls"] = json!(truthy(&json!(v))),
+    }
 
     // 區網 DNS：依 DNS 接管模式決定綁定位址與埠
     let mode = {
@@ -316,6 +335,14 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     listen.insert("plain".into(), plain);
     listen.insert("ddr".into(), json!(flag("main", "ddr", false)));
     out.insert("listen".into(), Value::Object(listen));
+    // 綁定網域（固定網域或 DDNS 名稱）：沿用 `tls.domain`；公開頁、社群、DDNS 記錄沒另外填時都用它
+    if !domain.is_empty() {
+        out.insert("domain".into(), json!(domain));
+    }
+    // 自備憑證（cert_mode = manual）：同時寫到共用憑證位置 `tls.cert / tls.key`（設定頁「存放位置」顯示用）
+    if manual && !s("tls", "cert").is_empty() && !s("tls", "key").is_empty() {
+        out.insert("tls".into(), json!({ "cert": cert, "key": key }));
+    }
 
     // 接管 53 埠時，區網網域與私有 IP 反查交回 dnsmasq
     let local_domains = if has("main", "local_domain") {
@@ -468,6 +495,11 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
             ddns[k] = json!(dd(k));
         }
     }
+    // 多網卡 / 多出口：`list interfaces 'pppoe-wan'`（沒寫 = 系統預設路由；舊的 iface4 / iface6 照樣有效）
+    let ifaces = list(sec("ddns").and_then(|x| x.get("interfaces")));
+    if !ifaces.is_empty() {
+        ddns["interfaces"] = json!(ifaces);
+    }
     out.insert("ddns".into(), ddns);
 
     // ---------------- 社群共享 ----------------
@@ -580,12 +612,31 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
 
 /// 讀取 UCI：`KUROSHIO_UCI_JSON`（init 先存的 `ubus call uci get` 結果）或直接讀 /etc/config/kuroshio
 pub fn load(env: &Env) -> Result<Value> {
+    Ok(overrides(&load_raw()?, env))
+}
+
+/// UCI 設定檔的位置（`KUROSHIO_UCI_FILE`，預設 /etc/config/kuroshio）
+pub fn file_path() -> String {
+    std::env::var("KUROSHIO_UCI_FILE").unwrap_or_else(|_| "/etc/config/kuroshio".into())
+}
+
+/// 還沒轉換的 UCI 內容（`{ values: {...} }`）
+pub fn load_raw() -> Result<Value> {
     if let Ok(f) = std::env::var("KUROSHIO_UCI_JSON") {
         if let Ok(b) = std::fs::read(&f) {
-            return Ok(overrides(&serde_json::from_slice(&b)?, env));
+            return Ok(serde_json::from_slice(&b)?);
         }
     }
-    let path = std::env::var("KUROSHIO_UCI_FILE").unwrap_or_else(|_| "/etc/config/kuroshio".into());
+    let path = file_path();
     let text = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("讀不到 {path}：{e}"))?;
-    Ok(overrides(&parse_text(&text)?, env))
+    parse_text(&text)
+}
+
+/// 憑證由誰管理：`acme`（acme.sh 申請、放在 `<etc>/cert.pem`）或 `manual`（使用者自備）
+pub fn cert_mode(uci: &Value) -> &'static str {
+    let vals = uci.get("values").unwrap_or(uci);
+    match vals.get("tls").and_then(|t| t.get("cert_mode")).and_then(Value::as_str) {
+        Some("manual") => "manual",
+        _ => "acme",
+    }
 }

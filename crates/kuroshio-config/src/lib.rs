@@ -65,12 +65,61 @@ pub fn requested_tier(user: &Value) -> Option<Tier> {
     get(user, "system.profile").and_then(Value::as_str).and_then(Tier::parse)
 }
 
-/// 內建預設值 → 等級調整值 → 使用者設定
+/// 內建預設值 → 等級調整值 → 使用者設定 → 綁定網域補齊（`normalize`）
 pub fn build(tier: Tier, user: &Value) -> Value {
     let mut cfg = defaults();
     merge(&mut cfg, &profile(tier));
     merge(&mut cfg, user);
+    normalize(&mut cfg);
     cfg
+}
+
+/// 綁定網域（頂層 `domain`）：整理成小寫、去掉結尾的點
+pub fn bound_domain(cfg: &Value) -> String {
+    cfg.get("domain")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// 合併後的整理：只填了綁定網域 `domain`（固定網域或 DDNS 名稱）時，需要網域的地方自動帶入。
+///
+/// - `site.hostname`、`community.domain` 空白 → `domain`
+/// - `acme.domains` 是空的 → `[domain]`
+/// - `ddns.records` 是空的而且 `ddns.enabled` → `[domain]`（DDNS 沒開就不動：固定網域不需要更新記錄）
+///
+/// 有明確填寫的一律不動；`domain` 空白時什麼都不做。
+pub fn normalize(cfg: &mut Value) {
+    let domain = bound_domain(cfg);
+    if domain.is_empty() {
+        return;
+    }
+    let Some(root) = cfg.as_object_mut() else { return };
+    root.insert("domain".into(), Value::String(domain.clone()));
+    let blank = |v: Option<&Value>| match v {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.trim().is_empty(),
+        Some(Value::Array(a)) => !a.iter().any(|x| x.as_str().is_some_and(|s| !s.trim().is_empty())),
+        _ => false,
+    };
+    let mut fill = |sec: &str, key: &str, val: Value, only_if: Option<&str>| {
+        let entry = root.entry(sec.to_string()).or_insert_with(|| Value::Object(Default::default()));
+        let Some(m) = entry.as_object_mut() else { return };
+        if let Some(flag) = only_if {
+            if m.get(flag).and_then(Value::as_bool) != Some(true) {
+                return;
+            }
+        }
+        if blank(m.get(key)) {
+            m.insert(key.to_string(), val);
+        }
+    };
+    fill("site", "hostname", Value::String(domain.clone()), None);
+    fill("community", "domain", Value::String(domain.clone()), None);
+    fill("acme", "domains", Value::Array(vec![Value::String(domain.clone())]), None);
+    fill("ddns", "records", Value::Array(vec![Value::String(domain)]), Some("enabled"));
 }
 
 /// 讀使用者設定檔（只有使用者寫的欄位）；檔案不存在 → 空物件
@@ -114,6 +163,7 @@ pub fn merge(base: &mut Value, over: &Value) {
 pub fn with_overrides(over: &Value) -> Value {
     let mut cfg = defaults();
     merge(&mut cfg, over);
+    normalize(&mut cfg);
     cfg
 }
 
@@ -211,6 +261,57 @@ mod tests {
             .map(|t| get(&build(*t, &json!({})), "resolver.cacheMax").unwrap().as_u64().unwrap())
             .collect();
         assert!(caches.windows(2).all(|w| w[0] < w[1]), "{caches:?}");
+    }
+
+    #[test]
+    fn bound_domain_fills_empty_fields_only() {
+        // 只填 domain、DDNS 沒開（固定網域）：公開頁、社群、ACME 都有網域，DDNS 記錄不動
+        let c = build(Tier::Large, &json!({ "domain": " DNS.Example.com. " }));
+        assert_eq!(get(&c, "domain"), Some(&json!("dns.example.com")));
+        assert_eq!(get(&c, "site.hostname"), Some(&json!("dns.example.com")));
+        assert_eq!(get(&c, "community.domain"), Some(&json!("dns.example.com")));
+        assert_eq!(get(&c, "acme.domains"), Some(&json!(["dns.example.com"])));
+        assert_eq!(get(&c, "ddns.records"), Some(&json!([])), "DDNS 沒開：不產生記錄");
+        assert_eq!(get(&c, "ddns.enabled"), Some(&json!(false)));
+        // DDNS 開了又沒寫記錄：更新綁定網域
+        let c = build(Tier::Large, &json!({ "domain": "dns.example.com", "ddns": { "enabled": true } }));
+        assert_eq!(get(&c, "ddns.records"), Some(&json!(["dns.example.com"])));
+        // 有明確填寫的不動
+        let c = build(
+            Tier::Tiny,
+            &json!({
+                "domain": "dns.example.com",
+                "site": { "hostname": "www.example.net" },
+                "community": { "domain": "share.example.net" },
+                "acme": { "domains": ["a.example.net", "b.example.net"] },
+                "ddns": { "enabled": true, "records": ["home.example.net"] }
+            }),
+        );
+        assert_eq!(get(&c, "site.hostname"), Some(&json!("www.example.net")));
+        assert_eq!(get(&c, "community.domain"), Some(&json!("share.example.net")));
+        assert_eq!(get(&c, "acme.domains"), Some(&json!(["a.example.net", "b.example.net"])));
+        assert_eq!(get(&c, "ddns.records"), Some(&json!(["home.example.net"])));
+        // 沒有 domain：完全不動（跟以前一樣）
+        let c = build(Tier::Large, &json!({ "site": { "hostname": "old.example.net" } }));
+        assert_eq!(get(&c, "domain"), Some(&json!("")));
+        assert!(get(&c, "community.domain").is_none());
+        assert_eq!(get(&c, "acme.domains"), Some(&json!([])));
+        // with_overrides（測試用）也一樣
+        let c = with_overrides(&json!({ "domain": "dns.example.com" }));
+        assert_eq!(get(&c, "site.hostname"), Some(&json!("dns.example.com")));
+    }
+
+    #[test]
+    fn new_keys_have_safe_defaults() {
+        let d = defaults();
+        assert_eq!(get(&d, "domain"), Some(&json!("")));
+        assert_eq!(get(&d, "tls"), Some(&json!({ "cert": "", "key": "" })));
+        assert_eq!(get(&d, "listen.doh.tls"), Some(&json!("auto")));
+        for k in ["listen.dot.binds", "listen.doq.binds", "listen.doh.binds", "listen.doh.http3Binds", "ddns.interfaces"] {
+            assert_eq!(get(&d, k), Some(&json!([])), "{k}");
+        }
+        assert_eq!(get(&d, "ddns.ipv4"), Some(&json!(true)));
+        assert_eq!(get(&d, "ddns.ipv6"), Some(&json!(false)), "中華電信常擋 IPv6 連入：AAAA 預設不發布");
     }
 
     #[test]

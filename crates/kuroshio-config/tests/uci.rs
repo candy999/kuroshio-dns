@@ -216,3 +216,103 @@ fn parser_edge_cases() {
     assert_eq!(v["values"]["cfg000000"]["k"], "v");
     assert!(parse_text("config a 'x'\nconfig b 'x'\n").is_err(), "同名不同型別");
 }
+
+// ---------------- 3.0 新增：綁定網域、共用憑證、多位址、多網卡 ----------------
+
+fn existing_text() -> String {
+    default_text()
+        .replace("option domain ''", "option domain 'dns.example.com'")
+        .replace(
+            "option cert_mode 'acme'",
+            "option cert_mode 'manual'\n\toption cert '/mnt/certs/fullchain.pem'\n\toption key '/mnt/certs/privkey.pem'",
+        )
+        .replace(
+            "config ddns 'ddns'\n\toption enabled '0'",
+            "config ddns 'ddns'\n\toption enabled '1'\n\tlist record 'dns.example.com'\n\toption iface4 'pppoe-wan'",
+        )
+        .replace("config doh 'doh'\n\toption enabled '0'", "config doh 'doh'\n\toption enabled '1'")
+        .replace("config dot 'dot'\n\toption enabled '0'", "config dot 'dot'\n\toption enabled '1'")
+}
+
+/// 沒用到新選項的既有設定：轉換結果跟加新功能之前完全一樣（快照是用舊版程式產生的）
+#[test]
+fn existing_configs_convert_identically() {
+    let snap = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+    let d = overrides(&parse_text(&default_text()).unwrap(), &env());
+    assert_eq!(d, snap(include_str!("fixtures/default.overrides.json")), "預設設定：輸出一字不差");
+
+    // 有網域、自備憑證、DDNS 的設定：只多了 `domain` 與 `tls`，其他一字不差
+    let mut e = overrides(&parse_text(&existing_text()).unwrap(), &env());
+    let m = e.as_object_mut().unwrap();
+    assert_eq!(m.remove("domain"), Some(json!("dns.example.com")));
+    assert_eq!(
+        m.remove("tls"),
+        Some(json!({ "cert": "/mnt/certs/fullchain.pem", "key": "/mnt/certs/privkey.pem" }))
+    );
+    assert_eq!(e, snap(include_str!("fixtures/existing.overrides.json")));
+
+    // 合併後的有效設定：監聽的憑證、網域、DDNS 都跟以前一樣
+    let c = load(&existing_text(), &env());
+    assert_eq!(g(&c, "listen.doh.cert"), &json!("/mnt/certs/fullchain.pem"));
+    assert_eq!(g(&c, "listen.dot.key"), &json!("/mnt/certs/privkey.pem"));
+    assert_eq!(g(&c, "listen.doh.host"), &json!("0.0.0.0"));
+    assert_eq!(g(&c, "listen.doh.tls"), &json!("auto"), "有明確的憑證、不是 127.0.0.1：照舊是 HTTPS");
+    assert_eq!(g(&c, "listen.doh.binds"), &json!([]));
+    assert_eq!(g(&c, "site.hostname"), &json!("dns.example.com"));
+    assert_eq!(g(&c, "community.domain"), &json!("dns.example.com"));
+    assert_eq!(g(&c, "ddns.records"), &json!(["dns.example.com"]));
+    assert_eq!(g(&c, "ddns.iface4"), &json!("pppoe-wan"));
+    assert_eq!(g(&c, "ddns.interfaces"), &json!([]));
+    assert_eq!(g(&c, "ddns.ipv6"), &json!(false));
+    assert_eq!(g(&c, "acme.enabled"), &json!(false), "OpenWrt 用 acme.sh，不啟用內建 ACME");
+}
+
+#[test]
+fn bound_domain_without_ddns_records() {
+    // 固定網域：只填 tls.domain，DDNS 關閉 → 不產生記錄；DDNS 開了沒寫記錄 → 更新綁定網域
+    let fixed = load(&default_text().replace("option domain ''", "option domain 'dns.example.com'"), &env());
+    assert_eq!(g(&fixed, "domain"), &json!("dns.example.com"));
+    assert_eq!(g(&fixed, "site.hostname"), &json!("dns.example.com"));
+    assert_eq!(g(&fixed, "ddns.enabled"), &json!(false));
+    assert_eq!(g(&fixed, "ddns.records"), &json!([]));
+    let dd = load(
+        &default_text()
+            .replace("option domain ''", "option domain 'dns.example.com'")
+            .replace("config ddns 'ddns'\n\toption enabled '0'", "config ddns 'ddns'\n\toption enabled '1'"),
+        &env(),
+    );
+    assert_eq!(g(&dd, "ddns.records"), &json!(["dns.example.com"]));
+}
+
+#[test]
+fn new_options_map_to_json() {
+    let text = default_text()
+        .replace(
+            "config ddns 'ddns'\n\toption enabled '0'\n\toption ipv4 '1'\n\toption ipv6 '0'",
+            "config ddns 'ddns'\n\toption enabled '1'\n\toption ipv4 '1'\n\toption ipv6 '1'\n\tlist interfaces 'pppoe-wan'\n\tlist interfaces 'wanb'",
+        )
+        .replace(
+            "config doh 'doh'\n\toption enabled '0'",
+            "config doh 'doh'\n\toption enabled '1'\n\tlist binds '0.0.0.0'\n\tlist binds '::'\n\tlist http3_binds '0.0.0.0'\n\toption tls '0'",
+        )
+        .replace("config dot 'dot'\n\toption enabled '0'", "config dot 'dot'\n\toption enabled '1'\n\tlist binds '192.0.2.1'")
+        // 2.x 的設定檔沒有 doq 區段：補在最後
+        + "\nconfig doq 'doq'\n\toption enabled '1'\n\tlist binds '::'\n";
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "ddns.interfaces"), &json!(["pppoe-wan", "wanb"]));
+    assert_eq!(g(&c, "ddns.ipv6"), &json!(true));
+    assert_eq!(g(&c, "listen.doh.binds"), &json!(["0.0.0.0", "::"]));
+    assert_eq!(g(&c, "listen.doh.http3Binds"), &json!(["0.0.0.0"]));
+    assert_eq!(g(&c, "listen.doh.tls"), &json!(false));
+    assert_eq!(g(&c, "listen.dot.binds"), &json!(["192.0.2.1"]));
+    assert_eq!(g(&c, "listen.doq.binds"), &json!(["::"]));
+    for (v, want) in [("1", json!(true)), ("auto", json!("auto"))] {
+        let c = load(
+            &default_text().replace("config doh 'doh'", &format!("config doh 'doh'\n\toption tls '{v}'")),
+            &env(),
+        );
+        assert_eq!(g(&c, "listen.doh.tls"), &want);
+    }
+    assert_eq!(kuroshio_config::uci::cert_mode(&parse_text(&default_text()).unwrap()), "acme");
+    assert_eq!(kuroshio_config::uci::cert_mode(&parse_text(&existing_text()).unwrap()), "manual");
+}

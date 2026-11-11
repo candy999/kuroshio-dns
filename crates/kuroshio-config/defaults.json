@@ -1,4 +1,9 @@
 {
+  "domain": "",
+  "tls": {
+    "cert": "",
+    "key": ""
+  },
   "system": {
     "profile": "auto",
     "allowHeavy": false,
@@ -17,11 +22,14 @@
     "doh": {
       "enabled": false,
       "host": "127.0.0.1",
+      "binds": [],
       "port": 8053,
       "trustProxy": true,
+      "tls": "auto",
       "cert": "",
       "key": "",
       "http3": false,
+      "http3Binds": [],
       "path": "/dns-query",
       "http3Port": 0,
       "altSvcPort": 0,
@@ -30,6 +38,7 @@
     "dot": {
       "enabled": false,
       "host": "0.0.0.0",
+      "binds": [],
       "port": 853,
       "cert": "",
       "key": ""
@@ -54,6 +63,7 @@
     "doq": {
       "enabled": false,
       "host": "0.0.0.0",
+      "binds": [],
       "port": 853
     },
     "ddr": false,
@@ -435,6 +445,7 @@
     "intervalMin": 5,
     "forceHours": 24,
     "ipSource": "web",
+    "interfaces": [],
     "iface4": "",
     "iface6": "",
     "httpsRecord": true

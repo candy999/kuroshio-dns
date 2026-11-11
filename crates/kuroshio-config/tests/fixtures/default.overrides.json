@@ -1,0 +1,265 @@
+{
+  "admin": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8054
+  },
+  "benchmark": {
+    "dir": "/etc/kuroshio/benchmark"
+  },
+  "cdn": {
+    "ecs": {
+      "resolvers": [
+        "udp://8.8.8.8",
+        "udp://8.8.4.4"
+      ],
+      "twSubnets": [
+        "168.95.0.0/24",
+        "1.160.0.0/24",
+        "139.175.0.0/24",
+        "140.112.0.0/24",
+        "35.229.0.0/24"
+      ]
+    },
+    "enabled": true,
+    "providers": {
+      "akamai": {
+        "ecs": true,
+        "enabled": true
+      },
+      "alibaba": {
+        "ecs": true,
+        "enabled": true
+      },
+      "apple": {
+        "ecs": true,
+        "enabled": true
+      },
+      "azure": {
+        "enabled": true
+      },
+      "bytedance": {
+        "ecs": true,
+        "enabled": true
+      },
+      "cdnetworks": {
+        "ecs": true,
+        "enabled": true
+      },
+      "cloudflare": {
+        "enabled": true,
+        "seedV4": [
+          "104.16.161.36",
+          "104.18.20.216",
+          "104.17.75.150",
+          "162.159.235.5",
+          "172.67.98.180",
+          "172.67.78.23",
+          "104.25.157.27",
+          "172.67.125.25",
+          "141.101.113.37",
+          "162.159.2.218",
+          "173.245.59.168",
+          "198.41.208.107"
+        ]
+      },
+      "cloudfront": {
+        "enabled": true,
+        "seedV4": [
+          "3.169.37.27",
+          "65.9.172.103",
+          "54.192.42.186",
+          "13.33.29.112"
+        ]
+      },
+      "edgio": {
+        "ecs": true,
+        "enabled": true
+      },
+      "fastly": {
+        "enabled": true
+      },
+      "gcore": {
+        "enabled": true
+      },
+      "tencent": {
+        "ecs": true,
+        "enabled": true
+      },
+      "wangsu": {
+        "ecs": true,
+        "enabled": true
+      }
+    }
+  },
+  "check": {
+    "enabled": false
+  },
+  "community": {
+    "cert": "/etc/kuroshio/cert.pem",
+    "dir": "/etc/kuroshio/community",
+    "domain": "",
+    "enabled": false,
+    "endpoints": {
+      "doh": null,
+      "dot": null
+    },
+    "rules": []
+  },
+  "ddns": {
+    "apiToken": "",
+    "enabled": false,
+    "forceHours": 24,
+    "iface4": "",
+    "iface6": "",
+    "intervalMin": 5,
+    "ipSource": "web",
+    "ipv4": true,
+    "ipv6": false,
+    "provider": "cloudflare",
+    "proxied": false,
+    "records": [],
+    "ttl": 1,
+    "zone": ""
+  },
+  "filter": {
+    "customRules": [
+      "/etc/kuroshio/custom-rules.txt"
+    ],
+    "enabled": true,
+    "lists": [
+      {
+        "category": "ads",
+        "name": "EasyList China",
+        "url": "https://easylist-downloads.adblockplus.org/easylistchina.txt"
+      },
+      {
+        "category": "ads",
+        "name": "CHN: anti-AD",
+        "url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt"
+      },
+      {
+        "category": "ads",
+        "name": "FutaGuard LowTechHost（台灣廣告）",
+        "url": "https://filter.futa.gg/hosts_abp.txt"
+      },
+      {
+        "category": "telemetry",
+        "name": "a-dove-is-dumb（Adobe 遙測）",
+        "url": "https://raw.githubusercontent.com/ignaciocastro/a-dove-is-dumb/main/list.txt"
+      },
+      {
+        "category": "telemetry",
+        "name": "Ruddernation（Adobe 驗證）",
+        "url": "https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts"
+      },
+      {
+        "category": "telemetry",
+        "name": "blocklistproject smart-tv（電視遙測）",
+        "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/smart-tv.txt"
+      },
+      {
+        "category": "malware",
+        "name": "FutaGuard TW165（台灣 165 反詐騙）",
+        "url": "https://filter.futa.gg/TW165_abp.txt"
+      }
+    ]
+  },
+  "iprank": {},
+  "jobs": {
+    "cdn-pool": {
+      "at": [
+        "05:30"
+      ],
+      "enabled": true
+    },
+    "cdn-ranges": {
+      "at": [
+        "03:10"
+      ],
+      "enabled": true,
+      "weekdays": [
+        0
+      ]
+    },
+    "cdn-scan": {
+      "at": [
+        "03:20"
+      ],
+      "enabled": true,
+      "weekdays": [
+        0
+      ]
+    },
+    "dns-benchmark": {
+      "at": [
+        "04:10"
+      ],
+      "enabled": true
+    }
+  },
+  "listen": {
+    "ddr": false,
+    "doh": {
+      "cert": "/etc/kuroshio/cert.pem",
+      "enabled": false,
+      "host": "0.0.0.0",
+      "http3": false,
+      "key": "/etc/kuroshio/key.pem",
+      "port": 8443,
+      "trustProxy": false
+    },
+    "doq": {
+      "enabled": false,
+      "port": 853
+    },
+    "dot": {
+      "cert": "/etc/kuroshio/cert.pem",
+      "enabled": false,
+      "host": "0.0.0.0",
+      "key": "/etc/kuroshio/key.pem",
+      "port": 853
+    },
+    "plain": {
+      "binds": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "enabled": true,
+      "openBinds": [],
+      "port": 5335
+    }
+  },
+  "log": {
+    "fileLog": false,
+    "level": "info",
+    "queryLog": false
+  },
+  "resolver": {
+    "lastResort": [
+      "udp://8.8.8.8",
+      "udp://1.1.1.1"
+    ]
+  },
+  "site": {
+    "enabled": false,
+    "hostname": ""
+  },
+  "upstream": {
+    "autoTypes": [
+      "udp",
+      "doh",
+      "dot"
+    ],
+    "bootstrap": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "fallback": [
+      "udp://45.90.30.126",
+      "udp://1.0.0.2",
+      "udp://8.8.4.4"
+    ],
+    "pinned": []
+  }
+}
