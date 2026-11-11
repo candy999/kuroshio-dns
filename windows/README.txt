@@ -19,7 +19,7 @@
   kuroshio.exe query example.com -s 127.0.0.1:53
 
 長期執行（用「以系統管理員身分執行」的命令提示字元）：
-  kuroshio.exe setup                         一次加好 Windows 防火牆規則
+  kuroshio.exe setup                         一次加好 Windows 防火牆規則（HTTP.sys 共用模式另外登記 urlacl 與憑證）
   kuroshio.exe service install               安裝成服務（開機自動啟動、當掉自動重啟）
   kuroshio.exe service start | stop | status | uninstall
 
@@ -33,7 +33,18 @@
 憑證：
   kuroshio.exe acme issue                    立即申請 / 續期（需要 acme.enabled 與 Cloudflare API Token）
 
-IIS 已經占用 443 時（反向代理模式）：
+IIS 已經占用 443 時（建議：HTTP.sys 共用，模式 B）：
+  設定 domain、listen.doh.enabled = true、listen.doh.port = 443、
+  listen.doh.windowsMode = "httpsys"（預設 "auto"：TCP 443 被 IIS / HTTP.sys 占用時自動用這個模式）
+  kuroshio.exe setup                         系統管理員執行一次：登記 urlacl（之後一般權限也能登記網址）、
+                                             把憑證匯入「本機電腦\個人」並綁到 HTTP.sys（hostnameport，SNI）
+  kuroshio.exe httpsys status                要登記的網址、HTTP.sys 的 HTTP/3 設定、目前綁定的憑證
+  kuroshio.exe httpsys cert                  立即同步憑證（執行中每 10 分鐘也會自動檢查，續期後自動更新）
+  只登記 https://網域:443/dns-query/、/.well-known/kuroshio/ 與公開頁，IIS 其他網站照常；
+  用戶端 IP 直接取得。HTTP.sys 開了 HTTP/3（登錄檔 EnableHttp3）時 DoH3 由 HTTP.sys 提供，
+  否則黑潮 DNS 自己聽 UDP 443。設定頁與 status 指令會顯示目前的模式與 DoH3 由誰提供。
+
+IIS 已經占用 443 時（反向代理模式，沿用 2.x 的 ARR 設定）：
   kuroshio.exe iis setup "Default Web Site"  產生 web.config 轉送規則與 Alt-Svc 標頭、更新設定檔，
                                              並把憑證匯入 Windows 憑證存放區、綁到站台的 HTTPS
   kuroshio.exe iis cert "Default Web Site"   只同步憑證（服務執行中每 10 分鐘也會自動檢查，續期後自動更新）

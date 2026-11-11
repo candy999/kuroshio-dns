@@ -22,7 +22,7 @@
           "desc": "網址是 https://網域/dns-query。需要先設定網域與憑證；只在這台電腦或區網使用的話不必打開。",
           "fields": [
             { "key": "listen.doh.enabled", "type": "bool", "label": "啟用" },
-            { "key": "listen.doh.windowsMode", "type": "select", "label": "跟 IIS 共用 443 的方式", "fallbackDefault": "auto", "help": "TCP 443 被 IIS（HTTP.sys）占用時怎麼處理。UDP 443（DoH3）、DoT、DoQ 跟 IIS 無關，一律由黑潮 DNS 自己監聽。只有 Windows 有效。", "options": [
+            { "key": "listen.doh.windowsMode", "type": "select", "label": "跟 IIS 共用 443 的方式", "fallbackDefault": "auto", "help": "TCP 443 被 IIS（HTTP.sys）占用時怎麼處理。HTTP.sys 共用：登記 https://網域:埠號/dns-query（埠號請設 443），用系統管理員執行一次 kuroshio setup 登記網址權限並綁定憑證；Windows 開了 HTTP/3（EnableHttp3）時 DoH3 由 HTTP.sys 提供。DoT、DoQ 跟 IIS 無關，一律由黑潮 DNS 自己監聽。只有 Windows 有效。", "options": [
               { "value": "auto", "label": "自動（443 沒被占用就獨立監聽，被 IIS 占用就跟 HTTP.sys 共用）" },
               { "value": "standalone", "label": "獨立（沒有 IIS，黑潮 DNS 自己聽 443）" },
               { "value": "httpsys", "label": "HTTP.sys 共用（有 IIS 時建議，只登記自己的網址）" },

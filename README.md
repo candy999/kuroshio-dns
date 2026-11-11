@@ -102,7 +102,7 @@ DNSCrypt 不支援：採用的伺服器少，而且都同時提供 DoH / DoT。
 | OpenWrt 正式套件與 LuCI（沿用 2.x 介面） | ✅ 可用 |
 | 公開頁、「這台裝置有沒有在用」偵測、統計歷史 | ✅ 可用 |
 | Windows：服務、攜帶版、防火牆 `setup`、IIS 反向代理 `iis setup`、設定頁（登入、存檔即重新載入） | 🚧 設定頁介面製作中 |
-| Windows：HTTP.sys 共用 443（模式 B） | ⬜ |
+| Windows：HTTP.sys 共用 443（模式 B，`listen.doh.windowsMode = httpsys / auto`） | ✅ 可用（CI 實機驗證 IIS 共存） |
 
 完整設計見 [`docs/spec/`](docs/spec/README.md)。
 
@@ -127,6 +127,12 @@ Windows：解壓 `kuroshio-windows-x86_64.zip`，在命令提示字元執行：
 kuroshio.exe run -c config.json
 kuroshio.exe query example.com -s 127.0.0.1:5336
 ```
+
+有 IIS 占用 TCP 443 時，DoH 可以跟 IIS 共用 443（模式 B）：設定 `domain`、`listen.doh.port = 443`、
+`listen.doh.windowsMode = httpsys`（或保持 `auto`，443 被 IIS 占用時自動切換），用系統管理員執行一次
+`kuroshio.exe setup`（登記 urlacl、把憑證綁到 HTTP.sys）。黑潮 DNS 只向 HTTP.sys 登記自己的網址
+（`/dns-query`、`/.well-known/kuroshio`、公開頁），IIS 其他網站不受影響；`kuroshio.exe httpsys status` 看設定，
+`kuroshio.exe httpsys cert` 立即同步憑證。詳見 [規格 07](docs/spec/07-windows.md) 第 2 節。
 
 ## 指令
 

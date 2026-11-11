@@ -50,12 +50,29 @@ Windows 版跟 OpenWrt 版是同一個核心程式（`kuroshio.exe`），差別�
 
 `auto`：TCP 443 沒被占用 → A；被 HTTP.sys / IIS 占用 → B。C 只在明確指定時使用。
 
-#### 模式 B：HTTP.sys 共用
+#### 模式 B：HTTP.sys 共用（已實作）
 - 登記的網址（只登記自己的，IIS 其他網站不受影響）：`https://<網域>:443/dns-query`、`https://<網域>:443/.well-known/kuroshio`、公開頁開啟時加上 `https://<網域>:443/`（同一網域的其他路徑仍可由 IIS 處理時，改登記公開頁的實際路徑）
 - TLS 由 HTTP.sys 處理：憑證匯入「本機電腦\個人」存放區，用 `hostnameport`（SNI）綁定到 `<網域>:443`
 - 用戶端 IP 直接取得（不需要 X-Forwarded-For）
 - HTTP.sys 開了 HTTP/3 時，登記的網址自動支援 DoH3
 - 優點：不用安裝 ARR / URL Rewrite、少一層轉送、延遲低；TLS 與 HTTP/2 由核心處理
+
+實作（`crates/kuroshio/src/httpsys.rs`）：
+- HTTP Server API 2.0：`HttpInitialize` → `HttpCreateServerSession` → `HttpCreateUrlGroup` → `HttpCreateRequestQueue` →
+  `HttpSetUrlGroupProperty(HttpServerBindingProperty)` → `HttpAddUrlToUrlGroup`；兩條專用執行緒同步呼叫
+  `HttpReceiveHttpRequest`（`COPY_BODY`），處理交給 tokio、跟 TCP 的 DoH 用同一個 `doh_core`（公開頁、社群、DoH 查詢）；
+  POST 剩下的內容（`HttpReceiveRequestEntityBody`）與回應（`HttpSendHttpResponse`）在 blocking 執行緒。內容上限、連線數上限跟 TCP 的 DoH 一樣
+- 網址一律以 `/` 結尾（HTTP.sys 的規定，請求 `/dns-query` 也對得到 `/dns-query/`），埠號是 `listen.doh.port`（要跟 IIS 共用請設 443）
+- 公開頁：先登記 `https://<網域>:<埠>/`；已經被 IIS 站台登記（`ERROR_ALREADY_EXISTS`）時改登記公開頁實際用到的路徑
+  （`/index.html`、`/robots.txt`、`/favicon.*`、`/qr.svg`、`/api/public/`、`/apple/`、詳細頁），首頁 `/` 照常由 IIS 處理
+- 一般權限、沒有 urlacl 時登記失敗（`ERROR_ACCESS_DENIED`）：記警告「請用系統管理員執行一次 kuroshio setup」，其他監聽照常
+- 重新載入與結束：`HttpRemoveUrlFromUrlGroup`（全部）＋ `HttpShutdownRequestQueue`，新的一輪重新登記
+- `auto`：啟動時試著綁定設定的 DoH 位址與 `0.0.0.0` 的 TCP 埠（位址已被使用），並看 `netsh http show servicestate view=requestq`
+  有沒有已登記在這個埠的網址；任一成立 → B，否則 A。結果寫在日誌、`/api/status` 的 `dohMode`（`configured`、`mode`、`reason`、
+  各網址登記結果、`enableHttp3`、`altSvc`）、`listenersDetail`（`proto: doh`、`bind: httpsys`）與 cmd 的 `status` 指令
+- `kuroshio.exe setup`（`windowsMode` 是 `httpsys` 或 `auto`、DoH 開著時）：`netsh http add urlacl url=… user=<目前帳號>`
+  （公開頁開著時登記網域根目錄，涵蓋底下所有路徑）並綁定憑證；服務以 LocalSystem 執行，不需要 urlacl
+- `kuroshio.exe httpsys status | cert`：顯示要登記的網址 / 立即同步憑證
 
 #### 模式 C：IIS 反向代理
 - `kuroshio.exe iis setup <IIS 站台名稱>`：產生 `web.config`（URL Rewrite 規則把 `/dns-query`、`/.well-known/kuroshio`、公開頁轉給 `http://127.0.0.1:8053`）、啟用 ARR 代理、在回應加上 `Alt-Svc` 自訂標頭
@@ -72,11 +89,15 @@ Windows 版跟 OpenWrt 版是同一個核心程式（`kuroshio.exe`），差別�
 
 啟動時讀登錄檔並嘗試綁定 UDP 443，自動判斷屬於哪一種；結果顯示在設定頁（「DoH3：黑潮 DNS 提供 / HTTP.sys 提供 / 改用 UDP 8443 / 無法提供：原因」）。
 
+實作：`/api/status` 的 `doh3Provider`（`provider`：`kuroshio` / `httpsys` / `none`，`reason`）。模式 B 而且 `EnableHttp3 = 1` 時
+不綁 UDP（不管 `listen.doh.http3`，HTTP.sys 對所有登記的網址都提供 HTTP/3），`listenersDetail` 列出 `proto: doh3`、`bind: httpsys`；
+其他情況照 `listen.doh.http3` 由黑潮 DNS 自己聽 `listen.doh.http3Port`（0 = 跟 DoH 同埠）。
+
 ### 2.3 讓用戶端知道有 DoH3
 
 | 管道 | 做法 |
 |---|---|
-| Alt-Svc 標頭 | DoH 回應帶 `Alt-Svc: h3=":443"; ma=86400`（埠號依實際）。模式 A / B 由黑潮 DNS 加；模式 C 寫在 `web.config` 的自訂標頭，確保 IIS 一定送出 |
+| Alt-Svc 標頭 | DoH 回應帶 `Alt-Svc: h3=":443"; ma=86400`（埠號依實際）。模式 A / B 由黑潮 DNS 加（只宣告真的有在聽的埠：自己的 UDP 沒綁成功就不加）；模式 B 由 HTTP.sys 提供 HTTP/3 時，登錄檔 `EnableAltSvc = 1` 表示 HTTP.sys 自己會送，黑潮 DNS 不重複加，沒開時黑潮 DNS 宣告 HTTP.sys 的埠；模式 C 寫在 `web.config` 的自訂標頭，確保 IIS 一定送出 |
 | 網域的 HTTPS 記錄 | 用 DDNS 已有的 Cloudflare API 權杖，自動發布 `<網域> HTTPS 1 . alpn="h3,h2"`（有改埠號時加 `port=`）。瀏覽器第一次連線就直接用 HTTP/3。選項，預設跟著 DoH3 開關 |
 | DDR | 區網裝置查 `_dns.resolver.arpa` 時列出 `alpn=h3`（規格 01 第 2 節） |
 | 公開頁 | 列出 `h3://` 網址，給 AdGuard 這類可手動設定的 App |
@@ -87,6 +108,9 @@ Windows 版跟 OpenWrt 版是同一個核心程式（`kuroshio.exe`），差別�
   - 存成 PEM：DoT、DoQ、DoH3（黑潮 DNS 自己監聽時）使用
   - 匯入 Windows「本機電腦\個人」存放區：模式 B 的 HTTP.sys 綁定、模式 C 的 IIS 站台綁定
 - 續期（到期前 30 天）時自動重新匯入並更新綁定（HTTP.sys `sslcert`、IIS 站台綁定），舊憑證保留到新綁定生效後再移除。不再需要 2.x 的 `restart-dot.ps1`。
+  - 實作（`iiscert.rs`）：IIS 與 HTTP.sys 共用同一段流程（`certutil -importPFX` → `netsh http delete/add sslcert hostnameport=<網域>:<埠>` → `certutil -delstore` 舊的）；
+    IIS 用 IIS 的 appid、模式 B 用黑潮 DNS 自己的 appid；紀錄分別在 `state\iis-cert.json` / `state\httpsys-cert.json`。
+    舊憑證還被另一種綁定使用時先不刪。執行中每 10 分鐘比對一次（設定了 `listen.doh.iisSite`，或這一輪是模式 B）
 - 也可以用自己的憑證（`tls.certMode = manual`，指定 PEM 或存放區的指紋）。
 
 ## 4. 防火牆與網路
