@@ -151,10 +151,11 @@ jobs:
           grep -q "0.0.0.0" /tmp/q.txt
           curl -s http://127.0.0.1:8056/api/status | python3 -c "import json,sys;d=json.load(sys.stdin);f=d['filter'];print('清單', f['lists'], '條、自訂', f['custom'], '條、過濾器', f['memoryBytes']//1024, 'KB、常駐記憶體', d['system']['rssKB'], 'KB')"
           kill $PID
-          # 低階硬體設定：等級調整生效
+          # 沒有硬體等級了：舊設定檔的 profile 照樣讀得進來（忽略），顯示動態的記憶體保留量與依核心數換算的設定
           echo '{"system":{"profile":"tiny"}}' > /tmp/tiny.json
           $RUN sysinfo -c /tmp/tiny.json | tee /tmp/sysinfo.txt
-          grep -q 'resolver.parallel: 0 → 2' /tmp/sysinfo.txt
+          grep -q '記憶體保留量' /tmp/sysinfo.txt
+          grep -q '依 CPU 核心數換算的設定' /tmp/sysinfo.txt
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target }}
