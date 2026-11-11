@@ -160,6 +160,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         check(/版本/.test(tiles) && /3\.\d/.test(tiles), '狀態：版本', tiles.slice(0, 200));
         check(/cmd 直接執行/.test(tiles), '狀態：執行方式');
         check(/硬體等級/.test(tiles) && /記憶體/.test(tiles) && /拉回台灣/.test(tiles) && /p50/.test(tiles), '狀態：硬體、記憶體、拉回台灣、回應時間');
+        check(/最久未存/.test(tiles) && /上限 \d+(\.\d+)? 小時/.test(tiles), '狀態：最久未存與上限', tiles.slice(-200));
         const lst = await page.textContent('#st-listen');
         check(lst.includes(String(dnsPort)) && /DoH3/.test(lst) && /DoQ/.test(lst), '狀態：監聽埠號', lst.slice(0, 300));
         check((await page.textContent('#st-up')).includes('udp://127.0.0.1:9'), '狀態：上游列表');

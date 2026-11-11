@@ -82,7 +82,7 @@ const STATUS = {
     upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ok: 100, fail: 1, avgMs: 12 }], autoUpstreams: null,
     filter: { lists: 100000, custom: 3, domains: 90000, memoryBytes: 4000000 }, cdn: { stats: {}, domains: 10 },
     jobs: { config: { 'dns-benchmark': { at: ['04:10'] } }, state: {}, running: null },
-    system: { tier: 'small', memTotalMB: 256, cores: 2, arch: 'mipsel', rssKB: 20000, memAvailableMB: 120, persist: { bytesToday: 2048, storage: 'flash', intervalMin: 60 } },
+    system: { tier: 'small', memTotalMB: 256, cores: 2, arch: 'mipsel', rssKB: 20000, memAvailableMB: 120, persist: { bytesToday: 2048, storage: 'flash', intervalMin: 360, effectiveIntervalMin: 720, maxAgeHours: 24, oldestUnsavedSec: 5400, forcedByAge: 1, estimatedDailyBytes: 1200000, lowSpace: false } },
     listeners: { doh: 8443, doh3: null, dot: 853, doq: null, ddr: true },
     listenersDetail: [
         { proto: 'dot', bind: '0.0.0.0', port: 853, ok: true, tls: true, error: null },

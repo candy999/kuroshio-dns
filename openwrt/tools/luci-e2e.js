@@ -80,6 +80,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         }
         if (NAME === 'kuroshio' && p === 'status' && MOCK) {
             /連線來源/.test(text) && /只開放台灣/.test(text) && /已拒絕 57 次/.test(text) ? ok('狀態頁：連線來源摘要') : bad('狀態頁沒有連線來源摘要');
+            /最久未存/.test(text) && /1\.5 小時/.test(text) && /上限 24 小時/.test(text) ? ok('狀態頁：最久未存') : bad('狀態頁沒有「最久未存」');
         }
     }
     // 黑潮：每頁最下方有「關於」（核心版本、介面版本、授權、原始碼），狀態頁一定要看得到

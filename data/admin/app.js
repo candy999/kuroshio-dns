@@ -107,6 +107,13 @@
 		var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
 		return (d ? d + ' 天 ' : '') + (d || h ? h + ' 小時 ' : '') + m + ' 分';
 	}
+	/** 還沒存的時間：0 = 都存了 */
+	function fmtAge(sec) {
+		if (sec == null) return '-';
+		if (sec <= 0) return '全部已存';
+		if (sec < 3600) return Math.max(1, Math.round(sec / 60)) + ' 分鐘';
+		return (sec / 3600).toFixed(1) + ' 小時';
+	}
 	function fmtBytes(b) {
 		if (b == null) return '-';
 		if (b < 1024) return b + ' B';
@@ -541,7 +548,9 @@
 			tile('過濾規則', f ? fmtNum((f.lists || 0) + (f.custom || 0)) : '未啟用', f ? '自訂 ' + fmtNum(f.custom) + (f.domains != null ? ' · ' + fmtNum(f.domains) + ' 個網域' : '') : ''),
 			st.access ? tile('連線來源', ACCESS_MODE[st.access.mode] || st.access.mode || '-',
 				st.access.failOpen ? '資料讀不到，暫時不擋' : '已拒絕 ' + fmtNum((st.access.denied || {}).total) + ' 次' + (st.access.generatedAt ? ' · 資料 ' + st.access.generatedAt : '')) : null,
-			tile('磁碟寫入（今天）', per.bytesToday != null ? fmtBytes(per.bytesToday) : '-', (per.storage || '') + (per.intervalMin ? ' · 最短間隔 ' + per.intervalMin + ' 分' : ''))
+			tile('磁碟寫入（今天）', per.bytesToday != null ? fmtBytes(per.bytesToday) : '-', (per.storage || '') + (per.effectiveIntervalMin != null ? ' · 間隔 ' + per.effectiveIntervalMin + ' 分' : '') + (per.estimatedDailyBytes != null ? ' · 預估每天 ' + fmtBytes(per.estimatedDailyBytes) : '')),
+			tile('最久未存', fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? '上限 ' + per.maxAgeHours + ' 小時' : '') + (per.forcedByAge ? ' · 到期強制寫入 ' + fmtNum(per.forcedByAge) + ' 次' : '') +
+				(per.lowSpace ? ' · 儲存空間不足（只寫核心資料）' : ''))
 		]);
 
 		// 監聽

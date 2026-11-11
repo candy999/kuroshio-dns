@@ -498,7 +498,9 @@
               { "value": "flash", "label": "Flash（隨身碟、記憶卡：少寫）" },
               { "value": "ram", "label": "記憶體（重開機就消失）" }
             ] },
-            { "key": "system.flashWriteBudgetKB", "type": "int", "label": "每天寫入上限（KB）", "pro": true, "min": 0 },
+            { "key": "system.flashWriteBudgetKB", "type": "int", "label": "每天寫入量目標（KB）", "help": "超過就延後寫入，但不會超過「最久未存」。", "pro": true, "min": 0 },
+            { "key": "system.persistMaxAgeHours", "type": "int", "label": "最久未存（小時）", "help": "學到的資料至少每隔這麼久一定存一次（Flash 上最多 24 小時）。越小，斷電時遺失越少，但 Flash 寫入越多。", "pro": true, "min": 1, "max": 24, "placeholder": "24" },
+            { "key": "system.minFreeKB", "type": "int", "label": "保留空間（KB）", "help": "寫入後至少留下這麼多可用空間；不夠時先刪日誌與可以重建的資料，核心資料（CDN 驗證紀錄、節點、社群身分、設定）絕不自動刪除。0 = 自動（最大一份待寫內容的兩倍，至少 1 MB）。", "pro": true, "min": 0 },
             { "key": "system.workerThreads", "type": "int", "label": "工作執行緒數", "help": "0 = 依 CPU 核心數自動決定。重新啟動程式後生效。", "pro": true, "min": 0 },
             { "key": "system.maxTlsConnections", "type": "int", "label": "TLS 同時連線上限", "pro": true, "min": 1 },
             { "key": "system.maxQuicConnections", "type": "int", "label": "QUIC 同時連線上限", "pro": true, "min": 1 },

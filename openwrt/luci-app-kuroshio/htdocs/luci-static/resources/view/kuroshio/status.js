@@ -21,6 +21,13 @@ var JOBS = { 'dns-benchmark': _('DNS 評測'), 'cdn-ranges': _('CDN IP 範圍'),
 function fmtNum(n) { return (n == null) ? '-' : Number(n).toLocaleString(); }
 function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
 function fmtTime(t) { return t ? new Date(t).toLocaleString() : '-'; }
+/* 還沒存的時間：0 = 都存了 */
+function fmtAge(s) {
+	if (s == null) return '-';
+	if (s <= 0) return _('全部已存');
+	if (s < 3600) return _('%d 分鐘').format(Math.max(1, Math.round(s / 60)));
+	return _('%s 小時').format((s / 3600).toFixed(1));
+}
 function fmtUptime(s) {
 	if (s == null) return '-';
 	var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
@@ -98,7 +105,10 @@ return view.extend({
 				tile(_('記憶體'), sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', _('可用 ') + (sys.memAvailableMB != null ? sys.memAvailableMB + ' MB' : '-') + (sys.pressure && sys.pressure !== 'normal' ? ' · ' + _('記憶體偏低') : '')),
 				tile(_('快取命中率'), d.hitRate != null ? d.hitRate + '%' : '-', _('預取 %s · 斷線回舊資料 %s').format(fmtNum(d.prefetch), fmtNum(d.stale))),
 				tile(_('回應時間 p50 / p95'), ms(lat.hit), _('問上游 ') + ms(lat.miss)),
-				tile(_('Flash 寫入（今天）'), per.bytesToday != null ? (per.bytesToday / 1024).toFixed(0) + ' KB' : '-', (per.storage || '') + _(' · 最短間隔 ') + (per.intervalMin || '-') + _(' 分')),
+				tile(_('Flash 寫入（今天）'), per.bytesToday != null ? (per.bytesToday / 1024).toFixed(0) + ' KB' : '-', (per.storage || '') + _(' · 間隔 ') + (per.effectiveIntervalMin != null ? per.effectiveIntervalMin : (per.intervalMin || '-')) + _(' 分') +
+					(per.estimatedDailyBytes != null ? _(' · 預估每天 ') + (per.estimatedDailyBytes / 1024).toFixed(0) + ' KB' : '')),
+				tile(_('最久未存'), fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? _('上限 %s 小時').format(per.maxAgeHours) : '') +
+					(per.forcedByAge ? _(' · 到期強制寫入 %s 次').format(fmtNum(per.forcedByAge)) : '') + (per.lowSpace ? _(' · 儲存空間不足（只寫核心資料）') : '')),
 				tile(_('加密協議'), protos.length ? protos.length + _(' 種') : _('未開啟'), protos.join(' · ') + (ls.ddr ? ' · DDR' : '')),
 				tile(_('過濾記憶體'), api.filter && api.filter.memoryBytes != null ? (api.filter.memoryBytes / 1048576).toFixed(1) + ' MB' : '-', api.filter && api.filter.domains != null ? fmtNum(api.filter.domains) + _(' 個網域') : '')
 			])

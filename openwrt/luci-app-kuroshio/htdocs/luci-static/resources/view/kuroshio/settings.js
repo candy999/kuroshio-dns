@@ -229,6 +229,16 @@ return view.extend({
 		o.value('standard', _('standard（512 MB – 1 GB）'));
 		o.value('large', _('large（1.5 GB 以上、x86）'));
 		o.default = 'auto';
+		if (pro) {
+			o = ss.option(form.Value, 'persist_max_age_hours', _('最久未存（小時）'),
+				_('學到的資料至少每隔這麼久一定存一次（最多 24 小時）。越小，斷電時遺失越少，但 Flash 寫入越多。'));
+			o.datatype = 'range(1,24)';
+			o.placeholder = '24';
+			o = ss.option(form.Value, 'min_free_kb', _('保留空間（KB）'),
+				_('寫入後至少留下這麼多可用空間；不夠時先刪日誌與可以重建的資料，核心資料（CDN 驗證紀錄、節點、社群身分、設定）絕不自動刪除。空白或 0 = 自動。'));
+			o.datatype = 'uinteger';
+			o.placeholder = '0';
+		}
 
 		o = s.option(form.Flag, 'listen_ipv6', _('同時處理 IPv6'),
 			_('積極劫持會另外建立 IPv6 規則並發送路由器的 ULA 位址（fd00::/8，不用 2001: 公網位址）；環境有 IPv6 但沒有 ULA 時會自動建立 ULA 前綴（第一次會重新載入網路，區網短暫中斷）。取代 dnsmasq 模式有 ULA 就使用。關閉時只處理 IPv4。'));
