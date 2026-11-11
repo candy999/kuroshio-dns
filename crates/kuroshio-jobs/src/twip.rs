@@ -98,7 +98,9 @@ impl Sources {
             .iter()
             .map(|(n, u)| json!({ "name": format!("{n} delegated (cc=TW)"), "url": u }))
             .collect();
-        v.push(json!({ "name": "RIPEstat announced-prefixes", "url": "https://stat.ripe.net/docs/data-api/api-endpoints/announced-prefixes" }));
+        v.push(
+            json!({ "name": "RIPEstat announced-prefixes", "url": "https://stat.ripe.net/docs/data-api/api-endpoints/announced-prefixes" }),
+        );
         Value::Array(v)
     }
 }
@@ -305,7 +307,11 @@ impl DelegatedParser {
             bail!("不是 RIR 統計檔（缺少標頭）");
         };
         if n != self.records {
-            bail!("檔案不完整：標頭寫 {n} 筆，實際讀到 {} 筆（另有 {} 行格式錯誤）", self.records, self.bad_lines);
+            bail!(
+                "檔案不完整：標頭寫 {n} 筆，實際讀到 {} 筆（另有 {} 行格式錯誤）",
+                self.records,
+                self.bad_lines
+            );
         }
         Ok(Dual::from_ranges(self.v4, self.v6))
     }
@@ -708,7 +714,10 @@ pub fn validate(cur: Option<&TwIp>, new: &TwIp) -> std::result::Result<(), Strin
     }
     let Some(cur) = cur else { return Ok(()) };
     if new.generated_at <= cur.generated_at {
-        return Err(format!("新清單的日期（{}）沒有比目前的（{}）新", new.generated_at, cur.generated_at));
+        return Err(format!(
+            "新清單的日期（{}）沒有比目前的（{}）新",
+            new.generated_at, cur.generated_at
+        ));
     }
     let (a, b) = (cur.all().v4.size() as f64, new.all().v4.size() as f64);
     if a > 0.0 && (b - a).abs() > a * 0.2 {
@@ -948,7 +957,11 @@ impl TwIpJob {
             "paused" => format!(
                 "暫停：{}{}{}",
                 st.reason,
-                if progress.is_empty() { String::new() } else { format!("（已完成 {progress}）") },
+                if progress.is_empty() {
+                    String::new()
+                } else {
+                    format!("（已完成 {progress}）")
+                },
                 st.resume_at.map(|t| format!("，{} 再試", fmt(Some(t)))).unwrap_or_default()
             ),
             "aborted" => format!("已放棄：{}（繼續用目前的清單）", st.reason),
@@ -1075,36 +1088,14 @@ impl TwIpJob {
             if now.saturating_sub(p.cycle_start) as f64 > c.deadline_h * 3_600_000.0 {
                 return Ok(Some(Exit::Abort(format!("超過 {} 小時還沒完成", c.deadline_h))));
             }
-            let used = p.heap_bytes();
-            self.set(|s| {
-                s.cycle_peak = s.cycle_peak.max(used);
-                s.peak_mem = s.peak_mem.max(used);
-            });
-            if used as u64 > c.max_mem_kb * 1024 {
-                return Ok(Some(Exit::Abort(format!(
-                    "進度資料用了 {} KB，超過上限 {} KB",
-                    used / 1024,
-                    c.max_mem_kb
-                ))));
-            }
-            let short = (hooks.memory_short)().or_else(|| {
-                (hooks.load)().and_then(|(l, n)| {
-                    (l > c.max_load_per_core * n as f64).then(|| format!("CPU 負載太高（{l:.1}，{n} 核心）"))
-                })
-            });
-            if let Some(why) = short {
-                p.res_pauses += 1;
-                let d = c.retry * 2f64.powi(p.res_pauses.min(10) as i32 - 1);
-                return Ok(Some(Exit::Pause(why, secs(d.min(7200.0)))));
-            }
-            p.res_pauses = 0;
-            if ctx.others_waiting() {
-                return Ok(Some(Exit::Pause("讓其他排程工作先執行".into(), secs(c.retry.min(60.0)))));
-            }
-            // 估計剩餘時間
+            // 目前做到哪、估計剩餘時間
             let rir_left = rirs.len().saturating_sub(p.rir_done) as f64;
             let asn_left = asns.len().saturating_sub(p.asn_done) as f64;
-            let per_rir = if p.rir_done > 0 { p.rir_ms as f64 / p.rir_done as f64 } else { 30_000.0 };
+            let per_rir = if p.rir_done > 0 {
+                p.rir_ms as f64 / p.rir_done as f64
+            } else {
+                30_000.0
+            };
             let per_asn = if p.asn_done > 0 {
                 p.asn_ms as f64 / p.asn_done as f64
             } else {
@@ -1124,6 +1115,30 @@ impl TwIpJob {
                 s.total = total;
                 s.eta = Some(eta);
             });
+            let used = p.heap_bytes();
+            self.set(|s| {
+                s.cycle_peak = s.cycle_peak.max(used);
+                s.peak_mem = s.peak_mem.max(used);
+            });
+            if used as u64 > c.max_mem_kb * 1024 {
+                return Ok(Some(Exit::Abort(format!(
+                    "進度資料用了 {} KB，超過上限 {} KB",
+                    used / 1024,
+                    c.max_mem_kb
+                ))));
+            }
+            let short = (hooks.memory_short)().or_else(|| {
+                (hooks.load)().and_then(|(l, n)| (l > c.max_load_per_core * n as f64).then(|| format!("CPU 負載太高（{l:.1}，{n} 核心）")))
+            });
+            if let Some(why) = short {
+                p.res_pauses += 1;
+                let d = c.retry * 2f64.powi(p.res_pauses.min(10) as i32 - 1);
+                return Ok(Some(Exit::Pause(why, secs(d.min(7200.0)))));
+            }
+            p.res_pauses = 0;
+            if ctx.others_waiting() {
+                return Ok(Some(Exit::Pause("讓其他排程工作先執行".into(), secs(c.retry.min(60.0)))));
+            }
             let t0 = Instant::now();
             let res: std::result::Result<(), Option<Duration>> = match phase {
                 "rir" => {
@@ -1438,7 +1453,10 @@ mod tests {
     #[test]
     fn validation() {
         let cur = twip("2026-10-01", &[("cht", &["1.160.0.0/12"]), ("other", &["61.216.0.0/14"])]);
-        let ok = twip("2026-11-01", &[("cht", &["1.160.0.0/12"]), ("other", &["61.216.0.0/15", "60.0.0.0/16"])]);
+        let ok = twip(
+            "2026-11-01",
+            &[("cht", &["1.160.0.0/12"]), ("other", &["61.216.0.0/15", "60.0.0.0/16"])],
+        );
         assert_eq!(validate(Some(&cur), &ok), Ok(()));
         assert_eq!(validate(None, &ok), Ok(()));
         let old = twip("2026-10-01", &[("cht", &["1.160.0.0/12"]), ("other", &["61.216.0.0/14"])]);
