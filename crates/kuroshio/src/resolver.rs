@@ -179,6 +179,26 @@ pub struct Ctx {
     pub client: IpAddr,
 }
 
+/// 解析流程的結果：已經是封包（格式錯誤、本機轉發），或還沒編碼的訊息
+enum Out {
+    Raw(Vec<u8>),
+    Msg(Message),
+}
+
+/// 回給用戶端的封包，以及答案的最小 TTL（DoH 的 Cache-Control 用）
+pub struct Reply {
+    pub bytes: Vec<u8>,
+    min_ttl: Option<u32>,
+}
+
+impl Reply {
+    /// 答案與權威區段的最小 TTL；沒有記錄是 0
+    pub fn min_ttl(&self) -> u32 {
+        self.min_ttl
+            .unwrap_or_else(|| Message::parse(&self.bytes).map(|m| logic::min_ttl(&m, 0)).unwrap_or(0))
+    }
+}
+
 impl Resolver {
     pub fn new(
         params: Params,
@@ -282,17 +302,26 @@ impl Resolver {
 
     /// 入口：用戶端查詢封包 → 回應封包；無法回應（不是查詢）回 None
     pub async fn handle(self: &Arc<Self>, buf: &[u8], ctx: &Ctx) -> Option<Vec<u8>> {
-        let resp = self.handle_inner(buf, ctx).await?;
-        // 加密連線、用戶端要求補齊時：回應補到 468 的倍數（RFC 8467）
-        if matches!(ctx.proto, "dot" | "doh" | "doh3" | "doq") {
-            if let (Ok(q), Ok(mut r)) = (Message::parse(buf), Message::parse(&resp)) {
-                if logic::wants_padding(&q) && r.opt.is_some() {
-                    logic::pad(&mut r, 468);
-                    return Some(r.encode());
-                }
+        self.handle_reply(buf, ctx).await.map(|r| r.bytes)
+    }
+
+    /// 同 [`Resolver::handle`]，另外帶著答案的最小 TTL（不用為了 TTL 再解析一次回應）
+    pub async fn handle_reply(self: &Arc<Self>, buf: &[u8], ctx: &Ctx) -> Option<Reply> {
+        let (out, pad) = self.handle_inner(buf, ctx).await?;
+        let (mut bytes, min_ttl) = match out {
+            Out::Raw(b) => (b, None),
+            Out::Msg(m) => {
+                let ttl = logic::min_ttl(&m, 0);
+                // 加密連線、用戶端要求補齊時：回應補到 468 的倍數（RFC 8467）
+                let b = if pad && m.opt.is_some() { m.encode_padded(468) } else { m.encode() };
+                (b, Some(ttl))
             }
+        };
+        // DNS 訊息最大 65535 bytes（TCP / DoT / DoQ 的長度欄位只有 2 bytes）：放不下就回截斷
+        if bytes.len() > 65535 {
+            bytes = kuroshio_proto::truncated_response(buf, &bytes);
         }
-        Some(resp)
+        Some(Reply { bytes, min_ttl })
     }
 
     /// DDR 回應；沒有設定時回空答案（不往上游問，resolver.arpa 是本機專用網域）
@@ -312,39 +341,46 @@ impl Resolver {
         r
     }
 
-    async fn handle_inner(self: &Arc<Self>, buf: &[u8], ctx: &Ctx) -> Option<Vec<u8>> {
+    /// 回傳（結果, 要不要補齊）
+    async fn handle_inner(self: &Arc<Self>, buf: &[u8], ctx: &Ctx) -> Option<(Out, bool)> {
+        let h = kuroshio_proto::header(buf).ok()?;
+        if h.qr {
+            return None; // 收到的是回應封包：不回（避免反射）
+        }
+        if h.opcode != 0 {
+            // 只處理一般查詢；NOTIFY / UPDATE 之類的回 NOTIMP，不能當成查詢轉給上游
+            return Some((Out::Raw(kuroshio_proto::error_response(buf, kuroshio_proto::RCODE_NOTIMP)), false));
+        }
         let query = match Message::parse(buf) {
-            Ok(m) if !m.is_response() && m.questions.len() == 1 => m,
-            Ok(_) | Err(_) => {
-                let h = kuroshio_proto::header(buf).ok()?;
-                if h.qr {
-                    return None;
-                }
-                return Some(kuroshio_proto::error_response(buf, kuroshio_proto::RCODE_FORMERR));
-            }
+            Ok(m) if m.questions.len() == 1 => m,
+            Ok(_) | Err(_) => return Some((Out::Raw(kuroshio_proto::error_response(buf, kuroshio_proto::RCODE_FORMERR)), false)),
         };
+        // 加密連線、用戶端的查詢帶 padding 選項 → 回應也補齊
+        let pad = matches!(ctx.proto, "dot" | "doh" | "doh3" | "doq") && logic::wants_padding(&query);
+        let msg = |m: Message| Some((Out::Msg(m), pad));
+        if query.opt.as_ref().is_some_and(|o| o.version != 0) {
+            // 只懂 EDNS 版本 0（RFC 6891 6.1.3）：回 BADVERS，OPT 裡帶我們支援的版本
+            return msg(Message::response_to(&query, 16));
+        }
         let t0 = Instant::now();
-        let q = query.questions[0].clone();
+        let q = &query.questions[0];
         let qname = normalize(&q.name);
-        let qtype = q.qtype;
+        let (qtype, qclass) = (q.qtype, q.qclass);
 
-        if qname == "_dns.resolver.arpa" || qname == "resolver.arpa" {
+        if qclass == 1 && (qname == "_dns.resolver.arpa" || qname == "resolver.arpa") {
             self.stats.count(StatKind::Local);
-            return Some(
-                if qtype == rtype::SVCB && qname.starts_with('_') {
-                    self.ddr_response(&query)
-                } else {
-                    Message::response_to(&query, 0)
-                }
-                .encode(),
-            );
+            return msg(if qtype == rtype::SVCB && qname.starts_with('_') {
+                self.ddr_response(&query)
+            } else {
+                Message::response_to(&query, 0)
+            });
         }
         if let Some(l) = &self.local {
             if l.matches(&qname) {
                 self.stats.count(StatKind::Local);
                 return match l.up.exchange(buf, self.params.timeout).await {
-                    Ok(r) => Some(r),
-                    Err(_) => Some(logic::servfail(&query).encode()),
+                    Ok(r) => Some((Out::Raw(r), false)),
+                    Err(_) => msg(logic::servfail(&query)),
                 };
             }
         }
@@ -361,7 +397,7 @@ impl Resolver {
                 self.stats.blocked_name(&qname, ctx.client, v.category);
                 let code = if v.category == "malware" { ede::BLOCKED } else { ede::FILTERED };
                 debug!("{} {qname} 攔截（{}）{}", ctx.proto, v.category, v.rule);
-                return Some(logic::blocked_response(&query, code, &format!("{}：{}", v.category, v.rule)).encode());
+                return msg(logic::blocked_response(&query, code, &format!("{}：{}", v.category, v.rule)));
             }
         }
 
@@ -369,8 +405,14 @@ impl Resolver {
             self.stats.site(&qname, ctx.client);
         }
 
-        // 2. 快取
-        let key = Cache::key(qtype, &qname);
+        // 2. 快取（鍵含類別與 DO / CD：要 DNSSEC 記錄的查詢不能拿沒有簽章的快取，反過來也一樣）
+        let key = Cache::key_for(
+            qtype,
+            qclass,
+            &qname,
+            query.dnssec_ok(),
+            query.flags & kuroshio_proto::message::FLAG_CD != 0,
+        );
         let now = Instant::now();
         let cached = self.cache.lock().unwrap().get(&key, now);
         if let Some((e, since_last)) = cached {
@@ -397,9 +439,9 @@ impl Resolver {
                     self.stats.blocked(cat);
                     self.stats.blocked_name(&qname, ctx.client, cat);
                 }
-                let out = self.serve(&query, &e, if stale { Some(10) } else { None }).encode();
+                let out = self.serve(&query, &e, if stale { Some(10) } else { None });
                 self.stats.latency(true, t0.elapsed().as_secs_f64() * 1000.0);
-                return Some(out);
+                return msg(out);
             }
         }
 
@@ -418,9 +460,9 @@ impl Resolver {
         if e.class == Class::ServFail {
             self.stats.count(StatKind::ServFail);
         }
-        let out = self.serve(&query, &e, stale.then_some(10)).encode();
+        let out = self.serve(&query, &e, stale.then_some(10));
         self.stats.latency(false, t0.elapsed().as_secs_f64() * 1000.0);
-        Some(out)
+        msg(out)
     }
 
     /// 由快取項目產生回應：答案 TTL 統一成剩餘秒數（過期回舊資料時用 10 秒）
@@ -751,7 +793,7 @@ impl Resolver {
         baseline: Option<kuroshio_cdn::Baseline>,
     ) -> Arc<Entry> {
         let p = &self.params;
-        let qtype: u16 = key.split('|').next().and_then(|t| t.parse().ok()).unwrap_or(1);
+        let qtype = Cache::key_qtype(key);
         let mut blocked = None;
         if class == Class::Ok {
             let me = self.filter_check(qname, qtype);

@@ -263,14 +263,6 @@ fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 回應的快取時間：答案的最小 TTL（沒有答案 0）
-fn min_ttl(resp: &[u8]) -> u32 {
-    kuroshio_proto::Message::parse(resp)
-        .ok()
-        .map(|m| kuroshio_proto::logic::min_ttl(&m, 0))
-        .unwrap_or(0)
-}
-
 fn text(code: StatusCode, s: &'static str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(code)
@@ -377,11 +369,14 @@ pub async fn doh_core(
     if query.len() < 12 {
         return txt(StatusCode::BAD_REQUEST, "bad dns message\n");
     }
-    match r.handle(&query, &Ctx { proto, client }).await {
-        Some(resp) => {
+    match r.handle_reply(&query, &Ctx { proto, client }).await {
+        Some(reply) => {
+            // 回應的快取時間：答案的最小 TTL（沒有答案 0）
+            let max_age = reply.min_ttl();
+            let resp = reply.bytes;
             let mut h = vec![
                 ("content-type", "application/dns-message".to_string()),
-                ("cache-control", format!("max-age={}", min_ttl(&resp))),
+                ("cache-control", format!("max-age={max_age}")),
                 ("x-robots-tag", "noindex, nofollow".to_string()),
             ];
             if let Some(a) = &opts.alt_svc {

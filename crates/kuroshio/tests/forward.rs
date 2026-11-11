@@ -132,3 +132,41 @@ async fn tiny_tier_asks_two_upstreams_then_hedges() {
         "失敗或 300 ms 後就要加問，不能等到逾時"
     );
 }
+
+#[tokio::test]
+async fn udp_truncation_follows_client_edns_size() {
+    use kuroshio_proto::message::{Message, Opt, FLAG_TC};
+    let up = fake_upstream().await;
+    let started = kuroshio::app::start(&cfg(vec![format!("udp://{up}")]), kuroshio_config::Tier::Large)
+        .await
+        .unwrap();
+    let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ask = |id: u16, size: Option<u16>| {
+        let mut m = Message::parse(&kuroshio_proto::build_query(id, "big.test", 1)).unwrap();
+        m.opt = size.map(|udp_size| Opt {
+            udp_size,
+            ..Default::default()
+        });
+        m.encode()
+    };
+    let mut buf = [0u8; 4096];
+    // big.test 的完整回應大約 1000 bytes。用戶端宣告只能收 600：要回 TC（原本只要有 EDNS 就一律塞到 1232）
+    c.send_to(&ask(1, Some(600)), started.bound[0]).await.unwrap();
+    let (n, _) = c.recv_from(&mut buf).await.unwrap();
+    let m = Message::parse(&buf[..n]).unwrap();
+    assert!(m.flags & FLAG_TC != 0, "超過用戶端宣告的大小要截斷");
+    assert!(m.answers.is_empty() && n <= 600);
+    assert_eq!(m.id, 1);
+    assert!(m.opt.is_some(), "查詢有 EDNS，截斷的回應也帶 OPT");
+    // 宣告 4096：放得進 1232，完整回應
+    c.send_to(&ask(2, Some(4096)), started.bound[0]).await.unwrap();
+    let (n, _) = c.recv_from(&mut buf).await.unwrap();
+    let m = Message::parse(&buf[..n]).unwrap();
+    assert_eq!((m.flags & FLAG_TC, m.answers.len()), (0, 60));
+    assert!(n > 600 && n <= 1232);
+    // 沒有 EDNS：512
+    c.send_to(&ask(3, None), started.bound[0]).await.unwrap();
+    let (n, _) = c.recv_from(&mut buf).await.unwrap();
+    let m = Message::parse(&buf[..n]).unwrap();
+    assert!(m.flags & FLAG_TC != 0 && m.opt.is_none() && n <= 512);
+}

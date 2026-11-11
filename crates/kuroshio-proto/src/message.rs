@@ -397,15 +397,17 @@ impl Message {
         self.opt.as_ref().map(|o| o.flags & EDNS_DO != 0).unwrap_or(false)
     }
 
-    /// 依照查詢產生回應的骨架：同 id、同問題、RD 照抄、RA=1；查詢有 EDNS 才加 OPT（1232）
+    /// 依照查詢產生回應的骨架：同 id、同問題、RD / CD 照抄、RA=1；
+    /// 查詢有 EDNS 才加 OPT（1232，DO 位元照抄：RFC 3225 第 3 節）
     pub fn response_to(query: &Message, rcode: u16) -> Message {
         Message {
             id: query.id,
             flags: FLAG_QR | FLAG_RA | (query.flags & FLAG_RD) | (query.flags & FLAG_CD),
             rcode,
             questions: query.questions.clone(),
-            opt: query.opt.as_ref().map(|_| Opt {
+            opt: query.opt.as_ref().map(|o| Opt {
                 udp_size: 1232,
+                flags: o.flags & EDNS_DO,
                 ..Default::default()
             }),
             ..Default::default()

@@ -1,6 +1,7 @@
 //! DNS 快取（對齊 2.x `Resolver.cache`）
 //!
-//! - 鍵：`類型|名稱`（名稱小寫）
+//! - 鍵：`類型|名稱`（名稱小寫）；類別不是 IN、或查詢帶 DO / CD 位元時是 `類型+類別[d][c]|名稱`
+//!   （會改變答案內容的都要算進鍵裡，不然要 DNSSEC 記錄的用戶端會拿到沒有簽章的快取）
 //! - 每分鐘清掃：過期超過 serve-stale 時間的刪掉；超過上限時刪掉最久沒用的，降到上限的 90%
 
 use kuroshio_proto::logic::Class;
@@ -100,8 +101,27 @@ impl Cache {
         }
     }
 
+    /// 一般查詢（類別 IN、沒有 DO / CD）的鍵
     pub fn key(qtype: u16, qname: &str) -> String {
         format!("{qtype}|{qname}")
+    }
+
+    /// 完整的鍵：類型、類別、DO（要不要 DNSSEC 記錄）、CD（不要上游驗證）都會改變答案，分開快取。
+    /// 一般查詢維持 `類型|名稱`（開機預熱的名單、管理 API 都用這個格式）
+    pub fn key_for(qtype: u16, qclass: u16, qname: &str, dnssec_ok: bool, cd: bool) -> String {
+        if qclass == 1 && !dnssec_ok && !cd {
+            return Self::key(qtype, qname);
+        }
+        format!(
+            "{qtype}+{qclass}{}{}|{qname}",
+            if dnssec_ok { "d" } else { "" },
+            if cd { "c" } else { "" }
+        )
+    }
+
+    /// 鍵裡的查詢類型
+    pub fn key_qtype(key: &str) -> u16 {
+        key.split(['|', '+']).next().and_then(|t| t.parse().ok()).unwrap_or(1)
     }
 
     pub fn len(&self) -> usize {
@@ -179,11 +199,12 @@ impl Cache {
         }
     }
 
-    /// 最常被查的 n 個鍵（開機預熱用）；失敗與被擋的不算
+    /// 最常被查的 n 個鍵（開機預熱用）；失敗與被擋的不算，也只列一般查詢（預熱只會重問 `類型|名稱`）
     pub fn hot_keys(&self, n: usize) -> Vec<String> {
         let mut v: Vec<(&String, u32)> = self
             .map
             .iter()
+            .filter(|(k, _)| !k.split('|').next().unwrap_or("").contains('+'))
             .filter(|(_, e)| e.class != Class::ServFail && e.blocked.is_none())
             .map(|(k, e)| (k, e.hits.load(Ordering::Relaxed)))
             .filter(|x| x.1 > 0)
@@ -248,6 +269,27 @@ mod tests {
         assert_eq!(c.len(), 18);
         c.sweep(t0 + Duration::from_secs(61 + 61), 60);
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn keys() {
+        assert_eq!(Cache::key(1, "a.test"), "1|a.test");
+        assert_eq!(Cache::key_for(1, 1, "a.test", false, false), "1|a.test");
+        assert_eq!(Cache::key_for(1, 1, "a.test", true, false), "1+1d|a.test");
+        assert_eq!(Cache::key_for(28, 1, "a.test", true, true), "28+1dc|a.test");
+        assert_eq!(Cache::key_for(16, 3, "version.bind", false, false), "16+3|version.bind");
+        for k in ["1|a.test", "1+1d|a.test", "1+3|a|b"] {
+            assert_eq!(Cache::key_qtype(k), 1);
+        }
+        assert_eq!(Cache::key_qtype("28+1dc|a.test"), 28);
+        // 預熱名單只列一般查詢
+        let mut c = Cache::new(100);
+        let now = Instant::now();
+        for k in ["1|a.test", "1+1d|a.test", "16+3|a.test"] {
+            c.insert(k.into(), entry(60, false), now);
+            c.get(k, now);
+        }
+        assert_eq!(c.hot_keys(10), vec!["1|a.test"]);
     }
 
     #[test]

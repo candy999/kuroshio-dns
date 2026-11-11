@@ -377,3 +377,144 @@ async fn parallel_limit_prefers_fastest_upstream() {
     assert_eq!(n_slow.load(Ordering::SeqCst), s0, "之後都問平均延遲較低的");
     assert_eq!(n_fast.load(Ordering::SeqCst), f0 + 10);
 }
+
+/// 假上游：查詢帶 DO 時多回一筆 RRSIG（類型 46）；答案的類別照查詢的
+async fn dnssec_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = s.local_addr().unwrap();
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (len, peer) = s.recv_from(&mut buf).await.unwrap();
+            n2.fetch_add(1, Ordering::SeqCst);
+            let q = Message::parse(&buf[..len]).unwrap();
+            let qs = q.questions[0].clone();
+            let mut r = Message::response_to(&q, 0);
+            r.answers.push(Record {
+                class: qs.qclass,
+                ..a(&qs.name, 300, [192, 0, 2, 7])
+            });
+            if q.dnssec_ok() {
+                r.answers.push(Record {
+                    name: qs.name.clone(),
+                    rtype: 46,
+                    class: qs.qclass,
+                    ttl: 300,
+                    data: RData::Raw(vec![0, 1, 13, 2, 0, 0, 1, 44, 1, 2, 3, 4]),
+                });
+            }
+            let _ = s.send_to(&r.encode(), peer).await;
+        }
+    });
+    (addr, n)
+}
+
+/// 組查詢：可以指定類別、標頭旗標、EDNS（UDP 大小、DO）
+fn q_ext(id: u16, name: &str, qclass: u16, flags: u16, edns: Option<(u16, bool)>) -> Vec<u8> {
+    let mut m = Message::parse(&q(id, name, 1)).unwrap();
+    m.questions[0].qclass = qclass;
+    m.flags = flags;
+    m.opt = edns.map(|(size, dnssec)| kuroshio_proto::message::Opt {
+        udp_size: size,
+        flags: if dnssec { kuroshio_proto::message::EDNS_DO } else { 0 },
+        ..Default::default()
+    });
+    m.encode()
+}
+
+#[tokio::test]
+async fn cache_key_separates_dnssec_ok_checking_disabled_and_class() {
+    use kuroshio_proto::message::{FLAG_CD, FLAG_RD};
+    let (up, n) = dnssec_upstream().await;
+    let r = kuroshio::app::build_resolver(&cfg(&[up], json!({ "resolver": { "fastPath": false } }))).unwrap();
+    let ask = |b: Vec<u8>| {
+        let r = r.clone();
+        async move { Message::parse(&r.handle(&b, &CTX).await.unwrap()).unwrap() }
+    };
+    // 一般查詢先進快取
+    let m = ask(q_ext(1, "signed.test", 1, FLAG_RD, None)).await;
+    assert_eq!(m.answers.len(), 1);
+    // 要 DNSSEC 記錄的查詢（DO=1）不能拿沒有簽章的快取：重新問上游，拿到 RRSIG
+    let m = ask(q_ext(2, "signed.test", 1, FLAG_RD, Some((1232, true)))).await;
+    assert_eq!(m.answers.len(), 2, "DO=1 的用戶端要拿到 RRSIG");
+    assert_eq!(m.answers[1].rtype, 46);
+    assert!(m.dnssec_ok(), "回應的 DO 位元照抄");
+    assert_eq!(n.load(Ordering::SeqCst), 2);
+    // 兩種各自命中自己的快取：沒有 DO 的不會拿到多餘的簽章
+    let m = ask(q_ext(3, "signed.test", 1, FLAG_RD, Some((1232, false)))).await;
+    assert_eq!(m.answers.len(), 1);
+    let m = ask(q_ext(4, "SIGNED.test", 1, FLAG_RD, Some((1232, true)))).await;
+    assert_eq!(m.answers.len(), 2);
+    assert_eq!(n.load(Ordering::SeqCst), 2, "各自命中快取");
+    // CD=1（不要上游驗證）也是不同的答案
+    let m = ask(q_ext(5, "signed.test", 1, FLAG_RD | FLAG_CD, None)).await;
+    assert!(m.flags & FLAG_CD != 0, "CD 照抄");
+    assert_eq!(n.load(Ordering::SeqCst), 3);
+    // 類別不是 IN（例如 CH）：不能跟 IN 的快取混在一起
+    let m = ask(q_ext(6, "signed.test", 3, FLAG_RD, None)).await;
+    assert_eq!((m.questions[0].qclass, m.answers[0].class), (3, 3));
+    assert_eq!(n.load(Ordering::SeqCst), 4);
+    let m = ask(q_ext(7, "signed.test", 1, FLAG_RD, None)).await;
+    assert_eq!(m.answers[0].class, 1);
+    assert_eq!(n.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn cached_reply_echoes_id_flags_question_and_opt() {
+    use kuroshio_proto::message::{FLAG_AA, FLAG_AD, FLAG_QR, FLAG_RA, FLAG_RD, FLAG_TC};
+    let (up, n) = upstream(0, answer).await;
+    let r = kuroshio::app::build_resolver(&cfg(&[up], json!({ "resolver": { "fastPath": false } }))).unwrap();
+    r.handle(&q(1, "echo.test", 1), &CTX).await.unwrap();
+    // 快取命中、沒有 EDNS、RD=0：id 與問題（含大小寫）照抄，RD 照抄，不能多出 OPT
+    let resp = r.handle(&q_ext(0xbeef, "Echo.TEST", 1, 0, None), &CTX).await.unwrap();
+    let m = Message::parse(&resp).unwrap();
+    assert_eq!(m.id, 0xbeef);
+    assert_eq!(m.questions[0].name, "Echo.TEST");
+    assert_eq!(m.flags & (FLAG_QR | FLAG_RA), FLAG_QR | FLAG_RA);
+    assert_eq!(
+        m.flags & (FLAG_RD | FLAG_AA | FLAG_TC | FLAG_AD),
+        0,
+        "RD 照抄（0），不自稱權威、不設 AD"
+    );
+    assert!(m.opt.is_none(), "查詢沒有 EDNS，回應不能帶 OPT");
+    assert_eq!(kuroshio_proto::header(&resp).unwrap().arcount, 0);
+    assert_eq!(m.answers.len(), 1);
+    // 有 EDNS、RD=1：回應帶 OPT（版本 0、1232），RD=1
+    let m = Message::parse(
+        &r.handle(&q_ext(7, "echo.test", 1, FLAG_RD, Some((4096, false))), &CTX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(m.flags & FLAG_RD != 0);
+    let opt = m.opt.expect("查詢有 EDNS，回應要帶 OPT");
+    assert_eq!((opt.udp_size, opt.version, opt.flags), (1232, 0, 0));
+    assert!(opt.options.is_empty(), "新鮮的快取命中不帶 EDE");
+    assert_eq!(n.load(Ordering::SeqCst), 1, "以上都是快取命中");
+}
+
+#[tokio::test]
+async fn non_query_opcode_and_unknown_edns_version() {
+    let (up, n) = upstream(0, answer).await;
+    let r = kuroshio::app::build_resolver(&cfg(&[up], json!({}))).unwrap();
+    // NOTIFY（opcode 4）：回 NOTIMP，opcode 照抄，不轉給上游
+    let mut notify = q(9, "zone.test", 6);
+    notify[2] = 4 << 3;
+    let resp = r.handle(&notify, &CTX).await.unwrap();
+    let h = kuroshio_proto::header(&resp).unwrap();
+    assert_eq!((h.id, h.rcode, h.opcode, h.qr), (9, kuroshio_proto::RCODE_NOTIMP, 4, true));
+    // EDNS 版本 1：回 BADVERS（rcode 16），OPT 帶我們支援的版本 0
+    let mut v1 = Message::parse(&q(10, "v1.test", 1)).unwrap();
+    v1.opt = Some(kuroshio_proto::message::Opt {
+        udp_size: 1232,
+        version: 1,
+        ..Default::default()
+    });
+    let m = Message::parse(&r.handle(&v1.encode(), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 16);
+    assert_eq!(m.opt.unwrap().version, 0);
+    assert!(m.answers.is_empty());
+    assert_eq!(n.load(Ordering::SeqCst), 0, "都不該問上游");
+}

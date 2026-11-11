@@ -127,15 +127,11 @@ impl Server {
     }
 }
 
-/// UDP 回應超過用戶端能收的大小 → 只回標頭與問題並設 TC，讓用戶端改用 TCP
+/// UDP 回應超過用戶端能收的大小 → 只回標頭與問題並設 TC，讓用戶端改用 TCP。
+/// 上限：沒有 EDNS 是 512；有 EDNS 用它宣告的大小，最多 1232（不讓回應被 IP 分片，也限制放大倍數）
 fn truncate_for_udp(query: &[u8], resp: Vec<u8>) -> Vec<u8> {
-    // 沒有 EDNS 的用戶端上限 512；有 EDNS 時第一階段一律以 1232 為上限（RFC 9715 建議值）
-    let has_edns = kuroshio_proto::header(query).map(|h| h.arcount > 0).unwrap_or(false);
-    let limit = if has_edns { 1232 } else { 512 };
-    if resp.len() <= limit {
+    if resp.len() <= kuroshio_proto::udp_limit(query) {
         return resp;
     }
-    let mut r = kuroshio_proto::error_response(query, kuroshio_proto::RCODE_NOERROR);
-    r[2] |= 0x02;
-    r
+    kuroshio_proto::truncated_response(query, &resp)
 }
