@@ -12,7 +12,7 @@ const SHOTS = process.env.SHOTS || 'screenshots';
 // 用法：node luci-e2e.js [candydns|kuroshio]
 const NAME = process.argv[2] || 'candydns';
 const TITLE = NAME === 'kuroshio' ? /黑潮 DNS/ : /優選 DNS/;
-const PAGES = ['status', 'settings', 'filter', 'cdn', 'community', 'advanced', 'log'];
+const PAGES = ['status', 'settings', 'filter', 'cdn', 'community', 'advanced', 'log'].concat(NAME === 'kuroshio' ? ['access'] : []);
 const MOCK = !!process.env.MOCK;
 const mockGet = async (p) => { const r = await fetch(BASE + p); if (!r.ok) throw new Error(`mock ${p}: HTTP ${r.status}`); return r.text(); };
 /** uci -q get <key>；list 用空白隔開 */
@@ -68,6 +68,18 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
             /DNR/.test(text) && /DNR 目前狀態/.test(text) ? ok('設定頁：DNR 開關與目前狀態') : bad('設定頁沒有 DNR');
             /存放位置/.test(text) ? ok('設定頁：存放位置') : bad('設定頁沒有「存放位置」');
             /目前的監聽狀態/.test(text) ? ok('設定頁：監聽狀態') : bad('設定頁沒有「目前的監聽狀態」');
+            // DNR：rpcd 的 dnr 方法（kuroshio dnr）給的真正結果；mock 是條件符合，真的容器還沒有網域
+            const dnr = await page.locator('#kuroshio-dnr').innerText().catch(() => '');
+            (MOCK ? /dns\.example\.com/.test(dnr) && /DoH \+ DoH3/.test(dnr) && /192\.168\.1\.1/.test(dnr) : /網域/.test(dnr))
+                ? ok('設定頁：DNR 顯示 kuroshio dnr 的結果') : bad(`設定頁：DNR 內容不對\n     ${dnr}`);
+        }
+        if (NAME === 'kuroshio' && p === 'access') {
+            /只開放台灣（建議）/.test(text) && /全開放/.test(text) && /允許名單/.test(text) && /封鎖名單/.test(text) && /一律允許/.test(text) && /VPN/.test(text) && /優先於一切/.test(text)
+                ? ok('連線來源頁：模式、名單與說明') : bad(`連線來源頁內容不對\n     ${text.slice(0, 300)}`);
+            if (MOCK) /\d{4}-\d{2}-\d{2} 的資料/.test(text) && /57 次/.test(text) && /45\.135\.232\.0\/24/.test(text) ? ok('連線來源頁：資料日期、拒絕次數、被拒絕最多的網段') : bad('連線來源頁沒有目前狀態');
+        }
+        if (NAME === 'kuroshio' && p === 'status' && MOCK) {
+            /連線來源/.test(text) && /只開放台灣/.test(text) && /已拒絕 57 次/.test(text) ? ok('狀態頁：連線來源摘要') : bad('狀態頁沒有連線來源摘要');
         }
     }
     // 黑潮：每頁最下方有「關於」（核心版本、介面版本、授權、原始碼），狀態頁一定要看得到
@@ -176,6 +188,86 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         } catch (e) { bad(`設定頁操作中斷：${e.message.split('\n')[0]}`); }
         await page.screenshot({ path: `${SHOTS}/settings-saved.png`, fullPage: true });
         if (errors.length) bad(`設定頁：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+    }
+
+    // 黑潮：連線來源（自訂 ISP、取消一組、允許 / 封鎖名單、測試 IP），儲存後寫進 UCI
+    if (NAME === 'kuroshio') {
+        errors = [];
+        await page.evaluate((n) => localStorage.setItem(n + '-ui-mode', 'simple'), NAME);
+        await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/access`);
+        await page.waitForLoadState('networkidle');
+        const field = opt => page.locator(`[id="cbi-${NAME}-access-${opt}"]`);
+        const addItem = async (opt, value) => {
+            const input = page.locator(`[id="cbid.${NAME}.access.${opt}"] .add-item input[type=text]`).first();
+            await input.fill(value);
+            await input.press('End');   // 驗證在 keyup 時跑：fill 不會觸發，先按一個鍵
+            await input.press('Enter');
+        };
+        try {
+            (await field('groups').isVisible()) ? bad('只開放台灣時不該顯示 ISP 勾選') : ok('只開放台灣（預設）時不顯示 ISP 勾選');
+            await page.locator(`[id="widget.cbid.${NAME}.access.mode.1"]`).evaluate(el => el.click());
+            await page.waitForTimeout(300);
+            (await field('groups').isVisible()) ? ok('自訂 ISP：顯示勾選清單') : bad('自訂 ISP：沒有顯示勾選清單');
+            const box = page.locator(`[id="cbid.${NAME}.access.groups"]`);
+            const ids = await box.locator('input[type=checkbox]:not([data-all])').evaluateAll(cs => cs.map(c => c.value));
+            let wantGroups;
+            if (ids.length) {
+                // 有台灣 IP 資料（mock）：取消「其他台灣網段」
+                const gt = await box.innerText();
+                /中華電信/.test(gt) && /萬個位址/.test(gt) && /全選（含日後新增的 ISP）/.test(gt) ? ok('ISP 清單：名稱、位址數（萬）、全選') : bad(`ISP 清單內容不對\n     ${gt.slice(0, 200)}`);
+                await box.locator('input[value=other]').evaluate(el => el.click());
+                (await box.locator('input[data-all]').isChecked()) ? bad('取消一組後「全選」應該跟著取消') : ok('取消一組：全選跟著取消');
+                wantGroups = ids.filter(x => x !== 'other').join(' ');
+            } else {
+                // 服務沒有執行（真的容器）：清單只有「全選」，取消 = 一組都不勾，要寫成 list groups ''
+                await box.locator('input[data-all]').evaluate(el => el.click());
+                wantGroups = '';
+            }
+            await addItem('allow', '10.0.0.0/33');
+            (await field('allow').locator('.cbi-input-invalid').count()) ? ok('允許名單：前綴長度超過 32 有標示') : bad('允許名單：前綴長度超過 32 沒有標示');
+            const allowInput = page.locator(`[id="cbid.${NAME}.access.allow"] .add-item input[type=text]`).first();
+            /10\.0\.0\.0\/33/.test(await page.locator(`[id="cbid.${NAME}.access.allow"]`).innerText()) ? bad('允許名單：格式錯誤的項目被加進去') : ok('允許名單：格式錯誤的項目不加入');
+            await allowInput.fill('');
+            await allowInput.press('End');
+            await addItem('allow', '203.0.113.0/24');
+            await addItem('allow', '2001:db8::/32');
+            await addItem('deny', '198.51.100.7');
+            await page.fill('#kuroshio-access-ip', '168.95.1.1');
+            await page.click('#kuroshio-access-test');
+            await page.waitForFunction(() => /可以連進來|會被擋下|沒有回應/.test(document.getElementById('kuroshio-access-result').innerText), null, { timeout: 10000 }).catch(() => {});
+            const tr = await page.locator('#kuroshio-access-result').innerText();
+            (MOCK && ids.length ? /可以連進來/.test(tr) && /中華電信/.test(tr) : /可以連進來|會被擋下|沒有回應/.test(tr)) ? ok(`測試 IP：${tr.replace(/\s+/g, ' ')}`) : bad(`測試 IP 結果不對：${tr}`);
+            await page.fill('#kuroshio-access-ip', '10.0.0.0/8');
+            await page.click('#kuroshio-access-test');
+            /請輸入一個 IP/.test(await page.locator('#kuroshio-access-result').innerText()) ? ok('測試 IP：格式錯誤不送出') : bad('測試 IP：格式錯誤沒有提示');
+            await page.screenshot({ path: `${SHOTS}/access-edited.png`, fullPage: true });
+            await page.locator('.cbi-page-actions .cbi-button-apply, .cbi-page-actions button:has-text("Save & Apply")').first().click();
+            await page.waitForTimeout(6000);
+            const want = { 'access.mode': 'custom', 'access.groups': wantGroups, 'access.allow': '203.0.113.0/24 2001:db8::/32', 'access.deny': '198.51.100.7' };
+            for (const k of Object.keys(want)) {
+                let v;
+                try { v = await uciGet(`${NAME}.${k}`); } catch (e) { v = `（${e.message.split('\n')[0]}）`; }
+                v === want[k] ? ok(`儲存：${k} = ${v || "''"}`) : bad(`儲存：${k} 應該是 ${want[k] || "''"}，實際 ${v}`);
+            }
+            // 改回只開放台灣：勾選的群組保留
+            await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/access`);
+            await page.waitForLoadState('networkidle');
+            await page.locator(`[id="widget.cbid.${NAME}.access.mode.0"]`).evaluate(el => el.click());
+            await page.locator('.cbi-page-actions .cbi-button-apply, .cbi-page-actions button:has-text("Save & Apply")').first().click();
+            await page.waitForTimeout(6000);
+            const m2 = await uciGet(`${NAME}.access.mode`), g2 = await uciGet(`${NAME}.access.groups`).catch(() => '（沒有）');
+            m2 === 'taiwan' && g2 === wantGroups ? ok('改回只開放台灣：勾選的群組保留') : bad(`改回只開放台灣：mode = ${m2}、groups = ${g2}`);
+            if (MOCK && ids.length) {
+                // 被拒絕最多的網段：一鍵加入封鎖名單
+                await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/access`);
+                await page.waitForLoadState('networkidle');
+                await page.locator('#kuroshio-access-status button[data-opt=deny][data-net="45.135.232.0/24"]').click();
+                const dl = await page.locator(`[id="cbid.${NAME}.access.deny"]`).innerText();
+                /45\.135\.232\.0\/24/.test(dl) ? ok('一鍵加入封鎖名單') : bad(`一鍵加入封鎖名單沒有作用\n     ${dl}`);
+            }
+        } catch (e) { bad(`連線來源頁操作中斷：${e.message.split('\n')[0]}`); }
+        await page.screenshot({ path: `${SHOTS}/access-saved.png`, fullPage: true });
+        if (errors.length) bad(`連線來源頁：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
     }
 
     // 自訂規則：編輯後存檔應寫進 /etc/<名稱>/custom-rules.txt

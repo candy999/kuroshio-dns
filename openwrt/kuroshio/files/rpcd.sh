@@ -9,6 +9,7 @@
 #    acme_status   憑證資訊與申請紀錄
 #    acme_issue    背景申請憑證                                          ← ACL 寫入權限
 #    log           最近的執行紀錄
+#    dnr           DNR 會發布什麼、沒發的原因（kuroshio dnr；區網位址在這裡自己取，不收參數）
 #    backup_export 匯出學習資料到 /tmp/kuroshio-backup.kuroshio（LuCI 再下載）  ← ACL 寫入權限
 #    backup_import 匯入 LuCI 上傳的 /tmp/kuroshio-import.kuroshio（合併）       ← ACL 寫入權限
 # =====================================================================
@@ -57,7 +58,7 @@ BACKUP_IN=/tmp/kuroshio-import.kuroshio
 case "$1" in
 list)
 	cat <<-'EOF'
-	{"status":{},"api":{"path":"str","query":"str"},"action":{"path":"str","query":"str"},"defaults":{},"acme_status":{},"acme_issue":{},"log":{"lines":64},"about":{},"backup_export":{"kind":"str"},"backup_import":{}}
+	{"status":{},"api":{"path":"str","query":"str"},"action":{"path":"str","query":"str"},"defaults":{},"acme_status":{},"acme_issue":{},"log":{"lines":64},"about":{},"backup_export":{"kind":"str"},"backup_import":{},"dnr":{}}
 	EOF
 	;;
 call)
@@ -146,6 +147,21 @@ call)
 		fi
 		out=$(/usr/bin/kuroshio import --uci --json "$BACKUP_IN" 2>/dev/null)
 		rm -f "$BACKUP_IN"
+		case "$out" in
+		'{'*) printf '%s' "$out" ;;
+		*) echo '{"ok":false,"error":"kuroshio 沒有回應"}' ;;
+		esac
+		;;
+	dnr)
+		# 區網位址從 netifd / UCI 取得（跟 takeover.sh 發布時一樣），不接受呼叫端給的參數；
+		# 只把 IP 用得到的字元交給 kuroshio，再確認輸出是 JSON 物件
+		# shellcheck source=lan.sh
+		. /usr/libexec/kuroshio/lan.sh
+		lan=$(printf '%s,%s' "$(lan_ip4)" "$(lan_ula6)" | sed 's/^,//; s/,$//')
+		case "$lan" in
+		''|*[!0-9A-Fa-f.:,]*) echo '{"ok":false,"error":"讀不到路由器的區網位址"}'; exit 0 ;;
+		esac
+		out=$(/usr/bin/kuroshio dnr --uci --lan "$lan" 2>/dev/null)
 		case "$out" in
 		'{'*) printf '%s' "$out" ;;
 		*) echo '{"ok":false,"error":"kuroshio 沒有回應"}' ;;

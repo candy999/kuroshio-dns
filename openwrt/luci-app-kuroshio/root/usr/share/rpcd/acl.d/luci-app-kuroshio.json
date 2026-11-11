@@ -3,7 +3,7 @@
 		"description": "Grant access to kuroshio",
 		"read": {
 			"ubus": {
-				"kuroshio": [ "status", "api", "defaults", "acme_status", "log", "about" ],
+				"kuroshio": [ "status", "api", "defaults", "acme_status", "log", "about", "dnr" ],
 				"service": [ "list" ]
 			},
 			"file": {

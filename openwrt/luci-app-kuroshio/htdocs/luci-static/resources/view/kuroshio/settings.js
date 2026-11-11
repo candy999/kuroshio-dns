@@ -9,6 +9,7 @@
 
 var callAcmeStatus = rpc.declare({ object: 'kuroshio', method: 'acme_status' });
 var callAcmeIssue = rpc.declare({ object: 'kuroshio', method: 'acme_issue' });
+var callDnr = rpc.declare({ object: 'kuroshio', method: 'dnr' });
 
 function certSummary(st) {
 	if (!st) return _('讀取中…');
@@ -67,14 +68,39 @@ function ddnsPanel(st) {
 	]);
 }
 
-/** DNR 目前發布的內容（takeover.sh 寫進 dhcp.lan 的 DHCP 選項 162 與 list dnr）；沒有發時說明可能的原因 */
-function dnrPanel(paths) {
+/**
+ * DNR：kuroshio dnr 判斷的結果（會發布什麼、沒發的原因；依已套用的設定）＋ dhcp.lan 裡目前實際發布的內容。
+ * 舊版 rpcd 沒有 dnr 方法時，退回依設定推測原因
+ */
+function dnrPanel(paths, dnr) {
 	var on = uci.get('kuroshio', 'main', 'dnr') !== '0';
 	if (!on) return T('em', {}, _('已關閉：不發布。'));
 	var opt = [].concat(uci.get('dhcp', 'lan', 'dhcp_option') || []).filter(function(x) { return /^162,/.test(x); });
 	var ra = [].concat(uci.get('dhcp', 'lan', 'dnr') || []);
-	if (opt.length || ra.length) {
-		return E('div', {}, [common.badge(_('發布中'), 'ok'), T('span', {}, ' ' + [opt.length ? _('DHCPv4（選項 162）') : '', ra.length ? _('RA / DHCPv6 %d 筆').format(ra.length) : ''].filter(Boolean).join('、'))]
+	var published = opt.length || ra.length;
+	var pubText = [opt.length ? _('DHCPv4（選項 162）') : '', ra.length ? _('RA / DHCPv6 %d 筆').format(ra.length) : ''].filter(Boolean).join('、');
+	var nodes = [];
+
+	if (dnr && typeof dnr.ok === 'boolean' && !dnr.error) {
+		if (dnr.ok) {
+			nodes.push(E('div', {}, [published ? common.badge(_('發布中'), 'ok') : common.badge(_('條件符合，還沒有發布'), 'warn'),
+				T('span', {}, ' ' + (published ? pubText : _('儲存並套用後就會發布。')))]));
+			nodes.push(T('div', { 'style': 'margin:.4em 0' }, _('網域（ADN）：') + (dnr.adn || '-')));
+			var P = { h2: 'DoH', h3: 'DoH3', dot: 'DoT', doq: 'DoQ' };
+			nodes.push(common.table([_('優先順序'), _('協議'), _('埠號'), _('位址'), _('路徑')], [].concat(dnr.protocols || []).map(function(x) {
+				return [String(x.priority), [].concat(x.alpn || []).map(function(a) { return P[a] || a; }).join(' + '), String(x.port),
+					[].concat(x.addrs || []).join('、') || '-', x.dohpath || '-'];
+			}), _('沒有協議')));
+		} else {
+			nodes.push(E('div', {}, [common.badge(_('目前沒有發布'), 'off'), T('span', { 'id': 'kuroshio-dnr-reason' }, ' ' + (dnr.reason || _('原因不明')))]));
+			if (published) nodes.push(T('div', { 'class': 'cbi-value-description' }, _('dhcp 設定裡還有舊的 DNR 內容（%s），儲存並套用後會移除。').format(pubText)));
+		}
+		return E('div', { 'id': 'kuroshio-dnr' }, nodes);
+	}
+
+	// 沒有 dnr 方法（舊版）或讀不到：看 dhcp 設定，沒發時依設定推測原因
+	if (published) {
+		return E('div', { 'id': 'kuroshio-dnr' }, [common.badge(_('發布中'), 'ok'), T('span', {}, ' ' + pubText)]
 			.concat(ra.map(function(x) { return T('code', { 'style': 'display:block;word-break:break-all;font-size:12px' }, x); })));
 	}
 	var why = [], dom = uci.get('kuroshio', 'tls', 'domain') || '', info = paths && paths.tls && paths.tls.info;
@@ -82,7 +108,8 @@ function dnrPanel(paths) {
 	if (!['doh', 'dot', 'doq'].some(function(k) { return uci.get('kuroshio', k, 'enabled') === '1'; })) why.push(_('沒有開啟 DoH / DoT / DoQ'));
 	if (paths && (!info || info.daysLeft < 0)) why.push(_('沒有有效的憑證'));
 	else if (info && dom && !common.certCovers(info, dom)) why.push(_('憑證沒有涵蓋綁定網域'));
-	return E('div', {}, [common.badge(_('目前沒有發布'), 'off'), T('span', {}, ' ' + (why.length ? why.join('；') : _('條件符合的話，儲存並套用後就會發布；仍然沒有發布時原因會寫在系統日誌（DNR 沒有發：…）。')))]);
+	return E('div', { 'id': 'kuroshio-dnr' }, [common.badge(_('目前沒有發布'), 'off'), T('span', {}, ' ' + (why.length ? why.join('；') : _('條件符合的話，儲存並套用後就會發布；仍然沒有發布時原因會寫在系統日誌（DNR 沒有發：…）。'))),
+		dnr && dnr.error ? T('div', { 'class': 'cbi-value-description' }, _('讀不到 DNR 的判斷結果：') + dnr.error) : '']);
 }
 
 /** 存放位置（/api/paths）：只有路徑，沒有密鑰內容 */
@@ -124,14 +151,15 @@ return view.extend({
 			common.fetch('/api/ddns'),
 			common.fetch('/api/status', { lite: 1 }),
 			uci.load('kuroshio'),
-			L.resolveDefault(uci.load('dhcp'), null)
+			L.resolveDefault(uci.load('dhcp'), null),
+			L.resolveDefault(callDnr(), null)
 		]);
 	},
 
 	render: function(data) {
 		var acme = data[1];
 		var ifaces = (data[2] && Array.isArray(data[2].interfaces)) ? data[2].interfaces : [];
-		var paths = data[3], ddnsStatus = data[4], status = data[5];
+		var paths = data[3], ddnsStatus = data[4], status = data[5], dnr = data[8];
 		var pro = common.isPro();
 		var m, s, o;
 
@@ -189,7 +217,7 @@ return view.extend({
 			_('RFC 9463：在 DHCP 與 IPv6 RA 裡告訴區網裝置這台路由器有加密 DNS（網域、位址、協議），裝置不用先查詢就能改用加密連線。要有綁定網域、涵蓋網域的有效憑證，而且加密協議聽得到區網位址才會發布；條件不符就不發。IPv6（RA）需要 OpenWrt 25.12 以上。'));
 		o.default = '1';
 		o.rmempty = false;
-		common.panel(s, '_dnr_status', _('DNR 目前狀態'), function() { return dnrPanel(paths); });
+		common.panel(s, '_dnr_status', _('DNR 目前狀態'), function() { return dnrPanel(paths, dnr); });
 
 		// ---------------- 硬體等級 ----------------
 		var ss = m.section(form.NamedSection, 'system', 'system', _('硬體等級'),

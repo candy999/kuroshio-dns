@@ -104,6 +104,20 @@ return view.extend({
 			])
 		]);
 
+		// 連線來源限制（規格 08）：模式、拒絕次數、資料日期；資料讀不到時不擋，要明顯提醒
+		var ac = api.access;
+		var accSec = ac ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-access' }, [
+			E('h3', {}, _('連線來源')),
+			ac.failOpen ? E('div', { 'class': 'alert-message danger' }, _('台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）') + (ac.warning ? '：' + ac.warning : ''))
+				: (ac.warning ? E('div', { 'class': 'alert-message warning' }, ac.warning) : ''),
+			E('p', {}, [
+				E('strong', {}, { taiwan: _('只開放台灣'), custom: _('自訂 ISP'), open: _('全開放') }[ac.mode] || ac.mode || '-'),
+				' · ', _('已拒絕 %s 次（啟動後）').format(fmtNum(ac.denied && ac.denied.total)),
+				ac.generatedAt ? ' · ' + _('台灣 IP 資料 %s').format(ac.generatedAt) : '',
+				' · ', E('a', { 'href': L.url('admin/services/kuroshio/access') }, _('設定'))
+			])
+		]) : '';
+
 		// 加密監聽：每個位址一列，綁定失敗列出原因
 		var detail = [].concat(api.listenersDetail || []);
 		var lsSec = detail.length ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-listeners' }, [
@@ -158,7 +172,7 @@ return view.extend({
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at) + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
-		return E([], [head, tiles, hw, lsSec, upSec, jobSec, infoSec, actions, errSec]);
+		return E([], [head, tiles, hw, accSec, lsSec, upSec, jobSec, infoSec, actions, errSec]);
 	},
 
 	render: function(data) {

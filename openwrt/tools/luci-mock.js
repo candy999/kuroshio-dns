@@ -89,15 +89,46 @@ const STATUS = {
         { proto: 'dot', bind: '::', port: 853, ok: false, tls: true, error: 'DoT 監聽 [::]:853 失敗: Address family not supported by protocol (os error 97)' },
         { proto: 'doh', bind: '0.0.0.0', port: 8443, ok: true, tls: true, error: null }]
 };
-const API = { '/api/community/peers': () => [], '/api/community/events': () => [], '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS };
+// 連線來源（規格 08）：群組用版控裡的台灣 IP 資料，模式與名單跟著 UCI；?ip= 用簡化的判斷（只給畫面用）
+const TWIP = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'geo', 'tw-ip.json'), 'utf-8'));
+const ACCESS = query => {
+    const a = uci.kuroshio.access || {}, list = v => [].concat(v === undefined ? [] : v).filter(x => x !== '');
+    const mode = a.mode || 'taiwan', sel = a.groups === undefined ? ['*'] : list(a.groups);
+    const applyTo = a.apply_to === undefined ? ['dot', 'doh', 'doq', 'doh3', 'site'] : list(a.apply_to);
+    const ip = new URLSearchParams(query || '').get('ip');
+    if (ip) {
+        const inList = l => list(l).find(c => ip.startsWith(c.split('/')[0].replace(/\.0$/, '').replace(/::$/, ':')));
+        let allowed = false, reason = '不在允許的網段';
+        if (inList(a.deny)) reason = '自訂封鎖 ' + inList(a.deny);
+        else if (/^(10|192\.168|127)\./.test(ip)) { allowed = true; reason = '私有 / 區網位址（永遠允許）'; }
+        else if (inList(a.allow)) { allowed = true; reason = '自訂允許 ' + inList(a.allow); }
+        else if (mode === 'open') { allowed = true; reason = '全開放模式'; }
+        else if (/^168\.95\./.test(ip) && (mode === 'taiwan' || sel.includes('*') || sel.includes('cht'))) { allowed = true; reason = '台灣網段：中華電信（HiNet、行動上網）'; }
+        return { ip, allowed, reason, mode, applyTo };
+    }
+    const groups = TWIP.groups.map(g => ({ id: g.id, name: g.name, note: g.note, asns: g.asns, size: g.size, cidrs: { v4: g.v4.length, v6: g.v6.length },
+        enabled: mode !== 'open' && (mode === 'taiwan' || sel.includes('*') || sel.includes(g.id)), checked: sel.includes('*') || sel.includes(g.id) }));
+    return { mode, applyTo, active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt, ranges: 1003, memoryBytes: 16048, dataBytes: 21312,
+        denied: { total: 57, byListener: { dot: 40, doh: 17, doq: 0, doh3: 0, site: 0, community: 0, plain: 0 } },
+        topDenied: [{ net: '45.135.232.0/24', count: 31 }, { net: '2a06:4880:1000::/48', count: 26 }],
+        groups, selected: sel, allow: list(a.allow), deny: list(a.deny), log: a.log !== '0', autoUpdate: a.auto_update === '1', dataSource: '/usr/share/kuroshio/geo/tw-ip.json', total: TWIP.total };
+};
+STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt,
+    ranges: 1003, memoryBytes: 16048, dataBytes: 21312, denied: { total: 57, byListener: { dot: 40, doh: 17 } }, topDenied: [] };
+const API = { '/api/access': ACCESS, '/api/community/peers': () => [], '/api/community/events': () => [], '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS };
 let defaults = null;
 try { defaults = JSON.parse(execFileSync(BIN, ['defaults', '--json'], { encoding: 'utf-8' })); } catch (e) { console.log('（沒有 kuroshio 執行檔：預設值提示不顯示）'); }
 
 function kuroshio(method, args) {
-    const wrap = p => (DOWN ? { ok: false, error: '服務沒有回應（可能尚未啟動）' } : (API[p] ? { ok: true, result: API[p]() } : { ok: true, result: {} }));
+    const wrap = (p, q) => (DOWN ? { ok: false, error: '服務沒有回應（可能尚未啟動）' } : (API[p] ? { ok: true, result: API[p](q) } : { ok: true, result: {} }));
     switch (method) {
     case 'status': return DOWN ? { running: false } : { running: true, api: wrap('/api/status') };
-    case 'api': return wrap(args.path);
+    case 'api': return wrap(args.path, args.query);
+    // kuroshio dnr --uci --lan …（DNR=fail：模擬條件不符）
+    case 'dnr': return process.env.DNR === 'fail' ? { ok: false, reason: '憑證 /etc/kuroshio/cert.pem：沒有涵蓋 dns.example.com', adn: 'dns.example.com', dhcpv4: null, odhcpd: [], protocols: [] }
+        : { ok: true, reason: null, adn: 'dns.example.com', dhcpv4: '00:2b', odhcpd: [], protocols: [
+            { priority: 1, alpn: ['h2', 'h3'], port: 8443, dohpath: '/dns-query{?dns}', addrs: ['192.168.1.1', 'fd12:3456::1'] },
+            { priority: 2, alpn: ['dot'], port: 853, dohpath: null, addrs: ['192.168.1.1'] }] };
     case 'action': return args.path === '/api/ddns/update' ? wrap('/api/ddns') : { ok: true, result: { ok: true } };
     case 'defaults': return { result: defaults };
     case 'about': return { core: { name: '黑潮 DNS', version: '3.0.0-alpha.2', language: 'Rust', target: 'mock', features: ['doh', 'dot'], license: 'GPL-3.0-or-later', licenseUrl: 'https://www.gnu.org/licenses/gpl-3.0.html', source: 'https://github.com/candy999/kuroshio-dns' }, ui: '3.0.0_alpha2-r1' };

@@ -30,6 +30,14 @@
 			}
 		}
 	},
+	"admin/services/kuroshio/access": {
+		"title": "連線來源",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/access"
+		}
+	},
 	"admin/services/kuroshio/filter": {
 		"title": "廣告過濾",
 		"order": 30,
