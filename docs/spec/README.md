@@ -13,6 +13,7 @@
 | [05-resources.md](05-resources.md) | 資源預算：硬體等級、最低需求、記憶體、Flash 寫入、CPU |
 | [06-optimizations.md](06-optimizations.md) | 體驗優化：命中率、回台灣機率、速度（含量測方式） |
 | [07-windows.md](07-windows.md) | Windows 版：cmd / 服務、跟 IIS 共用 443（HTTP.sys / 反向代理）、DoH3、憑證、權限、攜帶版 |
+| [08-access.md](08-access.md) | 來源 IP 存取控制：只開放台灣（依 ISP 勾選）、自訂允許 / 封鎖、OpenWrt 核心層丟棄 |
 
 ## 目標
 

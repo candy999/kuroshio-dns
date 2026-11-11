@@ -49,6 +49,14 @@ DNSCrypt 不支援：採用的伺服器少，而且都同時提供 DoH / DoT。
 - 每則訊息都有 Ed25519 簽名，收到的資料一定在本機驗證後才使用；只分享網域雜湊，不公開網站名稱。
 - 增量同步、自動規則（電信業者、延遲、共同好友…）、資料品質評分、封鎖與拒絕。
 
+### 只開放台灣（來源 IP 存取控制）
+- **預設只讓台灣的 IP 連進 DoH / DoT / DoQ / DoH3 與公開頁**：依 ISP 分組（中華電信、台灣大、遠傳、亞太、台灣之星、凱擘、中嘉、台灣寬頻、其他有線寬頻、TANet、政府網路、其他台灣網段），可以只勾其中幾家，或切成「全開放」。
+- 自訂允許 / 封鎖的 IP 或網段（封鎖勝過一切）；區網、私有位址、本機網段、社群好友目前的 IP 永遠允許。
+- 擋在最前面：TCP 在 accept 時就關閉（不做 TLS 握手），QUIC 在握手前就忽略；OpenWrt 另外產生 nftables 集合，在核心層就丟掉 WAN 來的封包。
+- 台灣 IP 清單 `data/geo/tw-ip.json` 由 RIR 配發資料（cc=TW）與各 ISP 的 BGP 宣告產生，GitHub Actions 每月更新；也可以開 `access.autoUpdate` 每天自動下載。
+- **這是 3.0 的行為改變**：沒有 `access` 設定的舊設定檔也會套用「只開放台灣」。人在國外、漫遊、用 VPN 的親友會連不上，請改成 `access.mode = "open"` 或把他們的 IP 加進 `access.allow`。
+- 限制：應用層過濾擋不了塞滿對外頻寬的流量型 DDoS（那要靠 ISP 或 Cloudflare 之類的服務）；行動網路的網段常變動，所以每月更新。詳見 [規格 08](docs/spec/08-access.md)。
+
 ### 系統整合
 - **OpenWrt**：五種 DNS 接管方式（不接管、dnsmasq 上游、重定向、積極劫持、取代 dnsmasq），IPv4 / IPv6 分開處理並自動建立 ULA；停用時自動還原。
 - **Windows**：Windows 服務、本機設定頁、一鍵設定網卡 DNS 與防火牆。
@@ -144,6 +152,8 @@ kuroshio sysinfo [-c 設定檔]       偵測到的硬體、等級，以及因為
 kuroshio query <網域> [-t 類型] [-s 伺服器]   查詢（診斷用，類似 dig）
 kuroshio export [--share] [-o 檔案]   匯出學習資料（.kuroshio）
 kuroshio import <檔案>              匯入（合併）
+kuroshio access check <IP>        這個 IP 能不能連進來、符合哪一條規則
+kuroshio access groups            台灣 IP 群組（ISP）、大小、是否生效
 ```
 
 ## 備份、換機與分享學習資料
