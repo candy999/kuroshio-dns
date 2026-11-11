@@ -505,7 +505,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.waitForFunction(() => /上游有回應|失敗/.test(document.querySelector('#tool-trace .verdict').textContent), null, { timeout: 15000 }).catch(() => {});
         check(/上游有回應/.test(await page.textContent('#tool-trace .verdict')) && /"upstreams"/.test(await page.textContent('#tool-trace pre')), '追蹤網域', await page.textContent('#tool-trace .verdict'));
         await page.waitForSelector('#tool-jobs button[data-job]');
-        check(await page.locator('#tool-jobs button[data-job]').count() === 4, '排程工作列表');
+        check(await page.locator('#tool-jobs button[data-job]').count() === 5, '排程工作列表');
+        check(/台灣 IP 清單/.test(await page.textContent('#tool-jobs table')) && /每月 1 日起（每台錯開）/.test(await page.textContent('#tool-jobs table')), '排程工作：台灣 IP 清單每月、每台錯開');
         await page.click('#tool-jobs button[data-job="cdn-ranges"]');
         await page.waitForFunction(() => /已排入|沒有排入|失敗/.test(document.querySelector('#tool-jobs .verdict').textContent), null, { timeout: 10000 }).catch(() => {});
         // CDN 關閉時 CDN 的工作沒有註冊：要顯示原因，不能當成成功

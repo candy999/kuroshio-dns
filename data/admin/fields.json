@@ -164,8 +164,7 @@
         {
           "title": "台灣 IP 資料",
           "fields": [
-            { "key": "access.autoUpdate", "type": "bool", "label": "自動更新台灣 IP 資料", "help": "每天下載一次本專案發布的新資料（業者合併、網段變動）。格式正確、比目前的新、大小差不多才換上；不開的話跟著程式升級更新。" },
-            { "key": "access.updateUrl", "type": "text", "label": "更新來源網址", "pro": true, "pattern": "^https://\\S+$", "patternMsg": "請輸入 https:// 開頭的網址" },
+            { "key": "access.autoUpdate", "type": "bool", "label": "每月在本機重新產生台灣 IP 資料", "help": "排程工作「台灣 IP 清單」：每月一次（每台電腦錯開時間），慢慢向 RIR 與 RIPEstat 的公開資料查詢，在本機算出新的清單；不連本專案的任何伺服器。資源不夠會暫停稍後續跑，失敗就繼續用目前的清單。不開的話只用程式附帶的公版（跟著程式升級更新）。" },
             { "key": "access.dataFile", "type": "path", "label": "指定資料檔", "help": "空白 = 程式附帶的 geo\\tw-ip.json。", "pro": true }
           ]
         },

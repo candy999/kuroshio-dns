@@ -172,7 +172,7 @@ return view.extend({
 			var rows = [
 				[_('開放對象'), T('span', {}, (MODE[acc.mode] || acc.mode || '-') + (acc.mode === 'custom' && groups.length ? _('（開放 %d / %d 組）').format(on.length, groups.length) : ''))],
 				[_('套用在'), T('span', {}, [].concat(acc.applyTo || []).map(function(k) { return KIND[k] || k; }).join('、') || _('（沒有，不限制）'))],
-				[_('台灣 IP 資料'), acc.generatedAt ? E('span', {}, [T('span', {}, _('%s 的資料').format(acc.generatedAt) + ' '), acc.autoUpdate ? common.badge(_('每天自動更新'), 'ok') : common.badge(_('跟著套件升級更新'), 'off')])
+				[_('台灣 IP 資料'), acc.generatedAt ? E('span', {}, [T('span', {}, _('%s 的資料').format(acc.generatedAt) + '（' + (acc.dataOrigin || _('公版')) + '） '), acc.autoUpdate ? common.badge(_('每月在本機更新'), 'ok') : common.badge(_('跟著套件升級更新'), 'off'), T('span', {}, acc.update && acc.update.text ? ' ' + acc.update.text : '')])
 					: common.badge(_('讀不到'), 'err')],
 				[_('已拒絕'), T('span', {}, _('%s 次').format(fmtNum(dn.total)) + (dn.total ? '（' + Object.keys(by).filter(function(k) { return by[k]; }).map(function(k) { return (KIND[k] || k) + ' ' + fmtNum(by[k]); }).join('、') + '）' : ''))]
 			];
@@ -272,14 +272,11 @@ return view.extend({
 
 		// ---------------- 台灣 IP 資料、套用範圍 ----------------
 		s = m.section(form.NamedSection, 'access', 'access', _('台灣 IP 資料'));
-		o = s.option(form.Flag, 'auto_update', _('自動更新台灣 IP 資料'),
-			_('每天下載一次本專案發布的新資料（業者合併、網段變動）。格式正確、比目前的新、大小差不多才換上，存檔受 Flash 寫入限制。不開的話跟著套件升級更新。'));
-		o.default = '0';
+		o = s.option(form.Flag, 'auto_update', _('每月在本機重新產生台灣 IP 資料'),
+			_('排程工作「台灣 IP 清單」：每月一次（每台路由器錯開時間），慢慢向 RIR 與 RIPEstat 的公開資料查詢，在路由器上算出新的清單；不連本專案的任何伺服器。記憶體或 CPU 不夠會暫停稍後續跑，失敗就繼續用目前的清單；內容有變才寫入 Flash（約每月一次）。不開的話跟著套件升級更新。'));
+		o.default = '1';
 		o.rmempty = false;
 		if (pro) {
-			o = s.option(form.Value, 'update_url', _('更新來源網址'));
-			o.placeholder = common.def('access.updateUrl') || '';
-			o.validate = function(sid, v) { return !v || /^https:\/\/\S+$/.test(v) || _('請輸入 https:// 開頭的網址'); };
 			o = s.option(form.Value, 'data_file', _('指定資料檔'), _('空白 = 套件附帶的 /usr/share/kuroshio/geo/tw-ip.json。'));
 			o.validate = function(sid, v) { return !v || /^\/\S*$/.test(v) || _('請輸入完整路徑（/ 開頭，不能有空白）'); };
 

@@ -1203,7 +1203,7 @@
 		var rows = [
 			['開放對象', modeText],
 			['套用在', [].concat(a.applyTo || []).map(function (k) { return ACCESS_KIND[k] || k; }).join('、') || '（沒有，不限制）'],
-			['台灣 IP 資料', a.generatedAt ? el('span', {}, [a.generatedAt + ' 的資料 ', a.autoUpdate ? badge('每天自動更新', 'ok') : badge('跟著程式升級更新', 'off')])
+			['台灣 IP 資料', a.generatedAt ? el('span', {}, [a.generatedAt + ' 的資料（' + (a.dataOrigin || '公版') + '） ', a.autoUpdate ? badge('每月在本機更新', 'ok') : badge('跟著程式升級更新', 'off'), a.update && a.update.text ? ' ' + a.update.text : ''])
 				: badge('讀不到', 'err')],
 			['已拒絕', fmtNum(dn.total) + ' 次' + (dn.total ? '（' + Object.keys(by).filter(function (k) { return by[k]; }).map(function (k) { return (ACCESS_KIND[k] || k) + ' ' + fmtNum(by[k]); }).join('、') + '）' : '')]
 		];
@@ -1695,7 +1695,7 @@
 
 	// ---------------------------------------------------------------- 工具分頁
 	var toolsBuilt = false;
-	var JOBS = { 'dns-benchmark': 'DNS 評測', 'cdn-ranges': 'CDN IP 範圍', 'cdn-scan': 'CDN 網段分類', 'cdn-pool': '台灣節點池' };
+	var JOBS = { 'dns-benchmark': 'DNS 評測', 'cdn-ranges': 'CDN IP 範圍', 'cdn-scan': 'CDN 網段分類', 'cdn-pool': '台灣節點池', 'tw-ip': '台灣 IP 清單' };
 	var QTYPES = ['A', 'AAAA', 'HTTPS', 'CNAME', 'MX', 'TXT', 'NS', 'SOA', 'SRV'];
 
 	function toolCard(id, title, desc, wide) {
@@ -1908,7 +1908,7 @@
 				jc.show(r.ok ? '排程器沒有啟動' : '讀取失敗：' + errText(r), 'warn');
 				return;
 			}
-			var j = r.data, cfg = j.config || {}, state = j.state || {}, next = j.nextRun || {};
+			var j = r.data, cfg = j.config || {}, state = j.state || {}, next = j.nextRun || {}, detail = j.detail || {};
 			var running = j.running && j.running.name;
 			var queue = (j.queue || []).map(function (q) { return q.name || q; });
 			tableRows(tb, Object.keys(cfg).map(function (n) {
@@ -1924,8 +1924,10 @@
 						setTimeout(refreshJobs, 800);
 					});
 				});
-				var sched = [].concat(c.at || []).join(', ') + (c.weekdays ? '（' + [].concat(c.weekdays).map(function (w) { return '週' + ('日一二三四五六'.charAt(+w) || w); }).join('、') + '）' : '') + (c.enabled === false ? ' 已停用' : '');
+				var sched = (c.monthDays ? '每月 ' + [].concat(c.monthDays).join('、') + ' 日' + (c.jitterDays ? '起（每台錯開）' : '') + ' ' : '') + [].concat(c.at || []).join(', ') + (c.weekdays ? '（' + [].concat(c.weekdays).map(function (w) { return '週' + ('日一二三四五六'.charAt(+w) || w); }).join('、') + '）' : '') + (c.enabled === false ? ' 已停用' : '');
 				var res = running === n ? '執行中…' : queue.indexOf(n) >= 0 ? '排隊中' : s.lastCode === 0 ? '成功' : s.lastCode == null ? '-' : '失敗（' + s.lastCode + '）';
+				// 有自己進度的工作（台灣 IP 清單）：顯示進度、暫停原因、上次結果
+				if (detail[n] && detail[n].text) res = detail[n].text;
 				return [JOBS[n] || n, sched, fmtTime(next[n]), fmtTime(s.lastEnd), res, b];
 			}), 6);
 		});

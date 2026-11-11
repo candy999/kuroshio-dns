@@ -16,7 +16,7 @@ var MODES = {
 	'hijack': _('積極劫持'),
 	'exchange': _('取代 dnsmasq（53 埠）')
 };
-var JOBS = { 'dns-benchmark': _('DNS 評測'), 'cdn-ranges': _('CDN IP 範圍'), 'cdn-scan': _('CDN 網段分類'), 'cdn-pool': _('台灣節點池') };
+var JOBS = { 'dns-benchmark': _('DNS 評測'), 'cdn-ranges': _('CDN IP 範圍'), 'cdn-scan': _('CDN 網段分類'), 'cdn-pool': _('台灣節點池'), 'tw-ip': _('台灣 IP 清單') };
 
 function fmtNum(n) { return (n == null) ? '-' : Number(n).toLocaleString(); }
 function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
@@ -186,9 +186,9 @@ return view.extend({
 			var running = jobs.running && jobs.running.name === n;
 			return [
 				JOBS[n] || n,
-				[].concat(c.at || []).join(', ') + (c.weekdays ? ' (' + c.weekdays.join(',') + ')' : '') + (c.enabled === false ? ' ' + _('已停用') : ''),
+				(c.monthDays ? _('每月 %s 日').format([].concat(c.monthDays).join(',')) + (c.jitterDays ? _('起（每台錯開）') : '') + ' ' : '') + [].concat(c.at || []).join(', ') + (c.weekdays ? ' (' + c.weekdays.join(',') + ')' : '') + (c.enabled === false ? ' ' + _('已停用') : ''),
 				running ? _('執行中…') : fmtTime(s.lastEnd),
-				s.lastCode === 0 ? _('成功') : (s.lastCode == null ? '-' : _('失敗（%s）').format(s.lastCode)),
+				(jobs.detail && jobs.detail[n] && jobs.detail[n].text) || (s.lastCode === 0 ? _('成功') : (s.lastCode == null ? '-' : _('失敗（%s）').format(s.lastCode))),
 				E('button', { 'class': 'btn cbi-button', 'disabled': running ? '' : null, 'click': ui.createHandlerFn(self, 'runJob', n) }, _('立即執行'))
 			];
 		});
