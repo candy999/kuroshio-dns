@@ -1032,6 +1032,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_step_keeps_hot_and_caps_growth_until_restored() {
+        use crate::cache::Entry;
+        use kuroshio_proto::message::Record;
+        let cfg = kuroshio_config::with_overrides(&json!({ "resolver": { "cacheMax": 2000, "lastResort": [], "rankIps": false } }));
+        let r = crate::app::build_resolver(&cfg).unwrap();
+        let now = std::time::Instant::now();
+        let entry = |n: &str| {
+            Entry::new(
+                0,
+                vec![Record::a(n, 600, std::net::Ipv4Addr::new(192, 0, 2, 1))],
+                vec![],
+                kuroshio_proto::logic::Class::Ok,
+                "up".into(),
+                600,
+                false,
+                None,
+            )
+        };
+        {
+            let mut c = r.cache.lock().unwrap();
+            for i in 0..2000 {
+                c.insert(format!("1|n{i}.example"), entry(&format!("n{i}.example")), now);
+            }
+            for _ in 0..8 {
+                c.get("1|n7.example", now);
+            }
+        }
+        let s = CacheStep::new(r.clone());
+        let o = s.shed(&Reading::default()).await.unwrap();
+        assert!(o.bytes > 0);
+        {
+            let c = r.cache.lock().unwrap();
+            assert_eq!((c.len(), c.max), (500, 500));
+            assert!(c.peek("1|n7.example").is_some(), "熱門的留著");
+        }
+        assert!(!s.can_shed() && s.is_shed());
+        // 釋出期間不會長回去（超過上限就清掃）
+        {
+            let mut c = r.cache.lock().unwrap();
+            for i in 0..2000 {
+                c.insert(format!("1|m{i}.example"), entry(&format!("m{i}.example")), now);
+            }
+            assert!(c.len() <= 550, "{}", c.len());
+        }
+        s.restore().await.unwrap();
+        assert_eq!(r.cache.lock().unwrap().max, 2000, "恢復上限，之後自然長回來");
+        assert!(s.can_shed());
+    }
+
+    #[tokio::test]
     async fn restore_failure_backs_off() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let f = Fake::new("filter", State::Critical, 1, 0, &log);

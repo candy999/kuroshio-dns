@@ -114,6 +114,12 @@ async fn lists_custom_priority_and_reload() {
         .await
         .body;
     assert_eq!(st["filter"]["lists"], 4);
+    // 記憶體控制（規格 09）：預設開啟，large 等級的預算依實體記憶體
+    assert_eq!(st["memory"]["enabled"], true);
+    assert!(st["memory"]["budgetKB"].as_u64().unwrap() >= 8 * 1024);
+    assert!(st["memory"]["shed"].as_array().unwrap().is_empty());
+    assert_eq!(st["system"]["memory"]["state"], st["memory"]["state"]);
+    assert_eq!(st["filter"]["notice"], serde_json::Value::Null);
     // 沒有固定字串的規則超過上限：不載入，但統計看得到（不會默默丟掉）
     assert_eq!(st["filter"]["unindexed"], 1);
     assert_eq!(st["filter"]["unindexedDropped"], 1);

@@ -116,7 +116,7 @@ pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
 
 #[cfg(windows)]
 mod win {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -125,7 +125,7 @@ mod win {
         unsafe {
             let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
             c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-            if GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
                 Some(c.WorkingSetSize as u64)
             } else {
                 None

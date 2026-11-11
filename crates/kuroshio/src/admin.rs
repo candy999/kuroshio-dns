@@ -577,6 +577,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "cdn": r.cdn().map(|c| c.status_lite()),
                 "jobs": st.scheduler.as_ref().map(|s| s.status()),
                 "system": st.system_json(),
+                // 記憶體控制（規格 09）：狀態、預算、釋出中的項目（system.memory 是同一份）
+                "memory": st.memory_json(),
                 "listeners": {
                     "doh": st.encrypted.doh.map(|a| a.port()), "doh3": st.encrypted.doh3.map(|a| a.port()),
                     "dot": st.encrypted.dot.map(|a| a.port()), "doq": st.encrypted.doq.map(|a| a.port()),
