@@ -81,6 +81,15 @@ pub fn rss_bytes() -> Option<u64> {
     }
 }
 
+/// 把配置器手上空著的記憶體還給系統（記憶體控制釋出之後呼叫）。只有 glibc 需要（musl 釋放大塊時會直接還）
+pub fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim 只整理配置器自己的空閒區塊
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// 系統實體記憶體與可用記憶體（bytes）。Linux：/proc/meminfo；Windows：GlobalMemoryStatusEx
 pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
     #[cfg(windows)]

@@ -75,7 +75,7 @@ impl Reading {
         }
     }
 
-    fn avail_pct(&self) -> Option<u64> {
+    pub fn avail_pct(&self) -> Option<u64> {
         match (self.total, self.avail) {
             (Some(t), Some(a)) if t > 0 => Some(a * 100 / t),
             _ => None,
@@ -252,6 +252,10 @@ pub trait Step: Send + Sync {
     }
     /// 還能再釋出
     fn can_shed(&self) -> bool;
+    /// 依這次的量測，這一步現在該不該做（預設：該）。過濾清單只在「系統」真的不足時才停用
+    fn wanted(&self, _r: &Reading, _t: &Thresholds) -> bool {
+        true
+    }
     /// 目前有釋出中的東西（要恢復）
     fn is_shed(&self) -> bool;
     /// 恢復下一個項目估計要多少記憶體
@@ -395,7 +399,7 @@ impl Governor {
                 } else {
                     self.steps
                         .iter()
-                        .position(|s| state >= s.min_state() && s.can_shed())
+                        .position(|s| state >= s.min_state() && s.can_shed() && s.wanted(&r, &self.t))
                         .map(Plan::Shed)
                 }
             } else if now.saturating_sub(i.hyst.changed_at) >= self.t.dwell && now >= i.next_restore_at {
@@ -431,6 +435,8 @@ impl Governor {
                 let mut g = self.inner.lock().unwrap();
                 let i = &mut *g;
                 i.next_shed_at = now + self.gap;
+                // 把釋出的記憶體還給系統（glibc 不會自己還；musl 大塊會直接還）
+                sysinfo::trim_heap();
                 match res {
                     Ok(o) => {
                         warn!("記憶體控制：{}（約 {} KB）{}", s.label(), o.bytes / 1024, o.detail);
@@ -721,6 +727,11 @@ impl Step for FilterStep {
     fn can_shed(&self) -> bool {
         self.filter.next_shed_bytes().is_some()
     }
+    /// 只有系統可用記憶體真的不足（< 8%）才停用；只是自己的常駐記憶體超過預算、系統還有空間時，
+    /// 不拿保護去換（前面幾步已經釋出能釋出的）。量不到系統記憶體時才看預算
+    fn wanted(&self, r: &Reading, t: &Thresholds) -> bool {
+        r.avail_pct().map_or(true, |p| p < t.crit_avail_pct)
+    }
     fn is_shed(&self) -> bool {
         !self.filter.unloaded().is_empty()
     }
@@ -905,6 +916,10 @@ mod tests {
         fn can_shed(&self) -> bool {
             self.shed_n.load(Ordering::Relaxed) < self.units
         }
+        /// 跟 FilterStep 一樣：「不足」才做的步驟只在系統真的不足時做
+        fn wanted(&self, r: &Reading, t: &Thresholds) -> bool {
+            self.min < State::Critical || r.avail_pct().map_or(true, |p| p < t.crit_avail_pct)
+        }
         fn is_shed(&self) -> bool {
             self.shed_n.load(Ordering::Relaxed) > 0
         }
@@ -954,6 +969,13 @@ mod tests {
             now += 30;
         }
         assert_eq!(*log.lock().unwrap(), ["shed:diagnostics", "shed:cache", "shed:cdn"]);
+        // 只是 RSS 超過預算 1.2 倍（不足），系統還有很多可用記憶體：過濾清單不動
+        for _ in 0..4 {
+            g.tick(rd(600, 130), now).await;
+            now += 30;
+        }
+        assert_eq!(g.state(), State::Critical);
+        assert_eq!(log.lock().unwrap().len(), 3, "系統不缺記憶體時不拿保護換");
         // 不足：過濾清單一次停用一份，停完就沒有了
         for _ in 0..4 {
             g.tick(rd(70, 50), now).await;
