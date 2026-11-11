@@ -144,7 +144,8 @@ pub async fn get_status(
         headers: headers.to_vec(),
         body: None,
     };
-    if let Outcome::Done { status, .. } = stream(url, &r, &Validators::default(), max, timeout, true, None, Some(&mut st), on_chunk).await? {
+    if let Outcome::Done { status, .. } = stream(url, &r, &Validators::default(), max, timeout, true, None, Some(&mut st), on_chunk).await?
+    {
         st.code = status;
     }
     Ok(st)

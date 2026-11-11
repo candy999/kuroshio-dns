@@ -642,13 +642,13 @@ fn access_cmd(cmd: AccessCmd) -> Result<()> {
         }
     };
     let (cfg, ..) = effective(&config, uci)?;
-    // 自動更新下載的資料：快照目錄（Flash）與執行期目錄（記憶體）取比較新的
+    // 本機產生的資料：快照目錄（Flash，壓縮的 .zst 或一般 JSON）與執行期目錄（記憶體）取比較新的
     let saved = [
         kuroshio::app::persist_dir(&cfg).join(kuroshio::ipfilter::STATE_FILE),
         kuroshio::app::runtime_dir(&cfg).join(kuroshio::ipfilter::STATE_FILE),
     ]
     .iter()
-    .filter_map(|p| std::fs::read(p).ok())
+    .filter_map(|p| kuroshio_cdn::statefile::load(p).map(|l| l.data))
     .filter_map(|b| kuroshio_jobs::geo::TwIp::parse(&b).ok().map(|t| (t.generated_at, b)))
     .max_by(|a, b| a.0.cmp(&b.0))
     .map(|(_, b)| b);

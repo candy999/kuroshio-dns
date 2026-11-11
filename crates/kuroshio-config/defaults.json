@@ -91,8 +91,7 @@
       "site"
     ],
     "log": true,
-    "autoUpdate": false,
-    "updateUrl": "https://raw.githubusercontent.com/candy999/kuroshio-dns/main/data/geo/tw-ip.json",
+    "autoUpdate": true,
     "dataFile": ""
   },
   "site": {
@@ -433,6 +432,27 @@
       "runIfMissing": "state/cdn/pools.json",
       "startDelaySec": 120,
       "timeoutMin": 60
+    },
+    "tw-ip": {
+      "enabled": true,
+      "at": "00:50",
+      "monthDays": [
+        1
+      ],
+      "jitterDays": 27,
+      "jitterMin": 180,
+      "startDelaySec": 900,
+      "timeoutMin": 120,
+      "minAgeDays": 20,
+      "pauseSec": [
+        5,
+        30
+      ],
+      "retrySec": 300,
+      "deadlineHours": 72,
+      "maxFailures": 6,
+      "maxMemKB": 2048,
+      "maxLoadPerCore": 2
     }
   },
   "benchmark": {

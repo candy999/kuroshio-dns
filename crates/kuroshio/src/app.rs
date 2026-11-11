@@ -604,12 +604,13 @@ pub fn runtime_dir(cfg: &Value) -> PathBuf {
     }
 }
 
-/// 排程器：每日上游評測、CDN 範圍 / 網段分類（每週）、台灣節點池（每日）
+/// 排程器：每日上游評測、CDN 範圍 / 網段分類（每週）、台灣節點池（每日）、台灣 IP 清單（每月）
 fn start_scheduler(
     cfg: &Value,
     persister: &Arc<Mutex<Persister>>,
     base_dir: &std::path::Path,
     cdn: Option<&Arc<kuroshio_cdn::Cdn>>,
+    access: Option<&Arc<crate::ipfilter::Access>>,
 ) -> Arc<kuroshio_jobs::Scheduler> {
     use kuroshio_jobs::{BenchPaths, Benchmark, Options, Scheduler, JOBS_STATE_FILE};
     let state_dir = persist_dir(cfg);
@@ -625,7 +626,14 @@ fn start_scheduler(
         }
     }));
     let saved = persister.lock().unwrap().load(JOBS_STATE_FILE);
-    let sched = Arc::new(Scheduler::new(cfg.clone(), saved.as_deref(), o));
+    let mut scfg = cfg.clone();
+    // 舊的 access.autoUpdate=false 也關掉台灣 IP 清單的每月工作（排程清單裡顯示「已停用」）
+    if access.map(|a| !a.settings.auto_update).unwrap_or(false) {
+        if let Some(j) = scfg.pointer_mut("/jobs/tw-ip").and_then(Value::as_object_mut) {
+            j.insert("enabled".into(), json!(false));
+        }
+    }
+    let sched = Arc::new(Scheduler::new(scfg, saved.as_deref(), o));
     let _ = slot.set(Arc::downgrade(&sched));
     let mut paths = BenchPaths::from_config(cfg, &state_dir, base_dir);
     let shipped = share_dir(cfg).join("benchmark");
@@ -643,8 +651,47 @@ fn start_scheduler(
     if let Some(cdn) = cdn {
         register_cdn_jobs(&sched, cdn);
     }
+    if let Some(a) = access {
+        register_twip_job(&sched, a, persister, runtime_dir(cfg));
+    }
     sched.start();
     sched
+}
+
+/// 背景工作用的記憶體檢查：吃緊時回傳原因。記憶體控制改版時只要改這裡
+pub fn job_memory_short() -> Option<String> {
+    match pressure() {
+        Pressure::Normal => None,
+        Pressure::Low => Some("記憶體偏低".into()),
+        Pressure::Critical => Some("記憶體不足".into()),
+    }
+}
+
+/// 台灣 IP 清單（規格 08）：每月在本機慢慢重新產生，不連任何專案伺服器。
+/// 成功後換上規則、經快照寫入器壓縮存檔（內容沒變不寫）、通知防火牆
+fn register_twip_job(
+    sched: &Arc<kuroshio_jobs::Scheduler>,
+    access: &Arc<crate::ipfilter::Access>,
+    persister: &Arc<Mutex<Persister>>,
+    runtime: PathBuf,
+) {
+    use kuroshio_jobs::twip::{system_load, Hooks, Sources, TwIpJob};
+    let (a1, a2, p2) = (access.clone(), access.clone(), persister.clone());
+    let hooks = Hooks {
+        current: Arc::new(move || a1.data_and_origin()),
+        memory_short: Arc::new(job_memory_short),
+        load: Arc::new(system_load),
+        install: Arc::new(move |t, bytes: Vec<u8>| {
+            a2.set_data(t, crate::ipfilter::LOCAL_SOURCE);
+            p2.lock().unwrap().stage(crate::ipfilter::STATE_FILE, bytes.clone());
+            tokio::spawn(crate::ipfilter::after_update(runtime.clone(), bytes));
+            Ok(())
+        }),
+    };
+    let job = TwIpJob::new(Sources::default(), hooks);
+    let j2 = job.clone();
+    access.set_update_status(Arc::new(move || j2.status_json()));
+    sched.register("tw-ip", job);
 }
 
 /// CDN 的三個背景工作（同 2.x `jobs/cdn-*.js`，但在同一個行程裡跑，直接更新記憶體裡的狀態）
@@ -1193,10 +1240,10 @@ fn bytes_source(f: impl Fn() -> Vec<(String, Vec<u8>)> + Send + Sync + 'static) 
     Arc::new(move || f().into_iter().map(|(n, b)| (n, Snapshot::Bytes(b), Opts::default())).collect())
 }
 
-/// 哪些狀態檔壓縮成 `.zst`：CDN 的檔（網域分片、節點池、IPv6 節點、候選 IP、網段分類）。
+/// 哪些狀態檔壓縮成 `.zst`：CDN 的檔（網域分片、節點池、IPv6 節點、候選 IP、網段分類）與本機產生的台灣 IP 清單。
 /// 分片清單很小、方便人看，維持一般 JSON
 pub fn compressed_file(name: &str) -> bool {
-    name.starts_with("cdn/") && name != kuroshio_cdn::db::MANIFEST
+    (name.starts_with("cdn/") && name != kuroshio_cdn::db::MANIFEST) || name == crate::ipfilter::STATE_FILE
 }
 
 /// CDN：網域資料庫分片寫（規格 05 第 5.3 節）。只登記有變動的分片，內容要寫的那一刻才邊序列化邊寫進檔案；
@@ -1369,7 +1416,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     };
     access.refresh_local_in_background();
     let _ = resolver.access.set(access.clone());
-    crate::ipfilter::spawn_tasks(access, persister.clone(), runtime_dir(cfg));
+    crate::ipfilter::spawn_tasks(access.clone());
     // 統計歷史（公開頁 7 / 30 天）：重開機後接續
     if let Some(b) = persister.lock().unwrap().load(STATS_FILE) {
         resolver.stats.restore(&b);
@@ -1466,7 +1513,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         spawn_monitor(reserve.clone(), memgov.clone());
     }
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
-    let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref()));
+    let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));
     let ddns = crate::ddns::Config::from_cfg(cfg).map(crate::ddns::Ddns::new);
     if let Some(d) = &ddns {
         d.spawn();

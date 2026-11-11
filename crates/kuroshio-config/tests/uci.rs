@@ -380,7 +380,8 @@ fn access_section() {
     assert_eq!(g(&c, "access.applyTo"), &json!(["dot", "plain"]));
     assert_eq!(g(&c, "access.log"), &json!(false));
     assert_eq!(g(&c, "access.autoUpdate"), &json!(true));
-    assert_eq!(g(&c, "access.updateUrl"), g(&defaults(), "access.updateUrl"));
+    // 台灣 IP 清單改在本機每月產生，不再有下載網址
+    assert!(kuroshio_config::get(&c, "access.updateUrl").is_none());
     // option groups '' = 一組都不勾；全開放
     let c = load(
         &(default_text() + "\nconfig access 'access'\n\toption mode 'open'\n\toption groups ''\n"),

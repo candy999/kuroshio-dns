@@ -24,8 +24,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{info, warn};
 
-/// 快照目錄裡自動更新下載的台灣 IP 資料
+/// 快照目錄裡本機產生的台灣 IP 資料（每月排程工作 `tw-ip`，經快照寫入器壓縮存成 `tw-ip.json.zst`）
 pub const STATE_FILE: &str = "tw-ip.json";
+
+/// 本機產生的資料在狀態裡顯示的來源
+pub const LOCAL_SOURCE: &str = "本機產生（tw-ip.json）";
 
 /// 測試用：把迴路位址當成公網位址（只有整合測試會打開；同一個行程裡全部生效）
 #[doc(hidden)]
@@ -101,8 +104,8 @@ pub struct Settings {
     pub deny: Vec<String>,
     pub apply: [bool; 7],
     pub log: bool,
+    /// 每月在本機重新產生台灣 IP 清單（排程工作 `tw-ip`）。舊版的意思是「每天從 GitHub 下載」，現在不連任何專案伺服器
     pub auto_update: bool,
-    pub update_url: String,
     /// 指定資料檔（空白 = 唯讀資料目錄的 geo/tw-ip.json）
     pub data_file: String,
 }
@@ -160,8 +163,7 @@ impl Settings {
             deny: strings(get(cfg, "access.deny")),
             apply,
             log: flag("log", true),
-            auto_update: flag("autoUpdate", false),
-            update_url: s("updateUrl"),
+            auto_update: flag("autoUpdate", true) && get(cfg, "jobs.tw-ip.enabled").and_then(Value::as_bool) != Some(false),
             data_file: s("dataFile"),
         }
     }
@@ -388,6 +390,7 @@ pub struct Access {
     local: RwLock<Dual>,
     friends: RwLock<Dual>,
     denied: Denied,
+    update_status: std::sync::OnceLock<Arc<dyn Fn() -> Value + Send + Sync>>,
 }
 
 impl Access {
@@ -402,7 +405,6 @@ impl Access {
                 apply: [false; 7],
                 log: false,
                 auto_update: false,
-                update_url: String::new(),
                 data_file: String::new(),
             },
             None,
@@ -420,13 +422,20 @@ impl Access {
             local: RwLock::new(Dual::default()),
             friends: RwLock::new(Dual::default()),
             denied: Denied::default(),
+            update_status: std::sync::OnceLock::new(),
         };
         Arc::new(a)
     }
 
-    /// 依設定載入：自動更新下載的（較新的）→ `access.dataFile` → 唯讀資料目錄的 geo/tw-ip.json
+    /// 依設定載入：本機產生的（較新的）→ `access.dataFile` → 唯讀資料目錄的 geo/tw-ip.json（公版）
     pub fn from_cfg(cfg: &Value, share_dir: &Path, persisted: Option<Vec<u8>>) -> Arc<Access> {
         let st = Settings::from_cfg(cfg);
+        if get(cfg, "access.updateUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|u| !u.trim().is_empty())
+        {
+            info!("存取控制：access.updateUrl 已經不用了（台灣 IP 清單改在本機每月重新產生，不從任何伺服器下載），略過");
+        }
         let path = if st.data_file.is_empty() {
             share_dir.join("geo").join("tw-ip.json")
         } else {
@@ -445,7 +454,7 @@ impl Access {
                 let sane = data.as_ref().map(|d| sane_size(d, &t)).unwrap_or(true);
                 if newer && sane {
                     data = Some(Arc::new(t));
-                    source = format!("自動更新（{STATE_FILE}）");
+                    source = LOCAL_SOURCE.to_string();
                     error = None;
                 }
             }
@@ -513,7 +522,7 @@ impl Access {
         }
     }
 
-    /// 換上新的台灣 IP 資料（自動更新）
+    /// 換上新的台灣 IP 資料（本機產生）
     pub fn set_data(&self, t: TwIp, source: &str) {
         *self.data.write().unwrap() = (Some(Arc::new(t)), source.to_string());
         *self.data_error.write().unwrap() = None;
@@ -522,6 +531,17 @@ impl Access {
 
     pub fn data(&self) -> Option<Arc<TwIp>> {
         self.data.read().unwrap().0.clone()
+    }
+
+    /// 目前的資料，以及是不是本機產生的（false = 隨程式附帶的公版或指定的資料檔）
+    pub fn data_and_origin(&self) -> (Option<Arc<TwIp>>, bool) {
+        let d = self.data.read().unwrap();
+        (d.0.clone(), d.1 == LOCAL_SOURCE)
+    }
+
+    /// 排程工作 `tw-ip` 的狀態（`/api/access` 的 `update`）
+    pub fn set_update_status(&self, f: Arc<dyn Fn() -> Value + Send + Sync>) {
+        let _ = self.update_status.set(f);
     }
 
     /// 這個服務要不要檢查來源
@@ -674,6 +694,8 @@ impl Access {
         o.insert("log".into(), json!(self.settings.log));
         o.insert("autoUpdate".into(), json!(self.settings.auto_update));
         o.insert("dataSource".into(), json!(source));
+        o.insert("dataOrigin".into(), json!(if source == LOCAL_SOURCE { "本機產生" } else { "公版" }));
+        o.insert("update".into(), self.update_status.get().map(|f| f()).unwrap_or(Value::Null));
         o.insert("total".into(), data.as_ref().map(|d| d.all().size_json()).unwrap_or(Value::Null));
         o.insert("topDenied".into(), self.top_json(50));
         st
@@ -751,73 +773,27 @@ pub fn request_check(r: &crate::resolver::Resolver, path: &str, doh_path: &str, 
     Some(site_ok)
 }
 
-/// 背景工作：每 10 分鐘重新讀本機網卡的網段；`access.autoUpdate` 開著時每天檢查一次新的台灣 IP 資料
-/// 更新成功後：新資料另外寫一份到執行期目錄（記憶體，不寫 Flash），再執行 `KUROSHIO_ACCESS_HOOK`
-/// （OpenWrt：access.sh apply，重新產生核心層的 nftables 集合）
-pub fn spawn_tasks(a: Arc<Access>, persister: Arc<Mutex<crate::persist::Persister>>, runtime_dir: PathBuf) {
-    if a.settings.mode == Mode::Open && !a.settings.auto_update {
+/// 背景工作：每 10 分鐘重新讀本機網卡的網段。
+/// （台灣 IP 清單的更新是排程工作 `tw-ip`，在本機慢慢產生，見 `kuroshio_jobs::twip`；不從任何伺服器下載）
+pub fn spawn_tasks(a: Arc<Access>) {
+    if a.settings.mode == Mode::Open {
         return;
     }
     tokio::spawn(async move {
-        let mut tick = 0u64;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
-            tick += 1;
             a.refresh_local();
-            // 啟動 10 分鐘後第一次，之後每 24 小時
-            if a.settings.auto_update && tick % 144 == 1 {
-                match fetch_update(&a).await {
-                    Ok(Some((t, bytes))) => {
-                        info!("存取控制：台灣 IP 資料更新到 {}", t.generated_at);
-                        a.set_data(t, &format!("自動更新（{STATE_FILE}）"));
-                        // 經過快照寫入器（跟其他狀態一樣受 Flash 寫入間隔與每日上限限制）
-                        let _ = std::fs::create_dir_all(&runtime_dir);
-                        let _ = crate::persist::write_atomic(&runtime_dir.join(STATE_FILE), &bytes);
-                        persister.lock().unwrap().stage(STATE_FILE, bytes);
-                        if let Some(hook) = std::env::var_os("KUROSHIO_ACCESS_HOOK").filter(|h| !h.is_empty()) {
-                            let _ = tokio::task::spawn_blocking(move || std::process::Command::new(hook).arg("apply").status()).await;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => warn!("存取控制：台灣 IP 資料更新失敗：{e:#}"),
-                }
-            }
         }
     });
 }
 
-/// 下載新的台灣 IP 資料；比目前的新、格式正確、IPv4 總量在 ±20% 以內才接受
-async fn fetch_update(a: &Access) -> anyhow::Result<Option<(TwIp, Vec<u8>)>> {
-    let url = &a.settings.update_url;
-    if url.is_empty() {
-        return Ok(None);
-    }
-    let req = kuroshio_net::fetch::Request {
-        method: "GET",
-        ..Default::default()
-    };
-    let (code, body) = kuroshio_net::fetch::request(url, &req, 4 << 20, std::time::Duration::from_secs(60)).await?;
-    if code != 200 {
-        anyhow::bail!("HTTP {code}");
-    }
-    let t = TwIp::parse(&body)?;
-    Ok(accept_update(a.data().as_deref(), t).map(|t| (t, body)))
-}
-
-/// 自動更新的取捨（純函式）：比目前的新、而且大小合理才換
-pub fn accept_update(cur: Option<&TwIp>, new: TwIp) -> Option<TwIp> {
-    match cur {
-        None => Some(new),
-        Some(c) if new.generated_at <= c.generated_at => None,
-        Some(c) if !sane_size(c, &new) => {
-            warn!(
-                "存取控制：下載的台灣 IP 資料大小跟目前的差超過 20%（{} → {}），不採用",
-                c.all().v4.size(),
-                new.all().v4.size()
-            );
-            None
-        }
-        Some(_) => Some(new),
+/// 排程工作產生的新清單換上之後：執行期目錄（記憶體）放一份給指令列用，再執行 `KUROSHIO_ACCESS_HOOK`
+/// （OpenWrt：access.sh apply，重新產生核心層的 nftables 集合）
+pub async fn after_update(runtime_dir: PathBuf, bytes: Vec<u8>) {
+    let _ = std::fs::create_dir_all(&runtime_dir);
+    let _ = crate::persist::write_atomic(&runtime_dir.join(STATE_FILE), &bytes);
+    if let Some(hook) = std::env::var_os("KUROSHIO_ACCESS_HOOK").filter(|h| !h.is_empty()) {
+        let _ = tokio::task::spawn_blocking(move || std::process::Command::new(hook).arg("apply").status()).await;
     }
 }
 
@@ -948,7 +924,7 @@ pub fn nft_render(cfg: &Value, a: &Access) -> (String, String) {
     (sets, rules)
 }
 
-/// 自動更新的新資料是否合理：IPv4 總量跟目前的差在 ±20% 以內
+/// 本機產生的資料是否合理：IPv4 總量跟目前的差在 ±20% 以內
 pub fn sane_size(old: &TwIp, new: &TwIp) -> bool {
     let (a, b) = (old.all().v4.size() as f64, new.all().v4.size() as f64);
     a > 0.0 && (b - a).abs() <= a * 0.2
@@ -1009,8 +985,11 @@ mod tests {
         assert_eq!(s.groups, vec!["*"]);
         assert!(s.applies(Kind::Dot) && s.applies(Kind::Doh) && s.applies(Kind::Doq) && s.applies(Kind::Doh3) && s.applies(Kind::Site));
         assert!(!s.applies(Kind::Plain) && !s.applies(Kind::Community));
-        assert!(!s.auto_update);
-        assert!(s.update_url.starts_with("https://"));
+        assert!(s.auto_update, "預設每月在本機重新產生");
+        // 舊的鍵：autoUpdate=false 或 jobs.tw-ip.enabled=false 都關掉；updateUrl 不再使用
+        assert!(!Settings::from_cfg(&json!({ "access": { "autoUpdate": false } })).auto_update);
+        assert!(!Settings::from_cfg(&json!({ "jobs": { "tw-ip": { "enabled": false } } })).auto_update);
+        assert!(kuroshio_config::get(&kuroshio_config::defaults(), "access.updateUrl").is_none());
         // 沒有 access 區段（舊設定檔）也一樣
         let s = Settings::from_cfg(&json!({}));
         assert_eq!((s.mode, s.groups.clone()), (Mode::Taiwan, vec!["*".to_string()]));
@@ -1260,16 +1239,7 @@ mod tests {
         let mut close = (*old).clone();
         close.groups[2].nets = Dual::parse(["203.64.0.0/15"]).0;
         assert!(sane_size(&old, &close));
-        // 下載的：要比目前的新、大小合理才換
-        let mut later = close.clone();
-        later.generated_at = "2026-12-01".into();
-        assert!(accept_update(Some(&old), later.clone()).is_some());
-        assert!(accept_update(Some(&old), close.clone()).is_none(), "日期一樣：不換");
-        let mut huge = bigger.clone();
-        huge.generated_at = "2026-12-01".into();
-        assert!(accept_update(Some(&old), huge).is_none(), "差超過 20%：不換");
-        assert!(accept_update(None, later).is_some(), "原本沒有資料：直接用");
-        // 快照裡較新的資料（自動更新）優先，但只有開了 autoUpdate
+        // 快照裡較新的資料（本機產生）優先，但只有開著每月更新時
         let dir = std::env::temp_dir().join(format!("kuroshio-access-up-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("geo")).unwrap();
         std::fs::write(
@@ -1280,6 +1250,14 @@ mod tests {
         let newer = br#"{"generatedAt":"2026-11-01","groups":[{"id":"a","name":"A","v4":["1.0.0.0/16","2.0.0.0/20"]}]}"#.to_vec();
         let a = Access::from_cfg(&json!({ "access": { "autoUpdate": true } }), &dir, Some(newer.clone()));
         assert_eq!(a.data().unwrap().generated_at, "2026-11-01");
+        assert!(a.data_and_origin().1, "本機產生");
+        assert_eq!(a.api_json()["dataOrigin"], "本機產生");
+        // 比公版舊的不用（程式升級帶來較新的公版）
+        let older = br#"{"generatedAt":"2026-09-01","groups":[{"id":"a","name":"A","v4":["1.0.0.0/16"]}]}"#.to_vec();
+        let a = Access::from_cfg(&json!({}), &dir, Some(older));
+        assert_eq!(a.data().unwrap().generated_at, "2026-10-01");
+        assert!(!a.data_and_origin().1);
+        assert_eq!(a.api_json()["dataOrigin"], "公版");
         let a = Access::from_cfg(&json!({ "access": { "autoUpdate": false } }), &dir, Some(newer));
         assert_eq!(a.data().unwrap().generated_at, "2026-10-01");
         let _ = std::fs::remove_dir_all(&dir);
