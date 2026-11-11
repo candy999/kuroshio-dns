@@ -178,14 +178,28 @@ impl Persister {
     }
 }
 
-/// 暫存檔 + fsync + 改名
+/// 暫存檔 + fsync + 改名。
+///
+/// Unix 上檔案一律只有擁有者能讀寫（0600）：狀態目錄裡有 ACME 帳號金鑰、憑證私鑰、設定頁 token、
+/// 社群私鑰、含私鑰的備份暫存檔，其餘的快照（查過的網域、統計）也不該讓同一台機器的其他帳號讀到。
+/// 暫存檔一開始就用 0600 建立（不是寫完才改權限），所以私鑰不會有短暫可讀的空窗。
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        let mut f = o.open(&tmp)?;
+        // 上次留下來的暫存檔可能是舊版用 0644 建的：mode() 只在新建時有效，這裡再收緊一次
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         f.write_all(data)?;
         f.sync_all()?;
     }
@@ -200,6 +214,26 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kuroshio-persist-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("mode");
+        let f = dir.join("acme-account.json");
+        // 舊版留下、所有人可讀的檔案與暫存檔：重寫之後都收緊成 0600
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&f, b"old").unwrap();
+        std::fs::write(f.with_extension("tmp"), b"junk").unwrap();
+        for p in [&f, &f.with_extension("tmp")] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        write_atomic(&f, b"secret").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"secret");
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!f.with_extension("tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

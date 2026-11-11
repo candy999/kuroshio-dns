@@ -410,9 +410,14 @@ async fn read_only_api_and_masking() {
     assert!(names.contains(&"2001:db8:…"));
     assert!(!text(&r).contains("203.0.113.77"));
     assert_eq!(v["stats"]["topDomains"][0]["name"], "www.example.com", "網域不打馬賽克");
+    // 本機的資料夾路徑不給外面看
+    assert_eq!(v["system"]["persist"].get("dir"), None);
+    assert!(!text(&r).contains(&dir.to_string_lossy().to_string()), "回應裡沒有狀態目錄的路徑");
+    assert!(v["system"]["tier"].is_string(), "其他欄位照舊");
     // 本機管理 API 不受影響
     let raw = kuroshio::admin::route(&st, "/api/status", &Default::default()).await.body;
     assert_eq!(raw["stats"]["topClients"][0]["name"], "203.0.113.77");
+    assert!(raw["system"]["persist"]["dir"].is_string());
 
     for p in [
         "/api/cache/flush",
@@ -436,6 +441,15 @@ async fn read_only_api_and_masking() {
         400,
         "交給管理 API 判斷參數"
     );
+    // 追蹤會讓這台去問所有上游、測 IP：同時最多 2 個，多的直接回 429（不排隊）
+    let t = "/detail/api/trace?name=www.example.com";
+    let (a, b, c, d) = tokio::join!(get(&s, t), get(&s, t), get(&s, t), get(&s, t));
+    let codes: Vec<u16> = [a, b, c, d].into_iter().map(|r| r.unwrap().status).collect();
+    assert_eq!(codes.iter().filter(|c| **c == 200).count(), 2, "{codes:?}");
+    assert_eq!(codes.iter().filter(|c| **c == 429).count(), 2, "{codes:?}");
+    // 本機管理 API 不受這個限制
+    let q = [("name".to_string(), "www.example.com".to_string())].into_iter().collect();
+    assert_eq!(kuroshio::admin::route(&st, "/api/trace", &q).await.code, 200);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -455,6 +469,33 @@ async fn csv_download_with_cdn() {
         Some("attachment; filename=\"cdn-domains-cloudflare.csv\"")
     );
     assert_eq!(r.header("cache-control"), Some("no-store"));
+    // 查詢參數帶換行：不能進到回應標頭（DoH 伺服器組回應時遇到不合法的標頭會 panic，正式版 panic = 整個服務結束）
+    for evil in ["x%0d%0aSet-Cookie:%20a=b", "%0a", "%00", "a%22b"] {
+        let r = get(&s, &format!("/detail/api/cdn/domains?format=csv&provider={evil}"))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        for (k, v) in &r.headers {
+            assert!(http::HeaderValue::from_str(v).is_ok(), "{k}: {v:?} 不是合法的標頭");
+            assert!(!v.contains(['\r', '\n', '\0']), "{k}: {v:?}");
+        }
+        let cd = r.header("content-disposition").unwrap();
+        assert!(
+            cd.starts_with("attachment; filename=\"cdn-domains-") && cd.ends_with(".csv\""),
+            "{cd}"
+        );
+        assert_eq!(cd.matches('"').count(), 2, "{cd}");
+    }
+    // 整個資料庫的輸出每分鐘有上限（上面已經要了 5 次）
+    let mut limited = 0;
+    for _ in 0..40 {
+        let r = get(&s, "/detail/api/cdn/domains?limit=5").await.unwrap();
+        if r.status == 429 {
+            limited += 1;
+            assert_eq!(r.header("cache-control"), Some("no-store"));
+        }
+    }
+    assert_eq!(limited, 15, "每分鐘 30 次");
     // CDN 開著時公開統計也算得出來：加速成效、原本的 POP → 台灣 POP（依查詢次數加權）
     let entries = [
         json!({ "name": "a.example", "provider": "cloudflare", "hits": 5, "base": { "pop": "SJC", "ms": 150 }, "v4": { "verdict": "ok", "pop": "TPE", "ms": 20 } }),

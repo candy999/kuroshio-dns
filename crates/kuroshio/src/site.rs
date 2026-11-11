@@ -85,6 +85,13 @@ const DEFAULT_DETAIL_PATH: &str = "/detail";
 /// 公開統計的快取時間
 const STATS_CACHE: Duration = Duration::from_secs(10);
 
+/// 詳細頁比較花力氣的唯讀 API 每分鐘最多幾次（全部訪客合計）。
+/// 詳細頁只靠「知道路徑」保護，預設路徑又是公開的，不能讓外面的人無限次叫這台去問所有上游、測 IP、輸出整個資料庫
+const TRACE_PER_MINUTE: u32 = 20;
+const DOMAINS_PER_MINUTE: u32 = 30;
+/// 同時進行的追蹤
+const TRACE_CONCURRENCY: usize = 2;
+
 /// 圖示：深靛藍的海 + 三道洋流（跟公開頁的標誌一樣）
 const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0b2152"/><g fill="none" stroke-width="5" stroke-linecap="round"><path d="M12 24c7-6 13-6 20 0s13 6 20 0" stroke="#22d3c5"/><path d="M12 35c7-6 13-6 20 0s13 6 20 0" stroke="#27b4ea"/><path d="M12 46c7-6 13-6 20 0s13 6 20 0" stroke="#fff"/></g></svg>"##;
 
@@ -334,6 +341,9 @@ pub struct Site {
     /// 網域自己的 IP（每小時更新）
     ips: RwLock<(Vec<IpAddr>, Vec<IpAddr>)>,
     cache: Mutex<HashMap<&'static str, (Instant, Value)>>,
+    /// 詳細頁唯讀 API 的次數限制：路徑 →（這一分鐘的開始, 次數）
+    limits: Mutex<HashMap<&'static str, (Instant, u32)>>,
+    trace_slots: tokio::sync::Semaphore,
 }
 
 /// 設定的檔案路徑：空白用 `share/site/<預設檔名>`；相對路徑以設定目錄為準，找不到再退回內建的檔案
@@ -398,6 +408,8 @@ impl Site {
             files: Mutex::new(HashMap::new()),
             ips: RwLock::new((Vec::new(), Vec::new())),
             cache: Mutex::new(HashMap::new()),
+            limits: Mutex::new(HashMap::new()),
+            trace_slots: tokio::sync::Semaphore::new(TRACE_CONCURRENCY),
         }))
     }
 
@@ -518,10 +530,19 @@ impl Site {
                     200,
                     "application/x-apple-aspen-config",
                     mobileconfig(kind, &host, &self.doh_path),
-                    &[(
-                        "content-disposition",
-                        format!("attachment; filename=\"{}-{kind}.mobileconfig\"", host.trim_matches(['[', ']'])),
-                    )],
+                    &[
+                        (
+                            "content-disposition",
+                            format!(
+                                "attachment; filename=\"{}\"",
+                                crate::admin::safe_filename(&format!(
+                                    "{}-{kind}.mobileconfig",
+                                    host.trim_matches(['[', ']']).replace(':', "-")
+                                ))
+                            ),
+                        ),
+                        ("cache-control", "no-cache".to_string()),
+                    ],
                 )
             }
             // QR 碼只給固定的三種內容（不當成任意文字的產生器）
@@ -532,7 +553,8 @@ impl Site {
                     _ => format!("https://{host}/"),
                 };
                 match crate::about::qr_svg(&text) {
-                    Some(svg) => send(200, "image/svg+xml", svg, &[("cache-control", "max-age=3600".into())]),
+                    // 沒設定網域時內容跟著 Host 標頭變：只讓瀏覽器自己快取，中間的代理不要存
+                    Some(svg) => send(200, "image/svg+xml", svg, &[("cache-control", "private, max-age=3600".into())]),
                     None => send(500, "text/plain; charset=utf-8", "error", &[]),
                 }
             }
@@ -565,11 +587,42 @@ impl Site {
         }
     }
 
-    /// 詳細頁的唯讀管理 API：只開放 [`READ_ONLY`]，`/api/status` 的用戶端 IP 打馬賽克
+    /// 這一分鐘還能不能再做一次（固定時間窗，全部訪客合計）
+    fn allow(&self, key: &'static str, per_minute: u32) -> bool {
+        let now = Instant::now();
+        let mut m = self.limits.lock().unwrap();
+        let e = m.entry(key).or_insert((now, 0));
+        if now.duration_since(e.0) >= Duration::from_secs(60) {
+            *e = (now, 0);
+        }
+        e.1 += 1;
+        e.1 <= per_minute
+    }
+
+    /// 詳細頁的唯讀管理 API：只開放 [`READ_ONLY`]。這一頁在公開的 DoH 埠上、只靠路徑保護，所以回應要再整理：
+    /// 用戶端 IP 打馬賽克、不帶本機的資料夾路徑、追蹤不回報內部位址通不通，花力氣的 API 有次數上限
     pub async fn read_only_api(&self, sub: &str, q: &HashMap<String, String>) -> SiteResponse {
         if !READ_ONLY.contains(&sub) {
             return json_resp(404, &json!({ "error": "not found" }), "no-store");
         }
+        let busy = || json_resp(429, &json!({ "error": "查詢太頻繁，請稍後再試" }), "no-store");
+        let _slot = match sub {
+            "/api/trace" => {
+                // 追蹤會去問每一台上游、再測每個 IP：限制次數與同時數，不讓外面的人拿來放大流量
+                let Ok(slot) = self.trace_slots.try_acquire() else { return busy() };
+                if !self.allow("/api/trace", TRACE_PER_MINUTE) {
+                    return busy();
+                }
+                Some(slot)
+            }
+            "/api/cdn/domains" => {
+                if !self.allow("/api/cdn/domains", DOMAINS_PER_MINUTE) {
+                    return busy();
+                }
+                None
+            }
+            _ => None,
+        };
         let r = crate::admin::route(&self.state, sub, q).await;
         if let Some((ctype, name, text)) = r.raw {
             return send(
@@ -577,14 +630,23 @@ impl Site {
                 ctype,
                 text,
                 &[
-                    ("content-disposition", format!("attachment; filename=\"{name}\"")),
+                    (
+                        "content-disposition",
+                        format!("attachment; filename=\"{}\"", crate::admin::safe_filename(&name)),
+                    ),
                     ("cache-control", "no-store".to_string()),
                 ],
             );
         }
         let mut body = r.body;
-        if sub == "/api/status" {
-            mask_clients(&mut body);
+        match sub {
+            "/api/status" => {
+                mask_clients(&mut body);
+                strip_paths(&mut body);
+            }
+            "/api/benchmark" => strip_paths(&mut body),
+            "/api/trace" => hide_internal_probes(&mut body),
+            _ => {}
         }
         json_resp(r.code, &body, "no-store")
     }
@@ -878,6 +940,49 @@ impl Site {
     }
 }
 
+/// 區網、本機、連結本地之類不是公開網路的位址
+fn internal_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.is_multicast()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            v.is_loopback() || v.is_unspecified() || v.is_multicast() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// 追蹤結果裡「這個 IP 通不通、多少毫秒」：內部位址的不回報。
+/// 外面的人可以追蹤一個自己控制、指向 192.168.x.x 的網域，不能讓他藉此知道區網裡哪些主機開著
+pub fn hide_internal_probes(body: &mut Value) {
+    if let Some(list) = body.get_mut("ranking").and_then(Value::as_array_mut) {
+        list.retain(|x| {
+            x.get("ip")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<IpAddr>().ok())
+                .is_some_and(|ip| !internal_ip(ip))
+        });
+    }
+}
+
+/// 拿掉本機的資料夾路徑（`/api/status` 的 `system.persist.dir`、評測結果的 `reportDir`）
+pub fn strip_paths(body: &mut Value) {
+    if let Some(p) = body.pointer_mut("/system/persist").and_then(Value::as_object_mut) {
+        p.remove("dir");
+    }
+    if let Some(o) = body.as_object_mut() {
+        o.remove("reportDir");
+    }
+}
+
 /// `/api/status` 的 `stats.topClients[].name` 打馬賽克
 pub fn mask_clients(body: &mut Value) {
     if let Some(list) = body.pointer_mut("/stats/topClients").and_then(Value::as_array_mut) {
@@ -901,6 +1006,29 @@ mod tests {
         let mut v = json!({ "stats": { "topClients": [{ "name": "10.1.2.3", "count": 5 }] } });
         mask_clients(&mut v);
         assert_eq!(v["stats"]["topClients"][0], json!({ "name": "10.1.x.x", "count": 5 }));
+    }
+
+    #[test]
+    fn detail_api_scrubbing() {
+        let mut v = json!({ "system": { "tier": "small", "persist": { "dir": "/etc/kuroshio/state", "storage": "flash" } } });
+        strip_paths(&mut v);
+        assert_eq!(v, json!({ "system": { "tier": "small", "persist": { "storage": "flash" } } }));
+        let mut b = json!({ "generatedAt": "x", "reportDir": "C:\\ProgramData\\kuroshio\\state\\reports" });
+        strip_paths(&mut b);
+        assert_eq!(b, json!({ "generatedAt": "x" }));
+        let mut t = json!({ "ranking": [
+            { "ip": "192.168.1.1", "ok": true, "ms": 0.4 }, { "ip": "10.0.0.5", "ok": false, "ms": null },
+            { "ip": "127.0.0.1", "ok": true, "ms": 0.1 }, { "ip": "169.254.1.1", "ok": true, "ms": 1 },
+            { "ip": "100.64.0.1", "ok": true, "ms": 1 }, { "ip": "fd00::1", "ok": true, "ms": 1 },
+            { "ip": "fe80::1", "ok": true, "ms": 1 }, { "ip": "::ffff:192.168.1.1", "ok": true, "ms": 1 },
+            { "ip": "nonsense", "ok": true, "ms": 1 },
+            { "ip": "203.0.113.7", "ok": true, "ms": 12.5 }, { "ip": "2606:4700::1", "ok": true, "ms": 9 },
+        ] });
+        hide_internal_probes(&mut t);
+        assert_eq!(
+            t["ranking"],
+            json!([{ "ip": "203.0.113.7", "ok": true, "ms": 12.5 }, { "ip": "2606:4700::1", "ok": true, "ms": 9 }])
+        );
     }
 
     #[test]

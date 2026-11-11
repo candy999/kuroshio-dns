@@ -46,7 +46,16 @@ async fn http(addr: std::net::SocketAddr, method: &str, target: &str, headers: &
 }
 
 async fn get_json(addr: std::net::SocketAddr, target: &str) -> Value {
-    let (code, _, b) = http(addr, "GET", target, &[], b"").await;
+    req_json(addr, "GET", target).await
+}
+
+/// 會改東西的動作（POST）
+async fn post_json(addr: std::net::SocketAddr, target: &str) -> Value {
+    req_json(addr, "POST", target).await
+}
+
+async fn req_json(addr: std::net::SocketAddr, method: &str, target: &str) -> Value {
+    let (code, _, b) = http(addr, method, target, &[], b"").await;
     assert_eq!(code, 200, "{target}：{}", String::from_utf8_lossy(&b));
     serde_json::from_slice(&b).unwrap()
 }
@@ -75,7 +84,7 @@ async fn export_import_through_running_service() {
     assert!(started.resolver.cdn().is_some(), "CDN 有啟動");
 
     // 記憶體裡的變動（還沒寫到磁碟）
-    let r = get_json(admin, "/api/cdn/policy?name=a.example&policy=always").await;
+    let r = post_json(admin, "/api/cdn/policy?name=a.example&policy=always").await;
     assert_eq!(r["policy"], "always", "{r}");
     assert!(!String::from_utf8_lossy(&std::fs::read(state.join("cdn-domains.json")).unwrap()).contains("always"));
 
@@ -131,7 +140,7 @@ async fn export_import_through_running_service() {
     assert!(!state.join(PENDING_FILE).exists());
 
     // 匯入前，記憶體裡又改了一次（關機時才會寫出）
-    get_json(admin, "/api/cdn/policy?name=a.example&policy=never").await;
+    post_json(admin, "/api/cdn/policy?name=a.example&policy=never").await;
     let (code, _, b) = http(
         admin,
         "POST",

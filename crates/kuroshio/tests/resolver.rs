@@ -226,9 +226,13 @@ async fn formerr_for_garbage_and_no_reply_to_responses() {
 
 /// 管理 API：用真的 HTTP 打
 async fn http_get(addr: SocketAddr, path: &str, host: &str) -> (u16, serde_json::Value) {
+    http_req(addr, "GET", path, host).await
+}
+
+async fn http_req(addr: SocketAddr, method: &str, path: &str, host: &str) -> (u16, serde_json::Value) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: test\r\n\r\n").as_bytes())
+    s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: test\r\nContent-Length: 0\r\n\r\n").as_bytes())
         .await
         .unwrap();
     let mut out = Vec::new();
@@ -262,7 +266,12 @@ async fn admin_api() {
     assert_eq!(t["upstreams"][0]["answers"][0], "1 www.example.test 300 1.2.3.4");
     assert_eq!(t["cache"]["source"], format!("udp://{up}"));
 
-    let (_, fl) = http_get(admin, "/api/cache/flush", "localhost").await;
+    // 會改東西的動作只接受 POST（GET 任何網頁都能用 <img> 送出）
+    let (code, _) = http_get(admin, "/api/cache/flush", "localhost").await;
+    assert_eq!(code, 405);
+    let (_, st) = http_get(admin, "/api/status", "localhost").await;
+    assert_eq!(st["cacheEntries"], 1, "GET 沒有清掉快取");
+    let (_, fl) = http_req(admin, "POST", "/api/cache/flush", "localhost").await;
     assert_eq!(fl["ok"], true);
     let (_, st) = http_get(admin, "/api/status", "localhost").await;
     assert_eq!(st["cacheEntries"], 0);

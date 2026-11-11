@@ -15,15 +15,26 @@
 . /usr/share/libubox/jshn.sh
 
 
-port() { p=$(uci -q get kuroshio.main.admin_port); echo "${p:-8054}"; }
+# 埠號只接受數字（設定值會接進網址，不能讓它變成別台主機）
+port() {
+	p=$(uci -q get kuroshio.main.admin_port)
+	case "$p" in ''|*[!0-9]*) p=8054 ;; esac
+	echo "$p"
+}
 
 # 呼叫管理 API，輸出包成 {"result":…}（rpcd 只接受物件）
-fetch() { # fetch <path> [query]
+# 會改變狀態的動作用 POST（管理 API 不接受用 GET 做這些事，網頁才沒辦法用一張圖片的網址偷偷觸發）；
+# 參數仍然放在網址，--post-data 只是讓 uclient-fetch 改用 POST（內容不能是空的）
+fetch() { # fetch <path> [query] [post]
 	local url
 	url="http://127.0.0.1:$(port)$1"
 	[ -n "$2" ] && url="$url?$2"
 	local body
-	body=$(uclient-fetch -q -T 60 -O - "$url" 2>/dev/null)
+	if [ "$3" = post ]; then
+		body=$(uclient-fetch -q -T 60 --post-data="${2:-_}" -O - "$url" 2>/dev/null)
+	else
+		body=$(uclient-fetch -q -T 60 -O - "$url" 2>/dev/null)
+	fi
 	if [ -n "$body" ]; then printf '{"ok":true,"result":%s}' "$body"
 	else printf '{"ok":false,"error":"服務沒有回應（可能尚未啟動）"}'; fi
 }
@@ -78,7 +89,7 @@ call)
 		*) echo '{"ok":false,"error":"不允許的路徑"}'; exit 0 ;;
 		esac
 		valid_query "$P_QUERY" || { echo '{"ok":false,"error":"參數格式錯誤"}'; exit 0; }
-		fetch "$P_PATH" "$P_QUERY"
+		fetch "$P_PATH" "$P_QUERY" post
 		;;
 	about)
 		# 核心版本、授權、原始碼（含 QR 碼）＋ LuCI 介面版本
@@ -100,15 +111,21 @@ call)
 		read_input
 		kind=full
 		if [ "$P_KIND" = share ]; then kind=share; set -- --share; else set --; fi
-		rm -f "$BACKUP_OUT"
+		# /tmp 是大家都能寫的資料夾：先寫到 mktemp 建的檔案（只有 root 能讀寫、別人換不掉），再改名成固定的檔名。
+		# 直接寫固定檔名的話，別的帳號可以先在那裡放一個自己的檔案或符號連結，備份（含私鑰）就會寫到他手上
+		rm -rf "$BACKUP_OUT"
+		tmp=$(umask 077; mktemp /tmp/kuroshio-backup.XXXXXX) || tmp=
 		json_init
-		if msg=$(umask 077; /usr/bin/kuroshio export --uci "$@" -o "$BACKUP_OUT" 2>&1) && [ -s "$BACKUP_OUT" ]; then
+		# shellcheck disable=SC3067 # test -O（檔案是我的）不在 POSIX 裡，BusyBox ash 有
+		if [ -n "$tmp" ] && msg=$(umask 077; /usr/bin/kuroshio export --uci "$@" -o "$tmp" 2>&1) && [ -s "$tmp" ] \
+			&& mv -f "$tmp" "$BACKUP_OUT" && [ -f "$BACKUP_OUT" ] && [ ! -L "$BACKUP_OUT" ] && [ -O "$BACKUP_OUT" ]; then
 			json_add_boolean ok 1
 			json_add_int size "$(wc -c < "$BACKUP_OUT" | tr -d ' ')"
 			json_add_string name "kuroshio-$kind-$(date +%Y%m%d).kuroshio"
 			json_add_string path "$BACKUP_OUT"
 		else
-			rm -f "$BACKUP_OUT"
+			[ -n "$tmp" ] && rm -f "$tmp"
+			rm -rf "$BACKUP_OUT"
 			json_add_boolean ok 0
 			json_add_string error "${msg:-匯出失敗}"
 		fi
@@ -118,6 +135,13 @@ call)
 		# 服務執行中：交給服務、等它重新啟動合併；沒有執行：直接合併。輸出合併結果（JSON）
 		if [ ! -s "$BACKUP_IN" ]; then
 			echo '{"ok":false,"error":"沒有收到檔案"}'
+			exit 0
+		fi
+		# 只收 LuCI（root）上傳的一般檔案：別的帳號先在 /tmp 放好的檔案或符號連結不匯入
+		# shellcheck disable=SC3067
+		if [ -L "$BACKUP_IN" ] || [ ! -f "$BACKUP_IN" ] || [ ! -O "$BACKUP_IN" ]; then
+			rm -f "$BACKUP_IN"
+			echo '{"ok":false,"error":"上傳的檔案不是 LuCI 建立的，沒有匯入"}'
 			exit 0
 		fi
 		out=$(/usr/bin/kuroshio import --uci --json "$BACKUP_IN" 2>/dev/null)

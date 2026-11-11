@@ -22,14 +22,18 @@ pub async fn listen(state: Arc<AppState>, addr: SocketAddr) -> anyhow::Result<So
     let l = TcpListener::bind(addr).await?;
     let bound = l.local_addr()?;
     info!("管理 API http://{bound}/api/status");
+    // 同時處理的連線有上限：慢慢送標頭的連線、同時上傳很多大檔案都不會把記憶體用光
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     tokio::spawn(async move {
         loop {
+            let Ok(permit) = slots.clone().acquire_owned().await else { return };
             let Ok((s, peer)) = l.accept().await else { continue };
             let st = state.clone();
             tokio::spawn(async move {
                 if let Err(e) = conn(st, s).await {
                     debug!("管理 API {peer}：{e}");
                 }
+                drop(permit);
             });
         }
     });
@@ -105,8 +109,88 @@ pub fn local_host(host: Option<&str>) -> bool {
 /// 匯入備份的路徑（內容上限是備份檔的上限，不是 1 MB）
 const IMPORT_PATH: &str = "/api/backup/import";
 
-/// 讀一個 HTTP/1.1 請求（標頭最多 16 KB、內容最多 1 MB；匯入備份最多 64 MB）
-async fn read_req(s: &mut TcpStream) -> anyhow::Result<Option<Req>> {
+/// 同時處理的連線數上限
+const MAX_CONNS: usize = 64;
+
+/// 登入失敗時多等這麼久才回應（猜 token 的速度上限 = 連線數上限 ÷ 這個時間）
+const LOGIN_FAIL_DELAY: Duration = Duration::from_millis(500);
+
+/// 會改變狀態、或讓服務對外連線做事的路徑：只接受 POST。
+///
+/// GET 不帶 Origin，瀏覽器裡任何網頁都能用 `<img src>` 送出；關掉登入（OpenWrt 預設、或 `admin.auth=false`）時
+/// 那樣就能清快取、改 CDN 策略、加好友。POST 一定帶 Origin，跨站的會被 `same_origin` 擋下。
+pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
+    match path {
+        "/api/cache/flush" | "/api/jobs/run" | "/api/acme/issue" | "/api/ddns/update" | "/api/filter/update" | "/api/cdn/verify"
+        | "/api/cdn/policy" | "/api/cdn/ecs" => true,
+        p => match p.strip_prefix("/api/community/") {
+            Some("status" | "peers" | "events" | "scores") => false,
+            // 不帶 channel 是查詢，帶了是指定管道
+            Some("channel") => q.contains_key("channel"),
+            Some(_) => true,
+            None => false,
+        },
+    }
+}
+
+/// 下載檔名只留英數與 `._-`（檔名的一部分來自查詢參數，不能讓它帶換行塞進回應標頭）
+pub fn safe_filename(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .take(80)
+        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' })
+        .collect();
+    if s.is_empty() {
+        "download".into()
+    } else {
+        s
+    }
+}
+
+/// `Transfer-Encoding: chunked` 的內容（uclient-fetch 的 POST 一律用這個）；`raw` 是已經讀進來的部分
+async fn read_chunked(s: &mut TcpStream, mut raw: Vec<u8>, max: usize, deadline: Instant) -> anyhow::Result<Vec<u8>> {
+    let mut tmp = [0u8; 16384];
+    let mut body = Vec::new();
+    loop {
+        // 這一塊的長度（十六進位，後面可能有 `;擴充`）
+        let line_end = loop {
+            if let Some(p) = raw.windows(2).position(|w| w == b"\r\n") {
+                break p;
+            }
+            if raw.len() > 256 {
+                anyhow::bail!("chunked 格式錯誤");
+            }
+            let n = tokio::time::timeout_at(deadline.into(), s.read(&mut tmp)).await??;
+            if n == 0 {
+                anyhow::bail!("內容不完整");
+            }
+            raw.extend_from_slice(&tmp[..n]);
+        };
+        let line = std::str::from_utf8(&raw[..line_end]).unwrap_or("");
+        let size =
+            usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).map_err(|_| anyhow::anyhow!("chunked 格式錯誤"))?;
+        if size == 0 {
+            // 後面的 trailer 不需要
+            return Ok(body);
+        }
+        if size > max || body.len() + size > max {
+            anyhow::bail!("內容太大");
+        }
+        let start = line_end + 2;
+        while raw.len() < start + size + 2 {
+            let n = tokio::time::timeout_at(deadline.into(), s.read(&mut tmp)).await??;
+            if n == 0 {
+                anyhow::bail!("內容不完整");
+            }
+            raw.extend_from_slice(&tmp[..n]);
+        }
+        body.extend_from_slice(&raw[start..start + size]);
+        raw.drain(..start + size + 2);
+    }
+}
+
+/// 讀一個 HTTP/1.1 請求（標頭最多 16 KB、內容最多 1 MB；已登入的匯入備份最多 64 MB）
+async fn read_req(s: &mut TcpStream, ui: &crate::webui::WebUi) -> anyhow::Result<Option<Req>> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 16384];
     let mut deadline = Instant::now() + Duration::from_secs(10);
@@ -139,7 +223,8 @@ async fn read_req(s: &mut TcpStream) -> anyhow::Result<Option<Req>> {
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     (req.path, req.query) = (path.to_string(), query.to_string());
     let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let max = if req.path == IMPORT_PATH {
+    // 大檔案只收「會被處理的」：已登入、本機來源的匯入。沒登入的人不能讓服務先收下 64 MB 再回 401
+    let max = if req.path == IMPORT_PATH && req.method == "POST" && req.same_origin() && ui.authorized(&req) {
         deadline += Duration::from_secs(50);
         crate::backup::MAX_BYTES
     } else {
@@ -147,6 +232,13 @@ async fn read_req(s: &mut TcpStream) -> anyhow::Result<Option<Req>> {
     };
     if len > max {
         anyhow::bail!("內容太大");
+    }
+    if req
+        .header("transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+    {
+        req.body = read_chunked(s, buf[head_end + 4..].to_vec(), max, deadline).await?;
+        return Ok(Some(req));
     }
     let mut body = buf[head_end + 4..].to_vec();
     body.reserve(len.saturating_sub(body.len()));
@@ -194,7 +286,7 @@ impl Out {
             Some((t, name, text)) => Out {
                 code: r.code,
                 ctype: t,
-                headers: vec![format!("content-disposition: attachment; filename=\"{name}\"")],
+                headers: vec![format!("content-disposition: attachment; filename=\"{}\"", safe_filename(&name))],
                 body: text.into_bytes(),
             },
             None => Out::json(r.code, &r.body),
@@ -203,7 +295,22 @@ impl Out {
 }
 
 async fn conn(st: Arc<AppState>, mut s: TcpStream) -> anyhow::Result<()> {
-    let Some(req) = read_req(&mut s).await? else { return Ok(()) };
+    let req = match read_req(&mut s, &st.webui).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            // 太大或格式錯誤：回一個看得懂的狀態碼再關（用戶端才不會只看到連線被切斷）
+            let body = serde_json::to_vec(&json!({ "error": e.to_string() })).unwrap_or_default();
+            let head = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.write_all(&body).await;
+            let _ = s.shutdown().await;
+            return Err(e);
+        }
+    };
     let out = handle(&st, &req).await;
     let reason = match out.code {
         200 => "OK",
@@ -213,6 +320,7 @@ async fn conn(st: Arc<AppState>, mut s: TcpStream) -> anyhow::Result<()> {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        429 => "Too Many Requests",
         _ => "Error",
     };
     let mut head = format!(
@@ -226,11 +334,16 @@ async fn conn(st: Arc<AppState>, mut s: TcpStream) -> anyhow::Result<()> {
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    s.write_all(head.as_bytes()).await?;
-    if req.method != "HEAD" {
-        s.write_all(&out.body).await?;
-    }
-    s.shutdown().await.ok();
+    // 對方不收也不會一直占著連線（與回應的記憶體）
+    tokio::time::timeout(Duration::from_secs(60), async {
+        s.write_all(head.as_bytes()).await?;
+        if req.method != "HEAD" {
+            s.write_all(&out.body).await?;
+        }
+        s.shutdown().await.ok();
+        Ok::<_, std::io::Error>(())
+    })
+    .await??;
     Ok(())
 }
 
@@ -242,6 +355,10 @@ async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
     let m = req.method.as_str();
     let write = m == "POST" || m == "PUT";
     if write && !req.same_origin() {
+        return Out::from_response(bad("拒絕跨站請求", 403));
+    }
+    // 瀏覽器會標明請求是不是別的網站發的：別的網站連讀取類的 API 也不給碰（不讓它量回應時間、或幫忙猜 token）
+    if req.path.starts_with("/api/") && req.cross_site_fetch() {
         return Out::from_response(bad("拒絕跨站請求", 403));
     }
     match req.path.as_str() {
@@ -262,7 +379,10 @@ async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
                         Some(format!("{}={sid}; Path=/; HttpOnly; SameSite=Strict", crate::webui::COOKIE)),
                     )
                 }
-                _ => Out::redirect("/?login=failed", None),
+                _ => {
+                    tokio::time::sleep(LOGIN_FAIL_DELAY).await;
+                    Out::redirect("/?login=failed", None)
+                }
             }
         }
         "/logout" => {
@@ -301,7 +421,15 @@ async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
                         .unwrap_or(200usize);
                     Out::json(200, &json!({ "lines": crate::logring::lines(n) }))
                 }
-                ("GET" | "POST" | "HEAD", _) => Out::from_response(route(st, p, &parse_query(&req.query)).await),
+                ("GET" | "POST" | "HEAD", _) => {
+                    let q = parse_query(&req.query);
+                    if m != "POST" && is_action(p, &q) {
+                        let mut out = Out::from_response(bad("這個動作只接受 POST", 405));
+                        out.headers.push("allow: POST".into());
+                        return out;
+                    }
+                    Out::from_response(route(st, p, &q).await)
+                }
                 _ => Out::from_response(bad("不支援這個方法", 405)),
             }
         }
@@ -329,16 +457,27 @@ fn config_api(st: &Arc<AppState>, req: &Req) -> Response {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| json!({}));
         let tier = kuroshio_config::requested_tier(&user).unwrap_or(st.tier);
+        let mut effective = kuroshio_config::build(tier, &user);
+        // API Token 之類的密碼不送到瀏覽器：換成遮罩，存檔時遮罩 = 沒改
+        let mut user = user;
+        crate::webui::mask_secrets(&mut user);
+        crate::webui::mask_secrets(&mut effective);
         return ok(json!({
             "file": file, "user": user, "tier": st.tier.name(),
-            "effective": kuroshio_config::build(tier, &user),
+            "effective": effective,
             "defaults": kuroshio_config::build(tier, &json!({})),
         }));
     }
-    let v: Value = match serde_json::from_slice(&req.body) {
+    let mut v: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => return bad(&format!("JSON 格式錯誤：{e}"), 400),
     };
+    // 送回來的遮罩換回檔案裡原本的值
+    let old: Value = std::fs::read(file)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    crate::webui::unmask_secrets(&mut v, &old);
     if let Err(e) = crate::webui::validate_config(&v) {
         return bad(&e, 400);
     }
@@ -562,7 +701,7 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
                 sort: q.get("sort").cloned(),
             };
             if q.get("format").map(String::as_str) == Some("csv") {
-                let file = format!("cdn-domains-{}.csv", query.provider.as_deref().unwrap_or("all"));
+                let file = safe_filename(&format!("cdn-domains-{}.csv", query.provider.as_deref().unwrap_or("all")));
                 return Response {
                     code: 200,
                     body: Value::Null,
@@ -698,5 +837,53 @@ mod tests {
         assert!(!local_host(Some("192.168.1.1")));
         assert_eq!(qtype_num("https"), Some(65));
         assert_eq!(qtype_num("nope"), None);
+    }
+
+    #[test]
+    fn actions_are_post_only_and_filenames_are_clean() {
+        let none = HashMap::new();
+        for p in [
+            "/api/cache/flush",
+            "/api/jobs/run",
+            "/api/acme/issue",
+            "/api/ddns/update",
+            "/api/filter/update",
+            "/api/cdn/verify",
+            "/api/cdn/policy",
+            "/api/cdn/ecs",
+            "/api/community/add",
+            "/api/community/accept",
+            "/api/community/delete",
+            "/api/community/rotate",
+            "/api/community/accept-key",
+            "/api/community/check",
+            "/api/community/sync",
+        ] {
+            assert!(is_action(p, &none), "{p}");
+        }
+        for p in [
+            "/api/status",
+            "/api/trace",
+            "/api/filter/check",
+            "/api/cdn/domains",
+            "/api/jobs",
+            "/api/ddns",
+            "/api/acme",
+            "/api/community/status",
+            "/api/community/peers",
+            "/api/community/events",
+            "/api/community/scores",
+            "/api/community/channel",
+        ] {
+            assert!(!is_action(p, &none), "{p}");
+        }
+        assert!(is_action("/api/community/channel", &parse_query("domain=a.example&channel=doq")));
+        // 查詢參數裡的換行不能進到 content-disposition
+        let evil = parse_query("provider=x%0d%0aSet-Cookie:%20a=b");
+        let name = safe_filename(&format!("cdn-domains-{}.csv", evil["provider"]));
+        assert_eq!(name, "cdn-domains-x__Set-Cookie__a_b.csv");
+        assert_eq!(safe_filename("kuroshio-full-20261111.kuroshio"), "kuroshio-full-20261111.kuroshio");
+        assert_eq!(safe_filename("\"\r\n"), "___");
+        assert_eq!(safe_filename(""), "download");
     }
 }
