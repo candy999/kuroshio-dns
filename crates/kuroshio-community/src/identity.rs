@@ -173,17 +173,19 @@ pub struct Identity {
     pub rotation: Option<Rotation>,
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+/// 寫私鑰與身分資料：暫存檔一建立就是 0600（先寫再 chmod 會有別人讀得到的空檔），不跟著別人放的符號連結走
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write as _;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data).with_context(|| format!("寫入 {}", tmp.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    if let Ok(f) = std::fs::File::open(&tmp) {
-        let _ = f.sync_all();
-    }
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(&tmp).with_context(|| format!("寫入 {}", tmp.display()))?;
+    f.write_all(data).with_context(|| format!("寫入 {}", tmp.display()))?;
+    let _ = f.sync_all();
+    drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("改名 {}", path.display()))?;
     Ok(())
 }
@@ -193,6 +195,15 @@ impl Identity {
     pub fn load_or_create(dir: &Path) -> Result<Identity> {
         std::fs::create_dir_all(dir).with_context(|| format!("建立 {}", dir.display()))?;
         let key_file = dir.join("key.pem");
+        // 舊版寫的金鑰可能是 0644：收緊成只有擁有者能讀
+        #[cfg(unix)]
+        for n in ["key.pem", "key.old.pem"] {
+            use std::os::unix::fs::PermissionsExt;
+            let f = dir.join(n);
+            if std::fs::metadata(&f).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
         let meta_file = dir.join("identity.json");
         let key = if key_file.exists() {
             KeyPair::from_pem(&std::fs::read_to_string(&key_file)?).with_context(|| format!("讀取 {}", key_file.display()))?
@@ -354,6 +365,29 @@ mod tests {
         let sig = k.sign(b"hello");
         assert!(verify(&k.public, b"hello", &sig));
         assert!(!verify(&k.public, b"hellO", &sig));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kuroshio-ident-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mode = |n: &str| std::fs::metadata(dir.join(n)).unwrap().permissions().mode() & 0o777;
+        Identity::load_or_create(&dir).unwrap();
+        assert_eq!(mode("key.pem"), 0o600);
+        // 舊版留下的 0644 金鑰：下次啟動收緊
+        std::fs::set_permissions(dir.join("key.pem"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        Identity::load_or_create(&dir).unwrap();
+        assert_eq!(mode("key.pem"), 0o600);
+        // 暫存檔的位置先被放了符號連結：不跟著寫出去
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "v").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("x.tmp")).unwrap();
+        write_atomic(&dir.join("x.pem"), b"secret").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "v");
+        assert_eq!(mode("x.pem"), 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -152,7 +152,7 @@ impl Community {
         if !key_file.exists() {
             if let Some(old) = read_opt(&cdir.join("key.pem")) {
                 std::fs::create_dir_all(&opts.key_dir)?;
-                std::fs::write(&key_file, old)?;
+                crate::identity::write_atomic(&key_file, &old)?;
             }
         }
         let ident = Identity::load_or_create(&opts.key_dir)?;

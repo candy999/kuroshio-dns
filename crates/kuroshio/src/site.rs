@@ -648,6 +648,19 @@ impl Site {
             "/api/trace" => hide_internal_probes(&mut body),
             _ => {}
         }
+        // 其他 API（工作狀態、錯誤訊息…）的文字裡也可能帶本機路徑：一律換掉
+        let loc = &self.state.backup;
+        let mut dirs: Vec<String> = [
+            Some(loc.state.as_path()),
+            Some(loc.data.as_path()),
+            Some(loc.key_dir.as_path()),
+            loc.upstreams.parent(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+        scrub_dirs(&mut body, &mut dirs);
         json_resp(r.code, &body, "no-store")
     }
 
@@ -983,6 +996,30 @@ pub fn strip_paths(body: &mut Value) {
     }
 }
 
+/// 所有字串裡出現的本機資料夾路徑換成 `…`（長的先換；太短的像 `/` 不處理）
+pub fn scrub_dirs(body: &mut Value, dirs: &mut Vec<String>) {
+    dirs.retain(|d| d.trim_end_matches(['/', '\\']).len() >= 4);
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.len()));
+    dirs.dedup();
+    fn walk(v: &mut Value, dirs: &[String]) {
+        match v {
+            Value::String(s) => {
+                for d in dirs {
+                    if s.contains(d.as_str()) {
+                        *s = s.replace(d.as_str(), "…");
+                    }
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, dirs)),
+            Value::Object(o) => o.values_mut().for_each(|x| walk(x, dirs)),
+            _ => {}
+        }
+    }
+    if !dirs.is_empty() {
+        walk(body, dirs);
+    }
+}
+
 /// `/api/status` 的 `stats.topClients[].name` 打馬賽克
 pub fn mask_clients(body: &mut Value) {
     if let Some(list) = body.pointer_mut("/stats/topClients").and_then(Value::as_array_mut) {
@@ -1029,6 +1066,18 @@ mod tests {
             t["ranking"],
             json!([{ "ip": "203.0.113.7", "ok": true, "ms": 12.5 }, { "ip": "2606:4700::1", "ok": true, "ms": 9 }])
         );
+    }
+
+    #[test]
+    fn scrubs_local_dirs_everywhere() {
+        let mut v = json!({ "jobs": [{ "last": "寫入 /srv/kuroshio/state/cdn/pools.json 失敗", "n": 1 }],
+            "file": "/srv/kuroshio/state/upstreams.json", "other": "/srv/kuroshio/data/x", "keep": "/tmp/a" });
+        let mut dirs = vec!["/srv/kuroshio/state".to_string(), "/srv/kuroshio".to_string(), "/".to_string()];
+        scrub_dirs(&mut v, &mut dirs);
+        assert_eq!(v["jobs"][0]["last"], "寫入 …/cdn/pools.json 失敗");
+        assert_eq!(v["file"], "…/upstreams.json");
+        assert_eq!(v["other"], "…/data/x");
+        assert_eq!(v["keep"], "/tmp/a", "太短的路徑（/）不處理");
     }
 
     #[test]
