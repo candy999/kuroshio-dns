@@ -367,10 +367,10 @@ impl Cdn {
                     .cmp(&(bad.contains_key(&b.ip) as u8))
                     .then(a.ms.or(999.0).partial_cmp(&b.ms.or(999.0)).unwrap_or(std::cmp::Ordering::Equal))
             });
-            let mut tw48 = std::mem::take(&mut d.tw48);
+            let mut tw48 = (*d.tw48).clone();
             tw48.add(&util::subnet_key(ip));
             tw48.finalize();
-            d.tw48 = tw48;
+            d.tw48 = Arc::new(tw48);
             st.v6.mark_ok(provider, ip, &pop, Some(ms));
             st.pools.dirty = true;
             info!("★ {} 發現台灣 IPv6 節點 {ip} ({pop} {ms}ms)，已加入節點池並永久保存", prov.label);

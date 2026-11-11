@@ -472,3 +472,74 @@ fn recheck_and_shrink() {
     c.shrink(0.5);
     assert_eq!(c.state().db.domains.len(), 5);
 }
+
+#[test]
+fn classifier_snapshot_follows_range_changes() {
+    // `apply()` 用唯讀快照判斷是不是 CDN（不拿狀態鎖）；範圍 / 分類不管怎麼換，放開鎖之後快照都要跟上
+    let (c, _net) = setup(json!({}));
+    let x = ip("198.51.100.7");
+    assert_eq!(c.classify(x), None);
+    let mut m = msg("snap.test", 1, &["198.51.100.7"], vec![]);
+    assert_eq!(c.apply(&mut m, "snap.test", rtype::A).provider, None);
+    assert!(c.state().db.get("snap.test").is_none(), "不是 CDN 的回應不進資料庫");
+
+    // 直接換掉欄位
+    c.with_state(|st| st.pools.p.get_mut("cloudflare").unwrap().range4 = crate::pools::cidr(&["198.51.100.0/24"]));
+    assert_eq!(
+        c.classify(x).map(|k| (k.provider, k.cls)),
+        Some(("cloudflare", crate::Cls::Unknown))
+    );
+    assert_eq!(c.classify(x), c.state().pools.classify(x), "快照跟節點池的判斷一致");
+    let mut m = msg("snap.test", 1, &["198.51.100.7"], vec![]);
+    assert_eq!(c.apply(&mut m, "snap.test", rtype::A).provider, Some("cloudflare"));
+
+    // 透過 state() 的鎖改也一樣
+    {
+        let mut st = c.state();
+        st.pools.p.get_mut("cloudflare").unwrap().tw = crate::pools::cidr(&["198.51.100.0/24"]);
+    }
+    assert_eq!(c.classify(x).map(|k| k.cls), Some(crate::Cls::Tw));
+
+    // 重新讀範圍檔（每週工作之後）：回到檔案裡的內容
+    c.reload_ranges();
+    assert_eq!(c.classify(x), None);
+    assert_eq!(c.classify(ip("104.16.0.1")).map(|k| k.provider), Some("cloudflare"));
+
+    // CNAME 後綴不分大小寫、結尾的點不影響
+    assert_eq!(crate::providers::provider_by_cname("D111.CloudFront.NET."), Some("cloudfront"));
+    assert_eq!(crate::providers::provider_by_cname("notcloudfront.net"), None);
+}
+
+#[test]
+fn provider_by_cname_matches_plain_suffix_scan() {
+    // 索引版的結果要跟「所有後綴由長到短逐一比對」（2.x 的做法）完全一樣
+    use crate::providers::{provider_by_cname, PROVIDERS};
+    let mut all: Vec<(&str, &str)> = PROVIDERS.iter().flat_map(|p| p.cname.iter().map(move |s| (*s, p.name))).collect();
+    all.sort_by_key(|x| std::cmp::Reverse(x.0.len()));
+    let naive = |host: &str| {
+        let h = host.trim_end_matches('.').to_ascii_lowercase();
+        all.iter()
+            .find(|(suf, _)| h == *suf || (h.len() > suf.len() && h.ends_with(suf) && h.as_bytes()[h.len() - suf.len() - 1] == b'.'))
+            .map(|x| x.1)
+    };
+    let mut n = 0;
+    for (suf, _) in &all {
+        let long = format!("{}.{suf}", "a".repeat(70));
+        for host in [
+            suf.to_string(),
+            format!("x.{suf}"),
+            format!("a.b.{}.", suf.to_ascii_uppercase()),
+            format!("x{suf}"),
+            format!("{suf}.example.com"),
+            suf.split_once('.').map(|x| x.1.to_string()).unwrap_or_default(),
+            long,
+        ] {
+            assert_eq!(provider_by_cname(&host), naive(&host), "{host}");
+            n += 1;
+        }
+    }
+    assert!(n > 100);
+    for host in ["", ".", "com", "example.com", "localhost."] {
+        assert_eq!(provider_by_cname(host), naive(host), "{host}");
+    }
+}

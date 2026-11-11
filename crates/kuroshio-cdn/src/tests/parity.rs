@@ -165,7 +165,7 @@ fn parity_rewrite_decisions() {
     let (orig, orig_net) = mk("original");
     let (alias, alias_net) = mk("alias");
     let node = |v: &Value| -> PoolNode { serde_json::from_value(v.clone()).unwrap() };
-    let cs = |k: &str| -> crate::cidr::CidrSet {
+    let cs = |k: &str| -> Arc<crate::cidr::CidrSet> {
         let l = str_list(&p[k]);
         cidr(&l.iter().map(|s| s.as_str()).collect::<Vec<_>>())
     };

@@ -4,6 +4,7 @@
 //! - `ecs`：走 ECS 突破（DNS 分流型 CDN，用台灣子網路去問權威 DNS 拿台灣節點）
 //! - 只有 CNAME 的廠商只做網域蒐集與分析（設定裡開 `ecs: true` 也會嘗試 ECS 突破）
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// 回應標頭（名稱小寫）
@@ -209,24 +210,72 @@ pub fn label(name: &str) -> &str {
     get(name).map(|p| p.label).unwrap_or(name)
 }
 
-fn cname_index() -> &'static [(&'static str, &'static str)] {
-    static IDX: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+/// CNAME 後綴索引：依「最後兩段」分組（`d111.cloudfront.net` 只要比 `cloudfront.net` 那一組），
+/// 組內長的在前（同 2.x：長的先比）。只有一段的後綴放 `rest`
+struct CnameIndex {
+    by2: HashMap<&'static str, Vec<(&'static str, &'static str)>>,
+    rest: Vec<(&'static str, &'static str)>,
+}
+
+/// 最後兩段（不到兩段回 None）
+fn last2(s: &str) -> Option<&str> {
+    let i = s.rfind('.')?;
+    Some(match s[..i].rfind('.') {
+        Some(j) => &s[j + 1..],
+        None => s,
+    })
+}
+
+fn cname_index() -> &'static CnameIndex {
+    static IDX: OnceLock<CnameIndex> = OnceLock::new();
     IDX.get_or_init(|| {
         let mut v: Vec<(&str, &str)> = PROVIDERS.iter().flat_map(|p| p.cname.iter().map(move |s| (*s, p.name))).collect();
         v.sort_by_key(|x| std::cmp::Reverse(x.0.len())); // 長的先比（穩定排序，同 2.x）
-        v
+        let mut idx = CnameIndex {
+            by2: HashMap::new(),
+            rest: Vec::new(),
+        };
+        for x in v {
+            match last2(x.0) {
+                Some(k) => idx.by2.entry(k).or_default().push(x),
+                None => idx.rest.push(x),
+            }
+        }
+        idx
     })
 }
 
 /// 依 CNAME 後綴判斷廠商
 pub fn provider_by_cname(host: &str) -> Option<&'static str> {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    for (suf, name) in cname_index() {
-        if h == *suf || (h.len() > suf.len() && h.ends_with(suf) && h.as_bytes()[h.len() - suf.len() - 1] == b'.') {
-            return Some(name);
+    // 每個有 CNAME 的回應都會跑：不配置記憶體，不分大小寫比對結尾
+    let host = host.trim_end_matches('.');
+    let h = host.as_bytes();
+    let hit = |list: &[(&'static str, &'static str)]| {
+        list.iter()
+            .find(|(suf, _)| {
+                let s = suf.as_bytes();
+                h.len() >= s.len()
+                    && h[h.len() - s.len()..].eq_ignore_ascii_case(s)
+                    && (h.len() == s.len() || h[h.len() - s.len() - 1] == b'.')
+            })
+            .map(|x| x.1)
+    };
+    let idx = cname_index();
+    if let Some(k) = last2(host) {
+        let mut buf = [0u8; 64];
+        let group = if k.len() <= buf.len() {
+            let b = &mut buf[..k.len()];
+            b.copy_from_slice(k.as_bytes());
+            b.make_ascii_lowercase();
+            std::str::from_utf8(b).ok().and_then(|k| idx.by2.get(k))
+        } else {
+            idx.by2.get(k.to_ascii_lowercase().as_str())
+        };
+        if let Some(p) = group.and_then(|g| hit(g)) {
+            return Some(p);
         }
     }
-    None
+    hit(&idx.rest)
 }
 
 /// 台灣 POP：TPE 台北、KHH 高雄、TSA 松山、RMQ 台中、TXG 台中、TNN 台南（開頭比對，不分大小寫）

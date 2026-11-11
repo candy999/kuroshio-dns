@@ -82,6 +82,13 @@ impl CidrSet {
         self.sorted = false;
     }
 
+    /// 把另一個集合的區段全部加進來（之後要 `finalize`）
+    pub fn extend_from(&mut self, o: &CidrSet) {
+        self.v4.extend_from_slice(&o.v4);
+        self.v6.extend_from_slice(&o.v6);
+        self.sorted = false;
+    }
+
     /// 排序並合併相鄰 / 重疊的區段
     pub fn finalize(&mut self) -> &mut Self {
         fn merge<T: Ord + Copy>(arr: &mut Vec<(T, T)>, adjacent: impl Fn(T, T) -> bool) {

@@ -10,11 +10,11 @@
 
 use crate::cdn::{normalize, Cdn, State, Task};
 use crate::db::{Domain, Policy, Strategy};
-use crate::pools::{Cls, Pools};
+use crate::pools::{Classifier, Cls, Pools};
 use crate::providers::{self, provider_by_cname};
 use crate::svcb::{self, Hint};
 use crate::util::{self, now_ms};
-use kuroshio_proto::logic::{cname_targets, terminal_name};
+use kuroshio_proto::logic::terminal_name;
 use kuroshio_proto::message::{rtype, Message, RData, Record};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -156,26 +156,27 @@ impl Cdn {
     }
 
     /// 找出這個回應屬於哪家 CDN（IP 範圍優先，再看 CNAME 鏈最末端）
-    fn detect(pools: &Pools, msg: &Message) -> Option<(&'static str, &'static str)> {
-        let mut ips: Vec<IpAddr> = msg.answers.iter().filter_map(ip_of).collect();
+    /// 每個 A / AAAA / HTTPS 回應都會跑（絕大多數不是 CDN）：不拿狀態鎖、不配置記憶體
+    fn detect(cls: &Classifier, msg: &Message) -> Option<(&'static str, &'static str)> {
+        if let Some(c) = msg.answers.iter().filter_map(ip_of).find_map(|ip| cls.classify(ip)) {
+            return Some((c.provider, "ip"));
+        }
         for a in msg.answers.iter().filter(|a| is_svcb(a)) {
             if let RData::Raw(d) = &a.data {
                 let (v4, v6) = svcb::hints(d);
-                ips.extend(v4.into_iter().map(IpAddr::V4));
-                ips.extend(v6.into_iter().map(IpAddr::V6));
+                let mut ips = v4.into_iter().map(IpAddr::V4).chain(v6.into_iter().map(IpAddr::V6));
+                if let Some(c) = ips.find_map(|ip| cls.classify(ip)) {
+                    return Some((c.provider, "ip"));
+                }
             }
         }
-        for ip in ips {
-            if let Some(c) = pools.classify(ip) {
-                return Some((c.provider, "ip"));
-            }
-        }
-        for t in cname_targets(msg).iter().rev() {
-            if let Some(p) = provider_by_cname(t) {
-                return Some((p, "cname"));
-            }
-        }
-        None
+        msg.answers
+            .iter()
+            .rev()
+            .filter(|a| a.rtype == rtype::CNAME)
+            .filter_map(|a| a.target())
+            .find_map(provider_by_cname)
+            .map(|p| (p, "cname"))
     }
 
     /// 回給用戶端的 IP 中最快的延遲（測速快取或節點池紀錄）
@@ -221,12 +222,17 @@ impl Cdn {
         if qtype != rtype::A && qtype != rtype::AAAA && qtype != rtype::HTTPS {
             return res;
         }
+        // 先用唯讀快照判斷是不是 CDN：不是（絕大多數的回應）就直接回去，不碰狀態鎖
+        let Some((provider, via)) = self.with_classifier(|c| Self::detect(c, msg)) else {
+            return res;
+        };
         let name = normalize(qname);
+        let cname = terminal_name(msg, &name);
         let mut tasks: Vec<Task> = Vec::new();
         {
             let mut st = self.state();
             let st = &mut *st;
-            self.apply_locked(st, msg, &name, qtype, &mut res, &mut tasks);
+            self.apply_locked(st, msg, &name, qtype, provider, via, &cname, &mut res, &mut tasks);
             if let Some(r) = res.rewritten {
                 st.db.set_best(
                     &name,
@@ -242,15 +248,23 @@ impl Cdn {
         res
     }
 
-    fn apply_locked(&self, st: &mut State, msg: &mut Message, name: &str, qtype: u16, res: &mut ApplyResult, tasks: &mut Vec<Task>) {
-        let Some((provider, via)) = Self::detect(&st.pools, msg) else {
-            return;
-        };
+    #[allow(clippy::too_many_arguments)]
+    fn apply_locked(
+        &self,
+        st: &mut State,
+        msg: &mut Message,
+        name: &str,
+        qtype: u16,
+        provider: &'static str,
+        via: &str,
+        cname: &str,
+        res: &mut ApplyResult,
+        tasks: &mut Vec<Task>,
+    ) {
         res.provider = Some(provider);
         let ips4: Vec<IpAddr> = msg.answers.iter().filter(|a| a.rtype == rtype::A).filter_map(ip_of).collect();
         let ips6: Vec<IpAddr> = msg.answers.iter().filter(|a| a.rtype == rtype::AAAA).filter_map(ip_of).collect();
-        let cname = terminal_name(msg, name);
-        let entry = st.db.touch(name, provider, via, &ips4, &ips6, Some(&cname));
+        let entry = st.db.touch(name, provider, via, &ips4, &ips6, Some(cname));
         if entry.policy() == Policy::Never {
             res.tags.push("CDN-略過".into());
             return;

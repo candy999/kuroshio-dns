@@ -233,14 +233,16 @@ impl PoolsFile {
 /// 一家 CDN 的節點池與範圍
 #[derive(Debug, Clone, Default)]
 pub struct ProviderPools {
-    pub range4: CidrSet,
-    pub range6: CidrSet,
-    pub tw: CidrSet,
-    pub global: CidrSet,
-    pub dead: CidrSet,
+    // 範圍與分類用 `Arc`：查詢時用的唯讀快照（`Classifier`）直接共用同一份，不必複製。
+    // 要改就整個換掉（`d.tw = Arc::new(...)`）；快照靠指標有沒有變來判斷要不要更新
+    pub range4: Arc<CidrSet>,
+    pub range6: Arc<CidrSet>,
+    pub tw: Arc<CidrSet>,
+    pub global: Arc<CidrSet>,
+    pub dead: Arc<CidrSet>,
     pub pool4: Vec<PoolNode>,
     pub pool6: Vec<PoolNode>,
-    pub tw48: CidrSet,
+    pub tw48: Arc<CidrSet>,
     /// 最近節點型（Fastly）：每個 POP 的所有 /24（每日工作掃出來）
     pub prefixes: IndexMap<String, Vec<u32>>,
     pub bad: HashMap<IpAddr, Bad>,
@@ -254,6 +256,37 @@ pub struct ProviderPools {
 }
 
 impl ProviderPools {
+    /// 這個 IP（IPv4-mapped 已先轉成 IPv4）在這家 CDN 的分類；不在範圍內回 None
+    fn class_of(&self, ip: IpAddr, nearest: bool) -> Option<Cls> {
+        if ip.is_ipv4() {
+            if self.global.contains(ip) {
+                return Some(Cls::Global);
+            }
+            // 沒有台灣 POP 的 CDN：舊掃描的「TW」是誤判，一律當成國外
+            if self.tw.contains(ip) {
+                return Some(if nearest { Cls::Global } else { Cls::Tw });
+            }
+            if self.dead.contains(ip) {
+                return Some(Cls::Dead);
+            }
+            if self.range4.contains(ip) {
+                return Some(Cls::Unknown);
+            }
+        } else if self.range6.contains(ip) {
+            return Some(if self.tw48.contains(ip) { Cls::Tw } else { Cls::Global });
+        }
+        None
+    }
+
+    /// 範圍與分類是不是同一份（比指標）
+    fn same_ranges(&self, o: &ProviderPools) -> bool {
+        Arc::ptr_eq(&self.range4, &o.range4)
+            && Arc::ptr_eq(&self.range6, &o.range6)
+            && Arc::ptr_eq(&self.tw, &o.tw)
+            && Arc::ptr_eq(&self.global, &o.global)
+            && Arc::ptr_eq(&self.dead, &o.dead)
+            && Arc::ptr_eq(&self.tw48, &o.tw48)
+    }
     pub fn pool(&self, family: u8) -> &Vec<PoolNode> {
         if family == 6 {
             &self.pool6
@@ -267,6 +300,46 @@ impl ProviderPools {
         } else {
             &mut self.pool4
         }
+    }
+}
+
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    }
+}
+
+/// 「IP 屬於哪家 CDN、哪一類」的唯讀快照：每個回應都要查，不必拿 `Cdn` 的大鎖。
+/// 內容跟 `Pools::classify` 完全一樣（同一個判斷函式、同一份範圍資料）；範圍或分類換掉之後，
+/// `Cdn` 在放開鎖的時候會自動換一份新的快照
+#[derive(Debug, Default)]
+pub struct Classifier {
+    /// 所有 CDN 的範圍聯集（先用它篩掉不是 CDN 的 IP）
+    any: CidrSet,
+    /// （CDN，是不是最近節點型，範圍與分類——只有這幾個欄位有內容）
+    list: Vec<(&'static str, bool, ProviderPools)>,
+}
+
+impl Classifier {
+    pub fn classify(&self, ip: IpAddr) -> Option<Class> {
+        let ip = unmap(ip);
+        if !self.any.contains(ip) {
+            return None;
+        }
+        self.list
+            .iter()
+            .find_map(|(name, nearest, d)| d.class_of(ip, *nearest).map(|cls| Class { provider: name, cls }))
+    }
+
+    /// 跟 `pools` 目前的範圍是不是同一份（CDN 的數量、順序、每個集合的指標都一樣）
+    pub fn same_as(&self, pools: &Pools) -> bool {
+        self.list.len() == pools.p.len()
+            && self
+                .list
+                .iter()
+                .zip(&pools.p)
+                .all(|((name, _, a), (n2, b))| name == n2 && a.same_ranges(b))
     }
 }
 
@@ -317,7 +390,7 @@ impl Pools {
                     s.add_text(&t);
                 }
                 s.add_many(extra.iter().copied());
-                s.done()
+                Arc::new(s.done())
             };
             let range4 = set(&format!("ranges/{name}-ipv4.txt"), prov.extra_v4);
             let range6 = set(&format!("ranges/{name}-ipv6.txt"), prov.extra_v6);
@@ -398,7 +471,7 @@ impl Pools {
                     dead,
                     pool4,
                     pool6,
-                    tw48: tw48.done(),
+                    tw48: Arc::new(tw48.done()),
                     prefixes,
                     rest: saved.rest,
                     has_v4,
@@ -421,7 +494,7 @@ impl Pools {
                     s.add_text(&t);
                 }
                 s.add_many(extra.iter().copied());
-                s.done()
+                Arc::new(s.done())
             };
             d.range4 = set(&format!("ranges/{name}-ipv4.txt"), prov.extra_v4);
             d.range6 = set(&format!("ranges/{name}-ipv6.txt"), prov.extra_v6);
@@ -482,7 +555,7 @@ impl Pools {
                 tw48.add(s);
             }
         }
-        d.tw48 = tw48.done();
+        d.tw48 = Arc::new(tw48.done());
         d.pool4 = pool4;
         d.pool6 = pool6;
         d.rest = rest;
@@ -744,31 +817,43 @@ impl Pools {
 
     /// 判斷 IP 屬於哪個 CDN 及其分類
     pub fn classify(&self, ip: IpAddr) -> Option<Class> {
-        let ip = match ip {
-            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-            _ => ip,
-        };
-        for (name, d) in &self.p {
-            let c = |cls| Some(Class { provider: name, cls });
-            if ip.is_ipv4() {
-                if d.global.contains(ip) {
-                    return c(Cls::Global);
-                }
-                // 沒有台灣 POP 的 CDN：舊掃描的「TW」是誤判，一律當成國外
-                if d.tw.contains(ip) {
-                    return c(if self.is_nearest(name) { Cls::Global } else { Cls::Tw });
-                }
-                if d.dead.contains(ip) {
-                    return c(Cls::Dead);
-                }
-                if d.range4.contains(ip) {
-                    return c(Cls::Unknown);
-                }
-            } else if d.range6.contains(ip) {
-                return c(if d.tw48.contains(ip) { Cls::Tw } else { Cls::Global });
+        let ip = unmap(ip);
+        self.p
+            .iter()
+            .find_map(|(name, d)| d.class_of(ip, self.is_nearest(name)).map(|cls| Class { provider: name, cls }))
+    }
+
+    /// 目前範圍與分類的唯讀快照（共用同一份 `CidrSet`，只複製指標）
+    pub fn classifier(&self) -> Classifier {
+        // 所有 CDN 的範圍合成一個集合：不在裡面的 IP（絕大多數）查一次就知道不是 CDN
+        let mut any = CidrSet::new();
+        for d in self.p.values() {
+            for s in [&d.range4, &d.range6, &d.tw, &d.global, &d.dead] {
+                any.extend_from(s);
             }
         }
-        None
+        Classifier {
+            any: any.done(),
+            list: self
+                .p
+                .iter()
+                .map(|(name, d)| {
+                    (
+                        *name,
+                        self.is_nearest(name),
+                        ProviderPools {
+                            range4: d.range4.clone(),
+                            range6: d.range6.clone(),
+                            tw: d.tw.clone(),
+                            global: d.global.clone(),
+                            dead: d.dead.clone(),
+                            tw48: d.tw48.clone(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
     pub fn best_ms(&self, provider: &str, family: u8) -> Option<f64> {
@@ -924,8 +1009,8 @@ fn parse_prefixes(v: Option<&Value>) -> IndexMap<String, Vec<u32>> {
 }
 
 /// 測試與工作用：由清單建立 CIDR 集合
-pub fn cidr(list: &[&str]) -> CidrSet {
+pub fn cidr(list: &[&str]) -> Arc<CidrSet> {
     let mut s = CidrSet::new();
     s.add_many(list.iter().copied());
-    s.done()
+    Arc::new(s.done())
 }

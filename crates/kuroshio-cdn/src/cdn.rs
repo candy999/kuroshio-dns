@@ -3,13 +3,16 @@
 use crate::config::CdnConfig;
 use crate::db::{self, Db};
 use crate::net::Net;
-use crate::pools::{self, Pools, PoolsFile};
+use crate::pools::{self, Classifier, Pools, PoolsFile};
 use crate::util::{self, now_ms};
 use crate::v6store::{self, V6Store};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -122,6 +125,42 @@ pub struct State {
     pub ecs_subnets: Vec<String>,
     /// 每個網段成功找到更近節點的次數
     pub ecs_wins: HashMap<String, u32>,
+    /// 目前公布給查詢用的分類快照（跟 `Cdn::classifier` 是同一份；用來判斷範圍有沒有換過）
+    classifier: Arc<Classifier>,
+}
+
+/// 拿著狀態鎖的期間。放開的時候如果節點池的範圍 / 分類換過，順便更新查詢用的分類快照
+/// （不管是誰、用什麼方式改的都會被發現，不需要每個改的地方記得通知）
+pub struct StateGuard<'a> {
+    g: MutexGuard<'a, State>,
+    cdn: &'a Cdn,
+    mutated: bool,
+}
+
+impl Deref for StateGuard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.g
+    }
+}
+
+impl DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.mutated = true;
+        &mut self.g
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        if self.mutated && !self.g.classifier.same_as(&self.g.pools) {
+            let c = Arc::new(self.g.pools.classifier());
+            self.g.classifier = c.clone();
+            *self.cdn.classifier.write().unwrap_or_else(|e| e.into_inner()) = c;
+            // 先換內容、再加版本號（讀的那邊順序相反）：不會有人把舊內容記成新版本
+            self.cdn.cls_gen.fetch_add(1, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -137,12 +176,25 @@ pub struct Cdn {
     pub paths: Paths,
     pub(crate) net: Arc<dyn Net>,
     state: Mutex<State>,
+    /// IP 分類的唯讀快照：`apply()` 先用它判斷回應是不是 CDN，不是的話完全不碰 `state` 的鎖
+    classifier: RwLock<Arc<Classifier>>,
+    /// 分類快照的版本號（換一次加一）與這個 `Cdn` 的編號：每個執行緒記住自己上次拿到的那一份，
+    /// 版本沒變就不必碰共用的鎖與參照計數（多核心同時查詢時不會互相拖慢）
+    cls_gen: AtomicU32,
+    cls_id: u32,
     bg: Mutex<Bg>,
     pub(crate) verify_sem: Arc<Semaphore>,
     pub(crate) ecs_sem: Arc<Semaphore>,
     pub(crate) cross_sem: Arc<Semaphore>,
     hints: RwLock<Option<Arc<dyn Hints>>>,
     on_low_pool: RwLock<Option<LowPoolFn>>,
+}
+
+static NEXT_CLS_ID: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    /// （`Cdn` 編號，版本號，分類快照）
+    static CLS: RefCell<Option<(u32, u32, Arc<Classifier>)>> = const { RefCell::new(None) };
 }
 
 type LowPoolFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -239,7 +291,11 @@ impl Cdn {
             info!("第一次啟動，帶入種子資料：{}", used.join("、"));
         }
 
+        let classifier = Arc::new(pools.classifier());
         let me = Cdn {
+            classifier: RwLock::new(classifier.clone()),
+            cls_gen: AtomicU32::new(0),
+            cls_id: NEXT_CLS_ID.fetch_add(1, Ordering::Relaxed),
             verify_sem: Arc::new(Semaphore::new(c.verify_concurrency.max(1))),
             ecs_sem: Arc::new(Semaphore::new(c.ecs.concurrency.max(1))),
             cross_sem: Arc::new(Semaphore::new(c.cross.concurrency.max(1))),
@@ -253,6 +309,7 @@ impl Cdn {
                 ecs_preferred: Vec::new(),
                 ecs_subnets: c.ecs.tw_subnets.clone(),
                 ecs_wins: HashMap::new(),
+                classifier,
             }),
             cfg: c,
             paths,
@@ -295,8 +352,34 @@ impl Cdn {
     }
 
     /// 取得狀態（不要拿著鎖做網路操作）
-    pub fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap()
+    pub fn state(&self) -> StateGuard<'_> {
+        StateGuard {
+            g: self.state.lock().unwrap(),
+            cdn: self,
+            mutated: false,
+        }
+    }
+
+    /// IP 分類的唯讀快照（不拿狀態鎖）
+    pub fn classifier(&self) -> Arc<Classifier> {
+        self.classifier.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 用目前的分類快照做事（查詢路徑用）：這個執行緒上次拿到的那一份還是最新的就直接用
+    pub(crate) fn with_classifier<R>(&self, f: impl FnOnce(&Classifier) -> R) -> R {
+        let gen = self.cls_gen.load(Ordering::Acquire);
+        CLS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match &*slot {
+                Some((id, g, c)) if *id == self.cls_id && *g == gen => f(c),
+                _ => {
+                    let c = self.classifier();
+                    let r = f(&c);
+                    *slot = Some((self.cls_id, gen, c));
+                    r
+                }
+            }
+        })
     }
 
     /// 改狀態；節點不足的通知在放開鎖之後才送出
@@ -471,7 +554,7 @@ impl Cdn {
 
     /// IP 屬於哪家 CDN、哪一類
     pub fn classify(&self, ip: IpAddr) -> Option<crate::Class> {
-        self.state().pools.classify(ip)
+        self.with_classifier(|c| c.classify(ip))
     }
 
     /// 這家是不是 IP 置換型（任播）CDN
