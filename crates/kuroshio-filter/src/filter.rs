@@ -99,13 +99,16 @@ pub(crate) struct TierData {
     pub patterns: Box<[PatternRule]>,
     /// 複雜規則的索引：（固定字串開頭三個字元的雜湊，規則編號），依雜湊排序。
     /// 查詢時只看「名稱裡有出現那個雜湊」的規則，不必每個查詢把幾千條規則全部掃一遍
-    pub by_tri: Box<[(u16, u32)]>,
+    pub by_tri: TriIndex,
     /// 沒有固定字串可以先篩的規則（每個查詢都要比對），依編號排序
     pub always: Box<[u32]>,
 }
 
+/// （三字元雜湊，規則編號），依雜湊排序
+pub(crate) type TriIndex = Box<[(u16, u32)]>;
+
 /// 建立複雜規則的索引（見 `TierData::by_tri` / `always`）
-pub(crate) fn pattern_index(patterns: &[PatternRule]) -> (Box<[(u16, u32)]>, Box<[u32]>) {
+pub(crate) fn pattern_index(patterns: &[PatternRule]) -> (TriIndex, Box<[u32]>) {
     let mut by_tri = Vec::new();
     let mut always = Vec::new();
     for (i, p) in patterns.iter().enumerate() {

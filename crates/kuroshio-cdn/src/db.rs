@@ -436,6 +436,9 @@ pub struct Query {
     pub sort: Option<String>,
 }
 
+/// 分段寫快照時要寫的網域：（查詢次數，名稱）
+pub type DumpKeys = Vec<(u32, Arc<str>)>;
+
 pub struct Db {
     pub domains: HashMap<Arc<str>, Domain>,
     pub harvest: IndexMap<String, HarvestSet>,
@@ -548,7 +551,7 @@ impl Db {
     /// 分段寫 `cdn-domains.json` 的第一步（拿著鎖）：整理、定出「開頭」與「結尾」，列出要寫的網域。
     /// 回傳（開頭，結尾，（查詢次數，名稱）——還沒排序）。接著放開鎖排序，再分批呼叫 `dump_chunk`。
     /// 內容跟 `domains_json()` 一樣，只是不必整個過程都拿著鎖（20 萬筆要半秒，期間所有 CDN 回應都卡住）
-    pub fn dump_begin(&mut self) -> (Vec<u8>, Vec<u8>, Vec<(u32, Arc<str>)>) {
+    pub fn dump_begin(&mut self) -> (Vec<u8>, Vec<u8>, DumpKeys) {
         if self.domains.len() > self.max_entries {
             self.prune();
         }
