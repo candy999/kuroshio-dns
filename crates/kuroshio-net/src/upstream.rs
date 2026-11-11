@@ -135,9 +135,15 @@ impl Upstream {
         Ok(SocketAddr::new(self.host.parse()?, self.port))
     }
 
-    /// 送出查詢，回傳原始回應（id 已改回原本的）
+    /// 送出查詢，回傳原始回應（id 已改回原本的）。
+    /// 回應一律要「id 與問題」都跟送出的查詢相同：UDP / TCP 不相符的封包丟掉、繼續等到逾時；
+    /// DoH / DoH3 / DoQ 送出的 id 是 0（RFC 8484 第 4.1 節建議，方便 HTTP 快取；DoQ 規定），回應的 id 也必須是 0
     pub async fn exchange(&self, query: &[u8], limit: Duration) -> Result<Vec<u8>> {
-        let id = next_id();
+        let id = if matches!(self.kind, Kind::Doh | Kind::Doh3 | Kind::Doq) {
+            0
+        } else {
+            next_id()
+        };
         let mut q = query.to_vec();
         kuroshio_proto::set_id(&mut q, id);
         // 加密上游：查詢補到 128 的倍數（RFC 8467），封包長度不洩漏查了什麼
@@ -220,16 +226,21 @@ async fn udp_exchange(addr: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// TCP 查詢：id 或問題不相符的回應（偽造或錯置的）丟掉、繼續讀，跟 UDP 一樣等到相符的或逾時（呼叫端限時）
 pub async fn tcp_exchange(addr: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
     let mut s = TcpStream::connect(addr).await?;
     let mut msg = Vec::with_capacity(q.len() + 2);
     msg.extend_from_slice(&(q.len() as u16).to_be_bytes());
     msg.extend_from_slice(q);
     s.write_all(&msg).await?;
-    let len = s.read_u16().await? as usize;
-    let mut buf = vec![0u8; len];
-    s.read_exact(&mut buf).await?;
-    Ok(buf)
+    loop {
+        let len = s.read_u16().await? as usize;
+        let mut buf = vec![0u8; len];
+        s.read_exact(&mut buf).await?;
+        if kuroshio_proto::matches(q, &buf) {
+            return Ok(buf);
+        }
+    }
 }
 
 #[cfg(test)]

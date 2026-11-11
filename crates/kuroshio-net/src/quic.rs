@@ -130,6 +130,9 @@ impl Doq {
                         bail!("DoQ 回應不完整");
                     }
                     let mut resp = buf[2..2 + len].to_vec();
+                    if resp[..2] != [0, 0] {
+                        bail!("DoQ 回應的 id 不是 0（送出的是 0）");
+                    }
                     resp[..2].copy_from_slice(&orig);
                     return Ok(resp);
                 }
@@ -212,6 +215,9 @@ impl Doh3 {
             .await;
             match r {
                 Ok(Ok(mut resp)) if resp.len() >= 12 => {
+                    if resp[..2] != [0, 0] {
+                        bail!("DoH3 回應的 id 不是 0（送出的是 0）");
+                    }
                     resp[..2].copy_from_slice(&orig);
                     return Ok(resp);
                 }

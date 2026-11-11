@@ -433,15 +433,17 @@ impl Dot {
     }
 }
 
-/// 連線的讀寫迴圈：每筆查詢換一個連線內不重複的 id，回應依 id 送回；閒置 30 秒關閉
+/// 連線的讀寫迴圈：每筆查詢換一個連線內不重複的 id，回應依 id 送回；閒置 30 秒關閉。
+/// id 對不上任何一筆、或 id 對上但問題不同的回應（偽造或錯置的）丟掉，那筆查詢繼續等（跟 UDP 一樣，等到逾時）
 async fn dot_task(s: TlsStream<TcpStream>, mut rx: mpsc::Receiver<(Vec<u8>, Reply)>) {
     let (mut rd, mut wr) = tokio::io::split(s);
-    let mut pending: HashMap<u16, (u16, Reply)> = HashMap::new();
+    // 連線內的 id →（原本的 id，送出的查詢，回覆）
+    let mut pending: HashMap<u16, (u16, Vec<u8>, Reply)> = HashMap::new();
     let mut next: u16 = 1;
     let idle = Duration::from_secs(30);
     let mut len_buf = [0u8; 2];
-    let fail_all = |pending: &mut HashMap<u16, (u16, Reply)>, why: &str| {
-        for (_, (_, r)) in pending.drain() {
+    let fail_all = |pending: &mut HashMap<u16, (u16, Vec<u8>, Reply)>, why: &str| {
+        for (_, (_, _, r)) in pending.drain() {
             let _ = r.send(Err(anyhow!("{why}")));
         }
     };
@@ -465,7 +467,7 @@ async fn dot_task(s: TlsStream<TcpStream>, mut rx: mpsc::Receiver<(Vec<u8>, Repl
                     fail_all(&mut pending, "DoT 寫入失敗");
                     break;
                 }
-                pending.insert(next, (orig, reply));
+                pending.insert(next, (orig, q, reply));
                 next = next.wrapping_add(1);
             }
             r = rd.read_exact(&mut len_buf) => {
@@ -479,9 +481,12 @@ async fn dot_task(s: TlsStream<TcpStream>, mut rx: mpsc::Receiver<(Vec<u8>, Repl
                     break;
                 }
                 let id = u16::from_be_bytes([resp[0], resp[1]]);
-                if let Some((orig, reply)) = pending.remove(&id) {
+                if pending.get(&id).map(|p| kuroshio_proto::matches(&p.1, &resp)).unwrap_or(false) {
+                    let (orig, _, reply) = pending.remove(&id).unwrap();
                     resp[..2].copy_from_slice(&orig.to_be_bytes());
                     let _ = reply.send(Ok(resp));
+                } else {
+                    debug!("DoT 回應的 id / 問題對不上，丟掉");
                 }
             }
             _ = tokio::time::sleep(idle), if pending.is_empty() => break,
@@ -537,7 +542,7 @@ impl Doh {
         Ok(out)
     }
 
-    /// RFC 8484 POST；查詢 id 改成 0（方便 HTTP 快取），回應再改回原本的 id
+    /// RFC 8484 POST；查詢 id 改成 0（方便 HTTP 快取），回應的 id 也必須是 0，再改回原本的 id
     pub async fn exchange(&self, host: &str, port: u16, path: &str, q: &[u8], timeout: Duration) -> Result<Vec<u8>> {
         let orig = [q[0], q[1]];
         let mut body = q.to_vec();
@@ -558,6 +563,9 @@ impl Doh {
             .await;
             match r {
                 Ok(Ok(mut resp)) if resp.len() >= 12 => {
+                    if resp[..2] != [0, 0] {
+                        bail!("DoH 回應的 id 不是 0（送出的是 0）");
+                    }
                     resp[..2].copy_from_slice(&orig);
                     return Ok(resp);
                 }
