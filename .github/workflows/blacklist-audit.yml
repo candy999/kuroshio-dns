@@ -1,0 +1,30 @@
+name: 汙染黑名單體檢
+
+# 手動執行：用每日評測同一個標準（回答的 IP 用網域檢查憑證）重新驗證 data/benchmark/blacklist.txt，
+# 只留下確定劫持的。結果（新名單、逐筆報表）放在 Artifacts，確認後再 commit。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: 體檢
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 體檢
+        run: cargo run --release -p kuroshio-jobs --bin blacklist-audit -- data/benchmark/blacklist.txt blacklist-audit
+      - name: 摘要
+        if: always()
+        run: |
+          if [ -f blacklist-audit/report.md ]; then head -n 20 blacklist-audit/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blacklist-audit
+          path: blacklist-audit/
