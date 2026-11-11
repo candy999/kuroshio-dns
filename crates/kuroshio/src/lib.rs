@@ -18,6 +18,7 @@ pub mod encrypted;
 pub mod filtering;
 pub mod iiscert;
 pub mod logring;
+pub mod netif;
 pub mod persist;
 pub mod presence;
 pub mod resolver;

@@ -52,6 +52,9 @@ ring = "0.17"
 # 備份檔（.kuroshio）：zstd 壓縮的 JSON，二進位檔用 base64
 zstd = { version = "0.13", default-features = false }
 base64 = "0.22"
+# 列出本機網卡與位址（多網卡 / 多出口的 DDNS）：Unix 用 getifaddrs、Windows 用 GetAdaptersAddresses；
+# 只依賴 libc / windows-sys（本來就在相依樹裡）
+if-addrs = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

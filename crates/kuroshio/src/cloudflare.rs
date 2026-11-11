@@ -26,6 +26,11 @@ impl Cloudflare {
     }
 
     pub async fn api(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+        Ok(self.api_raw(method, path, body).await?["result"].clone())
+    }
+
+    /// 同 `api`，但回傳整個回應（含 `result_info`，分頁用）
+    pub async fn api_raw(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         let b = body.map(|v| serde_json::to_vec(v).unwrap());
         let req = Request {
             method,
@@ -50,7 +55,35 @@ impl Cloudflare {
                 .unwrap_or(format!("HTTP {status}"));
             bail!("Cloudflare API {method} {}：{msg}", path.split('?').next().unwrap_or(path));
         }
-        Ok(j["result"].clone())
+        Ok(j)
+    }
+
+    /// 列出某個名稱、某種類型的全部記錄（一頁 100 筆，照 `result_info.total_pages` 讀完；最多 20 頁）
+    pub async fn list_records(&self, zone_id: &str, rtype: &str, name: &str) -> Result<Vec<Value>> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u64 = 20;
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let j = self
+                .api_raw(
+                    "GET",
+                    &format!("/zones/{zone_id}/dns_records?type={rtype}&name={name}&per_page={PER_PAGE}&page={page}"),
+                    None,
+                )
+                .await?;
+            let items = j["result"].as_array().cloned().unwrap_or_default();
+            let n = items.len();
+            out.extend(items);
+            // 有 result_info 就照總頁數；沒有（或這一頁沒滿）就是最後一頁
+            let more = match j["result_info"]["total_pages"].as_u64() {
+                Some(total) => page < total,
+                None => n >= PER_PAGE,
+            };
+            if !more || n == 0 {
+                return Ok(out);
+            }
+        }
+        bail!("{name} 的 {rtype} 記錄超過 {} 筆，不處理", PER_PAGE as u64 * MAX_PAGES)
     }
 
     /// 找出記錄所屬的 zone：有設定 zone 就用它，否則從記錄名稱逐層往上試

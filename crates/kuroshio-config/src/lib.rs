@@ -307,7 +307,13 @@ mod tests {
         assert_eq!(get(&d, "domain"), Some(&json!("")));
         assert_eq!(get(&d, "tls"), Some(&json!({ "cert": "", "key": "" })));
         assert_eq!(get(&d, "listen.doh.tls"), Some(&json!("auto")));
-        for k in ["listen.dot.binds", "listen.doq.binds", "listen.doh.binds", "listen.doh.http3Binds", "ddns.interfaces"] {
+        for k in [
+            "listen.dot.binds",
+            "listen.doq.binds",
+            "listen.doh.binds",
+            "listen.doh.http3Binds",
+            "ddns.interfaces",
+        ] {
             assert_eq!(get(&d, k), Some(&json!([])), "{k}");
         }
         assert_eq!(get(&d, "ddns.ipv4"), Some(&json!(true)));

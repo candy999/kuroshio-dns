@@ -44,6 +44,55 @@ pub fn read(path: &Path) -> Result<Value, String> {
     }))
 }
 
+/// 憑證（`read` 的結果）有沒有涵蓋這個網域（含萬用字元 `*.example.com`）
+pub fn covers(info: &Value, domain: &str) -> bool {
+    let d = domain.trim().trim_end_matches('.').to_lowercase();
+    info["san"]
+        .as_str()
+        .unwrap_or("")
+        .split(", ")
+        .filter_map(|n| n.strip_prefix("DNS:"))
+        .map(str::to_lowercase)
+        .any(|n| {
+            n == d
+                || n.strip_prefix("*.")
+                    .is_some_and(|w| d.split_once('.').is_some_and(|(_, rest)| rest == w))
+        })
+}
+
+/// 自備憑證的檢查：檔案不存在、讀不出來、過期（或 7 天內到期）、沒有涵蓋綁定網域。
+/// 回傳要提醒使用者的訊息（沒問題時是空的）。只讀檔案，不會寫入或申請任何東西。
+pub fn problems(cert: &Path, key: &Path, domain: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !key.is_file() {
+        out.push(format!("私鑰檔不存在：{}", key.display()));
+    }
+    if !cert.is_file() {
+        out.push(format!("憑證檔不存在：{}", cert.display()));
+        return out;
+    }
+    match read(cert) {
+        Err(e) => out.push(format!("憑證 {} 讀不出來：{e}", cert.display())),
+        Ok(info) => {
+            let left = info["daysLeft"].as_i64().unwrap_or(0);
+            let until = info["validTo"].as_str().unwrap_or("");
+            if left < 0 {
+                out.push(format!("憑證 {} 已經過期（{until}），用戶端會拒絕連線", cert.display()));
+            } else if left < 7 {
+                out.push(format!("憑證 {} 剩 {left} 天到期（{until}）", cert.display()));
+            }
+            if !domain.is_empty() && !covers(&info, domain) {
+                out.push(format!(
+                    "憑證 {} 沒有涵蓋綁定網域 {domain}（憑證裡的名稱：{}）",
+                    cert.display(),
+                    info["san"].as_str().filter(|s| !s.is_empty()).unwrap_or("沒有")
+                ));
+            }
+        }
+    }
+    out
+}
+
 fn ip_text(b: &[u8]) -> String {
     match b.len() {
         4 => std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string(),

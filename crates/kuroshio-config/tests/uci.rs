@@ -256,7 +256,11 @@ fn existing_configs_convert_identically() {
     assert_eq!(g(&c, "listen.doh.cert"), &json!("/mnt/certs/fullchain.pem"));
     assert_eq!(g(&c, "listen.dot.key"), &json!("/mnt/certs/privkey.pem"));
     assert_eq!(g(&c, "listen.doh.host"), &json!("0.0.0.0"));
-    assert_eq!(g(&c, "listen.doh.tls"), &json!("auto"), "有明確的憑證、不是 127.0.0.1：照舊是 HTTPS");
+    assert_eq!(
+        g(&c, "listen.doh.tls"),
+        &json!("auto"),
+        "有明確的憑證、不是 127.0.0.1：照舊是 HTTPS"
+    );
     assert_eq!(g(&c, "listen.doh.binds"), &json!([]));
     assert_eq!(g(&c, "site.hostname"), &json!("dns.example.com"));
     assert_eq!(g(&c, "community.domain"), &json!("dns.example.com"));
@@ -270,7 +274,10 @@ fn existing_configs_convert_identically() {
 #[test]
 fn bound_domain_without_ddns_records() {
     // 固定網域：只填 tls.domain，DDNS 關閉 → 不產生記錄；DDNS 開了沒寫記錄 → 更新綁定網域
-    let fixed = load(&default_text().replace("option domain ''", "option domain 'dns.example.com'"), &env());
+    let fixed = load(
+        &default_text().replace("option domain ''", "option domain 'dns.example.com'"),
+        &env(),
+    );
     assert_eq!(g(&fixed, "domain"), &json!("dns.example.com"));
     assert_eq!(g(&fixed, "site.hostname"), &json!("dns.example.com"));
     assert_eq!(g(&fixed, "ddns.enabled"), &json!(false));
@@ -278,7 +285,10 @@ fn bound_domain_without_ddns_records() {
     let dd = load(
         &default_text()
             .replace("option domain ''", "option domain 'dns.example.com'")
-            .replace("config ddns 'ddns'\n\toption enabled '0'", "config ddns 'ddns'\n\toption enabled '1'"),
+            .replace(
+                "config ddns 'ddns'\n\toption enabled '0'",
+                "config ddns 'ddns'\n\toption enabled '1'",
+            ),
         &env(),
     );
     assert_eq!(g(&dd, "ddns.records"), &json!(["dns.example.com"]));

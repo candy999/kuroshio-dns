@@ -35,7 +35,10 @@ pub struct AcmeConfig {
     pub propagation: Duration,
 }
 
-/// 憑證檔位置：`acme.certFile` → `listen.dot.cert` → `listen.doh.cert` → `<設定目錄>/cert.pem`
+/// 內建 ACME 把憑證寫到哪裡：
+/// `acme.certFile` → `tls.cert`（共用憑證位置）→ `listen.dot.cert` → `listen.doh.cert` → `<設定目錄>/cert.pem`
+///
+/// 只有 `acme.enabled` 開著才會寫入；關閉時（自備憑證）這些檔案只會被讀取，絕不會被申請或覆蓋。
 pub fn cert_paths(cfg: &Value, base: &Path) -> (PathBuf, PathBuf) {
     let s = |k: &str| get(cfg, k).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
     let rel = |p: String| {
@@ -48,6 +51,7 @@ pub fn cert_paths(cfg: &Value, base: &Path) -> (PathBuf, PathBuf) {
     };
     let pair = s("acme.certFile")
         .zip(s("acme.keyFile"))
+        .or_else(|| s("tls.cert").zip(s("tls.key")))
         .or_else(|| s("listen.dot.cert").zip(s("listen.dot.key")))
         .or_else(|| s("listen.doh.cert").zip(s("listen.doh.key")));
     match pair {
@@ -74,8 +78,8 @@ impl AcmeConfig {
             })
             .unwrap_or_default();
         if domains.is_empty() {
-            // 沒寫網域：用公開頁的網域，再不然用 DDNS 的第一筆記錄
-            let fallback = [s("site.hostname")]
+            // 沒寫網域：用綁定網域，再來是公開頁的網域，再不然用 DDNS 的第一筆記錄
+            let fallback = [kuroshio_config::bound_domain(cfg), s("site.hostname")]
                 .into_iter()
                 .chain(
                     get(cfg, "ddns.records")
@@ -121,7 +125,7 @@ impl AcmeConfig {
 
     pub fn check(&self) -> Result<()> {
         if self.domains.is_empty() {
-            bail!("沒有設定網域（acme.domains，或 site.hostname / ddns.records）");
+            bail!("沒有設定網域（domain，或 acme.domains / site.hostname / ddns.records）");
         }
         if self.token.is_empty() {
             bail!("沒有設定 Cloudflare API Token（acme.apiToken 或 ddns.apiToken）");
@@ -140,21 +144,7 @@ pub fn renewal_reason(cert: &Path, domains: &[String], renew_days: i64) -> Optio
     if left < renew_days {
         return Some(format!("剩 {left} 天到期"));
     }
-    let names: Vec<String> = info["san"]
-        .as_str()
-        .unwrap_or("")
-        .split(", ")
-        .filter_map(|n| n.strip_prefix("DNS:"))
-        .map(str::to_lowercase)
-        .collect();
-    let covered = |d: &String| {
-        names.iter().any(|n| {
-            n == d
-                || n.strip_prefix("*.")
-                    .is_some_and(|w| d.split_once('.').is_some_and(|(_, rest)| rest == w))
-        })
-    };
-    if let Some(d) = domains.iter().find(|d| !covered(d)) {
+    if let Some(d) = domains.iter().find(|d| !crate::certinfo::covers(&info, d)) {
         return Some(format!("憑證沒有涵蓋 {d}"));
     }
     None
@@ -365,6 +355,44 @@ mod tests {
         let a = AcmeConfig::from_cfg(&json!({ "acme": { "enabled": true } }), base, state).unwrap();
         assert_eq!(a.cert, PathBuf::from("/etc/kuroshio/cert.pem"));
         assert!(a.check().is_err(), "沒有網域、沒有 token");
+    }
+
+    #[test]
+    fn shared_tls_location_and_bound_domain() {
+        let base = Path::new("/etc/kuroshio");
+        let state = Path::new("/etc/kuroshio/state");
+        // 輸出位置：acme.certFile → tls.cert → listen.dot.cert → listen.doh.cert → 設定目錄
+        let all = json!({
+            "acme": { "certFile": "/a/c.pem", "keyFile": "/a/k.pem" },
+            "tls": { "cert": "tls/fullchain.pem", "key": "tls/privkey.pem" },
+            "listen": { "dot": { "cert": "/d/c.pem", "key": "/d/k.pem" }, "doh": { "cert": "/h/c.pem", "key": "/h/k.pem" } }
+        });
+        assert_eq!(cert_paths(&all, base).0, PathBuf::from("/a/c.pem"));
+        let mut c = all.clone();
+        c["acme"] = json!({});
+        assert_eq!(
+            cert_paths(&c, base),
+            (
+                PathBuf::from("/etc/kuroshio/tls/fullchain.pem"),
+                PathBuf::from("/etc/kuroshio/tls/privkey.pem")
+            ),
+            "共用憑證位置優先於各監聽自己的"
+        );
+        c["tls"] = json!({ "cert": "", "key": "" });
+        assert_eq!(cert_paths(&c, base).0, PathBuf::from("/d/c.pem"));
+        c["listen"]["dot"] = json!({});
+        assert_eq!(cert_paths(&c, base).0, PathBuf::from("/h/c.pem"));
+        // 只填綁定網域（固定網域、DDNS 沒開）：ACME 申請的就是它
+        let cfg = kuroshio_config::with_overrides(&json!({ "domain": "dns.example.com", "acme": { "enabled": true, "apiToken": "t" } }));
+        let a = AcmeConfig::from_cfg(&cfg, base, state).unwrap();
+        assert_eq!(a.domains, vec!["dns.example.com"]);
+        assert!(a.check().is_ok());
+        // 自備憑證（tls.cert 有填、acme.enabled 關閉）：沒有 ACME 物件，就不可能申請或寫檔
+        let manual = kuroshio_config::with_overrides(&json!({
+            "domain": "dns.example.com",
+            "tls": { "cert": "/certs/fullchain.pem", "key": "/certs/privkey.pem" }
+        }));
+        assert!(AcmeConfig::from_cfg(&manual, base, state).is_none());
     }
 
     #[test]

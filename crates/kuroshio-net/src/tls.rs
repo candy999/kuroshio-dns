@@ -186,7 +186,55 @@ fn cached_config(alpn_h2: bool) -> Arc<rustls::ClientConfig> {
 
 /// 一般 HTTPS 下載用（只提供 http/1.1）
 pub async fn connect_h1(host: &str, port: u16, timeout: Duration) -> Result<TlsStream<TcpStream>> {
-    connect_with(host, port, cached_config_h1(), timeout).await
+    connect_with(host, port, cached_config_h1(), timeout, None).await
+}
+
+/// 同 `connect_h1`，但指定從哪個本機位址 / 網卡連出去（多出口時偵測每個出口的公網 IP）
+pub async fn connect_h1_from(host: &str, port: u16, timeout: Duration, from: Option<&LocalBind>) -> Result<TlsStream<TcpStream>> {
+    connect_with(host, port, cached_config_h1(), timeout, from).await
+}
+
+/// 指定對外連線的出口：本機位址，加上（選用的）網卡名稱。
+///
+/// 只綁來源位址時，Linux 仍然照路由表選出口（除非另外設了依來源位址的路由規則）；
+/// 所以 Linux 會再用 `SO_BINDTODEVICE` 綁網卡（需要 root 或 CAP_NET_RAW，失敗就只綁位址）。
+/// Windows 綁來源位址就會從那張網卡送出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBind {
+    pub ip: IpAddr,
+    pub device: Option<String>,
+}
+
+impl LocalBind {
+    pub fn ip(ip: IpAddr) -> LocalBind {
+        LocalBind { ip, device: None }
+    }
+}
+
+/// TCP 連線；`from` 有值時先綁本機位址（與網卡）。位址族不同（IPv4 出口連 IPv6 位址）直接回錯誤。
+pub async fn tcp_connect(addr: SocketAddr, from: Option<&LocalBind>) -> std::io::Result<TcpStream> {
+    let Some(b) = from else {
+        return TcpStream::connect(addr).await;
+    };
+    if b.ip.is_ipv4() != addr.is_ipv4() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("出口位址 {} 跟目的地 {} 不是同一種 IP 版本", b.ip, addr.ip()),
+        ));
+    }
+    let sock = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(dev) = b.device.as_deref().filter(|d| !d.is_empty()) {
+        if let Err(e) = sock.bind_device(Some(dev.as_bytes())) {
+            tracing::debug!("無法綁定網卡 {dev}（{e}），只綁來源位址 {}", b.ip);
+        }
+    }
+    sock.bind(SocketAddr::new(b.ip, 0))?;
+    sock.connect(addr).await
 }
 
 fn cached_config_h1() -> Arc<rustls::ClientConfig> {
@@ -199,7 +247,7 @@ fn cached_config_h1() -> Arc<rustls::ClientConfig> {
 
 /// 連線（依序試每個 IP）並完成 TLS 握手
 pub async fn connect(host: &str, port: u16, alpn_h2: bool, timeout: Duration) -> Result<TlsStream<TcpStream>> {
-    connect_with(host, port, cached_config(alpn_h2), timeout).await
+    connect_with(host, port, cached_config(alpn_h2), timeout, None).await
 }
 
 /// 不檢查憑證（2.x 的 `verifyCert: false`）：只用來探測節點、測速，不拿來傳使用者資料
@@ -280,8 +328,18 @@ pub async fn connect_ip(ip: IpAddr, port: u16, sni: &str, verify: bool, timeout:
     .map_err(|_| anyhow!("連線逾時 {ip}:{port}"))?
 }
 
-async fn connect_with(host: &str, port: u16, cfg: Arc<rustls::ClientConfig>, timeout: Duration) -> Result<TlsStream<TcpStream>> {
-    let ips = resolve_host(host).await?;
+async fn connect_with(
+    host: &str,
+    port: u16,
+    cfg: Arc<rustls::ClientConfig>,
+    timeout: Duration,
+    from: Option<&LocalBind>,
+) -> Result<TlsStream<TcpStream>> {
+    let mut ips = resolve_host(host).await?;
+    // 指定出口時只試同一種 IP 版本的位址
+    if let Some(b) = from {
+        ips.retain(|ip| ip.is_ipv4() == b.ip.is_ipv4());
+    }
     let name = match host.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
         Err(_) => ServerName::try_from(host.to_string()).context("主機名稱格式錯誤")?,
@@ -290,7 +348,7 @@ async fn connect_with(host: &str, port: u16, cfg: Arc<rustls::ClientConfig>, tim
     let mut last = anyhow!("沒有可用的位址");
     for ip in ips {
         let r = tokio::time::timeout(timeout, async {
-            let tcp = TcpStream::connect(SocketAddr::new(ip, port)).await?;
+            let tcp = tcp_connect(SocketAddr::new(ip, port), from).await?;
             tcp.set_nodelay(true)?;
             Ok::<_, anyhow::Error>(connector.connect(name.clone(), tcp).await?)
         })

@@ -6,9 +6,11 @@
 //! - 大小上限，超過就中止
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+
+pub use crate::tls::LocalBind;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Validators {
@@ -63,15 +65,18 @@ pub(crate) fn parse_url(u: &str) -> Result<Url> {
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
-async fn open(u: &Url, timeout: Duration) -> Result<Box<dyn Io>> {
+async fn open(u: &Url, timeout: Duration, from: Option<&LocalBind>) -> Result<Box<dyn Io>> {
     if u.tls {
         // 下載不用 h2：只提供 http/1.1 的 ALPN
-        Ok(Box::new(crate::tls::connect_h1(&u.host, u.port, timeout).await?))
+        Ok(Box::new(crate::tls::connect_h1_from(&u.host, u.port, timeout, from).await?))
     } else {
-        let ips = crate::tls::resolve_host(&u.host).await?;
+        let mut ips = crate::tls::resolve_host(&u.host).await?;
+        if let Some(b) = from {
+            ips.retain(|ip| ip.is_ipv4() == b.ip.is_ipv4());
+        }
         let mut last = anyhow!("沒有可用的位址");
         for ip in ips {
-            match tokio::time::timeout(timeout, TcpStream::connect((ip, u.port))).await {
+            match tokio::time::timeout(timeout, crate::tls::tcp_connect(SocketAddr::new(ip, u.port), from)).await {
                 Ok(Ok(s)) => return Ok(Box::new(s)),
                 Ok(Err(e)) => last = e.into(),
                 Err(_) => last = anyhow!("連線逾時"),
@@ -107,6 +112,7 @@ pub async fn get(url: &str, prev: &Validators, max: u64, timeout: Duration, on_c
         max,
         timeout,
         false,
+        None,
         on_chunk,
     )
     .await
@@ -114,8 +120,14 @@ pub async fn get(url: &str, prev: &Validators, max: u64, timeout: Duration, on_c
 
 /// 送出請求並把整個回應讀進記憶體（API 用，回應小）；任何狀態碼都回傳
 pub async fn request(url: &str, req: &Request<'_>, max: u64, timeout: Duration) -> Result<(u16, Vec<u8>)> {
+    request_from(url, req, max, timeout, None).await
+}
+
+/// 同 `request`，但指定從哪個本機位址 / 網卡連出去（`None` = 系統預設路由）。
+/// 多出口（多網卡、多條對外線路）時，用來偵測每個出口各自的公網 IP。
+pub async fn request_from(url: &str, req: &Request<'_>, max: u64, timeout: Duration, from: Option<&LocalBind>) -> Result<(u16, Vec<u8>)> {
     let mut body = Vec::new();
-    match stream(url, req, &Validators::default(), max, timeout, true, |c| {
+    match stream(url, req, &Validators::default(), max, timeout, true, from, |c| {
         body.extend_from_slice(c);
         Ok(())
     })
@@ -126,6 +138,7 @@ pub async fn request(url: &str, req: &Request<'_>, max: u64, timeout: Duration) 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream(
     url: &str,
     r: &Request<'_>,
@@ -133,12 +146,13 @@ async fn stream(
     max: u64,
     timeout: Duration,
     any_status: bool,
+    from: Option<&LocalBind>,
     mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<Outcome> {
     let mut url = url.to_string();
     for _ in 0..6 {
         let u = parse_url(&url)?;
-        let mut s = open(&u, timeout).await?;
+        let mut s = open(&u, timeout, from).await?;
         let mut req = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: kuroshio/{}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
             r.method,
