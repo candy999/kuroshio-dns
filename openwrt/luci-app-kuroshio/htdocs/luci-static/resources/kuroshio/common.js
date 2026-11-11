@@ -44,8 +44,126 @@ function getPath(obj, path) {
 	return String(path).split('.').reduce(function(a, k) { return (a == null) ? undefined : a[k]; }, obj);
 }
 
+var SCOPE = { 'public': _('公網'), 'private': _('私有'), 'cgnat': _('電信商 CGNAT'), 'linklocal': _('鏈路本地'), 'ula': _('區網 IPv6'), 'loopback': _('本機') };
+var BADGE = { ok: '#19733a', warn: '#8a5a00', err: '#b42318', off: '#6b7785' };
+
 return baseclass.extend({
 	defaults: {},
+
+	T: T,
+
+	/** 小標籤（狀態用）：kind = ok / warn / err / off */
+	badge: function(text, kind) {
+		return T('span', { 'class': 'kuroshio-badge', 'data-kind': kind || 'off',
+			'style': 'display:inline-block;padding:0 .6em;border-radius:1em;font-size:12px;line-height:1.7;white-space:nowrap;color:#fff;background:' + (BADGE[kind] || BADGE.off) }, text);
+	},
+
+	/** 表格：head = 標題陣列，rows = 每列的儲存格（字串或節點） */
+	table: function(head, rows, empty) {
+		return E('table', { 'class': 'table' }, [
+			E('tr', { 'class': 'tr table-titles' }, head.map(function(h) { return T('th', { 'class': 'th' }, h); }))
+		].concat(rows.length ? rows.map(function(r) {
+			return E('tr', { 'class': 'tr' }, r.map(function(c, i) {
+				var td = E('td', { 'class': 'td', 'data-title': head[i] || '' });
+				if (c != null && c.nodeType) td.appendChild(c);
+				else td.textContent = (c == null) ? '-' : String(c);
+				return td;
+			}));
+		}) : [E('tr', { 'class': 'tr placeholder' }, E('td', { 'class': 'td', 'colspan': head.length }, T('em', {}, empty || _('沒有資料'))))]));
+	},
+
+	/** 管理 API 的回應（rpcd 包成 { ok, result }）→ 內容；服務沒有執行或失敗時回 null */
+	result: function(r) {
+		return (r && r.ok !== false && r.result != null && typeof r.result === 'object') ? r.result : null;
+	},
+
+	/** 讀一個查看類 API；失敗（服務沒有執行、舊版核心）回 null */
+	fetch: function(path, params) {
+		var self = this;
+		return L.resolveDefault(this.api(path, params), null).then(function(r) { return self.result(r); });
+	},
+
+	/** 複製文字（LuCI 常用 http://，不能用 Clipboard API，所以用選取＋複製） */
+	copyButton: function(text) {
+		var b = T('button', { 'class': 'btn cbi-button', 'style': 'padding:0 .6em;line-height:1.8em;margin-left:.6em', 'title': _('複製') }, _('複製'));
+		b.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			var ta = E('textarea', { 'style': 'position:fixed;left:-9999px;top:0;opacity:0', 'readonly': '' });
+			ta.value = text;
+			document.body.appendChild(ta);
+			ta.select();
+			var ok = false;
+			try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+			document.body.removeChild(ta);
+			b.textContent = ok ? _('已複製') : _('請手動選取');
+			window.setTimeout(function() { b.textContent = _('複製'); }, 1500);
+		});
+		return b;
+	},
+
+	/** 路徑＋複製按鈕；沒有值時顯示「（沒有）」 */
+	pathCell: function(p) {
+		if (p == null || p === '') return T('em', {}, _('（沒有）'));
+		return E('span', {}, [T('code', { 'style': 'word-break:break-all' }, p), this.copyButton(String(p))]);
+	},
+
+	/** 憑證（/api/paths 的 tls.info）有沒有涵蓋這個網域（含萬用字元） */
+	certCovers: function(info, domain) {
+		var d = String(domain || '').replace(/\.$/, '').toLowerCase();
+		return String((info && info.san) || '').split(', ').some(function(n) {
+			if (n.slice(0, 4) !== 'DNS:') return false;
+			n = n.slice(4).toLowerCase();
+			if (n === d) return true;
+			var i = d.indexOf('.');
+			return n.slice(0, 2) === '*.' && i > 0 && d.slice(i + 1) === n.slice(2);
+		});
+	},
+
+	scopeName: function(s) { return SCOPE[s] || s || ''; },
+
+	/** 一張網卡的說明文字：位址（公網 / 私有、暫時、已停用）、未連線 */
+	ifaceText: function(i) {
+		var self = this;
+		var addrs = (i.addrs || []).filter(function(a) { return a.scope !== 'linklocal' && a.scope !== 'loopback'; }).map(function(a) {
+			var marks = [self.scopeName(a.scope)];
+			if (a.temporary) marks.push(_('暫時'));
+			if (a.deprecated) marks.push(_('已停用'));
+			return a.ip + '（' + marks.join('、') + '）';
+		});
+		return i.name + (i.up ? '' : ' [' + _('未連線') + ']') + ' — ' + (addrs.length ? addrs.join('、') : _('沒有可用的位址'));
+	},
+
+	/** 一個加密監聽位址的狀態（/api/status 的 listenersDetail） */
+	listenerState: function(x) {
+		if (x.ok) return this.badge(x.proto === 'doh' ? (x.tls ? _('執行中（TLS）') : _('執行中（純 HTTP）')) : _('執行中'), 'ok');
+		return E('span', {}, [this.badge(_('綁定失敗'), 'err'), T('div', { 'style': 'color:#b42318;font-size:12px' }, x.error || _('原因不明（請看日誌）'))]);
+	},
+
+	/** 加密監聽的表格：每個位址一列 */
+	listenerTable: function(detail) {
+		var self = this, P = { doh: 'DoH（TCP）', doh3: 'DoH3（UDP）', dot: 'DoT（TCP）', doq: 'DoQ（UDP）' };
+		return this.table([_('協議'), _('位址'), _('埠號'), _('狀態')], [].concat(detail || []).map(function(x) {
+			return [P[x.proto] || x.proto, x.bind, x.port, self.listenerState(x)];
+		}), _('沒有開啟任何加密協議（DoH / DoT / DoQ）'));
+	},
+
+	/**
+	 * 表單裡的唯讀面板（目前狀態、說明）：不讀也不寫 UCI
+	 * node 可以是節點或回傳節點的函式
+	 */
+	panel: function(s, name, title, node, desc) {
+		var o = s.option(form.DummyValue, name, title);
+		o.render = function() {
+			var n = (typeof node === 'function') ? node() : node;
+			return E('div', { 'class': 'cbi-value', 'id': 'kuroshio-panel-' + name.replace(/^_/, '') }, [
+				T('label', { 'class': 'cbi-value-title' }, title),
+				E('div', { 'class': 'cbi-value-field', 'style': 'overflow-x:auto' }, [n, desc ? T('div', { 'class': 'cbi-value-description' }, desc) : ''])
+			]);
+		};
+		o.write = function() {};
+		o.remove = function() {};
+		return o;
+	},
 
 	isPro: function() {
 		try { return window.localStorage.getItem(MODE_KEY) === 'pro'; } catch (e) { return false; }

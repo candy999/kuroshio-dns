@@ -1,6 +1,7 @@
 'use strict';
 // CI：用 Playwright 實際打開 LuCI 每一頁（簡易與專業模式），檢查沒有 JavaScript 錯誤、內容有出來、可以儲存
 //   BASE=http://127.0.0.1:8080 CONTAINER=owrt node openwrt/tools/luci-e2e.js
+//   MOCK=1：對著 openwrt/tools/luci-mock.js（沒有 Docker 時在本機跑），UCI 與檔案改從 mock 讀
 const { chromium } = require('playwright');
 const { execFileSync } = require('child_process');
 const fs = require('fs');
@@ -12,7 +13,13 @@ const SHOTS = process.env.SHOTS || 'screenshots';
 const NAME = process.argv[2] || 'candydns';
 const TITLE = NAME === 'kuroshio' ? /黑潮 DNS/ : /優選 DNS/;
 const PAGES = ['status', 'settings', 'filter', 'cdn', 'community', 'advanced', 'log'];
-const uci = (...a) => execFileSync('docker', ['exec', CONTAINER, 'uci', ...a], { encoding: 'utf-8' }).trim();
+const MOCK = !!process.env.MOCK;
+const mockGet = async (p) => { const r = await fetch(BASE + p); if (!r.ok) throw new Error(`mock ${p}: HTTP ${r.status}`); return r.text(); };
+/** uci -q get <key>；list 用空白隔開 */
+const uciGet = async key => (MOCK ? (await mockGet('/__mock/uci?key=' + encodeURIComponent(key))).trim()
+    : execFileSync('docker', ['exec', CONTAINER, 'uci', '-q', 'get', key], { encoding: 'utf-8' }).trim());
+const readFile = async file => (MOCK ? mockGet('/__mock/file?path=' + encodeURIComponent(file))
+    : execFileSync('docker', ['exec', CONTAINER, 'cat', file], { encoding: 'utf-8' }));
 
 let pass = 0, fail = 0;
 const ok = m => { pass++; console.log(`  ✔ ${m}`); };
@@ -53,7 +60,16 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         return text;
     };
 
-    for (const p of PAGES) await visit(p, 'simple');
+    for (const p of PAGES) {
+        const text = await visit(p, 'simple');
+        // 黑潮：基本設定頁要有網域與憑證、固定網域 / DDNS、DNR、存放位置
+        if (NAME === 'kuroshio' && p === 'settings') {
+            /網域與憑證/.test(text) && /綁定網域/.test(text) && /目前憑證/.test(text) ? ok('設定頁：網域與憑證') : bad('設定頁沒有「網域與憑證」');
+            /DNR/.test(text) && /DNR 目前狀態/.test(text) ? ok('設定頁：DNR 開關與目前狀態') : bad('設定頁沒有 DNR');
+            /存放位置/.test(text) ? ok('設定頁：存放位置') : bad('設定頁沒有「存放位置」');
+            /目前的監聽狀態/.test(text) ? ok('設定頁：監聽狀態') : bad('設定頁沒有「目前的監聽狀態」');
+        }
+    }
     // 黑潮：每頁最下方有「關於」（核心版本、介面版本、授權、原始碼），狀態頁一定要看得到
     if (NAME === 'kuroshio') {
         await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/status`);
@@ -68,6 +84,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         const text = await visit(p, 'pro');
         if (p === 'advanced' && !/上游 DNS/.test(text)) bad('專業模式：進階頁沒有顯示參數');
         if (p === 'cdn' && !/跨 CDN 備援/.test(text)) bad('專業模式：CDN 頁沒有顯示細部參數');
+        if (NAME === 'kuroshio' && p === 'settings' && !/多個監聽位址/.test(text)) bad('專業模式：設定頁沒有「多個監聽位址」');
     }
 
     // 儲存：在進階頁改一個數值參數，按「儲存並套用」，確認寫進 /etc/config/${NAME}
@@ -79,10 +96,87 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
     await page.locator('.cbi-page-actions .cbi-button-apply, .cbi-page-actions button:has-text("Save & Apply")').first().click();
     await page.waitForTimeout(6000);
     try {
-        const v = uci('-q', 'get', `${NAME}.resolver.timeout_ms`);
+        const v = await uciGet(`${NAME}.resolver.timeout_ms`);
         v === '1777' ? ok('儲存並套用寫入 UCI') : bad(`儲存並套用寫入 UCI（實際：${v}）`);
     } catch (e) { bad(`儲存並套用寫入 UCI（${e.message.split('\n')[0]}）`); }
     await page.screenshot({ path: `${SHOTS}/after-save.png`, fullPage: true });
+
+    // 黑潮：固定網域 / 自備憑證 / DDNS 出口 / IPv6 / DNR / 多位址監聽，儲存後寫進 UCI（專業模式）
+    if (NAME === 'kuroshio') {
+        errors = [];
+        await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/settings`);
+        await page.waitForLoadState('networkidle');
+        const w = (sec, opt) => page.locator(`[id="widget.cbid.${NAME}.${sec}.${opt}"]`);
+        const field = (sec, opt) => page.locator(`[id="cbi-${NAME}-${sec}-${opt}"]`);
+        /** 勾選 / 取消（LuCI 的核取方塊上面蓋著 label，直接對 input 送 click） */
+        const setCheck = async (sec, opt, on) => {
+            const c = page.locator(`[id="cbid.${NAME}.${sec}.${opt}"] input[type=checkbox]`).first();
+            if ((await c.isChecked()) !== on) await c.evaluate(el => el.click());
+        };
+        /** DynamicList 加一項（有選單時輸入框在下拉選單裡，沒有時是一般的輸入框） */
+        const addItem = async (sec, opt, value) => {
+            const box = page.locator(`[id="cbid.${NAME}.${sec}.${opt}"]`).first();
+            const dd = box.locator('.add-item .cbi-dropdown');
+            if (await dd.count()) {
+                await dd.locator('.open').click();
+                const li = dd.locator(`li[data-value="${value}"]`).locator('visible=true');
+                if (await li.count()) await li.first().click();
+                else {
+                    const custom = dd.locator('input.create-item-input').locator('visible=true').first();
+                    await custom.fill(value);
+                    await custom.press('Enter');
+                }
+            } else {
+                const input = box.locator('.add-item input[type=text]');
+                await input.fill(value);
+                await input.press('Enter');
+            }
+        };
+        try {
+            await w('tls', 'domain').fill('not a domain');
+            await w('tls', 'domain').blur();
+            (await field('tls', 'domain').locator('.cbi-input-invalid').count()) ? ok('綁定網域：格式錯誤有標示') : bad('綁定網域：格式錯誤沒有標示');
+            await w('tls', 'domain').fill('dns.example.com');
+            await w('tls', 'cert_mode').selectOption('acme');
+            await w('ddns', 'enabled').selectOption('0');
+            (await field('tls', 'cert').isVisible()) ? bad('自動申請時不該顯示憑證檔欄位') : ok('自動申請時不顯示憑證檔欄位');
+            await w('tls', 'cert_mode').selectOption('manual');
+            await w('tls', 'cert').fill('/etc/ssl/example/fullchain.pem');
+            await w('tls', 'key').fill('/etc/ssl/example/privkey.pem');
+            (await field('ddns', 'ipv6').isVisible()) ? bad('固定網域時不該顯示 DDNS 細項') : ok('固定網域（預設）時不顯示 DDNS 細項');
+            await w('ddns', 'enabled').selectOption('1');
+            const hint = await field('ddns', 'ipv6').innerText();
+            /IPv6/.test(hint) && /擋/.test(hint) ? ok('DDNS：IPv6 預設不發布，並說明原因') : bad(`DDNS：IPv6 沒有說明\n     ${hint}`);
+            await setCheck('ddns', 'ipv6', true);
+            await addItem('ddns', 'interfaces', 'pppoe-wan');
+            await addItem('ddns', 'interfaces', 'wan2');
+            await setCheck('main', 'dnr', false);
+            await addItem('dot', 'binds', '0.0.0.0');
+            await addItem('dot', 'binds', '::');
+            await w('doh', 'tls').selectOption('0');
+            await page.screenshot({ path: `${SHOTS}/settings-edited.png`, fullPage: true });
+            await page.locator('.cbi-page-actions .cbi-button-apply, .cbi-page-actions button:has-text("Save & Apply")').first().click();
+            await page.waitForTimeout(6000);
+            const want = { 'tls.domain': 'dns.example.com', 'tls.cert_mode': 'manual', 'tls.cert': '/etc/ssl/example/fullchain.pem', 'tls.key': '/etc/ssl/example/privkey.pem',
+                'ddns.enabled': '1', 'ddns.ipv6': '1', 'ddns.interfaces': 'pppoe-wan wan2', 'main.dnr': '0', 'dot.binds': '0.0.0.0 ::', 'doh.tls': '0' };
+            for (const k of Object.keys(want)) {
+                let v;
+                try { v = await uciGet(`${NAME}.${k}`); } catch (e) { v = `（${e.message.split('\n')[0]}）`; }
+                v === want[k] ? ok(`儲存：${k} = ${v}`) : bad(`儲存：${k} 應該是 ${want[k]}，實際 ${v}`);
+            }
+            // 改回固定網域：DDNS 關掉，但出口設定留著
+            await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/settings`);
+            await page.waitForLoadState('networkidle');
+            await w('ddns', 'enabled').selectOption('0');
+            await setCheck('main', 'dnr', true);
+            await page.locator('.cbi-page-actions .cbi-button-apply, .cbi-page-actions button:has-text("Save & Apply")').first().click();
+            await page.waitForTimeout(6000);
+            const en = await uciGet(`${NAME}.ddns.enabled`), keep = await uciGet(`${NAME}.ddns.interfaces`).catch(() => '');
+            en === '0' && keep === 'pppoe-wan wan2' ? ok('改回固定網域：ddns.enabled = 0，出口設定保留') : bad(`改回固定網域：enabled = ${en}、interfaces = ${keep}`);
+        } catch (e) { bad(`設定頁操作中斷：${e.message.split('\n')[0]}`); }
+        await page.screenshot({ path: `${SHOTS}/settings-saved.png`, fullPage: true });
+        if (errors.length) bad(`設定頁：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+    }
 
     // 自訂規則：編輯後存檔應寫進 /etc/<名稱>/custom-rules.txt
     await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/filter`);
@@ -91,7 +185,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
     await ta.fill((await ta.inputValue()) + '\n||e2e-test.example^\n');
     await page.locator('.cbi-page-actions .cbi-button-save, .cbi-page-actions button:has-text("Save")').first().click();
     await page.waitForTimeout(3000);
-    const rules = execFileSync('docker', ['exec', CONTAINER, 'cat', `/etc/${NAME}/custom-rules.txt`], { encoding: 'utf-8' });
+    const rules = await readFile(`/etc/${NAME}/custom-rules.txt`);
     await page.screenshot({ path: `${SHOTS}/after-rules-save.png`, fullPage: true });
     /e2e-test\.example/.test(rules) ? ok('自訂規則寫入檔案')
         : bad(`自訂規則寫入檔案\n     檔案開頭：${rules.slice(0, 200)}\n     textarea 數量：${await page.locator('textarea').count()}\n     ${errors.join('\n     ')}`);

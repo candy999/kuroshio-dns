@@ -104,6 +104,13 @@ return view.extend({
 			])
 		]);
 
+		// 加密監聽：每個位址一列，綁定失敗列出原因
+		var detail = [].concat(api.listenersDetail || []);
+		var lsSec = detail.length ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-listeners' }, [
+			E('h3', {}, _('加密監聽')),
+			E('div', { 'style': 'overflow-x:auto' }, common.listenerTable(detail))
+		]) : '';
+
 		var ups = (api.upstreams || []).map(function(u) {
 			var role = { pinned: _('固定'), auto: _('自動'), fallback: _('備援') }[u.role] || u.role;
 			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', u.paused ? _('暫停中') : ''];
@@ -151,7 +158,7 @@ return view.extend({
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at) + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
-		return E([], [head, tiles, hw, upSec, jobSec, infoSec, actions, errSec]);
+		return E([], [head, tiles, hw, lsSec, upSec, jobSec, infoSec, actions, errSec]);
 	},
 
 	render: function(data) {

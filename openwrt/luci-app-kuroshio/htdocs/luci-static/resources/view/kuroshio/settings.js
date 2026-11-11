@@ -3,6 +3,7 @@
 'require form';
 'require rpc';
 'require ui';
+'require uci';
 'require tools.widgets as widgets';
 'require kuroshio.common as common';
 
@@ -18,15 +19,138 @@ function certSummary(st) {
 	return st.certError || _('還沒有憑證');
 }
 
+var T = common.T;
+
+/** 目前的憑證：來源、位置、有效期間、有沒有涵蓋綁定網域（/api/paths；服務沒有執行時用 acme.sh 的狀態） */
+function certPanel(paths, acme) {
+	var t = paths && paths.tls, mode = uci.get('kuroshio', 'tls', 'cert_mode') || 'acme', dom = uci.get('kuroshio', 'tls', 'domain') || '';
+	var info = t ? t.info : (acme && acme.cert), rows = [];
+	var row = function(k, v) { rows.push([k, v]); };
+	row(_('來源'), mode === 'manual' ? _('自己的憑證檔（只讀取，不會申請或覆蓋）') : _('自動申請（acme.sh）'));
+	if (t) {
+		row(_('憑證檔'), common.pathCell(t.cert));
+		row(_('私鑰檔'), common.pathCell(t.key));
+	}
+	var state;
+	if (t && !t.exists) state = common.badge(mode === 'manual' ? _('找不到檔案（憑證檔或私鑰檔不存在）') : _('還沒有申請到憑證'), 'err');
+	else if (!info) state = common.badge((acme && acme.certError) || _('還沒有憑證'), 'err');
+	else if (info.daysLeft < 0) state = common.badge(_('已經過期'), 'err');
+	else if (info.daysLeft < 14) state = common.badge(_('快到期（剩 %d 天）').format(info.daysLeft), 'warn');
+	else state = common.badge(_('有效（剩 %d 天）').format(info.daysLeft), 'ok');
+	row(_('狀態'), state);
+	if (info) {
+		row(_('主體'), info.subject || '-');
+		row(_('涵蓋的名稱'), info.san || _('（沒有 SAN）'));
+		row(_('到期'), info.validTo || '-');
+		if (dom) row(_('綁定網域'), common.certCovers(info, dom) ? common.badge(_('有涵蓋 %s').format(dom), 'ok') : common.badge(_('沒有涵蓋 %s（用戶端會出現憑證錯誤）').format(dom), 'err'));
+	}
+	return E('div', { 'id': 'kuroshio-cert' }, [common.table([_('項目'), _('內容')], rows),
+		paths ? '' : T('div', { 'class': 'cbi-value-description' }, _('服務沒有執行：只顯示 acme.sh 的憑證資訊。'))]);
+}
+
+var DDNS_ACTION = { created: _('已新增'), updated: _('已更新'), unchanged: _('沒有變'), deleted: _('已移除'), kept: _('暫時保留'), skip: _('略過'), error: _('失敗') };
+
+/** DDNS 上一次檢查的結果：每個出口偵測到的 IP、每筆記錄 */
+function ddnsPanel(st) {
+	if (!st) return T('em', {}, _('服務沒有執行，無法讀取。'));
+	if (st.enabled === false) return T('em', {}, _('DDNS 沒有啟用（固定網域）：不會更新 DNS 記錄。'));
+	var bad = function(x) { return E('span', {}, [common.badge(DDNS_ACTION[x.action] || _('失敗'), x.action === 'skip' ? 'warn' : 'err'), T('div', { 'style': 'color:#b42318;font-size:12px' }, x.error || '')]); };
+	return E('div', { 'id': 'kuroshio-ddns' }, [
+		st.error ? T('p', { 'class': 'alert-message warning' }, _('上次更新有錯誤：') + st.error) : '',
+		T('p', {}, _('上次檢查：') + (st.lastRun ? new Date(st.lastRun).toLocaleString() : '-')),
+		common.table([_('出口（網卡）'), _('類型'), _('偵測到的 IP'), _('狀態')], [].concat(st.sources || []).map(function(x) {
+			return [x.interface || _('自動（預設路由）'), 'IPv' + x.family, x.ip || '-', x.ok ? common.badge(_('正常'), 'ok') : bad(x)];
+		}), _('還沒有偵測結果')),
+		common.table([_('名稱'), _('類型'), _('內容'), _('結果')], [].concat(st.records || []).map(function(x) {
+			return [x.name, x.type, x.content || x.ip || '-', x.ok ? common.badge(DDNS_ACTION[x.action] || x.action || '-', x.action === 'kept' ? 'warn' : 'ok') : bad(x)];
+		}), _('還沒有更新過'))
+	]);
+}
+
+/** DNR 目前發布的內容（takeover.sh 寫進 dhcp.lan 的 DHCP 選項 162 與 list dnr）；沒有發時說明可能的原因 */
+function dnrPanel(paths) {
+	var on = uci.get('kuroshio', 'main', 'dnr') !== '0';
+	if (!on) return T('em', {}, _('已關閉：不發布。'));
+	var opt = [].concat(uci.get('dhcp', 'lan', 'dhcp_option') || []).filter(function(x) { return /^162,/.test(x); });
+	var ra = [].concat(uci.get('dhcp', 'lan', 'dnr') || []);
+	if (opt.length || ra.length) {
+		return E('div', {}, [common.badge(_('發布中'), 'ok'), T('span', {}, ' ' + [opt.length ? _('DHCPv4（選項 162）') : '', ra.length ? _('RA / DHCPv6 %d 筆').format(ra.length) : ''].filter(Boolean).join('、'))]
+			.concat(ra.map(function(x) { return T('code', { 'style': 'display:block;word-break:break-all;font-size:12px' }, x); })));
+	}
+	var why = [], dom = uci.get('kuroshio', 'tls', 'domain') || '', info = paths && paths.tls && paths.tls.info;
+	if (!dom) why.push(_('還沒有填綁定網域'));
+	if (!['doh', 'dot', 'doq'].some(function(k) { return uci.get('kuroshio', k, 'enabled') === '1'; })) why.push(_('沒有開啟 DoH / DoT / DoQ'));
+	if (paths && (!info || info.daysLeft < 0)) why.push(_('沒有有效的憑證'));
+	else if (info && dom && !common.certCovers(info, dom)) why.push(_('憑證沒有涵蓋綁定網域'));
+	return E('div', {}, [common.badge(_('目前沒有發布'), 'off'), T('span', {}, ' ' + (why.length ? why.join('；') : _('條件符合的話，儲存並套用後就會發布；仍然沒有發布時原因會寫在系統日誌（DNR 沒有發：…）。')))]);
+}
+
+/** 存放位置（/api/paths）：只有路徑，沒有密鑰內容 */
+function pathsSection(p) {
+	var body;
+	if (!p) body = E('p', {}, [T('em', {}, _('服務沒有執行，無法讀取。啟用並套用後再回來看。'))]);
+	else {
+		var t = p.tls || {}, manual = (uci.get('kuroshio', 'tls', 'cert_mode') || 'acme') === 'manual';
+		var note = function(text, share, secret) {
+			return E('span', {}, [T('span', {}, text + ' '), share ? common.badge(_('其他服務可以讀取'), 'ok') : '', ' ', secret ? common.badge(_('含密鑰，請勿外流'), 'warn') : '']);
+		};
+		body = common.table([_('項目'), _('位置'), _('用途')], [
+			[_('設定檔'), common.pathCell(p.configFile || '/etc/config/kuroshio'), note(_('UCI 設定（用這個頁面修改）。Cloudflare API Token 也在裡面。'), false, true)],
+			[_('設定資料夾'), common.pathCell(p.configDir), note(_('憑證（自動申請時）、自訂規則、評測名單。'))],
+			[_('憑證檔'), common.pathCell(t.cert), note(manual ? _('自己的憑證檔（PEM），黑潮 DNS 只讀取。') : _('acme.sh 申請的憑證（含中繼憑證，PEM），續期時會更新。'), !!t.cert)],
+			[_('私鑰檔'), common.pathCell(t.key), note(_('憑證的私鑰（PEM）。其他服務要共用時，請確認只有需要的帳號讀得到。'), !!t.key, !!t.key)],
+			[_('學習資料'), common.pathCell(p.stateDir), note(_('評測結果、節點池、CDN 網域庫、統計。'))],
+			[_('執行期暫存'), common.pathCell(p.runtimeDir), note(_('放在記憶體，重新開機就清掉。'))],
+			[_('程式附帶的資料'), common.pathCell(p.shareDir), note(_('內建名單，升級套件時更新。'))],
+			[_('自訂規則'), common.pathCell(p.customRules), note(_('自己加的過濾規則（「過濾」頁可以編輯）。'))],
+			[_('評測報表'), common.pathCell(p.benchmarkDir), note(_('每日 DNS 評測的報表。'))],
+			[_('社群金鑰'), common.pathCell(p.communityKeyDir), note(_('好友社群的身分金鑰。'), false, true)]
+		]);
+	}
+	return E('div', { 'class': 'cbi-section', 'id': 'kuroshio-paths' }, [
+		T('h3', {}, _('存放位置')),
+		T('div', { 'class': 'cbi-section-descr' }, _('各種檔案實際放在哪裡（已套用的設定）。其他服務（例如 uhttpd、nginx）要共用憑證時，直接讀取下面的憑證檔與私鑰檔即可。這裡只顯示路徑，不會顯示密鑰內容。')),
+		E('div', { 'style': 'overflow-x:auto' }, body)
+	]);
+}
+
 return view.extend({
 	load: function() {
-		return Promise.all([common.loadDefaults(), L.resolveDefault(callAcmeStatus(), null)]);
+		return Promise.all([
+			common.loadDefaults(),
+			L.resolveDefault(callAcmeStatus(), null),
+			common.fetch('/api/interfaces'),
+			common.fetch('/api/paths'),
+			common.fetch('/api/ddns'),
+			common.fetch('/api/status', { lite: 1 }),
+			uci.load('kuroshio'),
+			L.resolveDefault(uci.load('dhcp'), null)
+		]);
 	},
 
 	render: function(data) {
 		var acme = data[1];
+		var ifaces = (data[2] && Array.isArray(data[2].interfaces)) ? data[2].interfaces : [];
+		var paths = data[3], ddnsStatus = data[4], status = data[5];
 		var pro = common.isPro();
 		var m, s, o;
+
+		/** 多位址監聽：可以從網卡位址挑選，也可以自己輸入 */
+		var bindsOption = function(name, title, desc) {
+			var b = s.option(form.DynamicList, name, title, desc);
+			b.datatype = 'ipaddr("nomask")';
+			b.placeholder = '0.0.0.0';
+			b.value('0.0.0.0', '0.0.0.0（' + _('所有 IPv4 位址') + '）');
+			b.value('::', '::（' + _('所有 IPv6 位址') + '）');
+			ifaces.forEach(function(i) {
+				(i.addrs || []).forEach(function(a) {
+					// 鏈路本地位址要指定網卡才能綁定，後端不接受
+					if (a.scope === 'linklocal' || a.scope === 'loopback') return;
+					b.value(a.ip, a.ip + '（' + i.name + '、' + common.scopeName(a.scope) + (a.temporary ? '、' + _('暫時') : '') + (a.deprecated ? '、' + _('已停用') : '') + '）');
+				});
+			});
+			return b;
+		};
 
 		m = new form.Map('kuroshio', _('黑潮 DNS · 基本設定'),
 			_('DoH / DoT / 區網 DNS，並行上游與 IP 測速、廣告過濾、CDN 走台灣節點。儲存並套用後服務會自動重新啟動。'));
@@ -60,6 +184,12 @@ return view.extend({
 
 		o = s.option(form.Flag, 'ddr', _('自動發現（DDR）'), _('區網裝置（Windows 11、iPhone、Mac）會自動改用 DoH / DoT / DoQ 加密連線，不用手動設定。需要設定網域並開啟至少一種加密協議。'));
 		o.rmempty = false;
+
+		o = s.option(form.Flag, 'dnr', _('用 DHCP / RA 通知加密 DNS（DNR）'),
+			_('RFC 9463：在 DHCP 與 IPv6 RA 裡告訴區網裝置這台路由器有加密 DNS（網域、位址、協議），裝置不用先查詢就能改用加密連線。要有綁定網域、涵蓋網域的有效憑證，而且加密協議聽得到區網位址才會發布；條件不符就不發。IPv6（RA）需要 OpenWrt 25.12 以上。'));
+		o.default = '1';
+		o.rmempty = false;
+		common.panel(s, '_dnr_status', _('DNR 目前狀態'), function() { return dnrPanel(paths); });
 
 		// ---------------- 硬體等級 ----------------
 		var ss = m.section(form.NamedSection, 'system', 'system', _('硬體等級'),
@@ -125,9 +255,16 @@ return view.extend({
 		o.depends('open_wan', '1');
 		if (pro) {
 			o = s.option(form.Flag, 'trust_proxy', _('信任 X-Forwarded-For'), _('只有前面還有反向代理時才打開，否則用戶端可以偽造來源 IP。'));
-			o = s.option(form.Value, 'host', _('監聽位址'));
-			o.datatype = 'ipaddr';
+			o = s.option(form.Value, 'host', _('監聽位址'), _('下面的「多個監聽位址」有填時不使用這一欄。'));
+			o.datatype = 'ipaddr("nomask")';
 			o.placeholder = '0.0.0.0';
+			bindsOption('binds', _('多個監聽位址'), _('有填就取代「監聽位址」。IPv4 與 IPv6 可以同時寫（0.0.0.0 與 ::），也可以只聽某幾個位址。其中一個綁定失敗只記警告，其他照常。'));
+			bindsOption('http3_binds', _('DoH3 的監聽位址'), _('空白 = 跟 DoH 同樣的位址。')).depends('http3', '1');
+			o = s.option(form.ListValue, 'tls', _('DoH 自己做 TLS'), _('自動：有憑證就用 TLS。前面有反向代理（例如 nginx）處理 TLS 時才選「關閉」。'));
+			o.value('auto', _('自動'));
+			o.value('1', _('開啟（一律 TLS）'));
+			o.value('0', _('關閉（純 HTTP，TLS 交給前面的反向代理）'));
+			o.default = 'auto';
 		}
 
 		s = m.section(form.NamedSection, 'dot', 'dot', _('DNS over TLS'), _('Android「私人 DNS」用這個。同樣需要網域與憑證。'));
@@ -138,6 +275,8 @@ return view.extend({
 		o.placeholder = '853';
 		o = s.option(form.Flag, 'open_wan', _('開放外網連線'));
 		o.rmempty = false;
+		if (pro)
+			bindsOption('binds', _('多個監聽位址'), _('空白 = 0.0.0.0（所有 IPv4 位址）。IPv4 與 IPv6 可以同時寫。'));
 
 		s = m.section(form.NamedSection, 'doq', 'doq', _('DNS over QUIC（DoQ）'), _('UDP 853，延遲最低；AdGuard 系列 App 支援。跟 DoT 共用憑證與「開放外網連線」設定。記憶體 200 MB 以下的路由器不會開 QUIC。'));
 		o = s.option(form.Flag, 'enabled', _('啟用'));
@@ -146,18 +285,26 @@ return view.extend({
 			o = s.option(form.Value, 'port', _('監聽埠號（UDP）'));
 			o.datatype = 'port';
 			o.placeholder = '853';
+			bindsOption('binds', _('多個監聽位址'), _('空白 = 0.0.0.0（所有 IPv4 位址）。IPv4 與 IPv6 可以同時寫。'));
 		}
+		common.panel(s, '_listeners', _('目前的監聽狀態'), function() {
+			return status ? E('div', { 'id': 'kuroshio-listeners' }, common.listenerTable(status.listenersDetail)) : T('em', {}, _('服務沒有執行，無法讀取。'));
+		}, _('DoH / DoT / DoQ 實際綁定的位址（已套用的設定）；綁定失敗會列出原因。'));
 
-		// ---------------- 憑證 ----------------
-		s = m.section(form.NamedSection, 'tls', 'tls', _('憑證（Let’s Encrypt）'),
-			_('用 Cloudflare DNS 驗證申請，不需要開 80 埠；到期前 30 天自動續期，DoH / DoT 會自動換上新憑證。'));
-		o = s.option(form.Value, 'domain', _('網域'));
+		// ---------------- 網域與憑證 ----------------
+		s = m.section(form.NamedSection, 'tls', 'tls', _('網域與憑證'),
+			_('DoH / DoT / DoQ 共用同一個網域與憑證。自動申請用 Cloudflare DNS 驗證，不需要開 80 埠，到期前 30 天自動續期；已經有憑證（例如其他服務在維護）就選「使用我自己的憑證檔」。'));
+		o = s.option(form.Value, 'domain', _('綁定網域'), _('固定網域或 DDNS 名稱，例如 dns.example.com。憑證、社群、DDNS 記錄沒有另外填時都用它。'));
 		o.datatype = 'hostname';
 		o.placeholder = 'dns.example.com';
+		o.validate = function(sid, v) {
+			if (!v) return true;
+			return (/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(v) && !/\.\d+$/.test(v)) || _('請輸入完整的網域名稱，例如 dns.example.com');
+		};
 
 		o = s.option(form.ListValue, 'cert_mode', _('憑證來源'));
 		o.value('acme', _('自動申請（Let’s Encrypt + Cloudflare DNS 驗證）'));
-		o.value('manual', _('自己指定檔案'));
+		o.value('manual', _('使用我自己的憑證檔（只讀取，不會申請或覆蓋）'));
 		o.default = 'acme';
 
 		o = s.option(form.Value, 'acme_email', _('聯絡信箱'), _('憑證到期通知用，可留空。'));
@@ -179,15 +326,19 @@ return view.extend({
 			o.default = 'ec-256';
 			o.depends('cert_mode', 'acme');
 		}
-		o = s.option(form.Value, 'cert', _('憑證檔（含中繼憑證）'));
+		var absPath = function(sid, v) { return !v || /^\/[^\s]*$/.test(v) || _('請輸入完整路徑（/ 開頭，不能有空白）'); };
+		o = s.option(form.Value, 'cert', _('憑證檔（含中繼憑證）'), _('PEM 檔的完整路徑，例如 /etc/ssl/dns.example.com/fullchain.pem。空白 = /etc/kuroshio/cert.pem。'));
 		o.placeholder = '/etc/kuroshio/cert.pem';
 		o.depends('cert_mode', 'manual');
-		o = s.option(form.Value, 'key', _('私鑰檔'));
+		o.retain = true;
+		o.validate = absPath;
+		o = s.option(form.Value, 'key', _('私鑰檔'), _('PEM 檔的完整路徑。空白 = /etc/kuroshio/key.pem。'));
 		o.placeholder = '/etc/kuroshio/key.pem';
 		o.depends('cert_mode', 'manual');
+		o.retain = true;
+		o.validate = absPath;
 
-		o = s.option(form.DummyValue, '_cert_status', _('目前憑證'));
-		o.cfgvalue = function() { return certSummary(acme); };
+		common.panel(s, '_cert_status', _('目前憑證'), function() { return certPanel(paths, acme); }, _('已套用的設定。修改後請先「儲存並套用」。'));
 
 		o = s.option(form.Button, '_issue', _('立即申請'), _('請先「儲存並套用」網域與 Cloudflare API Token。申請約需 1～3 分鐘。'));
 		o.inputtitle = _('申請 / 更新憑證');
@@ -214,45 +365,68 @@ return view.extend({
 		o = s.option(form.Value, 'api_token', _('API Token'));
 		o.password = true;
 
-		s = m.section(form.NamedSection, 'ddns', 'ddns', _('DDNS（Cloudflare）'), _('公網 IP 變了就自動更新 DNS 記錄。'));
-		o = s.option(form.Flag, 'enabled', _('啟用'));
+		s = m.section(form.NamedSection, 'ddns', 'ddns', _('DDNS（網域的 IP 由誰更新）'),
+			_('固定網域：IP 不會變，或已經由其他服務在更新，只要在上面填綁定網域。自動更新：公網 IP 變了就更新 Cloudflare 的 DNS 記錄。'));
+		o = s.option(form.ListValue, 'enabled', _('更新方式'));
+		o.value('0', _('固定網域，不需要更新'));
+		o.value('1', _('由黑潮 DNS 自動更新（DDNS，Cloudflare）'));
+		o.default = '0';
 		o.rmempty = false;
-		o = s.option(form.DynamicList, 'record', _('要更新的記錄'), _('完整網域名稱，例如 home.example.com。記錄不存在會自動建立。'));
+		// 改回固定網域時，底下的設定留著（之後再打開不用重填）
+		var dd = function(opt) { opt.depends('enabled', '1'); opt.retain = true; return opt; };
+		o = dd(s.option(form.DynamicList, 'record', _('要更新的記錄'), _('完整網域名稱，例如 home.example.com。空白 = 用綁定網域。記錄不存在會自動建立。')));
 		o.datatype = 'hostname';
-		o = s.option(form.Flag, 'ipv4', _('更新 IPv4（A）'));
+		o = dd(s.option(form.ListValue, 'ip_source', _('IP 來源'),
+			_('上網查：從每個出口各自連出去問公網 IP（路由器在其他路由器後面也正確）。讀取網路介面：直接用介面上的公網位址。')));
+		o.value('web', _('上網查公網 IP（推薦）'));
+		o.value('interface', _('讀取網路介面上的位址'));
+		o.default = 'web';
+		o = dd(s.option(form.DynamicList, 'interfaces', _('要發布的出口（網路介面）'),
+			_('多條對外線路時，選擇要發布哪幾個出口的 IP，同一個名稱會發布多筆記錄。空白 = 自動（預設路由走的那一個出口）。') +
+			(ifaces.length ? '' : ' ' + _('服務沒有執行，讀不到介面清單：請直接輸入介面名稱，例如 pppoe-wan。'))));
+		o.placeholder = 'pppoe-wan';
+		o.validate = function(sid, v) { return !v || /^[A-Za-z0-9_.@:-]{1,32}$/.test(v) || _('介面名稱只能有英數字與 . _ - @ :'); };
+		ifaces.forEach(function(i) {
+			// 迴路介面不會是對外的出口
+			if ((i.addrs || []).length && i.addrs.every(function(a) { return a.scope === 'loopback'; })) return;
+			o.value(i.name, common.ifaceText(i));
+		});
+		o = dd(s.option(form.Flag, 'ipv4', _('發布 IPv4（A）')));
 		o.default = '1';
 		o.rmempty = false;
-		o = s.option(form.Flag, 'ipv6', _('更新 IPv6（AAAA）'));
+		o = dd(s.option(form.Flag, 'ipv6', _('發布 IPv6（AAAA）'),
+			_('預設關閉：不少線路（例如中華電信）會擋外面連進來的 IPv6，發布了別人反而連不上。確定外面連得進來再打開；關閉時會移除自己建立的 AAAA 記錄。')));
+		o.default = '0';
 		o.rmempty = false;
-		o = s.option(form.ListValue, 'ip_source', _('IP 來源'));
-		o.value('web', _('問 Cloudflare（推薦，在其他路由器後面也正確）'));
-		o.value('interface', _('讀取網路介面'));
-		o.default = 'web';
-		o = s.option(widgets.DeviceSelect, 'iface4', _('IPv4 介面'), _('例如 pppoe-wan'));
-		o.noaliases = true;
-		o.depends('ip_source', 'interface');
-		o = s.option(widgets.DeviceSelect, 'iface6', _('IPv6 介面'), _('空白 = 同 IPv4 介面'));
-		o.noaliases = true;
-		o.depends('ip_source', 'interface');
-		o = s.option(form.Value, 'interval', _('檢查間隔（分鐘）'));
+		o = dd(s.option(form.Value, 'interval', _('檢查間隔（分鐘）')));
 		o.datatype = 'range(1,1440)';
 		o.placeholder = '5';
 		if (pro) {
-			o = s.option(form.Flag, 'proxied', _('經過 Cloudflare 代理（橘色雲朵）'), _('DoT 不能經過代理，給 DoH / DoT 用的記錄請保持關閉。'));
-			o = s.option(form.Value, 'ttl', _('TTL（秒）'), _('1 = 自動'));
+			o = s.option(widgets.DeviceSelect, 'iface4', _('IPv4 介面（舊欄位）'), _('舊版設定：上面有選出口時不使用。'));
+			o.noaliases = true;
+			o.retain = true;
+			o.depends({ enabled: '1', ip_source: 'interface' });
+			o = s.option(widgets.DeviceSelect, 'iface6', _('IPv6 介面（舊欄位）'), _('空白 = 同 IPv4 介面'));
+			o.noaliases = true;
+			o.retain = true;
+			o.depends({ enabled: '1', ip_source: 'interface' });
+			o = dd(s.option(form.Flag, 'proxied', _('經過 Cloudflare 代理（橘色雲朵）'), _('DoT 不能經過代理，給 DoH / DoT 用的記錄請保持關閉。')));
+			o = dd(s.option(form.Value, 'ttl', _('TTL（秒）'), _('1 = 自動')));
 			o.datatype = 'uinteger';
 			o.placeholder = '1';
-			o = s.option(form.Value, 'zone', _('Zone'), _('空白 = 從記錄名稱自動判斷'));
+			o = dd(s.option(form.Value, 'zone', _('Zone'), _('空白 = 從記錄名稱自動判斷')));
 			o.datatype = 'hostname';
-			o = s.option(form.Value, 'force_hours', _('強制確認間隔（小時）'), _('IP 沒變時多久重新向 Cloudflare 確認一次記錄。'));
+			o = dd(s.option(form.Value, 'force_hours', _('強制確認間隔（小時）'), _('IP 沒變時多久重新向 Cloudflare 確認一次記錄。')));
 			o.datatype = 'uinteger';
 			o.placeholder = '24';
-			o = s.option(form.Value, 'url4', _('IPv4 查詢網址'));
+			o = dd(s.option(form.Value, 'url4', _('IPv4 查詢網址')));
 			o.placeholder = 'https://1.1.1.1/cdn-cgi/trace';
-			o = s.option(form.Value, 'url6', _('IPv6 查詢網址'));
+			o = dd(s.option(form.Value, 'url6', _('IPv6 查詢網址')));
 			o.placeholder = 'https://[2606:4700:4700::1111]/cdn-cgi/trace';
 		}
+		common.panel(s, '_ddns_status', _('目前發布的結果'), function() { return ddnsPanel(ddnsStatus); });
 		o = s.option(form.Button, '_ddns_now', _('立即更新'), _('服務執行中才能使用。'));
+		o.depends('enabled', '1');
 		o.inputtitle = _('立即更新');
 		o.onclick = function() {
 			return common.action('/api/ddns/update').then(function(r) {
@@ -273,6 +447,6 @@ return view.extend({
 			o.depends('enabled', '1');
 		}
 
-		return m.render().then(function(node) { return E([], [common.modeBar(), node, common.footer()]); });
+		return m.render().then(function(node) { return E([], [common.modeBar(), node, pathsSection(paths), common.footer()]); });
 	}
 });

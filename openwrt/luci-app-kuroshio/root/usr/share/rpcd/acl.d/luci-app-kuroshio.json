@@ -16,7 +16,7 @@
 				"/etc/kuroshio/benchmark/doqlist.txt": [ "read" ],
 				"/etc/kuroshio/state/blacklist.txt": [ "read" ]
 			},
-			"uci": [ "kuroshio" ]
+			"uci": [ "kuroshio", "dhcp" ]
 		},
 		"write": {
 			"ubus": {
