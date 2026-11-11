@@ -72,10 +72,18 @@ impl Community {
 
     /// 送一個簽好名的信封給對方：依管道順序試，成功的管道記下來
     pub(crate) async fn post_env(&self, domain: &str, action: &str, env: &Envelope, max_wire: usize) -> Result<Reply> {
+        self.post_each(domain, action, max_wire, || env.clone()).await
+    }
+
+    /// 依序試每個端點；`make` 每試一個端點就叫一次。
+    /// 前一個端點可能已經收下訊息、只是回應沒傳回來，同一個 nonce 再送會被對方當成重放，
+    /// 所以能重做的訊息（sync、relation、poke）每個端點都用新的 nonce 重新簽。
+    async fn post_each(&self, domain: &str, action: &str, max_wire: usize, make: impl Fn() -> Envelope) -> Result<Reply> {
         let eps = self.peer_endpoints(domain);
         let mut last = anyhow!("沒有可用的端點");
         for ep in eps {
-            match crate::transport::call(&*self.resolver, &ep, action, Some(env), self.timeouts(max_wire)).await {
+            let env = make();
+            match crate::transport::call(&*self.resolver, &ep, action, Some(&env), self.timeouts(max_wire)).await {
                 Ok(r) => {
                     let mut st = self.lock();
                     if let Some(p) = st.store.get_mut(domain) {
@@ -95,6 +103,12 @@ impl Community {
     pub(crate) async fn post(&self, domain: &str, action: &str, body: Vec<u8>, max_wire: usize) -> Result<Reply> {
         let env = self.seal_envelope(action, body, None);
         self.post_env(domain, action, &env, max_wire).await
+    }
+
+    /// 同 `post`，但每個端點各自產生內容（新的 nonce）
+    pub(crate) async fn post_fresh(&self, domain: &str, action: &str, max_wire: usize, body: impl Fn() -> Vec<u8>) -> Result<Reply> {
+        self.post_each(domain, action, max_wire, || self.seal_envelope(action, body(), None))
+            .await
     }
 
     /// 驗證回應：簽名（對方的金鑰）、寄件者、收件者；回傳明文 body
@@ -338,7 +352,14 @@ impl Community {
             until: v.until,
             error: None,
         };
-        let r = self.post(domain, "relation", to_cbor(&body), MAX_REQUEST).await.ok()?;
+        let r = self
+            .post_fresh(domain, "relation", MAX_REQUEST, || {
+                let mut b = body.clone();
+                b.nonce = random_bytes::<12>().to_vec();
+                to_cbor(&b)
+            })
+            .await
+            .ok()?;
         let plain = self.open_reply(domain, &r, "relation", MAX_REQUEST).await.ok()?;
         let rb: RelationBody = from_cbor(&plain).ok()?;
         Some(View {
@@ -476,7 +497,14 @@ impl Community {
                 epoch: epoch.map(serde_bytes::ByteBuf::from),
                 since,
             };
-            let reply = match self.post(domain, "sync", to_cbor(&body), MAX_RESPONSE_WIRE).await {
+            let reply = match self
+                .post_fresh(domain, "sync", MAX_RESPONSE_WIRE, || {
+                    let mut b = body.clone();
+                    b.nonce = random_bytes::<12>().to_vec();
+                    to_cbor(&b)
+                })
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -777,7 +805,13 @@ impl Community {
             what: what.to_string(),
             seq: (what == "data").then_some(seq),
         };
-        self.post(domain, "poke", to_cbor(&body), MAX_REQUEST).await.is_ok()
+        self.post_fresh(domain, "poke", MAX_REQUEST, || {
+            let mut b = body.clone();
+            b.nonce = random_bytes::<12>().to_vec();
+            to_cbor(&b)
+        })
+        .await
+        .is_ok()
     }
 
     /// 產生新金鑰、用舊金鑰簽輪替聲明，通知所有好友
