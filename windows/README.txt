@@ -6,7 +6,16 @@
 
 快速開始（命令提示字元）：
   kuroshio.exe run                           前景執行（Ctrl+C 正常結束並寫出快照）
-                                             啟動時會印出設定頁的登入網址
+                                             啟動時會印出設定頁的登入網址與公開頁網址
+                                             執行中可以直接在視窗輸入指令：
+                                               help    指令說明
+                                               url     設定頁網址（含登入 token）
+                                               open    用瀏覽器打開設定頁
+                                               site    公開頁網址、裝置要填的 DoH / DoT 位址
+                                               status  今天的查詢數、命中率、監聽的協議
+                                               reload  重新讀取設定檔
+                                               quit    正常結束
+  kuroshio.exe url [--open]                  不在視窗裡（例如服務模式）時看同樣的網址
   kuroshio.exe query example.com -s 127.0.0.1:53
 
 長期執行（用「以系統管理員身分執行」的命令提示字元）：

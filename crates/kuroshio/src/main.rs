@@ -135,6 +135,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 設定頁、公開頁的網址與裝置要填的 DoH / DoT 位址（服務模式看不到視窗時用）
+    Url {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 用瀏覽器打開設定頁
+        #[arg(long)]
+        open: bool,
+    },
     /// 輸出完整預設設定
     Defaults {
         /// JSON 格式（目前只有這一種）
@@ -280,6 +290,9 @@ pub async fn serve(
         if mode == "service" { "，Windows 服務" } else { "" }
     );
     tokio::pin!(stop);
+    // cmd 執行：可以在視窗裡輸入 help、url、site…（標準輸入是終端機時才讀）
+    let console: ConsoleSlot = Default::default();
+    let mut console_rx = if mode == "cmd" { kuroshio::console::spawn_reader() } else { None };
     let mut first = true;
     // 上一份成功啟動的設定檔內容：設定頁存了一份啟動不了的設定時改回來（不讓服務整個停掉）
     let mut last_good: Option<Vec<u8>> = None;
@@ -299,22 +312,76 @@ pub async fn serve(
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<bool>>();
         let (config2, show_url) = (config.clone(), first && mode == "cmd");
+        let (slot, interactive) = (console.clone(), console_rx.is_some());
         std::thread::Builder::new().name("kuroshio".into()).spawn(move || {
             let r = (|| -> Result<bool> {
                 let rt = build_runtime(threads)?;
-                let r = rt.block_on(generation(cfg, tier, config2, uci, mode, show_url, stop_rx));
+                let r = rt.block_on(generation(
+                    cfg,
+                    tier,
+                    config2,
+                    uci,
+                    mode,
+                    show_url,
+                    interactive,
+                    slot.clone(),
+                    stop_rx,
+                ));
+                *slot.lock().unwrap() = None;
                 rt.shutdown_timeout(std::time::Duration::from_secs(3));
                 r
             })();
             let _ = done_tx.send(r);
         })?;
         tokio::pin!(done_rx);
-        let result = tokio::select! {
-            _ = &mut stop => {
-                let _ = stop_tx.send(());
-                (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false)
+        let mut stop_tx = Some(stop_tx);
+        let result = loop {
+            tokio::select! {
+                _ = &mut stop => {
+                    if let Some(t) = stop_tx.take() {
+                        let _ = t.send(());
+                    }
+                    break (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false);
+                }
+                r = &mut done_rx => break r.unwrap_or(Ok(false)),
+                Some(line) = console_line(&mut console_rx) => {
+                    use kuroshio::console::Action;
+                    let (out, act, url, reload) = {
+                        let g = console.lock().unwrap();
+                        let (out, act) = kuroshio::console::handle(&line, g.as_ref());
+                        (
+                            out,
+                            act,
+                            g.as_ref().and_then(|c| c.info.admin_url.clone()),
+                            g.as_ref().and_then(|c| c.state.as_ref().map(|s| s.reload.clone())),
+                        )
+                    };
+                    if !out.is_empty() {
+                        println!("{out}");
+                    }
+                    match act {
+                        Action::Quit => {
+                            if let Some(t) = stop_tx.take() {
+                                let _ = t.send(());
+                            }
+                            break (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false);
+                        }
+                        Action::Reload => {
+                            if let Some(r) = reload {
+                                r.notify_one();
+                            }
+                        }
+                        Action::Open => {
+                            if let Some(u) = url {
+                                if !kuroshio::console::open_browser(&u) {
+                                    println!("打不開瀏覽器，請自己複製網址：{u}");
+                                }
+                            }
+                        }
+                        Action::None => {}
+                    }
+                }
             }
-            r = &mut done_rx => r.unwrap_or(Ok(false)),
         };
         let reload = match result {
             Ok(r) => {
@@ -340,7 +407,68 @@ pub async fn serve(
     Ok(())
 }
 
+type ConsoleSlot = std::sync::Arc<std::sync::Mutex<Option<kuroshio::console::Ctx>>>;
+
+/// 互動指令的下一行；沒有終端機（或輸入已結束）時永遠不會回來
+async fn console_line(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>) -> Option<String> {
+    match rx {
+        Some(r) => match r.recv().await {
+            Some(l) => Some(l),
+            None => {
+                *rx = None;
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// 設定頁、公開頁的網址與位置（互動指令與 `kuroshio url` 共用）
+fn console_info(
+    cfg: &serde_json::Value,
+    config: Option<&std::path::Path>,
+    started: Option<&kuroshio::app::Started>,
+) -> kuroshio::console::Info {
+    use kuroshio_config::get;
+    let n = |k: &str, d: u64| get(cfg, k).and_then(|v| v.as_u64()).unwrap_or(d) as u16;
+    let on = |k: &str| get(cfg, k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let (admin_url, token_file, doh, dot, site_on) = match started {
+        Some(s) => {
+            let ui = &s.state.webui;
+            (
+                s.admin.map(|a| ui.login_url(a.port())),
+                ui.token_file.as_ref().map(|f| f.display().to_string()),
+                s.state.encrypted.doh.map(|a| a.port()),
+                s.state.encrypted.dot.map(|a| a.port()),
+                s.state.resolver.site.get().is_some(),
+            )
+        }
+        // 沒在這個行程裡跑（kuroshio url）：照設定推算，token 從檔案讀
+        None => {
+            let base = kuroshio::app::persist_dir(cfg).parent().map(PathBuf::from).unwrap_or_default();
+            let ui = kuroshio::webui::WebUi::peek(cfg, &base);
+            let admin = get(cfg, "admin.enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            (
+                admin.then(|| match (&ui.0, &ui.1) {
+                    (Some(t), _) => format!("http://127.0.0.1:{}/login?token={t}", n("admin.port", 8054)),
+                    // 要登入但 token 還沒產生：服務還沒啟動過
+                    (None, Some(_)) => format!("http://127.0.0.1:{}/（登入 token 會在服務第一次啟動時產生）", n("admin.port", 8054)),
+                    (None, None) => format!("http://127.0.0.1:{}/", n("admin.port", 8054)),
+                }),
+                ui.1.map(|f| f.display().to_string()),
+                on("listen.doh.enabled").then(|| n("listen.doh.port", 8053)),
+                on("listen.dot.enabled").then(|| n("listen.dot.port", 853)),
+                on("site.enabled") && on("listen.doh.enabled"),
+            )
+        }
+    };
+    let mut info = kuroshio::console::Info::build(cfg, admin_url, token_file, doh, dot, site_on);
+    info.config_file = config.map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.to_path_buf()).display().to_string());
+    info
+}
+
 /// 一輪執行：啟動、等到停止（回 false）或設定頁要求重新載入（回 true），收尾寫出快照
+#[allow(clippy::too_many_arguments)]
 async fn generation(
     cfg: serde_json::Value,
     tier: Tier,
@@ -348,21 +476,36 @@ async fn generation(
     uci: bool,
     mode: &'static str,
     show_url: bool,
+    interactive: bool,
+    console: ConsoleSlot,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<bool> {
     let started = kuroshio::app::start(&cfg, tier).await?;
     let ui = &started.state.webui;
     if !uci {
-        let _ = ui.config_file.set(std::fs::canonicalize(&config).unwrap_or(config));
+        let _ = ui
+            .config_file
+            .set(std::fs::canonicalize(&config).unwrap_or_else(|_| config.clone()));
     }
     let _ = ui.run_mode.set(mode);
+    let cinfo = console_info(&cfg, (!uci).then_some(config.as_path()), Some(&started));
     if let (Some(a), true) = (started.admin, ui.auth_enabled() || cfg!(windows)) {
         if show_url {
             println!("設定頁：{}", ui.login_url(a.port()));
+            if let Some(u) = cinfo.site_urls.first() {
+                println!("公開頁：{u}");
+            }
+            if interactive {
+                println!("輸入 help 可以看指令（url 設定頁網址、site 公開頁網址、status 狀態、quit 結束）");
+            }
         } else if let Some(f) = &ui.token_file {
             info!("設定頁 http://127.0.0.1:{}/（登入 token：{}）", a.port(), f.display());
         }
     }
+    *console.lock().unwrap() = Some(kuroshio::console::Ctx {
+        info: cinfo,
+        state: Some(started.state.clone()),
+    });
     let p = started.persister.lock().unwrap().policy().clone();
     info!(
         "快照目錄 {}（{}），最短間隔 {} 分鐘，每天寫入上限 {} KB",
@@ -517,6 +660,18 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
                 }
             } else {
                 r?;
+            }
+        }
+        Cmd::Url { config, uci, open } => {
+            let (cfg, ..) = effective(&config, uci)?;
+            let info = console_info(&cfg, (!uci).then_some(config.as_path()), None);
+            let ctx = kuroshio::console::Ctx { info, state: None };
+            println!("{}", kuroshio::console::handle("url", Some(&ctx)).0);
+            println!("{}", kuroshio::console::handle("site", Some(&ctx)).0);
+            if open {
+                if let Some(u) = &ctx.info.admin_url {
+                    kuroshio::console::open_browser(u);
+                }
             }
         }
         Cmd::Run { config, uci } => serve(config, uci, threads, None, shutdown_signal()).await?,

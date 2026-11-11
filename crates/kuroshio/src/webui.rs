@@ -115,6 +115,26 @@ impl WebUi {
         }
     }
 
+    /// 不啟動服務、也不產生 token，只看目前的 token 與它的檔案位置（`kuroshio url` 用）：(token, 檔案)
+    pub fn peek(cfg: &Value, base_dir: &std::path::Path) -> (Option<String>, Option<PathBuf>) {
+        let auth = match get(cfg, "admin.auth") {
+            Some(Value::Bool(b)) => *b,
+            _ => cfg!(windows),
+        };
+        if !auth {
+            return (None, None);
+        }
+        let file = match get(cfg, "admin.tokenFile").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            Some(p) => PathBuf::from(p),
+            None => base_dir.join("admin.token"),
+        };
+        let token = std::fs::read_to_string(&file)
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| t.len() >= 16);
+        (token, Some(file))
+    }
+
     pub fn auth_enabled(&self) -> bool {
         self.token.is_some()
     }

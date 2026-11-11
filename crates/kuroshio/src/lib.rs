@@ -11,6 +11,7 @@ pub mod certinfo;
 pub mod cloudflare;
 pub mod community_bridge;
 pub mod compare;
+pub mod console;
 pub mod ddns;
 pub mod encrypted;
 pub mod filtering;
