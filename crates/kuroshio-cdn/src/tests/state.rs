@@ -349,15 +349,17 @@ fn shards_migrate_and_track_changes() {
     assert!(ch.changed.is_empty() && ch.manifest.is_none(), "內容沒變：什麼都不用寫");
 
     // (ii) 一個驗證結果的變動只重寫一片
+    // 固定挑同一個（HashMap 的順序每次執行不同）：有供應商、而且原本就有 IPv4 驗證結果的網域中名稱最小的
+    drop(c);
     let name = c2
         .state()
         .db
         .domains
         .values()
-        .find(|d| d.provider().is_some())
-        .unwrap()
-        .name
-        .to_string();
+        .filter(|d| d.provider().is_some() && d.v4.is_some())
+        .map(|d| d.name.to_string())
+        .min()
+        .unwrap();
     c2.with_state(|st| st.db.set_verdict(&name, 4, |v| v.verdict = Some(crate::util::intern("fail"))));
     let (_, ch) = c2.snapshots_sharded(false);
     assert_eq!(ch.changed, vec![(crate::db::shard_of(&name, ch.shards), true)]);
@@ -378,9 +380,19 @@ fn shards_migrate_and_track_changes() {
     // 計數跟著分片一起寫出去
     let hits = c2.state().db.get(&name).unwrap().hits;
     write_changes(&c2, &dir, &ch);
+    let before = serde_json::to_string(c2.state().db.get(&name).unwrap()).unwrap();
+    drop(c2);
     let c3 = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
-    assert_eq!(c3.state().db.get(&name).unwrap().hits, hits);
-    assert!(c3.state().db.get(&name).unwrap().v4.as_ref().unwrap().is("fail"));
+    let after = c3.state().db.get(&name).map(|d| serde_json::to_string(d).unwrap());
+    assert_eq!(
+        c3.state().db.get(&name).map(|d| d.hits),
+        Some(hits),
+        "{name}\n寫出前 {before}\n讀回 {after:?}"
+    );
+    assert!(
+        c3.state().db.get(&name).and_then(|d| d.v4.as_ref()).is_some_and(|v| v.is("fail")),
+        "{name}\n寫出前 {before}\n讀回 {after:?}"
+    );
 
     // (v) 壞掉 / 不見的分片：其他照常載入、不會不能啟動，壞掉的那片之後重寫
     let shards = ch.shards;
