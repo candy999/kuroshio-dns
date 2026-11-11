@@ -853,7 +853,12 @@ mod tests {
 
     /// 在小堆疊（1 MiB，比 tokio 工作執行緒的 2 MiB 還小）的執行緒裡跑：堆疊用完會讓整個測試程序當掉
     fn small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-        std::thread::Builder::new().stack_size(1024 * 1024).spawn(f).unwrap().join().unwrap()
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
     }
 
     #[test]

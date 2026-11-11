@@ -160,6 +160,108 @@ async fn verifier_tries_community_hints_first() {
     assert_eq!(h.results.lock().unwrap().as_slice(), [("friend".to_string(), true)]);
 }
 
+/// 好友提示：可以指定多個 IP
+struct ListHints {
+    list: Vec<(&'static str, &'static str)>,
+    results: Mutex<Vec<(String, bool)>>,
+}
+
+impl Hints for ListHints {
+    fn domain_hint(&self, _n: &str, _p: &str, _f: u8) -> Vec<HintIp> {
+        self.list
+            .iter()
+            .map(|(i, f)| HintIp {
+                ip: ip(i),
+                from: f.to_string(),
+            })
+            .collect()
+    }
+    fn hint_result(&self, from: &str, ok: bool) {
+        self.results.lock().unwrap().push((from.into(), ok));
+    }
+    fn cross_hint(&self, _n: &str) -> Option<CrossHint> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn verifier_hint_outside_provider_range_is_never_probed() {
+    // 好友給的 IP 不在這家 CDN 的官方範圍（可能是任何人的機器）：連試都不試、算沒命中
+    let (c, net) = setup(json!({}));
+    let h = Arc::new(ListHints {
+        list: vec![("203.0.113.9", "bad"), ("2606:4700::1", "v6"), ("104.16.99.1", "good")],
+        results: Mutex::new(vec![]),
+    });
+    c.set_hints(Some(h.clone()));
+    c.with_state(|st| {
+        st.db.touch("hr.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|_, _| cf_ok("TPE"));
+    assert_eq!(c.verify("hr.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+    assert!(net.calls("https 203.0.113.9").is_empty(), "範圍外的不試");
+    assert!(net.calls("https 2606:4700::1").is_empty(), "家族不符的不試");
+    let mut r = h.results.lock().unwrap().clone();
+    r.sort();
+    assert_eq!(
+        r,
+        [("bad".to_string(), false), ("good".to_string(), true), ("v6".to_string(), false)]
+    );
+    // 判定裡只有自己節點池的 IP：好友的 IP 驗證通過也不回給用戶端
+    let st = c.state();
+    let v = st.db.get("hr.test").unwrap().v4.clone().unwrap();
+    assert_eq!(v.ip, Some(ip("104.16.161.36")));
+    assert_eq!(v.ips, Some(ips(&["104.16.161.36", "104.18.20.216"])));
+}
+
+#[tokio::test]
+async fn verifier_hint_only_pass_is_not_ok() {
+    // 只有好友的 IP 通過、自己節點池的都連不上：不能寫成「通過」（查詢時沒有 IP 可以回）
+    let (c, net) = setup(json!({}));
+    let h = Arc::new(ListHints {
+        list: vec![("104.16.99.1", "friend")],
+        results: Mutex::new(vec![]),
+    });
+    c.set_hints(Some(h.clone()));
+    c.with_state(|st| {
+        st.db.touch("ho.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "104.21.0.5" => cf_ok("NRT"),
+        "104.16.99.1" => cf_ok("TPE"),
+        _ => fail("ECONNRESET"),
+    });
+    assert_eq!(c.verify("ho.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("unknown"));
+    assert_eq!(h.results.lock().unwrap().as_slice(), [("friend".to_string(), true)]);
+    assert!(c.state().db.get("ho.test").unwrap().v4.as_ref().unwrap().is("unknown"));
+}
+
+#[tokio::test]
+async fn verifier_http_only_requires_consistent_https() {
+    // 原始節點的 HTTPS 只是一時連不上（ECONNRESET）、HTTP 可以用 → 改用 HTTP 驗證。
+    // 候選節點 HTTP 也可以用，但 HTTPS 是「憑證不符」：跟原始節點不一樣，不能算通過
+    // （否則用 HTTPS 的用戶端會被導到憑證沒驗證過的節點）
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        st.db.touch("mix.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|i, _| {
+        if i == ip("104.21.0.5") {
+            fail("ECONNRESET")
+        } else {
+            ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true)
+        }
+    });
+    net.on_http(|_, _| resp(200, &[("cf-ray", "x-TPE")], "ok"));
+    assert_eq!(c.verify("mix.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("unknown"));
+    let v = c.state().db.get("mix.test").unwrap().v4.clone().unwrap();
+    assert!(!v.is("ok"));
+    assert!(v.reason.as_deref().unwrap().contains("HTTPS"), "{:?}", v.reason);
+
+    // 候選節點的 HTTPS 有效（憑證驗證過）：比原始節點還好，通過
+    net.on_https(|i, _| if i == ip("104.21.0.5") { fail("ECONNRESET") } else { cf_ok("TPE") });
+    assert_eq!(c.verify("mix.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+}
+
 #[tokio::test]
 async fn ecs_probe_finds_closer_node() {
     let (c, net) = setup(json!({ "ecs": { "twSubnets": ["168.95.0.0/24", "1.160.0.0/24"], "resolvers": ["udp://8.8.8.8"] } }));

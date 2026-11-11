@@ -6,7 +6,7 @@ use crate::db::Base;
 use crate::providers::{self, detect_from_headers, hv};
 use crate::util::{self, intern, now_ms, Num, HOUR_MS};
 use kuroshio_net::probe::{HttpsOpts, ProbeResult};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,6 +103,22 @@ fn zone_kind(broken: &str) -> bool {
     broken.contains("錯誤 1") || broken.contains("421") || broken.contains("Distribution")
 }
 
+/// 社群好友提示的 IP 與驗證結果（None = 沒輪到試）
+struct Hinted {
+    ip: IpAddr,
+    from: String,
+    result: Option<bool>,
+}
+
+/// 好友提示最多試幾個（每個都要連一次）
+const MAX_HINTS: usize = 4;
+
+/// 原始節點 HTTPS 失敗的樣子（只用 HTTP 驗證時，候選節點要跟它一致）
+struct HttpsFail {
+    tls_error: bool,
+    error: Option<String>,
+}
+
 struct ZoneFail {
     reason: String,
     pop: Option<String>,
@@ -157,24 +173,29 @@ impl Cdn {
 
     /// 驗證（同 2.x `Verifier.verify`）：回傳 ok / fail / unknown，沒有候選 IP 回 None
     pub async fn verify(self: &Arc<Self>, name: &str, provider: &str, family: u8, orig: Option<IpAddr>) -> Option<&'static str> {
-        let mut hinted: Vec<(IpAddr, String)> = Vec::new();
+        let mut hinted: Vec<Hinted> = Vec::new();
         let r = self.verify_inner(name, provider, family, orig, &mut hinted).await;
-        // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗
+        // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗（沒輪到試的不算）
         if !hinted.is_empty() {
             if let Some(h) = self.hints() {
-                let ok_ips: Vec<IpAddr> = {
-                    let st = self.state();
-                    match st.db.get(name).and_then(|e| e.verdict(family)).filter(|v| v.is("ok")) {
-                        Some(v) => v.ips.clone().unwrap_or_else(|| v.ip.into_iter().collect()),
-                        None => vec![],
+                for x in &hinted {
+                    if let Some(ok) = x.result {
+                        h.hint_result(&x.from, ok);
                     }
-                };
-                for (ip, from) in &hinted {
-                    h.hint_result(from, ok_ips.contains(ip));
                 }
             }
         }
         r
+    }
+
+    /// 只用 HTTP 驗證的網站（原始節點的 HTTPS 連不上）：候選節點的 HTTPS 也要「跟原始節點一樣」或「可以用」。
+    /// 原始節點只是一時連不上 HTTPS 的時候，沒有這項檢查就會把「憑證沒驗證過」的節點回給用 HTTPS 的用戶端
+    async fn https_consistent(&self, ip: IpAddr, name: &str, base: &HttpsFail) -> bool {
+        let r = self.probe_site(ip, name, false).await;
+        if r.ok {
+            return true; // 憑證有效：比原始節點還好
+        }
+        r.tls_error == base.tls_error && (r.tls_error || r.error == base.error)
     }
 
     async fn verify_inner(
@@ -183,7 +204,7 @@ impl Cdn {
         provider: &str,
         family: u8,
         orig: Option<IpAddr>,
-        hinted_out: &mut Vec<(IpAddr, String)>,
+        hinted_out: &mut Vec<Hinted>,
     ) -> Option<&'static str> {
         let prov = providers::get(provider);
         let label = providers::label(provider);
@@ -197,11 +218,16 @@ impl Cdn {
         // 有些網站只開 HTTP（OCSP / CRL、軟體更新鏡像…），原始節點的 HTTPS 就失敗時改用 HTTP 驗證
         let mut base: Option<ProbeResult> = None;
         let mut http_mode = false;
+        let mut base_https: Option<HttpsFail> = None;
         if let Some(o) = orig.filter(|o| family == 4 || o.is_ipv6()) {
             let mut b = self.probe_site(o, name, false).await;
             if !b.ok && b.error.as_deref() != Some("TIMEOUT") {
                 let b2 = self.net.http_probe(o, name, "/", t).await;
                 if b2.ok {
+                    base_https = Some(HttpsFail {
+                        tls_error: b.tls_error,
+                        error: b.error.clone(),
+                    });
                     b = b2;
                     http_mode = true;
                 }
@@ -257,27 +283,47 @@ impl Cdn {
                 v
             }
         };
-        // 社群好友驗證過這個網站可用的 IP：排在最前面先試
-        if let Some(h) = self.hints() {
-            let mut seen: HashMap<IpAddr, String> = HashMap::new();
-            for x in h.domain_hint(name, provider, family) {
-                if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(x.ip) {
-                    e.insert(x.from.clone());
-                    hinted_out.push((x.ip, x.from));
-                }
-            }
-            if !hinted_out.is_empty() {
-                let mut c: Vec<IpAddr> = hinted_out.iter().map(|x| x.0).collect();
-                c.extend(candidates.iter().copied().filter(|ip| !seen.contains_key(ip)));
-                candidates = c;
-            }
-        }
+        // 自己的節點池沒有候選：好友的提示驗證通過也不能拿來用（見下面的 usable），不用試
         if candidates.is_empty() {
             return None;
         }
+        // 社群好友驗證過這個網站可用的 IP：排在最前面先試
+        if let Some(h) = self.hints() {
+            let mut seen: HashSet<IpAddr> = HashSet::new();
+            let st = self.state();
+            for x in h.domain_hint(name, provider, family) {
+                if !seen.insert(x.ip) {
+                    continue;
+                }
+                // 只收「這家 CDN 官方範圍內、位址家族相符」的：好友給的只是候選，範圍外的（可能是任何人的機器）
+                // 連試都不試，直接算沒命中。只用 HTTP 驗證的網站沒有憑證把關，這一關尤其重要
+                let in_range = x.ip.is_ipv6() == (family == 6) && st.pools.classify(x.ip).map(|c| c.provider == provider).unwrap_or(false);
+                let take = in_range && hinted_out.iter().filter(|h| h.result.is_none()).count() < MAX_HINTS;
+                hinted_out.push(Hinted {
+                    ip: x.ip,
+                    from: x.from,
+                    result: if in_range { None } else { Some(false) },
+                });
+                if !take {
+                    seen.remove(&x.ip);
+                }
+            }
+            drop(st);
+            if !seen.is_empty() {
+                let mut c: Vec<IpAddr> = hinted_out.iter().map(|x| x.ip).filter(|ip| seen.contains(ip)).collect();
+                c.extend(candidates.iter().copied().filter(|ip| !seen.contains(ip)));
+                candidates = c;
+            }
+        }
+        let note = |hinted: &mut Vec<Hinted>, ip: IpAddr, ok: bool| {
+            if let Some(h) = hinted.iter_mut().find(|h| h.ip == ip) {
+                h.result = Some(ok);
+            }
+        };
         let mut last_reason = "無可用台灣節點".to_string();
         let mut zone_fail: Option<ZoneFail> = None;
         for (idx, &ip) in candidates.iter().enumerate() {
+            note(hinted_out, ip, false);
             let r = self.probe_site(ip, name, http_mode).await;
             if !r.ok {
                 let err = r.error.clone().unwrap_or_default();
@@ -319,6 +365,11 @@ impl Cdn {
                 if let (Some(b), Some(_)) = (base_ok, base_broken) {
                     if b.status == r.status {
                         // 原始節點也是同樣錯誤 → 網站本身的問題，不算置換失敗
+                        note(hinted_out, ip, true);
+                        if !self.state().pools.usable(provider, ip) {
+                            last_reason = "只有不在節點池裡的 IP 可用".into();
+                            continue;
+                        }
                         return Some(self.done(
                             name,
                             family,
@@ -390,12 +441,27 @@ impl Cdn {
                     ));
                 }
             }
+            if let Some(bh) = &base_https {
+                if !self.https_consistent(ip, name, bh).await {
+                    last_reason = "HTTP 可以用，但 HTTPS 跟原始節點不一致".into();
+                    continue;
+                }
+            }
+            note(hinted_out, ip, true);
+            // 驗證通過、但不在自己節點池裡的（好友提示的 IP）不能回給用戶端：只算好友的命中率，繼續找自己能用的。
+            // 以前會把判定寫成「通過」，查詢時卻沒有 IP 可以回，於是每次查詢都重新驗證一輪
+            if !self.state().pools.usable(provider, ip) {
+                last_reason = "只有不在節點池裡的 IP 可用".into();
+                continue;
+            }
             self.with_state(|st| st.pools.zone_note(provider, ip, true));
             // 其餘候選也逐一確認：回給用戶端的每個 IP 都要驗證過（Cloudflare 有些網站只能用特定 IP）
             let mut ips = vec![ip];
             if !octet {
                 for &ip2 in &candidates[idx + 1..] {
-                    if self.passes(provider, name, http_mode, ip2, base_ok).await {
+                    let ok = self.passes(provider, name, http_mode, ip2, base_ok, base_https.as_ref()).await;
+                    note(hinted_out, ip2, ok);
+                    if ok && self.state().pools.usable(provider, ip2) {
                         ips.push(ip2);
                     }
                 }
@@ -455,7 +521,15 @@ impl Cdn {
     }
 
     /// 額外候選 IP 能不能服務這個網站（同樣的判斷，只是不寫判定）
-    async fn passes(&self, provider: &str, name: &str, http_mode: bool, ip: IpAddr, base: Option<&ProbeResult>) -> bool {
+    async fn passes(
+        &self,
+        provider: &str,
+        name: &str,
+        http_mode: bool,
+        ip: IpAddr,
+        base: Option<&ProbeResult>,
+        base_https: Option<&HttpsFail>,
+    ) -> bool {
         let prov = providers::get(provider);
         let r = self.probe_site(ip, name, http_mode).await;
         if !r.ok {
@@ -484,6 +558,11 @@ impl Cdn {
         }
         if let Some(b) = base {
             if b.status < 400 && r.status >= 400 && r.status != b.status && r.status != 404 {
+                return false;
+            }
+        }
+        if let Some(bh) = base_https {
+            if !self.https_consistent(ip, name, bh).await {
                 return false;
             }
         }

@@ -147,7 +147,10 @@ fn bench_apply() {
         ns_per_apply(&c, msgs, 1, rounds / 4 + 1); // 暖機
         let one = ns_per_apply(&c, msgs, 1, rounds);
         let four = ns_per_apply(&c, msgs, 4, rounds);
-        println!("{label:<30} {:>5} 則｜1 執行緒 {one:>7.0} ns/次｜4 執行緒 {four:>7.0} ns/次（每個執行緒）", msgs.len());
+        println!(
+            "{label:<30} {:>5} 則｜1 執行緒 {one:>7.0} ns/次｜4 執行緒 {four:>7.0} ns/次（每個執行緒）",
+            msgs.len()
+        );
     }
 }
 
