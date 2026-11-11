@@ -206,9 +206,36 @@ fn group(raw: impl IntoIterator<Item = (String, bool, IpAddr)>, flags: &[(Ipv6Ad
     out
 }
 
+/// 讀網卡清單最多等多久。系統呼叫平常幾毫秒就回來；
+/// 但在某些環境（例如 QEMU 模擬大端序 MIPS）netlink 會一直不回，不能讓呼叫端跟著卡住
+const IFADDRS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 同一時間只讓一個讀取在進行：卡住的那一個沒結束前，不再開新的執行緒
+static IFADDRS_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `if_addrs::get_if_addrs()`，但在另一條執行緒做、最多等 `IFADDRS_TIMEOUT`
+pub fn if_addrs_bounded() -> std::io::Result<Vec<if_addrs::Interface>> {
+    use std::sync::atomic::Ordering;
+    if IFADDRS_BUSY.swap(true, Ordering::AcqRel) {
+        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "上一次讀取網卡清單還沒結束"));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("ifaddrs".into()).spawn(move || {
+        let r = if_addrs::get_if_addrs();
+        IFADDRS_BUSY.store(false, Ordering::Release);
+        let _ = tx.send(r);
+    });
+    if let Err(e) = spawned {
+        IFADDRS_BUSY.store(false, Ordering::Release);
+        return Err(e);
+    }
+    rx.recv_timeout(IFADDRS_TIMEOUT)
+        .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "讀網卡清單超過 2 秒沒有回應")))
+}
+
 /// 列出本機所有有位址的網卡（讀不到時回空清單）
 pub fn list() -> Vec<Iface> {
-    match if_addrs::get_if_addrs() {
+    match if_addrs_bounded() {
         Ok(v) => group(v.into_iter().map(|i| (i.name.clone(), i.is_oper_up(), i.ip())), &inet6_flags()),
         Err(e) => {
             tracing::warn!("讀不到本機網卡清單：{e}");

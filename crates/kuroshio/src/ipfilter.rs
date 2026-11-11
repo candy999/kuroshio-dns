@@ -948,27 +948,31 @@ pub fn sane_size(old: &TwIp, new: &TwIp) -> bool {
 /// 本機各網卡所在的網段（迴路除外；IPv6 前綴短於 /48 的不算，避免把整個 ISP 放進來）
 pub fn local_networks() -> Dual {
     let mut list = Vec::new();
-    if let Ok(ifs) = if_addrs::get_if_addrs() {
-        for i in ifs {
-            if i.is_loopback() {
-                continue;
-            }
-            match i.addr {
-                if_addrs::IfAddr::V4(a) => {
-                    let len = u32::from(a.netmask).leading_ones();
-                    // 網段太大（短於 /16）的只放自己這個位址
-                    list.push(format!("{}/{}", a.ip, if len >= 16 { len } else { 32 }));
+    match crate::netif::if_addrs_bounded() {
+        Ok(ifs) => {
+            for i in ifs {
+                if i.is_loopback() {
+                    continue;
                 }
-                if_addrs::IfAddr::V6(a) => {
-                    let len = u128::from(a.netmask).leading_ones();
-                    if len >= 48 {
-                        list.push(format!("{}/{len}", a.ip));
-                    } else {
-                        list.push(format!("{}/128", a.ip));
+                match i.addr {
+                    if_addrs::IfAddr::V4(a) => {
+                        let len = u32::from(a.netmask).leading_ones();
+                        // 網段太大（短於 /16）的只放自己這個位址
+                        list.push(format!("{}/{}", a.ip, if len >= 16 { len } else { 32 }));
+                    }
+                    if_addrs::IfAddr::V6(a) => {
+                        let len = u128::from(a.netmask).leading_ones();
+                        if len >= 48 {
+                            list.push(format!("{}/{len}", a.ip));
+                        } else {
+                            list.push(format!("{}/128", a.ip));
+                        }
                     }
                 }
             }
         }
+        // 讀不到就只靠私有位址、迴路那幾條固定規則（區網照樣放行）
+        Err(e) => tracing::warn!("存取控制：讀不到本機網卡（{e}），本機網段暫時只靠私有位址規則"),
     }
     Dual::parse(list.iter().map(String::as_str)).0
 }
