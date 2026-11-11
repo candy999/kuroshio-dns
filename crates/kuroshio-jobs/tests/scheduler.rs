@@ -109,6 +109,54 @@ fn tick_fires_once_per_slot() {
 }
 
 #[test]
+fn tick_catches_up_slot_missed_while_running() {
+    // 程式一直在跑，但兩次檢查之間跨過了排定時間（系統休眠、時鐘往前跳）：補跑一次，錯過幾次都只跑一次
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 4, 0)));
+    let s = sched(
+        json!({ "jobs": {
+            "a": { "at": "04:10" },
+            "multi": { "at": ["05:00", "06:00", "07:00"] },
+            "later": { "at": "12:00" },
+        } }),
+        None,
+        &clock,
+    );
+    for n in ["a", "multi", "later"] {
+        s.register(n, noop);
+    }
+    assert!(s.tick().is_empty());
+    // 休眠到 09:00
+    clock.set(tpe(2026, 11, 10, 9, 0));
+    let mut got = s.tick();
+    got.sort();
+    assert_eq!(got, ["a", "multi"]);
+    let st = s.status();
+    assert_eq!(st["state"]["multi"]["lastSlot"], "2026-11-10 07:00", "記最近的那一次");
+    assert!(st["queue"].as_array().unwrap().iter().all(|q| q["reason"] == "排程（補跑錯過的）"));
+    assert!(s.tick().is_empty(), "不會重複");
+    clock.set(tpe(2026, 11, 10, 11, 0));
+    assert!(s.tick().is_empty(), "還沒到的不跑");
+
+    // 排定時間之後已經開始跑過的不補跑（只記下這次排定時間）
+    let saved = json!({ "a": { "lastStart": tpe(2026, 11, 11, 4, 20) } }).to_string();
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 11, 4, 0)));
+    let s = sched(json!({ "jobs": { "a": { "at": "04:10" } } }), Some(saved.as_bytes()), &clock);
+    s.register("a", noop);
+    assert!(s.tick().is_empty());
+    clock.set(tpe(2026, 11, 11, 4, 30));
+    assert!(s.tick().is_empty());
+    assert_eq!(s.status()["state"]["a"]["lastSlot"], "2026-11-11 04:10");
+
+    // 剛啟動、還沒檢查過就已經錯過的：交給啟動補跑（catch_up_plan），這裡不跑
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 11, 9, 0)));
+    let s = sched(json!({ "jobs": { "a": { "at": "04:10" } } }), None, &clock);
+    s.register("a", noop);
+    assert!(s.tick().is_empty());
+    clock.set(tpe(2026, 11, 11, 9, 1));
+    assert!(s.tick().is_empty());
+}
+
+#[test]
 fn catch_up_plan() {
     let now = tpe(2026, 11, 10, 12, 0);
     let clock = Arc::new(ManualClock::new(now));

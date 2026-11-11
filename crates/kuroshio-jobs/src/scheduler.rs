@@ -262,6 +262,8 @@ struct St {
     defer_logged: bool,
     unknown_warned: HashSet<String>,
     started_ms: Option<u64>,
+    /// 上次 `tick` 的時間：兩次檢查之間跨過了排定時間（系統休眠、時鐘往前跳）就知道是錯過了
+    last_tick: Option<u64>,
 }
 
 struct Inner {
@@ -298,6 +300,7 @@ impl Scheduler {
                     defer_logged: false,
                     unknown_warned: HashSet::new(),
                     started_ms: None,
+                    last_tick: None,
                 }),
                 notify: Notify::new(),
             }),
@@ -390,19 +393,29 @@ impl Scheduler {
         out
     }
 
-    /// 檢查排定時間；回傳這次排入的工作
+    /// 檢查排定時間；回傳這次排入的工作。
+    ///
+    /// 排定時間過了寬限（`slot_grace_ms`）才檢查到的：程式一直在跑、只是兩次檢查之間跨過了排定時間
+    /// （系統休眠、時鐘往前跳）就補跑一次——錯過好幾次也只跑一次，排定時間之後已經跑過的不再跑。
+    /// 程式剛啟動（還沒檢查過）時錯過的交給 `catch_up_plan`
     pub fn tick(&self) -> Vec<String> {
         let now = self.inner.opts.clock.now_ms();
         let mut due = Vec::new();
         {
             let mut st = self.inner.st.lock().unwrap();
             let started = st.started_ms.unwrap_or(0);
+            let prev = st.last_tick.replace(now);
             for (name, c) in Self::jobs_cfg(&st.cfg) {
                 if !enabled(&c) {
                     continue;
                 }
                 let Some(s) = last_slot(&c, now) else { continue };
-                if s < started || now - s > self.inner.opts.slot_grace_ms {
+                if s < started {
+                    continue;
+                }
+                let late = now - s > self.inner.opts.slot_grace_ms;
+                // 上次檢查時還沒到這個時間點 = 執行期間錯過的（不是啟動前錯過的）
+                if late && !prev.map(|p| p < s).unwrap_or(false) {
                     continue;
                 }
                 let stamp = slot_stamp(s);
@@ -410,16 +423,24 @@ impl Scheduler {
                 if entry.get("lastSlot").and_then(Value::as_str) == Some(stamp.as_str()) {
                     continue;
                 }
+                // 補跑：排定時間之後已經開始跑過（手動、其他模組觸發）就不必再跑
+                let ran_since = late && ms_field(Some(&*entry), "lastStart").map(|t| t >= s).unwrap_or(false);
                 if let Some(o) = entry.as_object_mut() {
-                    o.insert("lastSlot".into(), Value::String(stamp));
+                    o.insert("lastSlot".into(), Value::String(stamp.clone()));
                 } else {
                     *entry = json!({ "lastSlot": stamp });
                 }
-                due.push(name);
+                if ran_since {
+                    continue;
+                }
+                if late {
+                    info!("工作 {name} 錯過排定時間 {stamp}（系統休眠或時鐘跳動），補跑一次");
+                }
+                due.push((name, late));
             }
         }
         let mut queued = Vec::new();
-        for name in due {
+        for (name, late) in due {
             if !self.is_registered(&name) {
                 let mut st = self.inner.st.lock().unwrap();
                 if st.unknown_warned.insert(name.clone()) {
@@ -427,7 +448,7 @@ impl Scheduler {
                 }
                 continue;
             }
-            if self.request(&name, "排程")["ok"] == json!(true) {
+            if self.request(&name, if late { "排程（補跑錯過的）" } else { "排程" })["ok"] == json!(true) {
                 queued.push(name);
             }
         }
