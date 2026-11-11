@@ -924,6 +924,8 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         site.spawn();
         let _ = resolver.site.set(site);
     }
+    // IIS 反向代理模式：憑證續期後自動重新匯入 IIS（只有 Windows、而且設定了 listen.doh.iisSite）
+    crate::iiscert::spawn_auto_sync(cfg, base_dir.clone(), persist_dir(cfg));
     let mut admin = None;
     if get(cfg, "admin.enabled").and_then(Value::as_bool).unwrap_or(true) {
         let host: IpAddr = get(cfg, "admin.host")

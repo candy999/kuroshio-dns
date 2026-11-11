@@ -230,6 +230,41 @@ jobs:
           if ($log -notmatch '結束') { throw '服務停止時沒有正常收尾' }
           & $exe service uninstall
           if ($LASTEXITCODE -ne 0) { throw 'service uninstall 失敗' }
+      - name: IIS 憑證匯入與綁定
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+          if (!(Test-Path $appcmd)) { Write-Host "::warning::這台 runner 沒有 IIS，略過 IIS 憑證測試"; exit 0 }
+          $exe = (Resolve-Path ./target/release/kuroshio.exe).Path
+          $dir = Join-Path $env:RUNNER_TEMP 'iis'
+          New-Item -ItemType Directory $dir | Out-Null
+          # 測試憑證（EC P-256，網域 localhost）
+          & 'C:\Program Files\Git\usr\bin\openssl.exe' req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost -addext 'subjectAltName=DNS:localhost' -addext 'basicConstraints=critical,CA:FALSE' -keyout "$dir\key.pem" -out "$dir\cert.pem"
+          $cfg = @{ domain = 'localhost'; tls = @{ cert = "$dir\cert.pem"; key = "$dir\key.pem" }; system = @{ persistDir = "$dir\state" } } | ConvertTo-Json -Depth 5
+          Set-Content -Encoding utf8 -Path "$dir\config.json" -Value $cfg
+          & $exe iis cert 'Default Web Site' -c "$dir\config.json"
+          if ($LASTEXITCODE -ne 0) { throw 'iis cert 失敗' }
+          $thumb = (Get-Content "$dir\state\iis-cert.json" | ConvertFrom-Json).thumbprint
+          if (!(Test-Path "Cert:\LocalMachine\My\$thumb")) { throw "憑證存放區裡沒有 $thumb" }
+          $show = (netsh http show sslcert hostnameport=localhost:443 | Out-String) -replace ' ', ''
+          if ($show -notmatch $thumb) { Write-Host $show; throw 'netsh 的綁定不是這張憑證' }
+          $b = & $appcmd list site 'Default Web Site' /text:bindings
+          if ("$b" -notmatch 'https/\*:443:localhost') { throw "IIS 站台沒有 HTTPS 繫結：$b" }
+          # 再跑一次：已經是最新，不重複匯入
+          $again = & $exe iis cert 'Default Web Site' -c "$dir\config.json"
+          if ("$again" -notmatch '已經是最新') { throw "第二次應該是已經是最新：$again" }
+          # IIS 真的用這張憑證回應
+          Start-Service W3SVC
+          & $appcmd start site 'Default Web Site' | Out-Null
+          Start-Sleep 2
+          $tcp = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 443)
+          $ssl = [System.Net.Security.SslStream]::new($tcp.GetStream(), $false, { $true })
+          $ssl.AuthenticateAsClient('localhost')
+          $served = ([System.Security.Cryptography.X509Certificates.X509Certificate2]$ssl.RemoteCertificate).Thumbprint
+          $ssl.Dispose(); $tcp.Dispose()
+          if ($served -ne $thumb) { throw "IIS 回應的憑證是 $served，不是 $thumb" }
+          Write-Host "IIS 用 $thumb 回應 https://localhost"
       - name: 打包
         shell: pwsh
         run: |

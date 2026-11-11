@@ -16,6 +16,7 @@ pub mod ddns;
 pub mod dnr;
 pub mod encrypted;
 pub mod filtering;
+pub mod iiscert;
 pub mod logring;
 pub mod persist;
 pub mod presence;

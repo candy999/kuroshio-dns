@@ -55,7 +55,10 @@ base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+# PEM 憑證轉成 PFX 匯入 Windows 憑證存放區（IIS 用）；純 Rust、很小，只有 Windows 版會編進去
+p12 = "0.6.3"
 
 [dev-dependencies]
+p12 = "0.6.3"
 rcgen = "0.13"
 h2 = "0.4"

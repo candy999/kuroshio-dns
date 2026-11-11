@@ -34,7 +34,9 @@
   kuroshio.exe acme issue                    立即申請 / 續期（需要 acme.enabled 與 Cloudflare API Token）
 
 IIS 已經占用 443 時（反向代理模式）：
-  kuroshio.exe iis setup "Default Web Site"  產生 web.config 轉送規則與 Alt-Svc 標頭
+  kuroshio.exe iis setup "Default Web Site"  產生 web.config 轉送規則與 Alt-Svc 標頭、更新設定檔，
+                                             並把憑證匯入 Windows 憑證存放區、綁到站台的 HTTPS
+  kuroshio.exe iis cert "Default Web Site"   只同步憑證（服務執行中每 10 分鐘也會自動檢查，續期後自動更新）
   DoH3（UDP 443）、DoT（TCP 853）、DoQ（UDP 853）仍由黑潮 DNS 自己監聽
 
 提醒：家裡路由器的埠轉發也要加 UDP 443 與 UDP 853，DoH3 / DoQ 才連得進來。

@@ -47,7 +47,7 @@ enum Cmd {
     },
     /// Windows：IIS 反向代理模式，`kuroshio iis setup <站台名稱>`（規格 07 第 2 節模式 C）
     Iis {
-        /// 目前只有 setup
+        /// setup：設定反向代理並綁定憑證；cert：只把憑證同步到 IIS
         action: String,
         /// IIS 站台名稱（例如 "Default Web Site"）
         site: String,
@@ -417,6 +417,22 @@ pub async fn serve(
     Ok(())
 }
 
+/// 把黑潮 DNS 的憑證匯入 Windows 憑證存放區並綁到 IIS 站台。`soft`：憑證還沒準備好時只提示，不當成錯誤
+fn iis_cert(config: &std::path::Path, site: &str, force: bool, soft: bool) -> Result<()> {
+    let (cfg, ..) = effective(config, false)?;
+    let state = kuroshio::app::persist_dir(&cfg);
+    let base = state.parent().map(PathBuf::from).unwrap_or_default();
+    match kuroshio::iiscert::sync(&cfg, site, &base, &state, force) {
+        Ok(msg) => println!("{msg}"),
+        Err(e) if soft => {
+            println!("憑證還沒有綁到 IIS：{e:#}");
+            println!("準備好網域與憑證後執行：kuroshio iis cert \"{site}\"（服務執行中也會每 10 分鐘自動同步）");
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 type ConsoleSlot = std::sync::Arc<std::sync::Mutex<Option<kuroshio::console::Ctx>>>;
 
 /// 互動指令的下一行；沒有終端機（或輸入已結束）時永遠不會回來
@@ -718,8 +734,26 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             force,
             config,
         } => match action.as_str() {
-            "setup" => kuroshio::winsetup::iis_setup(&effective(&config, false)?.0, &site, force)?,
-            other => anyhow::bail!("不認識的動作 {other}（目前只有 setup）"),
+            "setup" => {
+                kuroshio::winsetup::iis_setup(&effective(&config, false)?.0, &site, force)?;
+                // 把反向代理模式要的設定寫進設定檔（DoH 聽本機純 HTTP、記下站台名稱）
+                let mut user: serde_json::Value = std::fs::read(&config)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let changed = kuroshio::iiscert::apply_iis_config(&mut user, &site);
+                if !changed.is_empty() {
+                    kuroshio::persist::write_atomic(&config, (serde_json::to_string_pretty(&user)? + "\n").as_bytes())?;
+                    println!("已更新設定檔 {}：", config.display());
+                    for c in &changed {
+                        println!("  {c}");
+                    }
+                    println!("服務執行中的話，請重新啟動服務（或在設定頁按儲存）讓它生效");
+                }
+                iis_cert(&config, &site, force, true)?;
+            }
+            "cert" => iis_cert(&config, &site, force, false)?,
+            other => anyhow::bail!("不認識的動作 {other}（setup：設定反向代理並綁定憑證；cert：只同步憑證）"),
         },
     }
     Ok(())
