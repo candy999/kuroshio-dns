@@ -1069,11 +1069,9 @@ mod copy_tests {
         let mut back = Vec::new();
         assert!(c2.read(url, &mut |b| back.extend_from_slice(b)));
         assert_eq!(back, body2);
-        // 沒有空間（記憶體不能長大）時不壓縮
-        crate::memgov::set_growth_allowed(false);
-        assert!(!c2.wanted(1000));
-        crate::memgov::set_growth_allowed(true);
-        assert!(c2.wanted(1000));
+        // 儲存空間不夠（低於保留量 + 遲滯）時不留副本（記憶體能不能長大由記憶體控制決定，見 memgov 的測試）
+        p.lock().unwrap().set_free_probe(|_| Some(1 << 20));
+        assert!(!c.wanted(1000));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

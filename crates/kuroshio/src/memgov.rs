@@ -372,11 +372,6 @@ pub fn growth_allowed() -> bool {
     GROWTH.load(Ordering::Relaxed)
 }
 
-/// 測試用：直接設定（平常由記憶體控制更新）
-pub fn set_growth_allowed(on: bool) {
-    GROWTH.store(on, Ordering::Relaxed);
-}
-
 /// 預設的 `oom_score_adj`：-500。
 ///
 /// 核心挑選 OOM 犧牲者的分數 ≈ 佔用的記憶體（以實體記憶體的千分比計）+ `oom_score_adj`。
@@ -1623,7 +1618,7 @@ mod tests {
         let g = Governor::new(res100(), vec![f], 0);
         g.tick(rd(600), 100).await;
         assert!(grow.lock().unwrap().is_empty(), "一開始就可以長大：沒有變化不通知");
-        assert!(growth_allowed());
+        assert_eq!(g.status_json()["growth"], true);
         // 保留量 + 遲滯（150 MB）以內：還沒低於保留量（不釋出），但停止長大
         assert!(g.tick(rd(140), 105).await.is_none());
         assert_eq!(*grow.lock().unwrap(), [false]);
@@ -1632,7 +1627,7 @@ mod tests {
         // 回到 160 MB：寬裕，恢復長大
         g.tick(rd(160), 110).await;
         assert_eq!(*grow.lock().unwrap(), [false, true]);
-        set_growth_allowed(true);
+        assert_eq!(g.status_json()["growth"], true);
     }
 
     #[tokio::test]
