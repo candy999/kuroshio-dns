@@ -196,6 +196,19 @@ async fn merges_ips_from_all_upstreams_and_ranks() {
     assert_eq!(ips, vec![RData::A(Ipv4Addr::new(127, 0, 0, 4))], "只留測得通的");
     let e = r.cache.lock().unwrap().peek("1|merge.test").unwrap();
     assert!(e.ranked.as_deref().unwrap().ends_with("/3IP"), "{:?}", e.ranked);
+    // 要 DNSSEC 記錄的查詢（DO=1）：答案原樣轉交，不合併、不重排（改過的 RRset 簽章驗不過）
+    let m = Message::parse(
+        &r.handle(
+            &q_ext(2, "merge.test", 1, kuroshio_proto::message::FLAG_RD, Some((1232, true))),
+            &CTX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let ips: Vec<_> = m.answers.iter().map(|a| a.data.clone()).collect();
+    assert_eq!(ips, vec![RData::A(Ipv4Addr::new(127, 0, 0, 5))], "最快的上游給的答案，原樣");
+    assert!(r.cache.lock().unwrap().peek("1+1d|merge.test").unwrap().ranked.is_none());
 }
 
 #[tokio::test]

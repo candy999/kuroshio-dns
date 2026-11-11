@@ -485,7 +485,9 @@ impl Resolver {
         }
         let mut r = Message::response_to(query, e.rcode);
         r.answers = e.answers.iter().map(|a| Record { ttl, ..a.clone() }).collect();
-        if let Some(cdn) = self.cdn() {
+        // CDN 調整會改寫答案：要 DNSSEC 記錄或類別不是 IN 的查詢不動（同 job() 的 verbatim）
+        let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1;
+        if let Some(cdn) = self.cdn().filter(|_| !verbatim) {
             let (qname, qtype) = (&query.questions[0].name, query.questions[0].qtype);
             let res = cdn.apply(&mut r, qname, qtype);
             if let Some(cap) = res.ttl_cap {
@@ -569,7 +571,12 @@ impl Resolver {
     }
 
     async fn job(self: Arc<Self>, key: String, query: Message) {
+        // 這個工作中途死掉（panic、被取消）時把鍵拿掉：等待的人收到「通道關閉」回 SERVFAIL，
+        // 不然他們會永遠等下去，之後同一個鍵的查詢也都會排進沒有人處理的名單
+        let guard = InflightGuard(&self.inflight, &key);
         let qtype = query.questions[0].qtype;
+        // 要 DNSSEC 記錄（DO）或類別不是 IN 的查詢：答案原樣轉交，不合併 / 重排 IP（改過的 RRset 簽章會驗不過）
+        let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1;
         let qname = normalize(&query.questions[0].name);
         let ecs = if self.params.send_ecs {
             *self.ecs_subnet.read().unwrap()
@@ -623,7 +630,7 @@ impl Resolver {
             ),
             Some(mut d) => {
                 let mut note = None;
-                if (qtype == rtype::A || qtype == rtype::AAAA) && !d.oks.is_empty() && self.params.rank_ips {
+                if (qtype == rtype::A || qtype == rtype::AAAA) && !d.oks.is_empty() && self.params.rank_ips && !verbatim {
                     if let Some((msg, source, n)) = self.merge_rank(&d.oks, &qname, qtype).await {
                         d.msg = msg;
                         d.source = source;
@@ -646,6 +653,8 @@ impl Resolver {
             }
         };
         self.notify(&key, &e, true);
+        // 正常結束：notify 已經把鍵拿掉；之後同一個鍵可能已經有新的工作，不能再刪一次
+        std::mem::forget(guard);
     }
 
     /// 並行詢問一組上游：全部回來，或第一個正常回應後再等 window；
@@ -696,7 +705,15 @@ impl Resolver {
         loop {
             tokio::select! {
                 r = set.join_next() => {
-                    let Some(Ok((up, r, ms))) = r else { break };
+                    let (up, r, ms) = match r {
+                        Some(Ok(x)) => x,
+                        // 某個上游的工作 panic：當成那個上游失敗，其他的照常等
+                        Some(Err(_)) => {
+                            if let Some(u) = rest.next() { spawn(&mut set, u); }
+                            continue;
+                        }
+                        None => break,
+                    };
                     match r.ok().and_then(|b| Message::parse(&b).ok()) {
                         Some(msg) => {
                             let class = logic::classify(&msg, qtype);
@@ -841,6 +858,16 @@ impl Resolver {
     }
 }
 
+/// singleflight 的保險：工作沒有走到最後的 notify 就結束時，把鍵從進行中的名單拿掉
+struct InflightGuard<'a>(&'a Mutex<HashMap<String, Waiters>>, &'a str);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        // 丟掉 sender：等待的人收到「通道關閉」，回 SERVFAIL
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(self.1);
+    }
+}
+
 /// 從多個上游結果決定答案（同 2.x）：有正常回應取最快的；否則 nodata / nxdomain 多數決（平手以固定上游為準）
 fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_cdn::Cdn>, qtype: u16) -> Option<Decided> {
     let by = |c: Class| -> Vec<Arc<Answer>> { results.iter().filter(|r| r.class == c).cloned().collect() };
@@ -941,5 +968,23 @@ mod tests {
         assert!(!l.matches("8.8.8.8.in-addr.arpa"));
         assert!(l.matches("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa"));
         assert!(!l.matches("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"));
+    }
+
+    #[tokio::test]
+    async fn singleflight_waiters_get_an_answer_when_the_job_dies() {
+        let inflight: Arc<Mutex<HashMap<String, Waiters>>> = Arc::default();
+        let (tx, rx) = oneshot::channel();
+        inflight.lock().unwrap().insert("1|dead.test".into(), vec![tx]);
+        let map = inflight.clone();
+        // 模擬 job() 中途 panic
+        let job = tokio::spawn(async move {
+            let _guard = InflightGuard(&map, "1|dead.test");
+            panic!("模擬上游處理中 panic");
+        });
+        assert!(job.await.is_err());
+        // 等待的人不會卡住（fetch() 收到通道關閉回 SERVFAIL），鍵也拿掉了：下一個查詢會重新問上游
+        let got = tokio::time::timeout(Duration::from_secs(1), rx).await.expect("不能卡住");
+        assert!(got.is_err());
+        assert!(inflight.lock().unwrap().is_empty());
     }
 }
