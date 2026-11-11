@@ -613,3 +613,127 @@ async fn ecs_probe_only_keeps_ips_validated_for_this_site() {
     assert_eq!(e.ips4, Some(ips(&["23.9.9.9", "23.9.9.11"])));
     assert_eq!(e.ips6, Some(ips(&["2600:9::2"])));
 }
+
+/// 改寫中、判定還有效的網域（上次驗證在 `age_h` 小時前，`left_h` 小時後到期）
+fn rewritten_ok(st: &mut crate::cdn::State, name: &str, hits: u32, age_h: u64, left_h: u64) {
+    let now = now_ms();
+    st.db.touch(name, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    st.db.set_verdict(name, 4, |v| {
+        v.verdict = Some(intern("ok"));
+        v.ip = Some(ip("104.16.161.36"));
+        v.ips = Some(ips(&["104.16.161.36"]));
+        v.until = Some(now + left_h * 3_600_000);
+    });
+    let e = st.db.get_mut(name).unwrap();
+    e.v4.as_mut().unwrap().at = Some(now - age_h * 3_600_000);
+    e.hits = hits;
+    e.best = Some(crate::db::Strategy::Alias);
+}
+
+fn verify_names(c: &Cdn) -> Vec<String> {
+    c.take_tasks()
+        .into_iter()
+        .map(|t| match t {
+            Task::Verify { name, family: 4, orig, .. } => {
+                assert_eq!(orig, Some(ip("104.21.0.5")));
+                name
+            }
+            t => panic!("{t:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn recheck_rotates_through_active_rewrites() {
+    let (c, _) = setup(json!({ "reverifyRatio": 0.1, "reverifyMin": 3, "reverifyMax": 4 }));
+    c.with_state(|st| {
+        for i in 0..20u32 {
+            // 熱門程度 × 距上次驗證的時間：i 越大越先
+            rewritten_ok(st, &format!("hot{i}.test"), i * 10, 5, 20);
+        }
+        // 一小時內剛驗證過：不抽
+        rewritten_ok(st, "fresh.test", 100_000, 0, 23);
+        // 沒有改寫過（`best` 不是換節點）：不抽
+        rewritten_ok(st, "idle.test", 100_000, 10, 20);
+        st.db.get_mut("idle.test").unwrap().best = None;
+        // 一天以上沒出現：不抽
+        rewritten_ok(st, "old.test", 100_000, 10, 20);
+        st.db.get_mut("old.test").unwrap().last_seen = now_ms() - 2 * 86_400_000;
+        // 快到期的交給原本的複驗（只排一次）
+        rewritten_ok(st, "soon.test", 100_000, 23, 0);
+        st.db.get_mut("soon.test").unwrap().v4.as_mut().unwrap().until = Some(now_ms() + 600_000);
+    });
+    // 改寫中 22 個（含快到期與剛驗證的）× 0.1 → 3（下限 3、上限 4）；加上快到期的 1 個
+    assert_eq!(c.recheck(), 4);
+    assert_eq!(verify_names(&c), ["soon.test", "hot19.test", "hot18.test", "hot17.test"]);
+
+    // 抽過的驗證通過（`at` 更新成現在）後，下一個小時輪到下一批
+    c.with_state(|st| {
+        for n in ["hot19.test", "hot18.test", "hot17.test", "soon.test"] {
+            let v = st.db.get_mut(n).unwrap().v4.as_mut().unwrap();
+            v.at = Some(now_ms());
+            v.until = Some(now_ms() + 86_400_000);
+        }
+    });
+    assert_eq!(c.recheck(), 3);
+    assert_eq!(verify_names(&c), ["hot16.test", "hot15.test", "hot14.test"]);
+
+    // 上限
+    let (c, _) = setup(json!({ "reverifyRatio": 1, "reverifyMin": 1, "reverifyMax": 2 }));
+    c.with_state(|st| {
+        for i in 0..10u32 {
+            rewritten_ok(st, &format!("m{i}.test"), i, 5, 20);
+        }
+    });
+    assert_eq!(c.recheck(), 2);
+
+    // 比例 0 = 關閉
+    let (c, _) = setup(json!({ "reverifyRatio": 0 }));
+    c.with_state(|st| rewritten_ok(st, "a.test", 10, 5, 20));
+    assert_eq!(c.recheck(), 0);
+}
+
+#[tokio::test]
+async fn reverify_failure_drops_rewrite_immediately() {
+    // 節點本身健康，但這個網站開始不讓它服務（Cloudflare 1034）：抽驗失敗後下一次查詢就回原始結果，
+    // 不必等 24 小時的判定過期
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| rewritten_ok(st, "s.test", 50, 5, 20));
+    let q = || msg("s.test", 1, &["104.21.0.5"], vec![]);
+    let a = |m: &Message| {
+        m.answers
+            .iter()
+            .filter_map(|r| match r.data {
+                kuroshio_proto::message::RData::A(v) => Some(IpAddr::V4(v)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut m = q();
+    let r = c.apply(&mut m, "s.test", rtype::A);
+    assert_eq!(r.rewritten, Some(crate::Rewrite::Alias), "{:?}", r.tags);
+    assert_eq!(a(&m), ips(&["104.16.161.36"]));
+    c.take_tasks();
+
+    assert_eq!(c.recheck(), 1);
+    let Some(Task::Verify {
+        name,
+        provider,
+        family,
+        orig,
+    }) = c.take_tasks().into_iter().next()
+    else {
+        panic!("沒有排入複驗")
+    };
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "104.21.0.5" => cf_ok("NRT"),
+        _ => resp(403, &[("cf-ray", "x-TPE")], "error code: 1034"),
+    });
+    assert_eq!(c.verify(&name, &provider, family, orig).await, Some("fail"));
+
+    let mut m = q();
+    let r = c.apply(&mut m, "s.test", rtype::A);
+    assert_eq!(r.rewritten, None, "{:?}", r.tags);
+    assert!(r.tags.iter().any(|t| t.contains("驗證失敗→原始")), "{:?}", r.tags);
+    assert_eq!(a(&m), ips(&["104.21.0.5"]));
+}

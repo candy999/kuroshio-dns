@@ -704,12 +704,14 @@ impl Cdn {
         self.state().db.cross_summary()
     }
 
-    /// 每小時：熱門且即將到期的「驗證通過」網域先重新驗證，避免掉回 10 秒試用。回傳排入幾個
+    /// 每小時：熱門且即將到期的「驗證通過」網域先重新驗證，避免掉回 10 秒試用；
+    /// 另外輪流抽一小批還在有效期內、最近真的有在改寫的網域複驗（見 `reverify_pick`）。回傳排入幾個
     pub fn recheck(self: &Arc<Self>) -> usize {
         let now = now_ms();
         let soon = now + util::HOUR_MS;
         let recent = now.saturating_sub(3 * util::DAY_MS);
         let mut tasks = Vec::new();
+        let sampled;
         {
             let st = self.state();
             for e in st.db.domains.values() {
@@ -732,13 +734,79 @@ impl Cdn {
                     }
                 }
             }
+            let pick = self.reverify_pick(&st, now);
+            sampled = pick.len();
+            tasks.extend(pick);
         }
         let n = tasks.len();
         if n > 0 {
-            info!("定時複驗：{n} 個網域");
+            info!("定時複驗：{n} 個網域（其中輪流抽驗 {sampled} 個）");
         }
         self.schedule_all(tasks);
         n
+    }
+
+    /// 輪流抽驗：判定「通過」要 24 小時才到期，期間節點一直健康、但某個網站開始不服務它
+    /// （例如 Cloudflare 1034）時，會一路回壞掉的節點到到期為止。
+    /// 每小時從「最近一天內有改寫（`best` = 換節點）、判定還有效、上次驗證超過一小時」的網域中，
+    /// 抽「改寫中網域數 × `reverifyRatio`」個（限制在 `reverifyMin`～`reverifyMax`）重新驗證：
+    /// 熱門程度 × 距上次驗證的時間越大越先（熱門的先驗，冷門的放久了也會輪到）。
+    /// 驗證失敗就跟判定過期一樣，馬上改回原始結果。即將到期的由 `recheck` 處理，這裡不重複
+    pub(crate) fn reverify_pick(&self, st: &State, now: u64) -> Vec<Task> {
+        let c = &self.cfg;
+        if c.reverify_ratio <= 0.0 || c.reverify_max == 0 {
+            return vec![];
+        }
+        let active_since = now.saturating_sub(util::DAY_MS);
+        let soon = now + util::HOUR_MS;
+        let mut active = 0usize;
+        // （優先度，網域，CDN，家族）
+        let mut cand: Vec<(f64, &db::Domain, &str, u8)> = Vec::new();
+        for e in st.db.domains.values() {
+            if e.last_seen < active_since || e.best != Some(db::Strategy::Alias) || e.policy() != db::Policy::Auto {
+                continue;
+            }
+            let Some(p) = e.provider() else { continue };
+            if !st.pools.has(p) {
+                continue;
+            }
+            for fam in [4u8, 6] {
+                let Some(v) = e.verdict(fam).filter(|v| v.is("ok") && v.valid(now)) else {
+                    continue;
+                };
+                active += 1;
+                let until = v.until.unwrap_or(0);
+                let age = now.saturating_sub(v.at.unwrap_or(0));
+                if until < soon || age < util::HOUR_MS {
+                    continue;
+                }
+                let score = (e.hits as f64 + 1.0) * (age as f64 / util::HOUR_MS as f64);
+                cand.push((score, e, p, fam));
+            }
+        }
+        if cand.is_empty() {
+            return vec![];
+        }
+        let want = ((active as f64 * c.reverify_ratio).ceil() as usize)
+            .max(c.reverify_min)
+            .min(c.reverify_max)
+            .min(cand.len());
+        if want == 0 {
+            return vec![];
+        }
+        if want < cand.len() {
+            cand.select_nth_unstable_by(want - 1, |a, b| b.0.total_cmp(&a.0));
+            cand.truncate(want);
+        }
+        cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+        cand.into_iter()
+            .map(|(_, e, p, fam)| Task::Verify {
+                name: e.name.to_string(),
+                provider: p.to_string(),
+                family: fam,
+                orig: e.orig_ip(fam),
+            })
+            .collect()
     }
 }
 

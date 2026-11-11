@@ -50,6 +50,11 @@ pub struct CdnConfig {
     pub verify_timeout_ms: u64,
     pub verify_concurrency: usize,
     pub verify_candidates: usize,
+    /// 每小時輪流複驗：還在有效期內、最近有改寫的「驗證通過」網域抽多少比例（0 = 不做）
+    pub reverify_ratio: f64,
+    /// 每小時輪流複驗的下限 / 上限（個）
+    pub reverify_min: usize,
+    pub reverify_max: usize,
     pub octet_search: usize,
     pub serve_count: usize,
     pub min_pool: usize,
@@ -127,6 +132,9 @@ impl CdnConfig {
             verify_timeout_ms: or(c, "verifyTimeoutMs", 5000.0) as u64,
             verify_concurrency: or(c, "verifyConcurrency", 8.0) as usize,
             verify_candidates: or(c, "verifyCandidates", 4.0) as usize,
+            reverify_ratio: nn(c, "reverifyRatio", 0.02).clamp(0.0, 1.0),
+            reverify_min: nn(c, "reverifyMin", 5.0).max(0.0) as usize,
+            reverify_max: nn(c, "reverifyMax", 50.0).max(0.0) as usize,
             octet_search: or(c, "octetSearch", 10.0) as usize,
             serve_count: or(c, "serveCount", 4.0) as usize,
             min_pool: or(c, "minPool", 3.0) as usize,
