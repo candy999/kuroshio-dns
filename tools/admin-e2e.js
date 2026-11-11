@@ -298,14 +298,14 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             const fb = unpack(fullFile), sb = unpack(shareFile);
             check(fb.format === 'kuroshio-backup' && fb.kind === 'full' && fb.files['cdn-domains.json'].json.domains[0].hits === 12, '完整備份內容（含查詢次數）');
             const sd = sb.files['cdn-domains.json'].json.domains[0];
-            check(sb.kind === 'share' && sd.name === 'a.example' && !('hits' in sd) && !('policy' in sd) && !('lastSeen' in sd) && sb.files['blacklist.txt'], '分享檔內容（沒有次數、時間、手動設定）', JSON.stringify(sd));
+            check(sb.kind === 'share' && sd.name === 'a.example' && !('hits' in sd) && !('policy' in sd) && !('lastSeen' in sd) && !sb.files['blacklist.txt'] && !sb.files['upstreams.json'], '分享檔內容（沒有次數、時間、手動設定，也沒有上游評測與黑名單）', JSON.stringify(sd));
         }
         await page.setInputFiles('#backup-file', shareFile);
         await page.click('#tool-backup button');
         await page.waitForFunction(() => /匯入完成|失敗|沒有在 30 秒|沒有讀到/.test(document.querySelector('#tool-backup .verdict').textContent), null, { timeout: 45000 }).catch(() => {});
         const bv = await page.textContent('#tool-backup .verdict');
         const bo = await page.textContent('#tool-backup pre');
-        check(/匯入完成/.test(bv) && /CDN 網域驗證紀錄/.test(bo) && /汙染 DNS 黑名單/.test(bo) && /保留本機/.test(bo), '匯入分享檔 → 服務重新啟動 → 顯示合併結果', bv + '\n     ' + bo);
+        check(/匯入完成/.test(bv) && /CDN 網域驗證紀錄/.test(bo) && !/汙染 DNS 黑名單/.test(bo), '匯入分享檔 → 服務重新啟動 → 顯示合併結果', bv + '\n     ' + bo);
         check(/匯入分享檔完成/.test(out), '伺服器記錄匯入結果');
         await shot('07b-backup');
 

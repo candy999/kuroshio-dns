@@ -102,7 +102,10 @@ async fn export_import_through_running_service() {
     let Data::Json(dj) = d else { panic!("json") };
     assert_eq!(dj["domains"][0]["name"], "a.example");
     assert!(dj["domains"][0].get("hits").is_none() && dj["domains"][0].get("policy").is_none());
-    assert!(share.files.contains_key("blacklist.txt"));
+    assert!(
+        !share.files.contains_key("blacklist.txt") && !share.files.contains_key("upstreams.json"),
+        "分享檔不含上游評測與黑名單"
+    );
     assert_eq!(
         read_json(&state.join("cdn-domains.json"))["domains"][0]["policy"],
         "always",
