@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "Windows 設定頁的欄位定義（規格 02 第 7.2 節）。key = config.json 的路徑；預設值一律由伺服器提供（/api/config 的 defaults），這裡不重複。type：bool / int / float / port / text / password / path / host / select / choice（單選，值可以是布林）/ list（一行一個）/ multi（多選）/ ifaces（從 /api/interfaces 勾選網卡）/ table（物件陣列）。validate = 另外檢查格式：domain（網域）/ record（網域，可以用 *. 開頭）/ ip（list 的每一行都要是 IP）/ iisSite；picker = addrs 時 list 下方多一個「從本機位址挑選」；typed = select 的值照 JSON 型別存（true / false / 字串）；pairWith = 兩個欄位要一起填。section 的 widget = 唯讀面板（listeners / cert / ddns / paths）。pro = 只在「專業」模式顯示。fallbackDefault = 伺服器的預設值沒有這個欄位時，程式內建的行為（只用來顯示）。dependsOn = 另一個欄位是指定值時才顯示。",
+  "about": "Windows 設定頁的欄位定義（規格 02 第 7.2 節）。key = config.json 的路徑；預設值一律由伺服器提供（/api/config 的 defaults），這裡不重複。type：bool / int / float / port / text / password / path / host / select / choice（單選，值可以是布林）/ list（一行一個）/ multi（多選）/ ifaces（從 /api/interfaces 勾選網卡）/ accessGroups（從 /api/access 勾選台灣 ISP 群組；* = 全部，含日後新增的）/ table（物件陣列）。validate = 另外檢查格式：domain（網域）/ record（網域，可以用 *. 開頭）/ ip（list 的每一行都要是 IP）/ cidr（IP 或 IP/前綴長度）/ iisSite；picker = addrs 時 list 下方多一個「從本機位址挑選」；typed = select 的值照 JSON 型別存（true / false / 字串）；pairWith = 兩個欄位要一起填。section 的 widget = 唯讀面板（listeners / cert / ddns / paths / access / accessTest）；choice 的選項可以有 desc（選項下方的一行說明）。pro = 只在「專業」模式顯示。fallbackDefault = 伺服器的預設值沒有這個欄位時，程式內建的行為（只用來顯示）。dependsOn = 另一個欄位是指定值時才顯示。",
   "groups": [
     {
       "id": "listen",
@@ -123,6 +123,67 @@
           "title": "存放位置",
           "desc": "各種檔案實際放在哪裡（已儲存並套用的設定）。其他服務要共用憑證時，直接讀取下面的憑證檔與私鑰檔即可。這裡只顯示路徑，不會顯示密鑰內容。",
           "widget": "paths"
+        }
+      ]
+    },
+    {
+      "id": "access",
+      "title": "連線來源",
+      "desc": "誰可以連進 DoH / DoT / DoQ / DoH3 與公開頁。黑潮 DNS 是為台灣網路調校的 DNS（台灣 CDN 節點、台灣上游），在國外使用沒有好處，所以預設只讓台灣的 IP 連進來，順便擋掉國外的掃描與濫用。只影響從外面連進來的連線，不影響這台電腦與區網。",
+      "sections": [
+        {
+          "title": "目前狀態",
+          "desc": "已儲存並套用的設定。拒絕的次數從服務啟動後開始算。",
+          "widget": "access"
+        },
+        {
+          "title": "開放對象",
+          "desc": "區網與私有位址（192.168.x.x、10.x.x.x 等）、這台電腦自己（127.0.0.1）、這台電腦各網卡所在的網段、社群好友目前的 IP 一律允許，不用加進名單。人在國外、手機漫遊、用國外的 VPN 出口，或用國外的監測服務（例如上線檢查）時連不進來：把那個 IP 加進下面的允許名單，或改成全開放。",
+          "fields": [
+            { "key": "access.mode", "type": "choice", "label": "誰可以連進來", "options": [
+              { "value": "taiwan", "label": "只開放台灣（建議）", "desc": "台灣各家 ISP 與其他登記在台灣的網段都能連，國外的來源連不進來。" },
+              { "value": "custom", "label": "自訂 ISP", "desc": "只開放下面勾選的業者，例如只給中華電信與學術網路。" },
+              { "value": "open", "label": "全開放", "desc": "任何來源都能連（封鎖名單照樣有效）。" }
+            ] },
+            { "key": "access.groups", "type": "accessGroups", "label": "開放的 ISP", "help": "全部勾選 = 整個台灣。業者合併後網段會慢慢移到併購方，兩組都保留；大小是 0 表示已經全部移過去。", "dependsOn": { "key": "access.mode", "values": ["custom"] } }
+          ]
+        },
+        {
+          "title": "自訂名單",
+          "desc": "一行一個 IP 或網段（CIDR），IPv4 與 IPv6 都可以，例如 203.0.113.7、198.51.100.0/24、2001:db8::/32。",
+          "fields": [
+            { "key": "access.allow", "type": "list", "label": "允許名單", "help": "不管上面選哪一種都放行，例如人在國外的家人、公司的固定 IP、國外的監測服務。", "validate": "cidr", "placeholder": "203.0.113.7\n198.51.100.0/24" },
+            { "key": "access.deny", "type": "list", "label": "封鎖名單", "help": "優先於一切（本機除外）：區網、好友、允許名單、全開放都擋不住它。", "validate": "cidr", "placeholder": "198.51.100.7" }
+          ]
+        },
+        {
+          "title": "測試 IP",
+          "desc": "輸入一個 IP，看它能不能連進來、是哪一條規則決定的（依已儲存並套用的設定）。",
+          "widget": "accessTest"
+        },
+        {
+          "title": "台灣 IP 資料",
+          "fields": [
+            { "key": "access.autoUpdate", "type": "bool", "label": "自動更新台灣 IP 資料", "help": "每天下載一次本專案發布的新資料（業者合併、網段變動）。格式正確、比目前的新、大小差不多才換上；不開的話跟著程式升級更新。" },
+            { "key": "access.updateUrl", "type": "text", "label": "更新來源網址", "pro": true, "pattern": "^https://\\S+$", "patternMsg": "請輸入 https:// 開頭的網址" },
+            { "key": "access.dataFile", "type": "path", "label": "指定資料檔", "help": "空白 = 程式附帶的 geo\\tw-ip.json。", "pro": true }
+          ]
+        },
+        {
+          "title": "套用範圍",
+          "pro": true,
+          "fields": [
+            { "key": "access.applyTo", "type": "multi", "label": "套用在哪些服務", "help": "社群共享預設不套用（好友的 IP 本來就一律允許）；區網 DNS（53 埠）有「允許查詢的來源」另外把關。全部取消 = 不限制任何服務。", "options": [
+              { "value": "dot", "label": "DoT" },
+              { "value": "doh", "label": "DoH" },
+              { "value": "doq", "label": "DoQ" },
+              { "value": "doh3", "label": "DoH3" },
+              { "value": "site", "label": "公開頁" },
+              { "value": "community", "label": "社群共享" },
+              { "value": "plain", "label": "區網 DNS（53 埠）" }
+            ] },
+            { "key": "access.log", "type": "bool", "label": "拒絕時寫進日誌", "help": "每分鐘最多一行，含這一分鐘被拒絕的次數。" }
+          ]
         }
       ]
     },

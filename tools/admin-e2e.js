@@ -1,6 +1,6 @@
 'use strict';
 // CI：Windows 本機設定頁（data/admin）端對端測試。自己啟動 kuroshio（暫存設定檔、空著的埠號），用 Playwright 實際操作：
-// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、網域與憑證 / 多網卡 / 多位址監聽 / 存放位置、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
+// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、網域與憑證 / 多網卡 / 多位址監聽 / 存放位置、連線來源、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
 //
 //   cargo build -p kuroshio && node tools/admin-e2e.js
 //   KUROSHIO_BIN=path/to/kuroshio SHOTS=screenshots-admin node tools/admin-e2e.js
@@ -60,6 +60,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         resolver: { stripEch: true },
         system: { persistDir: path.join(dir, 'state') },
         upstream: { pinned: ['udp://127.0.0.1:9'] },
+        // 台灣 IP 資料用版控裡的那一份（測試的執行檔旁邊沒有 data 目錄）
+        access: { dataFile: path.join(ROOT, 'data', 'geo', 'tw-ip.json') },
         // 設定頁不認識的欄位，存檔後要保留
         xTest: { keep: true }
     };
@@ -172,7 +174,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.goto(`${BASE}/#settings`);
         await page.waitForSelector('#cfg-groups button');
         const groups = await page.$$eval('#cfg-groups button', bs => bs.map(b => b.textContent));
-        check(['服務與監聽', '網域與憑證', '上游', '過濾', 'CDN', 'DDNS', '憑證', '公開頁', '社群', '系統', '日誌'].every(g => groups.some(x => x.includes(g))), '設定分類齊全', groups.join(' / '));
+        check(['服務與監聽', '網域與憑證', '連線來源', '上游', '過濾', 'CDN', 'DDNS', '憑證', '公開頁', '社群', '系統', '日誌'].every(g => groups.some(x => x.includes(g))), '設定分類齊全', groups.join(' / '));
         check(!groups.some(x => x.includes('原始 JSON')), '簡易模式沒有原始 JSON');
         check(await page.isVisible('[data-key="listen.doh.windowsMode"]'), '服務與監聽：Windows 443 模式');
         check(await page.isVisible('[data-key="listen.plain.port"]') && !(await page.isVisible('[data-key="listen.doh.trustProxy"]')), '簡易模式隱藏專業欄位');
@@ -379,9 +381,98 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             await page.goto(`${BASE}/#settings`);
             await page.waitForSelector('#cfg-groups button');
         } else ok('（沒有 openssl：略過加密監聽的綁定結果檢查）');
+        console.log('連線來源');
+        await page.click('#cfg-groups button[data-group=access]');
+        await page.waitForSelector('#panel-access[data-ready]');
+        const accText = await page.textContent('#panel-access');
+        check(/只開放台灣/.test(accText) && /\d{4}-\d{2}-\d{2} 的資料/.test(accText) && !(await page.locator('#access-failopen').count()), '連線來源：目前狀態（模式、資料日期，資料讀得到就沒有警告）', accText.slice(0, 300));
+        check(await page.isChecked(`${field('access.mode')} input[type=radio] >> nth=0`) && await page.isHidden(field('access.groups')), '預設「只開放台灣」，不顯示 ISP 勾選');
+        const accDesc = await page.textContent('#cfg-group');
+        check(/區網/.test(accDesc) && /好友/.test(accDesc) && /一律允許/.test(accDesc) && /VPN/.test(accDesc) && /優先於一切/.test(accDesc), '說明區網 / 本機 / 好友一律允許、VPN 與國外監測要加允許、封鎖優先於一切');
+        await page.check(`${field('access.mode')} input[type=radio] >> nth=1`);
+        await page.waitForSelector(`${field('access.groups')} .agroups[data-ready]`);
+        check(await page.isVisible(field('access.groups')), '自訂 ISP：顯示勾選清單');
+        const grText = await page.textContent(field('access.groups'));
+        check(/中華電信/.test(grText) && /萬個位址/.test(grText) && /全選（含日後新增的 ISP）/.test(grText), 'ISP 清單：名稱、位址數（萬）、全選', grText.slice(0, 200));
+        check(await page.isChecked(`${field('access.groups')} input[value="*"]`) && await page.isChecked(`${field('access.groups')} input[value=cht]`), '預設全選');
+        check(/AS\d+/.test(grText), '專業模式：ISP 顯示 ASN');
+        const allIds = await page.$$eval(`${field('access.groups')} input[type=checkbox]`, cs => cs.map(c => c.value).filter(v => v !== '*'));
+        await page.uncheck(`${field('access.groups')} input[value=other]`);
+        check(!(await page.isChecked(`${field('access.groups')} input[value="*"]`)), '取消一組：全選跟著取消');
+        await page.fill(`${field('access.allow')} textarea`, '203.0.113.0/24\n2001:DB8::/33');
+        await page.fill(`${field('access.deny')} textarea`, '198.51.100.7\n10.0.0.0/33');
+        check(/第 2 行/.test(await page.textContent(`${field('access.deny')} .err-text`)) && /0～32/.test(await page.textContent(`${field('access.deny')} .err-text`)) && await page.isDisabled('#btn-save'), '封鎖名單：前綴長度超過 32 不能儲存');
+        for (const badNet of ['2001:db8::/129', '300.1.1.1', 'example.com', '1.2.3.4/24/1', '[::1]']) {
+            await page.fill(`${field('access.deny')} textarea`, badNet);
+            check(await page.isVisible(`${field('access.deny')} .err-text`) && await page.isDisabled('#btn-save'), `封鎖名單：「${badNet}」格式錯誤`);
+        }
+        await page.fill(`${field('access.deny')} textarea`, '198.51.100.7');
+        check(!(await page.isVisible(`${field('access.deny')} .err-text`)) && !(await page.isDisabled('#btn-save')), '格式正確就可以儲存');
+        // 測試 IP（依已套用的設定：只開放台灣）
+        const testIp = async ip => {
+            await page.fill('#access-test-ip', ip);
+            await page.press('#access-test-ip', 'Enter');
+            await page.waitForFunction(() => !document.getElementById('access-test-out').hidden, null, { timeout: 5000 }).catch(() => {});
+            await page.waitForTimeout(300);
+            return page.textContent('#access-test-out');
+        };
+        let tv = await testIp('192.0.2.300');
+        check(/請輸入一個 IP/.test(tv), '測試 IP：格式錯誤不送出', tv);
+        tv = await testIp('168.95.1.1');
+        check(/可以連進來/.test(tv) && /中華電信/.test(tv), '測試 IP：中華電信的 IP 可以連（台灣網段：中華電信）', tv);
+        tv = await testIp('8.8.8.8');
+        check(/會被擋下/.test(tv) && /不在允許的網段/.test(tv), '測試 IP：國外 IP 被擋', tv);
+        tv = await testIp('192.168.1.5');
+        check(/可以連進來/.test(tv) && /私有/.test(tv), '測試 IP：私有位址一律允許', tv);
+        await shot('06f-access-edited');
+        await page.click('#btn-save');
+        await page.waitForFunction(() => /已儲存並套用|失敗|沒有在 30 秒/.test(document.getElementById('save-msg').textContent) || !document.getElementById('login').hidden, null, { timeout: 40000 });
+        check(/已儲存並套用/.test(await page.textContent('#save-msg')), '儲存連線來源', await page.textContent('#save-msg'));
+        const ua = (await page.evaluate(() => fetch('/api/config').then(r => r.json()))).user.access || {};
+        const wantGroups = allIds.filter(x => x !== 'other');
+        check(ua.mode === 'custom' && JSON.stringify(ua.groups) === JSON.stringify(wantGroups), '設定：access.mode = custom、access.groups = 勾選的群組（沒有 other）', JSON.stringify(ua));
+        check(JSON.stringify(ua.allow) === '["203.0.113.0/24","2001:db8::/33"]' && JSON.stringify(ua.deny) === '["198.51.100.7"]', '設定：access.allow / access.deny（IPv6 轉小寫）', JSON.stringify(ua));
+        await page.click('#cfg-groups button[data-group=access]');
+        await page.waitForSelector('#panel-access[data-ready]');
+        check(/自訂 ISP（開放 \d+ \/ \d+ 組）/.test(await page.textContent('#panel-access')), '目前狀態：自訂 ISP 與開放的組數', (await page.textContent('#panel-access')).slice(0, 200));
+        tv = await testIp('203.0.113.9');
+        check(/可以連進來/.test(tv) && /自訂允許 203\.0\.113\.0\/24/.test(tv), '測試 IP：允許名單', tv);
+        tv = await testIp('198.51.100.7');
+        check(/會被擋下/.test(tv) && /自訂封鎖/.test(tv), '測試 IP：封鎖名單', tv);
+        await page.waitForSelector(`${field('access.groups')} .agroups[data-ready]`);
+        check(!(await page.isChecked(`${field('access.groups')} input[value=other]`)) && await page.isChecked(`${field('access.groups')} input[value=cht]`), '重新讀取後勾選狀態保留');
+        // 被拒絕最多的網段：一鍵加入封鎖 / 允許（真的拒絕要從外面連，這裡換成固定的統計）
+        await page.route('**/api/access', async r => {
+            const res = await r.fetch();
+            const j = await res.json();
+            j.denied = { total: 57, byListener: { dot: 40, doh: 17 } };
+            j.topDenied = [{ net: '45.135.232.0/24', count: 31 }, { net: '2a06:4880:1000::/48', count: 26 }];
+            r.fulfill({ response: res, body: JSON.stringify(j) });
+        });
+        await page.click('#cfg-groups button[data-group=upstream]');
+        await page.click('#cfg-groups button[data-group=access]');
+        await page.waitForSelector('#panel-access[data-ready]');
+        check(/57 次/.test(await page.textContent('#panel-access')) && /45\.135\.232\.0\/24/.test(await page.textContent('#panel-access')), '目前狀態：拒絕次數與被拒絕最多的網段');
+        await page.click('#panel-access button[aria-label="把 45.135.232.0/24 加入封鎖名單"]');
+        check(await page.inputValue(`${field('access.deny')} textarea`) === '198.51.100.7\n45.135.232.0/24' && /項未儲存的變更/.test(await page.textContent('#save-msg')), '一鍵加入封鎖名單（還沒有儲存）');
+        await page.click('#panel-access button[aria-label="把 2a06:4880:1000::/48 加入允許名單"]');
+        check(/2a06:4880:1000::\/48/.test(await page.inputValue(`${field('access.allow')} textarea`)), '一鍵加入允許名單');
+        await shot('06g-access-top');
+        await page.click('#btn-discard');
+        await page.unroute('**/api/access');
+        await page.check(`${field('access.groups')} input[value="*"]`);
+        check(await page.isChecked(`${field('access.groups')} input[value=other]`) && /未儲存/.test(await page.textContent(field('access.groups'))), '勾「全選」：每一組都勾上');
+        await page.click('#btn-discard');
+        await page.goto(`${BASE}/#status`);
+        await page.waitForFunction(() => /連線來源自訂 ISP/.test(document.getElementById('st-tiles').textContent), null, { timeout: 8000 }).catch(() => {});
+        const tilesA = await page.textContent('#st-tiles');
+        check(/連線來源/.test(tilesA) && /自訂 ISP/.test(tilesA) && /已拒絕 \d+ 次/.test(tilesA), '狀態分頁：連線來源摘要', tilesA.slice(-200));
+        await page.goto(`${BASE}/#settings`);
+        await page.waitForSelector('#cfg-groups button');
+
         // 390 px：新面板不能把頁面撐寬
         await page.setViewportSize({ width: 390, height: 800 });
-        for (const g of ['domain', 'ddns', 'listen']) {
+        for (const g of ['domain', 'ddns', 'listen', 'access']) {
             await page.click(`#cfg-groups button[data-group=${g}]`);
             await page.waitForTimeout(600);
             const w = await page.evaluate(() => document.documentElement.scrollWidth);

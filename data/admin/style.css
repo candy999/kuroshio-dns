@@ -247,6 +247,34 @@ td.mono { font-family: var(--mono); font-size: 13px; }
 .addr { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; }
 .addr .mono { overflow-wrap: anywhere; }
 
+/* 單選的選項說明（連線來源的模式） */
+.field .choice label.has-desc { align-items: flex-start; }
+.field .choice label.has-desc input { margin-top: 3px; }
+.opt-desc { display: block; font-size: 13px; color: var(--muted); }
+
+/* 勾選開放的 ISP（連線來源） */
+.agroups { display: flex; flex-direction: column; gap: 6px; }
+.agroups > p { margin: 0; }
+.agroup {
+  display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+}
+.agroup:hover { border-color: var(--accent); }
+.agroup.all { background: var(--surface-2); }
+.agroup.missing { border-style: dashed; }
+.agroup input[type=checkbox] { margin-top: 2px; }
+.agroup-body { min-width: 0; flex: 1; }
+.agroup-name { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+.agroup-body .muted { margin-top: 2px; }
+.agroup-body .mono { font-size: 12px; overflow-wrap: anywhere; }
+.row-btns { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.access-test .ctl-row input[type=text] { flex: 1 1 200px; width: auto; min-width: 0; }
+.access-test .verdict { margin: 10px 0 0; font-weight: 600; font-size: 14px; }
+.access-test .verdict.ok { color: var(--ok); }
+.access-test .verdict.err { color: var(--err); }
+.access-test .verdict.warn { color: var(--warn); }
+#panel-access table:not(.kv) { min-width: 0; }
+
 /* 唯讀面板：監聽狀態、憑證、DDNS 結果、存放位置 */
 .panel { margin-top: 10px; }
 .section .field + .panel, .section .field + div > .panel { border-top: 1px solid var(--border); padding-top: 10px; }

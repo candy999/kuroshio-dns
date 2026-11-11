@@ -113,6 +113,11 @@
 		if (b < 1048576) return (b / 1024).toFixed(0) + ' KB';
 		return (b / 1048576).toFixed(1) + ' MB';
 	}
+	/** 位址數量：一萬以上用「萬」（1,401 萬），跟一般人講 IP 數量的方式一樣 */
+	function fmtWan(n) {
+		if (n == null || isNaN(n)) return '-';
+		return n >= 10000 ? nf.format(Math.floor(n / 10000)) + ' 萬' : nf.format(n);
+	}
 	function pretty(v) { return typeof v === 'string' ? v : JSON.stringify(v, null, 2); }
 
 	// ---------------------------------------------------------------- 格式檢查（後端不接受的值不寫進設定）
@@ -141,6 +146,17 @@
 		return dbl.length === 2 ? n <= 7 : n === 8;
 	}
 	function isIP(s) { return isIPv4(s) || isIPv6(s); }
+	/** IP 或網段（IP/前綴長度；IPv4 0～32、IPv6 0～128）。主機位元不是 0 也接受（後端取網段），跟後端 parse_cidr 一致 */
+	function checkCidr(s) {
+		var m = /^([^/\s]+)(?:\/(\d{1,3}))?$/.exec(s);
+		if (!m) return { err: '格式是 IP 或 IP/前綴長度，例如 203.0.113.7、198.51.100.0/24、2001:db8::/32' };
+		var v4 = isIPv4(m[1]);
+		if (!v4 && !isIPv6(m[1])) return { err: '「' + m[1] + '」不是 IP 位址（不含埠號與中括號）' };
+		if (m[2] == null) return { val: v4 ? m[1] : m[1].toLowerCase() };
+		var n = Number(m[2]), max = v4 ? 32 : 128;
+		if (n > max) return { err: (v4 ? 'IPv4' : 'IPv6') + ' 的前綴長度是 0～' + max };
+		return { val: (v4 ? m[1] : m[1].toLowerCase()) + '/' + n };
+	}
 	/** 完整網域名稱（至少兩段；不是 IP） */
 	function isDomain(s) {
 		if (!s || s.length > 253) return false;
@@ -158,6 +174,7 @@
 			var d = s.replace(/\.$/, '').toLowerCase();
 			return isDomain(d.replace(/^\*\./, '')) ? { val: d } : { err: '請輸入完整的網域名稱，例如 home.example.com' };
 		},
+		cidr: checkCidr,
 		ip: function (s) {
 			return isIP(s) ? { val: s } : { err: '請輸入 IP 位址，例如 0.0.0.0、192.168.1.10 或 ::（不含埠號、中括號與 %網卡）' };
 		},
@@ -522,6 +539,8 @@
 			tile('CDN 台灣節點', fmtNum(d.cdnServed), '置換 ' + fmtNum(d.cdnRewrite) + ' · ECS ' + fmtNum(d.ecsRewrite) + ' · 跨 CDN ' + fmtNum(d.crossRewrite)),
 			tile('快取筆數', fmtNum(st.cacheEntries), '約 ' + fmtBytes(st.cacheBytes)),
 			tile('過濾規則', f ? fmtNum((f.lists || 0) + (f.custom || 0)) : '未啟用', f ? '自訂 ' + fmtNum(f.custom) + (f.domains != null ? ' · ' + fmtNum(f.domains) + ' 個網域' : '') : ''),
+			st.access ? tile('連線來源', ACCESS_MODE[st.access.mode] || st.access.mode || '-',
+				st.access.failOpen ? '資料讀不到，暫時不擋' : '已拒絕 ' + fmtNum((st.access.denied || {}).total) + ' 次' + (st.access.generatedAt ? ' · 資料 ' + st.access.generatedAt : '')) : null,
 			tile('磁碟寫入（今天）', per.bytesToday != null ? fmtBytes(per.bytesToday) : '-', (per.storage || '') + (per.intervalMin ? ' · 最短間隔 ' + per.intervalMin + ' 分' : ''))
 		]);
 
@@ -572,6 +591,12 @@
 
 		// 憑證、最近的錯誤
 		var ex = clear($('st-extra'));
+		var ac = st.access;
+		if (ac && (ac.failOpen || ac.warning)) {
+			ex.appendChild(el('h3', { text: '連線來源' }));
+			ex.appendChild(el('p', { class: ac.failOpen ? 'msg err' : 'msg warn', id: 'st-access-warn',
+				text: (ac.failOpen ? '台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）' : '') + (ac.warning ? (ac.failOpen ? '：' : '') + ac.warning : '') }));
+		}
 		if (acme && acme.enabled) {
 			var c = acme.certInfo;
 			ex.appendChild(el('h3', { text: '憑證' }));
@@ -689,6 +714,7 @@
 	function renderGroup() {
 		var box = clear($('cfg-group'));
 		S.live = [];
+		S.access = null;
 		var g = visibleGroups().filter(function (x) { return x.id === S.group; })[0];
 		if (!g) return;
 		box.appendChild(el('h3', { text: g.title }));
@@ -745,6 +771,7 @@
 			return o ? o.label : String(d);
 		}
 		if (f.type === 'ifaces') return [].concat(d || []).length ? [].concat(d).join('、') : '自動';
+		if (f.type === 'accessGroups') return [].concat(d || []).indexOf('*') >= 0 ? '全部（含日後新增的 ISP）' : [].concat(d || []).join('、') || '一組都不勾';
 		if (f.type === 'password') return d ? '（已設定）' : '空白';
 		if (f.type === 'multi') return [].concat(d || []).join('、') || '無';
 		if (f.type === 'list') return [].concat(d || []).length ? [].concat(d).join('、') : '無';
@@ -806,7 +833,7 @@
 		var id = 'f' + (++uid);
 		var ctl = el('div', { class: 'ctl' });
 		var row = el('div', { class: 'field' + (f.type === 'bool' || f.type === 'choice' ? ' bool' : ''), 'data-key': f.key }, [
-			el('label', { class: 'lab', for: f.type === 'ifaces' ? null : id }, [f.label, el('span', { class: 'key', text: f.key })]),
+			el('label', { class: 'lab', for: f.type === 'ifaces' || f.type === 'accessGroups' ? null : id }, [f.label, el('span', { class: 'key', text: f.key })]),
 			ctl
 		]);
 		if (f.dependsOn) row.setAttribute('data-dep', JSON.stringify(f.dependsOn));
@@ -847,11 +874,14 @@
 					setValue(f, d !== undefined && o.value === d ? undefined : o.value);
 					changed(f, row);
 				});
-				grp.appendChild(el('label', { class: 'chk' }, [r, el('span', { text: o.label })]));
+				grp.appendChild(el('label', { class: 'chk' + (o.desc ? ' has-desc' : '') }, [r, el('span', {}, [el('span', { text: o.label }),
+					o.desc ? el('span', { class: 'opt-desc', text: o.desc }) : null])]));
 			});
 			ctl.appendChild(grp);
 		} else if (f.type === 'ifaces') {
 			ctl.appendChild(renderIfaces(f, row, id));
+		} else if (f.type === 'accessGroups') {
+			ctl.appendChild(renderAccessGroups(f, row, id));
 		} else if (f.type === 'list') {
 			var lines = u === undefined ? [] : [].concat(u);
 			var dlist = [].concat(d || []);
@@ -1029,6 +1059,147 @@
 		return box;
 	}
 
+	// ---------------------------------------------------------------- 連線來源（/api/access，規格 08）
+	var ACCESS_MODE = { taiwan: '只開放台灣', custom: '自訂 ISP', open: '全開放' };
+	var ACCESS_KIND = { dot: 'DoT', doh: 'DoH', doq: 'DoQ', doh3: 'DoH3', site: '公開頁', community: '社群共享', plain: '區網 DNS' };
+	/** GET /api/access（同一個分類畫面只讀一次） */
+	function loadAccess() {
+		if (!S.access) S.access = api('/api/access');
+		return S.access;
+	}
+
+	/** 勾選開放的 ISP 群組（access.groups）：「全選」= ["*"]（之後資料新增的群組也包含）；一組都不勾 = [] */
+	function renderAccessGroups(f, row, id) {
+		var box = el('div', { class: 'agroups', id: id, role: 'group', 'aria-label': f.label }, el('p', { class: 'muted', text: '讀取 ISP 清單中…' }));
+		var d = defOf(f), pro = isPro();
+		var draw = function (r) {
+			clear(box);
+			var data = r.ok && isObj(r.data) ? r.data : {};
+			var groups = [].concat(data.groups || []);
+			var cur = [].concat(effOf(f) || []), star = cur.indexOf('*') >= 0;
+			var boxes = [];
+			var none = el('p', { class: 'msg warn', text: '一組都沒有勾：只剩區網、好友與允許名單可以連進來。', hidden: cur.length > 0 });
+			var commit = function (arr) {
+				setValue(f, d !== undefined && deepEqual(arr, d) ? undefined : arr);
+				none.hidden = arr.length > 0;
+				changed(f, row);
+			};
+			var picked = function () { return boxes.filter(function (c) { return c.checked; }).map(function (c) { return c.value; }); };
+			var all = el('input', { type: 'checkbox', value: '*', checked: star });
+			all.addEventListener('change', function () {
+				if (all.checked) { boxes.forEach(function (c) { c.checked = true; }); commit(['*']); }
+				else commit(picked());   // 取消「全選」：目前勾的照舊，只是日後新增的不再自動包含
+			});
+			box.appendChild(el('label', { class: 'agroup all' }, [all, el('div', { class: 'agroup-body' }, [
+				el('strong', { text: '全選（含日後新增的 ISP）' }),
+				el('div', { class: 'muted', text: '台灣 IP 資料更新後新加入的業者也自動開放。' })])]));
+			var item = function (gid, body, missing) {
+				var c = el('input', { type: 'checkbox', value: gid, checked: star || cur.indexOf(gid) >= 0 });
+				c.addEventListener('change', function () { all.checked = false; commit(picked()); });
+				boxes.push(c);
+				box.appendChild(el('label', { class: 'agroup' + (missing ? ' missing' : '') }, [c, el('div', { class: 'agroup-body' }, body)]));
+			};
+			if (!r.ok) box.appendChild(el('p', { class: 'msg warn', text: '讀不到 ISP 清單（/api/access）：' + errText(r) }));
+			else if (!groups.length) box.appendChild(el('p', { class: 'msg warn', text: '讀不到台灣 IP 資料，無法列出 ISP。已經設定的群組仍然列在下面。' }));
+			groups.forEach(function (g) {
+				var sz = g.size || {};
+				var body = [el('div', { class: 'agroup-name' }, [el('strong', { text: g.name || g.id }),
+					sz.v4 ? badge(fmtWan(sz.v4) + (sz.v4 >= 10000 ? '個位址' : ' 個位址'), 'off') : badge('目前沒有網段', 'warn')])];
+				if (!sz.v4) body.push(el('div', { class: 'muted', text: '網段已經全部移到併購的業者（資料保留這一組，日後有網段會自動生效）。' }));
+				if (pro) {
+					if (g.note) body.push(el('div', { class: 'muted', text: g.note }));
+					var asns = [].concat(g.asns || []).map(function (n) { return 'AS' + n; }).join('、');
+					var cs = g.cidrs || {};
+					// 說明裡已經列了 ASN（含持有者名稱）就不再重複
+					var inNote = g.note && [].concat(g.asns || []).every(function (n) { return g.note.indexOf(String(n)) >= 0; });
+					body.push(el('div', { class: 'muted mono' }, [g.id, asns && !inNote ? ' · ' + asns : '', ' · ' + fmtNum(cs.v4) + ' 個 IPv4 網段、' + fmtNum(cs.v6) + ' 個 IPv6 網段']));
+				}
+				item(g.id, body);
+			});
+			// 設定裡有、但資料裡沒有的群組（資料更新後改名或移除）：也列出來，可以取消勾選
+			cur.forEach(function (gid) {
+				if (gid === '*' || groups.some(function (g) { return g.id === gid; })) return;
+				item(gid, [el('div', { class: 'agroup-name' }, [el('strong', { text: gid }), badge('資料裡沒有這一組', 'warn')]),
+					el('div', { class: 'muted', text: '台灣 IP 資料裡找不到，不會生效。取消勾選就會從設定移除。' })], true);
+			});
+			box.appendChild(none);
+			box.setAttribute('data-ready', '1');
+		};
+		loadAccess().then(draw);
+		return box;
+	}
+
+	/** 把一個網段加到允許 / 封鎖名單（編輯中的設定，還沒有儲存），重畫那個欄位 */
+	function addToList(key, net) {
+		var f = null;
+		(S.fields.groups || []).forEach(function (g) { groupFields(g).forEach(function (x) { if (x.key === key) f = x; }); });
+		if (!f) return;
+		var cur = [].concat(userOf(key) || []);
+		if (cur.indexOf(net) >= 0) { toast(net + ' 已經在名單裡'); return; }
+		cur.push(net);
+		setValue(f, cur);
+		var row = document.querySelector('#cfg-group .field[data-key="' + key + '"]');
+		if (row) {
+			var nr = renderField(f);
+			row.parentNode.replaceChild(nr, row);
+			changed(f, nr);
+		} else changed(f);
+		toast('已把 ' + net + ' 加到' + (key === 'access.deny' ? '封鎖' : '允許') + '名單（按「儲存並套用」才會生效）');
+	}
+
+	/** 「目前狀態」：模式、資料日期、資料讀不到時不擋的警告、拒絕次數、被拒絕最多的網段 */
+	function accessPanel(box, a) {
+		var dn = a.denied || {}, by = dn.byListener || {};
+		if (a.failOpen) box.appendChild(el('p', { class: 'msg err', id: 'access-failopen', text: '台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）' + (a.warning ? '：' + a.warning : '。') }));
+		else if (a.warning) box.appendChild(el('p', { class: 'msg warn', text: a.warning }));
+		var groups = [].concat(a.groups || []);
+		var on = groups.filter(function (g) { return g.enabled; });
+		var modeText = ACCESS_MODE[a.mode] || a.mode || '-';
+		if (a.mode === 'custom' && groups.length) modeText += '（開放 ' + on.length + ' / ' + groups.length + ' 組）';
+		var rows = [
+			['開放對象', modeText],
+			['套用在', [].concat(a.applyTo || []).map(function (k) { return ACCESS_KIND[k] || k; }).join('、') || '（沒有，不限制）'],
+			['台灣 IP 資料', a.generatedAt ? el('span', {}, [a.generatedAt + ' 的資料 ', a.autoUpdate ? badge('每天自動更新', 'ok') : badge('跟著程式升級更新', 'off')])
+				: badge('讀不到', 'err')],
+			['已拒絕', fmtNum(dn.total) + ' 次' + (dn.total ? '（' + Object.keys(by).filter(function (k) { return by[k]; }).map(function (k) { return (ACCESS_KIND[k] || k) + ' ' + fmtNum(by[k]); }).join('、') + '）' : '')]
+		];
+		if ([].concat(a.allow || []).length || [].concat(a.deny || []).length) rows.push(['自訂名單', '允許 ' + [].concat(a.allow || []).length + ' 筆、封鎖 ' + [].concat(a.deny || []).length + ' 筆']);
+		if (isPro()) {
+			rows.push(['資料來源', a.dataSource ? el('span', { class: 'mono', text: a.dataSource }) : '-']);
+			rows.push(['記憶體', fmtBytes(a.memoryBytes) + '（' + fmtNum(a.ranges) + ' 個區間）' + (a.dataBytes != null ? '＋群組資料 ' + fmtBytes(a.dataBytes) : '')]);
+		}
+		box.appendChild(kvTable(rows));
+		var top = [].concat(a.topDenied || []);
+		box.appendChild(el('h4', { text: '被拒絕最多的網段' }));
+		box.appendChild(simpleTable(['網段', '次數', ''], top.slice(0, 20).map(function (t) {
+			return [{ text: t.net, cls: 'mono' }, { text: fmtNum(t.count), cls: 'num' }, el('div', { class: 'row-btns' }, [
+				el('button', { type: 'button', class: 'btn small danger', text: '加入封鎖', 'aria-label': '把 ' + t.net + ' 加入封鎖名單', onclick: function () { addToList('access.deny', t.net); } }),
+				el('button', { type: 'button', class: 'btn small', text: '加入允許', 'aria-label': '把 ' + t.net + ' 加入允許名單', onclick: function () { addToList('access.allow', t.net); } })])];
+		}), '還沒有拒絕過任何連線'));
+		if (top.length) box.appendChild(el('p', { class: 'muted', text: 'IPv4 以 /24、IPv6 以 /48 為單位統計。' }));
+	}
+
+	/** 「測試 IP」：依已套用的設定判斷一個 IP 能不能連進來 */
+	function accessTest() {
+		var inp = el('input', { type: 'text', id: 'access-test-ip', placeholder: '例如 168.95.1.1 或 2001:db8::1', 'aria-label': '要測試的 IP', spellcheck: 'false', autocomplete: 'off' });
+		var out = el('p', { class: 'verdict', id: 'access-test-out', hidden: true });
+		var show = function (text, kind) { out.textContent = text; out.className = 'verdict ' + (kind || ''); out.hidden = false; };
+		var run = function () {
+			var ip = inp.value.trim();
+			if (!isIP(ip)) { inp.classList.add('invalid'); show('請輸入一個 IP 位址（不含前綴長度與埠號）', 'warn'); return; }
+			inp.classList.remove('invalid');
+			return api('/api/access?' + qs({ ip: ip })).then(function (r) {
+				if (!r.ok) return show('失敗：' + errText(r), 'err');
+				var x = r.data || {};
+				var kinds = [].concat(x.applyTo || []).map(function (k) { return ACCESS_KIND[k] || k; }).join('、');
+				show((x.allowed ? '可以連進來' : '會被擋下') + '：' + (x.reason || '-') + (kinds ? '（套用在 ' + kinds + '）' : '') +
+					(isDirty() ? '。還沒儲存的變更不算在內。' : ''), x.allowed ? 'ok' : 'err');
+			});
+		};
+		inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') run(); });
+		return el('div', { class: 'panel access-test' }, [el('div', { class: 'ctl-row' }, [inp, actBtn('測試', 'primary', run)]), out]);
+	}
+
 	/** 清單欄位下方的「從本機位址挑選」：選了就加到清單最後一行 */
 	function addrPicker(input) {
 		var sel = el('select', { class: 'picker', 'aria-label': '從本機位址挑選' }, el('option', { value: '', text: '從本機位址挑選…' }));
@@ -1186,6 +1357,10 @@
 					}), msg]));
 			});
 		},
+
+		// 連線來源：目前狀態、被拒絕最多的網段
+		access: function () { return panel('access', loadAccess, accessPanel); },
+		accessTest: accessTest,
 
 		// 存放位置（/api/paths）：只有路徑，沒有密鑰內容
 		paths: function () {
