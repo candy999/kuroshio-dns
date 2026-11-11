@@ -707,7 +707,11 @@ impl Db {
 
     /// 收集候選節點 IP（給每日節點池工作使用）
     pub fn add_harvest(&mut self, provider: &str, ip: IpAddr) {
-        let h = self.harvest.entry(provider.to_string()).or_default();
+        // 每個 CDN 回應都會跑：已經有這家的時候不要為了查表配置字串
+        if !self.harvest.contains_key(provider) {
+            self.harvest.insert(provider.to_string(), HarvestSet::default());
+        }
+        let h = self.harvest.get_mut(provider).unwrap();
         let m = if ip.is_ipv6() { &mut h.v6 } else { &mut h.v4 };
         if !m.contains_key(&ip) {
             m.insert(ip, now_ms());

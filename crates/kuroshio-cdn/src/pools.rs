@@ -591,15 +591,37 @@ impl Pools {
         }
     }
 
+    /// 相容性紀錄（鍵是 `provider|ip`）。查詢路徑上每個節點都會查：鍵寫在堆疊上，不配置記憶體
+    fn zone_of(&self, provider: &str, ip: IpAddr) -> Option<&Zone> {
+        use std::fmt::Write;
+        struct Buf {
+            b: [u8; 96],
+            n: usize,
+        }
+        impl Write for Buf {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                let end = self.n + s.len();
+                self.b.get_mut(self.n..end).ok_or(std::fmt::Error)?.copy_from_slice(s.as_bytes());
+                self.n = end;
+                Ok(())
+            }
+        }
+        let mut k = Buf { b: [0; 96], n: 0 };
+        match write!(k, "{provider}|{ip}") {
+            Ok(()) => self.zone.get(std::str::from_utf8(&k.b[..k.n]).ok()?),
+            Err(_) => self.zone.get(&format!("{provider}|{ip}")),
+        }
+    }
+
     pub fn is_restricted(&self, provider: &str, ip: IpAddr) -> bool {
-        match self.zone.get(&format!("{provider}|{ip}")) {
+        match self.zone_of(provider, ip) {
             Some(z) => z.miss >= 2 && z.miss > z.hit * 2,
             None => false,
         }
     }
 
     pub fn zone_hit(&self, provider: &str, ip: IpAddr) -> bool {
-        match self.zone.get(&format!("{provider}|{ip}")) {
+        match self.zone_of(provider, ip) {
             Some(z) => z.hit > 0 && !(z.miss >= 2 && z.miss > z.hit * 2),
             None => false,
         }

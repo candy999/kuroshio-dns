@@ -859,12 +859,13 @@ impl Cdn {
             .flatten()
             .flat_map(|m| m.answers.iter().filter(|a| a.rtype == qtype).filter_map(ip_of))
             .collect();
-        let st = self.state();
+        // 只需要分類：用唯讀快照，不拿狀態鎖（每個上游回應都會跑）
+        let cls = self.classifier();
         for ip in pinned.answers.iter().filter(|a| a.rtype == qtype).filter_map(ip_of) {
             if seen.contains(&ip) {
                 continue;
             }
-            if let Some(c) = st.pools.classify(ip) {
+            if let Some(c) = cls.classify(ip) {
                 if Cdn::is_alias(c.provider) && !Cdn::is_nearest(c.provider) {
                     out.insert(ip);
                 }
@@ -881,15 +882,15 @@ impl Cdn {
         if others.is_empty() {
             return None;
         }
-        let st = self.state();
+        let cls = self.classifier();
         let mut provider: Option<&'static str> = None;
         let (mut abroad, mut tw) = (0, 0);
         let mut ips = Vec::new();
         for m in others {
             let (mut a, mut t) = (false, false);
             for ip in m.answers.iter().filter(|r| r.rtype == rtype::A).filter_map(ip_of) {
-                let Some(c) = st.pools.classify(ip) else { continue };
-                if st.pools.is_nearest(c.provider) {
+                let Some(c) = cls.classify(ip) else { continue };
+                if Cdn::is_nearest(c.provider) {
                     continue; // 沒有台灣節點的 CDN 不列入「拉回台灣」
                 }
                 let p = *provider.get_or_insert(c.provider);
@@ -928,11 +929,8 @@ impl Cdn {
     pub fn route(&self, baseline: Option<&Baseline>, res: &ApplyResult, served: &Message) -> Option<Route> {
         if let Some(b) = baseline {
             let ips: Vec<IpAddr> = served.answers.iter().filter(|a| a.rtype == rtype::A).filter_map(ip_of).collect();
-            let served_tw = res.rewritten == Some(Rewrite::Alias) || {
-                let st = self.state();
-                ips.iter()
-                    .any(|ip| st.pools.classify(*ip).map(|c| c.cls == Cls::Tw).unwrap_or(false))
-            };
+            let served_tw = res.rewritten == Some(Rewrite::Alias)
+                || self.with_classifier(|c| ips.iter().any(|ip| c.classify(*ip).map(|c| c.cls == Cls::Tw).unwrap_or(false)));
             let mut saved = None;
             if b.abroad && served_tw {
                 if let (Some(bm), Some(sm)) = (b.ms.filter(|m| *m != 0.0), self.served_ms(b.provider, &ips)) {
