@@ -1,6 +1,7 @@
 //! 測試共用：假的網路（`MockNet`）與建立 `Cdn` 的輔助函式
 
 mod behaviors;
+mod bench;
 mod jobs;
 mod parity;
 mod selftest;
