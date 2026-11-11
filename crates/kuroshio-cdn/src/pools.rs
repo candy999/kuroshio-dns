@@ -845,6 +845,15 @@ impl Pools {
             .find_map(|(name, d)| d.class_of(ip, self.is_nearest(name)).map(|cls| Class { provider: name, cls }))
     }
 
+    /// IP 在不在這家 CDN 的官方範圍（含掃描分類）裡。節點池工作的候選（流量收集、舊節點池、種子、
+    /// 好友提示）都要先過這一關：範圍外的 IP 可能是任何人的機器，不能因為「HTTP 回了台灣 POP」就放進池
+    pub fn in_ranges(&self, provider: &str, ip: IpAddr) -> bool {
+        self.p
+            .get(provider)
+            .and_then(|d| d.class_of(unmap(ip), self.is_nearest(provider)))
+            .is_some()
+    }
+
     /// 目前範圍與分類的唯讀快照（共用同一份 `CidrSet`，只複製指標）
     pub fn classifier(&self) -> Classifier {
         // 所有 CDN 的範圍合成一個集合：不在裡面的 IP（絕大多數）查一次就知道不是 CDN

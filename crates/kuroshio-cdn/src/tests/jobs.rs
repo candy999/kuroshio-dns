@@ -119,6 +119,25 @@ async fn pool_job_builds_taiwan_pool() {
             ms: f64::INFINITY,
         },
     });
+    // 範圍外的 IP 混進流量收集、舊節點池：就算「回了台灣 POP、延遲很低」也不能進節點池，連測都不測
+    ctx.cdn.with_state(|st| {
+        st.db.add_harvest("cloudflare", ip("203.0.113.5"));
+        st.db.add_harvest("cloudflare", ip("2001:db8::5"));
+        st.pools
+            .p
+            .get_mut("cloudflare")
+            .unwrap()
+            .pool4
+            .push(crate::pools::PoolNode::new(ip("198.51.100.9")));
+    });
+    net.on_ping(|i| match i {
+        IpAddr::V4(v) if v.octets()[2] == 0 || v.octets()[0] != 104 => lat(1.0),
+        IpAddr::V4(_) => lat(70.0),
+        IpAddr::V6(_) => Latency {
+            ok: false,
+            ms: f64::INFINITY,
+        },
+    });
     net.on_http(|_, _| resp(200, &[], "colo=TPE"));
     net.on_speed(|_| 55.5);
     net.on_quality(|_| Quality {
@@ -137,6 +156,12 @@ async fn pool_job_builds_taiwan_pool() {
     assert_eq!((n.ms, n.speed, n.pop.as_deref()), (Num::V(2.0), Num::V(55.5), Some("TPE")));
     assert!(st.pools.p["cloudflare"].rest.contains_key("updatedAt"));
     assert!(st.pools.dirty, "節點池換新後要寫快照");
+    drop(st);
+    assert!(
+        net.calls("http 203.0.113.5").is_empty() && net.calls("http 198.51.100.9").is_empty(),
+        "範圍外的不測"
+    );
+    assert!(!r.providers[0].v4.contains(&ip("203.0.113.5")) && !r.providers[0].v4.contains(&ip("198.51.100.9")));
 }
 
 #[tokio::test]

@@ -70,6 +70,24 @@ async fn ecs_resolve(cdn: &Cdn, name: &str, qtype: u16, subnets: &[String]) -> V
     out
 }
 
+/// 只留這家 CDN 官方範圍內的候選；範圍外的記一筆紀錄（流量收集、舊節點池、種子都可能混進別人的 IP）
+fn keep_in_ranges<C: FromIterator<IpAddr>>(cdn: &Cdn, name: &str, what: &str, ips: impl IntoIterator<Item = IpAddr>) -> C {
+    let st = cdn.state();
+    let mut dropped = 0usize;
+    let out = ips
+        .into_iter()
+        .filter(|ip| {
+            let ok = st.pools.in_ranges(name, *ip);
+            dropped += usize::from(!ok);
+            ok
+        })
+        .collect();
+    if dropped > 0 {
+        info!("{name} {what}：{dropped} 個不在官方範圍內，不列入");
+    }
+    out
+}
+
 fn p24(ip: IpAddr) -> Option<u32> {
     util::prefix24(ip)
 }
@@ -144,14 +162,18 @@ async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: 
             cand.insert((s >> 8) as u32, IpAddr::V4(Ipv4Addr::from((s + 10 + rng.below(200)) as u32)));
         }
     }
-    for ip in cdn.state().db.harvest_of(name, false) {
+    // 先取出來（不能在拿著鎖的時候呼叫 keep_in_ranges：它也要拿同一把鎖）
+    let harvest = cdn.state().db.harvest_of(name, false);
+    let harvest: Vec<IpAddr> = keep_in_ranges(cdn.as_ref(), name, "流量收集的候選", harvest);
+    for ip in harvest {
         if let Some(p) = p24(ip) {
             cand.insert(p, ip);
         }
     }
-    for x in &prev.v4 {
-        if let Some(p) = p24(x.ip) {
-            cand.insert(p, x.ip);
+    let old: Vec<IpAddr> = keep_in_ranges(cdn.as_ref(), name, "舊節點池", prev.v4.iter().map(|x| x.ip));
+    for ip in old {
+        if let Some(p) = p24(ip) {
+            cand.insert(p, ip);
         }
     }
     info!("{} 官方沒有台灣 POP：掃描 {} 個 /24，找品質最好的鄰近節點", prov.label, cand.len());
@@ -431,6 +453,8 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             } else {
                 carry_peak(&mut pool4, &prev.v4, w, true);
             }
+            // 保留舊節點池時也一樣：範圍外的不放回去
+            pool4.retain(|x| cdn.state().pools.in_ranges(name, x.ip));
             info!(
                 "節點池：IPv4 {} 個網段 → {}",
                 pool4.len(),
@@ -480,6 +504,8 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                 cand.insert(ip);
             }
         }
+        // 全部候選（掃描結果、舊節點池、種子、流量收集、ECS 解析）都要在官方範圍內
+        let cand: IndexSet<IpAddr> = keep_in_ranges(&cdn, name, "IPv4 候選", cand);
         info!(
             "IPv4 候選 {} 個（TW 網段 {}、實際流量收集 {}）",
             cand.len(),
@@ -641,6 +667,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             }
             let mut list: IndexSet<IpAddr> = permanent.iter().map(|x| x.ip).collect();
             list.extend(per48.values().flatten().copied());
+            let list: IndexSet<IpAddr> = keep_in_ranges(&cdn, name, "IPv6 候選", list);
             info!(
                 "IPv6 候選 {} 個（永久紀錄 {}、{} 個 /48）",
                 list.len(),
@@ -745,6 +772,12 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             }
         }
         pool6.sort_by(|a, b| a.ms.or(999.0).partial_cmp(&b.ms.or(999.0)).unwrap_or(std::cmp::Ordering::Equal));
+        // 舊節點池、永久 IPv6 紀錄也要在官方範圍內（以前的版本可能放進過範圍外的 IP）
+        {
+            let st = cdn.state();
+            pool4.retain(|x| st.pools.in_ranges(name, x.ip));
+            pool6.retain(|x| st.pools.in_ranges(name, x.ip));
+        }
 
         info!(
             "節點池：IPv4 {} 個 → {}",
