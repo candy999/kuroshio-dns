@@ -205,6 +205,17 @@ const SPIN_TRIES: u32 = 200;
 /// 寫網域資料庫的快照時，每拿一次鎖寫幾筆（一筆約 0.5 KB、幾微秒）
 const DUMP_CHUNK: usize = 256;
 
+/// 網域資料庫的變動（`snapshots_sharded`）
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DomainChanges {
+    /// 分片數
+    pub shards: usize,
+    /// 有變動的分片：（編號，是否重要變動——否 = 只有計數）
+    pub changed: Vec<(usize, bool)>,
+    /// 要寫的分片清單：（內容，清單寫好之後要刪掉的舊檔）。清單要等所有分片都寫好才寫
+    pub manifest: Option<(Vec<u8>, Vec<String>)>,
+}
+
 /// 狀態檔（相對於狀態目錄）
 pub const STATE_FILES: [&str; 5] = [pools::FILE, v6store::FILE, db::FILE, db::HARVEST_FILE, pools::ZONE_FILE];
 
@@ -212,7 +223,7 @@ impl Cdn {
     /// 從狀態目錄載入（沒有或是空的就用種子資料）
     pub fn load(cfg: &Value, paths: Paths, net: Arc<dyn Net>) -> Arc<Cdn> {
         let dir = paths.state_dir.clone();
-        Cdn::load_with(cfg, paths, net, &|rel| std::fs::read(dir.join(rel)).ok())
+        Cdn::load_with(cfg, paths, net, &|rel| crate::statefile::read(&dir.join(rel)))
     }
 
     /// 同 `load`，但狀態檔由 `read`（相對路徑 → 內容）提供，例如快照寫入器的 `load()`
@@ -275,10 +286,16 @@ impl Cdn {
             }
         }
 
-        // 網域資料庫
+        // 網域資料庫：分片（舊版的單一檔案也讀，之後搬進分片）
         let mut db = Db::new(c.max_entries);
-        let n = read(db::FILE).and_then(|b| db.load_domains(&b, false).map_err(|e| warn!("{} 讀取失敗：{e}", db::FILE)).ok());
-        if n.unwrap_or(0) == 0 {
+        let shard_dir = paths.state_dir.join(db::SHARD_DIR);
+        let list = || -> Vec<String> {
+            std::fs::read_dir(&shard_dir)
+                .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+                .unwrap_or_default()
+        };
+        let store = db.load_store(read, &list);
+        if db.domains.is_empty() {
             // 匯入時把「最後出現時間」設成現在：每小時的複驗只處理最近 3 天出現過的網域
             if let Some(b) = seed("cdn-domains.json") {
                 if db.load_domains(&b, true).map(|n| n > 0).unwrap_or(false) {
@@ -286,6 +303,10 @@ impl Cdn {
                     used.push("CDN 網域驗證紀錄");
                 }
             }
+        }
+        db.plan_after_load(&store);
+        if store.legacy {
+            info!("CDN 網域資料庫搬進分片（{} 片、壓縮）：寫完之後刪掉舊的 {}", db.shards, db::FILE);
         }
         if let Some(b) = read(db::HARVEST_FILE) {
             if let Err(e) = db.load_harvest(&b) {
@@ -332,7 +353,7 @@ impl Cdn {
     fn reset_octet_verdicts(&self) {
         let mut st = self.state();
         let st = &mut *st;
-        let mut n = 0;
+        let mut reset = Vec::new();
         for e in st.db.domains.values_mut() {
             let Some(p) = e.provider() else { continue };
             if !st.pools.octet_mode(p) {
@@ -340,11 +361,14 @@ impl Cdn {
             }
             if e.v4.as_ref().map(|v| v.is("fail") && v.algo != Some(2)).unwrap_or(false) {
                 e.v4 = None;
-                n += 1;
+                reset.push(e.name.clone());
             }
         }
+        let n = reset.len();
+        for name in reset {
+            st.db.mark(&name);
+        }
         if n > 0 {
-            st.db.dirty = true;
             info!("重新驗證 {n} 個 Fastly 網域（舊版只試了少數網段）");
         }
     }
@@ -430,12 +454,12 @@ impl Cdn {
 
     // ------------------------------------------------------------ 快照
 
-    /// `stream` = 網域資料庫不序列化，只回報有沒有變動（由呼叫端用 `write_domains` 邊寫邊產生）
-    fn collect(&self, all: bool, stream: bool) -> (Vec<(String, Vec<u8>)>, bool) {
+    /// `stream` = 網域資料庫不序列化，只回報哪些分片有變動（由呼叫端用 `write_shard` 邊寫邊產生）
+    fn collect(&self, all: bool, stream: bool) -> (Vec<(String, Vec<u8>)>, DomainChanges) {
         let mut out = Vec::new();
         // 網域資料庫（可能有 20 萬筆、上百 MB）分批寫：每批只拿一下鎖，查詢不會被整個擋住
         let mut dump = None;
-        let mut db_dirty = false;
+        let mut changes = DomainChanges::default();
         {
             let mut st = self.state();
             let st = &mut *st;
@@ -448,14 +472,17 @@ impl Cdn {
                 out.push((v6store::FILE.to_string(), st.v6.to_json()));
             }
             if stream {
-                db_dirty = all || st.db.dirty;
-                st.db.dirty = false;
+                changes.shards = st.db.shards;
+                changes.changed = st.db.take_marks(all);
+                if let Some(retire) = st.db.manifest_pending.take() {
+                    changes.manifest = Some((st.db.manifest_json(), retire));
+                }
             } else if all {
                 // 關機：一次寫完（已經沒有查詢了，內容也要是同一個時間點的）
-                st.db.dirty = false;
+                st.db.take_marks(true);
                 out.push((db::FILE.to_string(), st.db.domains_json()));
-            } else if st.db.dirty {
-                st.db.dirty = false;
+            } else if st.db.changed() {
+                st.db.take_marks(true);
                 dump = Some((out.len(), st.db.dump_begin()));
             }
             if all || st.db.harvest_dirty {
@@ -476,7 +503,7 @@ impl Cdn {
             buf.extend_from_slice(&tail);
             out.insert(at, (db::FILE.to_string(), buf)); // 順序跟一次寫完時一樣
         }
-        (out, db_dirty)
+        (out, changes)
     }
 
     /// 分批把網域接到後面（`dump_begin` 之後）：每批只拿一下鎖
@@ -509,10 +536,31 @@ impl Cdn {
         self.collect(true, false).0
     }
 
-    /// 同 `snapshots`，但不含網域資料庫，只回報它有沒有變動（`all` = 全部都算有變動）。
-    /// 網域資料庫要寫的時候用 `write_domains` 直接寫進檔案，整份 JSON 不會放在記憶體裡
-    pub fn snapshots_stream(&self, all: bool) -> (Vec<(String, Vec<u8>)>, bool) {
+    /// 正式執行用：同 `snapshots`，但網域資料庫不序列化，只回報哪些分片有變動（`all` = 全部都算重要變動）。
+    /// 分片要寫的時候用 `write_shard` 直接寫進檔案，整份 JSON 不會放在記憶體裡
+    pub fn snapshots_sharded(&self, all: bool) -> (Vec<(String, Vec<u8>)>, DomainChanges) {
         self.collect(all, true)
+    }
+
+    /// 把第 `i` 個分片（共 `n` 片，相對路徑 `db::shard_file(n, i)`）邊序列化邊寫出：分批拿鎖。
+    /// 依名稱排序（內容沒變時寫出來的位元組也一樣）
+    pub fn write_shard(&self, n: usize, i: usize, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let mut keys = self.state().db.shard_keys(n, i);
+        keys.sort_unstable();
+        let (head, tail) = Db::shard_frame(n, i);
+        w.write_all(&head)?;
+        let mut first = true;
+        let mut buf = Vec::new();
+        for (k, chunk) in keys.chunks(DUMP_CHUNK).enumerate() {
+            if k > 0 {
+                // 讓等著的查詢先拿到鎖（見 dump_rest）
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            buf.clear();
+            self.state().db.dump_names(chunk, &mut buf, &mut first);
+            w.write_all(&buf)?;
+        }
+        w.write_all(tail)
     }
 
     /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，

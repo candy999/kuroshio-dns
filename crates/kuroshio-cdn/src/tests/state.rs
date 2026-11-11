@@ -77,7 +77,10 @@ fn round_trip_keeps_format_and_unknown_fields() {
     let paths = paths_no_seed("roundtrip");
     let orig = seed_state_with_unknowns(&paths.state_dir);
     let c = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
-    assert!(c.snapshots().is_empty(), "沒有變動、沒有用種子：不需要寫");
+    // 沒有變動、沒有用種子：只有網域資料庫要寫（舊版單一檔案搬進分片）
+    let first: Vec<String> = c.snapshots().into_iter().map(|x| x.0).collect();
+    assert_eq!(first, vec!["cdn-domains.json".to_string()]);
+    assert!(c.snapshots().is_empty(), "取出後不再重複");
     let snap: HashMap<String, Vec<u8>> = c.snapshots_all().into_iter().collect();
     assert_eq!(snap.len(), STATE_FILES.len());
     for (k, v) in &orig {
@@ -202,6 +205,7 @@ fn load_with_custom_reader() {
     let mut got = calls.lock().unwrap().clone();
     got.sort();
     let mut want: Vec<String> = STATE_FILES.iter().map(|s| s.to_string()).collect();
+    want.push(crate::db::MANIFEST.to_string());
     want.sort();
     assert_eq!(got, want);
     assert!(c.state().pools.zone_hit("fastly", ip("151.101.1.1")));
@@ -255,7 +259,7 @@ fn chunked_domains_snapshot_matches_single_pass() {
 
 #[test]
 fn streamed_domains_snapshot_matches_single_pass() {
-    // 正式執行時網域資料庫邊序列化邊寫進檔案（write_domains）：內容要跟一次寫完的完全一樣，讀得回來
+    // 網域資料庫邊序列化邊寫（write_domains）：內容要跟一次寫完的完全一樣，讀得回來
     let d = tmpdir("streamed");
     let paths = Paths::new(d.join("state"), repo().join("data"));
     let c = Cdn::load(&full_cfg(), paths, MockNet::new());
@@ -263,12 +267,15 @@ fn streamed_domains_snapshot_matches_single_pass() {
         st.db.dirty = true;
         st.pools.dirty = true;
     });
-    let (small, db_dirty) = c.snapshots_stream(false);
-    assert!(db_dirty);
+    let (small, ch) = c.snapshots_sharded(false);
+    assert_eq!(ch.changed.len(), ch.shards, "整個資料庫有變動：每片都要寫");
+    assert!(ch.changed.iter().all(|x| x.1));
+    assert!(ch.manifest.is_some(), "種子帶入：還沒有分片清單");
     assert!(small.iter().any(|x| x.0 == "cdn/pools.json"));
     assert!(small.iter().all(|x| x.0 != "cdn-domains.json"), "網域資料庫不整份序列化");
-    assert!(!c.state().db.dirty, "登記之後不再重複");
-    assert!(!c.snapshots_stream(false).1);
+    assert!(!c.state().db.changed(), "登記之後不再重複");
+    let (_, ch2) = c.snapshots_sharded(false);
+    assert!(ch2.changed.is_empty() && ch2.manifest.is_none());
 
     /// 每次只收一小段（模擬檔案寫入），記下最大的一段
     struct Sink(Vec<u8>, usize);
@@ -295,5 +302,128 @@ fn streamed_domains_snapshot_matches_single_pass() {
     let mut db = crate::db::Db::new(1_000_000);
     assert_eq!(db.load_domains(&w.0, false).unwrap(), n);
     // 關機：全部都算有變動
-    assert!(c.snapshots_stream(true).1);
+    let (_, ch3) = c.snapshots_sharded(true);
+    assert_eq!(ch3.changed.len(), ch3.shards);
+}
+
+/// 把變動的分片（與清單）寫進狀態目錄（模擬快照寫入器：分片壓縮、清單一般 JSON）
+fn write_changes(c: &Cdn, dir: &std::path::Path, ch: &crate::cdn::DomainChanges) -> Vec<(usize, usize)> {
+    let mut sizes = Vec::new();
+    for (i, _) in &ch.changed {
+        let mut raw = Vec::new();
+        c.write_shard(ch.shards, *i, &mut raw).unwrap();
+        let z = crate::statefile::compress(&raw);
+        let p = crate::statefile::zst_path(&dir.join(crate::db::shard_file(ch.shards, *i)));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, &z).unwrap();
+        sizes.push((raw.len(), z.len()));
+    }
+    if let Some((m, retire)) = &ch.manifest {
+        std::fs::write(dir.join(crate::db::MANIFEST), m).unwrap();
+        for r in retire {
+            crate::statefile::remove(&dir.join(r));
+        }
+    }
+    sizes
+}
+
+#[test]
+fn shards_migrate_and_track_changes() {
+    // (iv) 舊版單一檔案 → 分片：讀得進來、全部重寫、清單寫好後刪掉舊檔；再啟動時內容一樣
+    let paths = paths_no_seed("shards");
+    let dir = paths.state_dir.clone();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(repo().join("data/seed/cdn-domains.json"), dir.join(crate::db::FILE)).unwrap();
+    let c = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
+    let n = c.state().db.domains.len();
+    assert!(n > 1000);
+    let (_, ch) = c.snapshots_sharded(false);
+    assert_eq!(ch.changed.len(), ch.shards, "搬家：每片都寫");
+    let (_, retire) = ch.manifest.clone().expect("要寫分片清單");
+    assert_eq!(retire, vec![crate::db::FILE.to_string()]);
+    write_changes(&c, &dir, &ch);
+    assert!(!dir.join(crate::db::FILE).exists(), "搬完刪掉舊檔");
+    let c2 = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
+    assert_eq!(c2.state().db.domains.len(), n);
+    let (_, ch) = c2.snapshots_sharded(false);
+    assert!(ch.changed.is_empty() && ch.manifest.is_none(), "內容沒變：什麼都不用寫");
+
+    // (ii) 一個驗證結果的變動只重寫一片
+    let name = c2.state().db.domains.values().find(|d| d.provider().is_some()).unwrap().name.to_string();
+    c2.with_state(|st| st.db.set_verdict(&name, 4, |v| v.verdict = Some(crate::util::intern("fail"))));
+    let (_, ch) = c2.snapshots_sharded(false);
+    assert_eq!(ch.changed, vec![(crate::db::shard_of(&name, ch.shards), true)]);
+
+    // (iii) 只有計數（查詢次數、最後出現時間）：標成「只有計數」，不算重要變動
+    let (prov, ips4) = {
+        let st = c2.state();
+        let e = st.db.get(&name).unwrap();
+        (e.provider().unwrap_or("cloudflare").to_string(), e.ips4.to_vec())
+    };
+    c2.with_state(|st| {
+        let cname = st.db.get(&name).unwrap().cname.val().cloned();
+        let via = st.db.get(&name).unwrap().via.val().map(|v| v.to_string()).unwrap_or_default();
+        st.db.touch(&name, &prov, &via, &ips4, &[], cname.as_deref());
+    });
+    let (_, ch) = c2.snapshots_sharded(false);
+    assert_eq!(ch.changed, vec![(crate::db::shard_of(&name, ch.shards), false)], "只有計數");
+    // 計數跟著分片一起寫出去
+    let hits = c2.state().db.get(&name).unwrap().hits;
+    write_changes(&c2, &dir, &ch);
+    let c3 = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
+    assert_eq!(c3.state().db.get(&name).unwrap().hits, hits);
+    assert!(c3.state().db.get(&name).unwrap().v4.as_ref().unwrap().is("fail"));
+
+    // (v) 壞掉 / 不見的分片：其他照常載入、不會不能啟動，壞掉的那片之後重寫
+    let shards = ch.shards;
+    let bad = crate::db::shard_of(&name, shards);
+    let bad_path = crate::statefile::zst_path(&dir.join(crate::db::shard_file(shards, bad)));
+    std::fs::write(&bad_path, b"not zstd at all").unwrap();
+    let other = (bad + 1) % shards;
+    std::fs::remove_file(crate::statefile::zst_path(&dir.join(crate::db::shard_file(shards, other)))).unwrap();
+    let c4 = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
+    let left = c4.state().db.domains.len();
+    assert!(left > n / 2 && left < n, "其他分片照常載入：{left} / {n}");
+    assert!(c4.state().db.get(&name).is_none());
+    let (_, ch) = c4.snapshots_sharded(false);
+    let mut want = vec![(bad, true), (other, true)];
+    want.sort();
+    assert_eq!(ch.changed, want, "只重寫壞掉的分片");
+    assert!(ch.manifest.is_none());
+
+    // 分片清單壞掉：用目錄裡的分片救回來，並重寫清單
+    std::fs::write(dir.join(crate::db::MANIFEST), b"{oops").unwrap();
+    let c5 = Cdn::load(&full_cfg(), paths, MockNet::new());
+    assert_eq!(c5.state().db.domains.len(), left);
+    assert!(c5.snapshots_sharded(false).1.manifest.is_some());
+}
+
+#[test]
+fn shard_count_change_rewrites_all() {
+    // 分片數改變（例如換了等級）：新的一組全部寫好、清單更新後才刪掉舊的一組
+    let paths = paths_no_seed("reshard");
+    let dir = paths.state_dir.clone();
+    let mut cfg = full_cfg();
+    cfg["cdn"]["maxEntries"] = json!(20000);
+    let c = Cdn::load(&cfg, paths.clone(), MockNet::new());
+    c.with_state(|st| {
+        for i in 0..300 {
+            st.db.touch(&format!("s{i}.example.com"), "cloudflare", "ip", &[], &[], None);
+        }
+    });
+    let (_, ch) = c.snapshots_sharded(false);
+    let old_n = ch.shards;
+    write_changes(&c, &dir, &ch);
+    cfg["cdn"]["maxEntries"] = json!(200000);
+    let c2 = Cdn::load(&cfg, paths.clone(), MockNet::new());
+    assert_eq!(c2.state().db.domains.len(), 300);
+    let (_, ch) = c2.snapshots_sharded(false);
+    assert!(ch.shards > old_n);
+    assert_eq!(ch.changed.len(), ch.shards);
+    let (_, retire) = ch.manifest.clone().unwrap();
+    assert!(retire.contains(&crate::db::shard_file(old_n, 0)));
+    write_changes(&c2, &dir, &ch);
+    assert!(!crate::statefile::exists(&dir.join(crate::db::shard_file(old_n, 0))));
+    let c3 = Cdn::load(&cfg, paths, MockNet::new());
+    assert_eq!(c3.state().db.domains.len(), 300);
 }

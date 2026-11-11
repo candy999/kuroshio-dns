@@ -1013,6 +1013,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

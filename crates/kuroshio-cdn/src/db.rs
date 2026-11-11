@@ -15,7 +15,19 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+/// 舊版（分片以前）的單一檔案：讀得到就搬進分片，搬完刪掉；備份檔裡也用這個名字代表整個資料庫
 pub const FILE: &str = "cdn-domains.json";
+/// 分片目錄（規格 05 第 5.3 節）：網域依名稱的雜湊分到 N 個檔，只重寫有變動的分片
+pub const SHARD_DIR: &str = "cdn/domains";
+/// 分片清單：記錄 N（一般 JSON、很少變）
+pub const MANIFEST: &str = "cdn/domains/manifest.json";
+pub const MANIFEST_FORMAT: &str = "kuroshio-cdn-domains";
+/// 每個分片壓縮後的目標大小（上限筆數時）：64–128 KB，大約一兩個 Flash 抹除區塊
+pub const SHARD_TARGET_BYTES: usize = 128 * 1024;
+/// 每筆網域壓縮後約幾 bytes（實測，見規格 05 第 5.5 節）
+pub const COMPRESSED_BYTES_PER_ENTRY: usize = 64;
+/// 分片數上限
+pub const MAX_SHARDS: usize = 256;
 pub const HARVEST_FILE: &str = "cdn/harvest.json";
 /// 每家 CDN 每個家族最多收集幾個候選 IP（同 2.x）
 pub const HARVEST_MAX: usize = 3000;
@@ -439,14 +451,81 @@ pub struct Query {
 /// 分段寫快照時要寫的網域：（查詢次數，名稱）
 pub type DumpKeys = Vec<(u32, Arc<str>)>;
 
+/// 分片的檔名（相對於狀態目錄；寫入器會加上 `.zst`）：`cdn/domains/16-003.json`。
+/// 檔名帶著 N：分片數改變時新舊兩組檔名不會互相蓋掉，新的一組寫完（清單也更新）才刪舊的
+pub fn shard_file(n: usize, i: usize) -> String {
+    format!("{SHARD_DIR}/{n}-{i:03}.json")
+}
+
+/// 網域屬於哪個分片：FNV-1a（各平台、各版本都一樣，不能用 std 的雜湊）
+pub fn shard_of(name: &str, n: usize) -> usize {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in name.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h as usize) & (n.max(1) - 1)
+}
+
+/// 依筆數上限決定分片數（2 的次方）：上限筆數時每片壓縮後約 64–128 KB
+pub fn shards_for(max_entries: usize) -> usize {
+    let total = max_entries.saturating_mul(COMPRESSED_BYTES_PER_ENTRY);
+    total.div_ceil(SHARD_TARGET_BYTES).clamp(1, MAX_SHARDS).next_power_of_two()
+}
+
+/// 分片的變動程度
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Mark {
+    #[default]
+    Clean,
+    /// 只有計數（查詢次數、最後出現時間）：不單獨觸發寫入，等這片因為別的原因要寫、或到了最久未存的上限
+    Counters,
+    /// 驗證結果、IP、策略、ECS、跨 CDN、新增 / 刪除網域
+    Important,
+}
+
+/// 分片清單的內容
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ManifestFmt {
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    shards: usize,
+    /// 舊版單一檔案最上層不認識的欄位（原樣保留）
+    #[serde(flatten)]
+    extra: Extra,
+}
+
+/// 載入分片的結果
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoreLoad {
+    /// 有讀到舊版的單一檔案
+    pub legacy: bool,
+    /// 磁碟上的分片數（沒有分片清單、也找不到分片時 None）
+    pub shards_on_disk: Option<usize>,
+    /// 有沒有分片清單
+    pub manifest: bool,
+    /// 讀不到 / 壞掉的分片
+    pub bad_shards: Vec<usize>,
+}
+
 pub struct Db {
     pub domains: HashMap<Arc<str>, Domain>,
     pub harvest: IndexMap<String, HarvestSet>,
     pub max_entries: usize,
     saved_at: Option<String>,
     extra: Extra,
+    /// 整個資料庫都要重寫（種子帶入、舊版搬家、分片數改變）
     pub dirty: bool,
     pub harvest_dirty: bool,
+    /// 分片數（2 的次方）
+    pub shards: usize,
+    /// 每個分片的變動程度
+    marks: Vec<Mark>,
+    /// 要寫分片清單：寫完之後要刪掉的舊檔（相對路徑）
+    pub manifest_pending: Option<Vec<String>>,
 }
 
 impl Db {
@@ -459,6 +538,171 @@ impl Db {
             extra: Extra::default(),
             dirty: false,
             harvest_dirty: false,
+            shards: shards_for(max_entries.max(100)),
+            marks: vec![Mark::Clean; shards_for(max_entries.max(100))],
+            manifest_pending: None,
+        }
+    }
+
+    /// 改分片數（測試、量測用；正式執行由筆數上限決定）
+    pub fn set_shards(&mut self, n: usize) {
+        self.shards = n.clamp(1, MAX_SHARDS).next_power_of_two();
+        self.marks = vec![Mark::Clean; self.shards];
+    }
+
+    /// 這個網域有重要的變動：它的分片要寫
+    pub fn mark(&mut self, name: &str) {
+        let i = shard_of(name, self.shards);
+        self.marks[i] = Mark::Important;
+    }
+
+    /// 目前各分片的變動（不清除）
+    pub fn marks(&self) -> &[Mark] {
+        &self.marks
+    }
+
+    /// 有沒有任何還沒取出的變動
+    pub fn changed(&self) -> bool {
+        self.dirty || self.marks.iter().any(|m| *m != Mark::Clean)
+    }
+
+    /// 取出有變動的分片（`all` = 全部算重要變動）並清除：（分片編號，是否重要）
+    pub fn take_marks(&mut self, all: bool) -> Vec<(usize, bool)> {
+        let full = std::mem::take(&mut self.dirty) || all;
+        let out = self
+            .marks
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| full || **m != Mark::Clean)
+            .map(|(i, m)| (i, full || *m == Mark::Important))
+            .collect();
+        self.marks.iter_mut().for_each(|m| *m = Mark::Clean);
+        out
+    }
+
+    /// 分片清單（一般 JSON；只記 N 與舊版不認識的欄位，平常不會變）
+    pub fn manifest_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&ManifestFmt {
+            format: MANIFEST_FORMAT.into(),
+            version: 1,
+            shards: self.shards,
+            extra: self.extra.clone(),
+        })
+        .unwrap_or_default()
+    }
+
+    /// 從狀態目錄載入：舊版單一檔案（有的話）→ 分片清單 → 各分片（分片的內容比舊檔新，蓋過去）。
+    /// `read` 給相對路徑、回傳內容（壓縮檔由它處理）；`list_dir` 列出分片目錄裡的檔名（沒有清單時救援用）。
+    /// 讀不到或壞掉的分片記一筆警告、略過，其他照常載入——絕不因為一個分片壞掉就不能啟動。
+    pub fn load_store(&mut self, read: &dyn Fn(&str) -> Option<Vec<u8>>, list_dir: &dyn Fn() -> Vec<String>) -> StoreLoad {
+        let mut out = StoreLoad::default();
+        if let Some(b) = read(FILE) {
+            match self.load_domains(&b, false) {
+                Ok(_) => out.legacy = true,
+                Err(e) => tracing::warn!("{FILE} 讀取失敗：{e}"),
+            }
+        }
+        let manifest = read(MANIFEST).and_then(|b| {
+            serde_json::from_slice::<ManifestFmt>(&b)
+                .map_err(|e| tracing::warn!("{MANIFEST} 讀取失敗：{e}"))
+                .ok()
+                .filter(|m| (1..=MAX_SHARDS).contains(&m.shards) && m.shards.is_power_of_two())
+        });
+        out.manifest = manifest.is_some();
+        let n = match &manifest {
+            Some(m) => Some(m.shards),
+            // 沒有清單（或壞掉）而且沒有舊檔：用目錄裡檔案最多的一組分片（救援）
+            None if !out.legacy => {
+                let mut count: HashMap<usize, usize> = HashMap::new();
+                for f in list_dir() {
+                    let f = f.trim_end_matches(".zst");
+                    if let Some((a, _)) = f.strip_suffix(".json").and_then(|x| x.split_once('-')) {
+                        if let Ok(n) = a.parse::<usize>() {
+                            if (1..=MAX_SHARDS).contains(&n) && n.is_power_of_two() {
+                                *count.entry(n).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                count.into_iter().max_by_key(|(n, c)| (*c, *n)).map(|(n, _)| n)
+            }
+            None => None,
+        };
+        if let Some(m) = manifest {
+            self.extra = m.extra;
+        }
+        out.shards_on_disk = n;
+        let Some(n) = n else { return out };
+        for i in 0..n {
+            let rel = shard_file(n, i);
+            match read(&rel).map(|b| serde_json::from_slice::<FileFmt>(&b)) {
+                Some(Ok(f)) => {
+                    if out.legacy {
+                        // 這片已經寫過：裡面的內容比舊檔新
+                        self.domains.retain(|k, _| shard_of(k, n) != i);
+                    }
+                    for d in f.domains {
+                        self.domains.insert(d.name.clone(), d);
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("CDN 網域分片 {rel} 壞掉，略過（其他分片照常載入）：{e}");
+                    out.bad_shards.push(i);
+                }
+                None => {
+                    tracing::warn!("CDN 網域分片 {rel} 不見了，略過（其他分片照常載入）");
+                    out.bad_shards.push(i);
+                }
+            }
+        }
+        if self.domains.len() > self.max_entries {
+            self.prune();
+        }
+        out
+    }
+
+    /// 載入之後決定要重寫什麼：舊檔搬家、分片數改變、清單不見 → 全部重寫並寫新清單（寫完刪舊檔）；
+    /// 只有幾個分片壞掉 → 只重寫那幾片
+    pub fn plan_after_load(&mut self, l: &StoreLoad) {
+        let same = l.shards_on_disk == Some(self.shards);
+        if l.legacy || !same || !l.manifest {
+            if l.legacy || l.shards_on_disk.is_some() {
+                self.dirty = true;
+            }
+            let mut retire = vec![FILE.to_string()];
+            if let Some(old) = l.shards_on_disk.filter(|n| *n != self.shards) {
+                retire.extend((0..old).map(|i| shard_file(old, i)));
+            }
+            self.manifest_pending = Some(retire);
+        } else {
+            for i in &l.bad_shards {
+                self.marks[*i] = Mark::Important;
+            }
+        }
+    }
+
+    /// 這個分片裡的網域名稱（拿著鎖時呼叫；之後放開鎖排序、分批寫）
+    pub fn shard_keys(&mut self, n: usize, i: usize) -> Vec<Arc<str>> {
+        if self.domains.len() > self.max_entries {
+            self.prune();
+        }
+        self.domains.keys().filter(|k| shard_of(k, n) == i).cloned().collect()
+    }
+
+    /// 分片內容的開頭（`{"shard":i,"of":n,"domains":[`）與結尾
+    pub fn shard_frame(n: usize, i: usize) -> (Vec<u8>, &'static [u8]) {
+        (format!("{{\"shard\":{i},\"of\":{n},\"domains\":[").into_bytes(), b"]}")
+    }
+
+    /// 把這些網域接到 `out` 後面（期間被刪掉的略過）
+    pub fn dump_names(&self, names: &[Arc<str>], out: &mut Vec<u8>, first: &mut bool) {
+        for name in names {
+            let Some(d) = self.domains.get(name) else { continue };
+            if !*first {
+                out.push(b',');
+            }
+            *first = false;
+            let _ = serde_json::to_writer(&mut *out, d);
         }
     }
 
@@ -655,8 +899,8 @@ impl Db {
         }
         for (_, n) in arr.into_iter().take(drop) {
             self.domains.remove(&n);
+            self.mark(&n);
         }
-        self.dirty = true;
     }
 
     pub fn get(&self, name: &str) -> Option<&Domain> {
@@ -690,24 +934,36 @@ impl Db {
                 },
             );
         }
-        self.dirty = true;
+        let shard = shard_of(name, self.shards);
         let e = self.domains.get_mut(name).unwrap();
+        // 剛新增的（hits 還是 0）算重要變動；其他只有計數變了的，不單獨觸發寫入
+        let mut important = e.hits == 0;
         e.last_seen = now;
         e.hits = e.hits.saturating_add(1);
         if !provider.is_empty() && e.provider() != Some(provider) {
             e.provider = Field::Val(util::intern(provider));
             e.via = Field::Val(util::intern(via));
+            important = true;
         }
         if let Some(c) = cname {
             if e.cname.val().map(|x| x.as_str()) != Some(c) {
                 e.cname = Field::Val(c.to_string());
+                important = true;
             }
         }
         if !ips4.is_empty() && *e.ips4 != ips4[..ips4.len().min(4)] {
             e.ips4 = ips4.iter().take(4).copied().collect();
+            important = true;
         }
         if !ips6.is_empty() && *e.ips6 != ips6[..ips6.len().min(2)] {
             e.ips6 = ips6.iter().take(2).copied().collect();
+            important = true;
+        }
+        let m = &mut self.marks[shard];
+        if important {
+            *m = Mark::Important;
+        } else if *m == Mark::Clean {
+            *m = Mark::Counters;
         }
         e
     }
@@ -719,7 +975,7 @@ impl Db {
         let v = slot.get_or_insert_with(Default::default);
         f(v);
         v.at = Some(now_ms());
-        self.dirty = true;
+        self.mark(name);
     }
 
     pub fn clear_verdict(&mut self, name: &str, family: u8) {
@@ -729,7 +985,7 @@ impl Db {
             } else {
                 e.v4 = None;
             }
-            self.dirty = true;
+            self.mark(name);
         }
     }
 
@@ -737,14 +993,14 @@ impl Db {
         let Some(e) = self.domains.get_mut(name) else { return };
         base.at = Some(now_ms());
         e.base = Some(Box::new(base));
-        self.dirty = true;
+        self.mark(name);
     }
 
     pub fn set_ecs(&mut self, name: &str, mut ecs: Ecs) {
         let Some(e) = self.domains.get_mut(name) else { return };
         ecs.at = Some(now_ms());
         e.ecs = Some(Box::new(ecs));
-        self.dirty = true;
+        self.mark(name);
     }
 
     /// 跨 CDN 探索結果（cross4）
@@ -752,7 +1008,7 @@ impl Db {
         let Some(e) = self.domains.get_mut(name) else { return };
         c.at = Some(now_ms());
         e.cross4 = Some(Box::new(c));
-        self.dirty = true;
+        self.mark(name);
     }
 
     /// 記住這個網站最後成功的改寫方式
@@ -760,13 +1016,14 @@ impl Db {
         if let Some(e) = self.domains.get_mut(name) {
             if e.best != Some(s) {
                 e.best = Some(s);
-                self.dirty = true;
+                self.mark(name);
             }
         }
     }
 
     pub fn set_policy(&mut self, name: &str, policy: Policy) -> &Domain {
         let now = now_ms();
+        self.mark(name);
         let key: Arc<str> = Arc::from(name);
         let e = self.domains.entry(key.clone()).or_insert_with(|| Domain {
             name: key,
@@ -777,7 +1034,6 @@ impl Db {
             ..Default::default()
         });
         e.policy = Some(policy);
-        self.dirty = true;
         e
     }
 

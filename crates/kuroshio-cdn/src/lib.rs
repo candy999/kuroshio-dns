@@ -19,6 +19,7 @@ pub mod net;
 pub mod optimizer;
 pub mod pools;
 pub mod providers;
+pub mod statefile;
 pub mod svcb;
 pub mod util;
 pub mod v6store;

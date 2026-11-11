@@ -17,6 +17,8 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 indexmap = { version = "2", features = ["serde"] }
+# 狀態檔壓縮（.zst）；跟 kuroshio、kuroshio-community 用同一版
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 rcgen = "0.13"
