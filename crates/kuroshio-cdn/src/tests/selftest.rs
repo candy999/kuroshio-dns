@@ -598,7 +598,7 @@ async fn cross_cdn_explore() {
 #[test]
 fn cross_cdn_rewrite() {
     // 已驗證跨 CDN 可用：Fastly 的 A 換成 Cloudflare 台北節點、AAAA 拿掉
-    let (opt, _) = setup(json!({}));
+    let (opt, net) = setup(json!({}));
     let host = "abs.twimg.example";
     opt.with_state(|st| {
         st.db.touch(host, "fastly", "ip", &ips(&["151.101.1.140"]), &[], None);
@@ -628,6 +628,22 @@ fn cross_cdn_rewrite() {
     assert!(m.answers.is_empty());
     // 記住這個網站最好的策略（規格 06 第 3.5 節）
     assert_eq!(opt.state().db.get(host).unwrap().best, Some(crate::db::Strategy::Cross));
+
+    // 到了複驗時間：照樣先用舊結果，但一定排入重新探索——不管原始節點現在快不快、有沒有量過延遲
+    let cross_tasks = |opt: &Arc<Cdn>| opt.take_tasks().into_iter().filter(|t| matches!(t, Task::Cross { .. })).count();
+    opt.take_tasks();
+    let mut m = msg(host, 1, &["151.101.1.140"], vec![]);
+    opt.apply(&mut m, host, 1);
+    assert_eq!(cross_tasks(&opt), 0, "還沒到複驗時間");
+    opt.with_state(|st| st.db.get_mut(host).unwrap().cross4.as_mut().unwrap().recheck_at = Some(now_ms() - 1));
+    let mut m = msg(host, 1, &["151.101.1.140"], vec![]);
+    opt.apply(&mut m, host, 1);
+    assert_eq!(answer_ips(&m, 1), ["104.16.161.36"]);
+    assert_eq!(cross_tasks(&opt), 1, "沒量過延遲也要複驗");
+    net.set_cached("151.101.1.140", 3.0);
+    let mut m = msg(host, 1, &["151.101.1.140"], vec![]);
+    opt.apply(&mut m, host, 1);
+    assert_eq!(cross_tasks(&opt), 1, "原始節點現在很快也要複驗");
 }
 
 #[test]

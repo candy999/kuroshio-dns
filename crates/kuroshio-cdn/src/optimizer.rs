@@ -430,12 +430,16 @@ impl Cdn {
                 .filter_map(ip_of)
                 .find(|ip| is_target(*ip));
             if let Some(o) = o {
+                let explore = Task::Cross {
+                    name: name.to_string(),
+                    from: provider.to_string(),
+                    orig: o,
+                };
                 match self.net.cached(o) {
-                    Some(c) if c.ok && c.ms >= self.cfg.cross.min_orig_ms => tasks.push(Task::Cross {
-                        name: name.to_string(),
-                        from: provider.to_string(),
-                        orig: o,
-                    }),
+                    // 已經在用跨 CDN 的結果、到了複驗時間：不管原始節點現在快不快都要重新確認
+                    // （以前原始節點變快、或還沒量過延遲時不會複驗，舊結果一路用到 3 天後過期）
+                    _ if s == "ok-recheck" => tasks.push(explore),
+                    Some(c) if c.ok && c.ms >= self.cfg.cross.min_orig_ms => tasks.push(explore),
                     Some(_) => {}
                     None => tasks.push(Task::Latency(o)),
                 }
