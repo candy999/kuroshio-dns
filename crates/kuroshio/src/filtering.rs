@@ -231,7 +231,8 @@ impl FilterService {
         self.rebuild().await.map(|_| true)
     }
 
-    /// 依記憶體預算（記憶體控制提供）先排除會放不下的清單（只用量過的大小估；沒量過的交給 `max_domains`）
+    /// 依記憶體預算（記憶體控制提供）先排除會放不下的清單：只用量過的大小估，依停用順序（保護清單絕不排除；
+    /// 只剩保護清單還是超過時照樣載入、記警告）。沒量過的清單（第一次載入）只受 `max_domains` 限制
     fn fit_allowance(&self) {
         let Some(limit) = self.allowance.get().and_then(|f| f()) else {
             return;
@@ -267,6 +268,13 @@ impl FilterService {
                 at: crate::persist::now_secs() * 1000,
             });
         }
+        if total > limit {
+            warn!(
+                "保護清單（與停用不了的清單）合計約 {} KB，超過記憶體預算 {} KB：保護清單照樣載入",
+                total / 1024,
+                limit / 1024
+            );
+        }
     }
 
     /// 依目前的停用名單重新下載、建一份清單層（下載失敗而且原本有清單時保留舊的）。回傳（重建前，重建後）的大小
@@ -279,11 +287,9 @@ impl FilterService {
             let c = self.custom.read().unwrap();
             (c.stats().custom, c.stats().unindexed)
         };
-        let mut max_domains = self.opts.max_domains.saturating_sub(custom_n);
-        // 記憶體預算：還沒量過大小的清單也不會超過（超過的清單整份不載入，統計裡看得到 overBudget）
-        if let Some(limit) = self.allowance.get().and_then(|f| f()) {
-            max_domains = max_domains.min(limit / BYTES_PER_DOMAIN);
-        }
+        // 記憶體預算不在這裡套用：maxDomains 依清單順序累計，會先擠掉排在後面的保護清單（例如 TW165）。
+        // 量過大小的清單在 `fit_allowance` 依停用順序先排除；第一次載入（還沒量過）只受等級的 maxDomains 限制
+        let max_domains = self.opts.max_domains.saturating_sub(custom_n);
         let mut b = FilterBuilder::new(BuildOptions {
             max_domains,
             // 每次查詢都要跑的規則：自訂規則的也算在內（查詢時兩層都要跑）

@@ -258,14 +258,20 @@ async fn memory_shedding_of_lists() {
     f2.restore_hits(&saved);
     assert_eq!(f2.hits_json(), saved);
 
-    // 預算：沒量過大小時用 maxDomains 擋（超過的清單整份不載入）；量過之後依停用順序先不載入（看得到原因）
+    // 預算：第一次載入（還沒量過大小）只受 maxDomains 限制；量過之後依停用順序先不載入（看得到原因），
+    // 保護清單就算超過預算也照樣載入
     let f3 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
-    f3.set_allowance(std::sync::Arc::new(|| Some(1000 * kuroshio::filtering::BYTES_PER_DOMAIN)));
+    f3.set_allowance(std::sync::Arc::new(|| Some(100 * kuroshio::filtering::BYTES_PER_DOMAIN)));
     f3.update_lists(true).await.unwrap();
-    let st = f3.stats();
-    assert_eq!(st["sources"][0]["status"], "loaded", "反詐騙在前面、放得下");
-    assert_eq!(st["sources"][1]["status"], "overBudget", "放不下的不載入");
-    assert!(f3.lists_bytes() < 2000 * 16);
+    assert!(f3.unloaded().is_empty(), "第一次載入不估");
+    f3.update_lists(true).await.unwrap();
+    let mut gone: Vec<String> = f3.unloaded().into_iter().map(|u| u.name).collect();
+    gone.sort();
+    assert_eq!(gone, ["大廣告", "常用廣告", "遙測"]);
+    assert!(f3.unloaded().iter().all(|u| u.reason == "budget"));
+    assert!(f3.check("scam1.example", 1).unwrap().block, "保護清單超過預算也照樣載入");
+    assert!(f3.check("keep1.example", 1).unwrap().block);
+    assert!(f3.check("big1.example", 1).is_none());
     let f4 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
     f4.update_lists(true).await.unwrap();
     let full = f4.lists_bytes();
