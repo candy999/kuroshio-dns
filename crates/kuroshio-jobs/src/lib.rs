@@ -24,6 +24,7 @@
 //! ```
 
 pub mod benchmark;
+pub mod geo;
 pub mod lock;
 pub mod scheduler;
 pub mod seed;

@@ -1,0 +1,52 @@
+name: 台灣 IP 清單更新
+
+# 每月重新產生 data/geo/tw-ip.json（RIR 配發 + RIPEstat 各 ISP 宣告的網段，依 ISP 分組）。
+# 有變動時 commit 到 tw-ip/<日期> 分支（不直接推到 main），確認報表後再開 PR 合併。
+# 行動網路的網段常常變動，所以每月更新一次。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 2 * *'
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    name: 產生
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 產生
+        run: |
+          mkdir -p tw-ip-out
+          cargo run --release -p kuroshio-jobs --bin tw-ip -- --cache tw-ip-out/raw data/geo/tw-ip.json tw-ip-out/report.md
+      - name: 摘要
+        if: always()
+        run: |
+          if [ -f tw-ip-out/report.md ]; then cat tw-ip-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tw-ip
+          path: |
+            tw-ip-out/report.md
+            data/geo/tw-ip.json
+      - name: commit 到分支
+        run: |
+          # 只有日期變了不算變動
+          if git diff --quiet -I '"generatedAt"' -- data/geo/tw-ip.json; then
+            echo "網段沒有變動" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          branch="tw-ip/$(date -u +%Y-%m-%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add data/geo/tw-ip.json
+          git commit -m "資料：更新台灣 IP 清單（$(date -u +%Y-%m-%d)）" -m "$(cat tw-ip-out/report.md)"
+          git push origin "$branch"
+          echo "已推到分支 $branch，確認後開 PR 合併" >> "$GITHUB_STEP_SUMMARY"
