@@ -12,6 +12,7 @@ pub const HEADER_LEN: usize = 12;
 pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_FORMERR: u8 = 1;
 pub const RCODE_SERVFAIL: u8 = 2;
+pub const RCODE_NOTIMP: u8 = 4;
 pub const RCODE_REFUSED: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +135,46 @@ pub fn error_response(query: &[u8], rcode: u8) -> Vec<u8> {
     r
 }
 
+/// 查詢帶的 EDNS UDP 大小（OPT 記錄的 class 欄位）；沒有 OPT 回 None。
+/// 只掃過記錄的外框，不展開名稱，給「UDP 回應要不要截斷」這種每個封包都要問的地方用。
+pub fn edns_udp_size(b: &[u8]) -> Option<u16> {
+    let h = header(b).ok()?;
+    let mut i = HEADER_LEN;
+    for _ in 0..h.qdcount {
+        i = skip_name(b, i).ok()? + 4;
+    }
+    for _ in 0..h.ancount as usize + h.nscount as usize + h.arcount as usize {
+        i = skip_name(b, i).ok()?;
+        if u16_at(b, i)? == message::rtype::OPT {
+            return u16_at(b, i + 2);
+        }
+        i += 10 + u16_at(b, i + 8)? as usize;
+    }
+    None
+}
+
+/// 用戶端這次 UDP 查詢最多能收多大的回應：沒有 EDNS 是 512（RFC 1035），
+/// 有 EDNS 用它宣告的大小，但不低於 512、不超過 1232（避免 IP 分片，DNS Flag Day 2020 的建議值）
+pub fn udp_limit(query: &[u8]) -> usize {
+    match edns_udp_size(query) {
+        Some(n) => (n as usize).clamp(512, 1232),
+        None => 512,
+    }
+}
+
+/// 回應放不進去時改回的「截斷」回應：標頭照原本的回應（rcode、RA…）、只留問題、TC=1，
+/// 用戶端看到 TC 會改用 TCP 重問。查詢有 EDNS 的話帶一筆空的 OPT（RFC 6891 第 7 節）
+pub fn truncated_response(query: &[u8], resp: &[u8]) -> Vec<u8> {
+    let rcode = header(resp).map(|h| h.rcode).unwrap_or(RCODE_NOERROR);
+    let mut r = error_response(query, rcode);
+    r[2] |= 0x02;
+    if edns_udp_size(query).is_some() {
+        r[11] = 1;
+        r.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+    }
+    r
+}
+
 /// 回應是否對應這個查詢（id 與問題都一樣）
 pub fn matches(query: &[u8], resp: &[u8]) -> bool {
     match (header(query), header(resp), question(query), question(resp)) {
@@ -243,6 +284,39 @@ mod tests {
         assert_eq!(a.len(), 2);
         assert_eq!((a[1].rtype, a[1].ttl, a[1].data.as_slice()), (1, 256, &[5u8, 6, 7, 8][..]));
         assert_eq!(answers(&r[..r.len() - 1]), Err(Error::TooShort));
+    }
+
+    #[test]
+    fn udp_limit_and_truncation() {
+        use crate::message::{Message, Opt};
+        let plain = build_query(7, "example.com", 1);
+        assert_eq!(edns_udp_size(&plain), None);
+        assert_eq!(udp_limit(&plain), 512);
+        let with = |size: u16| {
+            let mut m = Message::parse(&plain).unwrap();
+            m.opt = Some(Opt {
+                udp_size: size,
+                ..Default::default()
+            });
+            m.encode()
+        };
+        assert_eq!(edns_udp_size(&with(4096)), Some(4096));
+        assert_eq!(udp_limit(&with(4096)), 1232, "不超過 1232");
+        assert_eq!(udp_limit(&with(900)), 900, "用戶端宣告比較小就照它的");
+        assert_eq!(udp_limit(&with(100)), 512, "不低於 512");
+        // 截斷回應：TC=1、只有問題；查詢有 EDNS 才帶 OPT
+        let mut resp = error_response(&plain, 3);
+        resp.extend_from_slice(&[0; 600]);
+        let t = truncated_response(&plain, &resp);
+        let h = header(&t).unwrap();
+        assert!(h.tc && h.qr);
+        assert_eq!((h.id, h.rcode, h.qdcount, h.ancount, h.arcount), (7, 3, 1, 0, 0));
+        assert!(matches(&plain, &t));
+        let t = truncated_response(&with(1232), &resp);
+        let m = Message::parse(&t).unwrap();
+        assert!(m.flags & crate::message::FLAG_TC != 0);
+        assert_eq!(m.opt.unwrap().udp_size, 1232);
+        assert!(t.len() < 60);
     }
 
     #[test]

@@ -160,20 +160,20 @@ impl<'a> Reader<'a> {
         self.i += n;
         Ok(s)
     }
-    /// 讀一個名稱（處理壓縮指標，防止迴圈）
-    fn name(&mut self) -> Result<String, Error> {
-        let mut out = String::new();
-        let mut pos = self.i;
-        let mut jumped = false;
+    /// 走過一個名稱的所有標籤（處理壓縮指標），每個標籤呼叫一次 `f`；回傳名稱之後的位置。
+    ///
+    /// 防護：指標最多跳 64 次；展開後的名稱（含長度位元組與結尾的 0）不能超過 255 bytes（RFC 1035 2.3.4）。
+    /// 兩個限制加起來，再怎麼繞圈的惡意封包也只會走固定的步數就結束。
+    fn walk_name(&self, start: usize, mut f: impl FnMut(&'a [u8])) -> Result<usize, Error> {
+        let mut pos = start;
+        let mut next = None;
         let mut hops = 0;
+        let mut wire = 1usize;
         loop {
             let len = *self.b.get(pos).ok_or(Error::TooShort)? as usize;
             if len & 0xc0 == 0xc0 {
                 let lo = *self.b.get(pos + 1).ok_or(Error::TooShort)? as usize;
-                if !jumped {
-                    self.i = pos + 2;
-                    jumped = true;
-                }
+                next.get_or_insert(pos + 2);
                 hops += 1;
                 if hops > 64 {
                     return Err(Error::BadName);
@@ -185,30 +185,56 @@ impl<'a> Reader<'a> {
                 return Err(Error::BadName);
             }
             if len == 0 {
-                if !jumped {
-                    self.i = pos + 1;
-                }
-                break;
+                return Ok(next.unwrap_or(pos + 1));
             }
-            let label = self.b.get(pos + 1..pos + 1 + len).ok_or(Error::TooShort)?;
+            wire += 1 + len;
+            if wire > MAX_NAME_WIRE {
+                return Err(Error::BadName);
+            }
+            f(self.b.get(pos + 1..pos + 1 + len).ok_or(Error::TooShort)?);
+            pos += 1 + len;
+        }
+    }
+
+    /// 讀一個名稱，展開成字串（保留大小寫；不可列印或會造成歧義的字元用 \DDD 表示）
+    fn name(&mut self) -> Result<String, Error> {
+        // 先算好長度再配置：一個名稱只配置一次，而且沒有多餘的容量（名稱會留在快取裡）
+        let mut len = 0usize;
+        let next = self.walk_name(self.i, |label| {
+            len += 1 + label.iter().map(|&c| if plain_char(c) { 1 } else { 4 }).sum::<usize>();
+        })?;
+        let mut out = String::with_capacity(len.saturating_sub(1));
+        self.walk_name(self.i, |label| {
             if !out.is_empty() {
                 out.push('.');
             }
             for &c in label {
-                // 不可列印或會造成歧義的字元用 \DDD 表示
-                if c.is_ascii_graphic() && c != b'.' && c != b'\\' {
+                if plain_char(c) {
                     out.push(c as char);
                 } else {
-                    out.push_str(&format!("\\{c:03}"));
+                    out.push('\\');
+                    out.push((b'0' + c / 100) as char);
+                    out.push((b'0' + c / 10 % 10) as char);
+                    out.push((b'0' + c % 10) as char);
                 }
             }
-            if out.len() > 1024 {
-                return Err(Error::BadName);
-            }
-            pos += 1 + len;
-        }
+        })?;
+        self.i = next;
         Ok(out)
     }
+}
+
+/// 展開後的名稱在封包裡最多 255 bytes
+const MAX_NAME_WIRE: usize = 255;
+
+/// 可以直接放進名稱字串的字元（其他的用 \DDD）
+fn plain_char(c: u8) -> bool {
+    c.is_ascii_graphic() && c != b'.' && c != b'\\'
+}
+
+/// 區段的記錄數是封包自己說的，不能照單全收：預留空間時以「剩下的位元組最多放得下幾筆」為上限
+fn cap(count: u16, remaining: usize, min_size: usize) -> usize {
+    (count as usize).min(remaining / min_size)
 }
 
 fn parse_record(r: &mut Reader) -> Result<(Record, Option<Opt>), Error> {
@@ -251,24 +277,29 @@ fn parse_record(r: &mut Reader) -> Result<(Record, Option<Opt>), Error> {
     }
     let data = {
         let mut d = Reader { b: &r.b[..end], i: start };
+        let mut used = start;
         let v = match (rtype, len) {
             (rtype::A, 4) => RData::A(Ipv4Addr::new(d.u8()?, d.u8()?, d.u8()?, d.u8()?)),
             (rtype::AAAA, 16) => RData::Aaaa(Ipv6Addr::from(<[u8; 16]>::try_from(d.bytes(16)?).unwrap())),
             (rtype::CNAME | rtype::NS | rtype::PTR | rtype::DNAME, _) => {
                 // 名稱可能指向封包前面，所以用完整封包讀
                 let mut full = Reader { b: r.b, i: start };
-                RData::Name(full.name()?)
+                let v = RData::Name(full.name()?);
+                used = full.i;
+                v
             }
             (rtype::MX, _) => {
                 let pref = d.u16()?;
                 let mut full = Reader { b: r.b, i: start + 2 };
-                RData::Mx(pref, full.name()?)
+                let v = RData::Mx(pref, full.name()?);
+                used = full.i;
+                v
             }
             (rtype::SOA, _) => {
                 let mut full = Reader { b: r.b, i: start };
                 let mname = full.name()?;
                 let rname = full.name()?;
-                RData::Soa {
+                let v = RData::Soa {
                     mname,
                     rname,
                     serial: full.u32()?,
@@ -276,20 +307,28 @@ fn parse_record(r: &mut Reader) -> Result<(Record, Option<Opt>), Error> {
                     retry: full.u32()?,
                     expire: full.u32()?,
                     minimum: full.u32()?,
-                }
+                };
+                used = full.i;
+                v
             }
             (rtype::SRV, _) => {
                 let (priority, weight, port) = (d.u16()?, d.u16()?, d.u16()?);
                 let mut full = Reader { b: r.b, i: start + 6 };
-                RData::Srv {
+                let v = RData::Srv {
                     priority,
                     weight,
                     port,
                     target: full.name()?,
-                }
+                };
+                used = full.i;
+                v
             }
             _ => RData::Raw(d.bytes(len)?.to_vec()),
         };
+        // RDATA 裡的名稱與欄位不能超出 RDLENGTH 宣告的範圍（不然等於讀到下一筆記錄的內容）
+        if used > end {
+            return Err(Error::TooShort);
+        }
         v
     };
     r.i = end;
@@ -317,6 +356,7 @@ impl Message {
             rcode: fl & 0x000f,
             ..Default::default()
         };
+        m.questions.reserve_exact(cap(qd, b.len(), 5));
         for _ in 0..qd {
             let name = r.name()?;
             m.questions.push(Question {
@@ -325,9 +365,11 @@ impl Message {
                 qclass: r.u16()?,
             });
         }
+        m.answers.reserve_exact(cap(an, b.len().saturating_sub(r.i), 11));
         for _ in 0..an {
             m.answers.push(parse_record(&mut r)?.0);
         }
+        m.authorities.reserve_exact(cap(ns, b.len().saturating_sub(r.i), 11));
         for _ in 0..ns {
             m.authorities.push(parse_record(&mut r)?.0);
         }
@@ -371,10 +413,18 @@ impl Message {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer {
-            b: Vec::with_capacity(512),
-            names: HashMap::new(),
-        };
+        self.encode_inner(None)
+    }
+
+    /// 編碼並用 EDNS Padding（RFC 7830 / 8467）補到 `block` 的倍數；沒有 OPT 的訊息不補。
+    /// 原本帶著的 padding 選項不算（重新補），其他選項照寫。
+    /// 比「先 `logic::pad` 再 `encode`」少編碼一次。
+    pub fn encode_padded(&self, block: usize) -> Vec<u8> {
+        self.encode_inner(Some(block))
+    }
+
+    fn encode_inner(&self, pad: Option<usize>) -> Vec<u8> {
+        let mut w = Writer::new();
         w.u16(self.id);
         w.u16((self.flags & 0xfff0) | (self.rcode & 0x0f));
         w.u16(self.questions.len() as u16);
@@ -390,30 +440,76 @@ impl Message {
             w.record(r);
         }
         if let Some(o) = &self.opt {
+            let pad = pad.filter(|b| *b > 0);
             w.b.push(0);
             w.u16(rtype::OPT);
             w.u16(o.udp_size);
             let ext = ((self.rcode >> 4) & 0xff) as u32;
             w.u32((ext << 24) | ((o.version as u32) << 16) | o.flags as u32);
-            let len: usize = o.options.iter().map(|(_, d)| 4 + d.len()).sum();
-            w.u16(len as u16);
+            let len_pos = w.b.len();
+            w.u16(0);
+            let start = w.b.len();
             for (code, d) in &o.options {
+                if pad.is_some() && *code == opt_code::PADDING {
+                    continue;
+                }
                 w.u16(*code);
                 w.u16(d.len() as u16);
                 w.b.extend_from_slice(d);
             }
+            if let Some(block) = pad {
+                let total = w.b.len() + 4; // 加上 padding 選項本身的 4 bytes
+                let n = (block - total % block) % block;
+                w.u16(opt_code::PADDING);
+                w.u16(n as u16);
+                w.b.resize(w.b.len() + n, 0);
+            }
+            let len = (w.b.len() - start) as u16;
+            w.b[len_pos..len_pos + 2].copy_from_slice(&len.to_be_bytes());
         }
         w.b
     }
 }
 
+/// 鍵本身已經是雜湊值的 `HashMap` 用：不再雜湊一次
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) | b as u64;
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
 struct Writer {
     b: Vec<u8>,
-    /// 小寫名稱後綴 → 位置（只記 0x3fff 以內的位置）
-    names: HashMap<String, u16>,
+    /// 寫過的名稱後綴：小寫內容的雜湊 → 在封包裡的位置（只記指標指得到的 0x3fff 以內）。
+    /// 命中後會回頭比對封包裡的內容，雜湊碰巧相同也不會壓縮成錯的名稱。
+    names: HashMap<u64, u16, std::hash::BuildHasherDefault<IdHasher>>,
+    /// 目前這個名稱的標籤（封包格式：長度 + 內容，保留大小寫）；每個名稱重複使用，不重新配置
+    labels: Vec<u8>,
+    /// 每個標籤在 `labels` 裡的位置，與「從這個標籤到結尾」的雜湊
+    marks: Vec<(usize, u64)>,
 }
 
 impl Writer {
+    fn new() -> Writer {
+        Writer {
+            b: Vec::with_capacity(512),
+            names: HashMap::with_capacity_and_hasher(16, Default::default()),
+            labels: Vec::with_capacity(64),
+            marks: Vec::with_capacity(8),
+        }
+    }
+
     fn u16(&mut self, v: u16) {
         self.b.extend_from_slice(&v.to_be_bytes());
     }
@@ -421,27 +517,65 @@ impl Writer {
         self.b.extend_from_slice(&v.to_be_bytes());
     }
 
+    /// 封包裡 `pos` 開始的名稱（可能含指標）是不是剛好等於 `want`（一串「長度 + 內容」，不分大小寫）
+    fn same_name(&self, mut pos: usize, mut want: &[u8]) -> bool {
+        let mut hops = 0;
+        loop {
+            let Some(&len) = self.b.get(pos) else { return false };
+            if len & 0xc0 == 0xc0 {
+                let Some(&lo) = self.b.get(pos + 1) else { return false };
+                hops += 1;
+                if hops > 128 {
+                    return false;
+                }
+                pos = ((len as usize & 0x3f) << 8) | lo as usize;
+                continue;
+            }
+            if len == 0 {
+                return want.is_empty();
+            }
+            let n = 1 + len as usize;
+            match self.b.get(pos..pos + n) {
+                Some(have) if want.len() >= n && have.eq_ignore_ascii_case(&want[..n]) => {}
+                _ => return false,
+            }
+            want = &want[n..];
+            pos += n;
+        }
+    }
+
     /// 寫名稱；compress = 可以用前面出現過的後綴（並記下自己的後綴給後面用）
     fn name(&mut self, name: &str, compress: bool) {
-        let labels = split_labels(name);
-        for i in 0..labels.len() {
-            let suffix = labels[i..]
-                .iter()
-                .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(".");
+        wire_labels(name, &mut self.labels, &mut self.marks);
+        // 由後往前算每個後綴的雜湊（FNV-1a，小寫）：每個標籤只走一次
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for m in self.marks.iter_mut().rev() {
+            let len = self.labels[m.0] as usize;
+            for &c in &self.labels[m.0..m.0 + 1 + len] {
+                h = (h ^ c.to_ascii_lowercase() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            // 再攪一次，讓高低位元都夠亂（雜湊表直接拿這個值當索引）
+            let mut x = h ^ (h >> 29);
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            m.1 = x ^ (x >> 32);
+        }
+        for i in 0..self.marks.len() {
+            let (off, hash) = self.marks[i];
             if compress {
-                if let Some(&pos) = self.names.get(&suffix) {
-                    self.u16(0xc000 | pos);
-                    return;
-                }
-                if self.b.len() < 0x3fff {
-                    self.names.insert(suffix, self.b.len() as u16);
+                match self.names.get(&hash).copied() {
+                    Some(pos) if self.same_name(pos as usize, &self.labels[off..]) => {
+                        self.u16(0xc000 | pos);
+                        return;
+                    }
+                    Some(_) => {}
+                    None if self.b.len() < 0x4000 => {
+                        self.names.insert(hash, self.b.len() as u16);
+                    }
+                    None => {}
                 }
             }
-            let l = &labels[i];
-            self.b.push(l.len() as u8);
-            self.b.extend_from_slice(l);
+            let end = off + 1 + self.labels[off] as usize;
+            self.b.extend_from_slice(&self.labels[off..end]);
         }
         self.b.push(0);
     }
@@ -496,44 +630,46 @@ impl Writer {
     }
 }
 
-/// 把名稱拆成標籤（處理 \DDD 與 \. 跳脫）
-fn split_labels(name: &str) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut cur = Vec::new();
+/// 把名稱字串拆成封包格式的標籤（處理 \DDD 與 \. 跳脫），寫進 `out`（長度 + 內容，一個接一個，沒有結尾的 0），
+/// 每個標籤的位置記在 `marks`。空標籤（連續的點）略過；超過 63 bytes 的部分丟掉。
+fn wire_labels(name: &str, out: &mut Vec<u8>, marks: &mut Vec<(usize, u64)>) {
+    out.clear();
+    marks.clear();
     let b = name.as_bytes();
     let mut i = 0;
+    // 目前這個標籤的長度位元組在 `out` 裡的位置；None = 還沒開始
+    let mut cur: Option<usize> = None;
     while i < b.len() {
-        match b[i] {
+        let c = match b[i] {
             b'.' => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
+                cur = None;
                 i += 1;
+                continue;
             }
             b'\\' if i + 3 < b.len() && b[i + 1..i + 4].iter().all(u8::is_ascii_digit) => {
                 let v = (b[i + 1] - b'0') as u16 * 100 + (b[i + 2] - b'0') as u16 * 10 + (b[i + 3] - b'0') as u16;
-                cur.push(v.min(255) as u8);
                 i += 4;
+                v.min(255) as u8
             }
             b'\\' if i + 1 < b.len() => {
-                cur.push(b[i + 1]);
                 i += 2;
+                b[i - 1]
             }
             c => {
-                cur.push(c);
                 i += 1;
+                c
             }
+        };
+        let at = *cur.get_or_insert_with(|| {
+            marks.push((out.len(), 0));
+            out.push(0);
+            out.len() - 1
+        });
+        if out[at] < 63 {
+            out[at] += 1;
+            out.push(c);
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out.into_iter()
-        .map(|mut l| {
-            l.truncate(63);
-            l
-        })
-        .collect()
 }
 
 #[cfg(test)]
