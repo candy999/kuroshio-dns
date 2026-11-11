@@ -455,8 +455,9 @@ impl Access {
                 warn!("存取控制：{e}；台灣 IP 資料不能用，暫時不擋任何來源");
             }
         }
+        // 本機網段不在這裡讀：讀網卡可能要等（最多 2 秒），伺服器在背景讀（`refresh_local_in_background`），
+        // 命令列工具自己呼叫 `refresh_local`。讀到之前私有位址、迴路照樣一律放行。
         let a = Access::new(st, data, source, error);
-        a.refresh_local();
         if a.settings.mode != Mode::Open || !a.settings.deny.is_empty() {
             let r = a.rules();
             let (n, b) = r.footprint();
@@ -483,6 +484,14 @@ impl Access {
             self.friends.read().unwrap().clone(),
         );
         *self.rules.write().unwrap() = Arc::new(r);
+    }
+
+    /// 在另一條執行緒讀本機網段，不擋住啟動（伺服器啟動時用）
+    pub fn refresh_local_in_background(self: &Arc<Self>) {
+        let a = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("access-local".into())
+            .spawn(move || a.refresh_local());
     }
 
     /// 重新讀本機網卡的網段（啟動時；網卡位址變了可以再呼叫）

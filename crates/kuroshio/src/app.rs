@@ -1343,6 +1343,7 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         let saved = persister.lock().unwrap().load(crate::ipfilter::STATE_FILE);
         crate::ipfilter::Access::from_cfg(cfg, &share_dir(cfg), saved)
     };
+    access.refresh_local_in_background();
     let _ = resolver.access.set(access.clone());
     crate::ipfilter::spawn_tasks(access, persister.clone(), runtime_dir(cfg));
     // 統計歷史（公開頁 7 / 30 天）：重開機後接續

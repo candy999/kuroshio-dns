@@ -133,7 +133,8 @@ jobs:
           # 啟動伺服器，再用同一個執行檔查詢自己
           echo '{"listen":{"plain":{"binds":["127.0.0.1"],"port":5336}},"upstream":{"pinned":["udp://8.8.8.8","udp://1.1.1.1"]}}' > /tmp/k.json
           $RUN run -c /tmp/k.json & PID=$!
-          sleep 3
+          # 等到真的在監聽（QEMU 模擬慢的架構啟動要比較久），最多 30 秒
+          for i in $(seq 1 30); do $RUN query example.com -s 127.0.0.1:5336 >/dev/null 2>&1 && break; sleep 1; done
           $RUN query example.com -s 127.0.0.1:5336
           $RUN query example.com -s tcp://127.0.0.1:5336
           kill $PID

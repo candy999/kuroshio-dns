@@ -672,6 +672,7 @@ fn access_cmd(cmd: AccessCmd) -> Result<()> {
     .max_by(|a, b| a.0.cmp(&b.0))
     .map(|(_, b)| b);
     let a = kuroshio::ipfilter::Access::from_cfg(&cfg, &kuroshio::app::share_dir(&cfg), saved);
+    a.refresh_local();
     match cmd {
         AccessCmd::Check { ip, json, .. } => {
             let v = a.check_json(ip);
