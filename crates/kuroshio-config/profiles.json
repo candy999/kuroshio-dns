@@ -1,0 +1,132 @@
+{
+  "tiny": {
+    "resolver": {
+      "cacheMax": 4000,
+      "parallel": 2,
+      "warmNames": 200,
+      "warmRate": 5
+    },
+    "iprank": {
+      "concurrency": 8
+    },
+    "cdn": {
+      "verifyConcurrency": 2,
+      "maxEntries": 20000,
+      "qualityIntervalMin": 15,
+      "healthIntervalMin": 60,
+      "zoneMax": 2000,
+      "v6NodesMax": 300
+    },
+    "benchmark": {
+      "concurrency": 8
+    },
+    "scan": {
+      "concurrency": 32,
+      "samplesPerSubnet": 3
+    },
+    "pool": {
+      "candidatesPerProvider": 300,
+      "speedTop": 6,
+      "speedSeconds": 3,
+      "latencyConcurrency": 32,
+      "probeConcurrency": 8,
+      "nearestProbeTop": 400
+    },
+    "jobs": {
+      "cdn-scan": {
+        "enabled": false
+      }
+    },
+    "filter": {
+      "maxDomains": 400000,
+      "maxComplex": 2000
+    },
+    "system": {
+      "maxTlsConnections": 32,
+      "maxQuicConnections": 0,
+      "queryLogRing": 200
+    },
+    "community": {
+      "maxBundleMB": 4,
+      "maxFriends": 10
+    }
+  },
+  "small": {
+    "resolver": {
+      "cacheMax": 15000,
+      "parallel": 3,
+      "warmNames": 500,
+      "warmRate": 10
+    },
+    "iprank": {
+      "concurrency": 16
+    },
+    "cdn": {
+      "verifyConcurrency": 4,
+      "maxEntries": 60000,
+      "qualityIntervalMin": 10,
+      "zoneMax": 4000,
+      "v6NodesMax": 800
+    },
+    "benchmark": {
+      "concurrency": 16
+    },
+    "scan": {
+      "concurrency": 100,
+      "samplesPerSubnet": 4
+    },
+    "pool": {
+      "candidatesPerProvider": 800,
+      "speedTop": 10,
+      "speedSeconds": 4,
+      "latencyConcurrency": 64,
+      "probeConcurrency": 16,
+      "nearestProbeTop": 800
+    },
+    "filter": {
+      "maxDomains": 1500000,
+      "maxComplex": 5000
+    },
+    "system": {
+      "maxTlsConnections": 128,
+      "maxQuicConnections": 32,
+      "queryLogRing": 1000
+    },
+    "community": {
+      "maxBundleMB": 8,
+      "maxFriends": 20
+    }
+  },
+  "standard": {
+    "resolver": {
+      "cacheMax": 50000,
+      "warmNames": 1000
+    },
+    "iprank": {
+      "concurrency": 32
+    },
+    "cdn": {
+      "verifyConcurrency": 6,
+      "maxEntries": 150000
+    },
+    "benchmark": {
+      "concurrency": 32
+    },
+    "scan": {
+      "concurrency": 200
+    },
+    "pool": {
+      "latencyConcurrency": 128
+    },
+    "filter": {
+      "maxDomains": 4000000,
+      "maxComplex": 10000
+    },
+    "system": {
+      "maxTlsConnections": 512,
+      "maxQuicConnections": 128,
+      "queryLogRing": 5000
+    }
+  },
+  "large": {}
+}

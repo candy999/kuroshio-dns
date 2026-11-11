@@ -1,0 +1,414 @@
+{
+ "mobileconfig": [
+  {
+   "host": "dns.example",
+   "kind": "doh",
+   "uuids": [
+    "CAB8C1EB-21DA-5D8F-AB6B-6C421D159B68",
+    "093A700B-F698-5085-A7BC-AC49A613D48F"
+   ],
+   "identifiers": [
+    "example.dns.doh.dnssettings",
+    "example.dns.doh"
+   ],
+   "serverUrl": [
+    "https://dns.example/dns-query"
+   ],
+   "serverName": []
+  },
+  {
+   "host": "dns.example",
+   "kind": "dot",
+   "uuids": [
+    "0D8CAA26-52D7-5B0E-A823-AFEDFA6BC202",
+    "1E6B7710-87E4-502F-A782-E1C6067F02C4"
+   ],
+   "identifiers": [
+    "example.dns.dot.dnssettings",
+    "example.dns.dot"
+   ],
+   "serverUrl": [],
+   "serverName": [
+    "dns.example"
+   ]
+  },
+  {
+   "host": "my-dns.home.example",
+   "kind": "doh",
+   "uuids": [
+    "CFD63A0F-E52C-559E-A247-76DE193E8F2C",
+    "A6749DDD-DDAE-559D-A7FA-92A7BCDE6124"
+   ],
+   "identifiers": [
+    "example.home.my-dns.doh.dnssettings",
+    "example.home.my-dns.doh"
+   ],
+   "serverUrl": [
+    "https://my-dns.home.example/dns-query"
+   ],
+   "serverName": []
+  },
+  {
+   "host": "my-dns.home.example",
+   "kind": "dot",
+   "uuids": [
+    "EDCB6D6D-BA77-5BCC-A52D-512743239A2B",
+    "5B03EF86-B1BC-53BF-AA5A-82B912F0186E"
+   ],
+   "identifiers": [
+    "example.home.my-dns.dot.dnssettings",
+    "example.home.my-dns.dot"
+   ],
+   "serverUrl": [],
+   "serverName": [
+    "my-dns.home.example"
+   ]
+  },
+  {
+   "host": "a&b.test",
+   "kind": "doh",
+   "uuids": [
+    "3EDEE0AF-A636-53D3-A0F4-9DBCE72DECA3",
+    "2496F2FD-F07E-570E-A93E-CC569534BA4A"
+   ],
+   "identifiers": [
+    "test.a&amp;b.doh.dnssettings",
+    "test.a&amp;b.doh"
+   ],
+   "serverUrl": [
+    "https://a&amp;b.test/dns-query"
+   ],
+   "serverName": []
+  },
+  {
+   "host": "a&b.test",
+   "kind": "dot",
+   "uuids": [
+    "91930AFD-2EF1-53D6-ADC2-28316CD2965B",
+    "5C1B7D9F-6A2F-59C7-A193-FE4C29D642D6"
+   ],
+   "identifiers": [
+    "test.a&amp;b.dot.dnssettings",
+    "test.a&amp;b.dot"
+   ],
+   "serverUrl": [],
+   "serverName": [
+    "a&amp;b.test"
+   ]
+  }
+ ],
+ "sites": [
+  {
+   "name": "www.video.example",
+   "site": "video.example"
+  },
+  {
+   "name": "rr3---sn-x.videocdn.example",
+   "site": "videocdn.example"
+  },
+  {
+   "name": "www.shop.example.com.tw",
+   "site": "example.com.tw"
+  },
+  {
+   "name": "example.tw",
+   "site": "example.tw"
+  },
+  {
+   "name": "news.example.co.uk",
+   "site": "example.co.uk"
+  },
+  {
+   "name": "example.com.",
+   "site": "example.com"
+  },
+  {
+   "name": "a.b.example.github.io",
+   "site": "example.github.io"
+  },
+  {
+   "name": "localhost",
+   "site": null
+  },
+  {
+   "name": "1.2.3.4",
+   "site": null
+  },
+  {
+   "name": "4.3.2.1.in-addr.arpa",
+   "site": null
+  },
+  {
+   "name": "nas.lan",
+   "site": null
+  },
+  {
+   "name": "printer.local",
+   "site": null
+  },
+  {
+   "name": "x.home",
+   "site": null
+  },
+  {
+   "name": "svc.internal",
+   "site": null
+  },
+  {
+   "name": "WWW.Example.ORG",
+   "site": "example.org"
+  },
+  {
+   "name": "deep.sub.example.com.hk",
+   "site": "example.com.hk"
+  },
+  {
+   "name": "www.example.web.app",
+   "site": "example.web.app"
+  },
+  {
+   "name": "a.b.c.d.example.test",
+   "site": "example.test"
+  }
+ ],
+ "groups": [
+  {
+   "a": "192.0.2.1",
+   "b": "::ffff:192.0.2.1",
+   "same": true
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "2001:db8:1:2::1",
+   "same": false
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "same": false
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "2001:db8:1:3::1",
+   "same": false
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "2001:db8:1:2:0:0:0:9",
+   "same": false
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "fe80::1",
+   "same": false
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "::1",
+   "same": false
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "192.0.2.1",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "2001:db8:1:2::1",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "2001:db8:1:3::1",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "2001:db8:1:2:0:0:0:9",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "fe80::1",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "::1",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "::ffff:192.0.2.1",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2::1",
+   "b": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "same": true
+  },
+  {
+   "a": "2001:db8:1:2::1",
+   "b": "2001:db8:1:3::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2::1",
+   "b": "2001:db8:1:2:0:0:0:9",
+   "same": true
+  },
+  {
+   "a": "2001:db8:1:2::1",
+   "b": "fe80::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2::1",
+   "b": "::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2::1",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2::1",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "b": "2001:db8:1:3::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "b": "2001:db8:1:2:0:0:0:9",
+   "same": true
+  },
+  {
+   "a": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "b": "fe80::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "b": "::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:ffff:ffff:ffff:ffff",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:3::1",
+   "b": "2001:db8:1:2:0:0:0:9",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:3::1",
+   "b": "fe80::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:3::1",
+   "b": "::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:3::1",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:3::1",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:0:0:0:9",
+   "b": "fe80::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:0:0:0:9",
+   "b": "::1",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:0:0:0:9",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "2001:db8:1:2:0:0:0:9",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "fe80::1",
+   "b": "::1",
+   "same": false
+  },
+  {
+   "a": "fe80::1",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "fe80::1",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "::1",
+   "b": "2001:db8::",
+   "same": false
+  },
+  {
+   "a": "::1",
+   "b": "2001:db8::1:2:3:4",
+   "same": false
+  },
+  {
+   "a": "2001:db8::",
+   "b": "2001:db8::1:2:3:4",
+   "same": true
+  }
+ ],
+ "readOnly": [
+  "/api/benchmark",
+  "/api/cdn/domains",
+  "/api/cdn/pools",
+  "/api/cdn/summary",
+  "/api/cdn/v6nodes",
+  "/api/filter/check",
+  "/api/jobs",
+  "/api/routing",
+  "/api/status",
+  "/api/trace",
+  "/api/upstreams"
+ ]
+}

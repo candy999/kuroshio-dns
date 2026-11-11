@@ -1,0 +1,34 @@
+黑潮 DNS（Kuroshio DNS）Windows 版：3.0 預覽
+
+功能：區網 DNS、DoH / DoH3 / DoT / DoQ、廣告 / 遙測 / 詐騙過濾、CDN 台灣節點置換、
+每日上游評測、Cloudflare DDNS、內建 Let's Encrypt（Cloudflare DNS 驗證）、本機設定頁、
+公開頁、社群共享、Windows 服務、IIS 共存。
+
+快速開始（命令提示字元）：
+  kuroshio.exe run                           前景執行（Ctrl+C 正常結束並寫出快照）
+                                             啟動時會印出設定頁的登入網址
+  kuroshio.exe query example.com -s 127.0.0.1:53
+
+長期執行（用「以系統管理員身分執行」的命令提示字元）：
+  kuroshio.exe setup                         一次加好 Windows 防火牆規則
+  kuroshio.exe service install               安裝成服務（開機自動啟動、當掉自動重啟）
+  kuroshio.exe service start | stop | status | uninstall
+
+設定：
+  - 設定頁：http://127.0.0.1:8054/ ，登入 token 在設定資料夾的 admin.token
+  - 設定檔 config.json 只寫跟預設值不同的欄位；完整預設值：kuroshio.exe defaults
+  - 設定資料夾：執行檔旁邊有 config.json 時就是這個資料夾（攜帶版），
+    否則是 %ProgramData%\kuroshio\
+  - data\ 是程式附帶的唯讀資料（種子、評測名單、CDN 範圍、設定頁、公開頁），不要刪
+
+憑證：
+  kuroshio.exe acme issue                    立即申請 / 續期（需要 acme.enabled 與 Cloudflare API Token）
+
+IIS 已經占用 443 時（反向代理模式）：
+  kuroshio.exe iis setup "Default Web Site"  產生 web.config 轉送規則與 Alt-Svc 標頭
+  DoH3（UDP 443）、DoT（TCP 853）、DoQ（UDP 853）仍由黑潮 DNS 自己監聽
+
+提醒：家裡路由器的埠轉發也要加 UDP 443 與 UDP 853，DoH3 / DoQ 才連得進來。
+
+說明文件：docs/spec/07-windows.md
+授權：GPL-3.0-or-later

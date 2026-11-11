@@ -1,0 +1,222 @@
+//! 硬體偵測（規格 05）：記憶體、CPU、儲存類型 → 硬體等級
+
+use kuroshio_config::Tier;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct SysInfo {
+    /// 實體記憶體（MB）；偵測不到是 None
+    pub mem_total_mb: Option<u64>,
+    pub mem_available_mb: Option<u64>,
+    pub cores: usize,
+    pub arch: &'static str,
+    /// CPU 有沒有 AES 指令（沒有的話 TLS 優先用 ChaCha20）
+    pub aes: bool,
+}
+
+impl SysInfo {
+    pub fn detect() -> SysInfo {
+        let (total, avail) = meminfo();
+        SysInfo {
+            mem_total_mb: total,
+            mem_available_mb: avail,
+            cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            arch: std::env::consts::ARCH,
+            aes: has_aes(),
+        }
+    }
+
+    /// 自動判定的等級；偵測不到記憶體（例如 Windows）當成 large
+    pub fn tier(&self) -> Tier {
+        self.mem_total_mb.map(Tier::from_mem_mb).unwrap_or(Tier::Large)
+    }
+
+    /// tokio 工作執行緒數：單核心用單執行緒 runtime（回傳 1），多核心最多 4
+    pub fn worker_threads(&self, configured: u64) -> usize {
+        if configured > 0 {
+            return configured as usize;
+        }
+        self.cores.clamp(1, 4)
+    }
+}
+
+fn has_aes() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("aes")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// 自己的常駐記憶體（KB，/proc/self/status 的 VmRSS）
+pub fn rss_kb() -> Option<u64> {
+    let t = std::fs::read_to_string("/proc/self/status").ok()?;
+    t.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// 讀 /proc/meminfo：(MemTotal, MemAvailable)，單位 MB
+pub fn meminfo() -> (Option<u64>, Option<u64>) {
+    match std::fs::read_to_string("/proc/meminfo") {
+        Ok(t) => parse_meminfo(&t),
+        Err(_) => (None, None),
+    }
+}
+
+pub fn parse_meminfo(text: &str) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str| {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+    };
+    (field("MemTotal:"), field("MemAvailable:"))
+}
+
+/// 儲存類型（規格 05 第 5.4 節）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageClass {
+    /// tmpfs：不傷 Flash，但重開機就沒了
+    Ram,
+    /// jffs2 / ubifs / overlay / SD 卡 / eMMC：寫入要節制
+    Flash,
+    /// 硬碟、SSD、Windows
+    Disk,
+}
+
+impl StorageClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            StorageClass::Ram => "ram",
+            StorageClass::Flash => "flash",
+            StorageClass::Disk => "disk",
+        }
+    }
+    pub fn parse(s: &str) -> Option<StorageClass> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ram" => Some(StorageClass::Ram),
+            "flash" => Some(StorageClass::Flash),
+            "disk" => Some(StorageClass::Disk),
+            _ => None,
+        }
+    }
+}
+
+/// 判定某個路徑所在的儲存類型
+pub fn storage_class(path: &Path) -> StorageClass {
+    if cfg!(windows) {
+        return StorageClass::Disk;
+    }
+    match std::fs::read_to_string("/proc/mounts") {
+        Ok(m) => classify_path(&m, &existing_ancestor(path)),
+        Err(_) => StorageClass::Disk,
+    }
+}
+
+fn existing_ancestor(p: &Path) -> PathBuf {
+    let mut cur = p.to_path_buf();
+    while !cur.exists() {
+        if !cur.pop() {
+            return PathBuf::from("/");
+        }
+    }
+    cur.canonicalize().unwrap_or(cur)
+}
+
+/// 由 /proc/mounts 的內容判定（方便測試）
+pub fn classify_path(mounts: &str, path: &Path) -> StorageClass {
+    let p = path.to_string_lossy();
+    // 找出包含這個路徑、最長的掛載點
+    let best = mounts
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?, it.next()?, it.next()?))
+        })
+        .filter(|(_, mp, _)| *mp == "/" || p == *mp || p.starts_with(&format!("{mp}/")))
+        .max_by_key(|(_, mp, _)| mp.len());
+    match best {
+        Some((dev, _, fs)) => classify_fs(dev, fs),
+        None => StorageClass::Disk,
+    }
+}
+
+pub fn classify_fs(dev: &str, fs: &str) -> StorageClass {
+    match fs {
+        "tmpfs" | "ramfs" => StorageClass::Ram,
+        "jffs2" | "ubifs" | "squashfs" | "overlay" | "overlayfs" => StorageClass::Flash,
+        _ if dev.contains("mtd") || dev.contains("ubi") || dev.contains("mmcblk") => StorageClass::Flash,
+        _ => StorageClass::Disk,
+    }
+}
+
+/// 記憶體壓力（規格 05 第 3.2 節的看門狗）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Pressure {
+    Normal = 0,
+    /// 低於 15% 或 24 MB：縮小快取、暫停背景工作
+    Low = 1,
+    /// 低於 8%：拒絕新的加密連線
+    Critical = 2,
+}
+
+pub fn pressure(total_mb: u64, available_mb: u64) -> Pressure {
+    if total_mb == 0 {
+        return Pressure::Normal;
+    }
+    let pct = available_mb * 100 / total_mb;
+    if pct < 8 {
+        Pressure::Critical
+    } else if pct < 15 || available_mb < 24 {
+        Pressure::Low
+    } else {
+        Pressure::Normal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OPENWRT_MOUNTS: &str = "\
+/dev/root /rom squashfs ro,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,noatime 0 0
+tmpfs /tmp tmpfs rw,nosuid,nodev,noatime 0 0
+/dev/ubi0_1 /overlay ubifs rw,noatime 0 0
+overlayfs:/overlay / overlay rw,noatime,lowerdir=/,upperdir=/overlay/upper 0 0
+/dev/sda1 /mnt/usb ext4 rw,relatime 0 0
+";
+
+    #[test]
+    fn storage_classes() {
+        assert_eq!(classify_path(OPENWRT_MOUNTS, Path::new("/etc/kuroshio/state")), StorageClass::Flash);
+        assert_eq!(classify_path(OPENWRT_MOUNTS, Path::new("/tmp/kuroshio")), StorageClass::Ram);
+        assert_eq!(classify_path(OPENWRT_MOUNTS, Path::new("/mnt/usb/kuroshio")), StorageClass::Disk);
+        assert_eq!(
+            classify_path(OPENWRT_MOUNTS, Path::new("/tmpx")),
+            StorageClass::Flash,
+            "/tmpx 不在 /tmp 底下"
+        );
+        assert_eq!(classify_fs("/dev/mmcblk0p2", "ext4"), StorageClass::Flash);
+        assert_eq!(classify_fs("/dev/nvme0n1p2", "ext4"), StorageClass::Disk);
+        assert_eq!(classify_fs("/dev/mtdblock6", "jffs2"), StorageClass::Flash);
+    }
+
+    #[test]
+    fn meminfo_and_pressure() {
+        let (t, a) = parse_meminfo("MemTotal:         123456 kB\nMemFree:  1 kB\nMemAvailable:      61440 kB\n");
+        assert_eq!((t, a), (Some(120), Some(60)));
+        assert_eq!(Tier::from_mem_mb(t.unwrap()), Tier::Tiny);
+        assert_eq!(pressure(120, 60), Pressure::Normal);
+        assert_eq!(pressure(120, 20), Pressure::Low, "低於 24 MB");
+        assert_eq!(pressure(4000, 500), Pressure::Low, "低於 15%");
+        assert_eq!(pressure(4000, 300), Pressure::Critical);
+    }
+}

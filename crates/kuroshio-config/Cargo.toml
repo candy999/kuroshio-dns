@@ -1,0 +1,13 @@
+[package]
+name = "kuroshio-config"
+description = "黑潮 DNS：設定結構、預設值與合併"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

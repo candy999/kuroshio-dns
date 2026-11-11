@@ -1,0 +1,45 @@
+#!/bin/sh
+# 安裝 / 升級：補上新版本才有的設定區段、從 2.x（candydns）搬設定、放好可編輯的檔案
+
+# 第一次安裝、而且有 2.x 的設定：整份搬過來（欄位相同），先不啟用，避免跟 2.x 搶 53 埠
+if [ ! -f /etc/kuroshio/.migrated ] && [ -s /etc/config/candydns ] && ! uci -q get kuroshio.main.migrated >/dev/null; then
+	sed -e 's/^config candydns /config kuroshio /' /etc/config/candydns > /etc/config/kuroshio
+	uci -q set kuroshio.main.enabled='0'
+	uci -q set kuroshio.main.migrated='candydns'
+	uci commit kuroshio
+	mkdir -p /etc/kuroshio
+	for f in custom-rules.txt cert.pem key.pem benchmark community; do
+		[ -e "/etc/candydns/$f" ] && [ ! -e "/etc/kuroshio/$f" ] && cp -a "/etc/candydns/$f" "/etc/kuroshio/$f"
+	done
+	# 2.x 的節點池、驗證紀錄、評測結果（格式相同，直接沿用）
+	if [ -d /usr/share/candydns/state ] && [ ! -d /etc/kuroshio/state ]; then
+		mkdir -p /etc/kuroshio/state
+		cp -a /usr/share/candydns/state/. /etc/kuroshio/state/ 2>/dev/null
+		# 清單快取、評測報表、鎖是可重建的資料，不放 Flash
+		rm -rf /etc/kuroshio/state/filters /etc/kuroshio/state/benchmark /etc/kuroshio/state/locks
+	fi
+	touch /etc/kuroshio/.migrated
+	logger -t kuroshio "已從 2.x（candydns）搬移設定，請在 LuCI 停用 candydns 後再啟用黑潮 DNS"
+fi
+
+# 升級後補上新版本才有的設定區段（LuCI 的設定頁需要這些區段存在才能儲存）
+touch /etc/config/kuroshio
+for s in main:kuroshio doh:doh dot:dot doq:doq tls:tls cf_account:cf_account ddns:ddns site:site \
+	upstream:upstream resolver:resolver iprank:iprank filter:filter cdn:cdn ecs:ecs \
+	benchmark:benchmark scan:scan pool:pool community:community system:system; do
+	name=${s%%:*}
+	type=${s#*:}
+	uci -q get "kuroshio.$name" >/dev/null || uci set "kuroshio.$name=$type"
+done
+uci -q get kuroshio.system.profile >/dev/null || uci set kuroshio.system.profile='auto'
+uci commit kuroshio
+
+# 可編輯的評測名單：安裝時就放好（已存在的不覆蓋）；自訂規則檔不存在時由程式寫入預設規則
+mkdir -p /etc/kuroshio/benchmark
+for f in /usr/share/kuroshio/benchmark/*; do
+	[ -e "$f" ] || continue
+	[ -e "/etc/kuroshio/benchmark/${f##*/}" ] || cp -a "$f" /etc/kuroshio/benchmark/
+done
+[ -f /etc/kuroshio/custom-rules.txt ] || cp /usr/share/kuroshio/default-custom-rules.txt /etc/kuroshio/custom-rules.txt
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+exit 0

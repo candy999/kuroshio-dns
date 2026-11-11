@@ -1,0 +1,1452 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
+<meta name="googlebot" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#040b1a">
+<title>黑潮 DNS · 親友專用加密 DNS</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+/* ========== 色彩：黑潮（深靛藍的海、青綠到青藍的洋流），深色為主，淺色跟隨系統 ========== */
+:root {
+  color-scheme: dark;
+  --bg: #040b1a;
+  --bg-2: #0b1d40;
+  --text: #eef4fb;
+  --text-2: #a9bdd8;
+  --text-3: #7488a8;
+  --line: rgba(160,200,255,.11);
+  --grid: rgba(160,200,255,.07);
+  --glass: rgba(120,170,255,.05);
+  --glass-2: rgba(130,180,255,.09);
+  --glass-edge: rgba(150,220,255,.16);
+  --glass-hi: rgba(200,235,255,.24);
+  --shadow: 0 20px 60px rgba(0,4,20,.55);
+  --chip: rgba(140,190,255,.08);
+  /* 洋流色：品牌強調（按鈕、連結、標題漸層） */
+  --cur-1: #22d3c5; --cur-2: #27b4ea; --cur-3: #4c7cf0; --warm: #f2b45a;
+  --accent: #3fd6d0; --accent-ink: #032029;
+  --btn: linear-gradient(135deg, #14a9a5 0%, #1f7fd0 60%, #3560d8 100%);
+  --btn-shadow: 0 10px 28px rgba(24,160,210,.32);
+  /* 資料色（validated categorical, dark steps） */
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --track: rgba(140,190,255,.09);
+  --glow-1: #1b3fa6; --glow-2: #0fa3a8; --glow-3: #2a5fd8; --glow-4: #c98a3a;
+  --wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='28'%3E%3Cpath d='M0 14c20-9 60-9 80 0s60 9 80 0' fill='none' stroke='%2390c8ff' stroke-opacity='.07' stroke-width='1.2'/%3E%3C/svg%3E");
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+  --r: 22px;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #edf5fb; --bg-2: #d8e9f7;
+    --text: #0a1a33; --text-2: #33496b; --text-3: #5d7190;
+    --line: rgba(10,40,90,.11); --grid: rgba(10,40,90,.07);
+    --glass: rgba(255,255,255,.58); --glass-2: rgba(255,255,255,.78); --glass-edge: rgba(255,255,255,.9); --glass-hi: rgba(255,255,255,.96);
+    --shadow: 0 18px 48px rgba(16,50,100,.13);
+    --chip: rgba(10,50,110,.06);
+    --cur-1: #0b9c94; --cur-2: #1478b8; --cur-3: #2c4fb8; --warm: #b86e12;
+    --accent: #0a7f88; --accent-ink: #ffffff;
+    --btn: linear-gradient(135deg, #0c9c97 0%, #1574bf 60%, #2a4fbf 100%);
+    --btn-shadow: 0 10px 26px rgba(20,110,170,.30);
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+    --track: rgba(10,50,110,.08);
+    --glow-1: #8fb6f2; --glow-2: #7fdcd4; --glow-3: #a9c4ff; --glow-4: #f6d2a0;
+    --wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='28'%3E%3Cpath d='M0 14c20-9 60-9 80 0s60 9 80 0' fill='none' stroke='%231a4f8f' stroke-opacity='.07' stroke-width='1.2'/%3E%3C/svg%3E");
+  }
+}
+:root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #edf5fb; --bg-2: #d8e9f7;
+    --text: #0a1a33; --text-2: #33496b; --text-3: #5d7190;
+    --line: rgba(10,40,90,.11); --grid: rgba(10,40,90,.07);
+    --glass: rgba(255,255,255,.58); --glass-2: rgba(255,255,255,.78); --glass-edge: rgba(255,255,255,.9); --glass-hi: rgba(255,255,255,.96);
+    --shadow: 0 18px 48px rgba(16,50,100,.13);
+    --chip: rgba(10,50,110,.06);
+    --cur-1: #0b9c94; --cur-2: #1478b8; --cur-3: #2c4fb8; --warm: #b86e12;
+    --accent: #0a7f88; --accent-ink: #ffffff;
+    --btn: linear-gradient(135deg, #0c9c97 0%, #1574bf 60%, #2a4fbf 100%);
+    --btn-shadow: 0 10px 26px rgba(20,110,170,.30);
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+    --track: rgba(10,50,110,.08);
+    --glow-1: #8fb6f2; --glow-2: #7fdcd4; --glow-3: #a9c4ff; --glow-4: #f6d2a0;
+    --wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='28'%3E%3Cpath d='M0 14c20-9 60-9 80 0s60 9 80 0' fill='none' stroke='%231a4f8f' stroke-opacity='.07' stroke-width='1.2'/%3E%3C/svg%3E");
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; overflow-x: clip; touch-action: pan-y; }   /* 鎖定整頁：只能上下捲動，不能雙指 / 點兩下縮放，也不能左右晃 */
+body { overflow-x: clip; touch-action: pan-y; }
+@supports not (overflow: clip) { html, body { overflow-x: hidden; } }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 var(--font); }
+a { color: inherit; }
+
+/* ========== 背景：深海的光暈 + 細細的水紋 ========== */
+.ocean { position: fixed; inset: 0; z-index: -2; overflow: hidden; background: radial-gradient(1400px 900px at 70% -20%, var(--bg-2), var(--bg) 70%); }
+.ocean i { position: absolute; width: 60vmax; height: 60vmax; border-radius: 50%; filter: blur(100px); opacity: .5; mix-blend-mode: screen; animation: drift 32s ease-in-out infinite alternate; }
+.ocean i:nth-child(1) { background: var(--glow-1); left: -18vmax; top: -22vmax; }
+.ocean i:nth-child(2) { background: var(--glow-2); right: -24vmax; top: 6vmax; animation-duration: 38s; animation-delay: -8s; opacity: .30; }
+.ocean i:nth-child(3) { background: var(--glow-3); left: 15vmax; top: 60vmax; animation-duration: 44s; animation-delay: -16s; opacity: .30; }
+.ocean i:nth-child(4) { background: var(--glow-4); right: 0; top: 130vmax; animation-duration: 50s; opacity: .12; }   /* 黑潮是暖流：一點點暖色 */
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .ocean i { mix-blend-mode: multiply; opacity: .45; } }
+:root[data-theme="light"] .ocean i { mix-blend-mode: multiply; opacity: .45; }
+@keyframes drift { 0% { transform: translate(0,0) scale(1); } 50% { transform: translate(6vmax,-4vmax) scale(1.1); } 100% { transform: translate(-3vmax,-8vmax) scale(.96); } }
+.ripples { position: fixed; inset: 0; z-index: -1; pointer-events: none; background-image: var(--wave); background-size: 160px 28px; animation: tide 60s linear infinite; mask-image: linear-gradient(180deg, #000, transparent 85%); -webkit-mask-image: linear-gradient(180deg, #000, transparent 85%); }
+@keyframes tide { to { background-position: 160px -56px; } }
+@media (prefers-reduced-motion: reduce) { .ocean i, .ripples, .flow, .pulse, .cur, .status .dot, .status .dot::after, .endpoint::before { animation: none !important; } }
+
+/* ========== 液態玻璃 ========== */
+.glass {
+  position: relative; isolation: isolate;
+  background: linear-gradient(145deg, var(--glass-2), var(--glass) 55%);
+  -webkit-backdrop-filter: blur(22px) saturate(170%); backdrop-filter: blur(22px) saturate(170%);
+  border-radius: var(--r);
+  box-shadow: var(--shadow), inset 0 1px 0 var(--glass-hi), inset 0 -1px 1px rgba(255,255,255,.04);
+}
+/* 邊緣光：漸層描邊 */
+.glass::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; padding: 1px; pointer-events: none; z-index: 1;
+  background: linear-gradient(140deg, var(--glass-hi), rgba(255,255,255,.04) 35%, rgba(255,255,255,.02) 65%, var(--glass-edge));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude;
+}
+/* 隨游標移動的高光（液態感） */
+.glass::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: 0; opacity: 0; transition: opacity .35s;
+  background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 0%), rgba(255,255,255,.12), transparent 45%);
+}
+.glass:hover::after { opacity: 1; }
+.glass > * { position: relative; z-index: 2; }
+
+.wrap { width: 100%; max-width: 1120px; margin: 0 auto; padding-left: 20px; padding-right: 20px; }
+
+/* ========== 導覽 ========== */
+header.top { position: sticky; top: 12px; z-index: 20; padding: 0 12px; }
+.nav { max-width: 1120px; margin: 0 auto; display: flex; align-items: center; gap: 10px; height: 54px; padding: 0 10px 0 16px; border-radius: 999px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; text-decoration: none; letter-spacing: .01em; white-space: nowrap; }
+.brand svg { width: 28px; height: 28px; filter: drop-shadow(0 0 10px rgba(34,211,197,.45)); }
+.nav .links { margin-left: auto; display: flex; gap: 2px; }
+.nav .links a { color: var(--text-2); text-decoration: none; padding: 7px 12px; border-radius: 999px; font-size: 15px; }
+.nav .links a:hover { background: var(--chip); color: var(--text); }
+@media (max-width: 600px) { .nav .links a.opt { display: none; } }
+
+/* ========== Hero ========== */
+.hero { position: relative; text-align: center; padding-top: 64px; padding-bottom: 12px; overflow-x: clip; }   /* 雷達比畫面寬，不能把整頁撐寬（手機會整頁縮小） */
+/* 洋流背景：台灣東岸北上的黑潮（流線慢慢往北流） */
+.current { position: absolute; left: 50%; top: -30px; width: min(1100px, 170vw); aspect-ratio: 1000 / 760; transform: translateX(-50%); z-index: -1; pointer-events: none;
+  mask-image: radial-gradient(closest-side at 50% 45%, #000 55%, transparent 100%); -webkit-mask-image: radial-gradient(closest-side at 50% 45%, #000 55%, transparent 100%); }
+.current svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.current .isle { fill: color-mix(in srgb, var(--cur-1) 9%, transparent); stroke: var(--cur-1); stroke-opacity: .45; stroke-width: 1.4; }
+.current .isle-glow { fill: var(--cur-2); opacity: .10; filter: blur(18px); }
+.current .base { fill: none; stroke: url(#gCur); stroke-width: 1.4; opacity: .35; }
+.current .cur { fill: none; stroke: url(#gCur); stroke-width: 2.2; stroke-linecap: round; stroke-dasharray: 3 26; animation: stream 5s linear infinite; }
+.current .tag { font: 600 11px var(--mono); letter-spacing: .5em; fill: var(--cur-1); opacity: .55; }
+@keyframes stream { to { stroke-dashoffset: -58; } }
+@media (max-width: 600px) { .current { opacity: .5; } .current .tag { display: none; } }
+
+/* 狀態膠囊：單行、短句、點一下重新偵測 */
+.status { display: flex; width: fit-content; align-items: center; gap: 2px; height: 36px; padding: 0 6px 0 4px; border-radius: 999px; margin: 0 auto 22px; max-width: 100%; white-space: nowrap; }
+.status-main { height: 100%; padding: 0 10px 0 10px; background: none; color: var(--text-2); font-size: 13.5px; letter-spacing: .02em; gap: 9px; border-radius: 999px; }
+.status-main:hover { color: var(--text); }
+.status .dot { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); flex-shrink: 0; }
+.status .dot::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 1.5px solid transparent; }
+.status[data-state="checking"] .dot::after { border-color: var(--text-3) transparent transparent transparent; animation: spin .9s linear infinite; }
+.status[data-state="yes"] .dot { background: #2fd38a; animation: live 2s infinite; }
+.status[data-state="no"] .dot { background: #f0a020; box-shadow: 0 0 10px rgba(240,160,32,.7); }
+.status a { color: #fff; background: var(--btn); text-decoration: none; font-size: 13px; font-weight: 650; padding: 5px 12px; border-radius: 999px; margin-left: 2px; box-shadow: var(--btn-shadow); }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes live { 0% { box-shadow: 0 0 0 0 rgba(47,211,138,.55); } 70% { box-shadow: 0 0 0 9px rgba(47,211,138,0); } 100% { box-shadow: 0 0 0 0 rgba(47,211,138,0); } }
+
+.kicker { display: flex; width: fit-content; margin-left: auto !important; margin-right: auto !important; align-items: center; gap: 12px; font: 600 11.5px/1 var(--mono); letter-spacing: .26em; color: var(--text-3); margin: 0 0 18px; text-transform: uppercase; }
+.kicker::before, .kicker::after { content: ""; width: 28px; height: 1px; background: linear-gradient(90deg, transparent, var(--text-3)); }
+.kicker::after { transform: scaleX(-1); }
+.hero h1 { font-size: clamp(34px, 8.8vw, 74px); line-height: 1.08; margin: 0 auto 18px; letter-spacing: -.025em; font-weight: 800; }
+.hero br.sm { display: none; }
+@media (max-width: 600px) { .hero br.sm { display: inline; } }
+.grad { background: linear-gradient(100deg, #7fe7dc 0%, #2fd0c4 28%, #29b2ea 62%, #7d9cff 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .grad { background-image: linear-gradient(100deg, #0a8a83, #0f75a8 40%, #1b5fbf 70%, #2c3fa8); } }
+:root[data-theme="light"] .grad { background-image: linear-gradient(100deg, #0a8a83, #0f75a8 40%, #1b5fbf 70%, #2c3fa8); }
+.hero p.lead { font-size: clamp(15.5px, 2.2vw, 19px); line-height: 1.7; color: var(--text-2); margin: 0 auto 26px; max-width: 620px; }
+button, .btn { font: inherit; cursor: pointer; border: 0; color: var(--text); text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+.pill { border-radius: 999px; padding: 11px 20px; background: var(--chip); box-shadow: inset 0 1px 0 var(--glass-hi); transition: transform .15s, background .2s; font-size: 15px; }
+.pill:hover { background: var(--glass-2); transform: translateY(-1px); }
+.pill.small { padding: 6px 14px; font-size: 14px; }
+.pill.primary { background: var(--btn); color: #fff; font-weight: 650; box-shadow: var(--btn-shadow), inset 0 1px 0 rgba(255,255,255,.35); }
+.cta { display: flex; justify-content: center; gap: 10px; margin-bottom: 28px; }
+.cta .pill { min-width: 132px; }
+
+/* 端點卡：會流動的漸層邊框 */
+@property --a { syntax: '<angle>'; inherits: false; initial-value: 0deg; }
+.endpoint { max-width: 560px; margin: 0 auto; padding: 6px; text-align: left; border-radius: 20px; }
+.endpoint::before { background: conic-gradient(from var(--a), rgba(39,180,234,0) 0deg, rgba(39,180,234,.75) 60deg, rgba(34,211,197,.65) 120deg, rgba(39,180,234,0) 180deg, rgba(39,180,234,0) 360deg); animation: rot 6s linear infinite; }
+@keyframes rot { to { --a: 360deg; } }
+.ep { display: grid; grid-template-columns: 44px 1fr 36px; align-items: center; gap: 10px; padding: 9px 8px 9px 12px; border-radius: 14px; }
+.ep + .ep { border-top: 1px solid var(--line); border-radius: 0 0 14px 14px; }
+.ep-k { font: 700 11px/1 var(--mono); letter-spacing: .08em; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); padding: 5px 0; border-radius: 6px; text-align: center; }
+.ep code { font: 14.5px/1.35 var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ep code .dim { color: var(--text-3); }
+.icon-btn { width: 34px; height: 34px; border-radius: 10px; padding: 0; background: var(--chip); color: var(--text-2); display: grid; place-items: center; box-shadow: inset 0 1px 0 var(--glass-hi); transition: background .2s, color .2s; }
+.icon-btn:hover { background: var(--glass-2); color: var(--text); }
+.icon-btn svg { width: 16px; height: 16px; }
+.icon-btn.done { color: #2fd38a; }
+
+/* 指標列：三欄並排（手機也是），等寬數字 */
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); max-width: 760px; margin: 22px auto 0; border-radius: 20px; padding: 6px 0; }
+.m { padding: 12px 16px 12px; text-align: left; min-width: 0; }
+.m + .m { border-left: 1px solid var(--line); }
+.m-l { display: block; font-size: 12.5px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m-v { display: block; font: 700 clamp(20px, 4.2vw, 32px)/1.2 var(--mono); letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.m-h { display: block; font-size: 12px; color: var(--text-3); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m svg.spark { display: block; width: 100%; height: 22px; margin-top: 4px; }
+@media (max-width: 600px) {
+  .hero { padding-top: 40px; }
+  .current { top: -10px; }
+  .status { margin-bottom: 18px; }
+  .kicker { font-size: 10px; letter-spacing: .2em; gap: 8px; margin-bottom: 14px; }
+  .kicker::before, .kicker::after { width: 16px; }
+  .cta .pill { flex: 1; min-width: 0; padding: 11px 12px; }
+  .ep { grid-template-columns: 40px 1fr 34px; gap: 8px; padding: 8px 6px 8px 8px; }
+  .ep code { font-size: 13px; }
+}
+@media (max-width: 420px) {
+  .ep code .dim { display: none; }   /* 小螢幕省略 https://，複製時仍是完整網址 */
+  .m { padding: 10px 10px; }
+  .m-l { font-size: 11px; }
+  .m-h { font-size: 10.5px; }
+}
+
+/* ========== 區塊 ========== */
+section { padding: 56px 0 8px; }
+.sec-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 14px; margin-bottom: 20px; }
+.sec-head h2 { font-size: clamp(24px, 3.4vw, 32px); margin: 0; letter-spacing: -.01em; }
+.sec-head p { margin: 4px 0 0; color: var(--text-2); max-width: 640px; }
+.seg { display: inline-flex; padding: 4px; border-radius: 999px; gap: 2px; }
+.seg button { padding: 7px 16px; border-radius: 999px; background: transparent; color: var(--text-2); font-size: 14.5px; }
+.seg button[aria-pressed="true"] { background: var(--glass-2); color: var(--text); font-weight: 650; box-shadow: inset 0 1px 0 var(--glass-hi), 0 4px 14px rgba(0,0,0,.18); }
+.grid { display: grid; gap: 14px; }
+.g2 { grid-template-columns: 1fr 1fr; }
+.g3 { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 860px) { .g2, .g3 { grid-template-columns: 1fr; } }
+.card { padding: 20px; min-width: 0; }
+.card h3 { font-size: 16.5px; margin: 0; }
+.card .cap { font-size: 13.5px; color: var(--text-3); margin: 2px 0 14px; }
+.loading .card, .loading .tick { opacity: .6; transition: opacity .2s; }
+
+/* 機會成本 */
+.opp { padding: 26px; display: grid; grid-template-columns: 1.1fr 1fr; gap: 28px; align-items: center; }
+@media (max-width: 860px) { .opp { grid-template-columns: 1fr; } }
+.opp .headline { font-size: clamp(22px, 3vw, 30px); font-weight: 750; line-height: 1.3; margin: 0 0 10px; letter-spacing: -.01em; }
+.opp .headline em { font-style: normal; color: var(--s2); }
+.opp .headline strong { color: var(--s1); }
+.opp .sub { color: var(--text-2); margin: 0 0 18px; }
+.vs { display: grid; gap: 14px; }
+.vs-row .who { display: flex; justify-content: space-between; font-size: 14px; color: var(--text-2); margin-bottom: 6px; }
+.vs-row .who b { color: var(--text); font-size: 15px; }
+.vs-track { height: 14px; border-radius: 999px; background: var(--track); overflow: hidden; }
+.vs-fill { height: 100%; border-radius: 999px; width: 0; transition: width 1s cubic-bezier(.2,.8,.2,1); }
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 18px; }
+.kpi { padding: 12px 14px; border-radius: 16px; background: var(--chip); }
+.kpi .v { font-size: clamp(16px, 4.4vw, 22px); font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.kpi .l { font-size: 12.5px; color: var(--text-3); }
+
+/* 路由地圖 */
+.mapwrap { position: relative; overflow: hidden; border-radius: 14px; }
+.mapwrap.chart svg { width: 100%; height: auto; display: block; overflow: hidden; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+.mapwrap.chart svg.drag { cursor: grabbing; }
+.map-city.minor { opacity: 0; transition: opacity .2s; }
+.zin .map-city.minor { opacity: 1; }
+.map-hint.off { opacity: 0; transition: opacity .4s; }
+.map-ctl { position: absolute; right: 8px; bottom: 8px; display: flex; gap: 6px; z-index: 2; }
+.map-ctl button { width: 30px; height: 30px; border-radius: 10px; border: 1px solid var(--glass-edge); background: var(--glass-2); color: var(--text); font: 600 17px/1 var(--font); cursor: pointer; backdrop-filter: blur(12px) saturate(1.4); -webkit-backdrop-filter: blur(12px) saturate(1.4); box-shadow: inset 0 1px 0 var(--glass-hi); display: grid; place-items: center; padding: 0; }
+.map-ctl button:hover { background: var(--glass-hi); }
+.map-ctl button:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+.map-ctl button[hidden] { display: none; }
+.map-hint { position: absolute; left: 10px; bottom: 12px; font: 11px var(--font); color: var(--text-3); pointer-events: none; padding: 3px 8px; border-radius: 999px; background: var(--glass); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.map-land { fill: var(--s1); fill-opacity: .05; stroke: var(--text-3); stroke-opacity: .35; stroke-width: .7; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.map-dot { fill: var(--text-3); fill-opacity: .6; }
+.map-grat { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 7; }
+.map-grat.eq { stroke-dasharray: 4 6; }
+.map-lead { stroke: var(--text-3); stroke-opacity: .5; stroke-width: 1; }
+.map-city { font: 12px var(--font); fill: var(--text-2); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
+.map-city.tw { fill: var(--text); font-weight: 700; font-size: 13px; }
+.map-num { font: 600 11px var(--mono); fill: var(--text-3); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
+.flow { animation: flow 2.2s linear infinite; }
+@keyframes flow { to { stroke-dashoffset: -28; } }
+.pulse { transform-box: fill-box; transform-origin: center; animation: pulse 2.4s ease-out infinite; }
+@keyframes pulse { 0% { transform: scale(.6); opacity: .9; } 100% { transform: scale(3.2); opacity: 0; } }
+.map-legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--text-2); margin-top: 8px; }
+.map-legend i { display: inline-block; width: 22px; height: 3px; border-radius: 3px; vertical-align: middle; margin-right: 6px; background: linear-gradient(90deg, var(--s2), var(--s1)); }
+
+/* CDN 環形儀表 */
+.cross { padding: 20px; display: grid; grid-template-columns: 120px 1fr; gap: 22px; align-items: center; }
+.cross svg.ring { width: 120px; height: 120px; }
+.cross .ring-val { font: 750 22px var(--font); fill: var(--text); }
+.cross .ring-sub { font: 11.5px var(--font); fill: var(--text-3); }
+.cross .lead { font-size: 15px; margin: 0 0 12px; color: var(--text-2); }
+.cross .lead b { color: var(--text); font-variant-numeric: tabular-nums; }
+.cross .pairs { display: grid; gap: 8px; }
+.cross .pair { display: grid; grid-template-columns: minmax(150px, 38%) 1fr; gap: 10px; align-items: center; font-size: 14px; }
+.cross .pair .lbl { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; }
+.cross .pair .lbl i { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.cross .pair .arrow { color: var(--text-3); }
+.cross .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.cross .chip { font-size: 12.5px; padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--text-2); }
+.cross .chip b { color: var(--text); font-variant-numeric: tabular-nums; }
+@media (max-width: 600px) { .cross { grid-template-columns: 1fr; justify-items: center; gap: 14px; } .cross > div { width: 100%; } .cross .pair { grid-template-columns: 1fr; gap: 4px; } .cross svg.ring { width: 104px; height: 104px; } }
+.gauges { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
+.gauge { padding: 18px; display: grid; grid-template-columns: 92px 1fr; gap: 14px; align-items: center; }
+.gauge svg { width: 92px; height: 92px; }
+.gauge .ring-val { font: 750 19px var(--font); fill: var(--text); }
+.gauge .ring-sub { font: 11px var(--font); fill: var(--text-3); }
+.gauge .name { font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.gauge .name i { width: 10px; height: 10px; border-radius: 3px; }
+.gauge dl { margin: 6px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
+.gauge dt { color: var(--text-3); }
+.gauge dd { margin: 0; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text); }
+
+/* 圖表通用 */
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--text-2); margin-bottom: 8px; }
+.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
+.legend i.box { width: 10px; height: 10px; border-radius: 3px; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart text, .axis { fill: var(--text-3); font: 11.5px var(--font); }
+.tip { position: absolute; pointer-events: none; z-index: 5; padding: 10px 12px; border-radius: 14px; font-size: 13px; white-space: nowrap; opacity: 0; transition: opacity .12s; background: color-mix(in srgb, var(--bg) 70%, transparent); -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%); box-shadow: 0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 var(--glass-hi); }
+.tip .d { color: var(--text-3); margin-bottom: 4px; font-size: 12px; }
+.tip .r { display: flex; align-items: center; gap: 8px; line-height: 1.6; }
+.tip .r i { width: 12px; height: 3px; border-radius: 3px; }
+.tip .r b { font-weight: 700; min-width: 56px; font-variant-numeric: tabular-nums; }
+.tip .r span { color: var(--text-2); }
+.empty { color: var(--text-3); font-size: 14px; padding: 26px 0; text-align: center; }
+
+/* 去向 100% 長條 */
+.stack { display: flex; height: 18px; gap: 2px; border-radius: 999px; overflow: hidden; background: var(--track); }
+.stack > div { height: 100%; transition: flex-grow .8s; min-width: 2px; cursor: default; }
+.stack > div:first-child { border-radius: 999px 0 0 999px; }
+.stack > div:last-child { border-radius: 0 999px 999px 0; }
+.stack-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 14px; }
+.stack-legend div { font-size: 13px; color: var(--text-2); }
+.stack-legend b { display: block; font-size: 20px; color: var(--text); font-variant-numeric: tabular-nums; }
+.stack-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+
+/* 排行 */
+.rank { display: grid; gap: 9px; }
+.rank-row { display: grid; grid-template-columns: 24px minmax(80px, 42%) 1fr; align-items: center; gap: 10px; font-size: 14px; }
+.rank-row .n { color: var(--text-3); font: 12px var(--mono); }
+.rank-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rank-row .bar-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rank-row .bar { height: 10px; border-radius: 0 4px 4px 0; min-width: 3px; transition: width .6s; }
+.rank-row .val { font: 12.5px var(--mono); color: var(--text-2); white-space: nowrap; }
+.rank-row:hover .bar { filter: brightness(1.2); }
+details.table { margin-top: 12px; font-size: 13px; color: var(--text-2); }
+details.table summary { cursor: pointer; }
+details.table table { border-collapse: collapse; margin-top: 8px; width: 100%; font-variant-numeric: tabular-nums; }
+details.table th, details.table td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+details.table th:first-child, details.table td:first-child { text-align: left; }
+.privacy { font-size: 13px; color: var(--text-3); margin-top: 16px; text-align: center; }
+
+/* 特色 */
+.features { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+@media (max-width: 400px) { .features { grid-template-columns: 1fr; } }
+.feature { padding: 22px; }
+.feature .ic { width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center; margin-bottom: 14px; color: #fff; box-shadow: 0 8px 22px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.35); }
+.feature .ic svg { width: 21px; height: 21px; }
+.feature h3 { font-size: 17.5px; margin: 0 0 6px; }
+.feature p { margin: 0; color: var(--text-2); font-size: 15px; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 0; padding: 0; list-style: none; }
+.tags li { font-size: 12.5px; padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--text-2); }
+
+/* Rust */
+.rust-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px; }
+@media (max-width: 860px) { .rust-grid { grid-template-columns: 1fr; } }
+.why-list { padding: 22px 24px; display: grid; gap: 16px; }
+.why-list .row { display: grid; grid-template-columns: 36px 1fr; gap: 14px; align-items: start; }
+.why-list .n { width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center; font: 700 14px var(--mono); color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+.why-list h3 { margin: 0 0 2px; font-size: 16.5px; }
+.why-list p { margin: 0; color: var(--text-2); font-size: 14.5px; }
+.measure { padding: 24px; display: flex; flex-direction: column; gap: 18px; }
+.measure h3 { margin: 0; font-size: 16.5px; }
+.measure .big { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.measure .num { padding: 16px; border-radius: 16px; background: var(--chip); }
+.measure .num b { display: block; font: 750 clamp(28px, 6vw, 40px)/1.1 var(--font); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.measure .num b small { font-size: .5em; font-weight: 650; margin-left: 4px; color: var(--text-2); }
+.measure .num span { font-size: 13px; color: var(--text-2); }
+.measure .note { font-size: 12.5px; color: var(--text-3); margin: 0; }
+.targets { display: flex; flex-wrap: wrap; gap: 8px; }
+.targets span { font: 600 12.5px var(--mono); padding: 6px 11px; border-radius: 10px; background: color-mix(in srgb, var(--cur-2) 12%, transparent); color: var(--text); }
+
+/* 分享 */
+.share-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+@media (max-width: 960px) { .share-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 640px) { .share-grid { grid-template-columns: 1fr; } }
+.share { padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.share h3 { margin: 0; font-size: 17px; }
+.share .cap { margin: 0; font-size: 13.5px; color: var(--text-3); }
+.qr { display: block; width: 168px; height: 168px; margin: 4px auto; padding: 8px; border-radius: 16px; background: #fff; box-shadow: 0 8px 24px rgba(0,10,40,.25); }
+.copyrow { display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 12px; border-radius: 12px; background: var(--chip); min-width: 0; }
+.copyrow code { flex: 1; min-width: 0; font: 13.5px/1.4 var(--mono); overflow-wrap: anywhere; }
+.copyrow .lbl { font-size: 12px; color: var(--text-3); white-space: nowrap; }
+.btn-copy { flex: none; padding: 6px 12px; border-radius: 9px; font-size: 13.5px; font-weight: 650; background: var(--btn); color: #fff; }
+.btn-copy.done { background: var(--s3); }
+.share .dl { margin: 0; }
+.share-note { margin-top: 14px; font-size: 14px; color: var(--text-2); padding: 14px 18px; border-radius: 16px; }
+
+/* 教學 */
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+.tabs button { padding: 8px 15px; border-radius: 999px; font-size: 14.5px; background: var(--chip); color: var(--text-2); }
+.tabs button[aria-selected="true"] { background: var(--btn); color: #fff; box-shadow: var(--btn-shadow); }
+.panel { padding: 24px; }
+.panel[hidden] { display: none; }
+.panel h3 { margin: 0 0 4px; font-size: 20px; }
+.panel .req { color: var(--text-3); font-size: 14px; margin: 0 0 16px; }
+.panel ol { margin: 0; padding-left: 1.4em; }
+.panel ol li { margin: 0 0 11px; padding-left: 4px; }
+.panel .path { font-weight: 650; }
+.panel .code { font: 14px var(--mono); background: var(--chip); border-radius: 7px; padding: 2px 7px; overflow-wrap: anywhere; }
+.callout { margin-top: 16px; background: var(--chip); border-radius: 14px; padding: 12px 16px; font-size: 14px; color: var(--text-2); }
+.callout b { color: var(--text); }
+.dl { display: flex; flex-wrap: wrap; gap: 10px; margin: 4px 0 16px; }
+
+/* FAQ */
+.faq details { padding: 0 20px; margin-bottom: 10px; border-radius: 18px; }
+.faq summary { cursor: pointer; padding: 16px 0; font-weight: 650; list-style: none; display: flex; justify-content: space-between; gap: 12px; }
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary::after { content: "+"; color: var(--text-3); font-size: 20px; line-height: 1; }
+.faq details[open] summary::after { content: "−"; }
+.faq details p { margin: 0 0 16px; color: var(--text-2); }
+/* 關於 / 頁尾 */
+footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
+.about { padding: 24px; display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: start; }
+@media (max-width: 640px) { .about { grid-template-columns: 1fr; } .about figure { justify-self: center; } }
+.about h2 { margin: 0 0 4px; font-size: 20px; color: var(--text); display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+.about .ver { font: 600 13px var(--mono); color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); padding: 3px 9px; border-radius: 999px; }
+.about dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 14px 0 0; font-size: 14px; }
+.about dt { color: var(--text-3); white-space: nowrap; }
+.about dd { margin: 0; color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+.about a { color: var(--accent); text-underline-offset: 3px; }
+.about .gpl { margin: 16px 0 0; padding: 12px 14px; border-radius: 14px; background: var(--chip); color: var(--text-2); font-size: 13.5px; }
+.about figure { margin: 0; text-align: center; font-size: 12.5px; }
+.about figure .qr { width: 140px; height: 140px; margin: 0 auto 6px; }
+.fine { text-align: center; margin-top: 22px; font-size: 13px; }
+:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<div class="ocean" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+<div class="ripples" aria-hidden="true"></div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="gSea" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#14306e"/><stop offset="1" stop-color="#071433"/></linearGradient>
+    <linearGradient id="gWave" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#22d3c5"/><stop offset="1" stop-color="#27b4ea"/></linearGradient>
+    <linearGradient id="gCur" x1="0" y1="1" x2=".3" y2="0"><stop offset="0" stop-color="#22d3c5" stop-opacity="0"/><stop offset=".35" stop-color="#22d3c5"/><stop offset=".75" stop-color="#27b4ea"/><stop offset="1" stop-color="#4c7cf0" stop-opacity="0"/></linearGradient>
+    <linearGradient id="gTeal" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3fe0c8"/><stop offset="1" stop-color="#0f9f86"/></linearGradient>
+    <linearGradient id="gViolet" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#b49bff"/><stop offset="1" stop-color="#6a4be0"/></linearGradient>
+    <linearGradient id="gOrange" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffa36a"/><stop offset="1" stop-color="#e2571f"/></linearGradient>
+  </defs>
+</svg>
+
+<header class="top">
+  <div class="nav glass">
+    <a class="brand" href="#">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="16" fill="url(#gSea)"/><path d="M12 24c7-6 13-6 20 0s13 6 20 0" fill="none" stroke="url(#gWave)" stroke-width="5" stroke-linecap="round"/><path d="M12 35c7-6 13-6 20 0s13 6 20 0" fill="none" stroke="url(#gWave)" stroke-width="5" stroke-linecap="round" opacity=".75"/><path d="M12 46c7-6 13-6 20 0s13 6 20 0" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" opacity=".9"/></svg>
+      <span>黑潮 DNS</span>
+    </a>
+    <nav class="links">
+      <a href="#why" class="opt">加速成效</a>
+      <a href="#live" class="opt">即時數據</a>
+      <a href="#features" class="opt">特色</a>
+      <a href="#rust" class="opt">Rust</a>
+      <a href="#setup">設定教學</a>
+      <a href="#share">分享</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<div class="wrap hero">
+  <div class="current" aria-hidden="true"><svg viewBox="0 0 1000 760">
+    <g transform="translate(398 175)"><path class="isle-glow" d="M141,10C146,10 153,20 160,25C167,30 182,34 183,39C185,44 172,48 169,55C167,62 172,74 170,82C169,90 164,95 160,105C157,115 151,130 148,140C145,150 144,156 142,165C140,174 138,185 136,195C133,205 133,213 128,225C123,237 112,255 105,265C99,275 94,277 90,285C86,292 82,302 81,310C79,318 80,328 80,335C79,342 80,348 78,350C76,352 69,351 66,347C63,343 64,332 62,325C60,318 58,309 55,303C51,297 46,294 41,290C36,286 29,284 25,278C21,272 19,262 16,255C14,248 10,243 9,235C8,227 9,214 9,205C10,196 10,187 12,180C13,172 16,167 18,160C21,152 23,143 27,135C32,127 40,118 46,110C51,102 53,93 60,85C66,77 77,67 82,60C88,53 90,50 93,45C97,40 100,36 105,32C111,28 122,26 128,22C134,18 136,9 141,10Z"/><path class="isle" d="M141,10C146,10 153,20 160,25C167,30 182,34 183,39C185,44 172,48 169,55C167,62 172,74 170,82C169,90 164,95 160,105C157,115 151,130 148,140C145,150 144,156 142,165C140,174 138,185 136,195C133,205 133,213 128,225C123,237 112,255 105,265C99,275 94,277 90,285C86,292 82,302 81,310C79,318 80,328 80,335C79,342 80,348 78,350C76,352 69,351 66,347C63,343 64,332 62,325C60,318 58,309 55,303C51,297 46,294 41,290C36,286 29,284 25,278C21,272 19,262 16,255C14,248 10,243 9,235C8,227 9,214 9,205C10,196 10,187 12,180C13,172 16,167 18,160C21,152 23,143 27,135C32,127 40,118 46,110C51,102 53,93 60,85C66,77 77,67 82,60C88,53 90,50 93,45C97,40 100,36 105,32C111,28 122,26 128,22C134,18 136,9 141,10Z"/></g>
+    <path class="base" d="M470,800C500,640 586,500 600,380C610,270 600,120 700,-30"/><path class="base" d="M500,800C530,640 612,500 626,380C636,270 633,120 733,-30"/><path class="base" d="M530,800C560,640 637,500 651,380C661,270 666,120 766,-30"/><path class="base" d="M560,800C590,640 662,500 676,380C686,270 699,120 799,-30"/><path class="base" d="M590,800C620,640 688,500 702,380C712,270 732,120 832,-30"/><path class="base" d="M620,800C650,640 714,500 728,380C738,270 765,120 865,-30"/><path class="base" d="M650,800C680,640 739,500 753,380C763,270 798,120 898,-30"/><path class="cur" d="M470,800C500,640 586,500 600,380C610,270 600,120 700,-30" style="animation-duration:4.2s;stroke-dashoffset:0"/><path class="cur" d="M500,800C530,640 612,500 626,380C636,270 633,120 733,-30" style="animation-duration:5.1s;stroke-dashoffset:-7"/><path class="cur" d="M530,800C560,640 637,500 651,380C661,270 666,120 766,-30" style="animation-duration:6.0s;stroke-dashoffset:-14"/><path class="cur" d="M560,800C590,640 662,500 676,380C686,270 699,120 799,-30" style="animation-duration:4.2s;stroke-dashoffset:-21"/><path class="cur" d="M590,800C620,640 688,500 702,380C712,270 732,120 832,-30" style="animation-duration:5.1s;stroke-dashoffset:-28"/><path class="cur" d="M620,800C650,640 714,500 728,380C738,270 765,120 865,-30" style="animation-duration:6.0s;stroke-dashoffset:-35"/><path class="cur" d="M650,800C680,640 739,500 753,380C763,270 798,120 898,-30" style="animation-duration:4.2s;stroke-dashoffset:-42"/>
+    <path id="curText" d="M560,800C590,640 662,500 676,380C686,270 699,120 799,-30" fill="none"/><text class="tag" dy="-8"><textPath href="#curText" startOffset="18%">KUROSHIO · 黑潮</textPath></text>
+  </svg></div>
+  <div class="status glass" id="detect" data-state="checking" role="status" aria-live="polite">
+    <button class="status-main" id="detectRe" type="button" title="點一下重新偵測"><span class="dot"></span><span id="detectText">偵測中…</span></button>
+    <a href="#setup" id="detectGo" hidden>設定</a>
+  </div>
+  <p class="kicker">Kuroshio DNS · 黑潮</p>
+  <h1>讓網路回到<br class="sm"><span class="grad">台灣的最近路線</span></h1>
+  <p class="lead">親友專用的加密 DNS。擋掉廣告與詐騙網站，把被繞去舊金山、香港、大阪的連線，拉回台北、高雄節點。</p>
+  <div class="cta">
+    <a class="btn pill primary" href="#setup" id="ctaMain">開始設定</a>
+    <a class="btn pill" href="#why">加速成效</a>
+  </div>
+  <div class="endpoint glass">
+    <div class="ep"><span class="ep-k">DoH</span><code id="doh" data-v="https://{{HOST}}{{DOH_PATH}}"><span class="dim">https://</span>{{HOST}}{{DOH_PATH}}</code><button class="icon-btn copy" data-copy="doh" type="button" aria-label="複製 DoH 網址"></button></div>
+    <div class="ep"><span class="ep-k">DoT</span><code id="dot" data-v="{{HOST}}">{{HOST}}</code><button class="icon-btn copy" data-copy="dot" type="button" aria-label="複製 DoT 主機"></button></div>
+  </div>
+  <div class="metrics glass">
+    <div class="m"><span class="m-l">今日拉回台灣</span><span class="m-v" id="k-acc">—</span><span class="m-h">次 CDN 連線</span></div>
+    <div class="m"><span class="m-l">今日攔截</span><span class="m-v" id="k-blk">—</span><span class="m-h" id="k-blk-h">廣告與詐騙</span></div>
+    <div class="m"><span class="m-l">每分鐘查詢</span><span class="m-v" id="k-qpm">—</span><svg class="spark" id="spark" viewBox="0 0 100 22" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+  </div>
+</div>
+
+<section id="why">
+  <div class="wrap">
+    <div class="sec-head">
+      <div><h2>同一個網站，換個 DNS 就差很多</h2><p>拿其他 DNS 給的答案當對照：如果用它們，這些連線會被送去國外機房。</p></div>
+      <div class="seg glass" role="group" aria-label="統計期間">
+        <button data-range="today" aria-pressed="true">今天</button>
+        <button data-range="7d" aria-pressed="false">7 天</button>
+        <button data-range="30d" aria-pressed="false">30 天</button>
+      </div>
+    </div>
+    <div id="statsBody">
+      <div class="opp glass card">
+        <div>
+          <p class="headline" id="oppHead">資料累積中…</p>
+          <p class="sub" id="oppSub">每一次 CDN 網站的連線，都會和其他 DNS 的答案比對。</p>
+          <div class="kpis">
+            <div class="kpi"><div class="v" id="o-acc">—</div><div class="l">次連線拉回台灣</div></div>
+            <div class="kpi"><div class="v" id="o-ms">—</div><div class="l">平均每次縮短</div></div>
+            <div class="kpi"><div class="v" id="o-sec">—</div><div class="l">合計省下等待</div></div>
+          </div>
+        </div>
+        <div class="vs">
+          <div class="vs-row"><div class="who"><b>一般 DNS</b><span id="vs-other">—</span></div><div class="vs-track"><div class="vs-fill" id="vs-other-bar" style="background:var(--s2)"></div></div></div>
+          <div class="vs-row"><div class="who"><b>黑潮 DNS</b><span id="vs-ours">—</span></div><div class="vs-track"><div class="vs-fill" id="vs-ours-bar" style="background:var(--s1)"></div></div></div>
+          <div class="cap" style="font-size:13px;color:var(--text-3)">長條 = CDN 連線被送去國外節點的比例（越短越好）</div>
+        </div>
+      </div>
+
+      <div class="grid g2" style="margin-top:14px">
+        <div class="card glass" style="grid-column:1/-1">
+          <h3>原本會被送去哪裡</h3>
+          <p class="cap">實測各 CDN 原本分配的機房，以及改走的台灣節點（依查詢量加權）</p>
+          <div class="mapwrap chart" id="map"></div>
+          <div class="map-legend"><span><i></i>改走台灣的路線（越粗＝越多連線）</span><span id="mapNote"></span></div>
+          <details class="table"><summary>數據表</summary><table id="mapTable"></table></details>
+        </div>
+      </div>
+
+      <h3 style="margin:28px 0 12px;font-size:18px">各家 CDN 成功拉回台灣的比例</h3>
+      <div class="gauges" id="gauges"></div>
+
+      <h3 style="margin:28px 0 6px;font-size:18px">跨 CDN 備援</h3>
+      <p class="cap" style="margin:0 0 12px;color:var(--text-3);font-size:14px">原本的 CDN 在台灣沒有節點時（例如 Fastly），自動測試同一個網站是不是也放在 Cloudflare、CloudFront、Akamai 的台灣節點上；憑證與網頁內容都一致才採用</p>
+      <div class="card glass cross" id="cross"></div>
+    </div>
+  </div>
+</section>
+
+<section id="live">
+  <div class="wrap">
+    <div class="sec-head"><div><h2>即時數據</h2><p>全部是匿名彙總，看不到任何人的紀錄。</p></div></div>
+    <div class="grid">
+      <div class="card glass">
+        <h3>最近 60 分鐘</h3>
+        <p class="cap">每分鐘查詢、攔截與拉回台灣的連線數，每 15 秒更新</p>
+        <div class="legend"><span><i style="background:var(--s1)"></i>查詢</span><span><i style="background:var(--s3)"></i>拉回台灣</span><span><i style="background:var(--s2)"></i>攔截</span></div>
+        <div class="chart" id="rt"></div>
+      </div>
+      <div class="card glass">
+        <h3>查詢都去了哪裡</h3>
+        <p class="cap" id="outCap">所選期間的全部查詢</p>
+        <div class="stack" id="stack"></div>
+        <div class="stack-legend" id="stackLegend"></div>
+      </div>
+      <div class="card glass">
+        <h3>近 30 天</h3>
+        <p class="cap">每日查詢與攔截（不含尚未結束的今天）</p>
+        <div class="legend"><span><i style="background:var(--s1)"></i>查詢</span><span><i style="background:var(--s2)"></i>攔截</span></div>
+        <div class="chart" id="trend"></div>
+        <details class="table"><summary>數據表</summary><table id="trendTable"></table></details>
+      </div>
+      <div class="grid g3">
+        <div class="card glass"><h3>最常用到的 CDN</h3><p class="cap">網站內容實際由誰提供</p><div class="rank" id="cdnRank"></div></div>
+        <div class="card glass"><h3>熱門網站</h3><p class="cap" id="sitesCap">大家最常造訪的網站</p><div class="rank" id="siteRank"></div></div>
+        <div class="card glass"><h3>最常被擋的網域</h3><p class="cap">多半是廣告、追蹤與數據收集</p><div class="rank" id="blockRank"></div></div>
+      </div>
+    </div>
+    <p class="privacy" id="privacy"></p>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head"><div><h2>一路開發下來的特點</h2><p>一般 DNS 只負責把網址翻成 IP，黑潮 DNS 會多做很多事。</p></div></div>
+    <div class="features">
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#3cc4f5,#1a78c8)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div><h3>加密 DNS 全支援</h3><p>手機、電腦到這台伺服器全程加密，電信業者與公共 Wi-Fi 看不到你查了哪些網站，也沒辦法竄改結果。支援 DDR，裝置能自動發現加密連線；EDNS Padding 讓封包長度也透露不了內容。</p><ul class="tags"><li>DoH（HTTP/1.1・HTTP/2）</li><li>DoH3（HTTP/3）</li><li>DoT</li><li>DoQ</li><li>DDR 自動發現</li><li>EDNS Padding</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#2fe0d0,#0e968f)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></div><h3>CDN 走台灣節點</h3><p>Cloudflare、CloudFront 等常把台灣用戶導去國外機房。這裡辨識各大 CDN 之後，換成台灣或最近的節點；每個網站都先驗證能正常運作才換。</p><ul class="tags"><li>逐站驗證</li><li>ECS</li><li>跨 CDN 備援</li><li>IPv6 永久節點</li><li>尖峰時段加權</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#6f95ff,#3550c8)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></div><h3>多個上游一起問</h3><p>同時詢問多個上游 DNS，合併答案後實測每個 IP 的連線速度，給你最快的那組；上游名單每天自動評測一次。</p><ul class="tags"><li>並行查詢</li><li>IP 測速</li><li>每日上游評測</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#3a7be8,#1c3a9a)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg></div><h3>聰明的快取</h3><p>常用的網址在過期前自動更新，開機後先把熱門網域預熱好；上游暫時斷線時，先回上一次的答案，網路不會整個停擺。</p><ul class="tags"><li>自適應預取</li><li>開機預熱</li><li>斷線先回舊資料</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#f5c56e,#d07a26)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg></div><h3>擋廣告、遙測與詐騙</h3><p>在 DNS 層直接擋掉廣告、遙測追蹤，以及釣魚、詐騙與散播惡意程式的網站，App 和網頁都有效。自訂規則永遠優先，被誤擋的網站可以自己放行。</p><ul class="tags"><li>廣告</li><li>遙測</li><li>詐騙與惡意網站</li><li>自訂規則優先</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#2fe0d0,#0e968f)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8"/><path d="M18 14.8c2 .7 3.2 2.4 3.6 5.2"/></svg></div><h3>好友社群共享</h3><p>架設黑潮 DNS 的好友之間，可以互相分享台灣節點、網站驗證結果與評測選出的上游。資料有簽章驗證，網站只分享網域的雜湊值；收到的資料只當參考，一律先在本機驗證過才會使用。</p><ul class="tags"><li>簽章驗證</li><li>只分享網域雜湊</li><li>本機驗證後才用</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#3cc4f5,#1a78c8)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><path d="M3 3l18 18"/></svg></div><h3>預設不記錄</h3><p>預設不記錄查詢內容。這一頁的公開統計只有匿名的彙總：網站排行只列出多位使用者共同造訪的網站，看不到是誰，也沒有 IP。</p><ul class="tags"><li>不記錄查詢內容</li><li>匿名彙總</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#6f95ff,#3550c8)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg></div><h3>小台路由器也能跑</h3><p>128 MB 記憶體的路由器就能執行。依硬體自動分級，調整快取大小與功能；資料寫入有節制，保護 Flash 的壽命。</p><ul class="tags"><li>128 MB 記憶體</li><li>依硬體自動分級</li><li>保護 Flash 寫入壽命</li></ul></div>
+      <div class="feature glass"><div class="ic" style="background:linear-gradient(135deg,#3a7be8,#1c3a9a)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="14" height="10" rx="1.5"/><path d="M6 18h6M9 14v4"/><rect x="18" y="8" width="4" height="12" rx="1"/></svg></div><h3>OpenWrt 與 Windows</h3><p>路由器上用 OpenWrt 的 LuCI 介面管理；Windows 上可以裝成系統服務，有網頁設定頁，也能跟 IIS 共存。兩邊跑的是同一份核心。</p><ul class="tags"><li>OpenWrt（LuCI）</li><li>Windows 服務</li><li>設定頁</li><li>IIS 共存</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<section id="rust">
+  <div class="wrap">
+    <div class="sec-head"><div><h2>為什麼用 Rust 重寫</h2><p>3.0 版把整個伺服器從 Node.js 改寫成 Rust：功能一樣，更省資源、更穩定，也更容易裝進小台的路由器。</p></div></div>
+    <div class="rust-grid">
+      <div class="why-list glass">
+        <div class="row"><span class="n">01</span><div><h3>單一執行檔</h3><p>不需要另外安裝 Node.js 等執行環境，一個檔案複製過去就能跑，更新也只是換掉這個檔案。</p></div></div>
+        <div class="row"><span class="n">02</span><div><h3>記憶體安全</h3><p>編譯器在編譯時就擋掉緩衝區溢位、use-after-free 這類常見的安全漏洞，對 24 小時對外開放的服務特別重要。</p></div></div>
+        <div class="row"><span class="n">03</span><div><h3>沒有垃圾回收停頓</h3><p>記憶體用完就立刻釋放，不會因為回收記憶體突然卡一下，回應時間穩定。</p></div></div>
+        <div class="row"><span class="n">04</span><div><h3>非同步、多核心</h3><p>以 tokio 非同步執行，大量同時進來的連線平均分給每一顆 CPU 核心處理。</p></div></div>
+        <div class="row"><span class="n">05</span><div><h3>一份程式碼到處跑</h3><p>同一份程式碼編譯到 MIPS、ARM 路由器、x86 電腦與 Windows。</p></div></div>
+      </div>
+      <div class="measure glass">
+        <h3>實際量到的記憶體</h3>
+        <div class="big">
+          <div class="num"><b>約 23<small>MB</small></b><span>最低等級設定的常駐記憶體</span></div>
+          <div class="num"><b>約 27<small>MB</small></b><span>載入 13 萬條過濾規則</span></div>
+        </div>
+        <p class="note">以上是 x86_64 的實測數字，實際用量會依設定而不同。</p>
+        <h3>同一份核心</h3>
+        <div class="targets"><span>MIPS</span><span>ARM</span><span>x86_64</span><span>Windows</span></div>
+        <p class="note" id="rustCore"></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="setup">
+  <div class="wrap">
+    <div class="sec-head"><div><h2>設定教學</h2><p>選擇你的裝置。設定只要做一次，之後連 Wi-Fi 或行動網路都會自動使用。</p></div></div>
+    <div class="tabs" role="tablist" aria-label="裝置">
+      <button role="tab" data-tab="ios" aria-selected="false">iPhone / iPad</button>
+      <button role="tab" data-tab="mac" aria-selected="false">Mac</button>
+      <button role="tab" data-tab="android" aria-selected="false">Google Pixel / Android</button>
+      <button role="tab" data-tab="samsung" aria-selected="false">三星 Samsung</button>
+      <button role="tab" data-tab="other-android" aria-selected="false">小米 · OPPO · ASUS…</button>
+      <button role="tab" data-tab="windows" aria-selected="false">Windows 11</button>
+      <button role="tab" data-tab="browser" aria-selected="false">瀏覽器</button>
+      <button role="tab" data-tab="router" aria-selected="false">路由器 / 其他</button>
+    </div>
+
+    <div class="panel glass" role="tabpanel" data-panel="ios">
+      <h3>iPhone / iPad</h3>
+      <p class="req">需要 iOS / iPadOS 14 以上。請用 <b>Safari</b> 開啟這個頁面。</p>
+      <div class="dl"><a class="btn pill primary" href="/apple/doh.mobileconfig">下載描述檔（推薦）</a><a class="btn pill" href="/apple/dot.mobileconfig">DoT 版本</a></div>
+      <ol>
+        <li>點上面的「下載描述檔」，跳出提示時按 <span class="path">允許</span>，看到「已下載描述檔」後按 <span class="path">關閉</span>。</li>
+        <li>打開 <span class="path">設定</span> App，最上方會出現 <span class="path">已下載描述檔</span>，點進去。<br>（沒看到的話：<span class="path">設定 › 一般 › VPN 與裝置管理</span>）</li>
+        <li>按右上角 <span class="path">安裝</span>，輸入手機密碼，再按兩次 <span class="path">安裝</span>。</li>
+        <li>完成！回到這個頁面重新整理，最上方會顯示「已使用」。</li>
+      </ol>
+      <div class="callout"><b>畫面顯示「未驗證」是正常的</b>，代表描述檔沒有經過 Apple 簽章，不影響使用。<br>
+      <b>要停用：</b><span class="path">設定 › 一般 › VPN 與裝置管理</span> › 點描述檔 › <span class="path">移除描述檔</span>。<br>
+      <b>注意：</b>如果有開 iCloud 私密轉送，Safari 的查詢會走 Apple 的轉送服務，不經過這裡；其他 App 不受影響。</div>
+    </div>
+    <div class="panel glass" role="tabpanel" data-panel="mac" hidden>
+      <h3>Mac</h3>
+      <p class="req">需要 macOS 11 Big Sur 以上。</p>
+      <div class="dl"><a class="btn pill primary" href="/apple/doh.mobileconfig">下載描述檔（推薦）</a><a class="btn pill" href="/apple/dot.mobileconfig">DoT 版本</a></div>
+      <ol>
+        <li>下載後，在「下載項目」裡雙擊描述檔，畫面會提示到系統設定查看。</li>
+        <li>打開 <span class="path">系統設定 › 隱私權與安全性 › 描述檔</span>（較舊的 macOS：<span class="path">系統偏好設定 › 描述檔</span>）。</li>
+        <li>雙擊「黑潮 DNS（{{HOST}}）」，按 <span class="path">安裝</span>，輸入電腦密碼。</li>
+      </ol>
+      <div class="callout"><b>要停用：</b>同一個頁面選取描述檔，按「−」移除。</div>
+    </div>
+    <div class="panel glass" role="tabpanel" data-panel="android" hidden>
+      <h3>Google Pixel 與原生 Android</h3>
+      <p class="req">需要 Android 9 以上。</p>
+      <ol>
+        <li>打開 <span class="path">設定 › 網路和網際網路 › 私人 DNS</span>。</li>
+        <li>選擇 <span class="path">私人 DNS 供應商主機名稱</span>。</li>
+        <li>輸入 <span class="code">{{HOST}}</span>，按 <span class="path">儲存</span>。</li>
+      </ol>
+      <div class="callout"><b>找不到選項？</b>在設定最上方的搜尋欄輸入「私人 DNS」。<br><b>要停用：</b>同一個地方改回「自動」。</div>
+    </div>
+    <div class="panel glass" role="tabpanel" data-panel="samsung" hidden>
+      <h3>三星 Galaxy</h3>
+      <p class="req">One UI 1.0（Android 9）以上。</p>
+      <ol>
+        <li>打開 <span class="path">設定 › 連接</span>（部分機型為「連線」）<span class="path">› 更多連接設定 › 私人 DNS</span>。</li>
+        <li>選擇 <span class="path">私人 DNS 供應商主機名稱</span>。</li>
+        <li>輸入 <span class="code">{{HOST}}</span>，按 <span class="path">儲存</span>。</li>
+      </ol>
+      <div class="callout"><b>找不到選項？</b>在設定裡搜尋「私人 DNS」。<br><b>要停用：</b>同一個地方改回「自動」。</div>
+    </div>
+    <div class="panel glass" role="tabpanel" data-panel="other-android" hidden>
+      <h3>其他 Android 手機</h3>
+      <p class="req">各品牌選單名稱略有不同，最快的方法是在設定裡搜尋「私人 DNS」。</p>
+      <ol>
+        <li><b>小米 / 紅米 / POCO：</b><span class="path">設定 › 連線與共享 › 私人 DNS</span></li>
+        <li><b>OPPO / realme / OnePlus：</b><span class="path">設定 › 連線與共享 › 私人 DNS</span>（部分機型在「其他無線連線」裡）</li>
+        <li><b>ASUS / Sony / Motorola / Nokia：</b><span class="path">設定 › 網路和網際網路 › 私人 DNS</span></li>
+        <li>選擇 <span class="path">私人 DNS 供應商主機名稱</span>，輸入 <span class="code">{{HOST}}</span>，儲存。</li>
+      </ol>
+      <div class="callout"><b>要停用：</b>同一個地方改回「自動」或「關閉」。</div>
+    </div>
+    <div class="panel glass" role="tabpanel" data-panel="windows" hidden>
+      <h3>Windows 11</h3>
+      <p class="req">Windows 11 內建加密 DNS。Windows 10 請改用「瀏覽器」頁籤的方式。</p>
+      <ol>
+        <li>打開 <span class="path">設定 › 網路和網際網路</span>，點你正在用的 <span class="path">Wi-Fi</span> 或 <span class="path">乙太網路</span>（Wi-Fi 要再點 <span class="path">硬體內容</span>）。</li>
+        <li>在 <span class="path">DNS 伺服器指派</span> 旁按 <span class="path">編輯</span>，改成 <span class="path">手動</span>，打開 <span class="path">IPv4</span>。</li>
+        <li><span class="path">慣用 DNS</span> 填 <span class="code" id="win-ip">（讀取中）</span></li>
+        <li><span class="path">DNS over HTTPS</span> 選 <span class="path">開啟（手動範本）</span>，範本填 <span class="code">https://{{HOST}}{{DOH_PATH}}</span>。</li>
+        <li><span class="path">回退到純文字</span> 保持關閉，按 <span class="path">儲存</span>。</li>
+      </ol>
+      <div class="callout"><b>要停用：</b>同一個地方把 DNS 伺服器指派改回「自動 (DHCP)」。</div>
+    </div>
+    <div class="panel glass" role="tabpanel" data-panel="browser" hidden>
+      <h3>瀏覽器（任何電腦都可用）</h3>
+      <p class="req">只影響這個瀏覽器，適合公司電腦或 Windows 10。</p>
+      <ol>
+        <li><b>Chrome：</b><span class="path">設定 › 隱私權和安全性 › 安全性 › 使用安全 DNS</span> › 選擇 DNS 供應商 › <span class="path">自訂</span> › 填入 <span class="code">https://{{HOST}}{{DOH_PATH}}</span></li>
+        <li><b>Edge：</b><span class="path">設定 › 隱私權、搜尋與服務 › 安全性 › 使用安全 DNS</span> › <span class="path">選擇服務提供者</span> › 填入同一個網址</li>
+        <li><b>Firefox：</b><span class="path">設定 › 隱私權與安全性 › DNS over HTTPS</span> › <span class="path">最高保護</span> › 供應商選 <span class="path">自訂</span> › 填入同一個網址</li>
+        <li><b>Android 版 Chrome：</b><span class="path">設定 › 隱私權和安全性 › 使用安全 DNS</span> › 自訂（手機已設定私人 DNS 的話不需要）</li>
+      </ol>
+    </div>
+    <div class="panel glass" role="tabpanel" data-panel="router" hidden>
+      <h3>路由器、NAS 與其他裝置</h3>
+      <p class="req">支援加密 DNS 的設備可以直接填以下資訊。</p>
+      <ol>
+        <li><b>DNS over HTTPS：</b><span class="code">https://{{HOST}}{{DOH_PATH}}</span></li>
+        <li><b>DNS over TLS：</b>主機 <span class="code">{{HOST}}</span>，連接埠 <span class="code dot-port">853</span></li>
+        <li>OpenWrt 可用 https-dns-proxy；AdGuard Home、Pi-hole（搭配 cloudflared / dnscrypt-proxy）可把上面的網址設成上游。</li>
+      </ol>
+      <div class="callout">一般路由器的 DNS 欄位只能填 IP、不支援加密，建議直接在手機和電腦上設定。</div>
+    </div>
+  </div>
+</section>
+
+<section id="share">
+  <div class="wrap">
+    <div class="sec-head"><div><h2>分享這台 DNS</h2><p>每一台黑潮 DNS 都是架設的人自己的服務。下面的網址和 QR 碼都由這台伺服器（<b>{{HOST}}</b>）自己產生，直接傳給家人朋友就能用。</p></div></div>
+    <div class="share-grid">
+      <div class="share glass">
+        <h3>這個頁面</h3>
+        <p class="cap">用手機相機掃描，就能打開設定教學</p>
+        <img class="qr" src="/qr.svg?for=site" alt="這個頁面網址的 QR 碼" width="168" height="168">
+        <div class="copyrow"><code id="siteUrl" data-v="https://{{HOST}}/">https://{{HOST}}/</code><button class="btn btn-copy" type="button" data-copy="siteUrl">複製</button></div>
+      </div>
+      <div class="share glass">
+        <h3>DoH 網址</h3>
+        <p class="cap">瀏覽器、Windows 11、路由器填這個</p>
+        <img class="qr" src="/qr.svg?for=doh" alt="DoH 網址的 QR 碼" width="168" height="168">
+        <div class="copyrow"><code id="dohUrl" data-v="https://{{HOST}}{{DOH_PATH}}">https://{{HOST}}{{DOH_PATH}}</code><button class="btn btn-copy" type="button" data-copy="dohUrl">複製</button></div>
+      </div>
+      <div class="share glass">
+        <h3>手機快速設定</h3>
+        <p class="cap">Android「私人 DNS」主機名稱</p>
+        <div class="copyrow"><code id="androidHost" data-v="{{HOST}}">{{HOST}}</code><button class="btn btn-copy" type="button" data-copy="androidHost">複製</button></div>
+        <p class="cap">DoT：主機 {{HOST}}，連接埠 <span class="dot-port">853</span></p>
+        <p class="cap">iPhone、iPad、Mac：用 Safari 下載描述檔</p>
+        <div class="dl"><a class="btn pill primary small" href="/apple/doh.mobileconfig">DoH 描述檔</a><a class="btn pill small" href="/apple/dot.mobileconfig">DoT 描述檔</a></div>
+      </div>
+    </div>
+    <p class="share-note glass">想自己也架一台？黑潮 DNS 是開放原始碼軟體，裝在 OpenWrt 路由器或 Windows 電腦上，就會有一個像這樣、寫著你自己網址的分享頁。原始碼在頁尾的「關於」。</p>
+  </div>
+</section>
+
+<section id="faq" class="faq">
+  <div class="wrap">
+    <div class="sec-head"><div><h2>常見問題</h2></div></div>
+    <details class="glass"><summary>某個網站或 App 打不開怎麼辦？</summary><p>先依上面的方式暫時停用，確認是不是 DNS 造成的。如果停用後就正常，請把網址告訴我，我會把它加進白名單。</p></details>
+    <details class="glass"><summary>為什麼有些廣告還是會出現？</summary><p>DNS 只能擋「專門放廣告的網域」。YouTube 影片廣告、Facebook / Instagram 動態裡的廣告，和正常內容來自同一個網域，DNS 擋不掉。</p></details>
+    <details class="glass"><summary>「拉回台灣」是怎麼算的？</summary><p>每次 CDN 網站的查詢，都會同時看其他公共 DNS 給的答案。如果它們會把你送去國外機房，而這裡給的是台灣節點，就算一次成功拉回；縮短的毫秒數是伺服器實測兩邊連線時間的差距。</p></details>
+    <details class="glass"><summary>出國可以用嗎？</summary><p>可以，加密和擋廣告照常有效。不過「走台灣節點」是為在台灣使用設計的，人在國外時部分網站會被導回台灣反而變慢；長時間出國建議先停用。</p></details>
+    <details class="glass"><summary>連飯店、機場 Wi-Fi 時登入頁面跳不出來？</summary><p>少數公共 Wi-Fi 的登入頁需要使用當地的 DNS。暫時停用、完成登入後再開回來即可。</p></details>
+    <details class="glass"><summary>我也想架一台自己的，可以嗎？</summary><p>可以。黑潮 DNS 是開放原始碼軟體（GPL-3.0-or-later），可以裝在 OpenWrt 路由器或 Windows 電腦上，原始碼網址在頁尾的「關於」。架好之後，你的伺服器也會有一個寫著你自己網址的分享頁。</p></details>
+    <details class="glass"><summary>你看得到我上了什麼網站嗎？</summary><p>伺服器為了除錯會即時顯示查詢，但不會寫入硬碟保存。首頁統計只有匿名彙總：排行只列出多位使用者共同造訪的網站，看不到是誰、也沒有 IP。</p></details>
+  </div>
+</section>
+</main>
+
+<footer id="about">
+  <div class="wrap">
+    <div class="about glass">
+      <div>
+        <h2><span id="abName">黑潮 DNS（Kuroshio DNS）</span><span class="ver" id="abVer">—</span></h2>
+        <p style="margin:0;color:var(--text-2)">開放原始碼的家用加密 DNS 伺服器。</p>
+        <dl>
+          <dt>核心</dt><dd id="abCore">—</dd>
+          <dt>授權</dt><dd><a id="abLic" href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener noreferrer">GPL-3.0-or-later</a></dd>
+          <dt>原始碼</dt><dd><a id="abSrc" target="_blank" rel="noopener noreferrer">—</a></dd>
+          <dt>功能</dt><dd id="abFeat">—</dd>
+        </dl>
+        <p class="gpl"><b>GPL-3.0 是什麼意思？</b>你可以自由使用、修改、分享這個程式；如果把修改過的版本散布給別人，就要用同樣的授權一併提供它的原始碼。</p>
+      </div>
+      <figure><img class="qr" src="/qr.svg?for=source" alt="原始碼網址的 QR 碼" width="140" height="140"><figcaption>掃描開啟原始碼</figcaption></figure>
+    </div>
+    <div class="fine">黑潮 DNS · {{HOST}} · 僅供親友使用 · 本站不開放搜尋引擎收錄</div>
+  </div>
+</footer>
+
+<script>
+(() => {
+  // iOS Safari 不理會 user-scalable=no，要另外擋：雙指手勢、雙擊縮放
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(t => document.addEventListener(t, e => e.preventDefault(), { passive: false }));
+  document.addEventListener('touchmove', e => { if (e.touches.length > 1 && !e.target.closest('#map')) e.preventDefault(); }, { passive: false });
+  let lastTouch = 0;
+  document.addEventListener('touchend', e => {
+    const now = Date.now();
+    if (now - lastTouch < 300 && !e.target.closest('a, button, input, textarea, select, summary, label, #map')) e.preventDefault();
+    lastTouch = now;
+  }, { passive: false });
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  const nf = new Intl.NumberFormat('zh-TW');
+  const cf = new Intl.NumberFormat('zh-TW', { notation: 'compact', maximumFractionDigits: 1 });
+  const compact = n => (n >= 10000 ? cf.format(n) : nf.format(Math.round(n)));
+  const pct = (x, d = 0) => (x * 100).toFixed(d) + '%';
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+  const NS = 'http://www.w3.org/2000/svg';
+  const sv = (tag, attrs = {}, parent) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (parent) parent.appendChild(n); return n; };
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ---------- 液態玻璃高光跟著游標 ----------
+  document.addEventListener('pointermove', e => {
+    const g = e.target.closest && e.target.closest('.glass');
+    if (!g) return;
+    const r = g.getBoundingClientRect();
+    g.style.setProperty('--mx', (e.clientX - r.left) + 'px');
+    g.style.setProperty('--my', (e.clientY - r.top) + 'px');
+  }, { passive: true });
+
+  // ---------- 數字滾動 ----------
+  function countTo(node, value, fmt = compact) {
+    const from = +(node.dataset.v || 0);
+    node.dataset.v = value;
+    if (reduce || from === value) { node.textContent = fmt(value); return; }
+    const t0 = performance.now(), dur = 900;
+    const step = now => {
+      const p = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - p, 3);
+      node.textContent = fmt(from + (value - from) * e);
+      if (p < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  // ---------- 複製（圖示按鈕） ----------
+  const ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>';
+  const ICON_OK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+  $$('button.copy').forEach(b => {
+    b.innerHTML = ICON_COPY;
+    b.addEventListener('click', async () => {
+      const t = $('#' + b.dataset.copy).dataset.v;
+      try { await navigator.clipboard.writeText(t); } catch (e) {
+        const ta = el('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+      }
+      b.innerHTML = ICON_OK; b.classList.add('done');
+      setTimeout(() => { b.innerHTML = ICON_COPY; b.classList.remove('done'); }, 1400);
+    });
+  });
+
+  // ---------- 複製（文字按鈕：分享區） ----------
+  async function copyText(t) {
+    try { await navigator.clipboard.writeText(t); } catch (e) {
+      const ta = el('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+    }
+  }
+  $$('button.btn-copy').forEach(b => b.addEventListener('click', async () => {
+    const n = $('#' + b.dataset.copy);
+    await copyText(n.dataset.v || n.textContent);
+    b.textContent = '已複製'; b.classList.add('done');
+    setTimeout(() => { b.textContent = '複製'; b.classList.remove('done'); }, 1400);
+  }));
+
+  // ---------- 關於：版本、授權、原始碼（伺服器給的字串一律用 textContent） ----------
+  const FEAT = { doh: 'DoH', doh3: 'DoH3', dot: 'DoT', doq: 'DoQ', cdn: 'CDN 台灣節點', community: '好友社群', filter: '過濾', acme: '自動憑證', 'windows-service': 'Windows 服務' };
+  const httpUrl = u => (typeof u === 'string' && /^https?:\/\//i.test(u)) ? u : null;
+  function setAbout(a) {
+    if (!a || typeof a !== 'object') return;
+    if (a.name) $('#abName').textContent = a.name;
+    if (a.version) $('#abVer').textContent = 'v' + a.version;
+    $('#abCore').textContent = [a.version && 'v' + a.version, a.language, a.target].filter(Boolean).join(' · ') || '—';
+    const lic = $('#abLic');
+    if (a.license) lic.textContent = a.license;
+    if (httpUrl(a.licenseUrl)) lic.href = httpUrl(a.licenseUrl);
+    const src = $('#abSrc'), su = httpUrl(a.source);
+    if (su) { src.href = su; src.textContent = su; }
+    if (Array.isArray(a.features) && a.features.length) $('#abFeat').textContent = a.features.map(f => FEAT[f] || String(f)).join('、');
+    if (a.version) $('#rustCore').textContent = `這台伺服器正在執行黑潮 DNS v${a.version}（${[a.language, a.target].filter(Boolean).join(' · ')}）。`;
+  }
+
+  // ---------- 教學頁籤 ----------
+  function showTab(id) {
+    $$('[role=tab]').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === id)));
+    $$('[role=tabpanel]').forEach(p => p.hidden = p.dataset.panel !== id);
+  }
+  $$('[role=tab]').forEach(t => t.addEventListener('click', () => showTab(t.dataset.tab)));
+  $$('[data-goto]').forEach(a => a.addEventListener('click', () => showTab(a.dataset.goto)));
+  const ua = navigator.userAgent;
+  const isIpadOS = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+  showTab(/iPhone|iPad|iPod/.test(ua) || isIpadOS ? 'ios'
+    : /SM-|SAMSUNG|Samsung/i.test(ua) ? 'samsung'
+    : /Xiaomi|Redmi|POCO|MI \d|OPPO|CPH\d|realme|RMX\d|ASUS|OnePlus/i.test(ua) ? 'other-android'
+    : /Android/.test(ua) ? 'android' : /Windows/.test(ua) ? 'windows' : /Macintosh/.test(ua) ? 'mac' : 'ios');
+
+  // ---------- 偵測這台裝置有沒有在用（比對這個 IP 最近有沒有透過我們查詢）；點膠囊可重新偵測 ----------
+  const PROTO = { DoH: 'DoH', DoH3: 'DoH3', DoT: 'DoT', DoQ: 'DoQ', UDP: 'DNS', TCP: 'DNS' };
+  function setDetect(state, text, showGo) {
+    $('#detect').dataset.state = state;
+    $('#detectText').textContent = text;
+    $('#detectGo').hidden = !showGo;
+  }
+  let detecting = false;
+  async function detect() {
+    if (detecting) return;
+    detecting = true;
+    setDetect('checking', '偵測中…', false);
+    const t0 = Date.now();
+    let res = ['unknown', '服務運作中', false];
+    try {
+      const j = await (await fetch('/api/public/presence', { cache: 'no-store' })).json();
+      if (j.state === 'yes') res = ['yes', PROTO[j.protocol] === 'DNS' ? '已使用 · 一般 DNS' : `已使用 · ${PROTO[j.protocol] || j.protocol} 加密`, false];
+      else if (j.state === 'network') res = ['yes', `此網路已使用 · ${PROTO[j.protocol] || j.protocol}`, false];
+      else if (j.state === 'no') res = ['no', '這台裝置尚未使用', true];
+    } catch (e) { /* 保持「服務運作中」 */ }
+    // 至少轉 0.6 秒，讓使用者看得出有重新偵測
+    setTimeout(() => { setDetect(...res); detecting = false; }, Math.max(0, 600 - (Date.now() - t0)));
+  }
+  $('#detectRe').addEventListener('click', detect);
+  detect();
+  // 主要按鈕依裝置顯示
+  $('#ctaMain').textContent = /iPhone|iPad|iPod/.test(ua) || isIpadOS ? 'iPhone 一鍵安裝' : /Android/.test(ua) ? 'Android 設定' : '開始設定';
+  fetch('/api/public/info').then(r => r.json()).then(i => {
+    $('#doh').dataset.v = i.doh; $('#dot').dataset.v = i.dot;
+    $('#win-ip').textContent = i.ipv4 && i.ipv4.length ? i.ipv4[0] : '請向管理員詢問';
+    // 分享區：這台伺服器自己的網址
+    if (i.host) {
+      const site = `https://${i.host}/`;
+      [['#siteUrl', site], ['#dohUrl', i.doh], ['#androidHost', i.host]].forEach(([id, v]) => { if (v) { $(id).dataset.v = v; $(id).textContent = v; } });
+    }
+    if (i.dotPort) $$('.dot-port').forEach(n => { n.textContent = String(i.dotPort); });
+    setAbout(i.about);
+
+  }).catch(() => { $('#win-ip').textContent = '請向管理員詢問'; });
+
+  // ---------- 共用：提示框 ----------
+  function tooltip(container) { const t = el('div', 'tip'); container.appendChild(t); return t; }
+  function tipRows(tip, title, rows) {
+    tip.textContent = '';
+    tip.appendChild(el('div', 'd', title));
+    rows.forEach(([v, name, color]) => {
+      const r = el('div', 'r'); const i = el('i'); i.style.background = color; r.appendChild(i);
+      r.appendChild(el('b', '', v)); r.appendChild(el('span', '', name)); tip.appendChild(r);
+    });
+  }
+  function placeTip(tip, container, px, py) {
+    const w = container.clientWidth, tw = tip.offsetWidth || 160;
+    tip.style.left = Math.min(Math.max(0, px + 14), w - tw) + 'px';
+    tip.style.top = Math.max(0, py - 10) + 'px';
+    tip.style.opacity = 1;
+  }
+
+  // ---------- 折線圖（含十字準線） ----------
+  function lineChart(container, data, series, { xLabel, area = 0, height } = {}) {
+    container.textContent = '';
+    if (data.length < 2) { container.appendChild(el('div', 'empty', '資料累積中')); return; }
+    const W = Math.max(300, Math.round(container.clientWidth || 700)), H = height || (W < 520 ? 190 : 230);
+    const L = 44, R = 10, T = 10, B = 24;
+    const maxV = Math.max(1, ...data.flatMap(d => series.map(s => d[s.key])));
+    const mag = Math.pow(10, Math.floor(Math.log10(maxV)));
+    const niceMax = Math.ceil(maxV / mag * 2) / 2 * mag;
+    const x = i => L + (W - L - R) * i / (data.length - 1);
+    const y = v => T + (H - T - B) * (1 - v / niceMax);
+    const svg = sv('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': series.map(s => s.name).join('、') + '折線圖' });
+    for (let k = 0; k <= 4; k++) {
+      const v = niceMax * k / 4, yy = y(v);
+      sv('line', { x1: L, x2: W - R, y1: yy, y2: yy, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+      sv('text', { x: L - 8, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = compact(v);
+    }
+    const every = Math.ceil(data.length / (W < 520 ? 4 : 7));
+    data.forEach((d, i) => {
+      const lastI = data.length - 1;
+      if ((i % every !== 0 && i !== lastI) || (i !== lastI && lastI - i < every * 0.7)) return;
+      sv('text', { x: x(i), y: H - 5, 'text-anchor': i === 0 ? 'start' : i === lastI ? 'end' : 'middle', class: 'axis' }, svg).textContent = xLabel(d);
+    });
+    const path = key => data.map((d, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(d[key]).toFixed(1)}`).join('');
+    series.forEach((s, idx) => {
+      if (idx === area) sv('path', { d: path(s.key) + `L${x(data.length - 1)},${y(0)}L${x(0)},${y(0)}Z`, fill: s.color, opacity: .12 }, svg);
+      sv('path', { d: path(s.key), fill: 'none', stroke: s.color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+      const last = data.length - 1;
+      sv('circle', { cx: x(last), cy: y(data[last][s.key]), r: 4, fill: s.color, stroke: 'var(--bg)', 'stroke-width': 2 }, svg);
+    });
+    const cross = sv('line', { y1: T, y2: H - B, stroke: 'var(--text-3)', 'stroke-width': 1, opacity: 0 }, svg);
+    const hit = sv('rect', { x: L, y: T, width: W - L - R, height: H - T - B, fill: 'transparent' }, svg);
+    container.appendChild(svg);
+    const tip = tooltip(container);
+    hit.addEventListener('pointermove', e => {
+      const box = svg.getBoundingClientRect();
+      const sx = (e.clientX - box.left) / box.width * W;
+      const i = Math.max(0, Math.min(data.length - 1, Math.round((sx - L) / (W - L - R) * (data.length - 1))));
+      cross.setAttribute('x1', x(i)); cross.setAttribute('x2', x(i)); cross.setAttribute('opacity', .6);
+      tipRows(tip, xLabel(data[i], true), series.map(s => [nf.format(data[i][s.key]), s.name, s.color]));
+      placeTip(tip, container, x(i) / W * box.width, 0);
+    });
+    hit.addEventListener('pointerleave', () => { tip.style.opacity = 0; cross.setAttribute('opacity', 0); });
+  }
+
+  // ---------- 路由地圖 ----------
+  const POPS = {
+    TPE: ['台北', 121.5, 25.0], TSA: ['台北', 121.5, 25.1], KHH: ['高雄', 120.3, 22.6], RMQ: ['台中', 120.6, 24.3],
+    HKG: ['香港', 114.2, 22.3], MFM: ['澳門', 113.6, 22.2], CAN: ['廣州', 113.3, 23.4], SZX: ['深圳', 114.1, 22.6],
+    NRT: ['東京', 140.4, 35.8], HND: ['東京', 139.8, 35.6], TYO: ['東京', 139.8, 35.7], KIX: ['大阪', 135.2, 34.4], ITM: ['大阪', 135.4, 34.8], OSA: ['大阪', 135.4, 34.7], FUK: ['福岡', 130.4, 33.6], OKA: ['沖繩', 127.6, 26.2],
+    ICN: ['首爾', 126.4, 37.5], SEL: ['首爾', 126.9, 37.6], PUS: ['釜山', 129.0, 35.1],
+    SIN: ['新加坡', 103.9, 1.4], QPG: ['新加坡', 103.9, 1.4], KUL: ['吉隆坡', 101.7, 2.7], BKK: ['曼谷', 100.7, 13.7], MNL: ['馬尼拉', 121.0, 14.5], SGN: ['胡志明市', 106.7, 10.8], HAN: ['河內', 105.8, 21.2], CGK: ['雅加達', 106.7, -6.1],
+    BOM: ['孟買', 72.9, 19.1], DEL: ['新德里', 77.1, 28.6], MAA: ['清奈', 80.2, 13.0],
+    SYD: ['雪梨', 151.2, -33.9], MEL: ['墨爾本', 145.0, -37.7], BNE: ['布里斯本', 153.1, -27.4], AKL: ['奧克蘭', 174.8, -37.0],
+    SJC: ['聖荷西', -121.9, 37.4], SFO: ['舊金山', -122.4, 37.6], LAX: ['洛杉磯', -118.4, 33.9], SEA: ['西雅圖', -122.3, 47.4], PDX: ['波特蘭', -122.6, 45.6], HNL: ['檀香山', -157.9, 21.3],
+    DFW: ['達拉斯', -97.0, 32.9], ORD: ['芝加哥', -87.9, 41.9], IAD: ['華盛頓', -77.5, 38.9], EWR: ['紐約', -74.2, 40.7], JFK: ['紐約', -73.8, 40.6], ATL: ['亞特蘭大', -84.4, 33.6], MIA: ['邁阿密', -80.3, 25.8], DEN: ['丹佛', -104.7, 39.9],
+    FRA: ['法蘭克福', 8.7, 50.0], AMS: ['阿姆斯特丹', 4.8, 52.3], LHR: ['倫敦', -0.5, 51.5], CDG: ['巴黎', 2.5, 49.0], DXB: ['杜拜', 55.4, 25.3]
+  };
+  // 世界陸地輪廓：Natural Earth 1:110m（公有領域），以東經 160° 為中心的等距圓柱投影，x = 經度−160、y = −緯度
+  const LAND = 'M132.2,53.8l1.3,.7 1.4,.2 -.4,.5 -1,0 -.5-.3 -.3,.4 -.8,.3 -1.1-.1 -.8-.3 -1-.1 -2.3-1.1 -1.4-1.2 .9,.2 1.4,.7 1.3,.4 .5-.5 .3-.7 1-.4 .7,.1zM141.5,51.1l.8,.4 -.3,.4 -1.4,.3 -.4-.4 -.9,.5 -.5-.5 1.2-.5 .8,.2zM-89.7,49.7l-1.6,.1 .2-1.2 .7,.3 .9,.2zM-14.6,40.8l1,.3 1.3-.3 .6,.1 .1,1.2 -.4,.3 -.1,.8 -.3-.3 -.7,.7 -.9-.1 -.6-.8 -.1-.7 -.6-.8 0-.5zM13,40.9l.2,.4 .8-.4 .2,.9 -1,1.2 -.5,.4 .4,.5 -.8,0 -.8,.3 -.9,1.7 -1.3,.7 -.9,0 -.6-.3 -1.1-.1 -.2-.3 .5-.8 1.3-1 .6-.2 1.6-.9 .6-.5 .5-.7 .4-.3 .1-.5 .7-.5zM14.6,36.2l.7,1 .1-.7 .4,.3 .2,.8 1.4,.4 .6-.4 .5,.1 -.5,1.5 -.8-.1 -.2,.8 -1,1.4 -.8,.4 -.5-.4 .5-.8 -.3-.6 -1.1-.4 .1-.4 .7-.3 .1-1.4 -.4-.9 -1.2-1.3 -.5-.7 .4,0 .6,.5 .7,.3zM7.1,22.2l-.4,.2 -1.2-.7 -1.3-1.3 -.2-.3 1,.4zM18.4,17.3l.3,.3 -.1,.6 -1.2,0 -.1-.5 .4-.3zM20,16.6l-.6,.2 -.7,.2 -.1-.4 .8-.2 .6-.3zM7.1,14.9l.2,.8 -.5,0 -.2-1.1zM-109.9,13.6l.1,1.2 .3,.4 -.3,.8 -.3-.6 -.2,.3 .2,.8 -.4,.6 -.1,.9 -1.5,4.4 -.4,1.4 -.4,1.1 -1.7,.7 -1.4-.6 -.2-.5 -.1-.9 -.4-.8 0-.7 .1-.8 1-1.2 .1-.7 -.5-1.1 0-.9 .4-1.2 1.5-.4 .4,0 1.4-1.2 .3-.5 -.1-.4 .4,.1 .5-.7 .1-.6 .3-.5 .6,.9zM-16.4,13.8l.3,.7 .7-.3 .8,.8 -.1,.4 .3,1.4 .3,.1 .3,.9 -.1,.5 .3,.7 1.1,.5 1.3,.9 -.1,.2 .6,.7 .4,1 .4-.2 .4,.5 .2-.2 .2,1.1 1.2,1 .8,.8 .2,.8 0,1.2 .5,.8 -.1,.9 -.4,1.4 -.2,1.2 -.5,1 -.7,.4 -.7,1.3 -.3,.9 -.4,.5 -.2,.7 -.1,1 -.6,.4 -1.1,0 -.9,.4 -1.1,.8 -1.4-.6 .1-.5 -.5,.2 -.9,.7 -3-.8 -.6-.6 -.4-1.3 -.5-.4 -1-.1 .3-.5 -.2-.7 -.5,.7 -.9,.2 .6-.6 .5-1.1 -.1-.7 -.8,.9 -.6,.3 -.4,.8 -.8-.4 0-.6 -1.1-1.1 .2-.2 -1.3-.6 -.7,0 -1-.5 -1.8,.1 -2.4,.7 -1-.1 -1,.5 -.9,.3 -.5,.9 -1.5,.1 -.9-.2 -1.4,.2 -.6,.5 -.3,0 -1,.6 -1.4-.1 -1.6-.8 0-.6 .5-.1 .3-1.3 -.1-.6 -.5-1 -.2-1.1 -.4-1 -.4-.4 -.2-.8 -.5-.8 .3,0 -.4-.9 .8,.7 0-.5 -.8-1.4 .4-1.3 -.1-.6 .4-.7 .1,.7 .4-.7 .9-.3 1.2-.8 .7,0 1.4-.4 .5-.3 .5,0 1.1-.3 .5-.5 .3-.5 .5-.5 .1-.9 .7-.9 .4,.9 .5-.2 -.4-.5 .3-.5 .5,.2 .1-.7 1.3-1.4 1.4-.4 .7,.5 .6,.6 1.2,.1 -.2-.6 1.2-1.9 .6-.3 .5,.1 .9-.2 0-.5 -.8-.3 .6-.2 1.2,.7 1.7,.4 1.2-.3 .5,.5 -1.6,2.3 .1,.3 .8,.6 .8,.3 1.2,.9 .8,.3 .2,.3 .9,.3 .7-.3 .8-2.4 -.2-1.3 .2-1.3 .4-1.4 .4-.3 .4,1.1 .6,1zM2.1,10.5l.3,.3 -.7,0 -.4-.6zM-39.3,10.2l-.4,.1 -1.3-.7 .9-.2 .9,.6zM0.9,9.9l-1-.1 -.2-.6 .7,.2zM1.7,9.6l-.2,.2 -.7-.9 -.2-.6 .3,0zM-35.6,10.1l-.8,.3 0-.5 .4-.6 1-.4 .1-.2 1.9-.4 0,.4 -1.9,.7zM-42.1,8.1l.4,.3 .6-.1 .2,.4 -1.8,.3 -.6,0 .4-.5 .5-.1zM-37.1,8.1l-.1,.6 -1.5,.2 -1.4-.1 0-.4 .8-.2 .6,.3 .7,0zM-0.1,8.3l-.8-.2 -.9-.7 .2-.1 1.2,.7zM-51.4,6.8l1.9,.1 .3-.4 1.8,.4 .4,.7 1.5,.2 1.2,.6 -1.1,.4 -1.1-.5 -2,0 -2.1-.6 -1.1,.1 -1.8-.4 -.2-.5 -.9,0 .7-1 1.2,.1 1.2,.4zM-25.3,6.2l-.5,.7 -.1-.8 .4-.7zM-4.1,6.8l-.3,.1 -.9-1 -.2-.8 1.5,1.4zM-8,5.5l-1.8,.8 -.5,0 -1.4-.6 .1-.3 1.4,.1 .3-.5 .1,.5 .6,0 .8-.7 -.1-.6 .8,.1 0,.6zM-32.8,3.5l-.3,.3 -.7-.2 -.2-.4 1-.1zM-29.5,3.1l.3,.8 -.8-.5 -2.1,0 .2-.6 1.3,0zM-6.9,4.5l-.3,.3 -.4-1 -1-.8 -.7-.3 .2-.2 1.3,.7 .8,.8zM-25.9,1.2l.3,1.6 1.1,.6 .8-1.1 1.1-.6 .9,0 1.6,.7 1.1,.2 1.7,.7 1.9,.6 1.2,1 .2,.6 1.6,.6 .3,.5 -.9,.1 .2,.7 .9,.6 .6,1.1 .6,0 0,.4 .7,.2 -.3,.2 1.1,.4 -.1,.3 -.7,.1 -.2-.3 -1.9-.3 -1.3-1.2 -.6-.8 -1.3-.5 -1.4,.6 .1,.8 -.8,.3 -1.6-.2 -.9-.8 -1-.2 -.2,.3 -1.3,0 .4-.8 .7-.3 -.3-1.1 -.5-.8 -1.9-.9 -.8,0 -1.5-1 -.3,.5 -.4,.1 -.2-.8 -.8-.5 1.1-.3 .7,0 -.1-.3 -1.5,0 -.4-.6 -.9-.2 -.4-.5 1.4-.2 .5-.3 1.6,.4zM-34.8,-1.4l-.8,1 -.7,.2 -1-.2 -1.6,0 -.9,.2 -.2,.7 .9,.9 .6-.4 1.8-.4 0,.5 -.5-.2 -.4,.6 -.9,.4 1,1.3 -.2,.3 .9,1.2 0,.6 -.6,.3 -.4-.3 .5-.8 -1,.4 -.1-.7 -.7-.6 .1-1 -.7,.3 .1,2.6 -.6,.2 -.4-.3 .3-.9 -.2-1 -.4,0 -.3-.7 .4-.7 .1-.7 .7-2 .9-.7 .8,.3 1.2,.1 1.2,0 1-.7zM-31.3,-1.1l-.1,.8 -.5-.1 -.1,.7 .4,.5 -.3,.1 -.4-.6 -.3-1.3 .2-.8 .3-.4 .1,.6 .6,.1zM-54.2,5.9l-1.1,0 -.8-.9 -1.3-.8 -1.2-1.4 -1.3-2.1 -.8-.9 -.7-1.6 -.9-.7 -.5-.8 -.8-.6 -1-1.1 -.1-.5 2.2,.3 .9,.9 1.3,1.1 .9,1.1 1.1,0 .8,.7 .6,.8 .7,.5 -.4,.8 1,.4 .5,1.2 .7,.1 .5,.7 -.2,1.2zM-42.1,-1.8l1.1,.9 -1.2,.1 -.3,.7 0,.9 -.9,.7 -.1,1 -.4,1.5 -.1-.3 -1.1,.4 -.4-.6 -.7-.1 -.5-.3 -1.2,.4 -.4-.5 -1.5-.1 -.1-1.3 -.5-.3 -.5-.8 -.1-.9 .1-.9 .6-.7 .7,.3 .8-.2 .2-.8 1.6-.4 1.2-1.4 2-1.6 .5-.8 .4,0 .5,.5 .1,.4 1.5,.6 -.1,.4 -.7,0 .2,.5 -.7,.4 -.6,.9 .7,.9zM-33.6,-8.4l.1,1.2 -.3,.9 -.4-1 -.4,.5 .3,.8 -.3,.4 -1.2-.6 -.3-.7 .3-.5 -.6-.4 -.3,.4 -.5-.1 -.7,.6 -.2-.3 .4-.8 1.2-.7 .3,.5 .8-.3 .2-.5 .7,0 -.1-.8 .8,.5zM-78.8,-6.2l-.9,.2 -.4-.8 -.2-1.4 .4-1.6 .7,.5 1,1.8 -.2,1zM139.1,-10.1l-.9,.1 .1-.8 .8-.1zM-36,-10.3l-1,1.3 -.6-.7 .4-.6 .1-.6 .6,0 -.2,.6 .8-.9zM-41.5,-9.3l-1.3,.9 .5-.7 1.3-1.3 .5-1 .2,.8 -.7,.6zM-38.1,-11.9l.6,.3 .6,0 0,.4 -1.1,.8 0-1zM-34.5,-12.2l.3,1.2 -.8-.3 .3,.9 -.5,.3 0-.7 -.3-.1 -.2-.6 .6,.1 0-.4 -.6-.8 .9,.1zM-38.5,-13.1l-.2,.9 -1-1.3 .9,.1zM-38.7,-18.5l.6,.3 .3-.3 0,.7 .3,.7 -.2,.8 -.6,.4 -.2,.8 .2,.8 1,0 1.3,.5 -.1,.6 .3,.2 -.1,.5 -.8-.5 -.4-.6 -.2,.4 -.7-.6 -.9,.2 -.5-.3 .4-.6 -.4,.1 -.5-.6 -.2-1.4 .4,.4 .1-1.6 .3-.9zM134.4,-18.2l-.2,.2 -1.4,.1 .1-.6 1.3,.1zM123.1,-17.9l-.3,.2 -1.1-.5 .5-.3 .9,.1 .7,.5zM127.4,-19.9l.9,.2 .9-.2 .8,.3 .2,.3 .6,0 .9,.7 -.4,.4 -.5-.2 -.8,0 -.5,.2 -.5-.1 -.4,.7 -.3-.4 -.7-.2 -1.1,0 -.4,.2 -.6-.3 .1-.4 1.7,.3 .4-.3 -.5-.4 0-.4 -.6-.1 .2-.3zM-49.7,-18.7l-.8,.5 -.8-.3 -.1-.9 .5-.4 1.1-.3 .6,0 .2,.4zM44.5,-19.1l-.4,0 -.2-.6 .3-.5 .6,.2 .4,.5zM120.3,-22.8l.4,.4 1-.1 1.8,1.3 .9,.2 -.1,.3 .8,0 .7,.4 -.1,.2 -1.3,.2 -.7-.1 -1.5,.1 .7-.5 -1-.3 -.6-.9 -.6,0 -1.2-.4 -1.3-.2 -.4-.2 .4-.2 -1-.1 -1.3,.8 -.9,0 .8-.7 .9-.4 1-.2 1.7,.1zM122.5,-23.8l-.3,.1 -.6-.9 .2-.6 .3,0 .4,.9zM-38.8,-22.8l-.5,.8 -.5-.8 -.1-.8 .6-.9 .8-.8 .5,.3zM122.2,-26.6l-1.1,.2 -.1-.4 1.2,0zM123,-26.6l-.2,.7 -.1-.6 -.5-.5zM-25.4,-34.1l.2,.3 -.6,.6 -.4-.3 -.5,.2 -.3,.6 -.6-.3 0-.5 .5-.6 .6,.2 .4-.5zM-125.4,-35.7l-.7,.5 .1,.2 -1,.4 -.5-.1 -.2-.4 .6-.3 .8,0zM-136.3,-35.7l.5,.3 .8,0 1.3,.1 -.1,.3 -1.5,.1 0-.2 -1.2-.2zM-144.5,-38.2l-.3,.8 -.1,.8 -.8-.4 -1.9-.6 .2-.5 1.1,.1zM-150.8,-41.2l.6,.7 -.1,1.3 -.5,0 -.4,.3 -.4-.3 0-1.2 -.2-.6 .5,.1zM-19,-37.1l-.4,.8 .2,.5 -.5,.7 -1.3,.4 -1.8,.1 -1.4,1.1 -.7-.3 0-.8 -1.8,.2 -1.1,.5 -1.2,0 1,.8 -.7,1.6 -.6,.5 -.5-.4 .2-.9 -.6-.3 -.4-.7 1-.3 .5-.6 1-.6 .7-.6 2-.3 1.1,.2 1-1.8 .7,.5 2-1.4 .7-1.2 -.2-1.2 .4-.6 1.1-.2 .5,1.4 0,.8 -.9,1zM-150.4,-42.2l-.4,.8 -.4-.2 -.3-.7 .2-.3 .7-.4zM-16.1,-44.2l.7,.2 .7-.4 .2,1.1 -1.4,.3 -.9,1 -1.6-.7 -.5,1.1 -1.1,0 -.2-1 .5-.7 1.1-.1 .3-1.4 .3-.8 1.1,1.1zM136.3,-46.5l1.7,.1 -.9,.4 -1.2-.4 -.3-.3 .4-.3zM138.2,-49.1l-.5,0 -1.3-.3 -.9-.5 .3-.1 1.3,.3 1.1,.4zM76.5,-48.5l-.5,.1 -1.7-.4 -.3-.4 -.8-.3 -.2-.3 -1.1-.2 -.3-.8 1.7,.4 .9,.1 .9,.8 1,.4zM143.9,-50.7l-.7,.9 .7-.3 .6,.2 -.3,.3 .9,.3 .4-.3 1,.4 -.3,.7 .7-.2 .5,1.2 -.5,.8 -1.1-.1 .2-.8 -.2-.2 -1.2,.9 -.6,0 .7-.5 -1-.2 -3,0 -.1-.3 .6-.4 -.4-.2 .8-.6 1-1.6 .7-.6 .8-.3 .5,0zM67.3,-54l1-.1 -.4,1.1 .9,.8 -.4,0 -1.5-1.2 -.1-.8zM-16.4,-50.7l1.1,1.7 -1.5-.3 -.6,1.4 .9,1.1 0,.7 -.8-.6 -.6,.7 -.2-.8 .1-1 -.1-1.1 .2-.7 .1-1.4 -.6-.9 .1-1.4 .9-.5 -.4-.4 .5-.2 .6,1.7 -.1,.9zM-166.8,-52.3l-1.8,.6 -1.4-.1 .8-1.1 -.5-1 2.1-1.2 .9-.1 1,.6 -.5,.7 .2,.7zM-147.3,-55.6l-.6,.8 -1.1-.6 -.1-.4 1.5-.3zM47,-57.1l-1,.4 -.5-.3 -.2-.5 1.5-.5 .6,.1 .5,.3zM-163,-58.6l-1.1,1 2.1-.1 -.2,.8 -.9,.9 1,.1 1,1.3 .7,.1 .9,1.6 1.2,.2 -.1,.6 -.6,.3 .4,.5 -.9,.5 -1.3,0 -1.7,.3 -.5-.2 -.6,.5 -.9-.1 -.7,.3 -.6-.2 1.5-1 .9-.2 -1.6-.2 -.3-.4 1.1-.3 -.6-.5 .2-.7 1.5,.1 .2-.6 -.7-.6 -1.2-.2 -.3-.3 .4-.4 -.3-.3 -.6,.5 0-1 -.6-.5 .4-1 .8-.8 .8,0zM34.4,-59.9l-.6,.1 -1.3-.4 1-.2 .8,.1zM120.7,-62.2l-.4,.6 -.7-.4 .5-.4zM118.1,-62.7l-1.2,.5 -.7,0 -.2-.3 .8-.4 1.3,0zM28.3,-63.8l.6,.2 .6-.1 1.8,.4 -.8,.3 -1.2-.4 -1.1,0zM114.8,-65.7l.2,.5 .5-.2 .6,.3 2.3,.6 0,.5 .8-.1 .7,.4 -.9,.3 -1.5-.3 -.6-.4 -1,.5 -1.4,.5 -.4-.5 -1.3,.1 .8-.5 .5-1.7zM180,-63.7l-2.8-.3 1-.4 -2.2-.5 1.8-.2 0-.3 -2.1-.2 .6-.7 1.6-.1 1.5,.7 .6-.2 0,2.2zM-180,-65.9l.9-.4 1.3,.3 1.6-.5 1.7,0 -.2,.7 1.1,.7 -1.3,.7 -3.8,.9 -1.3-.2 0-2.2zM124.1,-67.1l-1.1,0 -.2-.5 .4-.5 .9-.2 .8,.3 -.1,.6zM20,-69l2.5,.8 2.6,1 -.1,.6 .7,.3 -.3-.8 2.7,.2 2,.9 -1,.5 -1.6,.1 -.1,.9 -.4,.2 -.9,0 -.8-.3 -1.3-.3 -.2-.5 -1-.1 -1.2,.1 -.5-.3 .2-.4 -1.2,.2 .5,.5 -.6,.4 -1.3,.5 -1.3-.1 .9,.5 .6,.8 .5,.3 -.2,.7 -1.8-.2 -2.8,.7 -.9,.1 -3,1.4 -.4,.4 -1.4-.7 -2.6,.8 -.5-.4 -.9,.5 -1.4-.2 -.3,.7 -1.2,1 .1,.4 1.1,.2 -.1,1.4 -1,.1 -.4,.8 .4,.4 -1.7,.6 -.4,1.1 -1.5,.2 -.3,1.1 -1.4,.9 -.4-.7 -1-3.7 .5-1.4 .9-.6 0-.4 1.6-.3 1.7-1.2 1.8-1 1.8-.8 .8-1.5 -1.2,.1 -.6,.9 -2.6,1.1 -.8-1.3 -2.6,.4 -2.5,1.6 .8,.7 -2.2,.2 -1.5,.1 0-.7 -1.5-.2 -1.3,.5 -3-.1 -3.3,.3 -3.2,1.9 -3.9,2.4 1.6,.1 .5,.6 1,.2 .6-.5 1.1,.1 1.4,1.1 .1,.9 -.8,1 -.1,1.2 -.4,1.6 -1.5,1.4 -.4,.7 -3.3,2.9 -1.4,.6 -.6,0 -.6-.5 -1.9,1 -.7,.7 0,.7 -1.1,.7 -1.1,.4 -.1,.6 1,.6 .8,1.2 .3,.6 0,1.2 -.4,.5 -.9,.2 -.8,.4 -.9,.1 -.1-.5 .2-.8 -.5-1 .8-.2 -.7-.8 -1-.2 -.5-.2 .7-1.3 -1.1-.5 -1.4,.3 -.8,.4 -1,.3 .5-.5 -.2-.4 .8-.6 -.6-.5 -.8,.3 -1.2,.7 -.6,.6 -1,.1 -.5,.5 .6,.6 .8,.2 0,.5 .8,.2 1.1-.7 .9,.4 .7,0 .1,.6 -1.4,.2 -.5,.6 -.9,.5 -.5,.7 1,.5 .4,1 1.3,1.7 0,.8 -.6,.2 .2,.6 .6,.3 -.4,1.6 -.6,.1 -1.5,2.4 -.9,1.2 -2.8,1.7 -1.1,.1 -.6,.5 -.4-.3 -.6,.4 -1.4,.5 -1,.2 -.4,1.1 -.5,0 -.3-.7 .3-.4 -1.4-.3 -.5,.1 -1.3,.9 -.8,.9 -.2,.7 1.7,2.4 .9,.6 .6,.8 .4,1.9 -.1,1.7 -.8,.7 -1.2,.6 -.8,.9 -1.2,.9 -.4-.6 .3-.7 -.8-.6 -.8-.1 -.9-1.6 -.9-.4 -.9,0 .2-.8 -.9,0 -.1,1.1 -.8,2.3 0,.8 .7,0 .4,.9 .2,.9 .5,.5 .6,.2 1.4,1.2 .4,.6 -.1,1.2 .2,.9 .4,.3 .3,1.2 -.7,.1 -2.1-1.6 -.1-.5 -.6-.6 -.1-.9 -.4-.5 .1-.7 -.6-.8 -.2-.5 -1-1.1 -.2,.6 -.2-.5 .5-1.6 -.1-.8 .3-.7 -.4-.6 .1-1.1 -.4-.5 -.3-1.2 -.2-1.3 -.4-.8 -1.8,1.2 -1.2-.3 .3-1.3 -.2-.9 -.8-1.2 .2-.3 -.6-.2 -1-1.3 -.3-1 -.4-.6 -.9,0 .1,.4 -.3,.6 -1.3-.3 -.1,.4 -1.9,.2 0,.8 -.5,.5 -1.4,.7 -1.2,1.2 -1.7,1.3 0,.4 -1.4,.6 -.5,.1 -.3,.8 .3,2.1 -.4,.9 0,1.7 -.6,.1 -.4,.8 .3,.3 -.9,.3 -.4,.6 -.4,.3 -.9-.9 -.9-2.4 -.8-1.4 -.5-1.9 -.9-1.4 -.7-3.2 0-1.2 -.2-1 -1.4,.6 -.7-.1 -1.3-1.2 .4-.4 -.3-.3 -1.1-.9 -.8-.2 -.3-.8 -.7-.7 -1.9,.2 -1.6,0 -1.4,.1 -3-.5 -1.1-.1 -.4-1.3 -.5-.1 -.8,.1 -1,.5 -1.2-.3 -1-.8 -1-.3 -.6-.9 -.8-1.3 -.5,.1 -.7-.3 -.3,.4 -.6-.1 .1,.7 .7,1.6 1.4,1 -.1,.8 .7,1.1 -.1-.7 .6-.6 .3,.3 -.2,1.2 .4,.6 .8-.2 1.4,.1 2.4-2.3 -.1,.7 .1,.8 .4,.7 .6,.3 1.3,.3 1.1,1.3 -.5,.9 -.4,.3 -.4,.7 -.5-.1 -.3,.8 .1,.6 -1.2,.5 -.3,.7 -.6,0 -.4,.7 -.5,.3 -.6-.1 -.6,.3 -1.2,.3 -.2,.8 -1,.4 -1.6,.5 -.9,.7 -.8,0 -.5,.4 -1.8,.3 -.6,.6 -1.5,.1 -.2-1.2 -.4-1 -.2-2 -.4-.7 -.5-.3 -.6-.9 -.3-.8 -.7-.7 -.4-.1 -.7-1 0-1.3 -.6-1.1 -1-.6 -.3-.8 -.9-1.5 -1.2-1.5 -.5,0 .4-1.3 -.4,.3 -.2,.8 -.5,.7 -.8-.8 -.7-1.5 .3,1.2 .6,1 .8,1.6 .7,1.1 .9,1.1 -.2,.8 1.4,1.1 .3,1 -.2,.2 .1,1 .4,1.2 .9,.6 .6,1.2 .3,.9 1.9,1.4 1.4,1.5 .7,.6 0,.4 -.6,.3 .8,.4 .6,.9 2.5-.4 1.8-.6 .9,0 1.8-.6 -.1,1.4 -.4,1.4 -1.1,2.4 -.9,1.5 -2,2.4 -1,.9 -1.5,.9 -1,.8 -1.1,1.2 -.4,.8 -1.3,.9 -.2,.7 -.5,1 -.4,.4 -.5,1.2 .1,.6 .6,.3 -.2,.9 0,.8 .8,1.6 .5,.7 -.1,1 .2,2.4 .2,.5 -.7,1.4 -.6,.6 -2.1,.9 -1.1,1.1 -1.5,1.1 -.1,.7 .5,.8 .2,.8 .2,0 0,1.6 -.6,.8 -2,.9 -.4,.3 .3,.5 -.4,2.1 -.3,.5 -.9,.6 -1.2,1.7 -1.9,1.7 -.7,.4 -1.7,.7 -.6-.1 -.5,.2 -1.1-.2 -1,.1 -1.1,.4 -.8,.1 -1.1,.4 -.7-.4 -.7-.5 .1-.6 -.4-.7 .3-.2 0-.7 -.6-1 -1.3-2.1 -.7-.8 -.4-.7 -.8-3.2 -.1-1.8 -.9-1.2 -.8-1.9 -.8-.9 -.2-1.4 .2-.9 .4-1.4 .5-1.3 .9-1.1 .1-1.3 -.3-.3 -.5-1.2 .3-.6 -.5-1.7 -.8-1.9 -.8-1 -1-1 -.7-.9 -.6-1 .7-2.1 -.2-.2 .5-1.9 -.4-.6 -.5-.2 -.4-.9 -1.8,.6 -.8-.1 -.5-.6 -.4-.7 -.7-.7 -1.6,0 -1.6,.4 -3.1,1.2 -.9-.3 -1.1-.2 -1.8,.2 -1.7,.7 -.5-.1 -1-.4 -1.8-1.3 -.6-.7 -1-.5 -.5-.5 -.3-1.1 -.9-1 -.5-.3 -.2-.7 -.9-.6 -.4,0 -.5-.7 -.2-1 .1-.4 -.4-.8 -.5-.3 .4-.2 .7-1.2 -.1-.6 .3-.5 .2-.9 -.3-1.5 .1-.5 -.8-.9 .1-.9 .7-.8 0-.3 .3-.7 .9-.8 .3-1.1 .4-.7 .6-.3 .7-1 .5-.4 .9-.1 1.3-1 .8-.8 -.2-1.3 .5-1.4 .6-.6 1.8-.9 1-1.7 .7,0 .6,.5 1-.1 1.4,.2 1-.5 1.1-.2 .6-.4 1-.3 3.3-.3 .5,.2 1-.4 1,0 .4,.2 .7,0 1.1-.5 .7,.2 0,.5 .8-.4 -.4,.7 0,.5 .3,.2 -.1,.9 -.6,.5 .1,.5 .6,0 .2,.5 1.6,.5 1.2,.1 1.3,.4 .5,.9 2.3,.6 1.1,.5 1-.7 -.3-.8 .3-.4 .8-.5 .6-.1 1.4,.2 .3,.4 1.7,.3 .3,.3 1.3,0 2.4,.7 1.2-.6 .9-.1 .7,.2 .3,.5 .2-.4 1.6,.3 .5-.2 .5-.9 .2-.7 .5-1.1 .5-.7 -.1-.8 .2-.4 -.3-.5 .4-.4 -.6,.1 -.9-.2 -.7,.6 -1.5,.1 -.8-.5 -1.1-.1 -.2,.4 -.7,.2 -1-.6 -1.1,0 -.6-1 -.7-.5 .5-.8 -.6-.5 1.1-.9 1.5-.1 .4-.7 1.9,.1 1.2-.6 1.2-.3 1.7,0 1.7,.7 1.4,.4 1.2-.2 .9,.1 1.2-.5 .1-.5 -.2-.6 -1.2-.5 -1.6-1.2 -1.2-.4 -.8-.5 .7-.2 .8-.8 -.5-.4 1.4-.4 0-.3 -1.7,.3 -.6,.3 -1,.1 -.8,.3 0,.6 .5,.3 1-.1 -.2,.4 -1.1,.2 -1.3,.5 -.6-.2 .2-.4 -1-.3 1.1-.6 -.3-.2 -1.6-.2 0-.4 -1,.1 -1.1,1.3 0,.3 -.8,.1 -.2,1.2 -.6,.4 -.3,.7 .4,1 .9,.3 -.2,.2 -1.2,.1 -1.2,.8 -.3-.6 -1.2-.1 -1.2,.2 .7,.6 -1.1,.1 -.5-.5 -.2,.2 .3,.6 .5,.5 -.4,.2 1,.8 0,.5 -.9-.2 .3,.5 -.6,.1 .4,.9 -.7,0 -.8-.4 -.6-1.5 -.9-1 -.2-.6 -.6-.4 -.1-.4 .2-1 -.6-.6 -2.9-1.2 -.8-.7 -.3-.9 -.6-.1 -.3,.4 -.3-.3 .2-.5 -.8-.1 -.8,.3 0,.8 .3,.5 .9,.5 .5,.8 1.1,.8 .8,0 0,.5 1.6,.6 .9,.5 -.1,.6 -.6-.5 -.8-.1 -.4,.6 .7,.4 -.1,.5 -.5,.1 -.5,.8 -.4,.1 .4-1.1 -.7-1 -.7-.6 -.6-.2 -.5-.4 -.7-.1 -.8-.4 -1.6-1.2 -.3-1 -1.3-.5 -1.1,.6 -.4,.1 -.9,.6 -1.9-.3 -1.5,.3 -.1,1.2 -.9,.7 -1.3,.2 -.7,.9 -.4,.8 .4,.6 -.6,.4 -.2,.7 -.7,.2 -.7,.7 -2.3,0 -1,.8 -.5-.1 -.6-.9 -1-.2 -.4,.3 -1-.1 .2-.8 -.1-.6 -.7-.4 .1-.7 .4-.4 .2-1 -.2-.7 0-1.1 -.4-.4 1.4-.7 1.2,.1 1.4,0 1.1,.2 2.4,0 .5-.6 .2-2 -1-1.1 -.8-.5 -1.5-.4 -.1-.7 1.3-.2 1.7,.3 -.3-1.2 .9,.5 2.3-.8 .3-.8 1.7-.4 .5-.3 .9-1.5 1.4-.4 .8,0 .2-.2 .8,0 .2,.2 .7-.5 -.3-1 -.4-.5 0-1 .4-.6 .9-.1 1.2-.5 -.2,1.1 .5,.1 -.5,.3 -.8,.7 .3,.9 1,.2 0,.4 1.1-.2 .5-.3 1.1,.4 .5,.3 .7-.3 2.8-.8 1,.2 .1,.3 1,0 .2-.5 1.4-.3 -.2-.8 0-.8 .5-.6 .9-.4 .8,.8 .8,0 .3-1.4 -.3,.1 -.7-.3 -.1-.6 1.3-.3 1.3-.1 1,.2 1.1-.1 1.1-.5 -1-.5 -1.8,.1 -1.8,.3 -1.6,.3 -.6-.6 -1-.3 .2-1 -.4-.9 .4-.6 .9-.6 2.3-1.1 .7-.2 -.1-.4 -1.4-.5 -1.7,.3 -1,.7 .2,.6 -1.6,.8 -2,.9 -.7,1.4 .7,.7 1,.5 -.9,1.1 -1.1,.3 -.4,1.7 -.5,.9 -1.2-.1 -.6,.8 -1.2,0 -.3-.9 -.8-1.1 -.8-1.5 -.6-.6 -2,1.2 -1.3,.2 -1.4-.5 -.4-1.1 -.3-2.3 .9-.6 2.7-.9 1.9-1 1.9-1.4 2.4-1.9 4.4-2 2.2-.5 1.6,.1 1.5-.8 1.9,0 1.8-.2 3.1,.7 -1.3,.3 1.1,.6 1-.3 1.7,.6 2.7,.2 3.8,1.2 .8,.4 0,.7 -1.1,.5 -1.6,.3 -4.5-.8 -.7,.2 1.6,.7 .1,1.5 2.1,.5 .1-.4 -.6-.5 .7-.3 2.4,.6 .8-.3 -.6-.7 2.3-1 .9,.1 1,.3 .5-.7 -.8-.6 .5-.6 -.7-.6 2.8,.4 .5,.5 -1.2,.1 0,.6 .7,.3 1.6-.2 .2-.6 5.6-1.4 .8,.1 -1,.6 1.2,.1 .7-.3 1.9-.1 1.5-.4 1.1,.6 1.2-.6 -1.1-.6 .6-.4 2.9,.4 1.4,.3 3.6,1.1 .7-.5 -1-.5 -.1-.3 -1.2-.1 .4-.4 -.6-1.1 1.8-.9 .7-.9 .7-.2 2.7,.2 .2,.6 -1,.8 .7,.3 .3,.7 -.2,1.4 1.1,.6 -.5,.7 -1.9,1.4 1.1,.1 .4-.3 1.1-.3 .3-.5 .9-.5 -.6-.5 .4-.7 -1.1-.1 -.2-.5 .8-1 -1.3-.8 1.8-.7 -.2-.7 .5-.1 .5,.6 -.4,1 1.1,.1 -.5-.7 1.7-.4 2.1,0 1.8,.6 -.9-.9 -.1-1 1.8-.3 2.4,.1 2.1-.1 -.8-.6 1.2-.6 1.1,0 2-.5 2.6-.2 .3-.2 2.7-.1 .8,.2 2.2-.5 1.9,0 .2-.5 1-.4 2.4-.4 1.7,.3 -1.4,.3 2.3,.1 .2,.5 1-.2 2.9,0 2.2,.5 .8,.4 -.2,.5 -1.1,.3 -2.6,.5 -.8,.3 2.7,.4 .9-.2 .5,.7 .5-.3 1.6-.2 3.2,.2 .2,.5 4.2,.1 .1-.7 2.1,.1 1.6,0 1.6,.6 .5,.6 -.6,.4 1.2,.8 1.6,.4 1-1 1.6,.4 1.7-.3 1.9,.4 .7-.3 1.7,.1 -.8-.9 1.4-.4 9,.6 .9,.6 2.6,.8 4-.2 2,.1 .8,.4 -.1,.8 1.2,.3 1.4-.2 1.8-.1 1.8,.2 1.9-.1 1.8,.9 1.2-.3 -.8-.7 .5-.4 3.1,.3 2.1-.1 2.9,.5zM-110.9,-41.3l.5,.7 .8,.3 -.8,.1 -.4,1.2 -.3,.2 .3,1.2 .9,.2 .7,.5 1.5,.2 1.5-.3 -.1-.9 .2-1.1 -.8-.3 .3-.7 -.7,0 .2-.9 1,.3 .8-.4 -.7-.6 -.3-.5 -.8,.2 -.1,.8 -.4-.9 .3-.4 -.2-.4 -1.2-.3 -.4-.9 -.6-.3 0-.3 1,.1 0-.7 .9-.2 .8,.1 .2-.9 -.2-.7 -1,.1 -.8-.2 -1.2,.4 -.9,.2 -.5,.6 -.9,.2 -1,1 .9,.9 -.1,.7zM104.4,-69.1l-.7,.3 -1.3-.3 -.8,.1 -1.4-.4 .9-.3 .7-.4 1.6,.4zM20,-71.5l0,.7 -1.1,0 -.2-.3zM20,-71.5l1-.1 1.4,.3 -1.1,.4 -1.3,.1zM109.5,-69.5l0,1 1.3-.8 1.2,.7 -.3,.7 1,.7 1-.7 .7-.9 .1-1.1 2.9,.2 1.3,.5 .1,.5 -.8,.6 .7,.5 -.1,.5 -1.9,.7 -1.4,.1 -1.1-.3 -.3,.5 -.9,.9 -.3,.4 -1.2,.7 -1.4,.1 -.8,.4 -.1,.6 -1.1,.2 -1.3,.8 -1,1.1 -.4,.8 -.1,1.2 1.5,.1 .9,1.7 1.4-.2 1.9,.4 1,.4 .7,.5 1.2,.3 1.1,.4 2.7,.2 -.1,.8 .3,1 .7,1.1 1.5,1 .8-.3 .5-1.1 -.5-1.5 -.7-.6 1.6-.4 1.1-.7 .6-.7 -.1-.7 -.7-.9 -1.2-.7 1.2-1.1 -.5-.9 -.3-1.5 .7-.3 2.7,.4 .9-.2 2.1,.9 .3,.4 1.8,0 0,.9 .3,1.2 .9,.2 .7,.6 1.5-.6 1-1.1 .6-.4 .8,.9 2.4,2.4 -.4,.7 1.3,.5 .9,.6 1.6,.3 .7,.3 .4,.8 .7,.2 .4,.3 .1,1.2 -1.4,.7 -1.7,.3 -1.2,.9 -1.7,.1 -2.2-.2 -2.5,.1 -.8,.7 -1.3,.4 -1.5,1.4 -1.1,.9 .8-.2 1.6-1.3 2.1-.8 1.5-.1 .9,.5 -.9,.6 .6,1.9 1.3,.5 1.7-.2 1-1.1 0,.7 .7,.4 -1.2,.6 -2.3,.6 -.9,.4 -1.2,.8 -.7-.1 -.1-.9 1.8-.8 -2.7,.2 .1,.3 -1,.5 -2.1,.6 -.7,.8 0,.6 .3,.5 .5,.2 -2.9,.4 -.8,.3 1.5-.2 .3,.2 -1.4,.3 -.7,0 -.2,.9 -.7,.8 -.6-.6 .4,1.1 -.8,1.2 .2-.7 -.5-.4 -.2-.8 -.1,.4 .2,.8 0,.9 .3,.1 .3,1.3 -.7,.8 -1,.3 -.7,.6 -.5,0 -.6,.7 -1.1,.7 -1,1.1 -.2,.7 .5,1.5 .5,.7 0,.5 .4,1.1 0,1.1 -.3,.6 -.8,0 -.5-.7 -1.2-2 .2-.7 -.2-.5 -.8-.8 -.4-.2 -1,.5 -.7-.6 -.6-.2 -1.1,.1 -.9-.1 -1.2,.2 .2,1 -1.5,.1 -.7-.6 -.9,.1 -.7-.2 -1.5,.3 -.9,.8 -1,.4 -.8,.9 .1,1.2 .2,.3 -.6,1.6 -.2,1.9 .5,1 .2,.8 .7,.7 .6,1.1 1.1,.2 .4,.5 3-.8 .6-.4 .5-1.7 1.8-.5 1.4,0 .3,.7 -.6,.5 0,.8 -.4,1.2 -.3-.2 -.3,2 -.5,.6 .8,.2 .2-.2 1.5,.1 .4-.2 1.6,.2 1.3,.8 -.1,.7 -.4,1.2 .1,.7 -.4,1 .5,1 1.2,1.2 .8,.4 1.5-.5 .3-.3 1.5,.4 .7,.5 .6,.1 .7-.7 .4-.1 .2-1.2 .6-.5 .7-.2 .8,.1 1.2-.8 .4-.4 .7,.3 -.3,.6 -.5,.1 .3,.4 0,.6 -.5,.5 .4,.8 .4,0 .3-.8 -.4-.3 0-.8 1.2-.4 -.1-.4 .4-.4 .3,.7 .7,.1 .7,.5 0,.3 2,0 .5,.4 .8,.1 .6-.5 2.4-.1 -.8,.3 .3,.5 .8,0 .8,.5 .1,.8 .5,0 1.1,.6 .6,.7 0,.5 .4,0 1,.8 1.2,.2 .9-.2 2.1,.6 1.6,1.2 .8,2.3 .5,.2 .1,.7 -.8,.8 .3,.3 1.8,.1 0,1 .8-.6 1.2,.3 1.7,.7 .5,.5 -.2,.6 1.2-.3 1.9,.5 1.5,0 1.5,.8 1.3,1.1 .7,.3 .9,0 .4,.4 .5,1.8 -.4,1.7 -.5,.6 -1.4,1.4 -.7,1.2 -.7,.8 -.3,.1 -.3,.7 .1,1.9 -.4,2.2 -.3,.4 -.2,1.3 -1,1.3 -.1,1 -.9,.5 -.2,.6 -1.1,0 -1.5,.4 -.8,.4 -1.1,.3 -1.1,.8 -.9,1 -.1,.7 .1,.6 -.4,1.5 -.7,.5 -1.1,1.8 -1.6,1.2 -.4,1 -.7,.6 -.4,.6 -1.1,.6 -.8-.2 -.5,.1 -.9-.5 -.7,.1 -.6-.6 -.1,.5 1.3,.9 -.2,.7 .7,.4 -.1,.5 -.9,1.3 -1.5,.5 -2,.2 -1.1-.1 .2,.6 -.2,.8 .2,.5 -.6,.3 -1.1,.2 -.9-.4 -.4,.3 .1,1 .7,.3 .5-.4 .3,.6 -.9,.3 -.8,.6 -.1,1 -.3,.5 -.9,0 -.8,.6 -.3,.7 1,.7 1,.2 -.4,.9 -1.2,.6 -.6,1.2 -.9,.4 -.4,.4 .3,1.1 .6,.6 -1.3-.1 -1.3,.6 -.2,.9 -.4,.1 -1.2-.4 -1.1-.7 -1.2-.5 -.4-.7 .3-.6 -.5-.6 -.1-1.7 .4-1 1.1-.8 -1.5-.3 .9-.8 .3-1.7 1.2,.4 .5-2.1 -.7-.3 -.3,1.3 -.6-.2 .6-3.3 .5-.6 -.3-1 -.1-1.1 .4-.1 1.3-3.2 .5-1.5 -.3-1.5 .3-.8 -.1-1.2 .6-1.3 .2-1.9 .6-4.3 -.1-1.6 -.2-1.5 -1-.5 -.1-.4 -1.9-1 -1.8-1.1 -.8-.7 -.4-.8 .1-.3 -.8-1.3 -1-1.8 -.9-2 -.8-1.2 -1.5-1.1 .4-.4 -.5-1 .3-.7 .8-.6 .5-.7 -.2-.5 -.4,.5 -.6-.5 .2-.2 -.1-.9 .3-.2 .6-1.3 -.1-.4 1.2-.6 .5-1.2 .5-.1 .8-1.1 -.4-.3 .2-.6 -.2-.9 .2-.2 -.2-.9 -.7-.8 -.2-.6 .2-.2 -.9-.7 -1.4,.9 .5,.6 -.9,.3 -.2-.6 -.4,.1 -.2-.4 -1.3-.1 -.7-.5 .1-.4 -1.3-.7 -.2,.2 -.7-.5 .1-1 -1-1 -1-.8 .4-.1 -.5-.4 -.7,.2 -1.3-.3 -.8-.4 -.6,0 -1-.6 -1.2-1.1 -1.3-.6 -.6,.1 -1.3,.4 -1.4-.4 -.9-.5 -.8-.1 -1.1-.5 -1.1-.7 -1.6-.4 -.4-.4 -1.1-.6 -.7-1.1 .4-1 -.7-1.4 -.9-1 -1-.7 -.5-.7 -1-.6 .1-.6 -1.1-.8 -.2-.7 -.6,0 -1-1.1 -1-1.8 .1-.4 -.8-.4 -.9-.2 -.1,.4 .2,1.2 1.7,1.8 .2,.6 1.2,1.1 .3,1 .6,.9 0,.5 .5,0 .8,.9 -.6,.6 -.3-.6 -.7-.6 -1.2-.7 -.1-1.3 -1.2-.8 -1-.3 -.6-.6 .5,0 .4-.9 -.7-.7 -.6-.3 -1.2-2 -.6-1.4 -1.2-1 -.9-.3 -1-.1 -.3-.8 -1-1 -.8-1.4 -1.2-1.4 -.2-.8 -.5-.5 .2-.8 0-.9 -.3-.8 .4-.9 .2-1.8 -.2-1.4 -.6-1.3 .1-.2 1.5,.4 .5,.9 .3-.3 -.2-.8 -.5-.8 -2.6-1.4 -1.8-.4 -.6-.9 .2-.6 -1.3-.5 -.2-.8 -1.2-.7 0-.5 -1.5-.7 -.2-.9 -1.3-.8 -.6-.9 -2.5-.1 -1.2-.3 -2.1-1 -2.7-.6 -1.4,.1 -1.9-.5 -1.2-.4 -1.1,.2 .2,.7 -1.7,.3 -.9,.3 -1.1,.2 -.2-.5 .5-1 1.1-.3 -.3-.3 -1.3,.6 -.7,.6 -1.4,.7 .7,.5 -.9,.8 -2.1,.7 -.3,.4 -1.5,.5 -.3,.5 -1.2,.4 -.7,0 -2.8,.9 -1.7,.3 -.1-.2 2-.7 1.1-.6 1.2-.1 .5-.4 1.4-.6 1-.6 .1-.7 .6-.6 -1.2,.3 -.3-.2 -.6,.4 -.6-.5 -.3,.3 -.4-.5 -1,.4 -.6,0 .1-.9 -.6-.4 -1.3,.2 -1.5-.7 -.1-.6 -.7-.4 .4-.6 .8-.5 .3-.5 .8-.1 .7,.1 .8-.4 .8,0 .7-.3 -.2-.4 -.5-.2 .7-.4 -1.7,.2 -.3,.3 -.7-.3 -1.5,.2 -1.4-.3 -.4-.4 -1.3-.6 1.4-.4 2.2-.5 .8,0 -.1,.5 2.1,0 -.8-.6 -1.2-.4 -.7-.5 -1-.4 -1.4-.4 .6-.5 1.8,0 1.2-.5 .3-.5 1-.4 1-.1 1.9-.5 .9,.1 1.5-.6 1.5,.3 .8,.4 .4-.2 1.7,.1 -.1,.2 1.6,.2 1-.1 2.1,.3 1.9,.1 .8,.1 1.3-.2 1.5,.3 3,.4 1.6,.5 1,.1 .9-.4 1.2-.3 1.5,.1 1.5-.4 1.6-.3 .7,.4 .7-.2 .3-.5 .7,.1 1.6,.9 1.4-.7 .1,.8 1.2-.2 .4-.3 1.2,.1 1.6,.4 3.7,.6 1-.1 1.3,.5 -1.4,.5 1.8,.2 2.7-.1 .9-.2 1,.6 1.1-.5 -1-.4 .6-.4 2.1-.1 .8,.2 1,.6 1.1-.1 1.7,.5 1.6-.2 1.5,0 -.2-.6 .9-.2 1.6,.4 0,.9 .6-.8 .8,0 .5-1 -1.1-.6 -1.2-.4 .1-1.1 1.2-.7 1.3,.1 1,.5 1.4,1.1 -.9,.5zM85.8,-73.1l-.5,.4 2.3-.3 1.3,.5 1.2-.5 .9,.4 .8,.9 .5-.4 -.7-1 .9-.1 1,.1 1.1,.4 .9,1.7 3.5,1 -.1,.4 -1.6,.1 .6,.4 -.3,.3 -1.8-.1 -1.8-.3 -1.1,.1 -1.9,.3 -4.3,.3 -.6-.5 -1.3-.3 -.9,.1 -1.2-.8 2.2-.2 1.4,0 1.3-.2 -1.9-.2 -3.6,.1 -.5-.4 2.3-.4 -1.6,0 -1.7-.3 .8-.7 .7-.4 2.7-.6zM95.5,-73.4l-.9,.6 -1.5-.7 .3-.1 1.3,0zM123.7,-73.1l0,.3 -2.1-.1 -1.1,.2 -1.4-.6 .1-.4 .4-.1 2.3,.1zM113.4,-73.2l.8,.7 .9-.8 2.6-.5 1.7,1.1 -.2,.6 2-.3 1-.4 2.2,.6 1.4,.4 .1,.5 1.9-.3 1,.7 2.4,.4 .9,.4 .9,.9 -1.8,.5 2.3,.6 1.6,.3 1.5,.9 1.5,0 -.3,.7 -1.7,1.2 -1.2-.4 -1.6-1 -1.3,.1 -.1,.6 1,.6 1.4,.5 .4,.2 .6,1 -.3,.7 -1.3-.2 -2.5-.8 2.5,1.4 .1,.4 -2.7-.4 -2.1-.6 -1.2-.5 .3-.3 -2.9-1 0,.3 -2.9,.2 -.9-.4 .7-.7 1.9,0 2-.2 -.3-.3 .4-.5 1.2-1 -.6-.8 -1.5-.5 -2.1-.3 .7-.2 -1.1-.7 -.9,0 -.8-.4 -.5,.3 -1.8,.2 -3.6-.3 -3.8-.4 -.8-.4 1-.4 -1.4,0 -.3-1 .8-.9 1-.4 2.6-.3zM99.6,-73.8l1.2,.2 1.8-.2 .3,.3 -1,.5 1.6,.4 -.2,.9 -1.7,.4 -.9-.1 -.7-.3 -2.5-.8 0-.3 2.1,.1 -1.1-.7zM-16.4,-73.2l-1.5,0 -2.2-.2 .9-.4 1.3-.1 1.4,.4zM106.8,-72.8l-1.1,.8 -1.1-.1 -.6-.8 0-.5 .5-.5 1-.2 2.1,0 1.9,.2 -1.5,.9zM79.5,-71.4l-2.6,.5 -.5-.4 -2.3-.6 1.1-1.1 .9-.7 -1-.6 3.4-.1 1.4,.2 2.5,0 2.1,.7 -1.3,.3 -2.4,.7 -1.3,.7zM-9.3,-75.1l-1.1,.4 -1.6-.1 -1.9-.4 .3-.3zM106.4,-75l-.6,.4 -1.4-.1 -1.2-.2 .5-.5 1.4-.2zM-14.9,-75.6l-.8,.8 -3.7,0 -1.6,.2 -2-.7 .5-.6 1.3-.2 2.7,0zM101.5,-76.7l.8,.4 0,.6 -.5,.7 -1.6,.1 -1.1-.2 0-.5 -1.6,0 -.1-.7 1.1,0 1.5-.3 1.4,0zM91.8,-76.2l.4,.4 .9-.2 1,0 .2,.5 -.6,.5 -3.4,.1 -2.5,.5 -1.5,0 -.2-.3 2.1-.5 -4.5,.2 -1.4-.2 1.4-1 .9-.3 2.8,.4 1.8,.6 1.7,0 -1.4-.9 .9-.4 1,.1zM-102.5,-70.7l-.6,.1 -3.2-.2 -.3-.4 -1.8-.3 -.1-.5 1-.2 -.1-.6 2-.8 -.9-.2 2.4-.8 -.3-.5 2.3-.5 3.3-.7 3.3-.1 1.7-.4 2-.1 .7,.4 -.7,.3 -3.6,.5 -3,.4 -3.1,1 -3.1,1.9 .2,.9zM105.3,-77.1l1.1,.3 2,0 .9,.3 -.3,.4 1.8,.5 2.8,.1 1.6-.2 2-.1 1.7,.1 1,.4 .3,.4 -.7,.2 -1.4,.3 -1.3-.2 -2.9,.2 -2,0 -1.7-.1 -2.6-.3 -.5-1.1 -1-.4 -2.1-.1 -1.1-.4 .4-.4zM83.8,-77.6l-.1,.7 -.8,.4 -.9,0 -1.9,.4 -1.6,.2 -1.4-.2 1.7-.8 2.1-.6 1.5,0zM106.2,-77.5l-2.4-.1 -.2-.2 2,0zM89.8,-77.7l-1.9,.3 -1.4-.3 .8-.4 1.4-.1 1.4,.2zM-135.3,-77.9l-2.2,.5 -1.8-.3 .7-.2 -.6-.4 2.1-.2 .4,.4zM90.3,-78.6l-1.2,.2 -1.6,0 1-.5zM104.2,-78.1l-1.5,.3 -.8-.3 -.5-.8 1.8,.1 1.2,.4zM99.9,-78.3l.4,.4 -1.6-.1 -1.6-.3 -2.3-.1 1-.3 -1.2-.2 -.1-.4 2,.1 2.7,.4zM-54.9,-78.3l-5.7,.4 1.9-1.3 1.5-.1 2.6,.6zM-141.7,-79.7l3.2,.7 -2.5,.4 -.5,.8 -.9,.2 -.5,.8 -1.2,0 -2.1-.6 .9-.3 -1.5-.3 -2-.9 -.8-.8 2.8-.3 .5,.3 1.4,0 .4-.3 1.5-.1zM-134.6,-80.4l2,.3 -1.5,.6 -2.9,.1 -2.9-.2 -.2-.2 -1.4-.1 -1.1-.4 3.1-.3 1.4,.2 1-.3zM-108.9,-80.5l-2.2,.2 -.1,.1 -1.2,.2 -1.1-.2 .6-.4 -2.3,0 2-.2 1.5,0 .2,.3 1.5-.4 1.5,.2zM-60.1,-78.9l-2.1,.1 -2.8-.2 -1.7-.4 -.8-.7 -1.3-.2 2.6-.7 2.1-.3 2,.6 2.3,.9zM113,-79.7l1.2,.4 -1.4,.3 -1.8,.7 -1.8,.1 -2.1-.1 -1.1-.5 .1-.3 .8-.3 -1.9,0 -1.1-.3 -.6-.5 1.4-.7 1-.1 -.4-.2 2.3-.1 1.3,.6 3.3,.4zM131.5,-83.1l2.7,.1 2.1,.1 1.8,.3 0,.2 -2.4,.5 -2.5,.2 -.9,.2 2.2,0 -2.3,.6 -1.7,.3 -1.7,.8 -2,.2 -.7,.2 -3,.1 1.4,.1 -.7,.2 .8,.5 -.9,.3 -1.6,.3 -.5,.4 -1.4,.3 .2,.2 1.7,0 0,.2 -2.7,.6 -2.6-.3 -2.9,.2 -3.4-.2 -.1-.5 1.8-.2 -.5-.7 .7-.1 2.6,.5 -1.3-.7 -1.7-.2 .8-.4 1.8-.2 .3-.3 -1.4-.4 -.4-.6 2.7,.1 .8,.1 1.6-.4 -2.3-.1 -3.5,.1 -1.8-.4 -.8-.4 -1.2-.3 -.2-.3 1.5-.2 3.1-.2 1.5-.4 1.2,.1 1.1,.3 .8-.6 3.1-.2 3-.1 .6,.1 2.9-.1zM-180,-81.6l4.2-.3 3,.2 .6,.4 -4.1,.7 -.5,.3 -3.2,.1 0-1.4zM180,-80.2l0,3.3 -1.7,.3 1.7,.5 0,.9 -.7,0 .7,.5 0,.4 -1.6,.1 1.2,.4 -.4,.3 -1.4,.2 -1.4,0 1.3,.7 0,.4 -2-.4 -.5,.3 1.4,.2 1.3,.6 .3,.8 -1.7,.2 -2-.9 .3,.6 -1.2,.6 4.1,.1 -2.7,.8 -2.7,.8 -3,.4 -1.1,0 -1,.4 -1.4,1 -2.2,.7 -.6,.1 -2.8,.4 -.9,.7 0,.7 -.5,.6 -1.6,.8 .4,.8 -1,1.8 -1.4,.1 -1.5-.9 -2,0 -.9-.5 -.7-1 -1.7-1.2 -.5-.7 -.2-.9 -1.4-.9 .4-.7 -.7-.4 1-1.2 1.5-.3 .4-.4 .2-.8 -1.7,.5 -.9,.1 -1.2-.3 -.1-.7 .4-.5 1,0 2,.2 -2.6-.9 -1,.1 -.8-.3 1.1-.9 -.6-.4 -2-1.7 -1.3-.4 0-.4 -2.7-.6 -2.1-.1 -5.1,.1 -1.2-.3 -1.7-.6 2.6-.3 2-.1 -4.2-.2 -2.3-.4 .1-.4 7.5-1 .4-.4 -2.7-.3 .9-.4 3.4-.7 1.5-.1 -.4-.5 2.3-.2 3.1-.2 3.1,0 1.1,.3 2.6-.5 2.4,.3 1.4,.1 2.1,.3 -2.4-.5 .1-.4 3.4-.6 3.5,0 1.3-.3 3.5-.1 8,.1 6.3,.8 -1.9,.4 -9.2,.1 .5,.2 3.5-.1 3.1,.3 1.9-.3 .8,.4 -1.1,.5 2.6-.3 .6-.1 0,1.4zM-180,-80.2l2.3,.1 -1.2,.7 -.8,.6 0,1.2 1.2,.6 -1.5,.1 0-3.3zM-180,-76.1l.2,0 .2,.9 -.4,0 0-.9zM-180,-74.7l.6,.4 -.6,0 0-.4z';
+  const VIEWS = { wide: { x0: -180, x1: 180, y0: -72, y1: 50 }, narrow: { x0: -72, x1: 96, y0: -56, y1: 44 } };
+  const WORLD = { x0: -180, x1: 180, y0: -76, y1: 58 };   // 可拖曳的範圍（北緯 76° ～ 南緯 58°）
+  let MV = VIEWS.wide;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  function proj(lon, lat, W, H) {
+    const x = ((lon - 160) % 360 + 540) % 360 - 180, y = -lat;
+    return { x: (x - MV.x0) / (MV.x1 - MV.x0) * W, y: (y - MV.y0) / (MV.y1 - MV.y0) * H, edge: x < MV.x0 || x > MV.x1 || y < MV.y0 || y > MV.y1 };
+  }
+  // 縮放狀態：每 15 秒重畫時保留，手勢進行中不重畫
+  const MAPZ = { k: 1, tx: 0, ty: 0, W: 0 };
+  let mapBusy = false, mapPending = null, mapUsed = false;
+  const coarse = matchMedia('(pointer: coarse)').matches;
+  function routeMap(container, table, flows, toPops) {
+    if (mapBusy) { mapPending = [container, table, flows, toPops]; return; }
+    container.textContent = ''; table.textContent = '';
+    const W = Math.max(320, Math.round(container.clientWidth || 900));
+    MV = W < 600 ? VIEWS.narrow : VIEWS.wide;
+    const H = Math.round(W * (MV.y1 - MV.y0) / (MV.x1 - MV.x0));
+    if (MAPZ.W !== W) Object.assign(MAPZ, { k: 1, tx: 0, ty: 0, W });
+    const svg = sv('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'CDN 原本分配的國外機房與改走的台灣節點（可縮放、拖曳）' });
+    const defs = sv('defs', {}, svg);
+    const s = W / (MV.x1 - MV.x0);
+    const tf = `matrix(${s} 0 0 ${s} ${-MV.x0 * s} ${-MV.y0 * s})`;
+    const sp = Math.max(4.5, W / 190);
+    const pat = sv('pattern', { id: 'mapdots', width: sp, height: sp, patternUnits: 'userSpaceOnUse' }, defs);
+    sv('circle', { cx: sp / 2, cy: sp / 2, r: Math.min(1.3, sp * .24), class: 'map-dot' }, pat);
+    const clipLand = sv('path', { d: LAND }, sv('clipPath', { id: 'landclip' }, defs));
+    const glow = sv('radialGradient', { id: 'twglow' }, defs);
+    sv('stop', { offset: '0', 'stop-color': 'var(--s1)', 'stop-opacity': .35 }, glow); sv('stop', { offset: '1', 'stop-color': 'var(--s1)', 'stop-opacity': 0 }, glow);
+    // 圖層：世界（跟著縮放）→ 點陣陸地（點大小固定）→ 弧線（跟著縮放、線寬固定）→ 標記與標籤（位置跟著縮放、大小固定）
+    const gBack = sv('g', {}, svg);
+    [0, 23.4, -23.4].forEach(lat => { const y = proj(0, lat, W, H).y; sv('line', { x1: -4 * W, x2: 5 * W, y1: y, y2: y, class: 'map-grat' + (lat ? '' : ' eq') }, gBack); });
+    sv('path', { d: LAND, transform: tf, class: 'map-land' }, gBack);
+    sv('rect', { width: W, height: H, fill: 'url(#mapdots)', 'clip-path': 'url(#landclip)' }, svg);
+    const gFront = sv('g', {}, svg);
+    const tw0 = proj(121, 23.7, W, H);
+    sv('circle', { cx: tw0.x, cy: tw0.y, r: Math.max(40, W * .07), fill: 'url(#twglow)' }, gFront);
+    const gArc = sv('g', {}, gFront), gMarks = sv('g', {}, svg);
+    const tip = tooltip(container);
+    container.insertBefore(svg, tip);   // 先放進 DOM，標籤才量得到寬度
+    const small = W < 600;
+    // 台灣終點：太近（縮小的世界圖）就合併成一個「台灣」節點
+    const tpe = proj(POPS.TPE[1], POPS.TPE[2], W, H), khh = proj(POPS.KHH[1], POPS.KHH[2], W, H);
+    const nTpe = (toPops && (toPops.TPE || 0) + (toPops.TSA || 0) + (toPops.RMQ || 0)) || 0, nKhh = (toPops && toPops.KHH) || 0;
+    const ends = Math.hypot(tpe.x - khh.x, tpe.y - khh.y) < 26 || !nKhh
+      ? [{ p: proj(121, 24, W, H), name: '台灣', n: nTpe + nKhh }]
+      : [{ p: tpe, name: '台北', n: nTpe }, { p: khh, name: '高雄', n: nKhh }];
+    // 同城市的多個機房代碼合併（例如 NRT / HND → 東京）
+    const byCity = new Map();
+    flows.filter(f => POPS[f.pop]).forEach(f => {
+      const k = POPS[f.pop][0]; const c = byCity.get(k) || { city: k, codes: [], count: 0, fixed: 0, lon: POPS[f.pop][1], lat: POPS[f.pop][2] };
+      c.codes.push(f.pop); c.count += f.count; c.fixed += f.fixed || 0; byCity.set(k, c);
+    });
+    const known = [...byCity.values()].sort((x, y) => y.count - x.count);
+    const max = Math.max(1, ...known.map(f => f.count));
+    // 已佔用的區塊（點與標籤），標籤放置時避開（以未縮放時的位置計算，放大後距離只會變大）
+    const boxes = [];
+    const inView = (x, y) => x >= 0 && x <= W && y >= 0 && y <= H;
+    const hits = (bx, edgeCheck) => (edgeCheck && (bx.x0 < 2 || bx.y0 < 2 || bx.x1 > W - 2 || bx.y1 > H - 2)) || boxes.some(o => bx.x0 < o.x1 && bx.x1 > o.x0 && bx.y0 < o.y1 && bx.y1 > o.y0);
+    const marks = [];   // { x, y, g, r, f? }
+    const mark = (x, y, r, f) => { const g = sv('g', {}, gMarks); const m = { x, y, g, r, f }; marks.push(m); return m; };
+    const pts = known.map((f, i) => {
+      const o = proj(f.lon, f.lat, W, H);
+      const r = (small ? 3 : 4) + 3 * Math.sqrt(f.count / max);
+      boxes.push({ x0: o.x - r, y0: o.y - r, x1: o.x + r, y1: o.y + r });
+      return { f, o, r, d: ends.length > 1 && i % 2 === 1 ? ends[1].p : ends[0].p };
+    });
+    ends.forEach(e => boxes.push({ x0: e.p.x - 8, y0: e.p.y - 8, x1: e.p.x + 8, y1: e.p.y + 8 }));
+    function label(m, rows, maxR) {
+      const px = m.x, py = m.y, lh = small ? 13 : 14.5;
+      const ts = rows.map(([txt, cls]) => { const t = sv('text', { class: cls }, m.g); t.textContent = txt; return t; });
+      const w = Math.max(...ts.map(t => t.getComputedTextLength())) + 2, h = rows.length * lh;
+      const dirs = [[1, 0], [-1, 0], [0, -1], [0, 1], [1, -1], [1, 1], [-1, -1], [-1, 1]];
+      const edgeCheck = inView(px, py);
+      for (const r of [maxR + 5, maxR + 22, maxR + 40]) for (const [dx, dy] of dirs) {
+        const x0 = dx > 0 ? px + r : dx < 0 ? px - r - w : px - w / 2;
+        const y0 = dy > 0 ? py + r : dy < 0 ? py - r - h : py - h / 2;
+        const bx = { x0, y0, x1: x0 + w, y1: y0 + h };
+        if (hits(bx, edgeCheck)) continue;
+        boxes.push(bx);
+        ts.forEach((t, i) => { t.setAttribute('x', x0 + 1 - px); t.setAttribute('y', y0 + lh * (i + 1) - 3.5 - py); });
+        if (r > maxR + 10) {   // 離太遠時拉一條引線
+          const lx = Math.max(x0, Math.min(x0 + w, px)), ly = Math.max(y0, Math.min(y0 + h, py));
+          m.g.insertBefore(sv('line', { x1: 0, y1: 0, x2: lx - px, y2: ly - py, class: 'map-lead' }), m.g.firstChild);
+        }
+        return true;
+      }
+      ts.forEach(t => t.remove()); return false;
+    }
+    pts.forEach(({ f, o, r, d }, i) => {
+      const mx = (o.x + d.x) / 2;
+      const len = Math.hypot(d.x - o.x, d.y - o.y) || 1;
+      const cy = Math.min(o.y, d.y) - Math.min(H * 0.32, len * 0.22);
+      const id = 'ar' + i;
+      const g = sv('linearGradient', { id, gradientUnits: 'userSpaceOnUse', x1: o.x, y1: o.y, x2: d.x, y2: d.y }, defs);
+      sv('stop', { offset: '0', 'stop-color': 'var(--s2)' }, g); sv('stop', { offset: '1', 'stop-color': 'var(--s1)' }, g);
+      const w = (small ? 1 : 1.2) + (small ? 3 : 4.5) * Math.sqrt(f.count / max);
+      const dPath = `M${o.x},${o.y} Q${mx},${cy} ${d.x},${d.y}`;
+      const arc = { fill: 'none', stroke: `url(#${id})`, 'stroke-width': w, 'stroke-linecap': 'round', 'vector-effect': 'non-scaling-stroke' };
+      sv('path', { d: dPath, ...arc, opacity: .28 }, gArc);
+      sv('path', { d: dPath, ...arc, 'stroke-dasharray': '6 22', class: 'flow', style: `animation-duration:${(2.6 - 1.2 * f.count / max).toFixed(2)}s` }, gArc);
+      const m = mark(o.x, o.y, r, f);
+      sv('circle', { r, fill: 'var(--s2)', stroke: 'var(--bg)', 'stroke-width': 2 }, m.g);
+    });
+    // 台灣節點（脈衝）與標籤：先放，確保一定看得到
+    const endMarks = ends.map(e => {
+      const m = mark(e.p.x, e.p.y, 7, null);
+      sv('circle', { r: 6, fill: 'var(--s1)', opacity: .5, class: 'pulse' }, m.g);
+      sv('circle', { r: 6, fill: 'var(--s1)', stroke: '#fff', 'stroke-width': 2 }, m.g);
+      return m;
+    });
+    ends.forEach((e, i) => label(endMarks[i], [[e.name + (e.n ? ' ' + compact(e.n) : ''), 'map-city tw']], 7));
+    // 依流量大到小放標籤；手機只標前幾名，其餘點一下看提示或數據表
+    const limit = small ? 6 : 14;
+    marks.filter(m => m.f).forEach((m, i) => {
+      if (i < limit && label(m, small ? [[m.f.city, 'map-city']] : [[m.f.city, 'map-city'], [m.f.codes[0] + ' · ' + compact(m.f.count), 'map-num']], m.r)) return;
+      // 放不下的小標籤：放大後才顯示（點與點的距離拉開了）
+      const t = sv('text', { class: 'map-city minor', x: m.r + 4, y: 4 }, m.g); t.textContent = m.f.city;
+    });
+    // 台灣節點畫在最上層
+    endMarks.forEach(m => gMarks.appendChild(m.g));
+
+    // ---------- 縮放與拖曳 ----------
+    const ext = { x0: (WORLD.x0 - MV.x0) * s, x1: (WORLD.x1 - MV.x0) * s, y0: (WORLD.y0 - MV.y0) * s, y1: (WORLD.y1 - MV.y0) * s };
+    const kMin = Math.min(1, W / (ext.x1 - ext.x0)), kMax = 12;
+    const Z = MAPZ;
+    function constrain() {
+      Z.k = clamp(Z.k, kMin, kMax);
+      const fit = (t, lo, hi) => lo > hi ? (lo + hi) / 2 : clamp(t, lo, hi);
+      Z.tx = fit(Z.tx, W - ext.x1 * Z.k, -ext.x0 * Z.k);
+      Z.ty = fit(Z.ty, H - ext.y1 * Z.k, -ext.y0 * Z.k);
+    }
+    let raf = 0;
+    function apply() {
+      raf = 0;
+      const zt = `translate(${Z.tx} ${Z.ty}) scale(${Z.k})`;
+      gBack.setAttribute('transform', zt); gFront.setAttribute('transform', zt);
+      clipLand.setAttribute('transform', `${zt} ${tf}`);
+      for (const m of marks) m.g.setAttribute('transform', `translate(${(m.x * Z.k + Z.tx).toFixed(1)} ${(m.y * Z.k + Z.ty).toFixed(1)})`);
+      svg.classList.toggle('zin', Z.k >= 2.2);
+      reset.hidden = Math.abs(Z.k - 1) < .01 && Math.abs(Z.tx) < 1 && Math.abs(Z.ty) < 1;
+    }
+    const redraw = () => { constrain(); if (!raf) raf = requestAnimationFrame(apply); };
+    function zoomAt(px, py, nk) {
+      nk = clamp(nk, kMin, kMax);
+      Z.tx = px - (px - Z.tx) * nk / Z.k; Z.ty = py - (py - Z.ty) * nk / Z.k; Z.k = nk;
+      redraw();
+    }
+    // 控制鈕
+    const ctl = el('div', 'map-ctl');
+    const btn = (txt, label, fn) => { const b = el('button', '', txt); b.type = 'button'; b.setAttribute('aria-label', label); b.addEventListener('click', fn); ctl.appendChild(b); return b; };
+    btn('+', '放大', () => zoomAt(W / 2, H / 2, Z.k * 1.6));
+    btn('−', '縮小', () => zoomAt(W / 2, H / 2, Z.k / 1.6));
+    const reset = btn('⟲', '回到原始大小', () => { Object.assign(Z, { k: 1, tx: 0, ty: 0 }); redraw(); });
+    container.appendChild(ctl);
+    const hint = el('div', 'map-hint' + (mapUsed ? ' off' : ''), coarse ? '雙指縮放 · 拖曳移動' : '滾輪縮放 · 按住拖曳');
+    container.appendChild(hint);
+    const used = () => { if (!mapUsed) { mapUsed = true; hint.classList.add('off'); } };
+
+    const toLocal = (e) => { const r = svg.getBoundingClientRect(); return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height }; };
+    function pick(p) {
+      let best = null, bd = Infinity;
+      for (const m of marks) {
+        if (!m.f) continue;
+        const d = Math.hypot(m.x * Z.k + Z.tx - p.x, m.y * Z.k + Z.ty - p.y);
+        if (d < Math.max(coarse ? 20 : 14, m.r + 6) && d < bd) { best = m; bd = d; }
+      }
+      return best;
+    }
+    function showTip(m) {
+      if (!m) { tip.style.opacity = 0; return; }
+      const r = svg.getBoundingClientRect();
+      tipRows(tip, `${m.f.city}（${m.f.codes.join(' / ')}）`, [[compact(m.f.count), '次查詢原本分配到這裡', 'var(--s2)'], [compact(m.f.fixed), '已驗證改走台灣', 'var(--s1)']]);
+      placeTip(tip, container, (m.x * Z.k + Z.tx) / W * r.width, (m.y * Z.k + Z.ty) / H * r.height);
+    }
+    // 指標事件：單指 / 滑鼠拖曳、雙指縮放；touch-action: none 讓手勢不會穿透成整頁捲動或縮放
+    const ptrs = new Map();
+    let g0 = null, moved = false;
+    function begin() {
+      const ps = [...ptrs.values()];
+      if (ps.length === 1) g0 = { p: ps[0], tx: Z.tx, ty: Z.ty };
+      else if (ps.length >= 2) {
+        const [a, b] = ps;
+        g0 = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, m: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, k: Z.k, tx: Z.tx, ty: Z.ty };
+      }
+    }
+    function end() {
+      mapBusy = false; svg.classList.remove('drag');
+      if (mapPending) { const a = mapPending; mapPending = null; setTimeout(() => !mapBusy && routeMap(...a), 400); }
+    }
+    svg.addEventListener('pointerdown', e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      try { svg.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      ptrs.set(e.pointerId, toLocal(e));
+      if (ptrs.size === 1) moved = false;
+      mapBusy = true; svg.classList.add('drag'); svg.style.cursor = ''; used();
+      begin();
+    });
+    svg.addEventListener('pointermove', e => {
+      if (!ptrs.has(e.pointerId)) {   // 滑鼠移過：顯示提示
+        if (e.pointerType === 'mouse') { const m = pick(toLocal(e)); svg.style.cursor = m ? 'pointer' : ''; showTip(m); }
+        return;
+      }
+      ptrs.set(e.pointerId, toLocal(e));
+      const ps = [...ptrs.values()];
+      if (ps.length === 1 && g0 && g0.p) {
+        const dx = ps[0].x - g0.p.x, dy = ps[0].y - g0.p.y;
+        if (!moved && Math.hypot(dx, dy) < 4) return;
+        moved = true; tip.style.opacity = 0;
+        Z.tx = g0.tx + dx; Z.ty = g0.ty + dy; redraw();
+      } else if (ps.length >= 2 && g0 && g0.d) {
+        moved = true; tip.style.opacity = 0;
+        const [a, b] = ps;
+        const d = Math.hypot(a.x - b.x, a.y - b.y) || 1, mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+        const nk = clamp(g0.k * d / g0.d, kMin, kMax);
+        Z.tx = mid.x - (g0.m.x - g0.tx) * nk / g0.k; Z.ty = mid.y - (g0.m.y - g0.ty) * nk / g0.k; Z.k = nk;
+        redraw();
+      }
+    });
+    const up = e => {
+      if (!ptrs.has(e.pointerId)) return;
+      const p = ptrs.get(e.pointerId);
+      ptrs.delete(e.pointerId);
+      if (ptrs.size) { begin(); return; }      // 雙指放開一指：接著用剩下那指拖曳
+      if (!moved && e.type === 'pointerup') showTip(pick(p));   // 點一下：顯示 / 收起提示
+      end();
+    };
+    svg.addEventListener('pointerup', up);
+    svg.addEventListener('pointercancel', up);
+    svg.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse' && !ptrs.size) { tip.style.opacity = 0; svg.style.cursor = ''; } });
+    svg.addEventListener('wheel', e => {
+      e.preventDefault(); used();
+      const p = toLocal(e);
+      const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      tip.style.opacity = 0;
+      zoomAt(p.x, p.y, Z.k * Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0018)));
+    }, { passive: false });
+    svg.addEventListener('dblclick', e => { const p = toLocal(e); zoomAt(p.x, p.y, Z.k * 2); });
+    // iOS Safari 的手勢事件：避免雙指觸發整頁縮放
+    ['gesturestart', 'gesturechange'].forEach(t => svg.addEventListener(t, e => e.preventDefault()));
+    constrain(); apply();
+    $('#mapNote').textContent = known.length ? '' : '資料累積中：驗證過的網站越多，這張圖越完整';
+    if (flows.length) {
+      const hr = el('tr'); ['原本機房', '查詢次數', '已改走台灣'].forEach(h => hr.appendChild(el('th', '', h))); table.appendChild(hr);
+      flows.forEach(f => { const tr = el('tr'); [(POPS[f.pop] ? POPS[f.pop][0] + ' ' : '') + f.pop, nf.format(f.count), nf.format(f.fixed)].forEach(v => tr.appendChild(el('td', '', v))); table.appendChild(tr); });
+    }
+  }
+
+  // ---------- CDN 環形儀表 ----------
+  const SHORT = { cloudflare: 'Cloudflare', cloudfront: 'CloudFront', fastly: 'Fastly', akamai: 'Akamai', gcore: 'Gcore', azure: 'Azure' };
+  const CDN_COLOR = { cloudflare: 'var(--s1)', cloudfront: 'var(--s2)', fastly: 'var(--s3)', akamai: 'var(--s4)', gcore: 'var(--s5)', azure: 'var(--s6)' };
+  function gauges(container, rows) {
+    container.textContent = '';
+    const useful = rows.filter(r => r.connections > 0);
+    if (!useful.length) { const e = el('div', 'card glass empty', '資料累積中：有人瀏覽 Cloudflare、CloudFront 等網站後就會出現'); container.appendChild(e); return; }
+    useful.forEach(r => {
+      const color = CDN_COLOR[r.provider] || 'var(--s7)';
+      const card = el('div', 'gauge glass');
+      const svg = sv('svg', { viewBox: '0 0 92 92', role: 'img', 'aria-label': `${r.label} 成功拉回 ${r.successRate === null ? '—' : pct(r.successRate)}` });
+      const C = 2 * Math.PI * 38;
+      sv('circle', { cx: 46, cy: 46, r: 38, fill: 'none', stroke: 'var(--track)', 'stroke-width': 8 }, svg);
+      const arc = sv('circle', { cx: 46, cy: 46, r: 38, fill: 'none', stroke: color, 'stroke-width': 8, 'stroke-linecap': 'round', transform: 'rotate(-90 46 46)', 'stroke-dasharray': `0 ${C}`, style: 'transition:stroke-dasharray 1.1s cubic-bezier(.2,.8,.2,1)' }, svg);
+      sv('text', { x: 46, y: 49, 'text-anchor': 'middle', class: 'ring-val' }, svg).textContent = r.successRate === null ? '—' : pct(r.successRate);
+      sv('text', { x: 46, y: 64, 'text-anchor': 'middle', class: 'ring-sub' }, svg).textContent = r.successRate === null ? '原本就在台灣' : '拉回台灣';
+      card.appendChild(svg);
+      const info = el('div');
+      const nm = el('div', 'name'); const sw = el('i'); sw.style.background = color; nm.appendChild(sw); nm.appendChild(document.createTextNode(SHORT[r.provider] || r.label)); info.appendChild(nm);
+      const dl = el('dl');
+      [['原本出國', pct(r.abroadShare)], ['拉回', compact(r.accelerated) + ' 次'], ['縮短', r.avgSavedMs !== null ? r.avgSavedMs + ' ms' : '—'], ['連線', compact(r.connections)]].forEach(([k, v]) => { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v)); });
+      info.appendChild(dl); card.appendChild(info);
+      container.appendChild(card);
+      requestAnimationFrame(() => requestAnimationFrame(() => arc.setAttribute('stroke-dasharray', `${(r.successRate || 0) * C} ${C}`)));
+    });
+  }
+
+  // ---------- 跨 CDN 備援 ----------
+  function crossCard(container, c) {
+    container.textContent = '';
+    if (!c || !c.explored) { container.style.display = 'block'; container.appendChild(el('div', 'empty', '資料累積中：有人瀏覽 Fastly 等在台灣沒有節點的網站後，系統會自動測試其他 CDN')); return; }
+    container.style.display = '';
+    const C = 2 * Math.PI * 50;
+    const svg = sv('svg', { viewBox: '0 0 120 120', class: 'ring', role: 'img', 'aria-label': `跨 CDN 成功 ${pct(c.successRate || 0)}` });
+    sv('circle', { cx: 60, cy: 60, r: 50, fill: 'none', stroke: 'var(--track)', 'stroke-width': 10 }, svg);
+    const arc = sv('circle', { cx: 60, cy: 60, r: 50, fill: 'none', stroke: 'var(--s7)', 'stroke-width': 10, 'stroke-linecap': 'round', transform: 'rotate(-90 60 60)', 'stroke-dasharray': `0 ${C}`, style: 'transition:stroke-dasharray 1.1s cubic-bezier(.2,.8,.2,1)' }, svg);
+    sv('text', { x: 60, y: 63, 'text-anchor': 'middle', class: 'ring-val' }, svg).textContent = pct(c.successRate || 0);
+    sv('text', { x: 60, y: 80, 'text-anchor': 'middle', class: 'ring-sub' }, svg).textContent = '找到台灣節點';
+    container.appendChild(svg);
+    requestAnimationFrame(() => requestAnimationFrame(() => arc.setAttribute('stroke-dasharray', `${(c.successRate || 0) * C} ${C}`)));
+    const info = el('div');
+    const lead = el('p', 'lead');
+    lead.appendChild(document.createTextNode('試過 ')); lead.appendChild(el('b', '', nf.format(c.explored)));
+    lead.appendChild(document.createTextNode(' 個網站，')); lead.appendChild(el('b', '', nf.format(c.ok)));
+    lead.appendChild(document.createTextNode(' 個也能走別家 CDN 的台灣節點；期間共 ')); lead.appendChild(el('b', '', compact(c.serves)));
+    lead.appendChild(document.createTextNode(' 次連線因此改走台灣'));
+    info.appendChild(lead);
+    const pairs = el('div', 'pairs');
+    const max = Math.max(1, ...c.pairs.map(p => p.count));
+    c.pairs.forEach(p => {
+      const row = el('div', 'pair'); row.title = `${p.fromLabel} → ${p.toLabel}：${nf.format(p.count)} 次`;
+      const l = el('div', 'lbl');
+      const i1 = el('i'); i1.style.background = CDN_COLOR[p.from] || 'var(--s7)'; l.appendChild(i1); l.appendChild(document.createTextNode(SHORT[p.from] || p.fromLabel));
+      l.appendChild(el('span', 'arrow', ' → '));
+      const i2 = el('i'); i2.style.background = CDN_COLOR[p.to] || 'var(--s7)'; l.appendChild(i2); l.appendChild(document.createTextNode(SHORT[p.to] || p.toLabel));
+      row.appendChild(l);
+      const bw = el('div', 'bar-wrap'); bw.style.display = 'flex'; bw.style.alignItems = 'center'; bw.style.gap = '8px';
+      const bar = el('div', 'bar'); bar.style.cssText = `height:10px;border-radius:0 4px 4px 0;min-width:3px;background:${CDN_COLOR[p.to] || 'var(--s7)'};width:${Math.max(2, p.count / max * 74)}%`;
+      bw.appendChild(bar); bw.appendChild(el('span', 'val', compact(p.count) + ' 次')); bw.lastChild.style.cssText = 'font:12.5px var(--mono);color:var(--text-2)';
+      row.appendChild(bw); pairs.appendChild(row);
+    });
+    if (!c.pairs.length) pairs.appendChild(el('div', 'cap', '已找到可用的網站，等有人連線後就會出現轉換次數'));
+    info.appendChild(pairs);
+    const chips = el('div', 'chips');
+    c.byFrom.forEach(f => { const ch = el('span', 'chip'); ch.appendChild(document.createTextNode(`${SHORT[f.provider] || f.label} 網站 `)); ch.appendChild(el('b', '', `${f.ok}/${f.explored}`)); chips.appendChild(ch); });
+    c.byTo.forEach(t => { const ch = el('span', 'chip'); ch.appendChild(document.createTextNode(`可改走 ${SHORT[t.provider] || t.label} `)); ch.appendChild(el('b', '', String(t.sites))); chips.appendChild(ch); });
+    info.appendChild(chips);
+    container.appendChild(info);
+  }
+
+  // ---------- 排行 ----------
+  function rank(container, rows, { label, value, valueText, color = 'var(--s1)' }) {
+    container.textContent = '';
+    if (!rows.length) { container.appendChild(el('div', 'empty', '資料累積中')); return; }
+    const max = Math.max(...rows.map(value), 1);
+    rows.forEach((r, i) => {
+      const row = el('div', 'rank-row'); row.title = `${label(r)}：${valueText(r)}`;
+      row.appendChild(el('span', 'n', String(i + 1).padStart(2, '0')));
+      row.appendChild(el('span', 'name', label(r)));
+      const bw = el('div', 'bar-wrap'); const bar = el('div', 'bar'); bar.style.background = typeof color === 'function' ? color(r) : color; bar.style.width = Math.max(2, value(r) / max * 74) + '%';
+      bw.appendChild(bar); bw.appendChild(el('span', 'val', valueText(r))); row.appendChild(bw);
+      container.appendChild(row);
+    });
+  }
+
+  // ---------- 資料載入 ----------
+  let range = 'today', last = null;
+  $$('.seg button').forEach(b => b.addEventListener('click', () => {
+    range = b.dataset.range;
+    $$('.seg button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    load();
+  }));
+
+  function render(s) {
+    const t = s.totals, o = s.opportunity;
+    const rangeName = range === 'today' ? '今天' : `近 ${s.days} 天`;
+    // 頂部即時計數（今天）
+    if (range === 'today') {
+      countTo($('#k-acc'), o.accelerated);
+      countTo($('#k-blk'), t.blocked);
+      $('#k-blk-h').textContent = t.queries ? `佔查詢 ${pct(t.blockRate, 1)}` : '廣告與詐騙';
+    }
+    const rtLast = s.realtime.slice(-2, -1)[0] || { queries: 0 };
+    countTo($('#k-qpm'), rtLast.queries);
+    // 迷你走勢：最近 30 分鐘
+    const pts = s.realtime.slice(-31, -1).map(d => d.queries);
+    const sp = $('#spark'); sp.textContent = '';
+    if (pts.length > 1) {
+      const mx = Math.max(1, ...pts);
+      const line = pts.map((v, i) => `${(i / (pts.length - 1) * 100).toFixed(1)},${(20 - v / mx * 17).toFixed(1)}`).join(' ');
+      sv('polygon', { points: `0,22 ${line} 100,22`, fill: 'var(--s1)', opacity: .15 }, sp);
+      sv('polyline', { points: line, fill: 'none', stroke: 'var(--s1)', 'stroke-width': 1.6, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round' }, sp);
+    }
+
+
+    // 機會成本
+    if (o.connections) {
+      $('#oppHead').innerHTML = '';
+      const h = $('#oppHead');
+      h.appendChild(document.createTextNode(`${rangeName}，一般 DNS 會把 `));
+      h.appendChild(el('em', '', pct(o.otherDnsAbroadShare)));
+      h.appendChild(document.createTextNode(' 的 CDN 連線送出國；這裡只剩 '));
+      h.appendChild(el('strong', '', pct(o.oursAbroadShare)));
+      $('#oppSub').textContent = `共比對 ${nf.format(o.connections)} 次 CDN 連線，其中 ${nf.format(o.wouldGoAbroad)} 次原本會出國，${nf.format(o.accelerated)} 次成功改走台灣節點。`;
+    } else {
+      $('#oppHead').textContent = '資料累積中…';
+      $('#oppSub').textContent = '有人瀏覽 Cloudflare、CloudFront 等 CDN 網站後，這裡就會開始比對。';
+    }
+    countTo($('#o-acc'), o.accelerated);
+    $('#o-ms').textContent = o.avgSavedMs !== null ? o.avgSavedMs + ' ms' : '—';
+    $('#o-sec').textContent = o.totalSavedSec ? (o.totalSavedSec >= 120 ? (o.totalSavedSec / 60).toFixed(1) + ' 分鐘' : o.totalSavedSec + ' 秒') : '—';
+    $('#vs-other').textContent = o.connections ? pct(o.otherDnsAbroadShare) + ' 出國' : '—';
+    $('#vs-ours').textContent = o.connections ? pct(o.oursAbroadShare) + ' 出國' : '—';
+    requestAnimationFrame(() => {
+      $('#vs-other-bar').style.width = (o.connections ? Math.max(1, o.otherDnsAbroadShare * 100) : 0) + '%';
+      $('#vs-ours-bar').style.width = (o.connections ? Math.max(1, o.oursAbroadShare * 100) : 0) + '%';
+    });
+
+    routeMap($('#map'), $('#mapTable'), s.flows || [], s.toPops || {});
+    gauges($('#gauges'), s.routing || []);
+    crossCard($('#cross'), s.crossCdn);
+
+    // 即時 60 分鐘
+    const fmtHM = (ms) => new Date(ms).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false });
+    lineChart($('#rt'), s.realtime, [
+      { key: 'queries', name: '查詢', color: 'var(--s1)' },
+      { key: 'accelerated', name: '拉回台灣', color: 'var(--s3)' },
+      { key: 'blocked', name: '攔截', color: 'var(--s2)' }
+    ], { xLabel: (d) => fmtHM(d.t), height: 200 });
+
+    // 去向
+    const oc = s.outcomes; const tot = oc.cache + oc.upstream + oc.ads + oc.malware;
+    const parts = [['快取直接回應', oc.cache, 'var(--s1)'], ['問上游解析', oc.upstream, 'var(--s7)'], ['擋下廣告追蹤', oc.ads, 'var(--s2)'], ['擋下惡意詐騙', oc.malware, 'var(--s8)']];
+    const st = $('#stack'); st.textContent = ''; const lg = $('#stackLegend'); lg.textContent = '';
+    if (tot) parts.forEach(([n, v, c]) => { if (!v) return; const d = el('div'); d.style.background = c; d.style.flexGrow = v; d.title = `${n}：${nf.format(v)}（${pct(v / tot, 1)}）`; st.appendChild(d); });
+    parts.forEach(([n, v, c]) => { const d = el('div'); const i = el('i'); i.style.background = c; d.appendChild(i); d.appendChild(document.createTextNode(n)); d.appendChild(el('b', '', tot ? pct(v / tot, 1) : '—')); lg.appendChild(d); });
+    $('#outCap').textContent = `${rangeName}共 ${nf.format(tot)} 次查詢`;
+
+    const trend = s.trend.length > 2 ? s.trend.slice(0, -1) : s.trend;
+    lineChart($('#trend'), trend, [{ key: 'queries', name: '查詢', color: 'var(--s1)' }, { key: 'blocked', name: '攔截', color: 'var(--s2)' }], { xLabel: (d, full) => full ? d.date : d.date.slice(5).replace('-', '/') });
+    const tb = $('#trendTable'); tb.textContent = '';
+    if (trend.length) {
+      const hr = el('tr'); ['日期', '查詢', '攔截', '攔截率'].forEach(h => hr.appendChild(el('th', '', h))); tb.appendChild(hr);
+      [...trend].reverse().forEach(d => { const tr = el('tr'); [d.date, nf.format(d.queries), nf.format(d.blocked), d.queries ? pct(d.blocked / d.queries, 1) : '—'].forEach(v => tr.appendChild(el('td', '', v))); tb.appendChild(tr); });
+    }
+    rank($('#cdnRank'), s.cdn, { label: r => r.label, value: r => r.count, valueText: r => pct(r.share, 1), color: r => CDN_COLOR[r.provider] || 'var(--s7)' });
+    rank($('#siteRank'), s.topSites, { label: r => r.site, value: r => r.count, valueText: r => compact(r.count) });
+    rank($('#blockRank'), s.topBlocked, { label: r => r.site, value: r => r.count, valueText: r => compact(r.count), color: 'var(--s2)' });
+    $('#sitesCap').textContent = `至少 ${s.privacy.minClients} 位不同使用者造訪過`;
+    const sys = s.system; const rules = sys.rules ? sys.rules.custom + sys.rules.lists : 0;
+    $('#privacy').textContent = `統計只保存匿名數字，不含 IP 或個人紀錄 · 過濾規則 ${nf.format(rules)} 條 · 上游 DNS ${sys.upstreams} 組${sys.benchmarkAt ? '（每日體檢 ' + new Date(sys.benchmarkAt).toLocaleDateString('zh-TW') + '）' : ''} · 已連續運作 ${Math.floor(s.system.uptimeSec / 3600)} 小時 · 更新於 ${new Date(s.generatedAt).toLocaleTimeString('zh-TW', { hour12: false })}`;
+  }
+
+  async function load() {
+    const body = $('#statsBody'); body.classList.add('loading');
+    try {
+      last = await (await fetch('/api/public/stats?range=' + range)).json();
+      render(last);
+      if (range !== 'today') {
+        // 頂部計數永遠顯示今天
+        const today = await (await fetch('/api/public/stats?range=today')).json();
+        countTo($('#k-acc'), today.opportunity.accelerated);
+        countTo($('#k-blk'), today.totals.blocked);
+      }
+    } catch (e) { $('#oppHead').textContent = '統計暫時無法載入'; }
+    body.classList.remove('loading');
+  }
+  load();
+  setInterval(() => { if (!document.hidden) load(); }, 15000);
+  let rt; addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => last && render(last), 200); });
+})();
+</script>
+</body>
+</html>

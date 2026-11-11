@@ -1,0 +1,333 @@
+# ==============================================================
+# 自訂過濾規則：最高原則，永遠優先於所有訂閱清單（白名單 @@ 也會蓋過清單）
+#
+# 分類段落（選用）：用註解標記把一段規則歸到某個分類，統計會分開計算；
+# 段落外的規則算「自訂」。標記本身是註解，AdGuard Home 也能直接讀。
+#   ! @begin 廣告      （或 遙測、惡意；也可以寫 ads、telemetry、malware）
+#   ||ads.example.com^
+#   ! @end
+# ==============================================================
+# ==============================================================
+# 🟢 ADGUARD DNS 完整白名單 (終極完美版 - 兼顧防遺失、功能與省電)
+# ==============================================================
+# ==============================================================
+# 📍 【防遺失 (Find My)、導航與秒定位 (A-GPS) 必備】(重要)
+# ==============================================================
+# [解鎖原因] gs-loc 與 spot-pa 負責 Apple/Google 的「尋找我的裝置」，封鎖將導致手機遺失時無法定位。
+# cl/gsp/qcc/supl 為導航星曆，解鎖可解決導航冷啟動需等 3~5 分鐘與嚴重耗電問題。
+@@||gs-loc.apple.com^
+@@||spot-pa.googleapis.com^
+@@||cl*.apple.com^
+@@||gsp*.apple.com^
+@@||gsp-ssl.ls.apple.com^
+@@||gsploc.apple.com^
+@@||configuration.apple.com^
+@@||qcc.qualcomm.com^
+@@||supl.google.com^
+@@||xtra*.gpsonextra.net^
+@@||epo.mediatek.com^
+# ==============================================================
+# ✂️ 【剪映 / 字節跳動 相關服務】
+# ==============================================================
+# [解鎖原因] 剪映 SVIP 驗證與素材載入核心，阻擋會導致 VIP 失效或無法登入。
+@@||pc-mon.zijieapi.com^
+@@||effect.snssdk.com^
+# ==============================================================
+# 🍔 【麥當勞 APP 相關服務】
+# ==============================================================
+# [解鎖原因] 麥當勞 APP 對 Firebase 與特定廣告追蹤依賴極高，若擋下會導致 APP 卡在載入畫面或點擊閃退。
+@@||app-measurement.com^
+@@||adc.tamedia.com.tw^
+@@||gmal.app^
+@@||mcdonalds.com^
+@@||vmobapps.com^
+# ==============================================================
+# 💳 【金融支付 (全盈 PlusPay) 與 電商防盜刷風控】
+# ==============================================================
+# [解鎖原因] 支付軟體需驗證裝置 GPS；Riskified 與 Forter 為主流電商防盜刷系統。
+@@||geomobileservices-pa.googleapis.com^
+@@||userlocation.googleapis.com^
+@@||recommendationv2.api.useinsider.com^
+@@||img.riskified.com^
+@@||forter.com^
+@@||taiwanlottery.com.tw^
+@@||fugle.tw^
+# ==============================================================
+# 🛒 【各大網購電商 (淘寶 / 蝦皮 / 91APP / 外送)】
+# ==============================================================
+# [解鎖原因] 維持淘寶圖片載入與防護盾、蝦皮首頁 UI 與防機器人驗證、91APP 台灣電商跳轉，以及餓了麼外送平台前端資源正常運作。
+@@||taobao.com^
+@@||alibaba.com^
+@@||aliyun.com^
+@@||alicdn.com^
+@@||ynuf.aliapp.org^
+@@||mum.alibabachengdun.com^
+@@||mum.alibabachengdun.net^
+@@||umdc.alibabachengdun.com^
+@@||restsdk.amap.com^
+@@||ccms.shopee.io^
+@@||patronus.idata.shopeemobile.com^
+@@||track.91app.io^
+@@||cube.elemecdn.com^
+@@||h5-data.elemecdn.com^
+@@||h5.ele.me^
+@@||cbu-search-app.cn-shanghai.log.aliyuncs.com^
+@@||ali-ctf.cn-hangzhou.dualstack.log.aliyuncs.com^
+@@||ali-ctf-req.cn-hangzhou.dualstack.log.aliyuncs.com^
+# ==============================================================
+# 🗺️ 【地圖圖資、路況與 Google 時間軸】
+# ==============================================================
+# [解鎖原因] 防誤殺 Google/Apple 衛星地圖與路況，並維持室內 Wi-Fi 地理位置匹配 (如不需要時間軸可刪除後五行)。
+@@||mt*.google.com^
+@@||khm*.google.com^
+@@||gspe*-ssl.ls.apple.com^
+@@||locationhistory-pa.googleapis.com^
+@@||locationhistoryaggregates-pa.googleapis.com^
+@@||footprints-pa.googleapis.com^
+@@||semanticlocation-pa.googleapis.com^
+@@||geolocation.googleapis.com^
+# ==============================================================
+# 💬 【社群媒體 (Meta & LINE) 核心功能】
+# ==============================================================
+# [解鎖原因] 維持 FB/IG 貼文載入、第三方網站「使用 FB 登入」功能，以及 LINE 的基本傳訊、貼圖下載與語音通話功能。
+@@||graph.facebook.com^
+@@||graph-fallback.facebook.com^
+@@||b-graph.facebook.com^
+@@||b-graph-fallback.facebook.com^
+@@||web.facebook.com^
+@@||web-fallback.facebook.com^
+@@||ep2.facebook.com^
+@@||connect.facebook.net^
+@@||graph.instagram.com^
+@@||graph-fallback.instagram.com^
+@@||gateway.instagram.com^
+@@||test-gateway.instagram.com^
+@@||obs.line-scdn.net^
+@@||obs-tw.line-apps.com^
+@@||stickershop.line-scdn.net^
+@@||uts-front.line-apps.com^
+@@||ad-feedback.line-apps.com^
+@@||oa.tr.line.me^
+# ==============================================================
+# 🎙️ 【語音通話 (WebRTC) 與 AI 服務】
+# ==============================================================
+# [解鎖原因] stun 負責 Discord/Meet 等語音穿透連線(擋了會聽不到聲音)；Suno 為 AI 音樂生成服務。
+@@||stun.l.google.com^
+@@||suno.com^
+@@||suno.ai^
+# ==============================================================
+# 🍎 【Apple 系統與核心基礎服務】
+# ==============================================================
+# [解鎖原因] lcdn 負責 App Store 路由；smoot 負責 Safari 搜尋建議；probe 負責 iCloud 網路狀態檢測 (擋了會嚴重耗電)。
+@@||lcdn-locator.apple.com^
+@@||smoot.apple.com^
+@@||probe.icloud.com^
+@@||partiality.itunes.apple.com^
+@@||token.safebrowsing.apple^
+# ==============================================================
+# 🌐 【Google 核心與資安防護 (SafeBrowsing)】
+# ==============================================================
+# [解鎖原因] 負責 Chrome 書籤同步、推播通知金鑰，以及 Android 系統內建安全資料庫更新與 DoT 測速探針。
+@@||clientservices.googleapis.com^
+@@||safebrowsing.googleapis.com^
+@@||android-safebrowsing.google.com^
+@@||sba.keys.ohttp.prod.via.google^
+@@||firebaseinstallations.googleapis.com^
+@@||playmoviesdfe-pa.googleapis.com^
+# (修正 Android DoT 探針，使用萬用字元匹配前綴防誤擋)
+@@*dnsotls-ds.metric.gstatic.com^
+# ==============================================================
+# 🪟 【Microsoft 系統服務】
+# ==============================================================
+# [解鎖原因] cxcs 為 Windows 網路狀態檢查 (阻擋會顯示無網際網路)；bingviz 為系統天氣地圖 API；skype 為核心設定。
+@@||cxcs.microsoft.net^
+@@||gateway.bingviz.microsoftapp.net^
+@@||config.edge.skype.com^
+# ==============================================================
+# 🔗 【動態連結、短網址與行銷跳轉 (防網頁空白)】
+# ==============================================================
+# [解鎖原因] 放行 Firebase 動態連結 (如 Spotify/Google Maps 分享短網址)，以及維持現金回饋網、Email 廣告點擊正常跳轉。
+@@||firebasedynamiclinks.googleapis.com^
+@@||clickserve.dartsearch.net^
+@@||ad.doubleclick.net^
+@@||analytics.google.com^
+@@||adsense.google.com^
+@@||www.googleadservices.com^
+@@||awstrack.me^
+@@||trafficgate.net^
+@@||adfoc.us^
+@@||onelink.me^
+@@||airbridge.io^
+@@||fstry.me^
+@@||appboy.com^
+@@||appboycdn.com^
+@@||sdk.split.io^
+# ==============================================================
+# 📡 【網路 IP 偵測、前端 CDN 與工具網站】
+# ==============================================================
+# [解鎖原因] 許多智慧家電、NAS 或天氣 App 需透過這些開源 API 檢查當前網路 IP (阻擋會判定斷網)；Optimizely CDN 攸關部分國外網站排版。
+@@||checkip.amazonaws.com^
+@@||icanhazip.com^
+@@||ipinfo.io^
+@@||api64.ipify.org^
+@@||cdn.optimizely.com^
+@@||t.co^
+@@||s.youtube.com^
+@@||blogspot.com^
+@@||chess.com^
+@@||123pan.com^
+@@||openwrt.ai^
+@@||taohome.tw^
+@@||ionitech.cn^
+@@||airscrn.com^
+@@||airscreenapp.com^
+@@||supes.top^
+@@||haxpc.net^
+@@||mcsv.top^
+@@||idev.top^
+@@||image-cdn.learnin.tw^
+# ==============================================================
+# 🔴 ADGUARD DNS 完整黑名單 (專注於軟體驗證、DRM 授權與特定遙測)
+# ==============================================================
+# ==============================================================
+# 🔋 【高耗電遙測、追蹤器「秒殺」區】 (針對日誌優化)
+# ==============================================================
+# [封鎖原因] 解決 Facebook 測速工具與阿里系追蹤器在背景不斷重試導致的手機發熱與耗電問題，直接使用萬用字元與根節點秒殺。
+! @begin 遙測
+*netseer-ipaddr-assoc*.fbcdn.net
+||wireless-app-log.cn-hangzhou.log.aliyuncs.com^
+||cbu-offer.cn-shanghai.log.aliyuncs.com^
+||arms-retcode.aliyuncs.com^
+||mmstat.com^
+||effirst.com^
+||app-analytics-services.com^
+! @end
+# ==============================================================
+# 💬 【LINE 廣告伺服器】 (保留自用)
+# ==============================================================
+! @begin 廣告
+||a.line.me^
+||w.line.me^
+||sch.line.me^
+||buy.line.me^
+||crs-event.line.me^
+||api.today.line.me^
+||linecrs.line-scdn.net^
+||voom-assets.line-scdn.net^
+||jp-col-tcp.nelo.linecorp.com^
+! @end
+# ==============================================================
+# 📺 【Smart TV 與影音設備隱私】 (保留自用)
+# ==============================================================
+! @begin 遙測
+||lgappstv.com^
+||yumenetworks.com^
+||smartclip.net^
+||smartclip.com^
+||smartshare.lgtvsdp.com^
+||apps.skype.com^
+||ui.skype.com^
+! @end
+# ==============================================================
+# 🖥️ 【專業軟體啟動驗證伺服器 (DRM) - 依軟體類型分類】
+# ==============================================================
+! @begin 遙測
+# 📦 [通用第三方軟體授權 / 結帳平台] (DigitalRiver, Esellerate 等)
+||store*.esellerate.net^
+||esellerate.net^
+||digitalriver.com^
+||digitalrivercontent.net^
+||directresponsetech.com^
+# 🏗️ [3D、CAD、建築與工程軟體]
+! Autodesk (AutoCAD, Maya, 3ds Max)
+||autodesk.com^
+||autodesk.fi^
+||autodesk.de^
+||autodesk.es^
+||autodesk.ca^
+||autodesk.dk^
+||autodesk.pl^
+||adobeereg.com^
+! Graphisoft (ArchiCAD)
+||graphisoft.com^
+||wit-ams-cloudservice.cloudapp.net^
+! Nemetschek (Vectorworks)
+||installer.nemetschek.net^
+||piracy.nemetschek.net^
+||secure.nemetschek.net^
+! Enscape 3D & Lumion (渲染器)
+||enscape3d.com^
+||lumion3d.net^
+||lumiontech.net^
+! SketchUp (阻擋驗證)
+||license.sketchup.com^
+# 🎬 [影音編輯、媒體製作與直播轉播]
+! Adobe (Creative Cloud / Pr / Ae / Ps 等) (阻擋正版驗證與警告)
+||genuine.adobe.com^
+||practivate.adobe.com^
+||lm.licenses.adobe.com^
+||hlrcv.stage.adobe.com^
+! Wowza Media (串流伺服器)
+||wowzalicense*.wowzamedia.com^
+! Telestream (Wirecast 直播)
+||telestream.net^
+||80-239-221-*.customer.teliacarrier.com^
+! vMix & Resolume (VJ / 導播軟體)
+||vmix.com^
+||vmix.at^
+||vmixcall.com^
+||resolume.com^
+! Xilisoft / Imtoo / Sorenson (轉檔與壓縮)
+||xilisoft.com^
+||xilisoft.net^
+||imtoo.com^
+||xiliaudio.com^
+||xilimobile.com^
+||xilipod.com^
+||xilivideo.com^
+||mp4converter.net^
+||sorensonmedia.com^
+! CyberLink (威力導演)
+||activation.gocyberlink.com^
+||cap.cyberlink.com^
+! TechSmith (Camtasia / Snagit) (阻擋啟動與驗證)
+||activation.cloud.techsmith.com^
+||os.techsmith.com^
+! Magix (Vegas Pro)
+||validation.magix.net^
+# 🎨 [平面設計、攝影與圖像]
+! Corel (CorelDRAW)
+||corel.com^
+! Phase One (Capture One)
+||phaseone.com^
+! Nikon Imaging
+||nikonimaging.com^
+# 🛠️ [系統工具、硬碟救援與備份軟體]
+! Acronis (True Image)
+||acronis.com^
+! Raxco (PerfectDisk)
+||raxco.com^
+! VSO Software
+||vso1.vso-software.fr^
+! Slysoft / RedFox (AnyDVD)
+||slysoft.com^
+! EaseUS (易我資料救援/分區大師) (阻擋連網驗證序號)
+||activation.easeus.com^
+||track.easeus.com^
+! IObit (Advanced SystemCare)
+||license.iobit.com^
+! Internet Download Manager (IDM) (阻擋假冒序號彈窗)
+||registeridm.com^
+||star.tonec.com^
+# 📚 [辦公室、生產力與教育軟體]
+! Xmind (心智圖)
+||xmind.net^
+||xmind.cn^
+! Rosetta Stone (語言學習)
+||rosettastone.com^
+! Wondershare (萬興科技 / PDFelement / 恢復工具)
+||wondershare.net^
+||wondershare.com^
+! Addintools (Classic Office Menu)
+||addintools.com^
+! @end

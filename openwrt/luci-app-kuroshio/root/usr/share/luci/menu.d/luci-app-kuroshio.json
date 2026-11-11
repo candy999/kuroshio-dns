@@ -1,0 +1,73 @@
+{
+	"admin/services/kuroshio/status": {
+		"title": "狀態",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/status"
+		}
+	},
+	"admin/services/kuroshio/settings": {
+		"title": "基本設定",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/settings"
+		}
+	},
+	"admin/services/kuroshio": {
+		"title": "黑潮 DNS",
+		"order": 30,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-kuroshio"
+			],
+			"uci": {
+				"kuroshio": true
+			}
+		}
+	},
+	"admin/services/kuroshio/filter": {
+		"title": "廣告過濾",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/filter"
+		}
+	},
+	"admin/services/kuroshio/cdn": {
+		"title": "CDN 台灣節點",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/cdn"
+		}
+	},
+	"admin/services/kuroshio/community": {
+		"title": "社群",
+		"order": 45,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/community"
+		}
+	},
+	"admin/services/kuroshio/advanced": {
+		"title": "進階",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/advanced"
+		}
+	},
+	"admin/services/kuroshio/log": {
+		"title": "日誌",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/log"
+		}
+	}
+}

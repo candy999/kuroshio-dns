@@ -1,0 +1,11 @@
+node_modules/
+.luci-skip
+certs/
+*.pem
+target/
+legacy-node/state/*
+!legacy-node/state/cdn/
+legacy-node/state/cdn/*
+!legacy-node/state/cdn/v6-nodes.json
+.uci-config.test.js
+.claude/worktrees/

@@ -1,0 +1,448 @@
+{
+  "version": 1,
+  "about": "Windows 設定頁的欄位定義（規格 02 第 7.2 節）。key = config.json 的路徑；預設值一律由伺服器提供（/api/config 的 defaults），這裡不重複。type：bool / int / float / port / text / password / path / host / select / list（一行一個）/ multi（多選）/ table（物件陣列）。pro = 只在「專業」模式顯示。fallbackDefault = 伺服器的預設值沒有這個欄位時，程式內建的行為（只用來顯示）。dependsOn = 另一個欄位是指定值時才顯示。",
+  "groups": [
+    {
+      "id": "listen",
+      "title": "服務與監聽",
+      "desc": "一般 DNS、DoH、DoH3、DoT、DoQ 的埠號與憑證。儲存後服務會在程式內重新啟動，大約 1 秒。",
+      "notice": true,
+      "sections": [
+        {
+          "title": "一般 DNS（UDP / TCP）",
+          "fields": [
+            { "key": "listen.plain.enabled", "type": "bool", "label": "啟用一般 DNS", "pro": true },
+            { "key": "listen.plain.port", "type": "port", "label": "DNS 埠號", "help": "本程式聽的埠。要讓這台電腦或區網裝置直接把 DNS 指過來，請保持 53。" },
+            { "key": "listen.plain.binds", "type": "list", "label": "監聽位址", "help": "一行一個 IP。127.0.0.1 = 只給這台電腦用；填這台電腦的區網 IP（例如 192.168.1.10）或 0.0.0.0，區網裝置也能使用。", "placeholder": "127.0.0.1" },
+            { "key": "listen.plain.allowFrom", "type": "list", "label": "允許查詢的來源", "help": "區網 DNS 只回答這些網段（空白用預設的私有網段）。", "pro": true, "placeholder": "192.168.0.0/16" }
+          ]
+        },
+        {
+          "title": "DNS over HTTPS（DoH / DoH3）",
+          "desc": "網址是 https://網域/dns-query。需要先設定網域與憑證；只在這台電腦或區網使用的話不必打開。",
+          "fields": [
+            { "key": "listen.doh.enabled", "type": "bool", "label": "啟用" },
+            { "key": "listen.doh.windowsMode", "type": "select", "label": "跟 IIS 共用 443 的方式", "fallbackDefault": "auto", "help": "TCP 443 被 IIS（HTTP.sys）占用時怎麼處理。UDP 443（DoH3）、DoT、DoQ 跟 IIS 無關，一律由黑潮 DNS 自己監聽。只有 Windows 有效。", "options": [
+              { "value": "auto", "label": "自動（443 沒被占用就獨立監聽，被 IIS 占用就跟 HTTP.sys 共用）" },
+              { "value": "standalone", "label": "獨立（沒有 IIS，黑潮 DNS 自己聽 443）" },
+              { "value": "httpsys", "label": "HTTP.sys 共用（有 IIS 時建議，只登記自己的網址）" },
+              { "value": "iis-proxy", "label": "IIS 反向代理（沿用 2.x 的 ARR 設定，IIS 轉給本機埠）" }
+            ] },
+            { "key": "listen.doh.port", "type": "port", "label": "監聽埠號", "help": "IIS 反向代理模式由 IIS 轉到這個本機埠；沒有 IIS、要直接對外時改成 443。" },
+            { "key": "listen.doh.host", "type": "host", "label": "監聽位址", "help": "127.0.0.1 = 只接受本機（IIS 反向代理用）；直接對外時改成 0.0.0.0。", "placeholder": "0.0.0.0" },
+            { "key": "listen.doh.http3", "type": "bool", "label": "HTTP/3（DoH3）", "help": "同一個埠號的 UDP 也提供 DoH3（QUIC），掉包環境比較穩。DoH 回應會帶 Alt-Svc 告訴用戶端。路由器的埠轉發記得也要加 UDP。" },
+            { "key": "listen.doh.http3Port", "type": "port", "label": "DoH3 改用的 UDP 埠", "help": "UDP 443 被其他程式占用時改用其他埠（例如 8443）。0 = 跟 DoH 同一個埠。", "pro": true, "allowZero": true },
+            { "key": "listen.doh.altSvcPort", "type": "port", "label": "Alt-Svc 對外埠號", "help": "外面看到的埠號跟監聽的不同（例如路由器把 443 轉到 8443）時填外面的埠號。0 = 自動。", "pro": true, "allowZero": true },
+            { "key": "listen.doh.path", "type": "text", "label": "路徑", "pro": true },
+            { "key": "listen.doh.trustProxy", "type": "bool", "label": "信任 X-Forwarded-For", "help": "只有前面還有反向代理（例如 IIS 反向代理模式）時才打開，否則用戶端可以偽造來源 IP。只信任來自 127.0.0.1 的代理。", "pro": true }
+          ]
+        },
+        {
+          "title": "DNS over TLS（DoT）",
+          "desc": "Android「私人 DNS」用這個。同樣需要網域與憑證。",
+          "fields": [
+            { "key": "listen.dot.enabled", "type": "bool", "label": "啟用" },
+            { "key": "listen.dot.port", "type": "port", "label": "監聽埠號" },
+            { "key": "listen.dot.host", "type": "host", "label": "監聽位址", "pro": true }
+          ]
+        },
+        {
+          "title": "DNS over QUIC（DoQ）",
+          "desc": "UDP 853，延遲最低；AdGuard 系列 App 支援。跟 DoT 共用憑證。",
+          "fields": [
+            { "key": "listen.doq.enabled", "type": "bool", "label": "啟用" },
+            { "key": "listen.doq.port", "type": "port", "label": "監聽埠號（UDP）", "pro": true },
+            { "key": "listen.doq.host", "type": "host", "label": "監聽位址", "pro": true }
+          ]
+        },
+        {
+          "title": "憑證檔",
+          "desc": "用內建 ACME 自動申請（「憑證」分頁）時保持空白；自己有憑證時填 PEM 檔的完整路徑。",
+          "fields": [
+            { "key": "listen.doh.cert", "type": "path", "label": "DoH 憑證檔（含中繼憑證）", "placeholder": "C:\\ProgramData\\kuroshio\\cert.pem" },
+            { "key": "listen.doh.key", "type": "path", "label": "DoH 私鑰檔", "placeholder": "C:\\ProgramData\\kuroshio\\key.pem" },
+            { "key": "listen.dot.cert", "type": "path", "label": "DoT / DoQ 憑證檔（含中繼憑證）", "placeholder": "C:\\ProgramData\\kuroshio\\cert.pem" },
+            { "key": "listen.dot.key", "type": "path", "label": "DoT / DoQ 私鑰檔", "placeholder": "C:\\ProgramData\\kuroshio\\key.pem" }
+          ]
+        },
+        {
+          "title": "其他",
+          "fields": [
+            { "key": "listen.ddr", "type": "bool", "label": "自動發現（DDR）", "help": "區網裝置（Windows 11、iPhone、Mac）會自動改用 DoH / DoT / DoQ 加密連線，不用手動設定。需要設定網域並開啟至少一種加密協議。" },
+            { "key": "listen.proxyProtocol", "type": "bool", "label": "PROXY protocol v2", "help": "前面有支援 PROXY protocol 的負載平衡器時才打開，用來取得真實的用戶端 IP。", "pro": true },
+            { "key": "admin.port", "type": "port", "label": "設定頁埠號", "help": "這個設定頁與管理 API 的埠號，只綁 127.0.0.1。改了之後要用新的網址開啟設定頁。", "pro": true }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "upstream",
+      "title": "上游",
+      "desc": "格式：udp://IP、tcp://IP、tls://主機、https://主機/dns-query、quic://主機、h3://主機/dns-query。每日評測會自動選出最佳組合，以下是固定參與與備援。",
+      "sections": [
+        {
+          "title": "上游 DNS",
+          "fields": [
+            { "key": "upstream.pinned", "type": "list", "label": "固定上游", "help": "每次查詢都參與、不會被評測淘汰。不要填這台電腦自己。", "placeholder": "udp://1.1.1.1" },
+            { "key": "upstream.fallback", "type": "list", "label": "備援", "help": "固定與自動上游都失敗時才用。" },
+            { "key": "upstream.bootstrap", "type": "list", "label": "Bootstrap", "help": "解析 DoH / DoT 上游主機名稱用，只能填 IP。", "pro": true },
+            { "key": "resolver.lastResort", "type": "list", "label": "最後手段", "help": "所有上游都沒回應時。", "pro": true },
+            { "key": "upstream.autoMax", "type": "int", "label": "自動上游最多幾台", "pro": true, "min": 0 },
+            { "key": "upstream.autoTypes", "type": "multi", "label": "自動上游可用協定", "pro": true, "options": [
+              { "value": "udp", "label": "UDP" },
+              { "value": "doh", "label": "DoH" },
+              { "value": "doh3", "label": "DoH3" },
+              { "value": "dot", "label": "DoT" },
+              { "value": "doq", "label": "DoQ" }
+            ] }
+          ]
+        },
+        {
+          "title": "解析行為",
+          "pro": true,
+          "fields": [
+            { "key": "resolver.timeoutMs", "type": "int", "label": "上游逾時（毫秒）", "min": 1 },
+            { "key": "resolver.collectWindowMs", "type": "int", "label": "收集其他上游答案的時間（毫秒）", "help": "第一個回應之後再等多久，用來合併 IP 測速。", "min": 0 },
+            { "key": "resolver.fastPath", "type": "bool", "label": "先回第一個正常回應" },
+            { "key": "resolver.fastPathTtl", "type": "int", "label": "快速回應的 TTL（秒）", "help": "測速排序完成後，下一次查詢就拿到最佳 IP。", "min": 0 },
+            { "key": "resolver.rankIps", "type": "bool", "label": "合併所有上游 IP 並測速排序" },
+            { "key": "resolver.maxIps", "type": "int", "label": "每個回應最多幾個 IP", "min": 1 },
+            { "key": "resolver.maxTtl", "type": "int", "label": "TTL 上限（秒）", "min": 0 },
+            { "key": "resolver.minTtl", "type": "int", "label": "TTL 下限（秒）", "min": 0 },
+            { "key": "resolver.negativeMaxTtl", "type": "int", "label": "不存在網域的 TTL 上限（秒）", "min": 0 },
+            { "key": "resolver.serveStaleSec", "type": "int", "label": "過期後仍可先回舊資料（秒）", "min": 0 },
+            { "key": "resolver.prefetchThresholdSec", "type": "int", "label": "剩餘 TTL 低於幾秒就預取", "min": 0 },
+            { "key": "resolver.prefetchRecentSec", "type": "int", "label": "最近幾秒內有人查才預取", "min": 0 },
+            { "key": "resolver.cacheMax", "type": "int", "label": "快取筆數上限", "min": 0 },
+            { "key": "resolver.sendEcs", "type": "bool", "label": "對上游附帶 ECS（本機對外 IP 的 /24）" },
+            { "key": "resolver.stripEch", "type": "bool", "label": "移除 HTTPS 記錄的 ECH", "help": "某些網路環境下 ECH 會讓網站連不上時再打開。" },
+            { "key": "resolver.dnssec", "type": "bool", "label": "本機 DNSSEC 驗證" },
+            { "key": "resolver.cookies", "type": "bool", "label": "DNS Cookies" }
+          ]
+        },
+        {
+          "title": "IP 測速",
+          "desc": "以 TCP 連線測量每個 IP 的延遲。",
+          "pro": true,
+          "fields": [
+            { "key": "iprank.port", "type": "port", "label": "測速埠號" },
+            { "key": "iprank.timeoutMs", "type": "int", "label": "逾時（毫秒）", "min": 1 },
+            { "key": "iprank.okTtlSec", "type": "int", "label": "成功結果保留（秒）", "min": 0 },
+            { "key": "iprank.failTtlSec", "type": "int", "label": "失敗結果保留（秒）", "min": 0 },
+            { "key": "iprank.concurrency", "type": "int", "label": "同時測速數", "min": 1 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "filter",
+      "title": "過濾",
+      "desc": "判定順序：自訂規則是最高原則，命中就不看任何訂閱清單（白名單 @@ 也會蓋過所有清單）；沒有命中才看訂閱清單。支援 AdGuard / hosts 語法，也會檢查 CNAME 鏈。",
+      "sections": [
+        {
+          "title": "過濾",
+          "fields": [
+            { "key": "filter.enabled", "type": "bool", "label": "啟用過濾" },
+            { "key": "filter.updateIntervalHours", "type": "int", "label": "清單更新間隔（小時）", "pro": true, "min": 1 },
+            { "key": "filter.relaxedModifiers", "type": "bool", "label": "寬鬆套用瀏覽器規則", "help": "EasyList 這類瀏覽器清單有很多帶 $third-party、$script 修飾詞的規則。關閉（預設，同 AdGuard Home）= 略過這些規則；打開 = 整個網域封鎖，擋得更多但可能誤殺。", "pro": true },
+            { "key": "filter.customRules", "type": "list", "label": "自訂規則檔", "help": "一行一個檔案（相對路徑以設定資料夾為準）。用記事本編輯即可，例：||ads.example.com^ 封鎖、@@||good.example.com^ 白名單、! 或 # 開頭是註解。存檔後 3 秒內生效，不用重啟。", "pro": true }
+          ]
+        },
+        {
+          "title": "訂閱清單",
+          "desc": "分類一層一層往上疊：廣告為底，遙測疊在上面，惡意在最上層。同一個網域出現在多份清單時只算一次，歸到最上層的分類。hosts 格式裡寫的 IP 一律不採用，只當成封鎖該網域。",
+          "fields": [
+            { "key": "filter.lists", "type": "table", "label": "訂閱清單", "columns": [
+              { "key": "enabled", "type": "bool", "label": "啟用", "default": true },
+              { "key": "name", "type": "text", "label": "名稱", "required": true },
+              { "key": "url", "type": "text", "label": "網址", "required": true, "pattern": "^https?://\\S+$", "patternMsg": "請輸入 http:// 或 https:// 開頭的網址", "placeholder": "https://example.com/list.txt" },
+              { "key": "category", "type": "select", "label": "分類", "default": "ads", "options": [
+                { "value": "ads", "label": "廣告 / 追蹤" },
+                { "value": "telemetry", "label": "遙測 / 驗證" },
+                { "value": "malware", "label": "惡意 / 詐騙" }
+              ] }
+            ] }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cdn",
+      "title": "CDN",
+      "desc": "Cloudflare、CloudFront 等常把台灣用戶導去國外機房。這裡把答案換成台北、高雄節點，並先用 HTTPS 實際連線驗證網站能正常運作才換；Akamai 等 DNS 分流型 CDN 則帶台灣網段的 ECS 找出更近的節點。",
+      "sections": [
+        {
+          "title": "節點置換",
+          "fields": [
+            { "key": "cdn.enabled", "type": "bool", "label": "啟用 CDN 台灣節點置換" },
+            { "key": "cdn.trialMode", "type": "select", "label": "未驗證的網站", "help": "還沒驗證過的網站要怎麼回答。「先回原始結果」最穩：驗證通過後下一次查詢才換台灣節點。", "options": [
+              { "value": "original", "label": "先回原始結果，驗證通過才換（推薦）" },
+              { "value": "alias", "label": "先換台灣節點，驗證失敗再改回" }
+            ] },
+            { "key": "cdn.v6Policy", "type": "select", "label": "沒有台灣 IPv6 節點時", "options": [
+              { "value": "drop", "label": "丟棄該 CDN 的 IPv6 位址（避免 IPv6 繞回國外，推薦）" },
+              { "value": "keep", "label": "保留" }
+            ] },
+            { "key": "cdn.ecs.twSubnets", "type": "list", "label": "ECS 台灣網段", "help": "DNS 分流型 CDN 用。放你用戶實際所在的 ISP 網段效果最好；本機對外 IP 的 /24 會自動放在最前面。" }
+          ]
+        },
+        {
+          "title": "驗證",
+          "pro": true,
+          "fields": [
+            { "key": "cdn.trialTtl", "type": "int", "label": "未驗證時的 TTL（秒）", "min": 0 },
+            { "key": "cdn.verifyOkHours", "type": "int", "label": "驗證通過有效時間（小時）", "help": "熱門網域到期前會自動複驗。", "min": 1 },
+            { "key": "cdn.verifyFailHours", "type": "int", "label": "驗證失敗後重試（小時）", "help": "每次失敗加倍。", "min": 1 },
+            { "key": "cdn.verifyFailMaxDays", "type": "int", "label": "重試間隔上限（天）", "min": 1 },
+            { "key": "cdn.verifyTimeoutMs", "type": "int", "label": "驗證逾時（毫秒）", "min": 1 },
+            { "key": "cdn.verifyConcurrency", "type": "int", "label": "同時驗證數", "min": 1 },
+            { "key": "cdn.nearestMinGainMs", "type": "int", "label": "沒有台灣 POP 時最少快幾毫秒才換", "help": "Fastly 等：換到鄰近國家節點的門檻。", "min": 0 }
+          ]
+        },
+        {
+          "title": "節點池",
+          "pro": true,
+          "fields": [
+            { "key": "cdn.serveCount", "type": "int", "label": "每次回幾個台灣 IP", "min": 1 },
+            { "key": "cdn.minPool", "type": "int", "label": "可用節點少於幾個就重建", "min": 1 },
+            { "key": "cdn.healthIntervalMin", "type": "int", "label": "節點池健檢間隔（分鐘）", "min": 1 },
+            { "key": "cdn.qualityIntervalMin", "type": "int", "label": "鄰近節點品質重測（分鐘）", "help": "Fastly：海纜壅塞、掉包變多時自動換 POP。", "min": 1 },
+            { "key": "cdn.maxEntries", "type": "int", "label": "CDN 網域資料庫上限（筆）", "help": "記憶體較小的機器可以調低。", "min": 0 }
+          ]
+        },
+        {
+          "title": "跨 CDN 備援",
+          "pro": true,
+          "fields": [
+            { "key": "cdn.cross.enabled", "type": "bool", "label": "啟用跨 CDN 備援", "help": "原本的 CDN 在台灣沒有節點（例如 Fastly）時，測試同一個網站是不是也放在 Cloudflare、CloudFront、Azure、Akamai 的台灣節點上；憑證與網頁內容都一致才採用。" },
+            { "key": "cdn.cross.minOrigMs", "type": "int", "label": "原本延遲超過幾毫秒才嘗試", "min": 0 },
+            { "key": "cdn.cross.recheckHours", "type": "int", "label": "複驗間隔（小時）", "min": 1 },
+            { "key": "cdn.cross.failDays", "type": "int", "label": "失敗後幾天再試", "min": 0 },
+            { "key": "cdn.cross.akamaiMaxMs", "type": "int", "label": "Akamai 台灣節點延遲上限（毫秒）", "min": 0 },
+            { "key": "cdn.cross.concurrency", "type": "int", "label": "同時測試數", "min": 1 }
+          ]
+        },
+        {
+          "title": "ECS 突破（DNS 分流型 CDN）",
+          "desc": "帶不同的台灣網段去問支援 ECS 的 DNS，找到明顯更近且 HTTPS 驗證通過的節點才換。",
+          "pro": true,
+          "fields": [
+            { "key": "cdn.ecs.resolvers", "type": "list", "label": "支援 ECS 的 DNS", "help": "Cloudflare 1.1.1.1 不支援 ECS。" },
+            { "key": "cdn.ecs.minGainMs", "type": "int", "label": "至少快幾毫秒", "min": 0 },
+            { "key": "cdn.ecs.minGainRatio", "type": "float", "label": "且至少快幾成", "help": "0.3 = 30%", "min": 0 },
+            { "key": "cdn.ecs.resultHours", "type": "int", "label": "結果有效時間（小時）", "min": 1 },
+            { "key": "cdn.ecs.concurrency", "type": "int", "label": "同時查詢數", "min": 1 }
+          ]
+        },
+        {
+          "title": "各家 CDN",
+          "desc": "任播型（Cloudflare、CloudFront、Fastly、Gcore、Azure）用 IP 置換；DNS 分流型（Akamai 等）用 ECS 找台灣節點。",
+          "pro": true,
+          "fields": [
+            { "key": "cdn.providers.cloudflare.enabled", "type": "bool", "label": "Cloudflare" },
+            { "key": "cdn.providers.cloudfront.enabled", "type": "bool", "label": "Amazon CloudFront" },
+            { "key": "cdn.providers.fastly.enabled", "type": "bool", "label": "Fastly" },
+            { "key": "cdn.providers.gcore.enabled", "type": "bool", "label": "Gcore" },
+            { "key": "cdn.providers.azure.enabled", "type": "bool", "label": "Azure Front Door / CDN" },
+            { "key": "cdn.providers.akamai.enabled", "type": "bool", "label": "Akamai" },
+            { "key": "cdn.providers.edgio.enabled", "type": "bool", "label": "Edgio / Edgecast" },
+            { "key": "cdn.providers.cdnetworks.enabled", "type": "bool", "label": "CDNetworks" },
+            { "key": "cdn.providers.tencent.enabled", "type": "bool", "label": "騰訊雲 CDN / EdgeOne" },
+            { "key": "cdn.providers.alibaba.enabled", "type": "bool", "label": "阿里雲 CDN" },
+            { "key": "cdn.providers.wangsu.enabled", "type": "bool", "label": "網宿" },
+            { "key": "cdn.providers.bytedance.enabled", "type": "bool", "label": "字節跳動 BytePlus" },
+            { "key": "cdn.providers.apple.enabled", "type": "bool", "label": "Apple CDN" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ddns",
+      "title": "DDNS",
+      "desc": "公網 IP 變了就自動更新 Cloudflare 的 DNS 記錄。API Token 到 Cloudflare 後台「我的設定檔 → API 權杖」建立，權限：區域 → DNS → 編輯、區域 → 區域 → 讀取。",
+      "sections": [
+        {
+          "title": "DDNS（Cloudflare）",
+          "fields": [
+            { "key": "ddns.enabled", "type": "bool", "label": "啟用" },
+            { "key": "ddns.apiToken", "type": "password", "label": "Cloudflare API Token", "help": "DDNS 與憑證申請共用。" },
+            { "key": "ddns.records", "type": "list", "label": "要更新的記錄", "help": "完整網域名稱，一行一個。記錄不存在會自動建立。", "placeholder": "home.example.com" },
+            { "key": "ddns.ipv4", "type": "bool", "label": "更新 IPv4（A）" },
+            { "key": "ddns.ipv6", "type": "bool", "label": "更新 IPv6（AAAA）" },
+            { "key": "ddns.ipSource", "type": "select", "label": "IP 來源", "options": [
+              { "value": "web", "label": "問 Cloudflare（推薦，在其他路由器後面也正確）" },
+              { "value": "interface", "label": "讀取網路介面" }
+            ] },
+            { "key": "ddns.iface4", "type": "text", "label": "IPv4 介面", "help": "網路介面名稱，例如「乙太網路」。", "dependsOn": { "key": "ddns.ipSource", "values": ["interface"] } },
+            { "key": "ddns.iface6", "type": "text", "label": "IPv6 介面", "help": "空白 = 同 IPv4 介面", "dependsOn": { "key": "ddns.ipSource", "values": ["interface"] } },
+            { "key": "ddns.intervalMin", "type": "int", "label": "檢查間隔（分鐘）", "min": 1, "max": 1440 },
+            { "key": "ddns.proxied", "type": "bool", "label": "經過 Cloudflare 代理（橘色雲朵）", "help": "DoT 不能經過代理，給 DoH / DoT 用的記錄請保持關閉。", "pro": true },
+            { "key": "ddns.ttl", "type": "int", "label": "TTL（秒）", "help": "1 = 自動", "pro": true, "min": 1 },
+            { "key": "ddns.zone", "type": "host", "label": "Zone", "help": "空白 = 從記錄名稱自動判斷", "pro": true, "placeholder": "example.com" },
+            { "key": "ddns.forceHours", "type": "int", "label": "強制確認間隔（小時）", "help": "IP 沒變時多久重新向 Cloudflare 確認一次記錄。", "pro": true, "min": 0 },
+            { "key": "ddns.httpsRecord", "type": "bool", "label": "發布 HTTPS 記錄（DoH3）", "help": "DoH3 開啟時自動在網域發布 HTTPS 記錄（alpn=\"h3,h2\"），瀏覽器第一次連線就直接用 HTTP/3。", "pro": true, "fallbackDefault": true }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "acme",
+      "title": "憑證",
+      "desc": "內建 ACME：用 Cloudflare DNS 驗證申請 Let’s Encrypt 憑證，不需要開 80 埠；到期前自動續期，DoH / DoT / DoQ 會自動換上新憑證。可以到「工具」分頁立即申請。",
+      "sections": [
+        {
+          "title": "憑證（Let’s Encrypt）",
+          "fields": [
+            { "key": "acme.enabled", "type": "bool", "label": "自動申請憑證" },
+            { "key": "acme.domains", "type": "list", "label": "網域", "help": "一行一個。空白 = 用公開頁的網域，再不然用 DDNS 的第一筆記錄。", "placeholder": "dns.example.com" },
+            { "key": "acme.email", "type": "text", "label": "聯絡信箱", "help": "憑證到期通知用，可留空。", "placeholder": "admin@example.com" },
+            { "key": "acme.apiToken", "type": "password", "label": "Cloudflare API Token", "help": "空白 = 跟 DDNS 共用同一個 Token。" },
+            { "key": "acme.server", "type": "select", "label": "憑證機構", "pro": true, "options": [
+              { "value": "letsencrypt", "label": "Let's Encrypt" },
+              { "value": "letsencrypt-staging", "label": "Let's Encrypt 測試環境（不受頻率限制，憑證不被信任）" }
+            ] },
+            { "key": "acme.renewDays", "type": "int", "label": "到期前幾天續期", "pro": true, "min": 1 },
+            { "key": "acme.zone", "type": "host", "label": "Zone", "help": "空白 = 跟 DDNS 相同，或從網域自動判斷", "pro": true, "placeholder": "example.com" },
+            { "key": "acme.propagationSec", "type": "int", "label": "加 TXT 記錄後等幾秒再驗證", "pro": true, "min": 0, "fallbackDefault": 15 },
+            { "key": "acme.certFile", "type": "path", "label": "憑證存放位置", "help": "空白 = 用上面「服務與監聽」的 DoT / DoH 憑證檔，再不然是設定資料夾的 cert.pem。", "pro": true },
+            { "key": "acme.keyFile", "type": "path", "label": "私鑰存放位置", "pro": true }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "site",
+      "title": "公開頁",
+      "desc": "官網與匿名統計頁，跟 DoH 共用網域與埠（TCP 與 HTTP/3 都可以）。關閉不影響 DoH。",
+      "sections": [
+        {
+          "title": "公開網頁",
+          "fields": [
+            { "key": "site.enabled", "type": "bool", "label": "啟用" },
+            { "key": "site.hostname", "type": "host", "label": "網域", "placeholder": "dns.example.com" },
+            { "key": "site.minClients", "type": "int", "label": "排行最少人數", "pro": true, "min": 0 },
+            { "key": "site.detailPath", "type": "text", "label": "詳細資料頁路徑", "pro": true },
+            { "key": "site.htmlFile", "type": "path", "label": "自訂首頁檔", "help": "空白 = 內建首頁。", "pro": true },
+            { "key": "site.detailFile", "type": "path", "label": "自訂詳細資料頁檔", "pro": true },
+            { "key": "check.enabled", "type": "bool", "label": "「這台裝置有沒有在用」偵測", "pro": true }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "community",
+      "title": "社群",
+      "desc": "跟好友交換台灣節點池、網站驗證結果、上游 DNS。只分享自己驗證過的資料；收到的資料一律在本機驗證後才使用。需要先設好網域、憑證，並打開 DoH 或 DoT 其中一種（共享走同一個加密連線，不另開埠）。",
+      "sections": [
+        {
+          "title": "設定",
+          "fields": [
+            { "key": "community.enabled", "type": "bool", "label": "啟用社群模式" },
+            { "key": "community.shareDomains", "type": "bool", "label": "分享網站驗證結果", "help": "只分享網域雜湊，不公開網站名稱。" },
+            { "key": "community.shareUpstreams", "type": "bool", "label": "分享上游 DNS", "help": "好友收到後只當每日評測的候選。" },
+            { "key": "community.staleDays", "type": "int", "label": "好友幾天連不上就自動刪除", "min": 1 },
+            { "key": "community.rejectDays", "type": "int", "label": "拒絕後幾天才能再請求", "pro": true, "min": 0 },
+            { "key": "community.syncIntervalMin", "type": "int", "label": "多久向好友拉一次資料（分鐘）", "pro": true, "min": 1 },
+            { "key": "community.maxFriends", "type": "int", "label": "好友數上限", "help": "達到上限後，自動同意的請求改成人工審核。", "pro": true, "min": 0 },
+            { "key": "community.minHitRate", "type": "float", "label": "命中率下限", "help": "好友給的資料在我這邊驗證成功的比例（0～1）。0 = 不檢查。", "pro": true, "min": 0, "max": 1 },
+            { "key": "community.autoDeleteLowHitRate", "type": "bool", "label": "命中率太低時自動刪除好友", "help": "試過 20 次以上還低於命中率下限就自動刪除。", "pro": true },
+            { "key": "community.powBits", "type": "int", "label": "好友請求的工作量證明難度", "help": "越高越難灌請求，但對方送請求也越久。", "pro": true, "min": 0 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "system",
+      "title": "系統",
+      "desc": "依記憶體自動調整快取、同時連線數、背景工作規模。狀態頁可以看到目前的等級與記憶體用量。",
+      "sections": [
+        {
+          "title": "硬體與資料",
+          "fields": [
+            { "key": "system.profile", "type": "select", "label": "硬體等級", "options": [
+              { "value": "auto", "label": "自動（依記憶體判斷）" },
+              { "value": "tiny", "label": "tiny（128 MB 級：基本功能，不開 QUIC、不掃網段）" },
+              { "value": "small", "label": "small（256 MB 級）" },
+              { "value": "standard", "label": "standard（512 MB – 1 GB）" },
+              { "value": "large", "label": "large（1.5 GB 以上）" }
+            ] },
+            { "key": "system.persistDir", "type": "path", "label": "資料目錄", "help": "評測結果、節點池、CDN 網域庫、統計的存放位置。空白 = 設定資料夾的 state。", "pro": true, "placeholder": "C:\\ProgramData\\kuroshio\\state" },
+            { "key": "system.persistIntervalMin", "type": "int", "label": "快照最短間隔（分鐘）", "help": "0 = 依儲存裝置自動決定。", "pro": true, "min": 0 },
+            { "key": "system.storageClass", "type": "select", "label": "儲存裝置類型", "help": "決定快照多久寫一次。自動 = 偵測資料目錄所在的裝置。", "pro": true, "options": [
+              { "value": "auto", "label": "自動" },
+              { "value": "disk", "label": "硬碟 / SSD" },
+              { "value": "flash", "label": "Flash（隨身碟、記憶卡：少寫）" },
+              { "value": "ram", "label": "記憶體（重開機就消失）" }
+            ] },
+            { "key": "system.flashWriteBudgetKB", "type": "int", "label": "每天寫入上限（KB）", "pro": true, "min": 0 },
+            { "key": "system.workerThreads", "type": "int", "label": "工作執行緒數", "help": "0 = 依 CPU 核心數自動決定。重新啟動程式後生效。", "pro": true, "min": 0 },
+            { "key": "system.maxTlsConnections", "type": "int", "label": "TLS 同時連線上限", "pro": true, "min": 1 },
+            { "key": "system.maxQuicConnections", "type": "int", "label": "QUIC 同時連線上限", "pro": true, "min": 1 },
+            { "key": "system.memoryWatchdog", "type": "bool", "label": "記憶體不足時自動縮減快取", "pro": true },
+            { "key": "about.sourceUrl", "type": "text", "label": "原始碼網址", "help": "顯示在頁尾、「關於」與公開頁。GPL-3.0：散布修改過的版本時要提供對應的原始碼，改過程式的話請填自己的原始碼網址（http:// 或 https:// 開頭）；空白 = 官方網址。", "pro": true, "pattern": "^https?://\\S+$", "patternMsg": "請輸入 http:// 或 https:// 開頭的網址", "placeholder": "https://example.com/my-fork" },
+            { "key": "system.allowHeavy", "type": "bool", "label": "低階硬體也開啟重功能", "help": "tiny / small 等級預設不開 QUIC、不掃網段；打開後照樣開啟，記憶體不夠時可能變慢。", "pro": true }
+          ]
+        },
+        {
+          "title": "排程工作（台北時間）",
+          "desc": "到時間在背景執行，不影響 DNS 回應。電腦在排定時間沒開機，下次啟動會自動補跑。",
+          "pro": true,
+          "fields": [
+            { "key": "jobs.dns-benchmark.enabled", "type": "bool", "label": "DNS 評測（選出最佳上游組合、剔除汙染）" },
+            { "key": "jobs.dns-benchmark.at", "type": "text", "label": "DNS 評測時間", "help": "HH:MM", "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$", "patternMsg": "格式：HH:MM" },
+            { "key": "jobs.cdn-ranges.enabled", "type": "bool", "label": "抓 CDN 官方 IP 範圍" },
+            { "key": "jobs.cdn-ranges.at", "type": "text", "label": "抓 CDN 官方 IP 範圍時間", "help": "HH:MM", "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$", "patternMsg": "格式：HH:MM" },
+            { "key": "jobs.cdn-scan.enabled", "type": "bool", "label": "CDN 網段分類（台灣 / 國外 / 失效）" },
+            { "key": "jobs.cdn-scan.at", "type": "text", "label": "CDN 網段分類時間", "help": "HH:MM", "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$", "patternMsg": "格式：HH:MM" },
+            { "key": "jobs.cdn-pool.enabled", "type": "bool", "label": "重建台灣節點池（延遲、掉包、下載速度）" },
+            { "key": "jobs.cdn-pool.at", "type": "text", "label": "重建台灣節點池時間", "help": "HH:MM", "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$", "patternMsg": "格式：HH:MM" }
+          ]
+        },
+        {
+          "title": "每日 DNS 評測",
+          "pro": true,
+          "fields": [
+            { "key": "benchmark.concurrency", "type": "int", "label": "同時測試數", "min": 1 },
+            { "key": "benchmark.timeoutMs", "type": "int", "label": "逾時（毫秒）", "min": 1 },
+            { "key": "benchmark.maxTimeouts", "type": "int", "label": "容許逾時次數", "min": 0 },
+            { "key": "benchmark.coverageTarget", "type": "float", "label": "涵蓋率目標", "help": "0.97 = 97%", "min": 0, "max": 1 },
+            { "key": "benchmark.minAuto", "type": "int", "label": "至少選幾台", "min": 0 },
+            { "key": "benchmark.maxAvgLatencyMs", "type": "int", "label": "平均延遲上限（毫秒）", "min": 1 },
+            { "key": "benchmark.keepDays", "type": "int", "label": "報表保留天數", "min": 0 }
+          ]
+        },
+        {
+          "title": "CDN 網段掃描與節點池建立",
+          "pro": true,
+          "fields": [
+            { "key": "scan.samplesPerSubnet", "type": "int", "label": "每個 /24 抽樣幾個 IP", "min": 1 },
+            { "key": "scan.concurrency", "type": "int", "label": "掃描同時連線數", "min": 1 },
+            { "key": "scan.timeoutMs", "type": "int", "label": "掃描逾時（毫秒）", "min": 1 },
+            { "key": "pool.candidatesPerProvider", "type": "int", "label": "每家 CDN 候選 IP 數", "min": 1 },
+            { "key": "pool.poolSize", "type": "int", "label": "節點池大小", "min": 1 },
+            { "key": "pool.speedTop", "type": "int", "label": "取前幾名測下載速度", "min": 0 },
+            { "key": "pool.speedSeconds", "type": "int", "label": "每次下載測速秒數", "min": 1 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "log",
+      "title": "日誌",
+      "desc": "cmd 執行時日誌直接顯示在視窗；Windows 服務寫到日誌檔。兩種都可以在「日誌」分頁看最近的紀錄。",
+      "sections": [
+        {
+          "title": "日誌",
+          "fields": [
+            { "key": "log.level", "type": "select", "label": "日誌等級", "help": "重新啟動程式後生效。", "options": [
+              { "value": "info", "label": "一般" },
+              { "value": "debug", "label": "除錯（更詳細）" },
+              { "value": "warn", "label": "只記警告與錯誤" }
+            ] },
+            { "key": "log.queryLog", "type": "bool", "label": "記錄每筆查詢", "help": "除錯用，量很大，會很快洗掉「日誌」分頁的紀錄。" }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7221 @@
+{
+ "generator": "tests/vectors/cdn/gen.js",
+ "node": "v22.22.0",
+ "cname": [
+  {
+   "host": "e1.dscx.akamaiedge.net",
+   "provider": "akamai"
+  },
+  {
+   "host": "e1.dscx.akamaiedge.net.",
+   "provider": "akamai"
+  },
+  {
+   "host": "X.CDN.CLOUDFLARE.NET",
+   "provider": "cloudflare"
+  },
+  {
+   "host": "cloudflare.net",
+   "provider": "cloudflare"
+  },
+  {
+   "host": "notcloudflare.net",
+   "provider": null
+  },
+  {
+   "host": "apple.com.edgekey.net",
+   "provider": "apple"
+  },
+  {
+   "host": "www.apple.com.edgekey.net",
+   "provider": "apple"
+  },
+  {
+   "host": "foo.edgekey.net",
+   "provider": "akamai"
+  },
+  {
+   "host": "d111.cloudfront.net",
+   "provider": "cloudfront"
+  },
+  {
+   "host": "cloudfront.net.evil.com",
+   "provider": null
+  },
+  {
+   "host": "dualstack.reddit.map.fastly.net",
+   "provider": "fastly"
+  },
+  {
+   "host": "global.ssl.fastly.net",
+   "provider": "fastly"
+  },
+  {
+   "host": "x.global.ssl.fastly.net",
+   "provider": "fastly"
+  },
+  {
+   "host": "a.b-cdn.net",
+   "provider": "bunny"
+  },
+  {
+   "host": "b-cdn.net.example",
+   "provider": null
+  },
+  {
+   "host": "x.vo.msecnd.net",
+   "provider": "microsoft"
+  },
+  {
+   "host": "x.msecnd.net",
+   "provider": "microsoft"
+  },
+  {
+   "host": "x.trafficmanager.net",
+   "provider": "microsoft"
+  },
+  {
+   "host": "azurefd-t-prod.trafficmanager.net",
+   "provider": "azure"
+  },
+  {
+   "host": "y.azurefd-t-prod.trafficmanager.net",
+   "provider": "azure"
+  },
+  {
+   "host": "gateway.fe2.apple-dns.net",
+   "provider": "apple"
+  },
+  {
+   "host": "scontent.xx.fbcdn.net",
+   "provider": null
+  },
+  {
+   "host": "www.google.com",
+   "provider": null
+  },
+  {
+   "host": "ghs.google.com",
+   "provider": "google"
+  },
+  {
+   "host": "x.l.google.com",
+   "provider": "google"
+  },
+  {
+   "host": "legy.line-apps.com",
+   "provider": "line"
+  },
+  {
+   "host": "cdn.jsdelivr.net",
+   "provider": null
+  },
+  {
+   "host": "kxcdn.com",
+   "provider": "keycdn"
+  },
+  {
+   "host": "p.kxcdn.com",
+   "provider": "keycdn"
+  },
+  {
+   "host": "eo.dnse1.com",
+   "provider": "tencent"
+  },
+  {
+   "host": "x.eo.dnse1.com",
+   "provider": "tencent"
+  },
+  {
+   "host": "dnse1.com",
+   "provider": null
+  },
+  {
+   "host": "",
+   "provider": null
+  },
+  {
+   "host": ".",
+   "provider": null
+  },
+  {
+   "host": "a..b.akamai.net",
+   "provider": "akamai"
+  },
+  {
+   "host": "qwilted-cds.cqloud.com",
+   "provider": "qwilt"
+  },
+  {
+   "host": "x.qwilted-cds.cqloud.com",
+   "provider": "qwilt"
+  },
+  {
+   "host": "cqloud.com",
+   "provider": null
+  },
+  {
+   "host": "user.github.io",
+   "provider": "github"
+  },
+  {
+   "host": "shop.myshopify.com",
+   "provider": "shopify"
+  }
+ ],
+ "twPop": [
+  {
+   "pop": "TPE",
+   "tw": true
+  },
+  {
+   "pop": "tpe51",
+   "tw": true
+  },
+  {
+   "pop": "KHH",
+   "tw": true
+  },
+  {
+   "pop": "TSA",
+   "tw": true
+  },
+  {
+   "pop": "RMQ",
+   "tw": true
+  },
+  {
+   "pop": "TXG",
+   "tw": true
+  },
+  {
+   "pop": "TNN",
+   "tw": true
+  },
+  {
+   "pop": "TPE50-C1",
+   "tw": true
+  },
+  {
+   "pop": "HKG",
+   "tw": false
+  },
+  {
+   "pop": "NRT",
+   "tw": false
+  },
+  {
+   "pop": "",
+   "tw": false
+  },
+  {
+   "pop": "TP",
+   "tw": false
+  },
+  {
+   "pop": "XTPE",
+   "tw": false
+  },
+  {
+   "pop": "tnn",
+   "tw": true
+  },
+  {
+   "pop": "Khh9",
+   "tw": true
+  },
+  {
+   "pop": "seed",
+   "tw": false
+  },
+  {
+   "pop": "TP E",
+   "tw": false
+  }
+ ],
+ "headers": [
+  {
+   "headers": {
+    "cf-ray": "8a1b2c3d-TPE",
+    "server": "cloudflare"
+   },
+   "body": "",
+   "detect": {
+    "provider": "cloudflare",
+    "pop": "TPE"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "TPE",
+     "is": true
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "cf-ray": "8a1b2c3d"
+   },
+   "body": "fl=1\nip=1.2.3.4\ncolo=khh\n",
+   "detect": {
+    "provider": "cloudflare",
+    "pop": "KHH"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "KHH",
+     "is": true
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "server": "CloudFlare"
+   },
+   "body": "colo=12 colo=NRT",
+   "detect": {
+    "provider": "cloudflare",
+    "pop": "NRT"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "NRT",
+     "is": true
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-amz-cf-pop": "TPE52-P1",
+    "x-cache": "Miss from cloudfront"
+   },
+   "body": "",
+   "detect": {
+    "provider": "cloudfront",
+    "pop": "TPE"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "TPE",
+     "is": true
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "via": "1.1 abc.cloudfront.net (CloudFront)"
+   },
+   "body": "",
+   "detect": {
+    "provider": "cloudfront",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": true
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-cache": "Error from cloudfront"
+   },
+   "body": "",
+   "detect": {
+    "provider": "cloudfront",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": true
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-amz-cf-pop": "52-x"
+   },
+   "body": "",
+   "detect": {
+    "provider": "cloudfront",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": true
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-served-by": "cache-iad-kiad7000-IAD, cache-hkg17920-HKG"
+   },
+   "body": "",
+   "detect": {
+    "provider": "fastly",
+    "pop": "HKG"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "HKG",
+     "is": true
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-served-by": "cache-nrt-rjtt8900042-NRT"
+   },
+   "body": "",
+   "detect": {
+    "provider": "fastly",
+    "pop": "NRT"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "NRT",
+     "is": true
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-served-by": "cache-tyo11953"
+   },
+   "body": "",
+   "detect": {
+    "provider": "fastly",
+    "pop": "TYO"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "TYO",
+     "is": true
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-served-by": "cache-tyo"
+   },
+   "body": "",
+   "detect": {
+    "provider": "fastly",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": true
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-served-by": "Cache-TYO123"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": "TYO"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "TYO",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-served-by": "origin-1"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-id": "fr5-hw-edge-gc17"
+   },
+   "body": "",
+   "detect": {
+    "provider": "gcore",
+    "pop": "FR"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "FR",
+     "is": true
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-id": "",
+    "x-id-fe": "tpe1-up-gc23"
+   },
+   "body": "",
+   "detect": {
+    "provider": "gcore",
+    "pop": "TPE"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "TPE",
+     "is": true
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-id": "-x"
+   },
+   "body": "",
+   "detect": {
+    "provider": "gcore",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": true
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-id": "abcd12"
+   },
+   "body": "",
+   "detect": {
+    "provider": "gcore",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": true
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-azure-ref": "0abc Ref A: 123 Ref B: TPE30EDGE0108 Ref C: 2026"
+   },
+   "body": "",
+   "detect": {
+    "provider": "azure",
+    "pop": "TPE"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "TPE",
+     "is": true
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-msedge-ref": "Ref A: x Ref B: 12 khh"
+   },
+   "body": "",
+   "detect": {
+    "provider": "azure",
+    "pop": "KHH"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "KHH",
+     "is": true
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-msedge-ref": "Ref B: 1KHH tpe"
+   },
+   "body": "",
+   "detect": {
+    "provider": "azure",
+    "pop": "KHH"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "KHH",
+     "is": true
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "server": "AkamaiGHost"
+   },
+   "body": "",
+   "detect": {
+    "provider": "akamai",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": true
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-akamai-transformed": "9 - 0 pmb=mRUM,1"
+   },
+   "body": "",
+   "detect": {
+    "provider": "akamai",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": true
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-cache": "TCP_HIT from a23-1-1-1.deploy.akamaitechnologies.com"
+   },
+   "body": "",
+   "detect": {
+    "provider": "akamai",
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": true
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-bunny-pop": "BunnyCDN-TW1-1103"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-pop": "edge TPE12 x"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": "TPE"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-edge-location": "HKG62-C1"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": "HKG"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "cdn-pop": "sjc"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "x-cache-pop": "ABC_1 DEF2"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": "DEF"
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "server": "NGX TPE"
+   },
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {
+    "server": "nginx"
+   },
+   "body": "<html>",
+   "detect": {
+    "provider": null,
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  },
+  {
+   "headers": {},
+   "body": "",
+   "detect": {
+    "provider": null,
+    "pop": ""
+   },
+   "per": {
+    "cloudflare": {
+     "pop": "",
+     "is": false
+    },
+    "cloudfront": {
+     "pop": "",
+     "is": false
+    },
+    "fastly": {
+     "pop": "",
+     "is": false
+    },
+    "gcore": {
+     "pop": "",
+     "is": false
+    },
+    "azure": {
+     "pop": "",
+     "is": false
+    },
+    "akamai": {
+     "pop": "",
+     "is": false
+    },
+    "edgio": {
+     "pop": null,
+     "is": null
+    },
+    "cdn77": {
+     "pop": null,
+     "is": null
+    },
+    "bunny": {
+     "pop": null,
+     "is": null
+    },
+    "cdnetworks": {
+     "pop": null,
+     "is": null
+    },
+    "tencent": {
+     "pop": null,
+     "is": null
+    },
+    "alibaba": {
+     "pop": null,
+     "is": null
+    },
+    "wangsu": {
+     "pop": null,
+     "is": null
+    },
+    "bytedance": {
+     "pop": null,
+     "is": null
+    },
+    "google": {
+     "pop": null,
+     "is": null
+    },
+    "apple": {
+     "pop": null,
+     "is": null
+    },
+    "microsoft": {
+     "pop": null,
+     "is": null
+    },
+    "stackpath": {
+     "pop": null,
+     "is": null
+    },
+    "imperva": {
+     "pop": null,
+     "is": null
+    },
+    "vercel": {
+     "pop": null,
+     "is": null
+    },
+    "netlify": {
+     "pop": null,
+     "is": null
+    },
+    "keycdn": {
+     "pop": null,
+     "is": null
+    },
+    "cachefly": {
+     "pop": null,
+     "is": null
+    },
+    "qwilt": {
+     "pop": null,
+     "is": null
+    },
+    "github": {
+     "pop": null,
+     "is": null
+    },
+    "shopify": {
+     "pop": null,
+     "is": null
+    },
+    "line": {
+     "pop": null,
+     "is": null
+    }
+   }
+  }
+ ],
+ "broken": [
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "error code: 1034",
+    "ms": 10
+   },
+   "looks": "Cloudflare 錯誤 1034",
+   "cross": "Cloudflare 錯誤 1034"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "error code:1020",
+    "ms": 10
+   },
+   "looks": "Cloudflare 錯誤 1020",
+   "cross": "Cloudflare 錯誤 1020"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "Error code   1016 x",
+    "ms": 10
+   },
+   "looks": "Cloudflare 錯誤 1016",
+   "cross": "Cloudflare 錯誤 1016"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "<b>Error 1016</b>",
+    "ms": 10
+   },
+   "looks": "Cloudflare 錯誤 1016",
+   "cross": "Cloudflare 錯誤 1016"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "Error 2016",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": null
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "cf-error-code",
+    "ms": 10
+   },
+   "looks": "Cloudflare 錯誤 1xxx",
+   "cross": "Cloudflare 錯誤 1xxx"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "Edge IP Restricted",
+    "ms": 10
+   },
+   "looks": "Cloudflare 錯誤 1xxx",
+   "cross": "Cloudflare 錯誤 1xxx"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 525,
+    "headers": {},
+    "body": "",
+    "ms": 10
+   },
+   "looks": "Cloudflare 525",
+   "cross": "Cloudflare 525"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 531,
+    "headers": {},
+    "body": "",
+    "ms": 10
+   },
+   "looks": "HTTP 531",
+   "cross": "HTTP 531"
+  },
+  {
+   "provider": "cloudflare",
+   "r": {
+    "ok": true,
+    "status": 200,
+    "headers": {},
+    "body": "<html>",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": null
+  },
+  {
+   "provider": "cloudfront",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {
+     "x-cache": "Error from cloudfront"
+    },
+    "body": "The request could not be satisfied",
+    "ms": 10
+   },
+   "looks": "CloudFront 403（此 POP 不服務該 Distribution）",
+   "cross": "CloudFront 403（此 POP 不服務該 Distribution）"
+  },
+  {
+   "provider": "cloudfront",
+   "r": {
+    "ok": true,
+    "status": 400,
+    "headers": {
+     "x-cache": "Error from cloudfront"
+    },
+    "body": "Bad request.",
+    "ms": 10
+   },
+   "looks": "CloudFront 400（此 POP 不服務該 Distribution）",
+   "cross": "CloudFront 400（此 POP 不服務該 Distribution）"
+  },
+  {
+   "provider": "cloudfront",
+   "r": {
+    "ok": true,
+    "status": 404,
+    "headers": {
+     "x-cache": "Error from cloudfront"
+    },
+    "body": "nope",
+    "ms": 10
+   },
+   "looks": "CloudFront 404",
+   "cross": "CloudFront 404"
+  },
+  {
+   "provider": "cloudfront",
+   "r": {
+    "ok": true,
+    "status": 301,
+    "headers": {
+     "x-cache": "Error from cloudfront"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": null
+  },
+  {
+   "provider": "fastly",
+   "r": {
+    "ok": true,
+    "status": 421,
+    "headers": {},
+    "body": "",
+    "ms": 10
+   },
+   "looks": "HTTP 421 Misdirected（該節點不服務此網域）",
+   "cross": "HTTP 421 Misdirected（該節點不服務此網域）"
+  },
+  {
+   "provider": "fastly",
+   "r": {
+    "ok": true,
+    "status": 503,
+    "headers": {},
+    "body": "",
+    "ms": 10
+   },
+   "looks": "HTTP 503",
+   "cross": "HTTP 503"
+  },
+  {
+   "provider": "akamai",
+   "r": {
+    "ok": true,
+    "status": 400,
+    "headers": {},
+    "body": "<h1>Invalid URL</h1> Reference&#32;&#35;9.1234",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": "Akamai 錯誤頁（沒有這個網站的設定）"
+  },
+  {
+   "provider": "akamai",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "Access Denied ... Reference #18.abc",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": "Akamai 錯誤頁（沒有這個網站的設定）"
+  },
+  {
+   "provider": "akamai",
+   "r": {
+    "ok": true,
+    "status": 403,
+    "headers": {},
+    "body": "Access Denied, no ref",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": null
+  },
+  {
+   "provider": "azure",
+   "r": {
+    "ok": true,
+    "status": 404,
+    "headers": {},
+    "body": "<h2>Page not found</h2>\n... Azure Front Door ...",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": "Azure Front Door 錯誤頁"
+  },
+  {
+   "provider": "azure",
+   "r": {
+    "ok": true,
+    "status": 503,
+    "headers": {},
+    "body": "Our services aren't available right now",
+    "ms": 10
+   },
+   "looks": "HTTP 503",
+   "cross": "HTTP 503"
+  },
+  {
+   "provider": "azure",
+   "r": {
+    "ok": true,
+    "status": 404,
+    "headers": {},
+    "body": "Azure Front Door ... page not found",
+    "ms": 10
+   },
+   "looks": null,
+   "cross": null
+  }
+ ],
+ "sameSite": [
+  {
+   "a": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>X</title></head></html>",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>X</title></head></html>",
+    "ms": 10
+   },
+   "diff": null
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>X</title></head></html>",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 403,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>X</title></head></html>",
+    "ms": 10
+   },
+   "diff": "狀態不同（原 200／403）"
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>X</title></head></html>",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>Cloudflare</title></head></html>",
+    "ms": 10
+   },
+   "diff": "頁面標題不同"
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 301,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "https://x.com/home"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 302,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "https://x.com/home"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "diff": null
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 301,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "https://x.com/home"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 301,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "https://www.cloudflare.com/"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "diff": "轉址目的地不同"
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 302,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "/a?x=1"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 302,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "https://x.invalid/a?y=2"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "diff": null
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 302,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "HTTPS://X.COM:443/p"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 302,
+    "headers": {
+     "content-type": "text/html; charset=utf-8",
+     "location": "https://x.com/p"
+    },
+    "body": "",
+    "ms": 10
+   },
+   "diff": null
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>X</title></head></html>",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body": "{}",
+    "ms": 10
+   },
+   "diff": "內容類型不同（text/html／application/json）"
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>  A \n B  </title></head></html>",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 200,
+    "headers": {
+     "content-type": "text/html; charset=utf-8"
+    },
+    "body": "<html><head><title>A B</title></head></html>",
+    "ms": 10
+   },
+   "diff": null
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 200,
+    "headers": {},
+    "body": "<TITLE lang=x>T</Title>",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 200,
+    "headers": {},
+    "body": "<title>T</title>",
+    "ms": 10
+   },
+   "diff": null
+  },
+  {
+   "a": {
+    "ok": true,
+    "status": 204,
+    "headers": {},
+    "body": "",
+    "ms": 10
+   },
+   "b": {
+    "ok": true,
+    "status": 200,
+    "headers": {},
+    "body": "x",
+    "ms": 10
+   },
+   "diff": null
+  }
+ ],
+ "classify": [
+  {
+   "ip": "198.41.203.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "198.41.203.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "104.19.133.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "104.19.133.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "172.65.236.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "172.65.236.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "141.101.90.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "141.101.90.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "104.21.215.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "104.21.215.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "172.64.100.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "172.64.100.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "162.159.202.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "162.159.202.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "104.26.105.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "104.26.105.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "131.0.75.1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "131.0.75.200",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "173.245.48.0",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "188.114.96.0",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "131.0.72.0",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "2400:cb00::1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2405:b500::1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2c0f:f248::1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "54.192.42.1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "54.192.42.200",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "3.169.113.1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "3.169.113.200",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "65.9.18.1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "65.9.18.200",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "18.161.191.1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "18.161.191.200",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "3.163.214.1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "3.163.214.200",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "52.52.191.1",
+   "c": null
+  },
+  {
+   "ip": "52.52.191.200",
+   "c": null
+  },
+  {
+   "ip": "116.129.226.1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "116.129.226.200",
+   "c": null
+  },
+  {
+   "ip": "18.173.87.1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "18.173.87.200",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "44.234.90.1",
+   "c": null
+  },
+  {
+   "ip": "44.234.90.200",
+   "c": null
+  },
+  {
+   "ip": "23.228.249.0",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "36.103.232.0",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "44.234.90.252",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "2600:9000:3000::1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2600:9000:4000::1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2600:9000:5200::1",
+   "c": {
+    "provider": "cloudfront",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "151.101.72.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "151.101.72.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.11.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.11.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.10.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.10.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.113.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.113.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.125.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "146.75.125.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "140.248.112.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "140.248.112.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "23.235.38.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "23.235.38.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "157.52.77.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "157.52.77.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "199.27.79.1",
+   "c": {
+    "provider": "fastly",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "199.27.79.200",
+   "c": {
+    "provider": "fastly",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "23.235.32.0",
+   "c": {
+    "provider": "fastly",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "151.101.0.0",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "199.232.0.0",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2a04:4e40::1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2a04:4e42::1",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "1.37.77.1",
+   "c": null
+  },
+  {
+   "ip": "1.37.77.200",
+   "c": null
+  },
+  {
+   "ip": "92.223.124.1",
+   "c": null
+  },
+  {
+   "ip": "92.223.124.200",
+   "c": null
+  },
+  {
+   "ip": "95.85.93.1",
+   "c": null
+  },
+  {
+   "ip": "95.85.93.200",
+   "c": null
+  },
+  {
+   "ip": "94.128.12.1",
+   "c": null
+  },
+  {
+   "ip": "94.128.12.200",
+   "c": null
+  },
+  {
+   "ip": "193.169.251.1",
+   "c": null
+  },
+  {
+   "ip": "193.169.251.200",
+   "c": null
+  },
+  {
+   "ip": "213.156.144.1",
+   "c": null
+  },
+  {
+   "ip": "213.156.144.200",
+   "c": null
+  },
+  {
+   "ip": "85.234.75.22",
+   "c": {
+    "provider": "gcore",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "213.156.144.6",
+   "c": {
+    "provider": "gcore",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "85.234.83.224",
+   "c": {
+    "provider": "gcore",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "2a03:90c0:6d1:2801::22",
+   "c": {
+    "provider": "gcore",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2a03:90c0:11:2801::177",
+   "c": {
+    "provider": "gcore",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2a03:90c0:6d1:2801::17",
+   "c": {
+    "provider": "gcore",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "13.107.213.1",
+   "c": {
+    "provider": "azure",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "13.107.213.200",
+   "c": {
+    "provider": "azure",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "150.171.84.1",
+   "c": {
+    "provider": "azure",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "150.171.84.200",
+   "c": {
+    "provider": "azure",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "150.171.85.1",
+   "c": {
+    "provider": "azure",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "150.171.85.200",
+   "c": {
+    "provider": "azure",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "104.212.68.1",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "104.212.68.200",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "150.171.23.1",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "150.171.23.200",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "150.171.109.1",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "150.171.109.200",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "4.145.22.1",
+   "c": null
+  },
+  {
+   "ip": "4.145.22.200",
+   "c": null
+  },
+  {
+   "ip": "20.197.145.1",
+   "c": {
+    "provider": "azure",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "20.197.145.200",
+   "c": null
+  },
+  {
+   "ip": "191.235.224.1",
+   "c": null
+  },
+  {
+   "ip": "191.235.224.200",
+   "c": null
+  },
+  {
+   "ip": "4.145.22.160",
+   "c": {
+    "provider": "azure",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "20.210.70.68",
+   "c": {
+    "provider": "azure",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "191.235.224.88",
+   "c": {
+    "provider": "azure",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "2603:1000:4::5e0",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2603:1030:504:1::7c0",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2620:1ec:bdf::1",
+   "c": {
+    "provider": "azure",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "185.199.110.133",
+   "c": {
+    "provider": "fastly",
+    "cls": "unknown"
+   }
+  },
+  {
+   "ip": "2606:50c0:8000::133",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "8.8.8.8",
+   "c": null
+  },
+  {
+   "ip": "1.1.1.1",
+   "c": null
+  },
+  {
+   "ip": "104.16.161.36",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "172.67.0.9",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "dead"
+   }
+  },
+  {
+   "ip": "151.101.67.6",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "13.107.246.1",
+   "c": {
+    "provider": "azure",
+    "cls": "tw"
+   }
+  },
+  {
+   "ip": "2001:db8::1",
+   "c": null
+  },
+  {
+   "ip": "2606:4700:3030::1",
+   "c": {
+    "provider": "cloudflare",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "2a04:4e42::396",
+   "c": {
+    "provider": "fastly",
+    "cls": "global"
+   }
+  },
+  {
+   "ip": "127.0.0.1",
+   "c": null
+  },
+  {
+   "ip": "0.0.0.0",
+   "c": null
+  },
+  {
+   "ip": "255.255.255.255",
+   "c": null
+  }
+ ],
+ "pools": {
+  "cfPool4": [
+   {
+    "ip": "104.16.161.36",
+    "ms": 3
+   },
+   {
+    "ip": "104.18.20.216",
+    "ms": 4
+   }
+  ],
+  "cfGlobal": [
+   "104.21.0.0/24",
+   "172.67.0.0/24"
+  ],
+  "cfTw": [
+   "104.16.161.0/24"
+  ],
+  "cfDead": [
+   "104.17.0.0/24"
+  ],
+  "cfRange4": [
+   "104.16.0.0/13",
+   "172.64.0.0/13"
+  ],
+  "cfRange6": [
+   "2606:4700::/32"
+  ],
+  "fastlyPool4": [
+   {
+    "ip": "151.101.76.2",
+    "pop": "HKG",
+    "ms": 26,
+    "jitter": 1,
+    "loss": 0,
+    "score": 28
+   },
+   {
+    "ip": "151.101.77.9",
+    "pop": "HKG",
+    "ms": 27,
+    "jitter": 1,
+    "loss": 0,
+    "score": 29
+   },
+   {
+    "ip": "151.101.0.5",
+    "pop": "NRT",
+    "ms": 48,
+    "jitter": 2,
+    "loss": 0,
+    "score": 52
+   }
+  ],
+  "fastlyPrefixes": {
+   "HKG": [
+    "151.101.76",
+    "151.101.77",
+    "151.101.78"
+   ],
+   "NRT": [
+    "151.101.0",
+    "151.101.1"
+   ]
+  }
+ },
+ "scenarios": [
+  {
+   "name": "cf-trial",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ],
+    [
+     "A",
+     "172.67.0.9"
+    ]
+   ],
+   "answers": [
+    "A 104.21.0.5 300",
+    "A 172.67.0.9 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-trial.test",
+     "cloudflare",
+     4,
+     "104.21.0.5"
+    ]
+   ]
+  },
+  {
+   "name": "cf-ok",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.16.161.36",
+    "ips": [
+     "104.16.161.36",
+     "104.18.20.216"
+    ]
+   },
+   "answers": [
+    "A 104.16.161.36 300",
+    "A 104.18.20.216 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF→TW"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-ok-partial",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.18.20.216",
+    "ips": [
+     "104.18.20.216",
+     "9.9.9.9"
+    ]
+   },
+   "answers": [
+    "A 104.18.20.216 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF→TW"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-ok-gone",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "1.2.3.4"
+   },
+   "answers": [
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF→TW",
+     "CF:尚無可用網段→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-ok-gone.test",
+     "cloudflare",
+     4,
+     "104.21.0.5"
+    ],
+    [
+     "verify",
+     "cf-ok-gone.test",
+     "cloudflare",
+     4,
+     "104.21.0.5"
+    ]
+   ]
+  },
+  {
+   "name": "cf-fail",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "fail",
+    "ip": "104.16.161.36",
+    "reason": "x"
+   },
+   "answers": [
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:驗證失敗→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-fail-tried",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "fail",
+    "ip": "104.16.161.36",
+    "reason": "TLS（試了 2 個網段）"
+   },
+   "zone": [
+    [
+     "cloudflare",
+     "104.16.161.36",
+     false
+    ],
+    [
+     "cloudflare",
+     "104.16.161.36",
+     false
+    ]
+   ],
+   "answers": [
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:驗證失敗→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-fail-restricted",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "fail",
+    "ip": "104.16.161.36",
+    "reason": "x"
+   },
+   "zone": [
+    [
+     "cloudflare",
+     "104.16.161.36",
+     false
+    ],
+    [
+     "cloudflare",
+     "104.16.161.36",
+     false
+    ]
+   ],
+   "answers": [
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-fail-restricted.test",
+     "cloudflare",
+     4,
+     "104.21.0.5"
+    ]
+   ]
+  },
+  {
+   "name": "cf-expired",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.16.161.36",
+    "hours": -1
+   },
+   "answers": [
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-expired.test",
+     "cloudflare",
+     4,
+     "104.21.0.5"
+    ]
+   ]
+  },
+  {
+   "name": "cf-unknown-pending",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "unknown"
+   },
+   "answers": [
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-tw",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.16.161.99"
+    ]
+   ],
+   "answers": [
+    "A 104.16.161.99 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:已是台灣"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-dead",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.17.0.9"
+    ]
+   ],
+   "answers": [
+    "A 104.17.0.9 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:已是台灣"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-unknown-range",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.20.1.1"
+    ]
+   ],
+   "answers": [
+    "A 104.20.1.1 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-unknown-range.test",
+     "cloudflare",
+     4,
+     "104.20.1.1"
+    ]
+   ]
+  },
+  {
+   "name": "cf-cname",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "site.cdn.cloudflare.net"
+    ],
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.16.161.36"
+   },
+   "answers": [
+    "CNAME site.cdn.cloudflare.net 300",
+    "A 104.16.161.36 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF→TW"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-cname-only",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "x.cdn.cloudflare.net"
+    ],
+    [
+     "A",
+     "9.9.9.9"
+    ]
+   ],
+   "answers": [
+    "CNAME x.cdn.cloudflare.net 300",
+    "A 9.9.9.9 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-mixed-other",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "9.9.9.9"
+    ],
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.16.161.36"
+   },
+   "answers": [
+    "A 9.9.9.9 300",
+    "A 104.16.161.36 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF→TW"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-mixed-faster",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "9.9.9.9"
+    ],
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "cached": {
+    "9.9.9.9": 1
+   },
+   "answers": [
+    "A 9.9.9.9 300",
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-mixed-faster.test",
+     "cloudflare",
+     4,
+     "104.21.0.5"
+    ]
+   ]
+  },
+  {
+   "name": "cf-v6-drop",
+   "q": "AAAA",
+   "ans": [
+    [
+     "AAAA",
+     "2606:4700:3030::1"
+    ],
+    [
+     "AAAA",
+     "2001:db8::1"
+    ]
+   ],
+   "answers": [
+    "AAAA 2001:db8::1 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:V6丟棄"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "tryV6",
+     "cloudflare",
+     "2606:4700:3030::1"
+    ]
+   ]
+  },
+  {
+   "name": "cf-v6-trial",
+   "q": "AAAA",
+   "ans": [
+    [
+     "AAAA",
+     "2606:4700:3030::1"
+    ]
+   ],
+   "cfPool6": [
+    "2606:4700:10::1"
+   ],
+   "answers": [
+    "AAAA 2606:4700:3030::1 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "tryV6",
+     "cloudflare",
+     "2606:4700:3030::1"
+    ],
+    [
+     "verify",
+     "cf-v6-trial.test",
+     "cloudflare",
+     6,
+     "2606:4700:3030::1"
+    ]
+   ]
+  },
+  {
+   "name": "cf-v6-ok",
+   "q": "AAAA",
+   "ans": [
+    [
+     "AAAA",
+     "2606:4700:3030::1"
+    ]
+   ],
+   "cfPool6": [
+    "2606:4700:10::1"
+   ],
+   "v6": {
+    "verdict": "ok",
+    "ip": "2606:4700:10::1"
+   },
+   "answers": [
+    "AAAA 2606:4700:10::1 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF→TW"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "tryV6",
+     "cloudflare",
+     "2606:4700:3030::1"
+    ]
+   ]
+  },
+  {
+   "name": "cf-v6-fail",
+   "q": "AAAA",
+   "ans": [
+    [
+     "AAAA",
+     "2606:4700:3030::1"
+    ]
+   ],
+   "cfPool6": [
+    "2606:4700:10::1"
+   ],
+   "v6": {
+    "verdict": "fail",
+    "ip": "2606:4700:10::1"
+   },
+   "answers": [],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:V6丟棄"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "tryV6",
+     "cloudflare",
+     "2606:4700:3030::1"
+    ]
+   ]
+  },
+  {
+   "name": "cf-https-trial",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "104.21.0.7"
+     ],
+     true
+    ]
+   ],
+   "answers": [
+    "HTTPS {\"v4\":[\"104.21.0.7\"],\"v6\":[\"2606:4700::1\"]}"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:驗證中→原始"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-https-trial.test",
+     "cloudflare",
+     4,
+     "104.21.0.7"
+    ]
+   ]
+  },
+  {
+   "name": "cf-https-ok",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "104.21.0.7"
+     ],
+     true
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.16.161.36",
+    "ips": [
+     "104.16.161.36",
+     "104.18.20.216"
+    ]
+   },
+   "answers": [
+    "HTTPS {\"v4\":[\"104.16.161.36\",\"104.18.20.216\"],\"v6\":[]}"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:HTTPS提示改寫"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-https-v6pool",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "104.21.0.7"
+     ],
+     true
+    ]
+   ],
+   "cfPool6": [
+    "2606:4700:10::1"
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.16.161.36"
+   },
+   "v6": {
+    "verdict": "ok",
+    "ip": "2606:4700:10::1"
+   },
+   "answers": [
+    "HTTPS {\"v4\":[\"104.16.161.36\"],\"v6\":[\"2606:4700:10::1\"]}"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF:HTTPS提示改寫"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-https-v6trial",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "104.21.0.7"
+     ],
+     true
+    ]
+   ],
+   "cfPool6": [
+    "2606:4700:10::1"
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "104.16.161.36"
+   },
+   "answers": [
+    "HTTPS {\"v4\":[\"104.16.161.36\"],\"v6\":[\"2606:4700::1\"]}"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:HTTPS提示改寫"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-https-tw",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "104.16.161.7"
+     ],
+     false
+    ]
+   ],
+   "answers": [
+    "HTTPS {\"v4\":[\"104.16.161.7\"],\"v6\":[]}"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-never",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "policy": "never",
+   "answers": [
+    "A 104.21.0.5 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CDN-略過"
+    ],
+    "provider": "cloudflare",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-always",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "policy": "always",
+   "answers": [
+    "A 104.16.161.36 300",
+    "A 104.18.20.216 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "CF→TW"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "cf-alias-mode",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "104.21.0.5"
+    ]
+   ],
+   "trialMode": "alias",
+   "answers": [
+    "A 104.16.161.36 300",
+    "A 104.18.20.216 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF→TW 試用"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-alias-mode.test",
+     "cloudflare",
+     4,
+     "104.21.0.5"
+    ]
+   ]
+  },
+  {
+   "name": "cf-alias-mode-https",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "104.21.0.7"
+     ],
+     true
+    ]
+   ],
+   "trialMode": "alias",
+   "answers": [
+    "HTTPS {\"v4\":[\"104.16.161.36\",\"104.18.20.216\"],\"v6\":[\"2606:4700::1\"]}"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "CF:HTTPS提示改寫"
+    ],
+    "provider": "cloudflare",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "cf-alias-mode-https.test",
+     "cloudflare",
+     4,
+     "104.21.0.7"
+    ]
+   ]
+  },
+  {
+   "name": "ak-new",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "e1.dscx.akamaiedge.net"
+    ],
+    [
+     "A",
+     "23.1.1.1"
+    ]
+   ],
+   "answers": [
+    "CNAME e1.dscx.akamaiedge.net 300",
+    "A 23.1.1.1 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "akamai",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "ecs",
+     "ak-new.test"
+    ]
+   ]
+  },
+  {
+   "name": "ak-new-aaaa",
+   "q": "AAAA",
+   "ans": [
+    [
+     "CNAME",
+     "e1.dscx.akamaiedge.net"
+    ],
+    [
+     "AAAA",
+     "2600:1400::1"
+    ]
+   ],
+   "answers": [
+    "CNAME e1.dscx.akamaiedge.net 300",
+    "AAAA 2600:1400::1 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "akamai",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "ak-ok",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "e1.dscx.akamaiedge.net"
+    ],
+    [
+     "A",
+     "23.1.1.1"
+    ]
+   ],
+   "ecs": {
+    "verdict": "ok",
+    "ips4": [
+     "23.2.2.2"
+    ],
+    "ips6": [],
+    "gainMs": 30
+   },
+   "answers": [
+    "CNAME e1.dscx.akamaiedge.net 300",
+    "A 23.2.2.2 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "AKAMAI→ECS"
+    ],
+    "provider": "akamai",
+    "rewritten": "ecs",
+    "crossTo": null,
+    "gainMs": 30
+   },
+   "bg": []
+  },
+  {
+   "name": "ak-ok-aaaa",
+   "q": "AAAA",
+   "ans": [
+    [
+     "CNAME",
+     "e1.dscx.akamaiedge.net"
+    ],
+    [
+     "AAAA",
+     "2600:1400::1"
+    ]
+   ],
+   "ecs": {
+    "verdict": "ok",
+    "ips4": [
+     "23.2.2.2"
+    ],
+    "ips6": [
+     "2600:1400::9"
+    ]
+   },
+   "answers": [
+    "CNAME e1.dscx.akamaiedge.net 300",
+    "AAAA 2600:1400::9 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "AKAMAI→ECS"
+    ],
+    "provider": "akamai",
+    "rewritten": "ecs",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "ak-none-slow",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "e1.dscx.akamaiedge.net"
+    ],
+    [
+     "A",
+     "23.1.1.1"
+    ]
+   ],
+   "ecs": {
+    "verdict": "none"
+   },
+   "cached": {
+    "23.1.1.1": 45
+   },
+   "answers": [
+    "CNAME e1.dscx.akamaiedge.net 300",
+    "A 23.1.1.1 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "akamai",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "cross",
+     "ak-none-slow.test",
+     "akamai",
+     "23.1.1.1"
+    ]
+   ]
+  },
+  {
+   "name": "ak-none-fast",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "e1.dscx.akamaiedge.net"
+    ],
+    [
+     "A",
+     "23.1.1.1"
+    ]
+   ],
+   "ecs": {
+    "verdict": "none"
+   },
+   "cached": {
+    "23.1.1.1": 5
+   },
+   "answers": [
+    "CNAME e1.dscx.akamaiedge.net 300",
+    "A 23.1.1.1 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "akamai",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "ak-none-cross",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "e1.dscx.akamaiedge.net"
+    ],
+    [
+     "A",
+     "23.1.1.1"
+    ]
+   ],
+   "ecs": {
+    "verdict": "none"
+   },
+   "cross": {
+    "verdict": "ok",
+    "to": "cloudflare",
+    "ips": [
+     "104.16.161.36"
+    ],
+    "ms": 4,
+    "origMs": 40
+   },
+   "answers": [
+    "CNAME e1.dscx.akamaiedge.net 300",
+    "A 104.16.161.36 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "AKAMAI⇄Cloudflare"
+    ],
+    "provider": "akamai",
+    "rewritten": "cross",
+    "crossTo": "cloudflare",
+    "gainMs": 36
+   },
+   "bg": []
+  },
+  {
+   "name": "bunny-nocache",
+   "q": "A",
+   "ans": [
+    [
+     "CNAME",
+     "x.b-cdn.net"
+    ],
+    [
+     "A",
+     "5.5.5.5"
+    ]
+   ],
+   "answers": [
+    "CNAME x.b-cdn.net 300",
+    "A 5.5.5.5 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "bunny",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "latency",
+     "5.5.5.5"
+    ]
+   ]
+  },
+  {
+   "name": "bunny-cross",
+   "q": "AAAA",
+   "ans": [
+    [
+     "CNAME",
+     "x.b-cdn.net"
+    ],
+    [
+     "AAAA",
+     "2a02::5"
+    ]
+   ],
+   "cross": {
+    "verdict": "ok",
+    "to": "cloudflare",
+    "ips": [
+     "104.16.161.36"
+    ],
+    "ms": 4,
+    "origMs": 40
+   },
+   "answers": [
+    "CNAME x.b-cdn.net 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "BUNNY⇄Cloudflare"
+    ],
+    "provider": "bunny",
+    "rewritten": "cross",
+    "crossTo": "cloudflare",
+    "gainMs": 36
+   },
+   "bg": []
+  },
+  {
+   "name": "fastly-faster-other",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "203.69.141.59"
+    ],
+    [
+     "A",
+     "151.101.67.6"
+    ]
+   ],
+   "cached": {
+    "203.69.141.59": 6,
+    "151.101.67.6": 64
+   },
+   "answers": [
+    "A 203.69.141.59 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY:別家 CDN 更快（6ms）"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "cross",
+     "fastly-faster-other.test",
+     "fastly",
+     "151.101.67.6"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-trial",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "185.199.110.133"
+    ],
+    [
+     "A",
+     "185.199.108.133"
+    ]
+   ],
+   "cached": {
+    "185.199.110.133": 63,
+    "185.199.108.133": 63
+   },
+   "answers": [
+    "A 185.199.110.133 300",
+    "A 185.199.108.133 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "FASTLY:驗證中→原始"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "cross",
+     "fastly-trial.test",
+     "fastly",
+     "185.199.110.133"
+    ],
+    [
+     "verify",
+     "fastly-trial.test",
+     "fastly",
+     4,
+     "185.199.110.133"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-ok",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "185.199.110.133"
+    ],
+    [
+     "A",
+     "185.199.108.133"
+    ]
+   ],
+   "cached": {
+    "185.199.110.133": 63
+   },
+   "zone": [
+    [
+     "fastly",
+     "151.101.76.133",
+     true
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "151.101.76.133",
+    "algo": 2
+   },
+   "answers": [
+    "A 151.101.76.133 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY→最近節點"
+    ],
+    "provider": "fastly",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "cross",
+     "fastly-ok.test",
+     "fastly",
+     "185.199.110.133"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-ok-octet-changed",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "151.101.65.140"
+    ]
+   ],
+   "cached": {
+    "151.101.65.140": 63
+   },
+   "zone": [
+    [
+     "fastly",
+     "151.101.76.133",
+     true
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "151.101.76.133",
+    "algo": 2
+   },
+   "answers": [
+    "A 151.101.65.140 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "FASTLY→最近節點",
+     "FASTLY:尚無可用網段→原始"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "cross",
+     "fastly-ok-octet-changed.test",
+     "fastly",
+     "151.101.65.140"
+    ],
+    [
+     "verify",
+     "fastly-ok-octet-changed.test",
+     "fastly",
+     4,
+     "151.101.65.140"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-aaaa-ok",
+   "q": "AAAA",
+   "ans": [
+    [
+     "AAAA",
+     "2606:50c0:8000::133"
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "151.101.76.133",
+    "algo": 2
+   },
+   "answers": [],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY:V6丟棄"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "tryV6",
+     "fastly",
+     "2606:50c0:8000::133"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-aaaa-trial",
+   "q": "AAAA",
+   "ans": [
+    [
+     "AAAA",
+     "2606:50c0:8000::133"
+    ]
+   ],
+   "answers": [
+    "AAAA 2606:50c0:8000::133 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "tryV6",
+     "fastly",
+     "2606:50c0:8000::133"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-close",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "151.101.65.140"
+    ]
+   ],
+   "cached": {
+    "151.101.65.140": 30
+   },
+   "answers": [
+    "A 151.101.65.140 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY:已是最近節點"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "cross",
+     "fastly-close.test",
+     "fastly",
+     "151.101.65.140"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-nocache",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "151.101.65.140"
+    ]
+   ],
+   "answers": [
+    "A 151.101.65.140 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY:已是最近節點"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "latency",
+     "151.101.65.140"
+    ],
+    [
+     "latency",
+     "151.101.65.140"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-cross-a",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "151.101.1.140"
+    ],
+    [
+     "A",
+     "151.101.65.140"
+    ]
+   ],
+   "cross": {
+    "verdict": "ok",
+    "to": "cloudflare",
+    "ips": [
+     "104.16.161.36"
+    ],
+    "ms": 4,
+    "origMs": 62
+   },
+   "answers": [
+    "A 104.16.161.36 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY⇄Cloudflare"
+    ],
+    "provider": "fastly",
+    "rewritten": "cross",
+    "crossTo": "cloudflare",
+    "gainMs": 58
+   },
+   "bg": []
+  },
+  {
+   "name": "fastly-cross-aaaa",
+   "q": "AAAA",
+   "ans": [
+    [
+     "AAAA",
+     "2a04:4e42::396"
+    ]
+   ],
+   "cross": {
+    "verdict": "ok",
+    "to": "cloudflare",
+    "ips": [
+     "104.16.161.36"
+    ],
+    "ms": 4,
+    "origMs": 62
+   },
+   "answers": [],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY⇄Cloudflare"
+    ],
+    "provider": "fastly",
+    "rewritten": "cross",
+    "crossTo": "cloudflare",
+    "gainMs": 58
+   },
+   "bg": [
+    [
+     "tryV6",
+     "fastly",
+     "2a04:4e42::396"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-cross-https",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "151.101.1.140"
+     ],
+     true
+    ]
+   ],
+   "cross": {
+    "verdict": "ok",
+    "to": "cloudflare",
+    "ips": [
+     "104.16.161.36"
+    ],
+    "ms": 4,
+    "origMs": 62
+   },
+   "answers": [
+    "HTTPS {\"v4\":[\"104.16.161.36\"],\"v6\":[]}"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY⇄HTTPS 提示"
+    ],
+    "provider": "fastly",
+    "rewritten": "cross",
+    "crossTo": "cloudflare",
+    "gainMs": null
+   },
+   "bg": []
+  },
+  {
+   "name": "fastly-cross-recheck",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "151.101.1.140"
+    ]
+   ],
+   "cached": {
+    "151.101.1.140": 62
+   },
+   "cross": {
+    "verdict": "ok",
+    "to": "cloudflare",
+    "ips": [
+     "104.16.161.36"
+    ],
+    "ms": 4,
+    "origMs": 62,
+    "recheck": -1
+   },
+   "answers": [
+    "A 104.16.161.36 300"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY⇄Cloudflare"
+    ],
+    "provider": "fastly",
+    "rewritten": "cross",
+    "crossTo": "cloudflare",
+    "gainMs": 58
+   },
+   "bg": [
+    [
+     "cross",
+     "fastly-cross-recheck.test",
+     "fastly",
+     "151.101.1.140"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-cross-wait",
+   "q": "A",
+   "ans": [
+    [
+     "A",
+     "151.101.1.140"
+    ]
+   ],
+   "cached": {
+    "151.101.1.140": 62
+   },
+   "cross": {
+    "verdict": "fail"
+   },
+   "answers": [
+    "A 151.101.1.140 300"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "FASTLY:驗證中→原始"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "fastly-cross-wait.test",
+     "fastly",
+     4,
+     "151.101.1.140"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-https-trial",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "151.101.65.140"
+     ],
+     false
+    ]
+   ],
+   "cached": {
+    "151.101.65.140": 63
+   },
+   "answers": [
+    "HTTPS {\"v4\":[\"151.101.65.140\"],\"v6\":[]}"
+   ],
+   "result": {
+    "ttlCap": 10,
+    "tags": [
+     "FASTLY:驗證中→原始"
+    ],
+    "provider": "fastly",
+    "rewritten": null,
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": [
+    [
+     "verify",
+     "fastly-https-trial.test",
+     "fastly",
+     4,
+     "151.101.65.140"
+    ]
+   ]
+  },
+  {
+   "name": "fastly-https-ok",
+   "q": "HTTPS",
+   "ans": [
+    [
+     "HTTPS",
+     [
+      "151.101.65.133"
+     ],
+     true
+    ]
+   ],
+   "zone": [
+    [
+     "fastly",
+     "151.101.76.133",
+     true
+    ]
+   ],
+   "v4": {
+    "verdict": "ok",
+    "ip": "151.101.76.133",
+    "algo": 2
+   },
+   "answers": [
+    "HTTPS {\"v4\":[\"151.101.76.133\"],\"v6\":[\"2606:4700::1\"]}"
+   ],
+   "result": {
+    "ttlCap": null,
+    "tags": [
+     "FASTLY:HTTPS提示改寫"
+    ],
+    "provider": "fastly",
+    "rewritten": "alias",
+    "crossTo": null,
+    "gainMs": null
+   },
+   "bg": []
+  }
+ ]
+}

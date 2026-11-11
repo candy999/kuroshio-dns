@@ -1,0 +1,14 @@
+[package]
+name = "kuroshio-filter"
+description = "黑潮 DNS：過濾引擎（AdGuard / hosts 規則、緊湊雜湊結構、串流建置）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# 只用標準函式庫；不含網路、非同步。下載由整合端負責，把位元組餵進 FilterBuilder。
+[dependencies]
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>黑潮 DNS 設定</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>黑潮 DNS</h1>
+      <div class="sub" id="hdr-sub">本機設定頁</div>
+    </div>
+  </div>
+  <div class="hdr-right">
+    <span class="badge" id="hdr-mode" hidden></span>
+    <a class="btn small ghost" id="logout" href="/logout" hidden>登出</a>
+  </div>
+</header>
+
+<main id="app">
+  <p class="loading" id="boot">讀取中…</p>
+
+  <!-- 登入 -->
+  <section id="login" class="card login" hidden>
+    <h2>登入設定頁</h2>
+    <p>請輸入登入 token。token 存在設定資料夾的 <code>admin.token</code>（只有系統管理員能讀）；用 cmd 執行時，視窗一開始會顯示可以直接點的登入網址。</p>
+    <p class="msg err" id="login-err" hidden>token 不正確，請再試一次。</p>
+    <form method="post" action="/login" class="login-form" id="login-form">
+      <label for="login-token">登入 token</label>
+      <input type="password" id="login-token" name="token" autocomplete="current-password" required spellcheck="false">
+      <button type="submit" class="btn primary">登入</button>
+    </form>
+  </section>
+
+  <!-- 主畫面 -->
+  <div id="main" hidden>
+    <nav class="tabs" id="tabs" role="tablist">
+      <a href="#status" role="tab" data-tab="status">狀態</a>
+      <a href="#settings" role="tab" data-tab="settings">設定</a>
+      <a href="#tools" role="tab" data-tab="tools">工具</a>
+      <a href="#log" role="tab" data-tab="log">日誌</a>
+      <a href="#about" role="tab" data-tab="about">關於</a>
+    </nav>
+
+    <details class="notice" id="notice">
+      <summary>Windows 使用提醒</summary>
+      <ul>
+        <li><strong>路由器埠轉發</strong>：除了 TCP 443、TCP 853，也要加 <strong>UDP 443</strong>（DoH3）與 <strong>UDP 853</strong>（DoQ）。很多人只轉了 TCP，DoH3 / DoQ 就連不進來。</li>
+        <li><strong>防火牆</strong>：用「以系統管理員身分執行」開啟命令提示字元，執行一次 <code>kuroshio.exe setup</code>，會加入 Windows 防火牆規則（只加實際開啟的協議）、網址登記與憑證綁定。之後一般權限也能跑全部功能。</li>
+        <li>第一次監聽時 Windows 可能跳出防火牆詢問，按「允許」即可（執行過 setup 就不會跳）。</li>
+      </ul>
+    </details>
+
+    <!-- 狀態 -->
+    <section class="tab" id="tab-status" hidden>
+      <div class="row-head">
+        <h2>狀態</h2>
+        <span class="muted" id="st-updated"></span>
+      </div>
+      <p class="msg err" id="st-err" hidden></p>
+      <div class="tiles" id="st-tiles"></div>
+      <h3>監聽</h3>
+      <div class="table-wrap"><table id="st-listen"><thead><tr><th>協議</th><th>埠號</th><th>狀態</th></tr></thead><tbody></tbody></table></div>
+      <h3>上游</h3>
+      <p class="muted" id="st-up-desc"></p>
+      <div class="table-wrap"><table id="st-up"><thead><tr><th>上游</th><th>角色</th><th>成功</th><th>失敗</th><th>平均延遲</th><th>健康</th></tr></thead><tbody></tbody></table></div>
+      <div id="st-extra"></div>
+    </section>
+
+    <!-- 設定 -->
+    <section class="tab" id="tab-settings" hidden>
+      <div class="row-head">
+        <h2>設定</h2>
+        <div class="seg" id="mode-toggle" role="group" aria-label="介面模式">
+          <button type="button" data-mode="simple">簡易</button>
+          <button type="button" data-mode="pro">專業</button>
+        </div>
+      </div>
+      <p class="muted" id="mode-desc"></p>
+      <div class="card" id="cfg-unavailable" hidden></div>
+      <div class="settings" id="cfg-body" hidden>
+        <nav class="groups" id="cfg-groups" aria-label="設定分類"></nav>
+        <div class="group-body" id="cfg-group"></div>
+      </div>
+      <div class="savebar" id="savebar" hidden>
+        <span class="savebar-msg" id="save-msg" role="status" aria-live="polite"></span>
+        <div class="savebar-btns">
+          <button type="button" class="btn" id="btn-discard">放棄變更</button>
+          <button type="button" class="btn primary" id="btn-save">儲存並套用</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 工具 -->
+    <section class="tab" id="tab-tools" hidden>
+      <h2>工具</h2>
+      <div class="tools" id="tools"></div>
+    </section>
+
+    <!-- 日誌 -->
+    <section class="tab" id="tab-log" hidden>
+      <div class="row-head">
+        <h2>日誌</h2>
+        <div class="log-ctl">
+          <label>行數
+            <select id="log-lines">
+              <option value="100">100</option>
+              <option value="200" selected>200</option>
+              <option value="500">500</option>
+            </select>
+          </label>
+          <label class="chk"><input type="checkbox" id="log-auto" checked> 自動更新</label>
+          <input type="search" id="log-filter" placeholder="篩選關鍵字" aria-label="篩選關鍵字">
+          <button type="button" class="btn small" id="log-refresh">重新整理</button>
+        </div>
+      </div>
+      <p class="muted">要看每一筆查詢，請在「設定 → 日誌 → 記錄每筆查詢」打開。</p>
+      <pre class="log" id="log-pre"></pre>
+    </section>
+
+    <!-- 關於 -->
+    <section class="tab" id="tab-about" hidden>
+      <h2>關於</h2>
+      <div class="about">
+        <div class="card">
+          <table class="kv" id="about-kv"><tbody></tbody></table>
+          <h3>授權是什麼意思</h3>
+          <p class="gpl">黑潮 DNS 是自由軟體，採用 GPL-3.0-or-later 授權：任何人都可以免費使用、研究、修改與分享。</p>
+          <p class="gpl">如果你把修改過的版本提供給別人（散布），也要用同樣的授權公開對應的原始碼。只是自己使用、沒有提供給別人，就不需要公開。</p>
+        </div>
+        <div class="card qr">
+          <img src="/api/qr" alt="原始碼網址 QR 碼" width="180" height="180" id="about-qr">
+          <p class="muted">用手機掃描開啟原始碼網址</p>
+          <p class="mono" id="about-src"></p>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+<footer class="foot" id="foot">
+  <span id="foot-name">黑潮 DNS</span>
+  <span class="sep" aria-hidden="true">·</span>
+  <span>授權 <a id="foot-license" href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener noreferrer">GPL-3.0-or-later</a></span>
+  <span class="sep" aria-hidden="true">·</span>
+  <span>原始碼 <a id="foot-src" target="_blank" rel="noopener noreferrer"></a></span>
+</footer>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

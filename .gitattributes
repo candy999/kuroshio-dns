@@ -1,0 +1,6 @@
+# 測試資料與 OpenWrt 腳本一律用 LF（Windows 的 git 預設會轉成 CRLF）
+*.uci text eol=lf
+*.sh text eol=lf
+*.init text eol=lf
+*.json text eol=lf
+*.txt text eol=lf

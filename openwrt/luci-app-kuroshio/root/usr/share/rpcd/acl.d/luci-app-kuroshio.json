@@ -1,0 +1,32 @@
+{
+	"luci-app-kuroshio": {
+		"description": "Grant access to kuroshio",
+		"read": {
+			"ubus": {
+				"kuroshio": [ "status", "api", "defaults", "acme_status", "log", "about" ],
+				"service": [ "list" ]
+			},
+			"file": {
+				"/etc/kuroshio/custom-rules.txt": [ "read" ],
+				"/etc/kuroshio/benchmark/iplist.txt": [ "read" ],
+				"/etc/kuroshio/benchmark/dohlist.txt": [ "read" ],
+				"/etc/kuroshio/benchmark/web.txt": [ "read" ],
+				"/etc/kuroshio/benchmark/blacklist.txt": [ "read" ]
+			},
+			"uci": [ "kuroshio" ]
+		},
+		"write": {
+			"ubus": {
+				"kuroshio": [ "action", "acme_issue" ]
+			},
+			"file": {
+				"/etc/kuroshio/custom-rules.txt": [ "write" ],
+				"/etc/kuroshio/benchmark/iplist.txt": [ "write" ],
+				"/etc/kuroshio/benchmark/dohlist.txt": [ "write" ],
+				"/etc/kuroshio/benchmark/web.txt": [ "write" ],
+				"/etc/kuroshio/benchmark/blacklist.txt": [ "write" ]
+			},
+			"uci": [ "kuroshio" ]
+		}
+	}
+}

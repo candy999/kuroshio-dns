@@ -1,0 +1,17 @@
+﻿quic://dns.adguard-dns.com
+quic://dns.alidns.com:853
+quic://dns.caliph.dev:853
+quic://dns.comss.one
+quic://dns.dnsguard.pub
+quic://dns.jupitrdns.com
+quic://dns.surfsharkdns.com
+quic://doh.tiar.app
+quic://doq.ffmuc.net
+quic://family.adguard-dns.com
+quic://ibksturm.synology.me
+quic://juuri.hagezi.org
+quic://root.hagezi.org
+quic://router.comss.one
+quic://rx.techomespace.com
+quic://unfiltered.adguard-dns.com
+quic://wurzn.hagezi.org

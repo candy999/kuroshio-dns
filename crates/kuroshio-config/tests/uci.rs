@@ -1,0 +1,218 @@
+//! UCI 轉換：對照 2.x 的 openwrt/tools/test-uci-config.js 逐條移植
+
+use kuroshio_config::uci::{overrides, parse_text, Env};
+use kuroshio_config::{build, defaults, get, Tier};
+use serde_json::{json, Value};
+
+const DEFAULT_RAW: &str = include_str!("fixtures/default.uci");
+
+/// Windows 上的 git 可能把測試檔轉成 CRLF：統一成 LF 再做文字替換
+fn default_text() -> String {
+    DEFAULT_RAW.replace("\r\n", "\n")
+}
+
+fn env() -> Env {
+    Env {
+        etc: "/etc/kuroshio".into(),
+        ..Default::default()
+    }
+}
+
+fn load(text: &str, env: &Env) -> Value {
+    build(Tier::Large, &overrides(&parse_text(text).unwrap(), env))
+}
+
+fn g<'a>(v: &'a Value, p: &str) -> &'a Value {
+    get(v, p).unwrap_or(&Value::Null)
+}
+
+#[test]
+fn defaults_dnsmasq_upstream() {
+    let d = load(&default_text(), &env());
+    assert_eq!(g(&d, "listen.plain.binds"), &json!(["127.0.0.1", "::1"]));
+    assert_eq!(g(&d, "listen.plain.port"), &json!(5335));
+    assert!(get(&d, "resolver.localForward").is_none());
+    assert_eq!(g(&d, "upstream.pinned"), &json!([]), "固定上游清空（避免問路由器自己）");
+    assert_eq!(g(&d, "listen.doh.port"), &json!(8443));
+    assert_eq!(g(&d, "listen.doh.trustProxy"), &json!(false));
+    assert_eq!(g(&d, "listen.doh.cert"), &json!("/etc/kuroshio/cert.pem"));
+    assert_eq!(g(&d, "site.hostname"), &json!(""));
+    assert_eq!(g(&d, "listen.doh.enabled"), &json!(false));
+    assert_eq!(g(&d, "listen.dot.enabled"), &json!(false));
+    assert_eq!(g(&d, "ddns.records"), &json!([]));
+    assert_eq!(g(&d, "site.enabled"), &json!(false));
+    assert_eq!(g(&d, "ddns.enabled"), &json!(false));
+    // 數值參數沿用內建預設
+    assert_eq!(g(&d, "resolver.cacheMax"), g(&defaults(), "resolver.cacheMax"));
+    assert_eq!(g(&d, "cdn.cross"), g(&defaults(), "cdn.cross"));
+    // 只帶入預設勾選的清單
+    let on: Vec<Value> = g(&defaults(), "filter.lists")
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l.get("enabled") != Some(&json!(false)))
+        .map(|l| json!({ "url": l["url"], "category": l["category"], "name": l["name"] }))
+        .collect();
+    assert_eq!(g(&d, "filter.lists"), &Value::Array(on));
+    assert_eq!(g(&d, "filter.customRules"), &json!(["/etc/kuroshio/custom-rules.txt"]));
+    assert_eq!(g(&d, "community.enabled"), &json!(false));
+    assert_eq!(g(&d, "community.endpoints"), &json!({ "doh": null, "dot": null }));
+}
+
+#[test]
+fn custom_values_exchange_mode() {
+    let text = default_text()
+        .replace("option redirect 'dnsmasq-upstream'", "option redirect 'exchange'")
+        .replace("option listen_ipv6 '1'", "option listen_ipv6 '0'")
+        .replace("config resolver 'resolver'", "config resolver 'resolver'\n\toption timeout_ms '2000'\n\toption fast_path '0'\n\toption cache_max ''")
+        .replace("config cdn 'cdn'\n\toption enabled '1'", "config cdn 'cdn'\n\toption enabled '1'\n\toption trial_mode 'alias'\n\toption cross_min_orig_ms '30'\n\toption cross_enabled '0'")
+        .replace("config cdn_provider 'fastly'\n\toption enabled '1'", "config cdn_provider 'fastly'\n\toption enabled '0'")
+        .replacen("config filter_list\n\toption enabled '1'", "config filter_list\n\toption enabled '0'", 1)
+        .replace(
+            "config job 'cdn_scan'\n\toption enabled '1'\n\tlist at '03:20'\n\tlist weekday '0'",
+            "config job 'cdn_scan'\n\toption enabled '0'\n\tlist at '02:00'\n\tlist at '14:00'\n\tlist weekday '3'\n\tlist weekday '6'",
+        )
+        .replace("config upstream 'upstream'", "config upstream 'upstream'\n\tlist pinned 'udp://168.95.1.1'\n\toption auto_max '3'")
+        + "\nconfig filter_list\n\toption name 'My'\n\toption url 'https://example.com/my.txt'\n\toption category 'malware'\n";
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "listen.plain.binds"), &json!(["0.0.0.0"]));
+    assert_eq!(g(&c, "listen.plain.port"), &json!(53));
+    assert_eq!(
+        g(&c, "resolver.localForward"),
+        &json!({ "server": "udp://127.0.0.1:5354", "domains": ["lan"] })
+    );
+    // 依預設型別轉換；空白沿用預設
+    assert_eq!(g(&c, "resolver.timeoutMs"), &json!(2000));
+    assert_eq!(g(&c, "resolver.fastPath"), &json!(false));
+    assert_eq!(g(&c, "resolver.cacheMax"), g(&defaults(), "resolver.cacheMax"));
+    assert_eq!(g(&c, "cdn.trialMode"), &json!("alias"));
+    assert_eq!(g(&c, "cdn.cross.minOrigMs"), &json!(30));
+    assert_eq!(g(&c, "cdn.cross.enabled"), &json!(false));
+    assert_eq!(g(&c, "cdn.providers.fastly.enabled"), &json!(false));
+    let lists = g(&c, "filter.lists").as_array().unwrap();
+    assert_eq!(
+        lists.last().unwrap(),
+        &json!({ "url": "https://example.com/my.txt", "category": "malware", "name": "My" })
+    );
+    assert!(!lists.iter().any(|l| l["name"] == "EasyList China"), "停用的清單不載入");
+    assert_eq!(g(&c, "jobs.cdn-scan.enabled"), &json!(false));
+    assert_eq!(g(&c, "jobs.cdn-scan.at"), &json!(["02:00", "14:00"]));
+    assert_eq!(g(&c, "jobs.cdn-scan.weekdays"), &json!([3, 6]));
+    assert_eq!(g(&c, "upstream.pinned"), &json!(["udp://168.95.1.1"]));
+    assert_eq!(g(&c, "upstream.autoMax"), &json!(3));
+}
+
+#[test]
+fn takeover_modes() {
+    let r = load(
+        &default_text().replace("option redirect 'dnsmasq-upstream'", "option redirect 'redirect'"),
+        &env(),
+    );
+    assert_eq!(g(&r, "listen.plain.binds"), &json!(["0.0.0.0", "::"]));
+    assert_eq!(g(&r, "listen.plain.openBinds"), &json!([]));
+    assert_eq!(g(&r, "resolver.localForward.server"), &json!("udp://127.0.0.1:53"));
+
+    let lan = Env {
+        etc: "/etc/kuroshio".into(),
+        lan4: "10.0.0.1".into(),
+        ula: "fd00::1".into(),
+    };
+    let h = load(
+        &default_text().replace("option redirect 'dnsmasq-upstream'", "option redirect 'hijack'"),
+        &lan,
+    );
+    assert_eq!(g(&h, "listen.plain.binds"), &json!(["127.0.0.1", "10.0.0.1", "::1", "fd00::1"]));
+    assert_eq!(g(&h, "listen.plain.openBinds"), &json!(["fd00::1"]), "ULA 不檢查來源");
+    assert_eq!(g(&h, "listen.plain.port"), &json!(5335));
+    assert_eq!(g(&h, "resolver.localForward.server"), &json!("udp://127.0.0.1:53"));
+
+    let x = load(
+        &default_text().replace("option redirect 'dnsmasq-upstream'", "option redirect 'exchange'"),
+        &lan,
+    );
+    assert_eq!(
+        g(&x, "listen.plain.binds"),
+        &json!(["0.0.0.0", "::1", "fd00::1"]),
+        "不綁 :: 避免跟 ULA 衝突"
+    );
+    assert_eq!(g(&x, "listen.plain.port"), &json!(53));
+
+    let h4 = load(
+        &default_text()
+            .replace("option redirect 'dnsmasq-upstream'", "option redirect 'hijack'")
+            .replace("option listen_ipv6 '1'", "option listen_ipv6 '0'"),
+        &lan,
+    );
+    assert_eq!(g(&h4, "listen.plain.binds"), &json!(["127.0.0.1", "10.0.0.1"]), "不處理 IPv6");
+
+    let none = load(
+        &default_text().replace("option redirect 'dnsmasq-upstream'", "option redirect 'hijack'"),
+        &env(),
+    );
+    assert_eq!(
+        g(&none, "listen.plain.binds"),
+        &json!(["0.0.0.0", "::1"]),
+        "沒有區網 IP 時綁全部 IPv4"
+    );
+}
+
+#[test]
+fn community_endpoints_and_rules() {
+    let text = default_text()
+        .replace("option domain ''", "option domain 'dns.example.com'")
+        .replace(
+            "config doh 'doh'\n\toption enabled '0'\n\toption port '8443'\n\toption open_wan '0'",
+            "config doh 'doh'\n\toption enabled '1'\n\toption port '8443'\n\toption open_wan '1'",
+        )
+        .replace("config dot 'dot'\n\toption enabled '0'", "config dot 'dot'\n\toption enabled '1'")
+        .replace("config community 'community'\n\toption enabled '0'", "config community 'community'\n\toption enabled '1'\n\toption stale_days '14'\n\toption sync_interval '30'")
+        + "\nconfig community_rule\n\toption name '同業者'\n\toption action 'accept'\n\toption same_asn '1'\n\toption max_rtt_ms '30'\n\tlist colo 'TPE'\n";
+    let cm = load(&text, &env());
+    assert_eq!(g(&cm, "community.enabled"), &json!(true));
+    assert_eq!(
+        g(&cm, "community.endpoints"),
+        &json!({ "doh": "https://dns.example.com/.well-known/kuroshio", "dot": "dot://dns.example.com:853" })
+    );
+    assert_eq!(g(&cm, "community.staleDays"), &json!(14));
+    assert_eq!(g(&cm, "community.syncIntervalMin"), &json!(30));
+    assert_eq!(
+        g(&cm, "community.rules"),
+        &json!([{ "enabled": true, "name": "同業者", "action": "accept", "colo": ["TPE"], "same_asn": "1", "max_rtt_ms": "30" }])
+    );
+    assert_eq!(g(&cm, "community.dir"), &json!("/etc/kuroshio/community"));
+}
+
+#[test]
+fn tier_still_applies_and_user_wins() {
+    let o = overrides(
+        &parse_text(&default_text().replace(
+            "config resolver 'resolver'",
+            "config resolver 'resolver'\n\toption cache_max '7777'",
+        ))
+        .unwrap(),
+        &env(),
+    );
+    let tiny = build(Tier::Tiny, &o);
+    assert_eq!(g(&tiny, "resolver.cacheMax"), &json!(7777), "UCI 有填的以 UCI 為準");
+    assert_eq!(g(&tiny, "resolver.parallel"), &json!(2), "沒填的由等級決定");
+    let sys = overrides(
+        &parse_text(&(default_text() + "\nconfig system 'system'\n\toption profile 'small'\n\toption allow_heavy '1'\n")).unwrap(),
+        &env(),
+    );
+    assert_eq!(kuroshio_config::requested_tier(&sys), Some(Tier::Small));
+    assert_eq!(g(&sys, "system.allowHeavy"), &json!(true));
+    let dd = overrides(
+        &parse_text(&default_text().replace("option data_dir ''", "option data_dir '/mnt/usb/kuroshio'")).unwrap(),
+        &env(),
+    );
+    assert_eq!(g(&dd, "system.persistDir"), &json!("/mnt/usb/kuroshio"));
+}
+
+#[test]
+fn parser_edge_cases() {
+    let v = parse_text("config a 'x'\n\toption q 'it'\\''s'\n\tlist l '1'\n\tlist l '2'\nconfig b\n\toption k \"v\"\n# comment\n").unwrap();
+    assert_eq!(v["values"]["x"]["q"], "it's");
+    assert_eq!(v["values"]["x"]["l"], json!(["1", "2"]));
+    assert_eq!(v["values"]["cfg000000"]["k"], "v");
+    assert!(parse_text("config a 'x'\nconfig b 'x'\n").is_err(), "同名不同型別");
+}

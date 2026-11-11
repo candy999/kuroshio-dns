@@ -1,0 +1,28 @@
+[package]
+name = "kuroshio-community"
+description = "黑潮 DNS：社群共享協定 v2（身分、好友、增量同步、資料品質分數）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+kuroshio-net = { path = "../kuroshio-net" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ring = "0.17"
+base64 = "0.22"
+ciborium = "0.2"
+serde_bytes = "0.11"
+# zstd C 函式庫：cargo-zigbuild 交叉編譯 mipsel / aarch64 musl 都測過可以編
+zstd = { version = "0.13", default-features = false }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

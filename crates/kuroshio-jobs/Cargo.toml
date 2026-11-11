@@ -1,0 +1,22 @@
+[package]
+name = "kuroshio-jobs"
+description = "黑潮 DNS：背景工作排程器、每日上游評測、種子資料"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+kuroshio-config = { path = "../kuroshio-config" }
+kuroshio-proto = { path = "../kuroshio-proto" }
+kuroshio-net = { path = "../kuroshio-net" }
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# 確認評測結果伺服器讀得懂（只在測試用）
+kuroshio = { path = "../kuroshio" }

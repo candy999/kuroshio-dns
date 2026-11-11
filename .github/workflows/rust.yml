@@ -1,0 +1,390 @@
+name: Kuroshio DNS (Rust)
+
+# 推送：測試 + 所有 CPU 的執行檔 + Windows + x86_64 的 OpenWrt 套件與實機測試
+# v3.* 標籤或手動執行（full = true）：所有 CPU 的 OpenWrt 套件，標籤時建立 Release
+on:
+  push:
+    branches: [ main, rust-3.0 ]
+    tags: [ 'v3.*' ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: 編譯所有 CPU 的 OpenWrt 套件
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: 測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 格式
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy（內建 ACME，Windows 版用）
+        run: cargo clippy -p kuroshio --all-targets --features acme -- -D warnings
+      - name: 單元與整合測試
+        run: cargo test
+      - name: Shell 腳本
+        run: |
+          shellcheck -s sh -e SC2034,SC2154,SC1008,SC3043,SC1091 openwrt/kuroshio/files/kuroshio.init
+          shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/kuroshio.uci-defaults
+          shellcheck -s sh -e SC3043,SC2015,SC2086,SC1091 openwrt/tools/ci-smoke-kuroshio.sh openwrt/tools/ci-luci-setup.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: LuCI 語法
+        run: node openwrt/tools/check-luci.js luci-app-kuroshio
+      # Windows 本機設定頁（data/admin）：debug 執行檔 + Playwright，腳本自己用暫存設定檔啟動 kuroshio
+      - name: 編譯（設定頁測試用，debug）
+        run: cargo build -p kuroshio
+      - name: Playwright
+        run: |
+          npm i --no-save playwright@1.48.2
+          npx playwright install --with-deps chromium
+      - name: 設定頁端對端測試
+        run: node tools/admin-e2e.js
+        env:
+          KUROSHIO_BIN: target/debug/kuroshio
+          SHOTS: screenshots-admin
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: admin-ui-screenshots
+          path: screenshots-admin
+          if-no-files-found: ignore
+
+  binaries:
+    name: 執行檔 ${{ matrix.target }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,      qemu: '' }
+          - { target: i686-unknown-linux-musl,        qemu: qemu-i386 }
+          - { target: aarch64-unknown-linux-musl,     qemu: qemu-aarch64 }
+          - { target: armv7-unknown-linux-musleabihf, qemu: qemu-arm }
+          # MIPS 在 Rust 是 tier 3：用 nightly 自己編標準函式庫（OpenWrt 的 mips_24kc / mipsel_24kc 都是軟體浮點，跟這兩個 target 相同）
+          - { target: mipsel-unknown-linux-musl,      qemu: qemu-mipsel, nightly: true }
+          - { target: mips-unknown-linux-musl,        qemu: qemu-mips,   nightly: true }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.nightly }}
+        with:
+          targets: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@nightly
+        if: ${{ matrix.nightly }}
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: 安裝 zig 與 cargo-zigbuild
+        run: pip install ziglang cargo-zigbuild
+      - name: 編譯
+        run: |
+          if [ "${{ matrix.nightly }}" = "true" ]; then
+            # MIPS 的 static-pie 執行檔一啟動就 segfault：改成非 PIE 的靜態執行檔
+            export RUSTFLAGS="-C relocation-model=static"
+            cargo zigbuild --release -p kuroshio --target ${{ matrix.target }} -Zbuild-std=std,panic_abort
+          else
+            cargo zigbuild --release -p kuroshio --target ${{ matrix.target }}
+          fi
+          ls -la target/${{ matrix.target }}/release/kuroshio
+          file target/${{ matrix.target }}/release/kuroshio
+      - name: 用 QEMU 實際執行
+        run: |
+          BIN=target/${{ matrix.target }}/release/kuroshio
+          if [ -n "${{ matrix.qemu }}" ]; then
+            # 新版 Ubuntu 沒有 qemu-user-static，改用 qemu-user（執行檔是靜態連結，兩種都能跑）
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq qemu-user-static >/dev/null 2>&1 || sudo apt-get install -y -qq qemu-user >/dev/null
+            Q=$(command -v "${{ matrix.qemu }}-static" || command -v "${{ matrix.qemu }}")
+            RUN="$Q $BIN"
+          else
+            RUN="$BIN"
+          fi
+          $RUN --version
+          $RUN defaults | head -c 200; echo
+          $RUN query example.com -s 8.8.8.8
+          # 加密上游（DoT / DoH，HTTP/2）：TLS 在各種 CPU 上都要能用
+          $RUN query example.com -s tls://1.1.1.1
+          $RUN query example.com -s tls://dns.google
+          $RUN query example.com -s https://cloudflare-dns.com/dns-query
+          $RUN query example.com -s https://dns.google/dns-query
+          # QUIC：DoQ / DoH3
+          $RUN query example.com -s quic://dns.adguard-dns.com
+          $RUN query example.com -s h3://cloudflare-dns.com/dns-query || $RUN query example.com -s h3://dns.google/dns-query
+          # 啟動伺服器，再用同一個執行檔查詢自己
+          echo '{"listen":{"plain":{"binds":["127.0.0.1"],"port":5336}},"upstream":{"pinned":["udp://8.8.8.8","udp://1.1.1.1"]}}' > /tmp/k.json
+          $RUN run -c /tmp/k.json & PID=$!
+          sleep 3
+          $RUN query example.com -s 127.0.0.1:5336
+          $RUN query example.com -s tcp://127.0.0.1:5336
+          kill $PID
+          # 真的下載預設的訂閱清單：載入後擋得到廣告網域，順便記錄記憶體
+          echo '{"listen":{"plain":{"binds":["127.0.0.1"],"port":5337}},"admin":{"port":8056},"system":{"persistDir":"/tmp/kf/state"}}' > /tmp/kf.json
+          $RUN run -c /tmp/kf.json > /tmp/kf.log 2>&1 & PID=$!
+          for i in $(seq 1 180); do grep -q "訂閱清單已載入" /tmp/kf.log && break; sleep 1; done
+          grep -E "清單|自訂規則" /tmp/kf.log
+          $RUN query doubleclick.net -s 127.0.0.1:5337 | tee /tmp/q.txt
+          grep -q "0.0.0.0" /tmp/q.txt
+          curl -s http://127.0.0.1:8056/api/status | python3 -c "import json,sys;d=json.load(sys.stdin);f=d['filter'];print('清單', f['lists'], '條、自訂', f['custom'], '條、過濾器', f['memoryBytes']//1024, 'KB、常駐記憶體', d['system']['rssKB'], 'KB')"
+          kill $PID
+          # 低階硬體設定：等級調整生效
+          echo '{"system":{"profile":"tiny"}}' > /tmp/tiny.json
+          $RUN sysinfo -c /tmp/tiny.json | tee /tmp/sysinfo.txt
+          grep -q 'resolver.parallel: 0 → 2' /tmp/sysinfo.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/kuroshio
+
+  windows:
+    name: Windows
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 測試
+        run: cargo test --workspace --features kuroshio/acme
+      - name: 編譯（含內建 ACME）
+        run: cargo build --release -p kuroshio --features acme
+      - name: 實際執行
+        shell: pwsh
+        run: |
+          ./target/release/kuroshio.exe --version
+          ./target/release/kuroshio.exe query example.com -s 8.8.8.8
+          ./target/release/kuroshio.exe query example.com -s tls://1.1.1.1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./target/release/kuroshio.exe query example.com -s https://dns.google/dns-query
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./target/release/kuroshio.exe query example.com -s quic://dns.adguard-dns.com
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          '{"listen":{"plain":{"binds":["127.0.0.1"],"port":5336}},"upstream":{"pinned":["udp://8.8.8.8","udp://1.1.1.1"]}}' | Set-Content -Encoding utf8 k.json
+          $p = Start-Process -PassThru -NoNewWindow ./target/release/kuroshio.exe -ArgumentList 'run','-c','k.json'
+          Start-Sleep 3
+          ./target/release/kuroshio.exe query example.com -s 127.0.0.1:5336
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Stop-Process $p
+      - name: Windows 服務、防火牆、設定頁登入
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path ./target/release/kuroshio.exe).Path
+          $dir = Join-Path $env:RUNNER_TEMP 'ks'
+          New-Item -ItemType Directory $dir | Out-Null
+          $cfg = @{
+            listen = @{ plain = @{ binds = @('127.0.0.1'); port = 5337 } }
+            upstream = @{ pinned = @('udp://8.8.8.8', 'udp://1.1.1.1') }
+            admin = @{ port = 18054; auth = $true }
+            system = @{ persistDir = (Join-Path $dir 'state') }
+          } | ConvertTo-Json -Depth 5
+          Set-Content -Encoding utf8 -Path (Join-Path $dir 'config.json') -Value $cfg
+          $c = Join-Path $dir 'config.json'
+          & $exe setup -c $c
+          if ($LASTEXITCODE -ne 0) { throw 'setup 失敗' }
+          netsh advfirewall firewall show rule name=all | Select-String '黑潮 DNS'
+          & $exe service install -c $c
+          if ($LASTEXITCODE -ne 0) { throw 'service install 失敗' }
+          & $exe service start
+          Start-Sleep 6
+          $st = & $exe service status
+          Write-Host "狀態：$st"
+          if ("$st" -notmatch 'Running') { Get-Content (Join-Path $dir 'kuroshio*.log') -ErrorAction SilentlyContinue; throw '服務沒有在執行' }
+          & $exe query example.com -s 127.0.0.1:5337
+          if ($LASTEXITCODE -ne 0) { throw '服務的 DNS 查詢失敗' }
+          # 設定頁：沒登入 401、用 token 登入後可以讀狀態與設定
+          $r = Invoke-WebRequest http://127.0.0.1:18054/api/status -SkipHttpErrorCheck
+          if ($r.StatusCode -ne 401) { throw "沒登入應該是 401，實際 $($r.StatusCode)" }
+          $tok = (Get-Content (Join-Path $dir 'admin.token')).Trim()
+          $r = Invoke-WebRequest "http://127.0.0.1:18054/login?token=$tok" -SessionVariable s -MaximumRedirection 0 -SkipHttpErrorCheck
+          if ($r.StatusCode -ne 303) { throw "登入應該是 303，實際 $($r.StatusCode)" }
+          $status = Invoke-RestMethod http://127.0.0.1:18054/api/status -WebSession $s
+          Write-Host "版本 $($status.version)，等級 $($status.system.tier)"
+          $conf = Invoke-RestMethod http://127.0.0.1:18054/api/config -WebSession $s
+          if ($conf.user.listen.plain.port -ne 5337) { throw '讀不到設定檔' }
+          $sess = Invoke-RestMethod http://127.0.0.1:18054/api/session -WebSession $s
+          if ($sess.mode -ne 'service') { throw "執行方式應該是 service，實際 $($sess.mode)" }
+          & $exe service stop
+          Start-Sleep 5
+          $st = & $exe service status
+          if ("$st" -notmatch 'Stopped') { throw "停止後狀態 $st" }
+          $log = Get-Content (Join-Path $dir 'kuroshio.log') -Raw
+          Write-Host $log
+          if ($log -notmatch '結束') { throw '服務停止時沒有正常收尾' }
+          & $exe service uninstall
+          if ($LASTEXITCODE -ne 0) { throw 'service uninstall 失敗' }
+      - name: 打包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist/kuroshio | Out-Null
+          Copy-Item target/release/kuroshio.exe, LICENSE, windows/README.txt dist/kuroshio/
+          # 唯讀資料（種子、評測名單、CDN 範圍、設定頁、公開頁）：執行檔旁的 data\ 會自動使用
+          Copy-Item -Recurse data dist/kuroshio/data
+          Copy-Item rules/default-custom-rules.txt dist/kuroshio/data/
+          Compress-Archive dist/kuroshio dist/kuroshio-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kuroshio-windows-x86_64
+          path: dist/kuroshio-windows-x86_64.zip
+
+  plan:
+    name: 套件清單
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          # sdk = OpenWrt SDK 的架構名稱；arch = OpenWrt 編譯時的 $(ARCH)；target = Rust 執行檔
+          ALL='[
+            {"sdk":"x86_64","arch":"x86_64","target":"x86_64-unknown-linux-musl"},
+            {"sdk":"i386_pentium4","arch":"i386","target":"i686-unknown-linux-musl"},
+            {"sdk":"aarch64_generic","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
+            {"sdk":"aarch64_cortex-a53","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
+            {"sdk":"aarch64_cortex-a72","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
+            {"sdk":"arm_cortex-a7_neon-vfpv4","arch":"arm","target":"armv7-unknown-linux-musleabihf"},
+            {"sdk":"arm_cortex-a9_vfpv3-d16","arch":"arm","target":"armv7-unknown-linux-musleabihf"},
+            {"sdk":"arm_cortex-a15_neon-vfpv4","arch":"arm","target":"armv7-unknown-linux-musleabihf"},
+            {"sdk":"mipsel_24kc","arch":"mipsel","target":"mipsel-unknown-linux-musl"},
+            {"sdk":"mips_24kc","arch":"mips","target":"mips-unknown-linux-musl"}
+          ]'
+          if [ "${{ startsWith(github.ref, 'refs/tags/v3.') }}" = "true" ] || [ "${{ inputs.full }}" = "true" ]; then
+            ARCHS="$ALL"
+          else
+            ARCHS=$(echo "$ALL" | jq -c '[.[] | select(.sdk == "x86_64")]')
+          fi
+          echo "matrix=$(echo "$ARCHS" | jq -c '[.[] as $a | ("24.10","25.12") as $r | $a + {release: $r, format: (if $r == "24.10" then "ipk" else "apk" end)}]')" >> "$GITHUB_OUTPUT"
+
+  openwrt:
+    name: OpenWrt ${{ matrix.release }} ${{ matrix.sdk }}
+    needs: [ binaries, plan ]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: prebuilt/${{ matrix.arch }}
+      - run: chmod +x prebuilt/${{ matrix.arch }}/kuroshio
+      - name: OpenWrt SDK 打包
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.sdk }}-openwrt-${{ matrix.release }}
+          FEEDNAME: kuroshio
+          PACKAGES: kuroshio luci-app-kuroshio
+          NO_DEFAULT_FEEDS: 1
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          V: s
+      - name: 整理套件
+        run: |
+          mkdir -p dist
+          find bin/packages \( -name "kuroshio*.${{ matrix.format }}" -o -name "luci-app-kuroshio*.${{ matrix.format }}" \) -exec cp {} dist/ \;
+          ls -la dist
+          test -n "$(ls dist)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kuroshio-openwrt-${{ matrix.release }}-${{ matrix.sdk }}
+          path: dist/*
+
+  smoke:
+    name: OpenWrt 實機測試 ${{ matrix.release }}
+    needs: openwrt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [ '24.10', '25.12' ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kuroshio-openwrt-${{ matrix.release }}-x86_64
+          path: pkgs
+      - name: 測試憑證（rustls 需要 SAN，而且不能是 CA 憑證）
+        run: openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -addext "basicConstraints=critical,CA:FALSE" -keyout pkgs/test-key.pem -out pkgs/test-cert.pem
+      - name: 安裝、DNS 接管、啟動、各協議查詢
+        run: docker run --rm -v "$PWD:/src" -v "$PWD/pkgs:/pkgs" openwrt/rootfs:x86_64-openwrt-${{ matrix.release }} /bin/sh /src/openwrt/tools/ci-smoke-kuroshio.sh
+
+  luci:
+    name: LuCI 介面測試 ${{ matrix.release }}
+    needs: openwrt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [ '24.10', '25.12' ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kuroshio-openwrt-${{ matrix.release }}-x86_64
+          path: pkgs
+      - name: 啟動 OpenWrt + LuCI
+        run: |
+          docker run -d --name owrt -p 8080:80 -v "$PWD:/src" -v "$PWD/pkgs:/pkgs" openwrt/rootfs:x86_64-openwrt-${{ matrix.release }} /bin/sh -c 'sleep infinity'
+          docker exec owrt /bin/sh /src/openwrt/tools/ci-luci-setup.sh kuroshio
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Playwright
+        run: |
+          npm i --no-save playwright@1.48.2
+          npx playwright install --with-deps chromium
+      - name: 打開每一頁（簡易 / 專業）、儲存
+        run: node openwrt/tools/luci-e2e.js kuroshio
+        env:
+          SHOTS: screenshots-kuroshio-${{ matrix.release }}
+      - name: uhttpd 紀錄
+        if: always()
+        run: docker exec owrt cat /tmp/uhttpd.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: luci-kuroshio-screenshots-${{ matrix.release }}
+          path: screenshots-kuroshio-${{ matrix.release }}
+
+  release:
+    name: 發布
+    if: startsWith(github.ref, 'refs/tags/v3.')
+    needs: [ smoke, luci, windows ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+      - name: 整理
+        run: |
+          mkdir -p dist
+          find art -path '*kuroshio-openwrt-*' -type f -exec cp {} dist/ \;
+          cp art/kuroshio-windows-x86_64/*.zip dist/
+          for d in art/bin-*; do t=${d#art/bin-}; cp "$d/kuroshio" "dist/kuroshio-$t"; done
+          ( cd dist && sha256sum * > SHA256SUMS )
+          ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: dist/*

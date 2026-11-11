@@ -1,0 +1,459 @@
+{
+  "system": {
+    "profile": "auto",
+    "allowHeavy": false,
+    "persistDir": "",
+    "runtimeDir": "",
+    "storageClass": "auto",
+    "persistIntervalMin": 0,
+    "flashWriteBudgetKB": 4096,
+    "workerThreads": 0,
+    "maxTlsConnections": 2048,
+    "maxQuicConnections": 512,
+    "queryLogRing": 20000,
+    "memoryWatchdog": true
+  },
+  "listen": {
+    "doh": {
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 8053,
+      "trustProxy": true,
+      "cert": "",
+      "key": "",
+      "http3": false,
+      "path": "/dns-query",
+      "http3Port": 0,
+      "altSvcPort": 0,
+      "windowsMode": "auto"
+    },
+    "dot": {
+      "enabled": false,
+      "host": "0.0.0.0",
+      "port": 853,
+      "cert": "",
+      "key": ""
+    },
+    "plain": {
+      "enabled": true,
+      "binds": [
+        "127.0.0.1"
+      ],
+      "port": 53,
+      "allowFrom": [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10"
+      ]
+    },
+    "doq": {
+      "enabled": false,
+      "host": "0.0.0.0",
+      "port": 853
+    },
+    "ddr": false,
+    "proxyProtocol": false
+  },
+  "site": {
+    "enabled": false,
+    "hostname": "",
+    "minClients": 2,
+    "htmlFile": "",
+    "detailFile": "",
+    "detailPath": "/detail"
+  },
+  "check": {
+    "enabled": true,
+    "activeMinutes": 10,
+    "hostWindowSec": 180,
+    "ownHostTtl": 10
+  },
+  "admin": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8054
+  },
+  "log": {
+    "queryLog": false,
+    "fileLog": false,
+    "dir": "./logs",
+    "level": "info"
+  },
+  "upstream": {
+    "pinned": [],
+    "fallback": [
+      "udp://45.90.30.126",
+      "udp://1.0.0.2",
+      "udp://8.8.4.4"
+    ],
+    "bootstrap": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "autoMax": 5,
+    "autoTypes": [
+      "udp",
+      "doh",
+      "doh3",
+      "dot",
+      "doq"
+    ],
+    "autoStateFile": "./state/upstreams.json"
+  },
+  "resolver": {
+    "timeoutMs": 1500,
+    "collectWindowMs": 600,
+    "fastPath": true,
+    "fastPathTtl": 10,
+    "rankIps": true,
+    "maxIps": 4,
+    "maxTtl": 600,
+    "minTtl": 0,
+    "negativeMaxTtl": 300,
+    "serveStaleSec": 3600,
+    "prefetchThresholdSec": 5,
+    "prefetchRecentSec": 600,
+    "cacheMax": 100000,
+    "sendEcs": true,
+    "lastResort": [
+      "udp://8.8.8.8",
+      "udp://1.1.1.1"
+    ],
+    "stripEch": false,
+    "dnssec": false,
+    "cookies": false,
+    "parallel": 0,
+    "staleIfErrorSec": 86400,
+    "warmNames": 2000,
+    "warmRate": 20
+  },
+  "iprank": {
+    "port": 443,
+    "timeoutMs": 800,
+    "okTtlSec": 600,
+    "failTtlSec": 120,
+    "concurrency": 64
+  },
+  "filter": {
+    "enabled": true,
+    "customRules": [
+      "./custom-rules.txt"
+    ],
+    "lists": [
+      {
+        "url": "https://easylist-downloads.adblockplus.org/easylistchina.txt",
+        "category": "ads",
+        "name": "EasyList China"
+      },
+      {
+        "url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt",
+        "category": "ads",
+        "name": "CHN: anti-AD"
+      },
+      {
+        "url": "https://filter.futa.gg/hosts_abp.txt",
+        "category": "ads",
+        "name": "FutaGuard LowTechHost（台灣廣告）"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/tracking.txt",
+        "category": "ads",
+        "name": "blocklistproject tracking",
+        "enabled": false
+      },
+      {
+        "url": "https://danny0838.github.io/content-farm-terminator/files/blocklist/content-farms.txt",
+        "category": "ads",
+        "name": "內容農場終結者",
+        "enabled": false
+      },
+      {
+        "url": "https://raw.githubusercontent.com/ignaciocastro/a-dove-is-dumb/main/list.txt",
+        "category": "telemetry",
+        "name": "a-dove-is-dumb（Adobe 遙測）"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts",
+        "category": "telemetry",
+        "name": "Ruddernation（Adobe 驗證）"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/smart-tv.txt",
+        "category": "telemetry",
+        "name": "blocklistproject smart-tv（電視遙測）"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/adobe.txt",
+        "category": "telemetry",
+        "name": "blocklistproject adobe（會擋 Adobe 登入）",
+        "enabled": false
+      },
+      {
+        "url": "https://filter.futa.gg/TW165_abp.txt",
+        "category": "malware",
+        "name": "FutaGuard TW165（台灣 165 反詐騙）"
+      },
+      {
+        "url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_44.txt",
+        "category": "malware",
+        "name": "HaGeZi's Threat Intelligence Feeds",
+        "enabled": false
+      },
+      {
+        "url": "https://filter.futa.gg/nrd/past-07day_abp.txt",
+        "category": "malware",
+        "name": "FutaGuard 新註冊網域（7 天，誤擋風險高）",
+        "enabled": false
+      }
+    ],
+    "updateIntervalHours": 24,
+    "relaxedModifiers": false,
+    "maxDomains": 10000000,
+    "maxComplex": 20000
+  },
+  "cdn": {
+    "enabled": true,
+    "trialTtl": 10,
+    "trialMode": "original",
+    "nearestMinGainMs": 8,
+    "verifyOkHours": 24,
+    "verifyFailHours": 6,
+    "verifyFailMaxDays": 7,
+    "verifyTimeoutMs": 5000,
+    "verifyConcurrency": 8,
+    "serveCount": 4,
+    "minPool": 3,
+    "healthIntervalMin": 30,
+    "qualityIntervalMin": 5,
+    "qualitySamples": 6,
+    "nearestScoreSlack": 40,
+    "verifyCandidates": 4,
+    "octetSearch": 10,
+    "zoneMax": 8000,
+    "v6NodesMax": 2000,
+    "peak": {
+      "startHour": 20,
+      "endHour": 23,
+      "weight": 2
+    },
+    "cross": {
+      "enabled": true,
+      "minOrigMs": 20,
+      "recheckHours": 24,
+      "failDays": 3,
+      "akamaiMaxMs": 15,
+      "concurrency": 2
+    },
+    "v6Policy": "drop",
+    "dbFile": "./state/cdn-domains.json",
+    "maxEntries": 200000,
+    "providers": {
+      "cloudflare": {
+        "enabled": true,
+        "seedV4": [
+          "104.16.161.36",
+          "104.18.20.216",
+          "104.17.75.150",
+          "162.159.235.5",
+          "172.67.98.180",
+          "172.67.78.23",
+          "104.25.157.27",
+          "172.67.125.25",
+          "141.101.113.37",
+          "162.159.2.218",
+          "173.245.59.168",
+          "198.41.208.107"
+        ],
+        "serveCount": 4
+      },
+      "cloudfront": {
+        "enabled": true,
+        "seedV4": [
+          "3.169.37.27",
+          "65.9.172.103",
+          "54.192.42.186",
+          "13.33.29.112"
+        ],
+        "serveCount": 4
+      },
+      "fastly": {
+        "enabled": true
+      },
+      "gcore": {
+        "enabled": true
+      },
+      "azure": {
+        "enabled": true
+      },
+      "akamai": {
+        "enabled": true,
+        "ecs": true
+      },
+      "edgio": {
+        "enabled": true,
+        "ecs": true
+      },
+      "cdnetworks": {
+        "enabled": true,
+        "ecs": true
+      },
+      "tencent": {
+        "enabled": true,
+        "ecs": true
+      },
+      "alibaba": {
+        "enabled": true,
+        "ecs": true
+      },
+      "wangsu": {
+        "enabled": true,
+        "ecs": true
+      },
+      "bytedance": {
+        "enabled": true,
+        "ecs": true
+      },
+      "apple": {
+        "enabled": true,
+        "ecs": true
+      }
+    },
+    "ecs": {
+      "resolvers": [
+        "udp://8.8.8.8",
+        "udp://8.8.4.4"
+      ],
+      "twSubnets": [
+        "168.95.0.0/24",
+        "1.160.0.0/24",
+        "139.175.0.0/24",
+        "140.112.0.0/24",
+        "35.229.0.0/24"
+      ],
+      "minGainMs": 8,
+      "minGainRatio": 0.3,
+      "resultHours": 6,
+      "concurrency": 4
+    }
+  },
+  "community": {
+    "enabled": false,
+    "dir": "./state/community",
+    "endpoints": {
+      "doh": null,
+      "dot": null
+    },
+    "powBits": 16,
+    "rejectDays": 7,
+    "staleDays": 7,
+    "syncIntervalMin": 60,
+    "maxFriends": 50,
+    "minHitRate": 0,
+    "autoDeleteLowHitRate": false,
+    "shareDomains": true,
+    "shareUpstreams": true,
+    "rules": [],
+    "maxBundleMB": 32
+  },
+  "jobs": {
+    "dns-benchmark": {
+      "enabled": true,
+      "at": "04:10",
+      "runIfMissing": "state/upstreams.json",
+      "startDelaySec": 300,
+      "timeoutMin": 150
+    },
+    "cdn-ranges": {
+      "enabled": true,
+      "at": "03:10",
+      "weekdays": [
+        0
+      ],
+      "runIfMissing": "state/cdn/ranges/.done",
+      "startDelaySec": 30,
+      "timeoutMin": 20
+    },
+    "cdn-scan": {
+      "enabled": true,
+      "at": "03:20",
+      "weekdays": [
+        0
+      ],
+      "startDelaySec": 60,
+      "timeoutMin": 240
+    },
+    "cdn-pool": {
+      "enabled": true,
+      "at": "05:30",
+      "runIfMissing": "state/cdn/pools.json",
+      "startDelaySec": 120,
+      "timeoutMin": 60
+    }
+  },
+  "benchmark": {
+    "dir": "./data/benchmark",
+    "outDir": "./state/benchmark",
+    "concurrency": 50,
+    "timeoutMs": 1500,
+    "maxTimeouts": 2,
+    "coverageTarget": 0.97,
+    "minAuto": 3,
+    "maxAvgLatencyMs": 250,
+    "keepDays": 14
+  },
+  "scan": {
+    "samplesPerSubnet": 6,
+    "concurrency": 400,
+    "timeoutMs": 2000
+  },
+  "pool": {
+    "candidatesPerProvider": 1500,
+    "poolSize": 12,
+    "speedTop": 16,
+    "speedSeconds": 5,
+    "latencyConcurrency": 200,
+    "probeConcurrency": 32,
+    "nearestProbeTop": 1500,
+    "nearestPops": 6,
+    "nearestKeepPops": 5
+  },
+  "ddns": {
+    "enabled": false,
+    "provider": "cloudflare",
+    "apiToken": "",
+    "records": [],
+    "zone": "",
+    "ipv4": true,
+    "ipv6": false,
+    "proxied": false,
+    "ttl": 1,
+    "intervalMin": 5,
+    "forceHours": 24,
+    "ipSource": "web",
+    "iface4": "",
+    "iface6": "",
+    "httpsRecord": true
+  },
+  "acme": {
+    "enabled": false,
+    "provider": "cloudflare",
+    "server": "letsencrypt",
+    "email": "",
+    "domains": [],
+    "keyType": "ec-256",
+    "renewDays": 30,
+    "apiToken": "",
+    "zone": "",
+    "propagationSec": 15,
+    "certFile": "",
+    "keyFile": ""
+  },
+  "about": {
+    "sourceUrl": ""
+  }
+}
