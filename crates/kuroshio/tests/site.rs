@@ -55,6 +55,7 @@ fn state(cfg: &Value) -> Arc<AppState> {
         scheduler: None,
         encrypted: Encrypted::default(),
         backup: kuroshio::backup::Locations::from_cfg(cfg),
+        cfg: Arc::new(cfg.clone()),
     })
 }
 

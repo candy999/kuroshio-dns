@@ -273,6 +273,34 @@ pub fn json() -> Value {
     to_json(&list())
 }
 
+/// TCP 監聽：IPv6 位址一律 `IPV6_V6ONLY`，`0.0.0.0` 與 `::` 才能同時綁同一個埠
+pub fn bind_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        s.set_only_v6(true)?;
+    }
+    // Windows 的 SO_REUSEADDR 會讓兩個程式搶同一個埠，只在 Unix 設
+    #[cfg(unix)]
+    s.set_reuse_address(true)?;
+    s.set_nonblocking(true)?;
+    s.bind(&addr.into())?;
+    s.listen(1024)?;
+    tokio::net::TcpListener::from_std(s.into())
+}
+
+/// UDP（QUIC）監聽：同樣對 IPv6 設 `IPV6_V6ONLY`
+pub fn bind_udp(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        s.set_only_v6(true)?;
+    }
+    s.set_nonblocking(true)?;
+    s.bind(&addr.into())?;
+    Ok(s.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

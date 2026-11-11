@@ -176,6 +176,13 @@ enum Cmd {
         #[arg(long)]
         uci: bool,
     },
+    /// 列出設定檔、狀態、憑證、token 等檔案的位置（JSON；不含密鑰內容）
+    Paths {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
     /// 查詢一個網域（診斷用，類似 dig）
     Query {
         name: String,
@@ -637,6 +644,14 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
         Cmd::Sysinfo { config, uci } => sysinfo_report(&config, uci)?,
+        Cmd::Paths { config, uci } => {
+            let (cfg, ..) = effective(&config, uci)?;
+            let file = (!uci).then(|| std::fs::canonicalize(&config).unwrap_or(config));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&kuroshio::app::paths_json(&cfg, file.as_deref()))?
+            );
+        }
         Cmd::Query {
             name,
             qtype,

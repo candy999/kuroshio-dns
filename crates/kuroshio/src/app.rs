@@ -67,6 +67,37 @@ pub struct Encrypted {
     pub doh: Option<SocketAddr>,
     pub doq: Option<SocketAddr>,
     pub doh3: Option<SocketAddr>,
+    /// 每個監聽位址的結果（多位址 `binds`、綁定失敗的原因）
+    pub detail: Vec<ListenerInfo>,
+}
+
+/// 一個加密監聽位址的結果（`/api/status` 的 `listenersDetail`）
+#[derive(Debug, Clone)]
+pub struct ListenerInfo {
+    /// dot / doq / doh / doh3
+    pub proto: &'static str,
+    /// 設定裡寫的位址
+    pub bind: String,
+    pub port: u16,
+    /// 實際監聽的位址（失敗 = None）
+    pub bound: Option<SocketAddr>,
+    /// 這個監聽自己做 TLS（DoH 在反向代理後面時是 false）
+    pub tls: bool,
+    pub error: Option<String>,
+}
+
+impl Encrypted {
+    pub fn detail_json(&self) -> Value {
+        self.detail
+            .iter()
+            .map(|l| {
+                json!({
+                    "proto": l.proto, "bind": l.bind, "port": l.bound.map(|b| b.port()).unwrap_or(l.port),
+                    "ok": l.bound.is_some(), "tls": l.tls, "error": l.error,
+                })
+            })
+            .collect()
+    }
 }
 
 fn rel_path(base: &std::path::Path, p: &str) -> PathBuf {
@@ -78,14 +109,99 @@ fn rel_path(base: &std::path::Path, p: &str) -> PathBuf {
     }
 }
 
-/// DoT / DoH 伺服器（規格 01 第 1.1 節）；開不起來只記警告，區網 DNS 照常
+/// 設定裡的一組憑證 / 私鑰路徑（`<prefix>.cert`、`<prefix>.key`），兩個都有填才算
+fn cert_pair(cfg: &Value, prefix: &str, base: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    let s = |k: &str| {
+        get(cfg, &format!("{prefix}.{k}"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    Some((rel_path(base, s("cert")?), rel_path(base, s("key")?)))
+}
+
+/// 某個加密協議（dot / doq / doh / doh3）用哪一份憑證：
+/// 自己的 `listen.<x>.cert / key` → 共用的 `tls.cert / key` → 內建 ACME 的輸出位置（`acme.enabled` 才算）。
+/// DoQ 沒有自己的憑證時沿用 DoT 的、再來 DoH 的；DoH3 跟 DoH 同一份。都沒有 → None。
+pub fn cert_for(cfg: &Value, proto: &str, base: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    let own: &[&str] = match proto {
+        "dot" => &["listen.dot"],
+        "doq" => &["listen.doq", "listen.dot", "listen.doh"],
+        "doh" | "doh3" => &["listen.doh"],
+        _ => return None,
+    };
+    own.iter()
+        .find_map(|p| cert_pair(cfg, p, base))
+        .or_else(|| cert_pair(cfg, "tls", base))
+        .or_else(|| {
+            get(cfg, "acme.enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                .then(|| crate::acme::cert_paths(cfg, base))
+        })
+}
+
+/// 監聽位址：`listen.<x>.binds` 有填就用它（可以同時有 IPv4 與 IPv6），沒填用 `listen.<x>.host`
+fn listen_hosts(cfg: &Value, sec: &str) -> Vec<String> {
+    let binds: Vec<String> = strings(get(cfg, &format!("listen.{sec}.binds")))
+        .into_iter()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .collect();
+    if !binds.is_empty() {
+        return binds;
+    }
+    let host = get(cfg, &format!("listen.{sec}.host"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("0.0.0.0");
+    vec![host.to_string()]
+}
+
+fn parse_host(h: &str) -> Option<IpAddr> {
+    h.trim_start_matches('[').trim_end_matches(']').parse().ok()
+}
+
+/// DoH 的 TCP 監聽要不要自己做 TLS（`listen.doh.tls`：`"auto"` / `true` / `false`）。
+///
+/// auto：
+/// - `listen.doh.windowsMode == "iis-proxy"`（IIS 在前面做 TLS）→ 明文 HTTP
+/// - 只監聽本機（loopback）而且沒有明確寫 `listen.doh.cert / key`（前面有反向代理）→ 明文 HTTP
+/// - 其他：找得到憑證（`cert_for`）就做 TLS，找不到就明文
+///
+/// OpenWrt 的 UCI 設定一律會寫 `listen.doh.cert / key`，所以行為跟以前一樣（TLS）。
+pub fn doh_uses_tls(cfg: &Value, base: &std::path::Path) -> bool {
+    match get(cfg, "listen.doh.tls") {
+        Some(Value::Bool(b)) => return *b,
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => return true,
+            "false" | "0" | "off" | "no" => return false,
+            _ => {}
+        },
+        _ => {}
+    }
+    if get(cfg, "listen.doh.windowsMode").and_then(Value::as_str) == Some("iis-proxy") {
+        return false;
+    }
+    let explicit = cert_pair(cfg, "listen.doh", base).is_some();
+    let loopback = listen_hosts(cfg, "doh")
+        .iter()
+        .all(|h| parse_host(h).is_some_and(|ip| ip.is_loopback()));
+    if loopback && !explicit {
+        return false;
+    }
+    cert_for(cfg, "doh", base).is_some()
+}
+
+/// DoT / DoH 伺服器（規格 01 第 1.1 節）；開不起來只記警告，區網 DNS 照常。
+/// 一個協議可以監聽多個位址（`binds`）；其中一個綁定失敗只記警告，其他照常。
 async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path::Path) -> Encrypted {
     use crate::encrypted::{listen_doh, listen_doh3, listen_doq, listen_dot, CertStore, DohOptions, Limits};
     let mut out = Encrypted::default();
     let limits = Limits::new(get(cfg, "system.maxTlsConnections").and_then(Value::as_u64).unwrap_or(2048) as usize);
     let mut stores: std::collections::HashMap<(PathBuf, PathBuf), Arc<CertStore>> = std::collections::HashMap::new();
-    let mut store_for = |c: &str, k: &str| -> Arc<CertStore> {
-        let key = (rel_path(base, c), rel_path(base, k));
+    let mut store_for = |key: (PathBuf, PathBuf)| -> Arc<CertStore> {
         stores
             .entry(key.clone())
             .or_insert_with(|| {
@@ -95,57 +211,110 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             })
             .clone()
     };
-    let addr = |sec: &str, dport: u64| -> Option<SocketAddr> {
-        let host = get(cfg, &format!("listen.{sec}.host")).and_then(Value::as_str).unwrap_or("0.0.0.0");
-        let port = get(cfg, &format!("listen.{sec}.port")).and_then(Value::as_u64).unwrap_or(dport) as u16;
-        host.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, port))
-    };
+    let port_of = |sec: &str, dport: u64| get(cfg, &format!("listen.{sec}.port")).and_then(Value::as_u64).unwrap_or(dport) as u16;
     let on = |sec: &str| get(cfg, &format!("listen.{sec}.enabled")).and_then(Value::as_bool).unwrap_or(false);
-    let s = |k: &str| get(cfg, k).and_then(Value::as_str).unwrap_or("").to_string();
+    // 記下每個位址的結果；回傳要監聽的位址（格式錯誤的直接記成失敗）
+    fn targets(out: &mut Encrypted, proto: &'static str, hosts: &[String], port: u16, tls: bool) -> Vec<(usize, SocketAddr)> {
+        let mut v = Vec::new();
+        for h in hosts {
+            let ip = parse_host(h);
+            out.detail.push(ListenerInfo {
+                proto,
+                bind: h.clone(),
+                port,
+                bound: None,
+                tls,
+                error: ip.is_none().then(|| "位址格式錯誤".to_string()),
+            });
+            match ip {
+                Some(ip) => v.push((out.detail.len() - 1, SocketAddr::new(ip, port))),
+                None => warn!("{} 監聽位址格式錯誤：{h}", proto_label(proto)),
+            }
+        }
+        v
+    }
+    fn done(out: &mut Encrypted, i: usize, r: Result<SocketAddr>) -> Option<SocketAddr> {
+        match r {
+            Ok(b) => {
+                out.detail[i].bound = Some(b);
+                Some(b)
+            }
+            Err(e) => {
+                warn!("{e:#}，略過這個位址");
+                out.detail[i].error = Some(format!("{e:#}"));
+                None
+            }
+        }
+    }
+    fn skip(out: &mut Encrypted, proto: &'static str, hosts: &[String], port: u16, why: &str) {
+        warn!("{why}");
+        for h in hosts {
+            out.detail.push(ListenerInfo {
+                proto,
+                bind: h.clone(),
+                port,
+                bound: None,
+                tls: true,
+                error: Some(why.to_string()),
+            });
+        }
+    }
     if on("dot") {
-        let (c, k) = (s("listen.dot.cert"), s("listen.dot.key"));
-        match (addr("dot", 853), c.is_empty() || k.is_empty()) {
-            (_, true) => warn!("DoT 需要憑證（listen.dot.cert / key），沒有啟動"),
-            (None, _) => warn!("DoT 監聽位址格式錯誤"),
-            (Some(a), false) => match listen_dot(a, store_for(&c, &k), resolver.clone(), limits.clone()).await {
-                Ok(b) => out.dot = Some(b),
-                Err(e) => warn!("{e:#}"),
-            },
+        let (hosts, port) = (listen_hosts(cfg, "dot"), port_of("dot", 853));
+        match cert_for(cfg, "dot", base) {
+            None => skip(
+                &mut out,
+                "dot",
+                &hosts,
+                port,
+                "DoT 需要憑證（tls.cert / key 或 listen.dot.cert / key），沒有啟動",
+            ),
+            Some(pair) => {
+                let certs = store_for(pair);
+                for (i, a) in targets(&mut out, "dot", &hosts, port, true) {
+                    let r = listen_dot(a, certs.clone(), resolver.clone(), limits.clone()).await;
+                    if let Some(b) = done(&mut out, i, r) {
+                        out.dot.get_or_insert(b);
+                    }
+                }
+            }
         }
     }
     // DoQ（UDP 853）：跟 DoT 共用憑證（沒有 DoT 憑證時用 DoH 的）
     let quic_max = get(cfg, "system.maxQuicConnections").and_then(Value::as_u64).unwrap_or(512) as usize;
     if on("doq") {
-        let (mut c, mut k) = (s("listen.dot.cert"), s("listen.dot.key"));
-        if c.is_empty() || k.is_empty() {
-            (c, k) = (s("listen.doh.cert"), s("listen.doh.key"));
-        }
-        match (addr("doq", 853), c.is_empty() || k.is_empty()) {
-            (_, true) => warn!("DoQ 需要憑證（listen.dot.cert / key），沒有啟動"),
-            (None, _) => warn!("DoQ 監聽位址格式錯誤"),
-            (Some(_), false) if quic_max == 0 => {
-                warn!("這台硬體的等級不開 QUIC（system.maxQuicConnections = 0），DoQ 沒有啟動；要強制開請設定 system.maxQuicConnections")
+        let (hosts, port) = (listen_hosts(cfg, "doq"), port_of("doq", 853));
+        match cert_for(cfg, "doq", base) {
+            None => skip(
+                &mut out,
+                "doq",
+                &hosts,
+                port,
+                "DoQ 需要憑證（tls.cert / key 或 listen.dot.cert / key），沒有啟動",
+            ),
+            Some(_) if quic_max == 0 => skip(
+                &mut out,
+                "doq",
+                &hosts,
+                port,
+                "這台硬體的等級不開 QUIC（system.maxQuicConnections = 0），DoQ 沒有啟動；要強制開請設定 system.maxQuicConnections",
+            ),
+            Some(pair) => {
+                let certs = store_for(pair);
+                for (i, a) in targets(&mut out, "doq", &hosts, port, true) {
+                    let r = listen_doq(a, certs.clone(), resolver.clone(), Limits::new(quic_max)).await;
+                    if let Some(b) = done(&mut out, i, r) {
+                        out.doq.get_or_insert(b);
+                    }
+                }
             }
-            (Some(a), false) => match listen_doq(a, store_for(&c, &k), resolver.clone(), Limits::new(quic_max)).await {
-                Ok(b) => out.doq = Some(b),
-                Err(e) => warn!("{e:#}"),
-            },
         }
     }
     if on("doh") {
-        let (c, k) = (s("listen.doh.cert"), s("listen.doh.key"));
-        let certs = if c.is_empty() || k.is_empty() {
-            None
-        } else {
-            Some(store_for(&c, &k))
-        };
-        let path = {
-            let p = s("listen.doh.path");
-            if p.is_empty() {
-                "/dns-query".to_string()
-            } else {
-                p
-            }
+        let (hosts, port) = (listen_hosts(cfg, "doh"), port_of("doh", 8443));
+        let path = match get(cfg, "listen.doh.path").and_then(Value::as_str).unwrap_or("") {
+            "" => "/dns-query".to_string(),
+            p => p.to_string(),
         };
         let trust_proxy = get(cfg, "listen.doh.trustProxy").and_then(Value::as_bool).unwrap_or(false);
         let mut opts = DohOptions {
@@ -153,44 +322,112 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             trust_proxy,
             alt_svc: None,
         };
-        // DoH3（UDP，預設跟 DoH 同一個埠號）：需要憑證；開成功時 DoH 的回應加 Alt-Svc
+        // DoH3（UDP，預設跟 DoH 同樣的位址與埠號；`listen.doh.http3Binds` 可以另外指定位址）：
+        // 一定要憑證；開成功時 DoH 的回應加 Alt-Svc
         if get(cfg, "listen.doh.http3").and_then(Value::as_bool).unwrap_or(false) {
-            let h3_port = get(cfg, "listen.doh.http3Port").and_then(Value::as_u64).filter(|p| *p > 0);
-            match (addr("doh", 8443), &certs) {
-                (_, None) => warn!("DoH3 需要憑證，沒有啟動"),
-                (None, _) => warn!("DoH 監聽位址格式錯誤"),
-                _ if quic_max == 0 => warn!("這台硬體的等級不開 QUIC（system.maxQuicConnections = 0），DoH3 沒有啟動"),
-                (Some(a), Some(c)) => {
-                    let ua = SocketAddr::new(a.ip(), h3_port.map(|p| p as u16).unwrap_or(a.port()));
-                    let o3 = DohOptions {
-                        path,
-                        trust_proxy: false,
-                        alt_svc: None,
-                    };
-                    match listen_doh3(ua, c.clone(), resolver.clone(), o3, Limits::new(quic_max)).await {
-                        Ok(b) => {
-                            out.doh3 = Some(b);
-                            // 對外埠號可能不同（例如 WAN 443 → 本機 8443）：listen.doh.altSvcPort 可以指定
-                            let adv = get(cfg, "listen.doh.altSvcPort")
-                                .and_then(Value::as_u64)
-                                .filter(|p| *p > 0)
-                                .unwrap_or(b.port() as u64);
-                            opts.alt_svc = Some(format!("h3=\":{adv}\"; ma=86400"));
+            let h3_port = get(cfg, "listen.doh.http3Port")
+                .and_then(Value::as_u64)
+                .filter(|p| *p > 0)
+                .map(|p| p as u16)
+                .unwrap_or(port);
+            let h3_hosts: Vec<String> = match strings(get(cfg, "listen.doh.http3Binds")) {
+                b if b.iter().any(|x| !x.trim().is_empty()) => {
+                    b.into_iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+                }
+                _ => hosts.clone(),
+            };
+            match cert_for(cfg, "doh3", base) {
+                None => skip(&mut out, "doh3", &h3_hosts, h3_port, "DoH3 需要憑證，沒有啟動"),
+                Some(_) if quic_max == 0 => skip(
+                    &mut out,
+                    "doh3",
+                    &h3_hosts,
+                    h3_port,
+                    "這台硬體的等級不開 QUIC（system.maxQuicConnections = 0），DoH3 沒有啟動",
+                ),
+                Some(pair) => {
+                    let certs = store_for(pair);
+                    for (i, a) in targets(&mut out, "doh3", &h3_hosts, h3_port, true) {
+                        let o3 = DohOptions {
+                            path: path.clone(),
+                            trust_proxy: false,
+                            alt_svc: None,
+                        };
+                        let r = listen_doh3(a, certs.clone(), resolver.clone(), o3, Limits::new(quic_max)).await;
+                        if let Some(b) = done(&mut out, i, r) {
+                            out.doh3.get_or_insert(b);
                         }
-                        Err(e) => warn!("{e:#}"),
+                    }
+                    if let Some(b) = out.doh3 {
+                        // 對外埠號可能不同（例如 WAN 443 → 本機 8443）：listen.doh.altSvcPort 可以指定
+                        let adv = get(cfg, "listen.doh.altSvcPort")
+                            .and_then(Value::as_u64)
+                            .filter(|p| *p > 0)
+                            .unwrap_or(b.port() as u64);
+                        opts.alt_svc = Some(format!("h3=\":{adv}\"; ma=86400"));
                     }
                 }
             }
         }
-        match addr("doh", 8443) {
-            None => warn!("DoH 監聽位址格式錯誤"),
-            Some(a) => match listen_doh(a, certs, resolver.clone(), opts, limits.clone()).await {
-                Ok(b) => out.doh = Some(b),
-                Err(e) => warn!("{e:#}"),
-            },
+        let tls = doh_uses_tls(cfg, base);
+        match (tls, cert_for(cfg, "doh", base)) {
+            (true, None) => skip(
+                &mut out,
+                "doh",
+                &hosts,
+                port,
+                "DoH 設定成要 TLS（listen.doh.tls）但是沒有憑證（tls.cert / key 或 listen.doh.cert / key），沒有啟動",
+            ),
+            (tls, pair) => {
+                let certs = pair.filter(|_| tls).map(&mut store_for);
+                for (i, a) in targets(&mut out, "doh", &hosts, port, tls) {
+                    let r = listen_doh(a, certs.clone(), resolver.clone(), opts.clone(), limits.clone()).await;
+                    if let Some(b) = done(&mut out, i, r) {
+                        out.doh.get_or_insert(b);
+                    }
+                }
+            }
         }
     }
     out
+}
+
+fn proto_label(p: &str) -> &'static str {
+    match p {
+        "dot" => "DoT",
+        "doq" => "DoQ",
+        "doh3" => "DoH3",
+        _ => "DoH",
+    }
+}
+
+/// 自備憑證（沒開內建 ACME）的啟動檢查：檔案不存在、過期、沒有涵蓋綁定網域時提醒。只讀不寫。
+fn warn_manual_certs(cfg: &Value, base: &std::path::Path) {
+    if get(cfg, "acme.enabled").and_then(Value::as_bool).unwrap_or(false) {
+        return;
+    }
+    let on = |sec: &str| get(cfg, &format!("listen.{sec}.enabled")).and_then(Value::as_bool).unwrap_or(false);
+    let http3 = on("doh") && get(cfg, "listen.doh.http3").and_then(Value::as_bool).unwrap_or(false);
+    let used = [
+        ("dot", on("dot")),
+        ("doq", on("doq")),
+        ("doh", on("doh") && doh_uses_tls(cfg, base)),
+        ("doh3", http3),
+    ];
+    let mut seen: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let domain = kuroshio_config::bound_domain(cfg);
+    for (proto, enabled) in used {
+        let Some(pair) = cert_for(cfg, proto, base).filter(|_| enabled) else {
+            continue;
+        };
+        if seen.contains(&pair) {
+            continue;
+        }
+        for p in crate::certinfo::problems(&pair.0, &pair.1, &domain) {
+            warn!("{p}");
+        }
+        seen.push(pair);
+    }
 }
 
 /// DDR：區網裝置查 `_dns.resolver.arpa` 時告訴它們有哪些加密協議（規格 01 第 2 節）
@@ -434,22 +671,6 @@ fn start_community(
     Some(node)
 }
 
-/// 加密監聽沒有指定憑證時用 ACME 申請的那一份
-fn with_acme_cert(cfg: &Value, a: &crate::acme::AcmeConfig) -> Value {
-    let mut c = cfg.clone();
-    for sec in ["dot", "doh"] {
-        let Some(l) = c.get_mut("listen").and_then(|l| l.get_mut(sec)).and_then(Value::as_object_mut) else {
-            continue;
-        };
-        let empty = |k: &str| l.get(k).and_then(Value::as_str).unwrap_or("").is_empty();
-        if empty("cert") || empty("key") {
-            l.insert("cert".into(), json!(a.cert.to_string_lossy()));
-            l.insert("key".into(), json!(a.key.to_string_lossy()));
-        }
-    }
-    c
-}
-
 type BoxFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// CDN 台灣節點：讀狀態（經過快照寫入器，記下雜湊）、接上解析器、啟動定時檢查
@@ -638,6 +859,8 @@ pub struct AppState {
     pub encrypted: Encrypted,
     /// 備份 / 匯入用到的檔案位置
     pub backup: crate::backup::Locations,
+    /// 合併後的設定（`/api/paths` 用）
+    pub cfg: Arc<Value>,
 }
 
 impl AppState {
@@ -721,6 +944,61 @@ pub fn persist_dir(cfg: &Value) -> PathBuf {
         }
         _ => PathBuf::from("/etc/kuroshio/state"),
     }
+}
+
+/// 設定目錄：快照目錄的上一層（相對路徑都以它為基準）
+pub fn config_dir(cfg: &Value) -> PathBuf {
+    let state = persist_dir(cfg);
+    state.parent().map(|p| p.to_path_buf()).unwrap_or(state)
+}
+
+/// 各種檔案放在哪裡（`GET /api/paths`、`kuroshio paths`）。只有路徑與憑證的公開資訊，不含任何密鑰內容。
+///
+/// `tls.source`：`acme`（內建 ACME 申請、會寫入）、`manual`（自備憑證，只讀）、`none`（沒有設定憑證）
+pub fn paths_json(cfg: &Value, config_file: Option<&std::path::Path>) -> Value {
+    let state = persist_dir(cfg);
+    let base = config_dir(cfg);
+    let loc = crate::backup::Locations::from_cfg(cfg);
+    let acme_on = get(cfg, "acme.enabled").and_then(Value::as_bool).unwrap_or(false);
+    let (pair, source) = if acme_on {
+        (Some(crate::acme::cert_paths(cfg, &base)), "acme")
+    } else {
+        match cert_pair(cfg, "tls", &base).or_else(|| ["dot", "doh", "doq"].iter().find_map(|p| cert_for(cfg, p, &base))) {
+            Some(p) => (Some(p), "manual"),
+            None => (None, "none"),
+        }
+    };
+    let (cert, key) = pair.map(|(c, k)| (Some(c), Some(k))).unwrap_or((None, None));
+    let exists = cert.as_ref().is_some_and(|c| c.is_file()) && key.as_ref().is_some_and(|k| k.is_file());
+    let info = cert.as_ref().and_then(|c| crate::certinfo::read(c).ok());
+    // 評測報表：Flash 上放記憶體（執行期暫存），硬碟才照 benchmark.outDir
+    let bench = if storage_class(cfg) != StorageClass::Disk {
+        Some(runtime_dir(cfg).join("benchmark"))
+    } else {
+        kuroshio_jobs::benchmark::BenchPaths::from_config(cfg, &state, &base).out_root
+    };
+    // 日誌檔：Windows 服務寫在設定檔旁邊；其他平台輸出到標準輸出（OpenWrt 用 logread 看）
+    let log_file = config_file
+        .filter(|_| cfg!(windows))
+        .map(|f| f.parent().unwrap_or(std::path::Path::new(".")).join("kuroshio.log"));
+    json!({
+        "configFile": config_file,
+        "configDir": base,
+        "stateDir": state,
+        "runtimeDir": runtime_dir(cfg),
+        "shareDir": share_dir(cfg),
+        "tls": { "cert": cert, "key": key, "source": source, "exists": exists, "info": info },
+        "acme": {
+            "enabled": acme_on,
+            "account": state.join("acme-account.json"),
+            "domains": strings(get(cfg, "acme.domains")),
+        },
+        "adminToken": crate::webui::token_file(cfg, &base),
+        "customRules": loc.custom_rules,
+        "benchmarkDir": bench,
+        "communityKeyDir": loc.key_dir,
+        "logFile": log_file,
+    })
 }
 
 /// 快照目錄的儲存類型（`system.storageClass` 可以強制指定）
@@ -878,23 +1156,23 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     }
     // 內建 ACME：憑證不存在或快到期就先申請（最多等 3 分鐘），再啟動加密監聽
     let acme = crate::acme::AcmeConfig::from_cfg(cfg, &base_dir, &persist_dir(cfg)).map(crate::acme::Acme::new);
-    let tls_cfg = match &acme {
+    match &acme {
         Some(a) => {
             if crate::acme::renewal_reason(&a.cfg.cert, &a.cfg.domains, a.cfg.renew_days).is_some() {
                 let _ = tokio::time::timeout(Duration::from_secs(180), a.ensure(false)).await;
             }
             a.spawn();
-            with_acme_cert(cfg, &a.cfg)
         }
-        None => cfg.clone(),
-    };
+        // 自備憑證：只檢查、提醒，絕不申請或覆蓋
+        None => warn_manual_certs(cfg, &base_dir),
+    }
     let community = start_community(cfg, &base_dir, &resolver, cdn.clone());
     if let Some(c) = &community {
         let c = c.clone();
         snap_sources.push(Arc::new(move || c.snapshots()));
     }
     spawn_persist_loop(persister.clone(), snap_sources.clone());
-    let encrypted = start_encrypted(&tls_cfg, &resolver, &base_dir).await;
+    let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref()));
     let ddns = crate::ddns::Config::from_cfg(cfg).map(crate::ddns::Ddns::new);
     if let Some(d) = &ddns {
@@ -918,6 +1196,7 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         scheduler,
         encrypted: encrypted.clone(),
         backup,
+        cfg: Arc::new(cfg.clone()),
     });
     // 公開頁：需要整體狀態（唯讀 API），所以最後才建立；DoH 監聽之後才會開始轉給它
     if let Some(site) = crate::site::Site::new(cfg, state.clone(), resolver.presence.get().cloned()) {
@@ -947,4 +1226,178 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         bound,
         persister,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn cfg(over: Value) -> Value {
+        kuroshio_config::with_overrides(&over)
+    }
+
+    #[test]
+    fn cert_resolution_order() {
+        let base = Path::new("/etc/kuroshio");
+        let p = |a: &str, b: &str| Some((PathBuf::from(a), PathBuf::from(b)));
+        // 什麼都沒設定
+        let c = cfg(json!({}));
+        for proto in ["dot", "doq", "doh", "doh3"] {
+            assert_eq!(cert_for(&c, proto, base), None, "{proto}");
+        }
+        assert_eq!(cert_for(&c, "plain", base), None);
+        // 只有共用憑證：全部協議都用它（相對路徑以設定目錄為基準）
+        let c = cfg(json!({ "tls": { "cert": "tls/fullchain.pem", "key": "/certs/privkey.pem" } }));
+        for proto in ["dot", "doq", "doh", "doh3"] {
+            assert_eq!(
+                cert_for(&c, proto, base),
+                p("/etc/kuroshio/tls/fullchain.pem", "/certs/privkey.pem"),
+                "{proto}"
+            );
+        }
+        // 監聽自己的憑證優先；DoQ 沿用 DoT 的，DoH3 跟 DoH
+        let c = cfg(json!({
+            "tls": { "cert": "/t/c.pem", "key": "/t/k.pem" },
+            "listen": { "dot": { "cert": "/d/c.pem", "key": "/d/k.pem" }, "doh": { "cert": "/h/c.pem", "key": "/h/k.pem" } },
+        }));
+        assert_eq!(cert_for(&c, "dot", base), p("/d/c.pem", "/d/k.pem"));
+        assert_eq!(cert_for(&c, "doq", base), p("/d/c.pem", "/d/k.pem"));
+        assert_eq!(cert_for(&c, "doh", base), p("/h/c.pem", "/h/k.pem"));
+        assert_eq!(cert_for(&c, "doh3", base), p("/h/c.pem", "/h/k.pem"));
+        // 只填一半不算
+        let c = cfg(json!({ "tls": { "cert": "/t/c.pem", "key": "/t/k.pem" }, "listen": { "dot": { "cert": "/d/c.pem" } } }));
+        assert_eq!(cert_for(&c, "dot", base), p("/t/c.pem", "/t/k.pem"));
+        // 內建 ACME：沒有其他憑證時用它的輸出位置；ACME 關閉時不會冒出預設路徑
+        let c = cfg(json!({ "domain": "dns.example.com", "acme": { "enabled": true, "apiToken": "t" } }));
+        assert_eq!(cert_for(&c, "dot", base), p("/etc/kuroshio/cert.pem", "/etc/kuroshio/key.pem"));
+        assert_eq!(cert_for(&c, "doh", base), Some(crate::acme::cert_paths(&c, base)));
+        let c = cfg(json!({ "domain": "dns.example.com", "acme": { "enabled": false, "certFile": "/a/c.pem", "keyFile": "/a/k.pem" } }));
+        assert_eq!(cert_for(&c, "dot", base), None);
+    }
+
+    #[test]
+    fn doh_tls_modes() {
+        let base = Path::new("/etc/kuroshio");
+        let tls = json!({ "cert": "/t/c.pem", "key": "/t/k.pem" });
+        let t = |over: Value| doh_uses_tls(&cfg(over), base);
+        // 預設（只聽本機、沒有憑證）：明文
+        assert!(!t(json!({})));
+        // 只聽本機＋共用憑證：前面有反向代理，明文
+        assert!(!t(json!({ "tls": tls })));
+        assert!(!t(json!({ "tls": tls, "listen": { "doh": { "binds": ["127.0.0.1", "::1"] } } })));
+        // 只聽本機但明確寫了 DoH 自己的憑證：TLS
+        assert!(t(json!({ "listen": { "doh": { "cert": "/h/c.pem", "key": "/h/k.pem" } } })));
+        // 對外監聽：有憑證就 TLS，沒有就明文
+        assert!(t(json!({ "tls": tls, "listen": { "doh": { "host": "0.0.0.0" } } })));
+        assert!(t(
+            json!({ "tls": tls, "listen": { "doh": { "binds": ["127.0.0.1", "192.0.2.1"] } } })
+        ));
+        assert!(!t(json!({ "listen": { "doh": { "host": "0.0.0.0" } } })));
+        assert!(t(
+            json!({ "domain": "dns.example.com", "acme": { "enabled": true }, "listen": { "doh": { "host": "::" } } })
+        ));
+        // IIS 在前面：一律明文
+        assert!(!t(
+            json!({ "tls": tls, "listen": { "doh": { "host": "0.0.0.0", "windowsMode": "iis-proxy" } } })
+        ));
+        // 明確指定
+        assert!(t(json!({ "listen": { "doh": { "tls": true } } })));
+        assert!(!t(json!({ "tls": tls, "listen": { "doh": { "host": "0.0.0.0", "tls": false } } })));
+        assert!(t(
+            json!({ "tls": tls, "listen": { "doh": { "tls": true, "windowsMode": "iis-proxy" } } })
+        ));
+        // OpenWrt（UCI 轉出來的設定一律有 listen.doh.cert / key，host 預設 0.0.0.0）：跟以前一樣是 TLS
+        let uci = json!({ "listen": { "doh": { "enabled": true, "host": "0.0.0.0", "port": 8443, "cert": "/etc/kuroshio/cert.pem", "key": "/etc/kuroshio/key.pem" } } });
+        assert!(t(uci));
+    }
+
+    #[test]
+    fn paths_listing() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-paths-{}", std::process::id()));
+        let state = dir.join("state");
+        let c = cfg(json!({
+            "domain": "dns.example.com",
+            "system": { "persistDir": state, "runtimeDir": dir.join("run") },
+            "admin": { "auth": true },
+            "tls": { "cert": "tls/fullchain.pem", "key": "tls/privkey.pem" },
+        }));
+        let conf = dir.join("config.json");
+        let p = paths_json(&c, Some(&conf));
+        assert_eq!(p["configFile"], json!(conf));
+        assert_eq!(p["configDir"], json!(dir));
+        assert_eq!(p["stateDir"], json!(state));
+        assert_eq!(p["runtimeDir"], json!(dir.join("run")));
+        assert_eq!(p["tls"]["cert"], json!(dir.join("tls/fullchain.pem")));
+        assert_eq!(p["tls"]["key"], json!(dir.join("tls/privkey.pem")));
+        assert_eq!(p["tls"]["source"], "manual");
+        assert_eq!(p["tls"]["exists"], false);
+        assert_eq!(p["tls"]["info"], Value::Null);
+        assert_eq!(p["acme"]["enabled"], false);
+        assert_eq!(p["acme"]["domains"], json!(["dns.example.com"]));
+        assert_eq!(p["acme"]["account"], json!(state.join("acme-account.json")));
+        assert_eq!(p["adminToken"], json!(dir.join("admin.token")));
+        assert_eq!(p["customRules"], json!(dir.join("custom-rules.txt")));
+        assert_eq!(p["communityKeyDir"], json!(dir.join("state/community")));
+        for k in ["shareDir", "benchmarkDir", "logFile"] {
+            assert!(p.get(k).is_some(), "{k}");
+        }
+        // 內建 ACME：來源是 acme，位置照 ACME 的輸出順序
+        let c = cfg(json!({ "domain": "dns.example.com", "system": { "persistDir": state }, "acme": { "enabled": true } }));
+        let p = paths_json(&c, None);
+        assert_eq!(p["tls"]["source"], "acme");
+        assert_eq!(p["tls"]["cert"], json!(dir.join("cert.pem")));
+        assert_eq!(p["configFile"], Value::Null);
+        // 沒有憑證
+        let c = cfg(json!({ "system": { "persistDir": state } }));
+        let p = paths_json(&c, None);
+        assert_eq!(p["tls"]["source"], "none");
+        assert_eq!(p["tls"]["cert"], Value::Null);
+    }
+
+    /// 多位址監聽：其中一個綁不起來（不是這台機器的位址、格式錯誤）只記錄，其他照常
+    #[tokio::test]
+    async fn multiple_binds_and_one_failure() {
+        let c = cfg(json!({
+            "resolver": { "lastResort": [], "rankIps": false },
+            "listen": { "doh": { "enabled": true, "port": 0, "binds": ["192.0.2.1", "127.0.0.1", "不是位址", "127.0.0.2"] } },
+        }));
+        let r = build_resolver(&c).unwrap();
+        let e = start_encrypted(&c, &r, Path::new("/nonexistent")).await;
+        let d = e.detail_json();
+        let d = d.as_array().unwrap();
+        assert_eq!(d.len(), 4);
+        assert_eq!(d[0]["ok"], false);
+        assert!(d[0]["error"].is_string());
+        assert_eq!(d[1]["ok"], true);
+        assert_eq!(d[1]["tls"], false);
+        assert_eq!(d[1]["proto"], "doh");
+        assert_eq!(d[1]["bind"], "127.0.0.1");
+        assert_eq!(d[2]["ok"], false);
+        assert_eq!(d[2]["error"], "位址格式錯誤");
+        // 127.0.0.2：Linux 整個 127/8 都能綁；其他平台可能不行，只要求不影響前面的
+        assert_eq!(e.doh.map(|a| a.ip().to_string()).as_deref(), Some("127.0.0.1"));
+        // 要 TLS 卻沒有憑證：不啟動，每個位址都記下原因
+        let c = cfg(json!({
+            "resolver": { "lastResort": [], "rankIps": false },
+            "listen": { "doh": { "enabled": true, "port": 0, "tls": true, "binds": ["127.0.0.1"] }, "dot": { "enabled": true, "port": 0 } },
+        }));
+        let e = start_encrypted(&c, &r, Path::new("/nonexistent")).await;
+        assert!(e.doh.is_none() && e.dot.is_none());
+        assert_eq!(e.detail.len(), 2);
+        assert!(e.detail.iter().all(|l| l.error.is_some()));
+    }
+
+    /// `0.0.0.0` 與 `::` 可以同時綁同一個埠（IPv6 設了 V6ONLY）
+    #[tokio::test]
+    async fn v4_and_v6_share_a_port() {
+        let Ok(l6) = crate::netif::bind_tcp("[::]:0".parse().unwrap()) else {
+            return; // 這台機器沒有 IPv6
+        };
+        let port = l6.local_addr().unwrap().port();
+        crate::netif::bind_tcp(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), port)).expect("IPv4 同一個埠");
+        let u6 = crate::netif::bind_udp("[::]:0".parse().unwrap()).unwrap();
+        let port = u6.local_addr().unwrap().port();
+        crate::netif::bind_udp(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), port)).expect("IPv4 同一個 UDP 埠");
+    }
 }

@@ -443,6 +443,7 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                     "dot": st.encrypted.dot.map(|a| a.port()), "doq": st.encrypted.doq.map(|a| a.port()),
                     "ddr": st.resolver.ddr.read().unwrap().is_some(),
                 },
+                "listenersDetail": st.encrypted.detail_json(),
             }))
         }
         "/api/upstreams" => ok(r.upstreams.list_json()),
@@ -451,6 +452,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null)),
         "/api/sysinfo" => ok(st.system_json()),
+        "/api/interfaces" => ok(crate::netif::json()),
+        "/api/paths" => ok(crate::app::paths_json(&st.cfg, st.webui.config_file.get().map(|p| p.as_path()))),
         "/api/backup/last-import" => ok(crate::backup::last_import(&st.backup)),
         "/api/cache/flush" => {
             r.flush();

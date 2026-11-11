@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -154,7 +153,7 @@ impl Limits {
 // ---------------- DoT ----------------
 
 pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<Resolver>, limits: Limits) -> Result<SocketAddr> {
-    let l = TcpListener::bind(addr).await.with_context(|| format!("DoT 監聽 {addr} 失敗"))?;
+    let l = crate::netif::bind_tcp(addr).with_context(|| format!("DoT 監聽 {addr} 失敗"))?;
     let bound = l.local_addr()?;
     // 社群共享開著時同一個埠也接 ALPN kuroshio/2（規格 03 第 4 節）
     let community = resolver.community.get().is_some();
@@ -447,7 +446,7 @@ pub async fn listen_doh(
     opts: DohOptions,
     limits: Limits,
 ) -> Result<SocketAddr> {
-    let l = TcpListener::bind(addr).await.with_context(|| format!("DoH 監聽 {addr} 失敗"))?;
+    let l = crate::netif::bind_tcp(addr).with_context(|| format!("DoH 監聽 {addr} 失敗"))?;
     let bound = l.local_addr()?;
     let acceptor = certs
         .as_ref()
@@ -488,6 +487,16 @@ pub async fn listen_doh(
 
 // ---------------- QUIC：DoQ（RFC 9250）與 DoH3 ----------------
 
+/// QUIC 端點：IPv6 位址設 `IPV6_V6ONLY`（`0.0.0.0` 與 `::` 可以同時綁同一個埠）
+fn quic_endpoint(cfg: quinn::ServerConfig, addr: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(cfg),
+        crate::netif::bind_udp(addr)?,
+        Arc::new(quinn::TokioRuntime),
+    )
+}
+
 fn quic_server(certs: &Arc<CertStore>, alpn: &[&[u8]], max_conns: u32) -> Result<quinn::ServerConfig> {
     let tls = certs.server_config(alpn);
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| anyhow!("QUIC TLS 設定：{e}"))?;
@@ -505,7 +514,7 @@ fn quic_server(certs: &Arc<CertStore>, alpn: &[&[u8]], max_conns: u32) -> Result
 /// DoQ：每筆查詢一條雙向串流，2 bytes 長度 + 訊息，id 必須是 0
 pub async fn listen_doq(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<Resolver>, limits: Limits) -> Result<SocketAddr> {
     let max = limits.conns.available_permits() as u32;
-    let ep = quinn::Endpoint::server(
+    let ep = quic_endpoint(
         quic_server(
             &certs,
             if resolver.community.get().is_some() {
@@ -574,7 +583,7 @@ pub async fn listen_doh3(
 ) -> Result<SocketAddr> {
     use bytes::Buf;
     let max = limits.conns.available_permits() as u32;
-    let ep = quinn::Endpoint::server(quic_server(&certs, &[b"h3"], max)?, addr).with_context(|| format!("DoH3 監聽 UDP {addr} 失敗"))?;
+    let ep = quic_endpoint(quic_server(&certs, &[b"h3"], max)?, addr).with_context(|| format!("DoH3 監聽 UDP {addr} 失敗"))?;
     let bound = ep.local_addr()?;
     info!("DoH3 監聽 UDP {bound}{}", opts.path);
     let opts = Arc::new(opts);
