@@ -60,6 +60,15 @@ if-addrs = "0.15"
 windows-service = "0.8"
 # PEM 憑證轉成 PFX 匯入 Windows 憑證存放區（IIS 用）；純 Rust、很小，只有 Windows 版會編進去
 p12 = "0.6.3"
+# 模式 B（HTTP.sys 共用 443）：HTTP Server API 2.0 與讀登錄檔；windows-sys 本來就在相依樹裡，只開用到的功能
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Networking_HttpServer",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_System_IO",
+  "Win32_System_Registry",
+] }
 
 [dev-dependencies]
 p12 = "0.6.3"

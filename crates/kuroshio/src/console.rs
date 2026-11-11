@@ -81,6 +81,20 @@ impl Info {
         dot_port: Option<u16>,
         site_on: bool,
     ) -> Info {
+        Info::build_with(cfg, admin_url, token_file, doh_port, dot_port, site_on, false)
+    }
+
+    /// 同 [`Info::build`]；`httpsys`：這一輪 DoH 是向 HTTP.sys 登記的（模式 B）——對外一定是 HTTPS，
+    /// 而且只登記了網域的網址，沒有本機網址
+    pub fn build_with(
+        cfg: &Value,
+        admin_url: Option<String>,
+        token_file: Option<String>,
+        doh_port: Option<u16>,
+        dot_port: Option<u16>,
+        site_on: bool,
+        httpsys: bool,
+    ) -> Info {
         let s = |k: &str| get(cfg, k).and_then(Value::as_str).unwrap_or("").trim().to_string();
         let domain = [s("site.hostname"), s("domain")].into_iter().find(|d| !d.is_empty());
         let doh_path = match s("listen.doh.path") {
@@ -88,14 +102,16 @@ impl Info {
             p => p,
         };
         let iis = s("listen.doh.windowsMode") == "iis-proxy";
-        let tls = doh_tls(cfg);
+        let tls = httpsys || doh_tls(cfg);
         // 對外的網址：IIS 反向代理時走 IIS 的 443
         let public = domain.as_ref().and_then(|d| match (iis, doh_port) {
             (true, _) => Some(format!("https://{d}")),
             (false, Some(p)) => Some(with_port(if tls { "https" } else { "http" }, d, p)),
             (false, None) => None,
         });
-        let local = doh_port.map(|p| with_port(if tls { "https" } else { "http" }, "127.0.0.1", p));
+        let local = doh_port
+            .filter(|_| !httpsys)
+            .map(|p| with_port(if tls { "https" } else { "http" }, "127.0.0.1", p));
         let mut info = Info {
             admin_url,
             token_file,
@@ -212,14 +228,45 @@ fn status_line(st: &AppState) -> String {
             l.push(format!("{name} {}", a.port()));
         }
     }
-    format!(
+    let mut out = format!(
         "今天查詢 {}、快取命中率 {}、攔截 {}；已執行 {} 分鐘\n監聽：{}",
         t["query"],
         t["hitRate"].as_f64().map(|h| format!("{h}%")).unwrap_or_else(|| "—".into()),
         t["blocked"],
         s["uptimeSec"].as_u64().unwrap_or(0) / 60,
         l.join("、")
-    )
+    );
+    if let Some(m) = doh_mode_line(&e.doh_mode, &e.doh3_provider) {
+        out.push('\n');
+        out.push_str(&m);
+    }
+    out
+}
+
+/// DoH 的 Windows 模式與 DoH3 由誰提供（`status` 指令；只有 Windows 會顯示）
+pub fn doh_mode_line(mode: &Value, doh3: &Value) -> Option<String> {
+    if !cfg!(windows) && mode["configured"] != "httpsys" {
+        return None;
+    }
+    let name = match mode["mode"].as_str()? {
+        "httpsys" => "HTTP.sys 共用",
+        "iis-proxy" => "IIS 反向代理",
+        _ => "獨立監聽",
+    };
+    let mut v = vec![format!("DoH 模式：{name}（{}）", mode["reason"].as_str().unwrap_or(""))];
+    for u in mode["urls"].as_array().into_iter().flatten() {
+        v.push(match u["error"].as_str() {
+            None => format!("  已登記 {}", u["url"].as_str().unwrap_or("")),
+            Some(e) => format!("  沒登記：{e}"),
+        });
+    }
+    let p = match doh3["provider"].as_str() {
+        Some("kuroshio") => "黑潮 DNS 提供",
+        Some("httpsys") => "HTTP.sys 提供",
+        _ => "無法提供",
+    };
+    v.push(format!("DoH3：{p}（{}）", doh3["reason"].as_str().unwrap_or("")));
+    Some(v.join("\n"))
 }
 
 /// 用預設瀏覽器打開網址（失敗就算了，網址已經印在畫面上）
@@ -300,6 +347,11 @@ mod tests {
         let i = Info::build(&json!({ "site": { "enabled": true } }), None, None, Some(8053), None, true);
         assert_eq!(i.site_urls, vec!["http://127.0.0.1:8053/"]);
         assert_eq!(i.doh_url, None);
+        // HTTP.sys 共用：一定是 HTTPS，沒有本機網址
+        let cfg = json!({ "domain": "dns.example.net", "site": { "enabled": true }, "listen": { "doh": { "host": "127.0.0.1" } } });
+        let i = Info::build_with(&cfg, None, None, Some(443), None, true, true);
+        assert_eq!(i.site_urls, vec!["https://dns.example.net/"]);
+        assert_eq!(i.doh_url.as_deref(), Some("https://dns.example.net/dns-query"));
         // 公開頁沒開
         let i = Info::build(&json!({ "domain": "dns.example.net" }), None, None, Some(443), None, false);
         assert!(i.site_urls.is_empty() && i.site_off.is_some());

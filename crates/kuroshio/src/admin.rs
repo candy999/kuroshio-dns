@@ -583,6 +583,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                     "ddr": st.resolver.ddr.read().unwrap().is_some(),
                 },
                 "listenersDetail": st.encrypted.detail_json(),
+                "dohMode": st.encrypted.doh_mode,
+                "doh3Provider": st.encrypted.doh3_provider,
             }))
         }
         "/api/upstreams" => ok(r.upstreams.list_json()),

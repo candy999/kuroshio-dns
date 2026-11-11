@@ -239,8 +239,52 @@ mod imp {
         for (proto, port, what) in &ports {
             println!("  {what}：{proto} {port}");
         }
+        httpsys_setup(cfg);
         println!("完成。之後一般權限也能執行全部功能；服務模式請再執行 kuroshio service install");
         Ok(())
+    }
+
+    /// 目前登入的帳號（DOMAIN\\使用者）：urlacl 登記給它，之後一般權限的 cmd 執行也能向 HTTP.sys 登記網址。
+    /// 服務以 LocalSystem 執行，不需要 urlacl
+    fn current_user() -> String {
+        match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!("{d}\\{u}"),
+            _ => run("whoami", &[]).map(|s| s.trim().to_string()).unwrap_or_default(),
+        }
+    }
+
+    /// 模式 B（HTTP.sys 共用）的準備：urlacl 與憑證綁定。失敗只提示，不影響其他設定
+    fn httpsys_setup(cfg: &Value) {
+        if !crate::httpsys::setup_wanted(cfg) {
+            return;
+        }
+        let (domain, port, prefixes) = match crate::httpsys::plan(cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("HTTP.sys 共用：{e}，沒有登記網址（設定網域後再執行一次 kuroshio setup）");
+                return;
+            }
+        };
+        let user = current_user();
+        if user.is_empty() {
+            println!("HTTP.sys 共用：查不到目前的帳號，沒有登記 urlacl");
+        } else {
+            for step in crate::httpsys::urlacl_steps(&prefixes.acl(), &user) {
+                match crate::iiscert::run_step(&step) {
+                    Ok(_) if step.required => println!("HTTP.sys 網址登記（urlacl）：{} → {user}", step.args[3].trim_start_matches("url=")),
+                    Ok(_) => {}
+                    Err(e) => println!("HTTP.sys 網址登記失敗：{e:#}"),
+                }
+            }
+        }
+        let state = crate::app::persist_dir(cfg);
+        let base = state.parent().map(PathBuf::from).unwrap_or_default();
+        match crate::iiscert::sync_kind(cfg, &crate::iiscert::Kind::HttpSys(port), &base, &state, false) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => println!(
+                "HTTP.sys 憑證還沒有綁到 {domain}:{port}：{e:#}（憑證準備好後服務每 10 分鐘會自動同步，或執行 kuroshio httpsys cert）"
+            ),
+        }
     }
 
     fn appcmd() -> PathBuf {

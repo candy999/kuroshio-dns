@@ -992,6 +992,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-service",
+ "windows-sys 0.61.2",
  "x509-parser 0.16.0",
  "zstd",
 ]

@@ -69,6 +69,14 @@ pub struct Encrypted {
     pub doh3: Option<SocketAddr>,
     /// 每個監聽位址的結果（多位址 `binds`、綁定失敗的原因）
     pub detail: Vec<ListenerInfo>,
+    /// DoH 的 Windows 模式（`/api/status` 的 `dohMode`；DoH 沒開時 Null）
+    pub doh_mode: Value,
+    /// DoH3 由誰提供（`/api/status` 的 `doh3Provider`）
+    pub doh3_provider: Value,
+    /// 模式 B：向 HTTP.sys 登記的網址（關機、重新載入時移除）
+    pub httpsys: Option<Arc<crate::httpsys::Server>>,
+    /// 模式 B 的埠號（憑證自動同步到 HTTP.sys 的 `hostnameport`）
+    pub httpsys_port: Option<u16>,
 }
 
 /// 一個加密監聽位址的結果（`/api/status` 的 `listenersDetail`）
@@ -172,6 +180,10 @@ fn parse_host(h: &str) -> Option<IpAddr> {
 ///
 /// OpenWrt 的 UCI 設定一律會寫 `listen.doh.cert / key`，所以行為跟以前一樣（TLS）。
 pub fn doh_uses_tls(cfg: &Value, base: &std::path::Path) -> bool {
+    // 模式 B：TLS 由 HTTP.sys 處理，對外一定是 HTTPS
+    if cfg!(windows) && crate::httpsys::configured(cfg) == "httpsys" {
+        return true;
+    }
     match get(cfg, "listen.doh.tls") {
         Some(Value::Bool(b)) => return *b,
         Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
@@ -311,20 +323,37 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
         }
     }
     if on("doh") {
+        use crate::httpsys::{Doh3Plan, WinMode};
         let (hosts, port) = (listen_hosts(cfg, "doh"), port_of("doh", 8443));
         let path = match get(cfg, "listen.doh.path").and_then(Value::as_str).unwrap_or("") {
             "" => "/dns-query".to_string(),
             p => p.to_string(),
         };
-        let trust_proxy = get(cfg, "listen.doh.trustProxy").and_then(Value::as_bool).unwrap_or(false);
+        // Windows：跟 IIS 共用 443 的方式（規格 07 第 2 節），啟動時決定一次
+        let configured = crate::httpsys::configured(cfg);
+        let host_ips: Vec<IpAddr> = hosts.iter().filter_map(|h| parse_host(h)).collect();
+        let (mode, mode_reason) = crate::httpsys::decide(&configured, cfg!(windows), port, || crate::httpsys::probe_port(&host_ips, port));
+        if cfg!(windows) {
+            info!("DoH 的 Windows 模式：{}（{mode_reason}）", mode.name());
+        } else if configured == "httpsys" {
+            warn!("listen.doh.windowsMode = httpsys：{mode_reason}");
+        }
+        let (sys_h3, sys_alt) = if mode == WinMode::HttpSys {
+            crate::httpsys::registry_http3()
+        } else {
+            (false, false)
+        };
+        let http3 = get(cfg, "listen.doh.http3").and_then(Value::as_bool).unwrap_or(false);
+        let plan3 = crate::httpsys::doh3_plan(mode, http3, sys_h3);
+        let trust_proxy = mode != WinMode::HttpSys && get(cfg, "listen.doh.trustProxy").and_then(Value::as_bool).unwrap_or(false);
         let mut opts = DohOptions {
             path: path.clone(),
             trust_proxy,
             alt_svc: None,
         };
         // DoH3（UDP，預設跟 DoH 同樣的位址與埠號；`listen.doh.http3Binds` 可以另外指定位址）：
-        // 一定要憑證；開成功時 DoH 的回應加 Alt-Svc
-        if get(cfg, "listen.doh.http3").and_then(Value::as_bool).unwrap_or(false) {
+        // 一定要憑證；開成功時 DoH 的回應加 Alt-Svc。HTTP.sys 開了 HTTP/3 的模式 B 由 HTTP.sys 提供，不綁 UDP
+        if plan3 == Doh3Plan::Kuroshio {
             let h3_port = get(cfg, "listen.doh.http3Port")
                 .and_then(Value::as_u64)
                 .filter(|p| *p > 0)
@@ -358,36 +387,96 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
                             out.doh3.get_or_insert(b);
                         }
                     }
-                    if let Some(b) = out.doh3 {
-                        // 對外埠號可能不同（例如 WAN 443 → 本機 8443）：listen.doh.altSvcPort 可以指定
-                        let adv = get(cfg, "listen.doh.altSvcPort")
-                            .and_then(Value::as_u64)
-                            .filter(|p| *p > 0)
-                            .unwrap_or(b.port() as u64);
-                        opts.alt_svc = Some(format!("h3=\":{adv}\"; ma=86400"));
+                }
+            }
+        }
+        // 對外埠號可能不同（例如 WAN 443 → 本機 8443）：listen.doh.altSvcPort 可以指定
+        let adv = get(cfg, "listen.doh.altSvcPort").and_then(Value::as_u64).unwrap_or(0) as u16;
+        opts.alt_svc = crate::httpsys::alt_svc(plan3, out.doh3.map(|b| b.port()), port, sys_alt, adv);
+        let mut urls_json = Vec::new();
+        if mode == WinMode::HttpSys {
+            out.httpsys_port = Some(port);
+            let started = crate::httpsys::plan(cfg)
+                .map_err(anyhow::Error::msg)
+                .and_then(|(_, _, p)| crate::httpsys::start(&p, resolver.clone(), opts.clone(), limits.clone()));
+            let any = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), port);
+            match started {
+                Ok(srv) => {
+                    let failed: Vec<String> = srv.urls.iter().filter_map(|u| u.error.clone()).collect();
+                    for u in &srv.urls {
+                        urls_json.push(json!({ "url": u.url, "ok": u.error.is_none(), "error": u.error }));
+                    }
+                    out.detail.push(ListenerInfo {
+                        proto: "doh",
+                        bind: "httpsys".into(),
+                        port,
+                        bound: Some(any),
+                        tls: true,
+                        error: (!failed.is_empty()).then(|| failed.join("；")),
+                    });
+                    out.doh = Some(any);
+                    if plan3 == Doh3Plan::HttpSys {
+                        out.detail.push(ListenerInfo {
+                            proto: "doh3",
+                            bind: "httpsys".into(),
+                            port,
+                            bound: Some(any),
+                            tls: true,
+                            error: None,
+                        });
+                        out.doh3 = Some(any);
+                    }
+                    out.httpsys = Some(Arc::new(srv));
+                }
+                // 登記失敗（沒有權限、沒有網域…）只記警告，其他監聽照常
+                Err(e) => skip(
+                    &mut out,
+                    "doh",
+                    &["httpsys".to_string()],
+                    port,
+                    &format!("HTTP.sys 共用沒有啟動：{e:#}"),
+                ),
+            }
+        } else {
+            let tls = doh_uses_tls(cfg, base);
+            match (tls, cert_for(cfg, "doh", base)) {
+                (true, None) => skip(
+                    &mut out,
+                    "doh",
+                    &hosts,
+                    port,
+                    "DoH 設定成要 TLS（listen.doh.tls）但是沒有憑證（tls.cert / key 或 listen.doh.cert / key），沒有啟動",
+                ),
+                (tls, pair) => {
+                    let certs = pair.filter(|_| tls).map(&mut store_for);
+                    for (i, a) in targets(&mut out, "doh", &hosts, port, tls) {
+                        let r = listen_doh(a, certs.clone(), resolver.clone(), opts.clone(), limits.clone()).await;
+                        if let Some(b) = done(&mut out, i, r) {
+                            out.doh.get_or_insert(b);
+                        }
                     }
                 }
             }
         }
-        let tls = doh_uses_tls(cfg, base);
-        match (tls, cert_for(cfg, "doh", base)) {
-            (true, None) => skip(
-                &mut out,
-                "doh",
-                &hosts,
-                port,
-                "DoH 設定成要 TLS（listen.doh.tls）但是沒有憑證（tls.cert / key 或 listen.doh.cert / key），沒有啟動",
-            ),
-            (tls, pair) => {
-                let certs = pair.filter(|_| tls).map(&mut store_for);
-                for (i, a) in targets(&mut out, "doh", &hosts, port, tls) {
-                    let r = listen_doh(a, certs.clone(), resolver.clone(), opts.clone(), limits.clone()).await;
-                    if let Some(b) = done(&mut out, i, r) {
-                        out.doh.get_or_insert(b);
-                    }
-                }
+        out.doh_mode = json!({
+            "configured": configured, "mode": mode.name(), "reason": mode_reason,
+            "urls": urls_json, "enableHttp3": sys_h3, "enableAltSvc": sys_alt,
+            "altSvc": opts.alt_svc,
+        });
+        out.doh3_provider = match plan3 {
+            Doh3Plan::Off => json!({ "provider": "none", "reason": "沒有開 HTTP/3（listen.doh.http3）" }),
+            Doh3Plan::HttpSys if out.doh3.is_some() => {
+                json!({ "provider": "httpsys", "reason": format!("HTTP.sys 開了 HTTP/3（EnableHttp3），登記的網址自動支援 UDP {port}") })
             }
-        }
+            Doh3Plan::HttpSys => json!({ "provider": "none", "reason": "HTTP.sys 開了 HTTP/3，但是網址沒有登記成功" }),
+            Doh3Plan::Kuroshio => match out.doh3 {
+                Some(b) => json!({ "provider": "kuroshio", "reason": format!("黑潮 DNS 自己聽 UDP {}", b.port()) }),
+                None => json!({
+                    "provider": "none",
+                    "reason": out.detail.iter().filter(|l| l.proto == "doh3").find_map(|l| l.error.clone()).unwrap_or_else(|| "DoH3 沒有啟動".into()),
+                }),
+            },
+        };
     }
     out
 }
@@ -901,6 +990,10 @@ pub struct Started {
 impl Started {
     /// 關機：把有變動的快照全部寫出（規格 05 第 5.3 節）
     pub fn shutdown(&self) {
+        // 模式 B：先移除 HTTP.sys 的網址（重新載入時新的一輪要重新登記）
+        if let Some(h) = &self.encrypted.httpsys {
+            h.stop();
+        }
         stage_hot_names(&self.resolver, &self.persister, self.state.warm_names);
         stage_sources(&self.persister, &self.state.snap_sources);
         let mut p = self.persister.lock().unwrap();
@@ -1203,8 +1296,8 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         site.spawn();
         let _ = resolver.site.set(site);
     }
-    // IIS 反向代理模式：憑證續期後自動重新匯入 IIS（只有 Windows、而且設定了 listen.doh.iisSite）
-    crate::iiscert::spawn_auto_sync(cfg, base_dir.clone(), persist_dir(cfg));
+    // 憑證續期後自動重新匯入並更新綁定（只有 Windows）：IIS 站台（設定了 listen.doh.iisSite）、HTTP.sys 共用模式
+    crate::iiscert::spawn_auto_sync(cfg, base_dir.clone(), persist_dir(cfg), encrypted.httpsys_port);
     let mut admin = None;
     if get(cfg, "admin.enabled").and_then(Value::as_bool).unwrap_or(true) {
         let host: IpAddr = get(cfg, "admin.host")
@@ -1386,6 +1479,37 @@ mod tests {
         assert!(e.doh.is_none() && e.dot.is_none());
         assert_eq!(e.detail.len(), 2);
         assert!(e.detail.iter().all(|l| l.error.is_some()));
+    }
+
+    /// 模式與 DoH3 的狀態一定會回報；Windows 以外的系統 httpsys 改成自己監聽
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn doh_mode_is_reported() {
+        let c = cfg(json!({
+            "resolver": { "lastResort": [], "rankIps": false },
+            "domain": "dns.example.net",
+            "listen": { "doh": { "enabled": true, "port": 0, "binds": ["127.0.0.1"], "windowsMode": "httpsys", "http3": true } },
+        }));
+        let r = build_resolver(&c).unwrap();
+        let e = start_encrypted(&c, &r, Path::new("/nonexistent")).await;
+        assert_eq!(e.doh_mode["configured"], "httpsys");
+        assert_eq!(e.doh_mode["mode"], "standalone");
+        assert!(e.doh_mode["reason"].as_str().unwrap().contains("只有 Windows"));
+        assert!(e.httpsys.is_none() && e.httpsys_port.is_none());
+        assert!(e.doh.is_some(), "照常自己監聽");
+        // DoH3 要憑證，沒有：none + 原因；沒綁 UDP 就不宣告 Alt-Svc
+        assert_eq!(e.doh3_provider["provider"], "none");
+        assert!(e.doh3_provider["reason"].as_str().unwrap().contains("憑證"));
+        assert_eq!(e.doh_mode["altSvc"], Value::Null);
+        let c = cfg(json!({
+            "resolver": { "lastResort": [], "rankIps": false },
+            "listen": { "doh": { "enabled": true, "port": 0, "binds": ["127.0.0.1"] } },
+        }));
+        let e = start_encrypted(&c, &r, Path::new("/nonexistent")).await;
+        assert_eq!(
+            (e.doh_mode["mode"].as_str(), e.doh3_provider["provider"].as_str()),
+            (Some("standalone"), Some("none"))
+        );
     }
 
     /// `0.0.0.0` 與 `::` 可以同時綁同一個埠（IPv6 設了 V6ONLY）

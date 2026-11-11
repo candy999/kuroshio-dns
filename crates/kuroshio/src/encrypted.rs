@@ -142,7 +142,7 @@ impl Limits {
             conns: Arc::new(Semaphore::new(max.max(1))),
         }
     }
-    fn admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    pub(crate) fn admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
             return None;
         }

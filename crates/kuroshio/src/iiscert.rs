@@ -13,8 +13,12 @@ use std::path::{Path, PathBuf};
 
 /// IIS 自己的應用程式 ID（用這個 ID 綁定，IIS 管理員裡才看得到是站台的憑證）
 pub const IIS_APPID: &str = "{4dc3e181-e14b-4a21-b022-59fc669b0914}";
+/// 黑潮 DNS 自己的應用程式 ID（模式 B：HTTP.sys 共用時的 sslcert 綁定）
+pub const KUROSHIO_APPID: &str = "{5e0c3a9b-7d41-4f6e-9b2a-1c8d7e6f4a30}";
 /// 記錄目前綁在 IIS 上的是哪一張（state 目錄）
 pub const STATE_FILE: &str = "iis-cert.json";
+/// 記錄目前綁給 HTTP.sys 共用（模式 B）的是哪一張
+pub const HTTPSYS_STATE_FILE: &str = "httpsys-cert.json";
 
 /// 讀進來的憑證鏈（DER，第一張是伺服器憑證）與私鑰（PKCS#8 DER）
 pub struct Material {
@@ -163,16 +167,58 @@ pub struct Step {
     pub required: bool,
 }
 
-/// 同步的步驟：匯入 PFX → 站台加上 HTTPS（SNI）繫結 → 綁上這張憑證 → 移除舊憑證
-#[allow(clippy::too_many_arguments)]
+/// 憑證要綁到哪裡
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    /// 模式 C：IIS 站台（443）
+    Iis(String),
+    /// 模式 B：HTTP.sys 共用（黑潮 DNS 自己登記的網址，埠號依 `listen.doh.port`）
+    HttpSys(u16),
+}
+
+impl Kind {
+    pub fn port(&self) -> u16 {
+        match self {
+            Kind::Iis(_) => 443,
+            Kind::HttpSys(p) => *p,
+        }
+    }
+    pub fn state_file(&self) -> &'static str {
+        match self {
+            Kind::Iis(_) => STATE_FILE,
+            Kind::HttpSys(_) => HTTPSYS_STATE_FILE,
+        }
+    }
+    /// 另一種綁定的紀錄（同一張舊憑證還在那邊用時先不要刪）
+    pub fn other_state_file(&self) -> &'static str {
+        match self {
+            Kind::Iis(_) => HTTPSYS_STATE_FILE,
+            Kind::HttpSys(_) => STATE_FILE,
+        }
+    }
+    pub fn appid(&self) -> &'static str {
+        match self {
+            Kind::Iis(_) => IIS_APPID,
+            Kind::HttpSys(_) => KUROSHIO_APPID,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Kind::Iis(_) => "IIS",
+            Kind::HttpSys(_) => "HTTP.sys",
+        }
+    }
+}
+
+/// 同步的步驟：匯入 PFX →（IIS：站台加上 HTTPS（SNI）繫結）→ 綁上這張憑證（`hostnameport`，SNI）→ 移除舊憑證。
+/// `iis`：(appcmd 路徑, 站台已經有 HTTPS 繫結)，只有 IIS 用
 pub fn steps(
-    appcmd: &str,
-    site: &str,
+    kind: &Kind,
+    iis: Option<(&str, bool)>,
     domain: &str,
     thumb: &str,
     pfx_file: &str,
     password: &str,
-    has_binding: bool,
     old_thumb: Option<&str>,
 ) -> Vec<Step> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -181,7 +227,7 @@ pub fn steps(
         args: s(&["-f", "-p", password, "-importPFX", "My", pfx_file]),
         required: true,
     }];
-    if !has_binding {
+    if let (Kind::Iis(site), Some((appcmd, false))) = (kind, iis) {
         out.push(Step {
             cmd: appcmd.into(),
             args: vec![
@@ -193,7 +239,7 @@ pub fn steps(
             required: true,
         });
     }
-    let hostport = format!("hostnameport={domain}:443");
+    let hostport = format!("hostnameport={domain}:{}", kind.port());
     out.push(Step {
         cmd: "netsh".into(),
         args: s(&["http", "delete", "sslcert", &hostport]),
@@ -207,7 +253,7 @@ pub fn steps(
             "sslcert",
             &hostport,
             &format!("certhash={thumb}"),
-            &format!("appid={IIS_APPID}"),
+            &format!("appid={}", kind.appid()),
             "certstorename=MY",
         ]),
         required: true,
@@ -263,41 +309,56 @@ pub fn apply_iis_config(user: &mut Value, site: &str) -> Vec<String> {
 }
 
 #[cfg(not(windows))]
-pub fn sync(_cfg: &Value, _site: &str, _base: &Path, _state_dir: &Path, _force: bool) -> Result<String> {
-    bail!("IIS 只在 Windows 上")
+pub fn sync_kind(_cfg: &Value, _kind: &Kind, _base: &Path, _state_dir: &Path, _force: bool) -> Result<String> {
+    bail!("IIS / HTTP.sys 只在 Windows 上")
 }
 
-/// 服務執行中：憑證換了就重新同步到 IIS（只有 Windows、而且設定了 `listen.doh.iisSite` 才會動）
-pub fn spawn_auto_sync(cfg: &Value, base: PathBuf, state_dir: PathBuf) {
+/// 把目前的憑證同步到 IIS 站台（`kuroshio iis cert`）
+pub fn sync(cfg: &Value, site: &str, base: &Path, state_dir: &Path, force: bool) -> Result<String> {
+    sync_kind(cfg, &Kind::Iis(site.to_string()), base, state_dir, force)
+}
+
+/// 服務執行中：憑證換了就重新同步（只有 Windows）。設定了 `listen.doh.iisSite` 同步到 IIS 站台；
+/// 這一輪是 HTTP.sys 共用模式（`httpsys_port`）時同步 HTTP.sys 的 `hostnameport` 綁定。每 10 分鐘比對一次
+pub fn spawn_auto_sync(cfg: &Value, base: PathBuf, state_dir: PathBuf, httpsys_port: Option<u16>) {
     let site = get(cfg, "listen.doh.iisSite")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string();
-    if !cfg!(windows) || site.is_empty() {
+    let mut kinds = Vec::new();
+    if !site.is_empty() {
+        kinds.push(Kind::Iis(site));
+    }
+    if let Some(p) = httpsys_port {
+        kinds.push(Kind::HttpSys(p));
+    }
+    if !cfg!(windows) || kinds.is_empty() {
         return;
     }
     let cfg = cfg.clone();
     tokio::spawn(async move {
-        let mut last_error = String::new();
+        let mut last_error = vec![String::new(); kinds.len()];
         loop {
-            let (c, b, s, st) = (cfg.clone(), base.clone(), site.clone(), state_dir.clone());
-            match tokio::task::spawn_blocking(move || sync(&c, &s, &b, &st, false)).await {
-                Ok(Ok(msg)) => {
-                    if !msg.contains("已經是最新") {
-                        tracing::info!("IIS 憑證：{msg}");
+            for (i, kind) in kinds.iter().enumerate() {
+                let (c, b, k, st) = (cfg.clone(), base.clone(), kind.clone(), state_dir.clone());
+                match tokio::task::spawn_blocking(move || sync_kind(&c, &k, &b, &st, false)).await {
+                    Ok(Ok(msg)) => {
+                        if !msg.contains("已經是最新") {
+                            tracing::info!("{} 憑證：{msg}", kind.label());
+                        }
+                        last_error[i].clear();
                     }
-                    last_error.clear();
-                }
-                Ok(Err(e)) => {
-                    // 同一個錯誤只記一次（例如 cmd 執行時沒有系統管理員權限）
-                    let e = format!("{e:#}");
-                    if e != last_error {
-                        tracing::warn!("IIS 憑證同步失敗：{e}");
-                        last_error = e;
+                    Ok(Err(e)) => {
+                        // 同一個錯誤只記一次（例如 cmd 執行時沒有系統管理員權限）
+                        let e = format!("{e:#}");
+                        if e != last_error[i] {
+                            tracing::warn!("{} 憑證同步失敗：{e}", kind.label());
+                            last_error[i] = e;
+                        }
                     }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
         }
@@ -305,7 +366,7 @@ pub fn spawn_auto_sync(cfg: &Value, base: PathBuf, state_dir: PathBuf) {
 }
 
 #[cfg(windows)]
-pub use imp::sync;
+pub use imp::{run_step, sync_kind};
 
 #[cfg(windows)]
 mod imp {
@@ -313,7 +374,8 @@ mod imp {
     use serde_json::json;
     use std::process::Command;
 
-    fn run(step: &Step) -> Result<String> {
+    /// 執行一個步驟；必要的步驟失敗時回傳錯誤（不印出一次性密碼）
+    pub fn run_step(step: &Step) -> Result<String> {
         let out = Command::new(&step.cmd)
             .args(&step.args)
             .output()
@@ -340,12 +402,23 @@ mod imp {
         windir.join(r"System32\inetsrv\appcmd.exe")
     }
 
-    /// 把目前的憑證同步到 IIS 站台。回傳做了什麼（給人看的一句話）
-    pub fn sync(cfg: &Value, site: &str, base: &Path, state_dir: &Path, force: bool) -> Result<String> {
-        if !valid_site(site) {
-            bail!("IIS 站台名稱含有不允許的字元：{site}");
+    fn read_state(file: &Path) -> Value {
+        std::fs::read(file)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null)
+    }
+
+    /// 把目前的憑證匯入「本機電腦\個人」並綁到 IIS 站台或 HTTP.sys（`hostnameport`，SNI）。
+    /// IIS 與 HTTP.sys 共用同一段流程；回傳做了什麼（給人看的一句話）
+    pub fn sync_kind(cfg: &Value, kind: &Kind, base: &Path, state_dir: &Path, force: bool) -> Result<String> {
+        if let Kind::Iis(site) = kind {
+            if !valid_site(site) {
+                bail!("IIS 站台名稱含有不允許的字元：{site}");
+            }
         }
-        let domain = domain(cfg).ok_or_else(|| anyhow!("沒有設定網域（domain / site.hostname）：IIS 的 HTTPS 繫結需要網域"))?;
+        let domain =
+            domain(cfg).ok_or_else(|| anyhow!("沒有設定網域（domain / site.hostname）：{} 的 HTTPS 綁定需要網域", kind.label()))?;
         if !valid_domain(&domain) {
             bail!("網域格式不對：{domain}");
         }
@@ -357,60 +430,77 @@ mod imp {
             }
         }
         let thumb = thumbprint(&m.chain[0]);
-        let appcmd = appcmd();
-        if !appcmd.exists() {
-            bail!("找不到 IIS（{}）", appcmd.display());
-        }
-        let a = appcmd.to_string_lossy().to_string();
-        let state_file = state_dir.join(STATE_FILE);
-        let old: Value = std::fs::read(&state_file)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(Value::Null);
+        let port = kind.port();
+        let state_file = state_dir.join(kind.state_file());
+        let old = read_state(&state_file);
         let old_thumb = old["thumbprint"].as_str().map(str::to_string);
-        let hostport = format!("hostnameport={domain}:443");
+        let hostport = format!("hostnameport={domain}:{port}");
         let bound = Command::new("netsh")
             .args(["http", "show", "sslcert", &hostport])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).replace(' ', "").to_uppercase().contains(&thumb))
             .unwrap_or(false);
-        if bound && !force && old_thumb.as_deref() == Some(thumb.as_str()) && old["site"] == json!(site) {
-            return Ok(format!("{domain} 已經是最新的憑證（{thumb}）"));
+        let same_target = match kind {
+            Kind::Iis(site) => old["site"] == json!(site),
+            Kind::HttpSys(p) => old["port"] == json!(p) && old["domain"] == json!(domain),
+        };
+        if bound && !force && old_thumb.as_deref() == Some(thumb.as_str()) && same_target {
+            return Ok(format!("{domain}:{port} 已經是最新的憑證（{thumb}）"));
         }
-        let bindings = run(&Step {
-            cmd: a.clone(),
-            args: vec!["list".into(), "site".into(), site.into(), "/text:bindings".into()],
-            required: true,
-        })
-        .with_context(|| format!("找不到 IIS 站台「{site}」"))?;
-        let has_binding = bindings.to_lowercase().contains(&format!("https/*:443:{domain}"));
+        let iis = match kind {
+            Kind::Iis(site) => {
+                let appcmd = appcmd();
+                if !appcmd.exists() {
+                    bail!("找不到 IIS（{}）", appcmd.display());
+                }
+                let a = appcmd.to_string_lossy().to_string();
+                let bindings = run_step(&Step {
+                    cmd: a.clone(),
+                    args: vec!["list".into(), "site".into(), site.clone(), "/text:bindings".into()],
+                    required: true,
+                })
+                .with_context(|| format!("找不到 IIS 站台「{site}」"))?;
+                let has = bindings.to_lowercase().contains(&format!("https/*:443:{domain}"));
+                Some((a, has))
+            }
+            Kind::HttpSys(_) => None,
+        };
+        // 舊憑證還被另一種綁定（IIS / HTTP.sys）用著時先不要刪，等那邊也換成新的再刪
+        let other = read_state(&state_dir.join(kind.other_state_file()));
+        let old_thumb = old_thumb.filter(|o| other["thumbprint"].as_str().map(|t| !t.eq_ignore_ascii_case(o)).unwrap_or(true));
         // PFX 只存在匯入的這一瞬間，密碼是隨機的一次性密碼
         let password = crate::webui::random_hex(16);
         std::fs::create_dir_all(state_dir)?;
-        let pfx_file = state_dir.join(format!("iis-{}.pfx", crate::webui::random_hex(6)));
+        let pfx_file = state_dir.join(format!("cert-{}.pfx", crate::webui::random_hex(6)));
         std::fs::write(&pfx_file, pfx(&m, &password)?)?;
         let plan = steps(
-            &a,
-            site,
+            kind,
+            iis.as_ref().map(|(a, h)| (a.as_str(), *h)),
             &domain,
             &thumb,
             &pfx_file.to_string_lossy(),
             &password,
-            has_binding,
             old_thumb.as_deref(),
         );
-        let result = plan.iter().try_for_each(|s| run(s).map(|_| ()));
+        let result = plan.iter().try_for_each(|s| run_step(s).map(|_| ()));
         let _ = std::fs::remove_file(&pfx_file);
         result?;
-        crate::persist::write_atomic(
-            &state_file,
-            serde_json::to_string_pretty(&json!({ "site": site, "domain": domain, "thumbprint": thumb, "cert": cert }))?.as_bytes(),
-        )?;
-        Ok(format!(
-            "已把 {} 的憑證（{thumb}）匯入「本機電腦\\個人」並綁到 IIS 站台「{site}」的 https://{domain}:443{}",
-            cert.display(),
-            if has_binding { "" } else { "（新增了 HTTPS 繫結）" }
-        ))
+        let record = match kind {
+            Kind::Iis(site) => json!({ "site": site, "domain": domain, "thumbprint": thumb, "cert": cert }),
+            Kind::HttpSys(p) => json!({ "mode": "httpsys", "port": p, "domain": domain, "thumbprint": thumb, "cert": cert }),
+        };
+        crate::persist::write_atomic(&state_file, serde_json::to_string_pretty(&record)?.as_bytes())?;
+        Ok(match (kind, iis) {
+            (Kind::Iis(site), Some((_, has))) => format!(
+                "已把 {} 的憑證（{thumb}）匯入「本機電腦\\個人」並綁到 IIS 站台「{site}」的 https://{domain}:443{}",
+                cert.display(),
+                if has { "" } else { "（新增了 HTTPS 繫結）" }
+            ),
+            _ => format!(
+                "已把 {} 的憑證（{thumb}）匯入「本機電腦\\個人」並綁到 HTTP.sys 的 https://{domain}:{port}",
+                cert.display()
+            ),
+        })
     }
 }
 
@@ -497,14 +587,14 @@ mod tests {
 
     #[test]
     fn command_plan() {
+        let iis = Kind::Iis("Default Web Site".into());
         let s = steps(
-            "appcmd.exe",
-            "Default Web Site",
+            &iis,
+            Some(("appcmd.exe", false)),
             "dns.example.net",
             "ABCD",
             r"C:\x\iis.pfx",
             "pw",
-            false,
             Some("OLD1"),
         );
         let line = |i: usize| format!("{} {}", s[i].cmd, s[i].args.join(" "));
@@ -521,20 +611,24 @@ mod tests {
         );
         assert_eq!(line(4), "certutil -delstore My OLD1");
         // 已經有繫結、憑證沒換：不加繫結、不刪憑證
-        let s = steps(
-            "appcmd.exe",
-            "Default Web Site",
-            "dns.example.net",
-            "ABCD",
-            "f",
-            "pw",
-            true,
-            Some("abcd"),
-        );
+        let s = steps(&iis, Some(("appcmd.exe", true)), "dns.example.net", "ABCD", "f", "pw", Some("abcd"));
         assert_eq!(s.len(), 3);
         assert!(s
             .iter()
             .all(|x| !x.args.iter().any(|a| a.contains("delstore") || a.contains("bindings"))));
+        // HTTP.sys 共用：同一段流程，埠號照設定、用黑潮 DNS 自己的 appid、不碰 IIS 站台
+        let hs = Kind::HttpSys(8443);
+        let s = steps(&hs, None, "dns.example.net", "ABCD", "f", "pw", Some("OLD1"));
+        let line = |i: usize| format!("{} {}", s[i].cmd, s[i].args.join(" "));
+        assert_eq!(s.len(), 4);
+        assert_eq!(line(1), "netsh http delete sslcert hostnameport=dns.example.net:8443");
+        assert_eq!(
+            line(2),
+            format!("netsh http add sslcert hostnameport=dns.example.net:8443 certhash=ABCD appid={KUROSHIO_APPID} certstorename=MY")
+        );
+        assert_eq!(line(3), "certutil -delstore My OLD1", "舊憑證在新綁定之後才刪");
+        assert_eq!((hs.state_file(), hs.other_state_file()), (HTTPSYS_STATE_FILE, STATE_FILE));
+        assert_eq!((iis.port(), hs.port()), (443, 8443));
     }
 
     #[test]

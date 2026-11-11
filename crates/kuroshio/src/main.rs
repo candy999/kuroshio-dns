@@ -57,6 +57,17 @@ enum Cmd {
         #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
+    /// Windows：HTTP.sys 共用模式（規格 07 第 2 節模式 B）。cert：把憑證匯入並綁到 HTTP.sys；
+    /// status：要登記的網址、HTTP.sys 的 HTTP/3 設定、目前的憑證綁定
+    Httpsys {
+        /// cert 或 status
+        action: String,
+        /// 憑證不涵蓋網域也照樣綁定
+        #[arg(long)]
+        force: bool,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+    },
     /// 內建 ACME：`kuroshio acme issue [--force]` 立即申請 / 續期（Cloudflare DNS 驗證）
     Acme {
         /// issue（需要時申請）或 status
@@ -465,7 +476,7 @@ fn console_info(
     use kuroshio_config::get;
     let n = |k: &str, d: u64| get(cfg, k).and_then(|v| v.as_u64()).unwrap_or(d) as u16;
     let on = |k: &str| get(cfg, k).and_then(|v| v.as_bool()).unwrap_or(false);
-    let (admin_url, token_file, doh, dot, site_on) = match started {
+    let (admin_url, token_file, doh, dot, site_on, httpsys) = match started {
         Some(s) => {
             let ui = &s.state.webui;
             (
@@ -474,6 +485,7 @@ fn console_info(
                 s.state.encrypted.doh.map(|a| a.port()),
                 s.state.encrypted.dot.map(|a| a.port()),
                 s.state.resolver.site.get().is_some(),
+                s.state.encrypted.doh_mode["mode"] == "httpsys",
             )
         }
         // 沒在這個行程裡跑（kuroshio url）：照設定推算，token 從檔案讀
@@ -492,10 +504,11 @@ fn console_info(
                 on("listen.doh.enabled").then(|| n("listen.doh.port", 8053)),
                 on("listen.dot.enabled").then(|| n("listen.dot.port", 853)),
                 on("site.enabled") && on("listen.doh.enabled"),
+                cfg!(windows) && kuroshio::httpsys::configured(cfg) == "httpsys",
             )
         }
     };
-    let mut info = kuroshio::console::Info::build(cfg, admin_url, token_file, doh, dot, site_on);
+    let mut info = kuroshio::console::Info::build_with(cfg, admin_url, token_file, doh, dot, site_on, httpsys);
     info.config_file = config.map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.to_path_buf()).display().to_string());
     info
 }
@@ -740,6 +753,32 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
                 }
                 "status" => println!("{}", serde_json::to_string_pretty(&a.status())?),
                 other => anyhow::bail!("不認識的動作 {other}（issue / status）"),
+            }
+        }
+        Cmd::Httpsys { action, force, config } => {
+            let (cfg, ..) = effective(&config, false)?;
+            let state = kuroshio::app::persist_dir(&cfg);
+            let base = state.parent().map(PathBuf::from).unwrap_or_default();
+            let (domain, port, prefixes) = kuroshio::httpsys::plan(&cfg).map_err(anyhow::Error::msg)?;
+            match action.as_str() {
+                "cert" => {
+                    let kind = kuroshio::iiscert::Kind::HttpSys(port);
+                    println!("{}", kuroshio::iiscert::sync_kind(&cfg, &kind, &base, &state, force)?);
+                }
+                "status" => {
+                    let (h3, alt) = kuroshio::httpsys::registry_http3();
+                    let bound: serde_json::Value = std::fs::read(state.join(kuroshio::iiscert::HTTPSYS_STATE_FILE))
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    let v = serde_json::json!({
+                        "configured": kuroshio::httpsys::configured(&cfg), "domain": domain, "port": port,
+                        "urls": prefixes.doh, "siteRoot": prefixes.site_root, "sitePaths": prefixes.site_paths,
+                        "urlacl": prefixes.acl(), "enableHttp3": h3, "enableAltSvc": alt, "cert": bound,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                }
+                other => anyhow::bail!("不認識的動作 {other}（cert：憑證綁到 HTTP.sys；status：顯示設定）"),
             }
         }
         Cmd::Setup { config } => kuroshio::winsetup::setup(&effective(&config, false)?.0)?,
