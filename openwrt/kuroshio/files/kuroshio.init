@@ -11,13 +11,13 @@ ETC=/etc/kuroshio
 RUN=/var/run/kuroshio
 LIBEXEC=/usr/libexec/kuroshio
 
-# 第一次啟動：放入可編輯的評測名單（之後由 LuCI 修改，不會被覆蓋）；自訂規則由程式自己補
+# 使用者自己加的評測名單（LuCI 編輯）；程式附帶的預設名單在 $SHARE/benchmark，評測時兩邊合併，升級套件就更新
 seed_files() {
 	local f
 	mkdir -p "$ETC/benchmark"
-	for f in "$SHARE"/benchmark/*; do
-		[ -e "$f" ] || continue
-		[ -e "$ETC/benchmark/${f##*/}" ] || cp -a "$f" "$ETC/benchmark/"
+	for f in iplist.txt dohlist.txt dotlist.txt doqlist.txt web.txt blacklist.txt; do
+		[ -e "$ETC/benchmark/$f" ] && continue
+		printf '# 在這裡加上自己要的項目（一行一個）；程式附帶的預設名單會自動一起使用，不用複製過來\n' > "$ETC/benchmark/$f"
 	done
 }
 

@@ -11,6 +11,9 @@ if [ ! -f /etc/kuroshio/.migrated ] && [ -s /etc/config/candydns ] && ! uci -q g
 	for f in custom-rules.txt cert.pem key.pem benchmark community; do
 		[ -e "/etc/candydns/$f" ] && [ ! -e "/etc/kuroshio/$f" ] && cp -a "/etc/candydns/$f" "/etc/kuroshio/$f"
 	done
+	# 2.x 的永久黑名單只看 IP 屬於哪家業者就定罪，誤殺很多：留著參考但不再使用
+	# （3.0 每一筆都實際驗證網站憑證；程式附帶的名單已經重新體檢過）
+	[ -f /etc/kuroshio/benchmark/blacklist.txt ] && mv /etc/kuroshio/benchmark/blacklist.txt /etc/kuroshio/benchmark/blacklist.2x.txt
 	# 2.x 的節點池、驗證紀錄、評測結果（格式相同，直接沿用）
 	if [ -d /usr/share/candydns/state ] && [ ! -d /etc/kuroshio/state ]; then
 		mkdir -p /etc/kuroshio/state
@@ -34,11 +37,11 @@ done
 uci -q get kuroshio.system.profile >/dev/null || uci set kuroshio.system.profile='auto'
 uci commit kuroshio
 
-# 可編輯的評測名單：安裝時就放好（已存在的不覆蓋）；自訂規則檔不存在時由程式寫入預設規則
+# 使用者自己加的評測名單（程式附帶的預設名單會自動一起使用，不複製，升級時才會更新）
 mkdir -p /etc/kuroshio/benchmark
-for f in /usr/share/kuroshio/benchmark/*; do
-	[ -e "$f" ] || continue
-	[ -e "/etc/kuroshio/benchmark/${f##*/}" ] || cp -a "$f" /etc/kuroshio/benchmark/
+for f in iplist.txt dohlist.txt dotlist.txt doqlist.txt web.txt blacklist.txt; do
+	[ -e "/etc/kuroshio/benchmark/$f" ] && continue
+	printf '# 在這裡加上自己要的項目（一行一個）；程式附帶的預設名單會自動一起使用，不用複製過來\n' > "/etc/kuroshio/benchmark/$f"
 done
 [ -f /etc/kuroshio/custom-rules.txt ] || cp /usr/share/kuroshio/default-custom-rules.txt /etc/kuroshio/custom-rules.txt
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*

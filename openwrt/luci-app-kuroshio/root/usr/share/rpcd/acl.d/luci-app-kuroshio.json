@@ -11,7 +11,10 @@
 				"/etc/kuroshio/benchmark/iplist.txt": [ "read" ],
 				"/etc/kuroshio/benchmark/dohlist.txt": [ "read" ],
 				"/etc/kuroshio/benchmark/web.txt": [ "read" ],
-				"/etc/kuroshio/benchmark/blacklist.txt": [ "read" ]
+				"/etc/kuroshio/benchmark/blacklist.txt": [ "read" ],
+				"/etc/kuroshio/benchmark/dotlist.txt": [ "read" ],
+				"/etc/kuroshio/benchmark/doqlist.txt": [ "read" ],
+				"/etc/kuroshio/state/blacklist.txt": [ "read" ]
 			},
 			"uci": [ "kuroshio" ]
 		},
@@ -24,7 +27,10 @@
 				"/etc/kuroshio/benchmark/iplist.txt": [ "write" ],
 				"/etc/kuroshio/benchmark/dohlist.txt": [ "write" ],
 				"/etc/kuroshio/benchmark/web.txt": [ "write" ],
-				"/etc/kuroshio/benchmark/blacklist.txt": [ "write" ]
+				"/etc/kuroshio/benchmark/blacklist.txt": [ "write" ],
+				"/etc/kuroshio/benchmark/dotlist.txt": [ "write" ],
+				"/etc/kuroshio/benchmark/doqlist.txt": [ "write" ],
+				"/etc/kuroshio/state/blacklist.txt": [ "write" ]
 			},
 			"uci": [ "kuroshio" ]
 		}

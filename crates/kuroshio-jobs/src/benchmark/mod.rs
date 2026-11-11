@@ -63,12 +63,30 @@ pub struct BenchPaths {
     pub upstreams_file: PathBuf,
     /// 社群好友提供的上游候選（`state/community/upstream-candidates.json`）
     pub community_candidates: Option<PathBuf>,
+    /// 程式附帶的預設名單（OpenWrt：`/usr/share/kuroshio/benchmark`）。`list_dir` 是使用者自己加的名單時，
+    /// 兩邊合併一起測：升級套件就會拿到新的預設名單，使用者加的也不會被蓋掉
+    pub default_list_dir: Option<PathBuf>,
     /// 自己評測學到的永久黑名單（`state/blacklist.txt`）；程式附帶的 `list_dir/blacklist.txt` 是唯讀的基本名單，
     /// 學到的寫在 state，升級套件不會被蓋掉
     pub blacklist_file: Option<PathBuf>,
 }
 
 impl BenchPaths {
+    /// 名單：使用者的（`list_dir`）加上程式附帶的（`default_list_dir`），保持順序、去掉重複
+    pub fn read_lists(&self, name: &str) -> Vec<String> {
+        let mut out = read_list(&self.list_dir.join(name));
+        if let Some(d) = self.default_list_dir.as_ref().filter(|d| **d != self.list_dir) {
+            let key = |l: &str| l.split_whitespace().next().unwrap_or("").trim_end_matches('/').to_ascii_lowercase();
+            let mut seen: HashSet<String> = out.iter().map(|l| key(l)).collect();
+            for l in read_list(&d.join(name)) {
+                if seen.insert(key(&l)) {
+                    out.push(l);
+                }
+            }
+        }
+        out
+    }
+
     /// 依設定組出路徑：`state/` 開頭的放到 `state_dir`，其他相對於 `base_dir`
     pub fn from_config(cfg: &Value, state_dir: &Path, base_dir: &Path) -> BenchPaths {
         let s = |k: &str, d: &str| {
@@ -85,6 +103,7 @@ impl BenchPaths {
             upstreams_file: r(&s("upstream.autoStateFile", "./state/upstreams.json")),
             community_candidates: Some(r("./state/community/upstream-candidates.json")),
             blacklist_file: Some(r("./state/blacklist.txt")),
+            default_list_dir: None,
         }
     }
 }
@@ -355,11 +374,11 @@ fn pick_token(line: &str, prefix: &str) -> String {
 
 /// 依 2.x 的順序組出候選清單：udp、doh（含社群提供的加密上游）、doq，再加上 3.0 新增的 dot、doh3、dnscrypt
 fn candidate_ids(paths: &BenchPaths) -> (Vec<String>, usize) {
-    let dir = &paths.list_dir;
-    let mut udp = read_list(&dir.join("iplist.txt"));
-    let mut doh: Vec<String> = read_list(&dir.join("dohlist.txt")).iter().map(|l| pick_token(l, "http")).collect();
-    let doq: Vec<String> = read_list(&dir.join("doqlist.txt")).iter().map(|l| pick_token(l, "quic")).collect();
-    let dot: Vec<String> = read_list(&dir.join("dotlist.txt"))
+    let mut udp = paths.read_lists("iplist.txt");
+    let mut doh: Vec<String> = paths.read_lists("dohlist.txt").iter().map(|l| pick_token(l, "http")).collect();
+    let doq: Vec<String> = paths.read_lists("doqlist.txt").iter().map(|l| pick_token(l, "quic")).collect();
+    let dot: Vec<String> = paths
+        .read_lists("dotlist.txt")
         .iter()
         .map(|l| {
             let t = l
@@ -373,10 +392,7 @@ fn candidate_ids(paths: &BenchPaths) -> (Vec<String>, usize) {
             }
         })
         .collect();
-    let stamps: Vec<String> = read_list(&dir.join("stamps.txt"))
-        .iter()
-        .map(|l| pick_token(l, "sdns://"))
-        .collect();
+    let stamps: Vec<String> = paths.read_lists("stamps.txt").iter().map(|l| pick_token(l, "sdns://")).collect();
     // 社群好友提供的上游：只是候選，照常經過資格賽、汙染、封殺、速度檢查
     let shared: Vec<String> = paths
         .community_candidates
@@ -543,6 +559,9 @@ impl Benchmark {
         let base_bl = self.paths.list_dir.join("blacklist.txt");
         let bl_file = self.paths.blacklist_file.clone().unwrap_or_else(|| base_bl.clone());
         let mut blacklist = read_blacklist(&base_bl);
+        if let Some(d) = &self.paths.default_list_dir {
+            blacklist.extend(read_blacklist(&d.join("blacklist.txt")));
+        }
         blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
 
@@ -612,7 +631,7 @@ impl Benchmark {
         ctx.checkpoint().await;
 
         // Phase 1：逐一測網域
-        let domains = read_list(&self.paths.list_dir.join("web.txt"));
+        let domains = self.paths.read_lists("web.txt");
         // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
         let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
         let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
@@ -1074,5 +1093,43 @@ fn cleanup_reports(root: &Path, now: u64, keep_days: u64) {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod list_merge_tests {
+    use super::*;
+
+    #[test]
+    fn user_and_default_lists_are_merged() {
+        let root = std::env::temp_dir().join(format!("kuroshio-lists-{}", std::process::id()));
+        let (user, shipped) = (root.join("etc"), root.join("share"));
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&shipped).unwrap();
+        std::fs::write(
+            user.join("dohlist.txt"),
+            "# 自己加的\nhttps://mine.example/dns-query\nhttps://Both.example/dns-query/\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shipped.join("dohlist.txt"),
+            "\u{feff}https://both.example/dns-query\nhttps://new.example/dns-query  # 新版\n",
+        )
+        .unwrap();
+        let mut p = BenchPaths::from_config(&json!({}), &root.join("state"), &root);
+        p.list_dir = user.clone();
+        p.default_list_dir = Some(shipped.clone());
+        assert_eq!(
+            p.read_lists("dohlist.txt"),
+            vec![
+                "https://mine.example/dns-query",
+                "https://Both.example/dns-query/",
+                "https://new.example/dns-query  # 新版"
+            ]
+        );
+        // 使用者沒有這個檔：只用程式附帶的
+        std::fs::write(shipped.join("dotlist.txt"), "tls://dot.example\n").unwrap();
+        assert_eq!(p.read_lists("dotlist.txt"), vec!["tls://dot.example"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

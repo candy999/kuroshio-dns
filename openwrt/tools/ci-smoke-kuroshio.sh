@@ -43,7 +43,8 @@ eq "uci-defaults 補齊區段" "$(uci -q get kuroshio.system)" "system"
 eq "預設不啟用" "$(uci -q get kuroshio.main.enabled)" "0"
 eq "預設不帶入任何網域" "$(uci -q get kuroshio.tls.domain)" ""
 check "自訂規則已放好" test -s /etc/kuroshio/custom-rules.txt
-check "評測名單已放好" test -s /etc/kuroshio/benchmark/iplist.txt
+check "自己的評測名單已放好" test -s /etc/kuroshio/benchmark/iplist.txt
+check "程式附帶的預設名單（含 DoT）" test -s /usr/share/kuroshio/benchmark/dotlist.txt
 check "預設值不帶個人網域" sh -c '! /usr/bin/kuroshio defaults | grep -q candy.moe'
 ubus call uci get '{"config":"kuroshio"}' > /tmp/uci.json 2>/dev/null || true
 check "UCI 轉換：dnsmasq 上游模式聽 5335" sh -c 'KUROSHIO_UCI_JSON=/tmp/uci.json /usr/bin/kuroshio check-config --uci | grep -q 5335 || /usr/bin/kuroshio check-config --uci | grep -q 5335'

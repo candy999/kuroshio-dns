@@ -302,8 +302,12 @@ fn start_scheduler(
     let sched = Arc::new(Scheduler::new(cfg.clone(), saved.as_deref(), o));
     let _ = slot.set(Arc::downgrade(&sched));
     let mut paths = BenchPaths::from_config(cfg, &state_dir, base_dir);
+    let shipped = share_dir(cfg).join("benchmark");
     if !paths.list_dir.is_dir() {
-        paths.list_dir = share_dir(cfg).join("benchmark");
+        paths.list_dir = shipped.clone();
+    }
+    if shipped.is_dir() && shipped != paths.list_dir {
+        paths.default_list_dir = Some(shipped);
     }
     // 評測報表放記憶體：Flash 上不寫每天的報表
     if storage_class(cfg) != StorageClass::Disk {

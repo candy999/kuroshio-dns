@@ -5,12 +5,18 @@
 'require kuroshio.common as common';
 
 var BENCH = '/etc/kuroshio/benchmark/';
+// 這些檔案只放「自己加的」：程式附帶的預設名單（/usr/share/kuroshio/benchmark）每次評測都會自動一起測，升級套件就更新
+var MINE = _('只放自己要加的；程式附帶的預設名單會自動一起測，升級時更新。');
 var FILES = [
-	['iplist.txt', _('一般 DNS 候選名單'), _('每天評測的 UDP DNS，一行一個 IP。')],
-	['dohlist.txt', _('DoH 候選名單'), _('一行一個 https:// 網址。')],
-	['web.txt', _('評測用網域'), _('用來判斷各 DNS 速度、汙染、封殺的網域。')],
-	['blacklist.txt', _('永久淘汰名單'), _('評測判定汙染的 DNS 會自動加進來；刪掉那行即可恢復。')]
+	['iplist.txt', _('一般 DNS 候選名單'), _('一行一個 IP。') + MINE],
+	['dohlist.txt', _('DoH 候選名單'), _('一行一個 https:// 網址（每一個也會自動用 HTTP/3 測）。') + MINE],
+	['dotlist.txt', _('DoT 候選名單'), _('一行一個 tls://主機[:埠]。') + MINE],
+	['doqlist.txt', _('DoQ 候選名單'), _('一行一個 quic://主機[:埠]。') + MINE],
+	['web.txt', _('評測用網域'), _('用來判斷各 DNS 速度、汙染、封殺的網域。') + MINE],
+	['blacklist.txt', _('自己加的淘汰名單'), _('不想讓評測使用的 DNS，一行一個。')],
+	['/etc/kuroshio/state/blacklist.txt', _('評測自動淘汰的 DNS'), _('每一筆都實際驗證過：回答的 IP 用網域檢查憑證不符，或連續 3 天無法驗證。刪掉那行即可恢復。')]
 ];
+var path = function(f) { return f.charAt(0) === '/' ? f : BENCH + f; };
 
 var WEEKDAYS = [_('週日'), _('週一'), _('週二'), _('週三'), _('週四'), _('週五'), _('週六')];
 var JOBS = {
@@ -23,7 +29,7 @@ var JOBS = {
 return view.extend({
 	load: function() {
 		return Promise.all([common.loadDefaults()].concat(FILES.map(function(f) {
-			return L.resolveDefault(fs.read(BENCH + f[0]), '');
+			return L.resolveDefault(fs.read(path(f[0])), '');
 		})));
 	},
 
@@ -143,7 +149,7 @@ return view.extend({
 				value = String(value || '').replace(/\r\n/g, '\n');
 				if (value === content) return;
 				content = value;
-				return fs.write(BENCH + f[0], value.replace(/\n*$/, '\n'));
+				return fs.write(path(f[0]), value.replace(/\n*$/, '\n'));
 			};
 			o.remove = function() { return this.write(null, ''); };
 		});
