@@ -4,6 +4,7 @@
 //!   其他 crate（例如 `kuroshio-cdn` 的 cdn-ranges / cdn-scan / cdn-pool）的工作也註冊進同一個排程器。
 //! - `benchmark`：每日上游評測，結果寫 `state/upstreams.json`（格式同 2.x，伺服器照讀）。
 //! - `seed`：第一次啟動時帶入種子資料。
+//! - `twip`：台灣 IP 清單 `tw-ip.json` 的產生（指令列 `tw-ip` 與每月排程工作 `tw-ip` 共用，規格 08）。
 //!
 //! 32 位元 MIPS 沒有 64 位元原子操作，這個 crate 不用 `AtomicU64` / `AtomicI64`。
 //!
@@ -29,9 +30,11 @@ pub mod lock;
 pub mod scheduler;
 pub mod seed;
 pub mod time;
+pub mod twip;
 pub mod util;
 
 pub use benchmark::{BenchPaths, Benchmark};
 pub use scheduler::{resolve_path, Job, JobCtx, Options, Scheduler, JOBS_STATE_FILE};
 pub use seed::{apply_seeds, apply_seeds_with, SeedSpec, SEEDS};
 pub use time::{Clock, ManualClock, SystemClock};
+pub use twip::TwIpJob;

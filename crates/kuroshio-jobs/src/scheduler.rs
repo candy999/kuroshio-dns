@@ -8,6 +8,9 @@
 //!   `JobCtx::checkpoint()` 讓出 CPU（規格 05 第 4 節），強制結束就是把 future 丟掉。
 //! - 狀態（`jobs.json`）不自己寫檔：`snapshot()` 交給呼叫者排進快照（規格 05 第 5 節）。
 //! - `should_defer`（例如記憶體不足）回 true 時不啟動新工作，執行中的工作在 checkpoint 暫停。
+//! - 每月（`monthDays`，1–31）與每台裝置錯開（`jitterDays` / `jitterMin`：依這台裝置的亂數種子往後挪，
+//!   種子存在 `jobs.json` 裡，重開機後不變）：大家不會在同一時間去打同一個公開資料來源。
+//! - 很久的工作可以分段跑：`JobCtx::request_later` 讓自己稍後再排進佇列，`others_waiting` 看有沒有別的工作在等。
 
 use crate::lock::JobLock;
 use crate::time::{self, Clock, SystemClock, DAY_MS, MIN_MS};
@@ -33,6 +36,11 @@ pub type DeferFn = Arc<dyn Fn() -> bool + Send + Sync>;
 /// 一個背景工作。閉包 `Fn(JobCtx) -> impl Future<Output = anyhow::Result<()>>` 也可以直接註冊。
 pub trait Job: Send + Sync + 'static {
     fn run(&self, ctx: JobCtx) -> BoxFuture<anyhow::Result<()>>;
+
+    /// 工作自己的進度與狀態（`/api/jobs` 的 `detail.<名稱>`）；沒有就不顯示
+    fn detail(&self) -> Option<Value> {
+        None
+    }
 }
 
 impl<F, Fut> Job for F
@@ -55,6 +63,7 @@ pub struct JobCtx {
     pub clock: Arc<dyn Clock>,
     defer: Option<DeferFn>,
     defer_poll: Duration,
+    sched: Option<std::sync::Weak<Inner>>,
 }
 
 impl JobCtx {
@@ -67,6 +76,7 @@ impl JobCtx {
             clock: Arc::new(SystemClock),
             defer: None,
             defer_poll: Duration::from_secs(5),
+            sched: None,
         }
     }
 
@@ -83,6 +93,32 @@ impl JobCtx {
 
     pub fn now_ms(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// 由排程器啟動的（可以 `request_later`）；指令列、測試直接執行的不是
+    pub fn can_requeue(&self) -> bool {
+        self.sched.as_ref().map(|w| w.strong_count() > 0).unwrap_or(false)
+    }
+
+    /// 佇列裡有別的工作在等（很久的工作可以先讓出來，稍後再續跑）
+    pub fn others_waiting(&self) -> bool {
+        self.sched
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|i| !i.st.lock().unwrap().queue.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// `delay` 之後把這個工作再排進佇列（原因 `reason`）。不是排程器啟動的就什麼都不做
+    pub fn request_later(&self, delay: Duration, reason: &str) {
+        let Some(w) = self.sched.clone() else { return };
+        let (name, reason) = (self.name.clone(), reason.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(inner) = w.upgrade() {
+                Scheduler { inner }.request(&name, &reason);
+            }
+        });
     }
 
     pub fn should_defer(&self) -> bool {
@@ -182,14 +218,43 @@ pub fn weekdays(c: &Value) -> Option<Vec<u32>> {
         .map(|a| a.iter().filter_map(Value::as_u64).map(|d| d as u32).collect())
 }
 
+/// `monthDays`（每月的哪幾天，1–31）；不是陣列就不限
+pub fn month_days(c: &Value) -> Option<Vec<u32>> {
+    c.get("monthDays")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).map(|d| d as u32).collect())
+}
+
+fn num_u64(c: &Value, k: &str) -> u64 {
+    c.get(k).and_then(Value::as_f64).filter(|v| *v > 0.0).map(|v| v as u64).unwrap_or(0)
+}
+
+/// 有沒有設定每台裝置錯開（`jitterDays` / `jitterMin`）
+pub fn has_jitter(c: &Value) -> bool {
+    num_u64(c, "jitterDays") > 0 || num_u64(c, "jitterMin") > 0
+}
+
+/// 這台裝置的錯開量（毫秒）：`seed` 決定往後挪幾天（0..=jitterDays）、幾分鐘（0..=jitterMin）
+pub fn jitter_ms(c: &Value, seed: u64) -> u64 {
+    let (d, m) = (num_u64(c, "jitterDays"), num_u64(c, "jitterMin"));
+    (seed % (d + 1)) * DAY_MS + ((seed / 1009) % (m + 1)) * MIN_MS
+}
+
+/// 排程的時間範圍要看多遠（天）：每週 7 天、每月 32 天，再加上錯開的天數
+fn span_days(c: &Value) -> i64 {
+    let base = if month_days(c).is_some() { 32 } else { 7 };
+    base + num_u64(c, "jitterDays") as i64 + num_u64(c, "jitterMin").div_ceil(24 * 60) as i64
+}
+
 fn enabled(c: &Value) -> bool {
     c.get("enabled") != Some(&Value::Bool(false))
 }
 
-/// 排程時間點（Unix 毫秒），依時間遞增；`from_day` 到 `to_day` 是相對今天（台北）的天數
-fn slots(c: &Value, now: u64, from_day: i64, to_day: i64) -> Vec<u64> {
+/// 排程時間點（Unix 毫秒，已加上錯開量 `offset`），依時間遞增；`from_day` 到 `to_day` 是相對今天（台北）的天數
+fn slots(c: &Value, now: u64, from_day: i64, to_day: i64, offset: u64) -> Vec<u64> {
     let times = at_minutes(c);
     let wd = weekdays(c);
+    let md = month_days(c);
     let today = time::taipei_midnight(now) as i64;
     let mut out = Vec::new();
     for off in from_day..=to_day {
@@ -197,26 +262,60 @@ fn slots(c: &Value, now: u64, from_day: i64, to_day: i64) -> Vec<u64> {
         if start < 0 {
             continue;
         }
-        let w = time::taipei_parts(start as u64).weekday;
-        if wd.as_ref().map(|l| !l.contains(&w)).unwrap_or(false) {
+        let p = time::taipei_parts(start as u64);
+        if wd.as_ref().map(|l| !l.contains(&p.weekday)).unwrap_or(false) {
             continue;
         }
-        out.extend(times.iter().map(|m| start as u64 + *m as u64 * MIN_MS));
+        if md.as_ref().map(|l| !l.contains(&p.d)).unwrap_or(false) {
+            continue;
+        }
+        out.extend(times.iter().map(|m| start as u64 + *m as u64 * MIN_MS + offset));
     }
     out
 }
 
 /// 下次排定的時間（嚴格晚於 now）；停用或沒有 `at` 回 None
 pub fn next_run(c: &Value, now: u64) -> Option<u64> {
+    next_run_seeded(c, now, 0)
+}
+
+/// 同 `next_run`，錯開量依這台裝置的種子
+pub fn next_run_seeded(c: &Value, now: u64, seed: u64) -> Option<u64> {
     if !enabled(c) {
         return None;
     }
-    slots(c, now, 0, 7).into_iter().find(|s| *s > now)
+    let off = jitter_ms(c, seed);
+    let back = (off / DAY_MS) as i64 + 1;
+    slots(c, now, -back, span_days(c), off).into_iter().find(|s| *s > now)
 }
 
 /// 最近一次已經到的排定時間（≤ now）
 pub fn last_slot(c: &Value, now: u64) -> Option<u64> {
-    slots(c, now, -7, 0).into_iter().rev().find(|s| *s <= now)
+    last_slot_seeded(c, now, 0)
+}
+
+/// 同 `last_slot`，錯開量依這台裝置的種子
+pub fn last_slot_seeded(c: &Value, now: u64, seed: u64) -> Option<u64> {
+    let off = jitter_ms(c, seed);
+    slots(c, now, -span_days(c), 0, off).into_iter().rev().find(|s| *s <= now)
+}
+
+/// 新的亂數種子（每台裝置錯開排程用）
+fn new_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    h.write_u32(std::process::id());
+    h.finish() >> 1
+}
+
+fn seed_in(state: &Map<String, Value>, name: &str) -> u64 {
+    state.get(name).and_then(|s| s.get("seed")).and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// 排程戳記（同 2.x 的 lastSlot：`YYYY-MM-DD HH:MM`，台北）
@@ -366,7 +465,13 @@ impl Scheduler {
         let mut out = Vec::new();
         for (name, c) in list {
             let st = state.get(name.as_str());
-            let period = if weekdays(c).is_some() { 7 } else { 1 } * DAY_MS;
+            let period = if month_days(c).is_some() {
+                31
+            } else if weekdays(c).is_some() {
+                7
+            } else {
+                1
+            } * DAY_MS;
             let rim = c.get("runIfMissing").and_then(Value::as_str).filter(|s| !s.is_empty());
             let missing = rim.map(|p| !(self.inner.opts.file_exists)(p)).unwrap_or(false);
             let ok_code = st.and_then(|s| s.get("lastCode")).and_then(Value::as_i64) == Some(0);
@@ -401,6 +506,7 @@ impl Scheduler {
     pub fn tick(&self) -> Vec<String> {
         let now = self.inner.opts.clock.now_ms();
         let mut due = Vec::new();
+        let mut seeded = false;
         {
             let mut st = self.inner.st.lock().unwrap();
             let started = st.started_ms.unwrap_or(0);
@@ -409,7 +515,18 @@ impl Scheduler {
                 if !enabled(&c) {
                     continue;
                 }
-                let Some(s) = last_slot(&c, now) else { continue };
+                if has_jitter(&c) && seed_in(&st.state, &name) == 0 {
+                    // 第一次：這台裝置的錯開種子（存進 jobs.json，之後固定）
+                    let e = st.state.entry(name.clone()).or_insert_with(|| json!({}));
+                    if !e.is_object() {
+                        *e = json!({});
+                    }
+                    e.as_object_mut().unwrap().insert("seed".into(), Value::from(new_seed().max(1)));
+                    seeded = true;
+                }
+                let Some(s) = last_slot_seeded(&c, now, seed_in(&st.state, &name)) else {
+                    continue;
+                };
                 if s < started {
                     continue;
                 }
@@ -438,6 +555,9 @@ impl Scheduler {
                 }
                 due.push((name, late));
             }
+        }
+        if seeded {
+            self.changed();
         }
         let mut queued = Vec::new();
         for (name, late) in due {
@@ -534,6 +654,7 @@ impl Scheduler {
                 o.insert("reason".into(), Value::String(reason.clone()));
                 let c = Self::jobs_cfg(&st.cfg).get(&name).cloned().unwrap_or(Value::Null);
                 let mut ctx = JobCtx::new(&name, &reason, st.cfg.clone()).with_clock(self.inner.opts.clock.clone());
+                ctx.sched = Some(Arc::downgrade(&self.inner));
                 if let Some(f) = &self.inner.opts.should_defer {
                     ctx = ctx.with_defer(f.clone(), self.inner.opts.defer_poll);
                 }
@@ -607,15 +728,28 @@ impl Scheduler {
     }
 
     /// 給 `/api/jobs`：`{ running, queue, state, config }`（同 2.x），另外多一個 `nextRun`（各工作下次排定時間，Unix 毫秒）
+    /// 與 `detail`（有自己進度的工作，例如 `tw-ip`）
     pub fn status(&self) -> Value {
         let now = self.inner.opts.clock.now_ms();
         let st = self.inner.st.lock().unwrap();
         let cfg = Self::jobs_cfg(&st.cfg);
         let next: Map<String, Value> = cfg
             .iter()
-            .map(|(n, c)| (n.clone(), next_run(c, now).map(Value::from).unwrap_or(Value::Null)))
+            .map(|(n, c)| {
+                let t = next_run_seeded(c, now, seed_in(&st.state, n));
+                (n.clone(), t.map(Value::from).unwrap_or(Value::Null))
+            })
+            .collect();
+        let detail: Map<String, Value> = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(n, j)| j.detail().map(|d| (n.clone(), d)))
             .collect();
         json!({
+            "detail": Value::Object(detail),
             "running": st.running.as_ref().map(|r| json!({
                 "name": r.name, "pid": std::process::id(), "startedAt": r.started_at, "reason": r.reason
             })),
@@ -637,7 +771,9 @@ impl Scheduler {
     pub fn next_run(&self, name: &str) -> Option<u64> {
         let now = self.inner.opts.clock.now_ms();
         let st = self.inner.st.lock().unwrap();
-        Self::jobs_cfg(&st.cfg).get(name).and_then(|c| next_run(c, now))
+        Self::jobs_cfg(&st.cfg)
+            .get(name)
+            .and_then(|c| next_run_seeded(c, now, seed_in(&st.state, name)))
     }
 
     /// 有工作在跑或在排隊

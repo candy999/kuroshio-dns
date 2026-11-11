@@ -113,9 +113,41 @@ pub async fn get(url: &str, prev: &Validators, max: u64, timeout: Duration, on_c
         timeout,
         false,
         None,
+        None,
         on_chunk,
     )
     .await
+}
+
+/// `get_status` 的結果：狀態碼與 `Retry-After`（429 / 503 時才有意義）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    pub code: u16,
+    pub retry_after: Option<String>,
+}
+
+/// 同 `get`，但不是 200 也不當成錯誤：回傳狀態碼與 `Retry-After`（只有 200 的內容會交給 `on_chunk`）。
+/// 背景工作要自己處理 429（照對方要求的時間再試）時用
+pub async fn get_status(
+    url: &str,
+    headers: &[(String, String)],
+    max: u64,
+    timeout: Duration,
+    on_chunk: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<Status> {
+    let mut st = Status {
+        code: 0,
+        retry_after: None,
+    };
+    let r = Request {
+        method: "GET",
+        headers: headers.to_vec(),
+        body: None,
+    };
+    if let Outcome::Done { status, .. } = stream(url, &r, &Validators::default(), max, timeout, true, None, Some(&mut st), on_chunk).await? {
+        st.code = status;
+    }
+    Ok(st)
 }
 
 /// 送出請求並把整個回應讀進記憶體（API 用，回應小）；任何狀態碼都回傳
@@ -127,7 +159,7 @@ pub async fn request(url: &str, req: &Request<'_>, max: u64, timeout: Duration) 
 /// 多出口（多網卡、多條對外線路）時，用來偵測每個出口各自的公網 IP。
 pub async fn request_from(url: &str, req: &Request<'_>, max: u64, timeout: Duration, from: Option<&LocalBind>) -> Result<(u16, Vec<u8>)> {
     let mut body = Vec::new();
-    match stream(url, req, &Validators::default(), max, timeout, true, from, |c| {
+    match stream(url, req, &Validators::default(), max, timeout, true, from, None, |c| {
         body.extend_from_slice(c);
         Ok(())
     })
@@ -147,6 +179,7 @@ async fn stream(
     timeout: Duration,
     any_status: bool,
     from: Option<&LocalBind>,
+    mut early: Option<&mut Status>,
     mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<Outcome> {
     let mut url = url.to_string();
@@ -218,6 +251,17 @@ async fn stream(
             }
             304 => return Ok(Outcome::NotModified),
             200 => {}
+            // `get_status`：不是 200 就不讀內容，把狀態碼與 Retry-After 交回去
+            _ if early.is_some() => {
+                if let Some(st) = early.as_deref_mut() {
+                    st.retry_after = header("retry-after");
+                }
+                return Ok(Outcome::Done {
+                    status,
+                    bytes: 0,
+                    validators: Validators::default(),
+                });
+            }
             _ if any_status => {}
             _ => bail!("HTTP {status}"),
         }
