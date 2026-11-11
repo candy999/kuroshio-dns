@@ -80,9 +80,9 @@ const STATUS = {
     version: '3.0.0-alpha.2', stats: { uptimeSec: 3700, today: { date: '2026-11-11', query: 1234, hit: 900, hitRate: 72.9, blocked: 50, blockedAds: 40, blockedTelemetry: 8, blockedMalware: 2, route: {}, latency: { hit: { p50: 1, p95: 2 }, miss: { p50: 20, p95: 80 } } } },
     cacheEntries: 800, cacheBytes: 300000, errors: { count: 0, recent: [] }, ownIp: null,
     upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ok: 100, fail: 1, avgMs: 12 }], autoUpstreams: null,
-    filter: { lists: 100000, custom: 3, domains: 90000, memoryBytes: 4000000 }, cdn: { stats: {}, domains: 10 },
+    filter: { lists: 100000, custom: 3, domains: 90000, memoryBytes: 4000000, notice: '記憶體不足，暫時停用：大廣告 清單（3000 條規則）', unloaded: [{ name: '大廣告', rules: 3000, bytes: 27000, reason: 'memory', at: 1793000000000 }] }, cdn: { stats: {}, domains: 10 },
     jobs: { config: { 'dns-benchmark': { at: ['04:10'] } }, state: {}, running: null },
-    system: { tier: 'small', memTotalMB: 256, cores: 2, arch: 'mipsel', rssKB: 20000, memAvailableMB: 120, persist: { bytesToday: 2048, storage: 'flash', intervalMin: 360, effectiveIntervalMin: 720, maxAgeHours: 24, oldestUnsavedSec: 5400, forcedByAge: 1, estimatedDailyBytes: 1200000, lowSpace: false } },
+    system: { tier: 'small', memTotalMB: 256, cores: 2, arch: 'mipsel', rssKB: 20000, memAvailableMB: 120, memory: { enabled: true, state: 'critical', stateLabel: '不足', rssKB: 30000, budgetKB: 24576, shed: [{ step: 'cache', label: '縮小 DNS 快取', detail: '4000 → 1000 筆', freedBytes: 900000, at: 1793000000000 }], freedBytes: 900000, events: [] }, persist: { bytesToday: 2048, storage: 'flash', intervalMin: 360, effectiveIntervalMin: 720, maxAgeHours: 24, oldestUnsavedSec: 5400, forcedByAge: 1, estimatedDailyBytes: 1200000, lowSpace: false } },
     listeners: { doh: 8443, doh3: null, dot: 853, doq: null, ddr: true },
     listenersDetail: [
         { proto: 'dot', bind: '0.0.0.0', port: 853, ok: true, tls: true, error: null },

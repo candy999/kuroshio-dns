@@ -150,3 +150,127 @@ async fn missing_custom_file_gets_defaults() {
     assert!(f.stats()["custom"].as_u64().unwrap() > 100, "預設自訂規則已載入");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// 依路徑回不同內容的清單伺服器；`down` = true 時全部回 503（模擬下載失敗）
+async fn lists_by_path(lists: Vec<(&'static str, String)>, down: std::sync::Arc<std::sync::atomic::AtomicBool>) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let lists = std::sync::Arc::new(lists);
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            let (lists, down) = (lists.clone(), down.clone());
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = lists.iter().find(|(p, _)| path == format!("/{p}")).map(|x| x.1.clone());
+                let resp = match body {
+                    Some(b) if !down.load(std::sync::atomic::Ordering::Relaxed) => {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{b}", b.len())
+                    }
+                    _ => "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n".to_string(),
+                };
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+fn many(prefix: &str, n: usize) -> String {
+    (0..n).map(|i| format!("||{prefix}{i}.example^\n")).collect()
+}
+
+/// 記憶體控制（規格 09）：清單停用順序、保護清單絕不停用、恢復順序、下載失敗保留舊的、預算放不下的不載入
+#[tokio::test]
+async fn memory_shedding_of_lists() {
+    use kuroshio::resolver::FilterCheck;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let down = std::sync::Arc::new(AtomicBool::new(false));
+    let srv = lists_by_path(
+        vec![
+            ("tw165.txt", many("scam", 50)),
+            ("ads-big.txt", many("big", 3000)),
+            ("ads-hot.txt", many("hot", 500)),
+            ("tele.txt", many("tele", 200)),
+            ("ads-protected.txt", many("keep", 100)),
+        ],
+        down.clone(),
+    )
+    .await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-memshed-{}", std::process::id()));
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "反詐騙", "url": format!("http://{srv}/tw165.txt"), "category": "malware" },
+        { "name": "大廣告", "url": format!("http://{srv}/ads-big.txt"), "category": "ads" },
+        { "name": "常用廣告", "url": format!("http://{srv}/ads-hot.txt"), "category": "ads" },
+        { "name": "遙測", "url": format!("http://{srv}/tele.txt"), "category": "telemetry" },
+        { "name": "保護廣告", "url": format!("http://{srv}/ads-protected.txt"), "category": "ads", "protect": true },
+    ] } }));
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    assert!(f.update_lists(true).await.unwrap());
+    assert!(f.check("hot1.example", 1).unwrap().block);
+    // 「常用廣告」常常命中：同樣是廣告，先停用「大廣告」
+    for _ in 0..20 {
+        f.check("hot1.example", 1);
+    }
+    let before = f.lists_bytes();
+    let u = f.unload_one().await.unwrap().unwrap();
+    assert_eq!((u.name.as_str(), u.rules), ("大廣告", 3000));
+    assert!(u.bytes > 3000 * 8, "實測釋出：{}", u.bytes);
+    assert!(f.lists_bytes() < before);
+    assert!(f.check("big1.example", 1).is_none(), "停用中");
+    assert!(f.check("scam1.example", 1).unwrap().block, "其他照常");
+    let st = f.stats();
+    assert_eq!(st["unloaded"][0]["name"], "大廣告");
+    assert_eq!(st["notice"], "記憶體不足，暫時停用：大廣告 清單（3000 條規則）");
+    assert_eq!(st["sources"][1]["status"], "unloaded");
+    assert_eq!(st["sources"][0]["protect"], true);
+    assert_eq!(st["sources"][2]["hits"], 21);
+    // 接下來：常用廣告 → 遙測；反詐騙（惡意，預設保護）與標成保護的清單永遠不停用
+    assert_eq!(f.unload_one().await.unwrap().unwrap().name, "常用廣告");
+    assert_eq!(f.unload_one().await.unwrap().unwrap().name, "遙測");
+    assert!(f.unload_one().await.unwrap().is_none(), "只剩保護清單");
+    assert!(f.check("scam1.example", 1).unwrap().block);
+    assert!(f.check("keep1.example", 1).unwrap().block);
+    // 恢復：最後停用的先恢復；下載失敗時維持停用（舊的過濾器照常）
+    down.store(true, Ordering::Relaxed);
+    assert!(f.restore_one().await.is_err());
+    assert_eq!(f.unloaded().len(), 3);
+    assert!(f.check("scam1.example", 1).unwrap().block, "下載失敗保留舊的");
+    down.store(false, Ordering::Relaxed);
+    assert_eq!(f.restore_one().await.unwrap().unwrap().name, "遙測");
+    assert_eq!(f.restore_one().await.unwrap().unwrap().name, "常用廣告");
+    assert_eq!(f.restore_one().await.unwrap().unwrap().name, "大廣告");
+    assert!(f.restore_one().await.unwrap().is_none());
+    assert!(f.check("big1.example", 1).unwrap().block);
+    assert_eq!(f.stats()["notice"], serde_json::Value::Null);
+    // 命中次數保存 / 讀回（依名稱）
+    let saved = f.hits_json();
+    let f2 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f2.restore_hits(&saved);
+    assert_eq!(f2.hits_json(), saved);
+
+    // 預算：沒量過大小時用 maxDomains 擋（超過的清單整份不載入）；量過之後依停用順序先不載入（看得到原因）
+    let f3 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f3.set_allowance(std::sync::Arc::new(|| Some(1000 * kuroshio::filtering::BYTES_PER_DOMAIN)));
+    f3.update_lists(true).await.unwrap();
+    let st = f3.stats();
+    assert_eq!(st["sources"][0]["status"], "loaded", "反詐騙在前面、放得下");
+    assert_eq!(st["sources"][1]["status"], "overBudget", "放不下的不載入");
+    assert!(f3.lists_bytes() < 2000 * 16);
+    let f4 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f4.update_lists(true).await.unwrap();
+    let full = f4.lists_bytes();
+    let limit = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+    let l2 = limit.clone();
+    f4.set_allowance(std::sync::Arc::new(move || Some(u64::from(l2.load(Ordering::Relaxed)))));
+    limit.store((full / 2) as u32, Ordering::Relaxed);
+    f4.update_lists(true).await.unwrap();
+    let st = f4.stats();
+    assert_eq!(st["unloaded"][0]["name"], "大廣告");
+    assert_eq!(st["unloaded"][0]["reason"], "budget");
+    assert!(f4.lists_bytes() <= full / 2, "{} / {full}", f4.lists_bytes());
+    assert!(f4.check("scam1.example", 1).unwrap().block);
+}

@@ -57,6 +57,14 @@ return view.extend({
 		o.value('telemetry', _('遙測 / 驗證'));
 		o.value('malware', _('惡意 / 詐騙'));
 		o.default = 'ads';
+		if (pro) {
+			o = s.option(form.ListValue, 'protect', _('保護'),
+				_('記憶體不足時也不暫時停用。自動 = 惡意 / 詐騙類保護（例如 165 反詐騙），其他不保護。'));
+			o.value('', _('自動'));
+			o.value('1', _('保護'));
+			o.value('0', _('不保護'));
+			o.optional = true;
+		}
 
 		// ---------------- 自訂規則 ----------------
 		s = m.section(form.NamedSection, 'filter', 'filter', _('自訂規則'),

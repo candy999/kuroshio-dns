@@ -238,6 +238,15 @@ return view.extend({
 				_('寫入後至少留下這麼多可用空間；不夠時先刪日誌與可以重建的資料，核心資料（CDN 驗證紀錄、節點、社群身分、設定）絕不自動刪除。空白或 0 = 自動。'));
 			o.datatype = 'uinteger';
 			o.placeholder = '0';
+			o = ss.option(form.Flag, 'memory_governor', _('記憶體控制'),
+				_('記憶體吃緊時依序縮小診斷緩衝、DNS 快取，把 CDN 冷資料移出記憶體（磁碟保留）；記憶體不足時最後才暫時停用優先順序最低的過濾清單（自訂規則與保護清單不停用），寬裕後自動恢復。狀態頁看得到釋出了什麼。'));
+			o.default = '1';
+			o.rmempty = false;
+			o = ss.option(form.Value, 'memory_budget_mb', _('記憶體預算（MB）'),
+				_('黑潮 DNS 自己最多用多少記憶體；超過就開始釋出。空白或 0 = 依等級自動（tiny 24、small 48、standard 128 MB）。'));
+			o.datatype = 'uinteger';
+			o.placeholder = '0';
+			o.depends('memory_governor', '1');
 		}
 
 		o = s.option(form.Flag, 'listen_ipv6', _('同時處理 IPv6'),

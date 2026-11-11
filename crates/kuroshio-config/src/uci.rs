@@ -427,7 +427,12 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
                 let cat = if cat == "malware" || cat == "telemetry" { cat } else { "ads" };
                 let url = l["url"].as_str().unwrap();
                 let name = l.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(url);
-                json!({ "url": url, "category": cat, "name": name })
+                let mut o = json!({ "url": url, "category": cat, "name": name });
+                // 保護清單（記憶體不足也不停用）：沒寫時由分類決定（惡意 / 反詐騙是）
+                if let Some(p) = l.get("protect") {
+                    o["protect"] = json!(truthy(p));
+                }
+                o
             })
             .collect();
         filter.insert("lists".into(), Value::Array(ls));
@@ -612,6 +617,7 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
             sec(name),
             &[
                 ("min_free_kb", Some("minFreeKB")),
+                ("memory_budget_mb", Some("memoryBudgetMB")),
                 ("flash_write_budget_kb", Some("flashWriteBudgetKB")),
             ],
         );

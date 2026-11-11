@@ -95,14 +95,15 @@ return view.extend({
 		]);
 
 		// 硬體與效能（3.0）
-		var sys = api.system || {}, per = sys.persist || {}, lat = d.latency || {}, ls = api.listeners || {};
+		var sys = api.system || {}, per = sys.persist || {}, lat = d.latency || {}, ls = api.listeners || {}, mem = sys.memory || {};
 		var ms = function(x) { return x && x.p50 != null ? x.p50 + ' / ' + (x.p95 != null ? x.p95 : '>1000') + ' ms' : '-'; };
 		var protos = ['doh', 'doh3', 'dot', 'doq'].filter(function(k) { return ls[k]; }).map(function(k) { return { doh: 'DoH', doh3: 'DoH3', dot: 'DoT', doq: 'DoQ' }[k] + ':' + ls[k]; });
 		var hw = E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('硬體與效能')),
 			E('div', { 'style': 'display:flex;gap:.6em;flex-wrap:wrap' }, [
 				tile(_('硬體等級'), sys.tier || '-', (sys.memTotalMB ? sys.memTotalMB + ' MB · ' : '') + (sys.cores || '?') + _(' 核 ') + (sys.arch || '')),
-				tile(_('記憶體'), sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', _('可用 ') + (sys.memAvailableMB != null ? sys.memAvailableMB + ' MB' : '-') + (sys.pressure && sys.pressure !== 'normal' ? ' · ' + _('記憶體偏低') : '')),
+				tile(_('記憶體'), sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', _('可用 ') + (sys.memAvailableMB != null ? sys.memAvailableMB + ' MB' : '-') +
+					(mem.enabled ? _(' · 預算 %s MB · %s').format((mem.budgetKB / 1024).toFixed(0), mem.stateLabel || mem.state) : (sys.pressure && sys.pressure !== 'normal' ? ' · ' + _('記憶體偏低') : ''))),
 				tile(_('快取命中率'), d.hitRate != null ? d.hitRate + '%' : '-', _('預取 %s · 斷線回舊資料 %s').format(fmtNum(d.prefetch), fmtNum(d.stale))),
 				tile(_('回應時間 p50 / p95'), ms(lat.hit), _('問上游 ') + ms(lat.miss)),
 				tile(_('Flash 寫入（今天）'), per.bytesToday != null ? (per.bytesToday / 1024).toFixed(0) + ' KB' : '-', (per.storage || '') + _(' · 間隔 ') + (per.effectiveIntervalMin != null ? per.effectiveIntervalMin : (per.intervalMin || '-')) + _(' 分') +
@@ -113,6 +114,18 @@ return view.extend({
 				tile(_('過濾記憶體'), api.filter && api.filter.memoryBytes != null ? (api.filter.memoryBytes / 1048576).toFixed(1) + ' MB' : '-', api.filter && api.filter.domains != null ? fmtNum(api.filter.domains) + _(' 個網域') : '')
 			])
 		]);
+
+		// 記憶體控制（規格 09）：釋出中的項目、停用中的過濾清單（停用期間少了這些保護，要明顯）
+		var shed = mem.shed || [], fl = api.filter || {};
+		var memSec = (shed.length || fl.notice) ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-memory' }, [
+			E('h3', {}, _('記憶體控制')),
+			fl.notice ? E('div', { 'class': 'alert-message warning' }, fl.notice) : '',
+			E('p', {}, _('目前：%s（常駐 %s MB / 預算 %s MB）').format(mem.stateLabel || mem.state || '-', mem.rssKB != null ? (mem.rssKB / 1024).toFixed(1) : '-', mem.budgetKB != null ? (mem.budgetKB / 1024).toFixed(0) : '-') +
+				(mem.waiting ? ' · ' + mem.waiting : '')),
+			shed.length ? table([_('已釋出'), _('內容'), _('約'), _('時間')], shed.map(function(x) {
+				return [x.label, x.detail || '', (x.freedBytes / 1024).toFixed(0) + ' KB', fmtTime(x.at)];
+			})) : ''
+		]) : '';
 
 		// 連線來源限制（規格 08）：模式、拒絕次數、資料日期；資料讀不到時不擋，要明顯提醒
 		var ac = api.access;
@@ -182,7 +195,7 @@ return view.extend({
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at) + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
-		return E([], [head, tiles, hw, accSec, lsSec, upSec, jobSec, infoSec, actions, errSec]);
+		return E([], [head, tiles, hw, memSec, accSec, lsSec, upSec, jobSec, infoSec, actions, errSec]);
 	},
 
 	render: function(data) {

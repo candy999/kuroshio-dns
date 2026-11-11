@@ -209,6 +209,24 @@ fn tier_still_applies_and_user_wins() {
     );
     assert_eq!(g(&ps, "system.persistMaxAgeHours"), &json!(6));
     assert_eq!(g(&ps, "system.minFreeKB"), &json!(2048));
+    // 記憶體控制（規格 09）：預算（MB）、開關；清單的保護旗標
+    let mg = overrides(
+        &parse_text(
+            &(default_text()
+                + "\nconfig system 'system'\n\toption memory_budget_mb '40'\n\toption memory_governor '0'\n\nconfig filter_list\n\toption url 'https://lists.example.com/a.txt'\n\toption category 'ads'\n\toption protect '1'\n"),
+        )
+        .unwrap(),
+        &env(),
+    );
+    assert_eq!(g(&mg, "system.memoryBudgetMB"), &json!(40));
+    assert_eq!(g(&mg, "system.memoryGovernor"), &json!(false));
+    let lists = g(&mg, "filter.lists").as_array().unwrap();
+    let a = lists.iter().find(|l| l["url"] == "https://lists.example.com/a.txt").unwrap();
+    assert_eq!(a["protect"], json!(true));
+    assert!(
+        lists.iter().filter(|l| l["url"] != a["url"]).all(|l| l.get("protect").is_none()),
+        "沒寫就不帶（由分類決定）"
+    );
     let dd = overrides(
         &parse_text(&default_text().replace("option data_dir ''", "option data_dir '/mnt/usb/kuroshio'")).unwrap(),
         &env(),
