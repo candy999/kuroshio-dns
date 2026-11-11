@@ -56,6 +56,10 @@ base64 = "0.22"
 # 只依賴 libc / windows-sys（本來就在相依樹裡）
 if-addrs = "0.15"
 
+[target.'cfg(unix)'.dependencies]
+# 狀態目錄所在檔案系統的可用空間（statvfs）；libc 本來就在相依樹裡
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 # PEM 憑證轉成 PFX 匯入 Windows 憑證存放區（IIS 用）；純 Rust、很小，只有 Windows 版會編進去
@@ -66,6 +70,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Networking_HttpServer",
   "Win32_Networking_WinSock",
   "Win32_Security",
+  "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Registry",
 ] }

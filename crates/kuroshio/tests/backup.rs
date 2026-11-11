@@ -60,8 +60,9 @@ async fn req_json(addr: std::net::SocketAddr, method: &str, target: &str) -> Val
     serde_json::from_slice(&b).unwrap()
 }
 
-fn read_json(p: &Path) -> Value {
-    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+/// 整個網域資料庫（分片或舊版單一檔案）
+fn store_json(state: &Path) -> Value {
+    serde_json::from_slice(&kuroshio_cdn::db::read_store_json(state).unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -86,7 +87,7 @@ async fn export_import_through_running_service() {
     // 記憶體裡的變動（還沒寫到磁碟）
     let r = post_json(admin, "/api/cdn/policy?name=a.example&policy=always").await;
     assert_eq!(r["policy"], "always", "{r}");
-    assert!(!String::from_utf8_lossy(&std::fs::read(state.join("cdn-domains.json")).unwrap()).contains("always"));
+    assert!(!String::from_utf8_lossy(&kuroshio_cdn::db::read_store_json(&state).unwrap()).contains("always"));
 
     // 匯出分享檔：先寫出記憶體，檔名、型態對；不含次數與手動設定
     let (code, head, body) = http(admin, "GET", "/api/backup/export?kind=share", &[], b"").await;
@@ -107,9 +108,13 @@ async fn export_import_through_running_service() {
         "分享檔不含上游評測與黑名單"
     );
     assert_eq!(
-        read_json(&state.join("cdn-domains.json"))["domains"][0]["policy"],
+        store_json(&state)["domains"][0]["policy"],
         "always",
         "匯出前把記憶體裡的狀態寫出"
+    );
+    assert!(
+        !state.join("cdn-domains.json").exists() && state.join("cdn/domains/manifest.json").exists(),
+        "舊版單一檔案搬進分片（壓縮）後刪掉"
     );
 
     // 完整備份：有次數

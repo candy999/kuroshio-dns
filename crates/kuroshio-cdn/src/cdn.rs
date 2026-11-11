@@ -233,7 +233,7 @@ impl Cdn {
         let seed_ok = paths.seed_dir.join("meta.json").exists();
         let seed = |name: &str| -> Option<Vec<u8>> {
             if seed_ok {
-                std::fs::read(paths.seed_dir.join(name)).ok()
+                crate::statefile::read(&paths.seed_dir.join(name))
             } else {
                 None
             }

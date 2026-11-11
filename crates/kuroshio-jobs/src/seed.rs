@@ -24,6 +24,9 @@ pub struct SeedSpec {
     pub empty: fn(&Value) -> bool,
     /// 匯入前的轉換（參數：資料、現在的 Unix 毫秒）
     pub transform: Option<fn(&mut Value, u64)>,
+    /// state 裡另外這些檔存在就算「已經有資料」（新格式：壓縮檔、CDN 網域分片清單）。
+    /// `state` 本身的 `.zst` 一律也算
+    pub present: &'static [&'static str],
 }
 
 fn arr_len(v: Option<&Value>) -> usize {
@@ -69,6 +72,7 @@ pub const SEEDS: [SeedSpec; 4] = [
         label: "上游評測結果",
         empty: upstreams_empty,
         transform: None,
+        present: &[],
     },
     SeedSpec {
         seed: "cdn-pools.json",
@@ -76,6 +80,7 @@ pub const SEEDS: [SeedSpec; 4] = [
         label: "台灣節點池",
         empty: pools_empty,
         transform: None,
+        present: &[],
     },
     SeedSpec {
         seed: "v6-nodes.json",
@@ -83,6 +88,7 @@ pub const SEEDS: [SeedSpec; 4] = [
         label: "永久 IPv6 節點",
         empty: v6_empty,
         transform: None,
+        present: &[],
     },
     SeedSpec {
         seed: "cdn-domains.json",
@@ -90,6 +96,7 @@ pub const SEEDS: [SeedSpec; 4] = [
         label: "CDN 網域驗證紀錄",
         empty: domains_empty,
         transform: Some(touch_domains),
+        present: &["cdn/domains/manifest.json"],
     },
 ];
 
@@ -108,6 +115,12 @@ pub fn apply_seeds_with(state_dir: &Path, seed_dir: &Path, specs: &[SeedSpec], c
         let src = seed_dir.join(s.seed);
         let dst = state_dir.join(s.state);
         if !src.exists() || !(s.empty)(&read_json(&dst).unwrap_or(Value::Null)) {
+            continue;
+        }
+        // 新格式（壓縮檔、分片）已經有資料：不要用種子蓋過去
+        let mut zst = dst.clone().into_os_string();
+        zst.push(".zst");
+        if std::path::Path::new(&zst).exists() || s.present.iter().any(|p| state_dir.join(p).exists()) {
             continue;
         }
         let Some(mut data) = read_json(&src) else {

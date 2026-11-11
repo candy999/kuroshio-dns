@@ -20,6 +20,7 @@
 //! - 上游評測結果、黑名單：不匯入。上游 DNS 能決定所有答案，只能由本機自己評測；別人的黑名單可以把好的上游全部排除。
 
 use crate::persist::write_atomic;
+use kuroshio_cdn::statefile;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use kuroshio_config::get;
@@ -164,7 +165,7 @@ impl Data {
 
 /// 檔案依副檔名決定存法：.json → json（解析不了就略過）、.txt / .pem → text、其他 → b64
 fn read_data(path: &Path, key: &str) -> Option<Data> {
-    let b = std::fs::read(path).ok()?;
+    let b = statefile::read(path)?;
     if key.ends_with(".json") {
         match serde_json::from_slice(&b) {
             Ok(v) => Some(Data::Json(v)),
@@ -335,7 +336,13 @@ pub fn export(loc: &Locations, kind: Kind) -> Bundle {
     };
     for key in list {
         let Some(path) = loc.path_of(key) else { continue };
-        let Some(mut d) = read_data(&path, key) else { continue };
+        let d = if *key == DOMAINS {
+            // 網域資料庫分成好幾片：組回 2.x 的單一檔案格式（備份檔格式不變）
+            read_domains(&loc.state).map(Data::Json)
+        } else {
+            read_data(&path, key)
+        };
+        let Some(mut d) = d else { continue };
         if kind == Kind::Share && *key == DOMAINS {
             if let Data::Json(v) = &mut d {
                 strip_domains(v);
@@ -538,12 +545,29 @@ impl Item {
     }
 }
 
+/// 讀 JSON 狀態檔（一般或 .zst 都可以，兩份都有時用比較新的）
 fn read_json(p: &Path) -> Option<Value> {
-    std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    statefile::read(p).and_then(|b| serde_json::from_slice(&b).ok())
 }
 
+/// 整個 CDN 網域資料庫（舊版單一檔案或分片）
+fn read_domains(state: &Path) -> Option<Value> {
+    kuroshio_cdn::db::read_store_json(state).and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// 匯入合併後的網域資料庫寫成單一檔案（服務啟動時再搬進分片）：先拿掉分片清單、寫好再刪分片
+fn write_domains(state: &Path, v: &Value) -> Result<()> {
+    kuroshio_cdn::db::retire_shards(state);
+    write_json(&state.join(DOMAINS), v)?;
+    kuroshio_cdn::db::remove_shards(state);
+    Ok(())
+}
+
+/// 寫成一般 JSON；同名的壓縮檔（內容已經合併進來）刪掉，免得載入時用到舊的那份
 fn write_json(p: &Path, v: &Value) -> Result<()> {
-    write_atomic(p, &serde_json::to_vec(v)?).with_context(|| format!("寫入 {} 失敗", p.display()))
+    write_atomic(p, &serde_json::to_vec(v)?).with_context(|| format!("寫入 {} 失敗", p.display()))?;
+    let _ = std::fs::remove_file(statefile::zst_path(p));
+    Ok(())
 }
 
 /// 網域最後一次驗證的時間（v4、v6、跨 CDN、ECS、基準）
@@ -980,10 +1004,9 @@ fn share_nodes(key: &str, v: &Value) -> Vec<(String, String)> {
 fn merge_share(loc: &Locations, b: &Bundle, now: u64, items: &mut Vec<Item>) {
     if let Some(Data::Json(inc)) = b.files.get(DOMAINS) {
         let mut it = Item::new(DOMAINS);
-        let p = loc.state.join(DOMAINS);
-        let merged = merge_share_domains(read_json(&p), inc, now, &mut it);
+        let merged = merge_share_domains(read_domains(&loc.state), inc, now, &mut it);
         if it.added > 0 {
-            if let Err(e) = write_json(&p, &merged) {
+            if let Err(e) = write_domains(&loc.state, &merged) {
                 it.error = Some(format!("{e:#}"));
             }
         }
@@ -1031,10 +1054,9 @@ pub fn merge(loc: &Locations, b: &Bundle) -> Value {
 
     if let Some(Data::Json(inc)) = b.files.get(DOMAINS) {
         let mut it = Item::new(DOMAINS);
-        let p = path(DOMAINS);
-        let merged = merge_domains(read_json(&p), inc.clone(), now, &mut it);
+        let merged = merge_domains(read_domains(&loc.state), inc.clone(), now, &mut it);
         if it.added + it.updated > 0 {
-            if let Err(e) = write_json(&p, &merged) {
+            if let Err(e) = write_domains(&loc.state, &merged) {
                 it.error = Some(format!("{e:#}"));
             }
         }
@@ -1319,6 +1341,52 @@ mod tests {
         wj(&c.join("peers.json"), json!({ "peers": [] }));
         std::fs::write(c.join("share.cbor"), [0xa0, 0xff, 0x00]).unwrap();
         loc
+    }
+
+    #[test]
+    fn new_state_formats_export_and_import() {
+        // 壓縮檔（.zst）與網域分片：匯出組回單一檔案格式；匯入寫成一般 JSON，分片作廢、等啟動時重新搬進去
+        let d = tmp("zst");
+        let st = d.join("state");
+        std::fs::create_dir_all(st.join("cdn/domains")).unwrap();
+        let pools = json!({ "providers": { "cloudflare": { "v4": [{ "ip": "104.16.0.1" }] } } });
+        std::fs::write(
+            statefile::zst_path(&st.join(POOLS)),
+            statefile::compress(&serde_json::to_vec(&pools).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(st.join(kuroshio_cdn::db::MANIFEST), br#"{"format":"kuroshio-cdn-domains","version":1,"shards":2}"#).unwrap();
+        for i in 0..2 {
+            let names: Vec<&str> = ["a.example", "b.example", "c.example", "d.example"]
+                .into_iter()
+                .filter(|n| kuroshio_cdn::db::shard_of(n, 2) == i)
+                .collect();
+            let doms: Vec<Value> = names.iter().map(|n| domain(n, 1, 3)).collect();
+            let raw = serde_json::to_vec(&json!({ "shard": i, "of": 2, "domains": doms })).unwrap();
+            std::fs::write(
+                statefile::zst_path(&st.join(kuroshio_cdn::db::shard_file(2, i))),
+                statefile::compress(&raw),
+            )
+            .unwrap();
+        }
+        let loc = Locations::in_dir(&st);
+        let b = export(&loc, Kind::Full);
+        assert_eq!(b.files[POOLS].json().unwrap(), &pools);
+        let doms = b.files[DOMAINS].json().unwrap()["domains"].as_array().unwrap().clone();
+        assert_eq!(doms.len(), 4);
+        assert_eq!(doms[0]["xFuture"], 1, "內容原樣保留");
+        // 匯入到另一台已經分片的機器
+        let mut inc = b.clone();
+        inc.files.insert(
+            DOMAINS.into(),
+            Data::Json(json!({ "domains": [domain("e.example", 5, 1)] })),
+        );
+        let r = merge(&loc, &inc);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(!st.join(kuroshio_cdn::db::SHARD_DIR).exists(), "分片作廢");
+        let after = read_domains(&st).unwrap();
+        assert_eq!(after["domains"].as_array().unwrap().len(), 5, "原本的 4 個 + 新的 1 個");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

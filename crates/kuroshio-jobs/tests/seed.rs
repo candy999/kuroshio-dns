@@ -66,6 +66,16 @@ fn seeds_fill_empty_state_only() {
     assert_eq!(d["domains"][1]["lastSeen"], 1_794_240_000_000u64);
     // 第二次：都有資料了
     assert!(apply_seeds(&state, &seed).is_empty());
+
+    // 新格式：一般 JSON 已經搬進壓縮檔 / 分片，不能被種子蓋過去
+    let state2 = tmp("dst-new");
+    std::fs::create_dir_all(state2.join("cdn/domains")).unwrap();
+    std::fs::write(state2.join("cdn/pools.json.zst"), b"zstd").unwrap();
+    std::fs::write(state2.join("cdn/domains/manifest.json"), b"{}").unwrap();
+    std::fs::write(state2.join("upstreams.json"), br#"{"selected":[{"id":"x"}]}"#).unwrap();
+    assert!(apply_seeds_with(&state2, &seed, &SEEDS, &clock).is_empty());
+    assert!(!state2.join("cdn/pools.json").exists() && !state2.join("cdn-domains.json").exists());
+    let _ = std::fs::remove_dir_all(&state2);
     let _ = std::fs::remove_dir_all(&seed);
     let _ = std::fs::remove_dir_all(&state);
 }

@@ -279,6 +279,9 @@ fn init_log_to(cfg: Option<&serde_json::Value>, file: Option<&std::path::Path>) 
         .to_string();
     let filter = tracing_subscriber::EnvFilter::try_from_env("KUROSHIO_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     if let Some(path) = file {
+        // 儲存空間不足時日誌最先刪（規格 05 第 5.6 節）
+        kuroshio::space::register(path.with_extension("log.old"), kuroshio::space::Tier::Log);
+        kuroshio::space::register(path.to_path_buf(), kuroshio::space::Tier::Log);
         if std::fs::metadata(path).map(|m| m.len() > 5 << 20).unwrap_or(false) {
             let _ = std::fs::rename(path, path.with_extension("log.old"));
         }

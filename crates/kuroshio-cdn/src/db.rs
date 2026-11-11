@@ -473,6 +473,90 @@ pub fn shards_for(max_entries: usize) -> usize {
     total.div_ceil(SHARD_TARGET_BYTES).clamp(1, MAX_SHARDS).next_power_of_two()
 }
 
+/// 整個網域資料庫（舊版單一檔案、分片）組成 2.x 格式的單一 JSON（備份匯出、匯入合併時用）；什麼都沒有時 None
+/// 內容原樣保留（不經過 `Domain` 轉換，不會多出預設欄位）；選哪些分片的規則同 `Db::load_store`
+pub fn read_store_json(state_dir: &std::path::Path) -> Option<Vec<u8>> {
+    let read = |rel: &str| crate::statefile::read(&state_dir.join(rel));
+    let legacy_bytes = read(FILE);
+    let mut top: serde_json::Map<String, Value> = legacy_bytes
+        .as_deref()
+        .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+        .and_then(|v| match v {
+            Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let legacy = !top.is_empty();
+    let manifest = read(MANIFEST)
+        .and_then(|b| serde_json::from_slice::<ManifestFmt>(&b).ok())
+        .filter(|m| (1..=MAX_SHARDS).contains(&m.shards) && m.shards.is_power_of_two());
+    let n = match &manifest {
+        Some(m) => Some(m.shards),
+        None if !legacy => {
+            let names: Vec<String> = std::fs::read_dir(state_dir.join(SHARD_DIR))
+                .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+                .unwrap_or_default();
+            rescue_shards(&names)
+        }
+        None => None,
+    };
+    let Some(n) = n else {
+        // 只有舊版單一檔案（或什麼都沒有）：原樣
+        return legacy_bytes.filter(|_| legacy);
+    };
+    let mut list: Vec<Value> = match top.remove("domains") {
+        Some(Value::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    if let Some(m) = manifest {
+        if !legacy {
+            for (k, v) in m.extra.0.map(|b| *b).unwrap_or_default() {
+                top.insert(k, v);
+            }
+        }
+    }
+    for i in 0..n {
+        let Some(Ok(Value::Object(mut s))) = read(&shard_file(n, i)).map(|b| serde_json::from_slice::<Value>(&b)) else {
+            continue;
+        };
+        if legacy {
+            list.retain(|d| d.get("name").and_then(Value::as_str).is_none_or(|k| shard_of(k, n) != i));
+        }
+        if let Some(Value::Array(a)) = s.remove("domains") {
+            list.extend(a);
+        }
+    }
+    top.insert("domains".into(), Value::Array(list));
+    serde_json::to_vec(&top).ok()
+}
+
+/// 沒有分片清單時：目錄裡檔案最多的一組分片
+fn rescue_shards(names: &[String]) -> Option<usize> {
+    let mut count: HashMap<usize, usize> = HashMap::new();
+    for f in names {
+        let f = f.trim_end_matches(".zst");
+        if let Some((a, _)) = f.strip_suffix(".json").and_then(|x| x.split_once('-')) {
+            if let Ok(n) = a.parse::<usize>() {
+                if (1..=MAX_SHARDS).contains(&n) && n.is_power_of_two() {
+                    *count.entry(n).or_default() += 1;
+                }
+            }
+        }
+    }
+    count.into_iter().max_by_key(|(n, c)| (*c, *n)).map(|(n, _)| n)
+}
+
+/// 備份匯入寫出舊版單一檔案之前呼叫：拿掉分片清單與分片，下次啟動時從單一檔案重新搬進分片
+/// （先刪清單：中途斷電時，啟動只會看到單一檔案，或還沒刪完的分片與單一檔案——以單一檔案為準）
+pub fn retire_shards(state_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(state_dir.join(MANIFEST));
+}
+
+/// 單一檔案寫好之後：刪掉舊的分片
+pub fn remove_shards(state_dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(state_dir.join(SHARD_DIR));
+}
+
 /// 分片的變動程度
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Mark {
@@ -612,20 +696,7 @@ impl Db {
         let n = match &manifest {
             Some(m) => Some(m.shards),
             // 沒有清單（或壞掉）而且沒有舊檔：用目錄裡檔案最多的一組分片（救援）
-            None if !out.legacy => {
-                let mut count: HashMap<usize, usize> = HashMap::new();
-                for f in list_dir() {
-                    let f = f.trim_end_matches(".zst");
-                    if let Some((a, _)) = f.strip_suffix(".json").and_then(|x| x.split_once('-')) {
-                        if let Ok(n) = a.parse::<usize>() {
-                            if (1..=MAX_SHARDS).contains(&n) && n.is_power_of_two() {
-                                *count.entry(n).or_default() += 1;
-                            }
-                        }
-                    }
-                }
-                count.into_iter().max_by_key(|(n, c)| (*c, *n)).map(|(n, _)| n)
-            }
+            None if !out.legacy => rescue_shards(&list_dir()),
             None => None,
         };
         if let Some(m) = manifest {

@@ -26,6 +26,7 @@ pub mod presence;
 pub mod resolver;
 pub mod server;
 pub mod site;
+pub mod space;
 pub mod stats;
 pub mod sysinfo;
 pub mod upstreams;

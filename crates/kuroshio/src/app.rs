@@ -2,7 +2,7 @@
 
 use crate::acl::Acl;
 use crate::iprank::IpRank;
-use crate::persist::{Persister, Policy, Snapshot};
+use crate::persist::{Mem, Opts, Persister, Policy, Snapshot};
 use crate::resolver::{LocalForward, Params, Resolver};
 use crate::server::Server;
 use crate::sysinfo::{self, Pressure, StorageClass, SysInfo};
@@ -959,8 +959,8 @@ impl AppState {
     pub fn system_json(&self) -> Value {
         let (total, avail) = sysinfo::meminfo();
         let p = self.persister.lock().unwrap();
-        let st = p.stats();
-        let pol = p.policy();
+        let mut persist = p.status_json(crate::persist::now_secs());
+        persist["dir"] = json!(self.persist_dir);
         json!({
             "tier": self.tier.name(),
             "memTotalMB": total.or(self.info.mem_total_mb),
@@ -970,11 +970,7 @@ impl AppState {
             "cores": self.info.cores,
             "arch": self.info.arch,
             "aes": self.info.aes,
-            "persist": {
-                "dir": self.persist_dir, "storage": pol.class.name(),
-                "intervalMin": pol.min_interval / 60, "dailyBudgetKB": pol.daily_budget / 1024,
-                "bytesToday": st.bytes_today, "writesToday": st.writes_today, "deferred": st.deferred, "pending": st.pending,
-            },
+            "persist": persist,
         })
     }
 }
@@ -1113,6 +1109,16 @@ pub fn persist_policy(cfg: &Value, tiny: bool) -> Policy {
         n("system.flashWriteBudgetKB").max(64),
         tiny,
     )
+    .with_max_age_hours(n("system.persistMaxAgeHours"))
+    .with_min_free_kb(n("system.minFreeKB"))
+}
+
+/// 快照寫入器：依設定建立，CDN 的檔壓縮
+pub fn new_persister(cfg: &Value, tiny: bool) -> Persister {
+    let mut p = Persister::new(persist_dir(cfg), persist_policy(cfg, tiny));
+    p.set_compress(compressed_file);
+    p.set_mem(mem_now());
+    p
 }
 
 fn spawn_watchdog() {
@@ -1137,24 +1143,46 @@ fn spawn_watchdog() {
 }
 
 /// 會產生快照的模組（CDN、社群）：只在要寫的時候才序列化，有變動的才給
-pub type SnapSource = Arc<dyn Fn() -> Vec<(String, Snapshot)> + Send + Sync>;
+pub type SnapSource = Arc<dyn Fn() -> Vec<(String, Snapshot, Opts)> + Send + Sync>;
 
 /// 一般模組：整份內容
 fn bytes_source(f: impl Fn() -> Vec<(String, Vec<u8>)> + Send + Sync + 'static) -> SnapSource {
-    Arc::new(move || f().into_iter().map(|(n, b)| (n, Snapshot::Bytes(b))).collect())
+    Arc::new(move || f().into_iter().map(|(n, b)| (n, Snapshot::Bytes(b), Opts::default())).collect())
 }
 
-/// CDN：網域資料庫很大（tiny 等級上限也有幾 MB），不先整份序列化放在記憶體裡等寫入間隔，
-/// 要寫的那一刻才邊序列化邊寫進檔案
+/// 哪些狀態檔壓縮成 `.zst`：CDN 的檔（網域分片、節點池、IPv6 節點、候選 IP、網段分類）。
+/// 分片清單很小、方便人看，維持一般 JSON
+pub fn compressed_file(name: &str) -> bool {
+    name.starts_with("cdn/") && name != kuroshio_cdn::db::MANIFEST
+}
+
+/// CDN：網域資料庫分片寫（規格 05 第 5.3 節）。只登記有變動的分片，內容要寫的那一刻才邊序列化邊寫進檔案；
+/// 只有計數變動的分片標成 `lazy`（不單獨觸發寫入，最久未存上限到了才寫）。分片清單等分片都寫好才寫
 fn cdn_source(c: Arc<kuroshio_cdn::Cdn>) -> SnapSource {
     Arc::new(move || {
-        let (small, db_dirty) = c.snapshots_stream(false);
-        let mut v: Vec<(String, Snapshot)> = small.into_iter().map(|(n, b)| (n, Snapshot::Bytes(b))).collect();
-        if db_dirty {
+        let (small, ch) = c.snapshots_sharded(false);
+        let mut v: Vec<(String, Snapshot, Opts)> = small.into_iter().map(|(n, b)| (n, Snapshot::Bytes(b), Opts::default())).collect();
+        let n = ch.shards;
+        for (i, important) in ch.changed {
             let c = c.clone();
             v.push((
-                kuroshio_cdn::db::FILE.to_string(),
-                Snapshot::Stream(Arc::new(move |w| c.write_domains(w))),
+                kuroshio_cdn::db::shard_file(n, i),
+                Snapshot::Stream(Arc::new(move |w| c.write_shard(n, i, w))),
+                Opts {
+                    lazy: !important,
+                    ..Opts::default()
+                },
+            ));
+        }
+        if let Some((m, retire)) = ch.manifest {
+            v.push((
+                kuroshio_cdn::db::MANIFEST.to_string(),
+                Snapshot::Bytes(m),
+                Opts {
+                    after: (0..n).map(|i| kuroshio_cdn::db::shard_file(n, i)).collect(),
+                    retire,
+                    ..Opts::default()
+                },
             ));
         }
         v
@@ -1162,13 +1190,20 @@ fn cdn_source(c: Arc<kuroshio_cdn::Cdn>) -> SnapSource {
 }
 
 pub fn stage_sources(p: &Mutex<Persister>, sources: &[SnapSource]) {
+    let now = crate::persist::now_secs();
     for src in sources {
         let snaps = src();
         let mut p = p.lock().unwrap();
-        for (name, s) in snaps {
-            p.stage_snapshot(&name, s);
+        for (name, s, o) in snaps {
+            p.stage_with(&name, s, o, now);
         }
     }
+}
+
+/// 目前的記憶體狀況（給快照寫入器決定間隔）
+fn mem_now() -> Mem {
+    let (total_mb, avail_mb) = sysinfo::meminfo();
+    Mem { total_mb, avail_mb }
 }
 
 fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>) {
@@ -1176,7 +1211,11 @@ fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>) {
         loop {
             tokio::time::sleep(Duration::from_secs(300)).await;
             stage_sources(&p, &sources);
-            if let Err(e) = p.lock().unwrap().flush(crate::persist::now_secs()) {
+            let mut p = p.lock().unwrap();
+            // 記憶體越多、留在記憶體越久；記憶體吃緊時提早寫出、放掉待寫內容
+            p.set_mem(mem_now());
+            p.check_space();
+            if let Err(e) = p.flush(crate::persist::now_secs()) {
                 warn!("寫入快照失敗：{e}");
             }
         }
@@ -1188,7 +1227,7 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     // 設定頁 / 指令列匯入的備份：在讀取任何狀態之前合併（上一輪關機時已經把記憶體寫出）
     let backup = crate::backup::Locations::from_cfg(cfg);
     crate::backup::apply_pending(&backup);
-    let persister = Arc::new(Mutex::new(Persister::new(persist_dir(cfg), persist_policy(cfg, tiny))));
+    let persister = Arc::new(Mutex::new(new_persister(cfg, tiny)));
     {
         let p = persister.lock().unwrap();
         if p.policy().class == StorageClass::Ram {

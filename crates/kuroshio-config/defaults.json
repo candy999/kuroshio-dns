@@ -12,6 +12,8 @@
     "storageClass": "auto",
     "persistIntervalMin": 0,
     "flashWriteBudgetKB": 4096,
+    "persistMaxAgeHours": 24,
+    "minFreeKB": 0,
     "workerThreads": 0,
     "maxTlsConnections": 2048,
     "maxQuicConnections": 512,

@@ -979,6 +979,7 @@ dependencies = [
  "kuroshio-jobs",
  "kuroshio-net",
  "kuroshio-proto",
+ "libc",
  "p12",
  "qrcode",
  "quinn",
