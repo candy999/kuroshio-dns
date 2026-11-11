@@ -154,7 +154,15 @@ pub struct PublicResolver;
 
 impl Resolver for PublicResolver {
     fn lookup<'a>(&'a self, host: &'a str) -> BoxFut<'a, Result<Vec<IpAddr>>> {
-        Box::pin(kuroshio_net::tls::resolve_host(host))
+        // 好友的網域是對方給的：只連公開網路上的位址（不讓別人叫這台機器去連本機 / 區網）
+        Box::pin(async move {
+            let all = kuroshio_net::tls::resolve_host(host).await?;
+            let ips: Vec<IpAddr> = all.into_iter().filter(|ip| crate::transport::is_public_ip(*ip)).collect();
+            if ips.is_empty() {
+                anyhow::bail!("{host} 解析到的不是公開網路上的位址");
+            }
+            Ok(ips)
+        })
     }
     fn txt<'a>(&'a self, name: &'a str) -> BoxFut<'a, Result<Vec<String>>> {
         Box::pin(kuroshio_net::tls::lookup_txt(name))

@@ -386,9 +386,84 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// 公開網路上的位址（不是本機、區網、連結本地、CGNAT、多播、保留區段）。
+/// 對方的網域是對方說的：解析到 127.0.0.1 / 192.168.x.x 的話不能連，否則任何人都能叫這台機器去連區網裡的服務
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            !(v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.is_multicast()
+                || v.is_documentation()
+                || o[0] == 0
+                || o[0] >= 240
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18))
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            !(v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                // NAT64 / 6to4 / IPv4 相容位址：裡面包的 IPv4 可能是內部位址
+                || (s[0] == 0x0064 && s[1] == 0xff9b)
+                || s[0] == 0x2002
+                || s[..6] == [0, 0, 0, 0, 0, 0])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ips_only() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "198.18.0.1",
+            "192.0.0.8",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.0.1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::1",
+            "::7f00:1",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
 
     #[test]
     fn parse_endpoints() {

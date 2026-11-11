@@ -305,6 +305,9 @@ pub fn joint_pair_id(a: &str, b: &str) -> String {
     hex(&sha256(&[v.join("|").as_bytes()]))[..24].to_string()
 }
 
+/// 不是好友、也不是我主動加的網域（待確認、已拒絕、已刪除）最多留幾筆
+pub const MAX_STRANGERS: usize = 300;
+
 pub struct PeerStore {
     pub peers: BTreeMap<String, Peer>,
     pub events: Vec<Event>,
@@ -349,6 +352,30 @@ impl PeerStore {
     pub fn ensure(&mut self, domain: &str, now: u64) -> &mut Peer {
         let d = domain.to_ascii_lowercase();
         self.peers.entry(d.clone()).or_insert_with(|| Peer::blank(&d, now))
+    }
+
+    /// 陌生人的請求會留下紀錄（待確認、已拒絕…）：有上限，滿了先丟最不重要的。
+    /// 好友、我送出的請求、我封鎖的不會被丟。任何人只要有網域就能送請求，沒有上限的話
+    /// 紀錄會一直長（記憶體、peers.json、每次寫 Flash 的量）
+    fn make_room(&mut self, incoming: &str) {
+        let keep = incoming.to_ascii_lowercase();
+        let droppable = |p: &Peer| matches!(p.rel, Rel::None | Rel::In) && !p.my_block;
+        // 這個網域的紀錄可能已經在了（驗證金鑰時先建立）：算進去，但不會被丟
+        let n = self.peers.values().filter(|p| droppable(p)).count() + usize::from(!self.peers.contains_key(&keep));
+        if n <= MAX_STRANGERS {
+            return;
+        }
+        // 先丟沒有關係的舊紀錄，再丟最久以前的待確認請求
+        let mut list: Vec<(bool, u64, String)> = self
+            .peers
+            .values()
+            .filter(|p| droppable(p) && p.domain != keep)
+            .map(|p| (p.rel == Rel::In, p.last_contact.max(p.created_at), p.domain.clone()))
+            .collect();
+        list.sort();
+        for (_, _, d) in list.into_iter().take(n - MAX_STRANGERS) {
+            self.peers.remove(&d);
+        }
     }
 
     pub fn friends(&self) -> impl Iterator<Item = &Peer> {
@@ -496,6 +523,7 @@ impl PeerStore {
         decide: impl FnOnce(&Peer, usize) -> crate::rules::Action,
     ) -> View {
         let friend_count = self.friend_count();
+        self.make_room(domain);
         let p = self.ensure(domain, now);
         let d = p.domain.clone();
         if p.my_block {
@@ -807,6 +835,41 @@ mod tests {
 
     fn store() -> PeerStore {
         PeerStore::new(7)
+    }
+
+    #[test]
+    fn strangers_are_capped() {
+        let mut s = store();
+        let now = 1_000 * DAY;
+        // 好友、我封鎖的、我送出的請求：不會被擠掉
+        s.on_request("friend.test", "r", vec![], PeerInfo::default(), now, |_, _| Action::Accept);
+        assert_eq!(s.get("friend.test").unwrap().rel, Rel::Friend);
+        s.block("blocked.test", "手動");
+        s.ensure("out.test", now).rel = Rel::Out;
+        for i in 0..(MAX_STRANGERS + 50) {
+            let r = s.on_request(
+                &format!("s{i}.flood.test"),
+                "r",
+                vec![],
+                PeerInfo::default(),
+                now + i as u64,
+                |_, _| Action::Manual,
+            );
+            assert_eq!(r.status, "pending");
+        }
+        assert_eq!(s.peers.len(), MAX_STRANGERS + 3);
+        assert!(s.get("friend.test").is_some() && s.get("out.test").is_some());
+        assert!(s.get("blocked.test").unwrap().my_block);
+        assert!(s.get("s0.flood.test").is_none(), "最舊的先丟");
+        assert!(s.get(&format!("s{}.flood.test", MAX_STRANGERS + 49)).is_some());
+        // 已經有紀錄的網域再送一次：不會擠掉別人
+        s.on_request("s100.flood.test", "r", vec![], PeerInfo::default(), now, |_, _| Action::Manual);
+        assert_eq!(s.peers.len(), MAX_STRANGERS + 3);
+        // 紀錄先建立了（驗證金鑰時）再處理請求：一樣守住上限，而且不會丟掉正在處理的這一筆
+        s.ensure("late.flood.test", 1);
+        s.on_request("late.flood.test", "r", vec![], PeerInfo::default(), now, |_, _| Action::Manual);
+        assert_eq!(s.peers.len(), MAX_STRANGERS + 3);
+        assert_eq!(s.get("late.flood.test").unwrap().rel, Rel::In);
     }
 
     #[test]
