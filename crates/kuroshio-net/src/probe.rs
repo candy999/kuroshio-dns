@@ -73,6 +73,39 @@ impl Default for HttpsOpts {
     }
 }
 
+/// 網站驗證結果：連到 DNS 回答的 IP，用網域當 SNI 做 TLS 握手並完整檢查憑證
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteCheck {
+    /// 憑證有效、而且是這個網域的：這個 IP 真的在服務這個網站（不是劫持）
+    Valid,
+    /// 有回應 TLS，但憑證不對（名稱不符、自簽、過期、不受信任）：確定是劫持或攔截頁
+    Invalid,
+    /// 連不上、逾時、握手被拒：無法判斷（不能當成劫持的證據）
+    Unverified,
+}
+
+impl SiteCheck {
+    pub fn name(self) -> &'static str {
+        match self {
+            SiteCheck::Valid => "憑證有效",
+            SiteCheck::Invalid => "憑證不符",
+            SiteCheck::Unverified => "無法驗證",
+        }
+    }
+}
+
+/// 驗證「這個 IP 是不是真的在服務這個網域」（每日評測判斷汙染、黑名單體檢共用）
+pub async fn verify_site(ip: IpAddr, domain: &str, timeout: Duration) -> (SiteCheck, String) {
+    match crate::tls::connect_ip(ip, 443, domain, true, timeout).await {
+        Ok(_) => (SiteCheck::Valid, "OK".into()),
+        Err(e) => {
+            let (code, tls) = classify_error(&e);
+            let invalid = tls && (code.starts_with("ERR_TLS") || code.starts_with("UNABLE_TO") || code.starts_with("CERT_"));
+            (if invalid { SiteCheck::Invalid } else { SiteCheck::Unverified }, code)
+        }
+    }
+}
+
 /// 把連線 / TLS 錯誤轉成跟 2.x（node）相近的錯誤代碼
 fn classify_error(e: &anyhow::Error) -> (String, bool) {
     if let Some(io) = e.downcast_ref::<std::io::Error>() {

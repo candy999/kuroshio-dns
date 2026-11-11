@@ -26,7 +26,7 @@ use crate::util::{fixed_num, read_json, read_list, to_fixed, write_atomic, write
 use anyhow::{bail, Result};
 use kuroshio_config::get;
 use kuroshio_net::upstream::Upstream;
-use probe::{kind_name, query, sub_key, AsnSource, IpApi, NetProber, Outcome, Prober, QueryResult};
+use probe::{kind_name, query, sub_key, AsnSource, IpApi, NetProber, Outcome, Prober, QueryResult, SiteCheck};
 use rules::AsnInfo;
 use select::{Scored, SelectOpts, Strategy};
 use serde_json::{json, Map, Value};
@@ -484,6 +484,50 @@ fn append_blacklist(file: &Path, lines: &[String]) {
     }
 }
 
+/// 網站「無法驗證」幾天（不同日期）才列入永久黑名單
+const SUSPECT_DAYS: usize = 3;
+/// 網站驗證：每個回答最多驗幾個 IP、同時連線數、逾時
+const VERIFY_IPS: usize = 2;
+const VERIFY_CONC: usize = 16;
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 每台 DNS 被判「網站無法驗證」的日期（`state/blacklist-suspects.json`）；30 天沒再發生就忘掉
+struct Strikes {
+    file: PathBuf,
+    map: BTreeMap<String, Vec<String>>,
+    dirty: bool,
+}
+
+impl Strikes {
+    fn load(file: PathBuf, now_ms: u64) -> Strikes {
+        let mut map: BTreeMap<String, Vec<String>> = read_json(&file).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        let cutoff = local_date_str(now_ms.saturating_sub(30 * DAY_MS));
+        let before = map.len();
+        map.retain(|_, days| {
+            days.retain(|d| *d >= cutoff);
+            !days.is_empty()
+        });
+        let dirty = map.len() != before;
+        Strikes { file, map, dirty }
+    }
+    /// 記一天，回傳累計的不同日期數
+    fn add(&mut self, id: &str, day: &str) -> usize {
+        let days = self.map.entry(id.to_string()).or_default();
+        if !days.iter().any(|d| d == day) {
+            days.push(day.to_string());
+            self.dirty = true;
+        }
+        days.len()
+    }
+    fn save(&self) {
+        if self.dirty {
+            if let Err(e) = write_json(&self.file, &json!(self.map)) {
+                warn!("可疑 DNS 紀錄寫入失敗（{}）：{e}", self.file.display());
+            }
+        }
+    }
+}
+
 /// 同一組（2.x `groups` 的一個元素）
 struct Group {
     rep: AsnInfo,
@@ -569,6 +613,9 @@ impl Benchmark {
 
         // Phase 1：逐一測網域
         let domains = read_list(&self.paths.list_dir.join("web.txt"));
+        // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
+        let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
+        let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
         let mut universe: HashSet<u64> = HashSet::new();
         let mut blocked_report: Vec<Value> = Vec::new();
         let mut scored = 0usize;
@@ -658,19 +705,55 @@ impl Benchmark {
                     }
                 }
             }
-            let mut polluted = 0usize;
+            // 規則判定不在多數業者群組裡的回答：不再只看 IP 屬於哪家業者就定罪，
+            // 實際連過去用網域檢查憑證（跟替換台灣節點前的驗證同一個標準）。
+            // 憑證有效 = 規則沒涵蓋的 CDN（保留）；憑證不符 = 確定劫持（永久黑名單）；連不上 = 今天不用，連續多天才定罪
+            let suspects: Vec<usize> = ok
+                .iter()
+                .zip(&infos)
+                .enumerate()
+                .filter(|(_, (_, info))| !info.is_unknown() && !valid.iter().any(|g| rules::is_same_group(Some(&g.rep), Some(info))))
+                .map(|(k, _)| k)
+                .collect();
+            let checks = self
+                .verify_answers(domain, suspects.iter().map(|k| ok[*k].1.clone()).collect(), &mut site_cache)
+                .await;
+            let mut verdict: HashMap<usize, (SiteCheck, String)> = suspects.into_iter().zip(checks).collect();
+            let (mut polluted, mut suspicious, mut rescued) = (0usize, 0usize, 0usize);
             let mut newly_bl: Vec<String> = Vec::new();
-            for ((i, ips, ms), info) in ok.iter().zip(&infos) {
+            for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {
                 let s = &mut all[*i];
-                if info.is_unknown() || valid.iter().any(|g| rules::is_same_group(Some(&g.rep), Some(info))) {
-                    s.record(dix, *ms, ips);
-                } else {
-                    s.kill(format!("汙染 {domain} (判定為 {})", info.raw));
-                    polluted += 1;
-                    if !s.pinned {
-                        info!("   [淘汰] {} -> 汙染 {}（加入永久黑名單）", s.id, info.raw);
-                        if blacklist.insert(s.id.clone()) {
-                            newly_bl.push(format!("{}  # {today} 汙染：{domain} → {}", s.id, info.raw));
+                match verdict.remove(&k) {
+                    None => s.record(dix, *ms, ips),
+                    Some((SiteCheck::Valid, _)) => {
+                        rescued += 1;
+                        info!(
+                            "   [保留] {} -> {}：業者規則沒涵蓋，但 {domain} 的憑證有效（不是劫持）",
+                            s.id, info.raw
+                        );
+                        s.record(dix, *ms, ips);
+                    }
+                    Some((SiteCheck::Invalid, why)) => {
+                        s.kill(format!("汙染 {domain} (判定為 {}，憑證不符 {why})", info.raw));
+                        polluted += 1;
+                        if !s.pinned {
+                            info!("   [淘汰] {} -> 汙染 {}：憑證不符 {why}（加入永久黑名單）", s.id, info.raw);
+                            if blacklist.insert(s.id.clone()) {
+                                newly_bl.push(format!("{}  # {today} 汙染：{domain} → {}（憑證不符 {why}）", s.id, info.raw));
+                            }
+                        }
+                    }
+                    Some((SiteCheck::Unverified, why)) => {
+                        s.kill(format!("可疑 {domain} (判定為 {}，網站無法驗證 {why})", info.raw));
+                        suspicious += 1;
+                        if !s.pinned && strikes.add(&s.id, &today) >= SUSPECT_DAYS && blacklist.insert(s.id.clone()) {
+                            info!("   [淘汰] {} -> 連續 {SUSPECT_DAYS} 天回答無法驗證的位址（加入永久黑名單）", s.id);
+                            newly_bl.push(format!(
+                                "{}  # {today} 汙染：{domain} → {}（連續 {SUSPECT_DAYS} 天網站無法驗證）",
+                                s.id, info.raw
+                            ));
+                        } else if !s.pinned {
+                            info!("   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}）", s.id, info.raw);
                         }
                     }
                 }
@@ -679,13 +762,14 @@ impl Benchmark {
                 append_blacklist(&bl_file, &newly_bl);
             }
             info!(
-                "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、逾時 {errors}",
+                "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、逾時 {errors}",
                 groups.first().map(|g| g.rep.raw.as_str()).unwrap_or("無法判定"),
-                ok.len() - polluted,
+                ok.len() - polluted - suspicious,
                 blocked.len()
             );
         }
 
+        strikes.save();
         let finals: Vec<usize> = verified.iter().copied().filter(|i| all[*i].alive).collect();
         if !finals.iter().any(|i| !all[*i].pinned) {
             bail!("沒有倖存的 DNS，保留昨天的結果");
@@ -823,6 +907,55 @@ impl Benchmark {
     }
 
     /// 對 `idx` 這些候選並行查同一個網域；回傳（候選位置, 結果），依輸入順序
+    /// 每個可疑回答驗證最多 `VERIFY_IPS` 個 IP：任一個憑證有效 → 有效；否則任一個憑證不符 → 劫持；都連不上 → 無法驗證
+    async fn verify_answers(
+        &self,
+        domain: &str,
+        answers: Vec<Vec<Ipv4Addr>>,
+        cache: &mut HashMap<(String, Ipv4Addr), (SiteCheck, String)>,
+    ) -> Vec<(SiteCheck, String)> {
+        let mut todo: Vec<Ipv4Addr> = Vec::new();
+        for ips in &answers {
+            for ip in ips.iter().take(VERIFY_IPS) {
+                if !cache.contains_key(&(domain.to_string(), *ip)) && !todo.contains(ip) {
+                    todo.push(*ip);
+                }
+            }
+        }
+        if !todo.is_empty() {
+            let prober = self.prober.clone();
+            let d = domain.to_string();
+            let res = map_limit(todo.clone(), VERIFY_CONC, move |ip| {
+                let (p, d) = (prober.clone(), d.clone());
+                async move { p.verify_site(IpAddr::V4(ip), d, VERIFY_TIMEOUT).await }
+            })
+            .await;
+            for (ip, r) in todo.into_iter().zip(res) {
+                let r = r.unwrap_or((SiteCheck::Unverified, "驗證工作失敗".into()));
+                cache.insert((domain.to_string(), ip), r);
+            }
+        }
+        answers
+            .iter()
+            .map(|ips| {
+                let rs: Vec<&(SiteCheck, String)> = ips
+                    .iter()
+                    .take(VERIFY_IPS)
+                    .filter_map(|ip| cache.get(&(domain.to_string(), *ip)))
+                    .collect();
+                if let Some(v) = rs.iter().find(|r| r.0 == SiteCheck::Valid) {
+                    return (*v).clone();
+                }
+                if let Some(v) = rs.iter().find(|r| r.0 == SiteCheck::Invalid) {
+                    return (*v).clone();
+                }
+                rs.first()
+                    .map(|r| (*r).clone())
+                    .unwrap_or((SiteCheck::Unverified, "沒有 IP".into()))
+            })
+            .collect()
+    }
+
     async fn query_all(&self, all: &[Srv], idx: Vec<usize>, domain: &str, cfg: &BenchCfg) -> Vec<(usize, QueryResult)> {
         let jobs: Vec<(usize, Upstream)> = idx.iter().map(|&i| (i, all[i].up.clone())).collect();
         let prober = self.prober.clone();

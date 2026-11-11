@@ -36,7 +36,14 @@ pub trait Prober: Send + Sync + 'static {
     fn exchange(&self, up: Upstream, query: Vec<u8>, timeout: Duration) -> BoxFuture<Result<Vec<u8>>>;
     /// 主機名稱的 IPv4（查 DNS 擁有者用）
     fn resolve_v4(&self, host: String) -> BoxFuture<Option<Ipv4Addr>>;
+    /// 網站驗證：連到這個 IP，用網域當 SNI 檢查憑證（判斷汙染用）。
+    /// 預設「無法驗證」：沒有驗證能力的實作永遠不會把任何 DNS 列入永久黑名單
+    fn verify_site(&self, _ip: IpAddr, _domain: String, _timeout: Duration) -> BoxFuture<(SiteCheck, String)> {
+        Box::pin(async { (SiteCheck::Unverified, "不支援網站驗證".to_string()) })
+    }
 }
+
+pub use kuroshio_net::probe::SiteCheck;
 
 /// 正式環境：kuroshio-net 的 udp / tcp / dot / doh；主機名稱用 bootstrap 解析
 #[derive(Debug, Default, Clone, Copy)]
@@ -48,6 +55,9 @@ impl Prober for NetProber {
     }
     fn exchange(&self, up: Upstream, query: Vec<u8>, timeout: Duration) -> BoxFuture<Result<Vec<u8>>> {
         Box::pin(async move { up.exchange(&query, timeout).await })
+    }
+    fn verify_site(&self, ip: IpAddr, domain: String, timeout: Duration) -> BoxFuture<(SiteCheck, String)> {
+        Box::pin(async move { kuroshio_net::probe::verify_site(ip, &domain, timeout).await })
     }
     fn resolve_v4(&self, host: String) -> BoxFuture<Option<Ipv4Addr>> {
         Box::pin(async move {

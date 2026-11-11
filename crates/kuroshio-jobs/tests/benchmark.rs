@@ -1,7 +1,7 @@
 //! 每日評測端對端：本機假 DNS 伺服器（正常 / 汙染 / 封殺 / 慢 / 不回應 / 資格賽失敗），
 //! 經過排程器執行，檢查寫出的 upstreams.json、永久黑名單、報表，並確認伺服器（kuroshio）讀得懂。
 
-use kuroshio_jobs::benchmark::probe::{classify, AsnSource, NetProber, Outcome, Prober, StaticAsn};
+use kuroshio_jobs::benchmark::probe::{classify, AsnSource, NetProber, Outcome, Prober, SiteCheck, StaticAsn};
 use kuroshio_jobs::benchmark::rules::AsnInfo;
 use kuroshio_jobs::scheduler::BoxFuture;
 use kuroshio_jobs::time::{days_from_civil, ManualClock, DAY_MS, HOUR_MS, TPE_OFFSET_MS};
@@ -80,6 +80,19 @@ impl Prober for LocalOnly {
     fn resolve_v4(&self, _host: String) -> BoxFuture<Option<Ipv4Addr>> {
         Box::pin(async { None })
     }
+    /// 網站驗證（假的）：96.4.x 是劫持（憑證不符）、97.5.x 是規則不認識但真的在服務網站的 CDN、其他連不上
+    fn verify_site(&self, ip: std::net::IpAddr, _domain: String, _t: Duration) -> BoxFuture<(SiteCheck, String)> {
+        let s = ip.to_string();
+        Box::pin(async move {
+            if s.starts_with("96.4.") {
+                (SiteCheck::Invalid, "ERR_TLS_CERT_ALTNAME_INVALID".to_string())
+            } else if s.starts_with("97.5.") {
+                (SiteCheck::Valid, "OK".to_string())
+            } else {
+                (SiteCheck::Unverified, "ETIMEDOUT".to_string())
+            }
+        })
+    }
 }
 
 fn asn() -> Arc<dyn AsnSource> {
@@ -91,6 +104,8 @@ fn asn() -> Arc<dyn AsnSource> {
     add("94.2", "Beta Hosting", "AS200 Beta Hosting");
     add("95.3", "Gamma Cloud", "AS300 Gamma Cloud");
     add("96.4", "Evil Corp", "AS666 Evil Corp");
+    add("97.5", "Unknown CDN", "AS777 Unknown CDN");
+    add("98.6", "Quiet Hosting", "AS888 Quiet Hosting");
     for i in 1..=9 {
         add(&format!("127.{i}"), &format!("Owner{i} Ltd"), &format!("AS90{i} Owner{i}"));
     }
@@ -236,7 +251,7 @@ async fn end_to_end_with_mock_servers() {
     assert_eq!(up["pinned"][0]["coverageItems"], 2);
     assert_eq!(
         up["pinned"][0]["issues"],
-        json!(["汙染 www.alpha.com (判定為 Evil_Corp__AS666_Evil_Corp)"])
+        json!(["汙染 www.alpha.com (判定為 Evil_Corp__AS666_Evil_Corp，憑證不符 ERR_TLS_CERT_ALTNAME_INVALID)"])
     );
     assert_eq!(up["skippedTypes"], json!({ "dnscrypt": 1, "doh": 1, "doh3": 1, "doq": 1 }));
     assert!(up["generatedAt"].as_str().unwrap().starts_with("2026-11-10T04:00:00"));
@@ -246,7 +261,9 @@ async fn end_to_end_with_mock_servers() {
     assert_eq!(shipped, format!("# 黑名單\n{s10}  # 測試\n"));
     let bl = std::fs::read_to_string(root.join("state/blacklist.txt")).unwrap();
     assert!(
-        bl.contains(&format!("{s3}  # 2026-11-10 汙染：www.alpha.com → Evil_Corp__AS666_Evil_Corp")),
+        bl.contains(&format!(
+            "{s3}  # 2026-11-10 汙染：www.alpha.com → Evil_Corp__AS666_Evil_Corp（憑證不符 ERR_TLS_CERT_ALTNAME_INVALID）"
+        )),
         "{bl}"
     );
     assert!(!bl.contains(&s4.to_string()));
@@ -343,4 +360,79 @@ async fn real_internet_smoke() {
     let state = Benchmark::new(p.clone()).run(&ctx).await.unwrap();
     assert!(!state["selected"].as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 汙染要實際驗證網站：規則不認識的業者但憑證有效 → 保留；憑證不符 → 永久黑名單；
+/// 連不上 → 今天不用、記一天，連續 3 天才列入永久黑名單
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pollution_requires_site_verification() {
+    let a = mock("127.1.0.21:0", 0, |n| honest(n, 1)).await;
+    let b = mock("127.2.0.21:0", 0, |n| honest(n, 2)).await;
+    let c = mock("127.3.0.21:0", 0, |n| honest(n, 3)).await;
+    let hijack = mock("127.4.0.21:0", 0, |n| match n {
+        "www.alpha.com" => Reply::A(vec![ip("96.4.0.9")]),
+        _ => honest(n, 1),
+    })
+    .await;
+    let other_cdn = mock("127.5.0.21:0", 0, |n| match n {
+        "www.alpha.com" => Reply::A(vec![ip("97.5.0.9")]),
+        _ => honest(n, 1),
+    })
+    .await;
+    let quiet = mock("127.6.0.21:0", 0, |n| match n {
+        "www.alpha.com" => Reply::A(vec![ip("98.6.0.9")]),
+        _ => honest(n, 1),
+    })
+    .await;
+    let root = tmp("verify");
+    let p = paths(&root);
+    let list = &p.list_dir;
+    std::fs::create_dir_all(list).unwrap();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    let ids: Vec<String> = [a, b, c, hijack, other_cdn, quiet].iter().map(|x| x.to_string()).collect();
+    std::fs::write(list.join("iplist.txt"), ids.join("\n")).unwrap();
+    std::fs::write(list.join("web.txt"), "www.alpha.com\ncdn.beta.com\n").unwrap();
+    // 「無法驗證」已經記了前兩天：今天是第 3 天 → 列入永久黑名單
+    std::fs::write(
+        root.join("state/blacklist-suspects.json"),
+        serde_json::to_vec(&json!({ quiet.to_string(): ["2026-11-08", "2026-11-09"] })).unwrap(),
+    )
+    .unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "upstream": { "pinned": [], "autoTypes": ["udp"], "autoMax": 6 },
+        "benchmark": { "timeoutMs": 300, "concurrency": 4, "maxTimeouts": 1, "minAuto": 1 },
+        "jobs": { "dns-benchmark": { "at": "04:10", "catchUp": false } }
+    }));
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12)));
+    let mut o = Options::new(root.join("state"), &root);
+    o.clock = clock.clone();
+    let sched = Scheduler::new(cfg.clone(), None, o);
+    sched.register("dns-benchmark", Benchmark::with(p.clone(), Arc::new(LocalOnly), asn()));
+    let h = sched.start();
+    assert_eq!(sched.request("dns-benchmark", "測試")["ok"], true);
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !sched.is_busy() {
+            break;
+        }
+    }
+    h.abort();
+    assert_eq!(sched.status()["state"]["dns-benchmark"]["lastCode"], 0);
+
+    let bl = std::fs::read_to_string(root.join("state/blacklist.txt")).unwrap();
+    assert!(bl.contains(&format!("{hijack}  # 2026-11-10 汙染：www.alpha.com")), "{bl}");
+    assert!(bl.contains("憑證不符"), "{bl}");
+    assert!(
+        bl.contains(&format!("{quiet}  # 2026-11-10 汙染：www.alpha.com")),
+        "第 3 天無法驗證：{bl}"
+    );
+    assert!(!bl.contains(&other_cdn.to_string()), "憑證有效的不是汙染：{bl}");
+    let suspects: Value = read(&root.join("state/blacklist-suspects.json"));
+    assert_eq!(suspects[quiet.to_string()], json!(["2026-11-08", "2026-11-09", "2026-11-10"]));
+    // 規則外但驗證通過的 CDN 照常計分，可以被選上
+    let elim = std::fs::read_to_string(p.out_root.clone().unwrap().join("2026-11-10/eliminated.csv")).unwrap();
+    assert!(elim.contains(&hijack.to_string()) && elim.contains(&quiet.to_string()), "{elim}");
+    assert!(!elim.contains(&other_cdn.to_string()), "規則外但憑證有效的 CDN 不該被淘汰：{elim}");
+    let up = read(&p.upstreams_file);
+    assert_eq!(up["counts"]["eliminated"], 2, "{up:#}");
 }
