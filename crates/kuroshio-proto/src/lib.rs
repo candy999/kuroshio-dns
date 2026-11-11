@@ -331,4 +331,14 @@ mod tests {
         set_id(&mut other, 8);
         assert!(!matches(&q, &other));
     }
+
+    #[test]
+    fn question_match_ignores_letter_case() {
+        // 網域名稱不分大小寫（RFC 4343）：上游把問題改成小寫或大小寫混合都算同一題
+        let q = build_query(9, "WWW.Example.COM", 1);
+        let r = error_response(&build_query(9, "www.example.com", 1), RCODE_SERVFAIL);
+        assert!(matches(&q, &r));
+        let other = error_response(&build_query(9, "www.example.net", 1), RCODE_SERVFAIL);
+        assert!(!matches(&q, &other), "不同名稱仍然不算");
+    }
 }

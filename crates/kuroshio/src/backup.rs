@@ -53,7 +53,10 @@ const KEYS: &str = "community-keys/";
 const KEY_FILES: [&str; 3] = ["key.pem", "key.old.pem", "identity.json"];
 
 /// 分享檔只能有這些
-const SHARE_FILES: [&str; 5] = [DOMAINS, POOLS, V6, UPSTREAMS, BLACKLIST];
+/// 分享檔只放 CDN 網域與節點；上游評測與黑名單由每台機器自己判定，不放進分享檔
+const SHARE_FILES: [&str; 3] = [DOMAINS, POOLS, V6];
+/// 舊版分享檔還會帶這兩項：照樣可以匯入，但這兩項略過不用
+const SHARE_LEGACY: [&str; 2] = [UPSTREAMS, BLACKLIST];
 /// 完整備份的固定檔案（另外還有 community/*、community-keys/*）
 const FULL_FILES: [&str; 10] = [DOMAINS, POOLS, V6, HARVEST, ZONE, UPSTREAMS, BLACKLIST, STATS, HOT, CUSTOM];
 
@@ -303,7 +306,7 @@ pub fn allowed(kind: Kind, key: &str) -> bool {
         return false;
     }
     match kind {
-        Kind::Share => SHARE_FILES.contains(&key),
+        Kind::Share => SHARE_FILES.contains(&key) || SHARE_LEGACY.contains(&key),
         Kind::Full => {
             FULL_FILES.contains(&key)
                 || key.strip_prefix(COMMUNITY).is_some_and(safe_name)
@@ -1347,7 +1350,11 @@ mod tests {
         let share = Bundle::decode(&export(&loc, Kind::Share).encode()).unwrap();
         assert_eq!(share.kind, Kind::Share);
         let keys: Vec<&str> = share.files.keys().map(String::as_str).collect();
-        assert_eq!(keys, vec![BLACKLIST, DOMAINS, POOLS, V6, UPSTREAMS]);
+        assert_eq!(keys, vec![DOMAINS, POOLS, V6], "分享檔不含上游評測與黑名單");
+        assert!(
+            allowed(Kind::Share, UPSTREAMS) && allowed(Kind::Share, BLACKLIST),
+            "舊版分享檔照樣讀得進來"
+        );
         let dom = &share.files[DOMAINS].json().unwrap()["domains"][0];
         for k in PRIVATE_DOMAIN_FIELDS {
             assert!(dom.get(k).is_none(), "分享檔沒有 {k}");
