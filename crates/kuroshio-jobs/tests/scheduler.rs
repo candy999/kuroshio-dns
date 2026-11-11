@@ -472,3 +472,55 @@ async fn lock_held_by_other_process_skips_job() {
     h.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn monthly_and_per_device_jitter() {
+    use kuroshio_jobs::scheduler::{jitter_ms, last_slot_seeded, next_run_seeded};
+    let c = json!({ "at": "00:50", "monthDays": [1] });
+    assert_eq!(next_run(&c, tpe(2026, 11, 10, 3, 0)), Some(tpe(2026, 12, 1, 0, 50)));
+    assert_eq!(next_run(&c, tpe(2026, 12, 1, 0, 40)), Some(tpe(2026, 12, 1, 0, 50)));
+    assert_eq!(next_run(&c, tpe(2026, 12, 1, 0, 50)), Some(tpe(2027, 1, 1, 0, 50)));
+    // 錯開：0–27 天、0–180 分鐘，同一個種子一定落在同一個時間
+    let c = json!({ "at": "00:50", "monthDays": [1], "jitterDays": 27, "jitterMin": 180 });
+    for seed in [1u64, 7, 12_345, 987_654_321, u64::MAX >> 1] {
+        let j = jitter_ms(&c, seed);
+        assert!(j <= 27 * DAY_MS + 180 * MIN_MS, "{seed}");
+        let n = next_run_seeded(&c, tpe(2026, 11, 10, 3, 0), seed).unwrap();
+        assert!(n > tpe(2026, 11, 10, 3, 0));
+        // 下一次一定是某個月 1 日 00:50 往後挪 j
+        let base = n - j;
+        assert!(base == tpe(2026, 11, 1, 0, 50) || base == tpe(2026, 12, 1, 0, 50), "{seed}");
+        assert_eq!(last_slot_seeded(&c, n, seed), Some(n));
+        assert!(last_slot_seeded(&c, n - 1, seed).map(|t| t < n).unwrap_or(true));
+    }
+    // 不同裝置分散開
+    let spread: std::collections::HashSet<u64> = (1..50u64).map(|s| jitter_ms(&c, s * 7919) / DAY_MS).collect();
+    assert!(spread.len() > 10);
+}
+
+#[test]
+fn jitter_seed_is_created_once_and_saved() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 3, 0)));
+    let changed = Arc::new(AtomicU32::new(0));
+    let c2 = changed.clone();
+    let mut o = opts(&clock);
+    o.on_state_change = Some(Arc::new(move || {
+        c2.fetch_add(1, Ordering::SeqCst);
+    }));
+    let cfg = json!({ "jobs": { "m": { "at": "00:50", "monthDays": [1], "jitterDays": 27 } } });
+    let s = Scheduler::new(cfg.clone(), None, o);
+    s.register("m", noop);
+    s.tick();
+    let seed = s.status()["state"]["m"]["seed"].as_u64().unwrap();
+    assert!(seed > 0);
+    assert_eq!(changed.load(Ordering::SeqCst), 1, "種子要存進 jobs.json");
+    s.tick();
+    assert_eq!(s.status()["state"]["m"]["seed"].as_u64(), Some(seed), "之後固定");
+    assert_eq!(changed.load(Ordering::SeqCst), 1);
+    // 重新啟動：從 jobs.json 讀回同一個種子、同一個下次時間
+    let (_, saved) = s.snapshot();
+    let s2 = sched(cfg, Some(&saved), &clock);
+    s2.register("m", noop);
+    assert_eq!(s2.next_run("m"), s.next_run("m"));
+    assert_eq!(s.status()["nextRun"]["m"].as_u64(), s.next_run("m"));
+}
