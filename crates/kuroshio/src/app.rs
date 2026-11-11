@@ -2,7 +2,7 @@
 
 use crate::acl::Acl;
 use crate::iprank::IpRank;
-use crate::persist::{Persister, Policy};
+use crate::persist::{Persister, Policy, Snapshot};
 use crate::resolver::{LocalForward, Params, Resolver};
 use crate::server::Server;
 use crate::sysinfo::{self, Pressure, StorageClass, SysInfo};
@@ -1137,14 +1137,36 @@ fn spawn_watchdog() {
 }
 
 /// 會產生快照的模組（CDN、社群）：只在要寫的時候才序列化，有變動的才給
-pub type SnapSource = Arc<dyn Fn() -> Vec<(String, Vec<u8>)> + Send + Sync>;
+pub type SnapSource = Arc<dyn Fn() -> Vec<(String, Snapshot)> + Send + Sync>;
+
+/// 一般模組：整份內容
+fn bytes_source(f: impl Fn() -> Vec<(String, Vec<u8>)> + Send + Sync + 'static) -> SnapSource {
+    Arc::new(move || f().into_iter().map(|(n, b)| (n, Snapshot::Bytes(b))).collect())
+}
+
+/// CDN：網域資料庫很大（tiny 等級上限也有幾 MB），不先整份序列化放在記憶體裡等寫入間隔，
+/// 要寫的那一刻才邊序列化邊寫進檔案
+fn cdn_source(c: Arc<kuroshio_cdn::Cdn>) -> SnapSource {
+    Arc::new(move || {
+        let (small, db_dirty) = c.snapshots_stream(false);
+        let mut v: Vec<(String, Snapshot)> = small.into_iter().map(|(n, b)| (n, Snapshot::Bytes(b))).collect();
+        if db_dirty {
+            let c = c.clone();
+            v.push((
+                kuroshio_cdn::db::FILE.to_string(),
+                Snapshot::Stream(Arc::new(move |w| c.write_domains(w))),
+            ));
+        }
+        v
+    })
+}
 
 pub fn stage_sources(p: &Mutex<Persister>, sources: &[SnapSource]) {
     for src in sources {
         let snaps = src();
         let mut p = p.lock().unwrap();
-        for (name, bytes) in snaps {
-            p.stage(&name, bytes);
+        for (name, s) in snaps {
+            p.stage_snapshot(&name, s);
         }
     }
 }
@@ -1207,11 +1229,10 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     let mut snap_sources: Vec<SnapSource> = Vec::new();
     {
         let r = resolver.clone();
-        snap_sources.push(Arc::new(move || vec![(STATS_FILE.to_string(), r.stats.snapshot())]));
+        snap_sources.push(bytes_source(move || vec![(STATS_FILE.to_string(), r.stats.snapshot())]));
     }
     if let Some(c) = &cdn {
-        let c = c.clone();
-        snap_sources.push(Arc::new(move || c.snapshots()));
+        snap_sources.push(cdn_source(c.clone()));
     }
     spawn_maintenance(resolver.clone());
     // 過濾：自訂規則與清單路徑以設定目錄（快照目錄的上一層）為基準
@@ -1272,7 +1293,7 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     let community = start_community(cfg, &base_dir, &resolver, cdn.clone());
     if let Some(c) = &community {
         let c = c.clone();
-        snap_sources.push(Arc::new(move || c.snapshots()));
+        snap_sources.push(bytes_source(move || c.snapshots()));
     }
     spawn_persist_loop(persister.clone(), snap_sources.clone());
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;

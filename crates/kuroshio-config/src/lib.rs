@@ -229,6 +229,22 @@ mod tests {
     }
 
     #[test]
+    fn small_tiers_cdn_db_fits_flash_budget() {
+        // 網域資料庫快照每筆約 545 B、常駐記憶體約 850 B（kuroshio-cdn 的 bench_db_size 實測）：
+        // tiny / small 的上限要讓快照在每日 Flash 寫入上限內（每天至少寫得出去一次）、tiny 的記憶體只佔幾 MB
+        for t in [Tier::Tiny, Tier::Small] {
+            let c = build(t, &json!({}));
+            let n = get(&c, "cdn.maxEntries").and_then(Value::as_u64).unwrap();
+            let budget = get(&c, "system.flashWriteBudgetKB").and_then(Value::as_u64).unwrap() * 1024;
+            assert!(n * 545 < budget, "{}：{n} 筆的快照超過每日寫入上限", t.name());
+            assert!(n >= 4000, "{}：要放得下種子資料（約 4,000 筆）", t.name());
+            if t == Tier::Tiny {
+                assert!(n * 850 <= 5 * 1024 * 1024, "tiny 的網域資料庫不超過 5 MB 記憶體");
+            }
+        }
+    }
+
+    #[test]
     fn profiles_only_touch_existing_keys() {
         // 等級調整值裡的每個欄位都必須存在於內建預設值（避免拼錯字默默無效）
         fn walk(p: &Value, d: &Value, path: &str) {

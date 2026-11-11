@@ -252,3 +252,48 @@ fn chunked_domains_snapshot_matches_single_pass() {
     let all: HashMap<String, Vec<u8>> = c.snapshots_all().into_iter().collect();
     assert_eq!(strip(&part["cdn-domains.json"]), strip(&all["cdn-domains.json"]));
 }
+
+#[test]
+fn streamed_domains_snapshot_matches_single_pass() {
+    // 正式執行時網域資料庫邊序列化邊寫進檔案（write_domains）：內容要跟一次寫完的完全一樣，讀得回來
+    let d = tmpdir("streamed");
+    let paths = Paths::new(d.join("state"), repo().join("data"));
+    let c = Cdn::load(&full_cfg(), paths, MockNet::new());
+    c.with_state(|st| {
+        st.db.dirty = true;
+        st.pools.dirty = true;
+    });
+    let (small, db_dirty) = c.snapshots_stream(false);
+    assert!(db_dirty);
+    assert!(small.iter().any(|x| x.0 == "cdn/pools.json"));
+    assert!(small.iter().all(|x| x.0 != "cdn-domains.json"), "網域資料庫不整份序列化");
+    assert!(!c.state().db.dirty, "登記之後不再重複");
+    assert!(!c.snapshots_stream(false).1);
+
+    /// 每次只收一小段（模擬檔案寫入），記下最大的一段
+    struct Sink(Vec<u8>, usize);
+    impl std::io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.1 = self.1.max(b.len());
+            self.0.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = Sink(Vec::new(), 0);
+    c.write_domains(&mut w).unwrap();
+    let all: HashMap<String, Vec<u8>> = c.snapshots_all().into_iter().collect();
+    let strip = |b: &[u8]| -> String {
+        let s = String::from_utf8(b.to_vec()).unwrap();
+        s[s.find("\"domains\":[").unwrap()..].to_string()
+    };
+    assert_eq!(strip(&w.0), strip(&all["cdn-domains.json"]));
+    let n = c.state().db.domains.len();
+    assert!(w.1 < w.0.len() / 4, "分批寫出（最大一段 {} / 全部 {}）", w.1, w.0.len());
+    let mut db = crate::db::Db::new(1_000_000);
+    assert_eq!(db.load_domains(&w.0, false).unwrap(), n);
+    // 關機：全部都算有變動
+    assert!(c.snapshots_stream(true).1);
+}

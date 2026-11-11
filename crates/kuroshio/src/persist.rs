@@ -4,13 +4,16 @@
 //! - `flush()` 依儲存類型的最短間隔與每日寫入上限決定要不要真的寫。
 //! - 內容沒變不寫；寫入用暫存檔 + fsync + 改名，斷電不會留下半個檔案。
 //! - 關機時 `flush_all()` 不管間隔與上限，把有變動的都寫出去。
+//! - 很大的檔（CDN 網域資料庫）用 `stage_stream()`：登記的只是「怎麼產生內容」，
+//!   要寫的那一刻才邊序列化邊寫進暫存檔，整份內容不會放在記憶體裡（等寫入間隔的期間也不會）。
 
 use crate::sysinfo::StorageClass;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -42,11 +45,30 @@ impl Policy {
     }
 }
 
+/// 邊產生邊寫出內容（寫進 `Write`；失敗就回傳錯誤，暫存檔會被丟掉）
+pub type StreamFn = Arc<dyn Fn(&mut dyn Write) -> std::io::Result<()> + Send + Sync>;
+
+/// 一份快照的內容
+#[derive(Clone)]
+pub enum Snapshot {
+    Bytes(Vec<u8>),
+    /// 要寫的時候才產生（大檔用）
+    Stream(StreamFn),
+}
+
+enum Pending {
+    /// （內容雜湊，內容）
+    Bytes(u64, Vec<u8>),
+    Stream(StreamFn),
+}
+
 #[derive(Default)]
 struct Entry {
     written_hash: Option<u64>,
     written_at: u64,
-    pending: Option<(u64, Vec<u8>)>,
+    /// 上次寫入的大小（串流的快照寫之前不知道大小，用它估算每日上限）
+    written_size: u64,
+    pending: Option<Pending>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -65,10 +87,44 @@ pub struct Persister {
     stats: Stats,
 }
 
+/// 內容雜湊：分段餵進去跟整份一次餵結果相同（串流寫入時邊寫邊算）
+struct HashWriter<W> {
+    inner: W,
+    h: DefaultHasher,
+    n: u64,
+}
+
+impl<W: Write> HashWriter<W> {
+    fn new(inner: W) -> HashWriter<W> {
+        HashWriter {
+            inner,
+            h: DefaultHasher::new(),
+            n: 0,
+        }
+    }
+    fn finish(&self) -> (u64, u64) {
+        let mut h = self.h.clone();
+        h.write_u64(self.n);
+        (h.finish(), self.n)
+    }
+}
+
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let k = self.inner.write(buf)?;
+        self.h.write(&buf[..k]);
+        self.n += k as u64;
+        Ok(k)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn hash(b: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
-    b.hash(&mut h);
-    h.finish()
+    let mut w = HashWriter::new(std::io::sink());
+    let _ = w.write_all(b);
+    w.finish().0
 }
 
 pub fn now_secs() -> u64 {
@@ -113,6 +169,7 @@ impl Persister {
         let e = self.entries.entry(name.to_string()).or_default();
         e.written_hash = Some(hash(&data));
         e.written_at = mtime;
+        e.written_size = data.len() as u64;
         Some(data)
     }
 
@@ -120,7 +177,25 @@ impl Persister {
     pub fn stage(&mut self, name: &str, data: Vec<u8>) {
         let h = hash(&data);
         let e = self.entries.entry(name.to_string()).or_default();
-        e.pending = if e.written_hash == Some(h) { None } else { Some((h, data)) };
+        e.pending = if e.written_hash == Some(h) {
+            None
+        } else {
+            Some(Pending::Bytes(h, data))
+        };
+    }
+
+    /// 登記「有變動、要寫的時候這樣產生內容」（大檔用）：只記住產生的方法，不先序列化。
+    /// 內容在真的寫入那一刻才產生，所以寫出去的是當時最新的狀態
+    pub fn stage_stream(&mut self, name: &str, f: StreamFn) {
+        self.entries.entry(name.to_string()).or_default().pending = Some(Pending::Stream(f));
+    }
+
+    /// 依內容種類登記
+    pub fn stage_snapshot(&mut self, name: &str, s: Snapshot) {
+        match s {
+            Snapshot::Bytes(b) => self.stage(name, b),
+            Snapshot::Stream(f) => self.stage_stream(name, f),
+        }
     }
 
     /// 定時呼叫：到了間隔、而且今天的寫入量還沒超過上限的才寫
@@ -149,7 +224,11 @@ impl Persister {
         for name in names {
             let (due, size) = {
                 let e = &self.entries[&name];
-                let size = e.pending.as_ref().map(|p| p.1.len() as u64).unwrap_or(0);
+                let size = match &e.pending {
+                    Some(Pending::Bytes(_, d)) => d.len() as u64,
+                    Some(Pending::Stream(_)) => e.written_size,
+                    None => 0,
+                };
                 (
                     e.written_at == 0 || now.saturating_sub(e.written_at) >= self.policy.min_interval,
                     size,
@@ -162,14 +241,22 @@ impl Persister {
                 }
                 continue;
             }
-            let (h, data) = self.entries.get_mut(&name).unwrap().pending.take().unwrap();
-            if let Err(e) = write_atomic(&self.path(&name), &data) {
-                self.entries.get_mut(&name).unwrap().pending = Some((h, data));
-                return Err(e);
-            }
+            let pending = self.entries.get_mut(&name).unwrap().pending.take().unwrap();
+            let r = match &pending {
+                Pending::Bytes(h, data) => write_atomic(&self.path(&name), data).map(|_| (*h, data.len() as u64)),
+                Pending::Stream(f) => write_atomic_with(&self.path(&name), &mut |w| f(w)),
+            };
+            let (h, size) = match r {
+                Ok(x) => x,
+                Err(e) => {
+                    self.entries.get_mut(&name).unwrap().pending = Some(pending);
+                    return Err(e);
+                }
+            };
             let e = self.entries.get_mut(&name).unwrap();
             e.written_hash = Some(h);
             e.written_at = now;
+            e.written_size = size;
             self.stats.bytes_today += size;
             self.stats.writes_today += 1;
             n += 1;
@@ -184,26 +271,40 @@ impl Persister {
 /// 社群私鑰、含私鑰的備份暫存檔，其餘的快照（查過的網域、統計）也不該讓同一台機器的其他帳號讀到。
 /// 暫存檔一開始就用 0600 建立（不是寫完才改權限），所以私鑰不會有短暫可讀的空窗。
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, &mut |w| w.write_all(data)).map(|_| ())
+}
+
+/// 同 `write_atomic`，內容由 `f` 邊產生邊寫進暫存檔（經過緩衝）。回傳（內容雜湊，大小）
+pub fn write_atomic_with(path: &Path, gen: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<(u64, u64)> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    {
+    let out = {
         let mut o = std::fs::OpenOptions::new();
         o.write(true).create(true).truncate(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-        let mut f = o.open(&tmp)?;
+        let f = o.open(&tmp)?;
         // 上次留下來的暫存檔可能是舊版用 0644 建的：mode() 只在新建時有效，這裡再收緊一次
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        f.write_all(data)?;
+        let mut w = HashWriter::new(std::io::BufWriter::with_capacity(64 * 1024, f));
+        if let Err(e) = gen(&mut w).and_then(|_| w.flush()) {
+            drop(w);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        let out = w.finish();
+        let f = w.inner.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+        out
+    };
+    std::fs::rename(&tmp, path)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -294,6 +395,80 @@ mod tests {
         d.stage("a", vec![1; 4096]);
         d.stage("b", vec![2; 4096]);
         assert_eq!(d.flush(t).unwrap(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hash_is_chunk_independent() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut w = HashWriter::new(std::io::sink());
+        for c in data.chunks(997) {
+            w.write_all(c).unwrap();
+        }
+        assert_eq!(w.finish(), (hash(&data), data.len() as u64));
+        assert_ne!(hash(b"ab"), hash(b"abc"));
+    }
+
+    #[test]
+    fn stream_generates_at_write_time() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = tmpdir("s");
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096, false));
+        let calls = Arc::new(AtomicU32::new(0));
+        let ver = Arc::new(AtomicU32::new(1));
+        let gen = |calls: &Arc<AtomicU32>, ver: &Arc<AtomicU32>| -> StreamFn {
+            let (calls, ver) = (calls.clone(), ver.clone());
+            Arc::new(move |w: &mut dyn Write| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                for _ in 0..1000 {
+                    write!(w, "v{};", ver.load(Ordering::SeqCst))?;
+                }
+                Ok(())
+            })
+        };
+        let t0 = 1_000_000;
+        p.stage_stream("cdn-domains.json", gen(&calls, &ver));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "登記時不產生內容");
+        assert_eq!(p.stats().pending, 1);
+        assert_eq!(p.flush(t0).unwrap(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(dir.join("cdn-domains.json")).unwrap(), b"v1;".repeat(1000));
+        assert_eq!(p.stats().bytes_today, 3000);
+
+        // 等間隔的期間內容又變了：寫出去的是寫入那一刻的內容
+        p.stage_stream("cdn-domains.json", gen(&calls, &ver));
+        ver.store(2, Ordering::SeqCst);
+        assert_eq!(p.flush(t0 + 3600).unwrap(), 0, "未滿 6 小時不寫");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "沒寫就不產生");
+        assert_eq!(p.flush(t0 + 6 * 3600).unwrap(), 1);
+        assert_eq!(std::fs::read(dir.join("cdn-domains.json")).unwrap(), b"v2;".repeat(1000));
+
+        // 產生到一半失敗：舊檔不動、不留暫存檔，下次再寫
+        p.stage_stream(
+            "cdn-domains.json",
+            Arc::new(|w: &mut dyn Write| {
+                w.write_all(b"half")?;
+                Err(std::io::Error::other("中斷"))
+            }),
+        );
+        assert!(p.flush_all(t0 + 7 * 3600).is_err());
+        assert_eq!(std::fs::read(dir.join("cdn-domains.json")).unwrap(), b"v2;".repeat(1000));
+        assert!(!dir.join("cdn-domains.tmp").exists());
+        assert_eq!(p.stats().pending, 1);
+
+        // 每日上限用上次寫入的大小估算
+        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4, false)); // 每天 4 KB
+        assert!(q.load("cdn-domains.json").is_some());
+        q.stage("a", vec![1; 2000]);
+        q.stage_stream("cdn-domains.json", gen(&calls, &ver));
+        let before = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            q.flush(now_secs() + 7 * 3600).unwrap(),
+            1,
+            "a 先寫，資料庫（約 3 KB）超過今天的上限"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before, "延後的不產生內容");
+        assert_eq!(q.stats().deferred, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

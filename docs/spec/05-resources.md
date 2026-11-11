@@ -158,7 +158,7 @@ USB 隨身碟也算 Flash，但通常容量大、可以更換，判定為 `disk`
 | `resolver.parallel`（同時問幾個上游） | 2 | 3 | 0（全部） | 0（全部） |
 | `iprank.concurrency` | 8 | 16 | 32 | 64 |
 | `cdn.verifyConcurrency` | 2 | 4 | 6 | 8 |
-| `cdn.maxEntries` | 20,000 | 60,000 | 150,000 | 200,000 |
+| `cdn.maxEntries`（見下方說明） | 5,000 | 7,000 | 150,000 | 200,000 |
 | `cdn.qualityIntervalMin` | 15 | 10 | 5 | 5 |
 | `benchmark.concurrency` | 8 | 16 | 32 | 50 |
 | `scan.concurrency` | 32 | 100 | 200 | 400 |
@@ -170,6 +170,12 @@ USB 隨身碟也算 Flash，但通常容量大、可以更換，判定為 `disk`
 | `system.queryLogRing`（記憶體裡保留幾筆查詢紀錄） | 200 | 1,000 | 5,000 | 20,000 |
 | `community.maxBundleMB` | 4 | 8 | 32 | 32 |
 | `community.maxFriends` | 10 | 20 | 50 | 50 |
+
+`cdn.maxEntries` 的依據（實測，`bench_db_size`）：快照檔每筆約 545 B，載入後常駐記憶體每筆約 850 B（x86_64，32 位元平台更少）。
+tiny 5,000 筆 ≈ 快照 2.7 MB、記憶體約 4 MB，在 24 MB 常駐目標內；small 7,000 筆 ≈ 快照 3.8 MB。
+兩者都在預設的每日 Flash 寫入上限（`system.flashWriteBudgetKB` 4 MB）內，每天至少能寫一次；
+以前的 20,000 / 60,000 筆是 11 / 33 MB，平常永遠超過上限、只有關機才寫得出去。
+種子資料（約 4,000 筆）兩個等級都放得下。網域資料庫的快照是要寫的時候才邊序列化邊寫進檔案，整份 JSON 不會放在記憶體裡。
 
 ## 8. 驗收
 

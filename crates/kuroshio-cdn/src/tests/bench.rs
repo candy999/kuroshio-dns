@@ -210,3 +210,47 @@ fn bench_snapshot_stall() {
     });
     println!("到達上限時新增一筆（觸發整理）：{:.1} ms", t.elapsed().as_micros() as f64 / 1000.0);
 }
+
+/// 常駐記憶體（KB，Linux 才有）
+fn rss_kb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let l = s.lines().find(|l| l.starts_with("VmRSS:"))?;
+    l.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// 每筆網域在快照檔與記憶體裡各佔多少（決定各等級 `cdn.maxEntries` 用）
+#[test]
+#[ignore]
+fn bench_db_size() {
+    let c = seeded();
+    let n = 50_000usize;
+    let bytes = c.with_state(|st| {
+        let base: Vec<crate::db::Domain> = st.db.domains.values().cloned().collect();
+        let mut i = 0usize;
+        while st.db.domains.len() < n {
+            let mut d = base[i % base.len()].clone();
+            let name: Arc<str> = Arc::from(format!("n{i}.{}", d.name).as_str());
+            d.name = name.clone();
+            st.db.domains.insert(name, d);
+            i += 1;
+        }
+        st.db.domains_json()
+    });
+    drop(c);
+    // 第一份先用掉剛放掉的記憶體，量第二份（要新配置）才準
+    let mut warm = crate::db::Db::new(1_000_000);
+    warm.load_domains(&bytes, false).unwrap();
+    let before = rss_kb();
+    let mut db = crate::db::Db::new(1_000_000);
+    db.load_domains(&bytes, false).unwrap();
+    let after = rss_kb();
+    std::hint::black_box(&warm);
+    println!(
+        "{n} 筆：快照 {:.1} MB（{} B/筆）；載入後常駐記憶體 +{} KB（約 {} B/筆）",
+        bytes.len() as f64 / 1e6,
+        bytes.len() / n,
+        after.unwrap_or(0).saturating_sub(before.unwrap_or(0)),
+        after.unwrap_or(0).saturating_sub(before.unwrap_or(0)) * 1024 / n as u64
+    );
+    std::hint::black_box(&db);
+}

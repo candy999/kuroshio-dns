@@ -430,10 +430,12 @@ impl Cdn {
 
     // ------------------------------------------------------------ 快照
 
-    fn collect(&self, all: bool) -> Vec<(String, Vec<u8>)> {
+    /// `stream` = 網域資料庫不序列化，只回報有沒有變動（由呼叫端用 `write_domains` 邊寫邊產生）
+    fn collect(&self, all: bool, stream: bool) -> (Vec<(String, Vec<u8>)>, bool) {
         let mut out = Vec::new();
         // 網域資料庫（可能有 20 萬筆、上百 MB）分批寫：每批只拿一下鎖，查詢不會被整個擋住
         let mut dump = None;
+        let mut db_dirty = false;
         {
             let mut st = self.state();
             let st = &mut *st;
@@ -445,7 +447,10 @@ impl Cdn {
                 st.v6.dirty = false;
                 out.push((v6store::FILE.to_string(), st.v6.to_json()));
             }
-            if all {
+            if stream {
+                db_dirty = all || st.db.dirty;
+                st.db.dirty = false;
+            } else if all {
                 // 關機：一次寫完（已經沒有查詢了，內容也要是同一個時間點的）
                 st.db.dirty = false;
                 out.push((db::FILE.to_string(), st.db.domains_json()));
@@ -462,32 +467,61 @@ impl Cdn {
                 out.push((pools::ZONE_FILE.to_string(), st.pools.zone_json()));
             }
         }
-        if let Some((at, (mut buf, tail, mut keys))) = dump {
-            Db::dump_sort(&mut keys); // 不拿鎖
-            let mut first = true;
-            for chunk in keys.chunks(DUMP_CHUNK) {
-                self.state().db.dump_chunk(chunk, &mut buf, &mut first);
-                // 鎖已經放開：停一下讓等著的查詢先拿到鎖。只 yield 不夠——等的人被叫醒要幾十微秒，
-                // 這邊馬上又把鎖拿走，查詢會一路等到整份寫完（實測 20 萬筆還是被擋 400 ms）
-                std::thread::sleep(std::time::Duration::from_micros(100));
-            }
+        if let Some((at, (mut buf, tail, keys))) = dump {
+            let mut w = |b: &[u8]| -> std::io::Result<()> {
+                buf.extend_from_slice(b);
+                Ok(())
+            };
+            let _ = self.dump_rest(keys, &mut w);
             buf.extend_from_slice(&tail);
             out.insert(at, (db::FILE.to_string(), buf)); // 順序跟一次寫完時一樣
         }
-        out
+        (out, db_dirty)
+    }
+
+    /// 分批把網域接到後面（`dump_begin` 之後）：每批只拿一下鎖
+    fn dump_rest(&self, mut keys: db::DumpKeys, w: &mut dyn FnMut(&[u8]) -> std::io::Result<()>) -> std::io::Result<()> {
+        Db::dump_sort(&mut keys); // 不拿鎖
+        let mut first = true;
+        let mut buf = Vec::new();
+        for chunk in keys.chunks(DUMP_CHUNK) {
+            buf.clear();
+            self.state().db.dump_chunk(chunk, &mut buf, &mut first);
+            w(&buf)?;
+            // 鎖已經放開：停一下讓等著的查詢先拿到鎖。只 yield 不夠——等的人被叫醒要幾十微秒，
+            // 這邊馬上又把鎖拿走，查詢會一路等到整份寫完（實測 20 萬筆還是被擋 400 ms）
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        Ok(())
     }
 
     /// 上次取出之後有變動的狀態檔：（相對於狀態目錄的路徑，內容）。
     /// 內容是 2.x 相容的 JSON（不縮排）。網域資料庫可能很大（20 萬筆約 110 MB、要半秒）：分批序列化，
     /// 每批只拿一下鎖，查詢不會被擋住；但還是要花那麼多 CPU 與記憶體，不要太常呼叫（幾分鐘一次就好）。
     /// 分批期間有變動的網域，內容以寫到它的那一刻為準，下次呼叫會再寫一次。
+    /// 正式執行時用 `snapshots_stream`（網域資料庫不整份放在記憶體）
     pub fn snapshots(&self) -> Vec<(String, Vec<u8>)> {
-        self.collect(false)
+        self.collect(false, false).0
     }
 
     /// 全部的狀態檔（關機時）
     pub fn snapshots_all(&self) -> Vec<(String, Vec<u8>)> {
-        self.collect(true)
+        self.collect(true, false).0
+    }
+
+    /// 同 `snapshots`，但不含網域資料庫，只回報它有沒有變動（`all` = 全部都算有變動）。
+    /// 網域資料庫要寫的時候用 `write_domains` 直接寫進檔案，整份 JSON 不會放在記憶體裡
+    pub fn snapshots_stream(&self, all: bool) -> (Vec<(String, Vec<u8>)>, bool) {
+        self.collect(all, true)
+    }
+
+    /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，
+    /// 記憶體裡只有一批（256 筆）的內容
+    pub fn write_domains(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let (head, tail, keys) = self.state().db.dump_begin();
+        w.write_all(&head)?;
+        self.dump_rest(keys, &mut |b| w.write_all(b))?;
+        w.write_all(&tail)
     }
 
     /// 記憶體不足（規格 05 第 3.2 節的看門狗）：網域資料庫刪到剩 `keep_ratio`（例如 0.5）

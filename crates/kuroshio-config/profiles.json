@@ -11,7 +11,7 @@
     },
     "cdn": {
       "verifyConcurrency": 2,
-      "maxEntries": 20000,
+      "maxEntries": 5000,
       "qualityIntervalMin": 15,
       "healthIntervalMin": 60,
       "zoneMax": 2000,
@@ -63,7 +63,7 @@
     },
     "cdn": {
       "verifyConcurrency": 4,
-      "maxEntries": 60000,
+      "maxEntries": 7000,
       "qualityIntervalMin": 10,
       "zoneMax": 4000,
       "v6NodesMax": 800
