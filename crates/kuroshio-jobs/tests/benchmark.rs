@@ -114,6 +114,7 @@ fn paths(root: &Path) -> BenchPaths {
         out_root: Some(root.join("state/benchmark")),
         upstreams_file: root.join("state/upstreams.json"),
         community_candidates: Some(root.join("state/community/upstream-candidates.json")),
+        blacklist_file: Some(root.join("state/blacklist.txt")),
     }
 }
 
@@ -240,8 +241,10 @@ async fn end_to_end_with_mock_servers() {
     assert_eq!(up["skippedTypes"], json!({ "dnscrypt": 1, "doh": 1, "doh3": 1, "doq": 1 }));
     assert!(up["generatedAt"].as_str().unwrap().starts_with("2026-11-10T04:00:00"));
 
-    // 汙染的加入永久黑名單
-    let bl = std::fs::read_to_string(list.join("blacklist.txt")).unwrap();
+    // 汙染的加入永久黑名單：寫在 state（升級不會被蓋掉），程式附帶的名單不動
+    let shipped = std::fs::read_to_string(list.join("blacklist.txt")).unwrap();
+    assert_eq!(shipped, format!("# 黑名單\n{s10}  # 測試\n"));
+    let bl = std::fs::read_to_string(root.join("state/blacklist.txt")).unwrap();
     assert!(
         bl.contains(&format!("{s3}  # 2026-11-10 汙染：www.alpha.com → Evil_Corp__AS666_Evil_Corp")),
         "{bl}"

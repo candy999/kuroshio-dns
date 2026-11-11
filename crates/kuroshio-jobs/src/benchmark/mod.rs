@@ -63,6 +63,9 @@ pub struct BenchPaths {
     pub upstreams_file: PathBuf,
     /// 社群好友提供的上游候選（`state/community/upstream-candidates.json`）
     pub community_candidates: Option<PathBuf>,
+    /// 自己評測學到的永久黑名單（`state/blacklist.txt`）；程式附帶的 `list_dir/blacklist.txt` 是唯讀的基本名單，
+    /// 學到的寫在 state，升級套件不會被蓋掉
+    pub blacklist_file: Option<PathBuf>,
 }
 
 impl BenchPaths {
@@ -81,6 +84,7 @@ impl BenchPaths {
             out_root: Some(r(&s("benchmark.outDir", "./state/benchmark"))),
             upstreams_file: r(&s("upstream.autoStateFile", "./state/upstreams.json")),
             community_candidates: Some(r("./state/community/upstream-candidates.json")),
+            blacklist_file: Some(r("./state/blacklist.txt")),
         }
     }
 }
@@ -492,8 +496,10 @@ impl Benchmark {
         let now = ctx.now_ms();
         let today = local_date_str(now);
         let out_dir = self.paths.out_root.as_ref().map(|r| r.join(&today));
-        let bl_file = self.paths.list_dir.join("blacklist.txt");
-        let mut blacklist = read_blacklist(&bl_file);
+        let base_bl = self.paths.list_dir.join("blacklist.txt");
+        let bl_file = self.paths.blacklist_file.clone().unwrap_or_else(|| base_bl.clone());
+        let mut blacklist = read_blacklist(&base_bl);
+        blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
 
         // 候選：固定上游在前；同一個上游（正規化後）只測一次
