@@ -163,6 +163,8 @@ pub struct Resolver {
     pub site: std::sync::OnceLock<Arc<crate::site::Site>>,
     /// 「這台裝置有沒有在用」偵測
     pub presence: std::sync::OnceLock<Arc<crate::presence::Presence>>,
+    /// 來源 IP 存取控制（規格 08）；沒設定 = 不擋
+    pub access: std::sync::OnceLock<Arc<crate::ipfilter::Access>>,
     /// 本機對外 IP 的 /24（啟動後偵測）
     pub ecs_subnet: RwLock<Option<(IpAddr, u8)>>,
     inflight: Mutex<HashMap<String, Waiters>>,
@@ -220,6 +222,7 @@ impl Resolver {
             community: Default::default(),
             site: std::sync::OnceLock::new(),
             presence: std::sync::OnceLock::new(),
+            access: std::sync::OnceLock::new(),
             ecs_subnet: RwLock::new(None),
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
@@ -227,6 +230,16 @@ impl Resolver {
             base: Instant::now(),
             errors: Mutex::new((0, Vec::new())),
         })
+    }
+
+    /// 存取控制：這個服務允不允許這個來源（沒設定 = 允許）
+    pub fn access_allows(&self, k: crate::ipfilter::Kind, ip: IpAddr) -> bool {
+        self.access.get().map(|a| a.allow(k, ip)).unwrap_or(true)
+    }
+
+    /// 存取控制：連線剛接受時（同一個埠上的服務都要擋才擋，見 `Access::gate`）
+    pub fn access_gate(&self, kinds: &[crate::ipfilter::Kind], ip: IpAddr) -> bool {
+        self.access.get().map(|a| a.gate(kinds, ip)).unwrap_or(true)
     }
 
     pub fn set_filter(&self, f: Option<Arc<dyn FilterCheck>>) {

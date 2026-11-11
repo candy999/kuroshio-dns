@@ -585,8 +585,18 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "listenersDetail": st.encrypted.detail_json(),
                 "dohMode": st.encrypted.doh_mode,
                 "doh3Provider": st.encrypted.doh3_provider,
+                "access": r.access.get().map(|a| a.status_json()),
             }))
         }
+        // 來源 IP 存取控制（規格 08）；?ip= 說明這個 IP 的判斷結果
+        "/api/access" => match (r.access.get(), q.get("ip")) {
+            (None, _) => ok(json!({ "mode": "open", "active": false })),
+            (Some(a), None) => ok(a.api_json()),
+            (Some(a), Some(ip)) => match ip.trim().parse::<std::net::IpAddr>() {
+                Ok(ip) => ok(a.check_json(ip)),
+                Err(_) => bad("IP 格式錯誤", 400),
+            },
+        },
         "/api/upstreams" => ok(r.upstreams.list_json()),
         "/api/benchmark" => ok(std::fs::read(r.upstreams.state_file())
             .ok()

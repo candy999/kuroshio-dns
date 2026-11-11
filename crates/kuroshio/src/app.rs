@@ -734,6 +734,9 @@ fn start_community(
         }
     };
     resolver.community.set(node.clone());
+    if let Some(a) = resolver.access.get() {
+        crate::community_bridge::spawn_friend_ips(Arc::downgrade(&node), a.clone());
+    }
     if let Some(cdn) = &cdn {
         cdn.set_hints(Some(Arc::new(crate::community_bridge::CommunityHints(Arc::downgrade(&node)))));
     }
@@ -1180,6 +1183,13 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
     // （apply_seeds 自己會記錄帶入了哪些）
     let _ = kuroshio_jobs::apply_seeds(&persist_dir(cfg), &share_dir(cfg).join("seed"));
     let resolver = build_resolver(cfg)?;
+    // 來源 IP 存取控制（規格 08）：在任何監聽啟動之前
+    let access = {
+        let saved = persister.lock().unwrap().load(crate::ipfilter::STATE_FILE);
+        crate::ipfilter::Access::from_cfg(cfg, &share_dir(cfg), saved)
+    };
+    let _ = resolver.access.set(access.clone());
+    crate::ipfilter::spawn_tasks(access, persister.clone());
     // 統計歷史（公開頁 7 / 30 天）：重開機後接續
     if tiny {
         resolver.stats.set_limits(crate::stats::Limits::tiny());

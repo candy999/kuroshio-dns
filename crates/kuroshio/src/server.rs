@@ -3,6 +3,7 @@
 //! 查詢交給 `Resolver`（過濾、快取、並行上游、IP 測速）。
 
 use crate::acl::Acl;
+use crate::ipfilter::Kind;
 use crate::resolver::{Ctx, Resolver};
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -70,7 +71,7 @@ impl Server {
                     continue;
                 }
             };
-            if !open && !self.acl.allows(peer.ip()) {
+            if !open && !(self.acl.allows(peer.ip()) && self.resolver.access_allows(Kind::Plain, peer.ip())) {
                 continue; // 不在允許清單：不回應
             }
             let q = buf[..n].to_vec();
@@ -97,7 +98,7 @@ impl Server {
                     continue;
                 }
             };
-            if !open && !self.acl.allows(peer.ip()) {
+            if !open && !(self.acl.allows(peer.ip()) && self.resolver.access_allows(Kind::Plain, peer.ip())) {
                 continue;
             }
             let me = self.clone();

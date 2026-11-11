@@ -69,6 +69,25 @@
     "ddr": false,
     "proxyProtocol": false
   },
+  "access": {
+    "mode": "taiwan",
+    "groups": [
+      "*"
+    ],
+    "allow": [],
+    "deny": [],
+    "applyTo": [
+      "dot",
+      "doh",
+      "doq",
+      "doh3",
+      "site"
+    ],
+    "log": true,
+    "autoUpdate": false,
+    "updateUrl": "https://raw.githubusercontent.com/candy999/kuroshio-dns/main/data/geo/tw-ip.json",
+    "dataFile": ""
+  },
   "site": {
     "enabled": false,
     "hostname": "",

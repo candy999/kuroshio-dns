@@ -74,7 +74,7 @@ call)
 	api)
 		read_input
 		case "$P_PATH" in
-		/api/status|/api/sysinfo|/api/upstreams|/api/benchmark|/api/cdn/pools|/api/cdn/v6nodes|/api/cdn/summary|/api/cdn/domains|/api/jobs|/api/trace|/api/filter/check|/api/routing|/api/ddns|/api/paths|/api/interfaces) ;;
+		/api/status|/api/access|/api/sysinfo|/api/upstreams|/api/benchmark|/api/cdn/pools|/api/cdn/v6nodes|/api/cdn/summary|/api/cdn/domains|/api/jobs|/api/trace|/api/filter/check|/api/routing|/api/ddns|/api/paths|/api/interfaces) ;;
 		/api/community/status|/api/community/peers|/api/community/events) ;;
 		*) echo '{"ok":false,"error":"不允許的路徑"}'; exit 0 ;;
 		esac

@@ -167,6 +167,9 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
     tokio::spawn(async move {
         loop {
             let Ok((tcp, peer)) = l.accept().await else { continue };
+            if !crate::ipfilter::accept_dot(&resolver, peer.ip()) {
+                continue; // 存取控制：直接關閉，不做 TLS 握手
+            }
             let Some(permit) = limits.admit() else {
                 debug!("DoT 連線數已滿或記憶體不足，拒絕 {peer}");
                 continue;
@@ -181,7 +184,11 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
                 let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(10), acc.accept(tcp)).await else {
                     return;
                 };
-                if s.get_ref().1.alpn_protocol() == Some(kuroshio_community::ALPN) {
+                let community = s.get_ref().1.alpn_protocol() == Some(kuroshio_community::ALPN);
+                if !crate::ipfilter::after_alpn(&r, crate::ipfilter::Kind::Dot, community, peer.ip()) {
+                    return;
+                }
+                if community {
                     if let Some(c) = r.community.get().cloned() {
                         c.serve_stream(s, peer.ip()).await;
                     }
@@ -310,6 +317,11 @@ pub async fn doh_core(
     if req.path == "/robots.txt" {
         return txt(StatusCode::OK, "User-agent: *\nDisallow: /\n");
     }
+    // 存取控制（請求層級：反向代理時才知道真正的來源；同一個埠上的服務各自判斷）
+    let site_ok = match crate::ipfilter::request_check(r, &req.path, &opts.path, proto, client) {
+        Some(ok) => ok,
+        None => return txt(StatusCode::FORBIDDEN, "forbidden\n"),
+    };
     // 社群共享 v2（HTTPS 管道）
     if req.path.starts_with(kuroshio_community::BASE_PATH) {
         if let Some(c) = r.community.get() {
@@ -325,7 +337,7 @@ pub async fn doh_core(
         }
     }
     // 公開頁（首頁、詳細頁、/api/public/*、描述檔）：不是 DoH 查詢的 GET / HEAD 都先問它
-    if let Some(site) = r.site.get() {
+    if let Some(site) = r.site.get().filter(|_| site_ok) {
         if let Some(resp) = site
             .handle(
                 req.method.as_str(),
@@ -451,6 +463,9 @@ pub async fn listen_doh(
     tokio::spawn(async move {
         loop {
             let Ok((tcp, peer)) = l.accept().await else { continue };
+            if !crate::ipfilter::accept_doh(&resolver, peer.ip()) {
+                continue; // 存取控制：直接關閉，不做 TLS 握手
+            }
             let Some(permit) = limits.admit() else { continue };
             if certs.as_ref().map(|c| !c.ready()).unwrap_or(false) {
                 continue;
@@ -526,6 +541,10 @@ pub async fn listen_doq(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
     info!("DoQ 監聽 UDP {bound}");
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
+            if !crate::ipfilter::accept_doq(&resolver, incoming.remote_address().ip()) {
+                incoming.ignore(); // 存取控制：不回任何封包
+                continue;
+            }
             let Some(permit) = limits.admit() else {
                 incoming.refuse();
                 continue;
@@ -539,7 +558,11 @@ pub async fn listen_doq(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
                     .handshake_data()
                     .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
                     .and_then(|h| h.protocol);
-                if proto.as_deref() == Some(kuroshio_community::ALPN) {
+                let community = proto.as_deref() == Some(kuroshio_community::ALPN);
+                if !crate::ipfilter::after_alpn(&r, crate::ipfilter::Kind::Doq, community, client) {
+                    return;
+                }
+                if community {
                     if let Some(c) = r.community.get().cloned() {
                         c.serve_quic(conn, client).await;
                     }
@@ -584,6 +607,10 @@ pub async fn listen_doh3(
     let opts = Arc::new(opts);
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
+            if !crate::ipfilter::accept_doh3(&resolver, incoming.remote_address().ip()) {
+                incoming.ignore(); // 存取控制：不回任何封包
+                continue;
+            }
             let Some(permit) = limits.admit() else {
                 incoming.refuse();
                 continue;

@@ -182,3 +182,63 @@ impl Slot {
         self.0.get()
     }
 }
+
+/// 好友的網域與最近一次連線的來源 IP（`peers_json` 裡 rel = friend 的）
+pub fn friend_targets(peers: &serde_json::Value) -> (Vec<String>, Vec<IpAddr>) {
+    let (mut domains, mut ips) = (Vec::new(), Vec::new());
+    for p in peers.as_array().into_iter().flatten() {
+        if p.get("rel").and_then(serde_json::Value::as_str) != Some("friend") {
+            continue;
+        }
+        if let Some(d) = p.get("domain").and_then(serde_json::Value::as_str) {
+            domains.push(d.to_string());
+        }
+        if let Some(ip) = p
+            .pointer("/info/ip")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse().ok())
+        {
+            ips.push(ip);
+        }
+    }
+    (domains, ips)
+}
+
+/// 存取控制（規格 08）：好友目前的 IP 永遠允許。每 10 分鐘解析一次好友網域（A / AAAA）
+pub fn spawn_friend_ips(node: Weak<Community>, access: Arc<crate::ipfilter::Access>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(n) = node.upgrade() else { return };
+            let (domains, mut ips) = friend_targets(&n.peers_json());
+            drop(n);
+            for d in domains {
+                let look = tokio::net::lookup_host((d.as_str(), 443));
+                if let Ok(Ok(addrs)) = tokio::time::timeout(std::time::Duration::from_secs(5), look).await {
+                    ips.extend(addrs.map(|a| a.ip()));
+                }
+            }
+            ips.sort();
+            ips.dedup();
+            access.set_friends(&ips);
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::friend_targets;
+    use serde_json::json;
+
+    #[test]
+    fn only_friends_are_listed() {
+        let peers = json!([
+            { "domain": "a.example.com", "rel": "friend", "info": { "ip": "203.0.113.5" } },
+            { "domain": "b.example.com", "rel": "in", "info": { "ip": "198.51.100.1" } },
+            { "domain": "c.example.net", "rel": "friend", "info": {} }
+        ]);
+        let (d, ips) = friend_targets(&peers);
+        assert_eq!(d, vec!["a.example.com", "c.example.net"]);
+        assert_eq!(ips, vec!["203.0.113.5".parse::<std::net::IpAddr>().unwrap()]);
+    }
+}

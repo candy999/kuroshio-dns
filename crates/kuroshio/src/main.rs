@@ -210,6 +210,33 @@ enum Cmd {
         #[arg(long)]
         ca: Option<PathBuf>,
     },
+    /// 來源 IP 存取控制（只開放台灣 / 自訂名單）
+    Access {
+        #[command(subcommand)]
+        cmd: AccessCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccessCmd {
+    /// 這個 IP 能不能連進來、符合哪一條規則（不含社群好友的 IP：那要服務執行中才知道）
+    Check {
+        ip: std::net::IpAddr,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// JSON 格式
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出群組（ISP）、大小、是否生效
+    Groups {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
 }
 
 fn default_config_path() -> PathBuf {
@@ -609,6 +636,38 @@ fn user_config(config: &std::path::Path, uci: bool) -> Result<serde_json::Value>
     }
 }
 
+/// `kuroshio access …`：照設定載入存取控制（台灣 IP 資料、本機網段），不啟動服務
+fn access_cmd(cmd: AccessCmd) -> Result<()> {
+    let (config, uci) = match &cmd {
+        AccessCmd::Check { config, uci, .. } | AccessCmd::Groups { config, uci } => (config.clone(), *uci),
+    };
+    let (cfg, ..) = effective(&config, uci)?;
+    let saved = std::fs::read(kuroshio::app::persist_dir(&cfg).join(kuroshio::ipfilter::STATE_FILE)).ok();
+    let a = kuroshio::ipfilter::Access::from_cfg(&cfg, &kuroshio::app::share_dir(&cfg), saved);
+    match cmd {
+        AccessCmd::Check { ip, json, .. } => {
+            let v = a.check_json(ip);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!(
+                    "{ip}：{}（{}）
+模式 {}，套用在 {}",
+                    if v["allowed"] == true { "允許" } else { "拒絕" },
+                    v["reason"].as_str().unwrap_or(""),
+                    v["mode"].as_str().unwrap_or(""),
+                    v["applyTo"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("、"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        AccessCmd::Groups { .. } => println!("{}", serde_json::to_string_pretty(&a.api_json())?),
+    }
+    Ok(())
+}
+
 fn effective(config: &std::path::Path, uci: bool) -> Result<(serde_json::Value, Tier, bool, SysInfo)> {
     let user = user_config(config, uci)?;
     let info = SysInfo::detect();
@@ -657,6 +716,7 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
         Cmd::Sysinfo { config, uci } => sysinfo_report(&config, uci)?,
+        Cmd::Access { cmd } => access_cmd(cmd)?,
         Cmd::Paths { config, uci } => {
             let (cfg, ..) = effective(&config, uci)?;
             let file = (!uci).then(|| std::fs::canonicalize(&config).unwrap_or(config));

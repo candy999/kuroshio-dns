@@ -559,6 +559,15 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     );
     out.insert("community".into(), Value::Object(cm));
 
+    // ---------------- 來源 IP 存取控制（規格 08） ----------------
+    // `config access 'access'`：mode、list groups、list allow、list deny、list apply_to、log、auto_update。
+    // 沒有這個區段 = 內建預設（只開放台灣）；`option groups ''` = 一組都不勾
+    if sec("access").is_some() {
+        let mut acc = Map::new();
+        apply(&mut acc, d.get("access"), sec("access"), &[("apply_to", Some("applyTo"))]);
+        out.insert("access".into(), Value::Object(acc));
+    }
+
     // ---------------- 排程工作 ----------------
     let mut jobs = Map::new();
     for j in of_type("job") {

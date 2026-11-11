@@ -326,3 +326,30 @@ fn new_options_map_to_json() {
     assert_eq!(kuroshio_config::uci::cert_mode(&parse_text(&default_text()).unwrap()), "acme");
     assert_eq!(kuroshio_config::uci::cert_mode(&parse_text(&existing_text()).unwrap()), "manual");
 }
+
+#[test]
+fn access_section() {
+    // 沒有 access 區段：內建預設（只開放台灣、全部群組）
+    let d = load(&default_text(), &env());
+    assert_eq!(g(&d, "access.mode"), &json!("taiwan"));
+    assert_eq!(g(&d, "access.groups"), &json!(["*"]));
+    assert_eq!(g(&d, "access.applyTo"), &json!(["dot", "doh", "doq", "doh3", "site"]));
+    let text = default_text()
+        + "\nconfig access 'access'\n\toption mode 'custom'\n\tlist groups 'cht'\n\tlist groups 'tanet'\n\tlist allow '203.0.113.0/24'\n\tlist deny '198.51.100.7'\n\tlist apply_to 'dot'\n\tlist apply_to 'plain'\n\toption log '0'\n\toption auto_update '1'\n";
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "access.mode"), &json!("custom"));
+    assert_eq!(g(&c, "access.groups"), &json!(["cht", "tanet"]));
+    assert_eq!(g(&c, "access.allow"), &json!(["203.0.113.0/24"]));
+    assert_eq!(g(&c, "access.deny"), &json!(["198.51.100.7"]));
+    assert_eq!(g(&c, "access.applyTo"), &json!(["dot", "plain"]));
+    assert_eq!(g(&c, "access.log"), &json!(false));
+    assert_eq!(g(&c, "access.autoUpdate"), &json!(true));
+    assert_eq!(g(&c, "access.updateUrl"), g(&defaults(), "access.updateUrl"));
+    // option groups '' = 一組都不勾；全開放
+    let c = load(
+        &(default_text() + "\nconfig access 'access'\n\toption mode 'open'\n\toption groups ''\n"),
+        &env(),
+    );
+    assert_eq!(g(&c, "access.mode"), &json!("open"));
+    assert_eq!(g(&c, "access.groups"), &json!([]));
+}

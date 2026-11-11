@@ -126,8 +126,11 @@ const OTHER_ID: &str = "other";
 const OTHER_NAME: &str = "其他台灣網段";
 const OTHER_NOTE: &str = "登記在台灣、但不屬於上面任何一組的網段（機房、雲端、企業、小型業者）。全部勾選 = 整個台灣";
 
+/// IPv4、IPv6 的區間清單
+type Ranges = (Vec<(u32, u32)>, Vec<(u128, u128)>);
+
 /// RIR 統計檔：cc=TW 的 IPv4 / IPv6 配發
-fn parse_delegated(text: &str) -> (Vec<(u32, u32)>, Vec<(u128, u128)>) {
+fn parse_delegated(text: &str) -> Ranges {
     let (mut v4, mut v6) = (Vec::new(), Vec::new());
     for line in text.lines() {
         if line.starts_with('#') {
