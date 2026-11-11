@@ -289,13 +289,19 @@ pub fn synthetic_domains(n: usize) -> Vec<u8> {
             _ => {}
         }
     }
-    const WORDS: [&str; 12] = ["img", "static", "cdn", "api", "www", "assets", "video", "m", "media", "s", "edge", "files"];
+    const WORDS: [&str; 12] = [
+        "img", "static", "cdn", "api", "www", "assets", "video", "m", "media", "s", "edge", "files",
+    ];
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let mut d = base[i % base.len()].clone();
         let name = d["name"].as_str().unwrap().to_string();
         let w = WORDS[(rnd() % 12) as usize];
-        d["name"] = json!(if i < base.len() { name } else { format!("{w}{}.{name}", rnd() % 100_000) });
+        d["name"] = json!(if i < base.len() {
+            name
+        } else {
+            format!("{w}{}.{name}", rnd() % 100_000)
+        });
         walk(&mut d, &mut rnd);
         out.push(d);
     }
@@ -321,8 +327,24 @@ fn bench_persist() {
             t.elapsed().as_secs_f64() * 1000.0
         );
     }
+    for f in ["cdn-pools.json", "v6-nodes.json"] {
+        let b = std::fs::read(repo().join("data/seed").join(f)).unwrap();
+        let z = statefile::compress(&b);
+        println!(
+            "{f}：{} KB → {} KB（{:.1} 倍）",
+            b.len() / 1024,
+            z.len() / 1024,
+            b.len() as f64 / z.len() as f64
+        );
+    }
     let z = statefile::compress(&seed);
-    println!("種子（寫入器的設定：等級 {}、視窗 2^{}）：{} KB，{:.1} 倍", statefile::LEVEL, statefile::WINDOW_LOG, z.len() / 1024, seed.len() as f64 / z.len() as f64);
+    println!(
+        "種子（寫入器的設定：等級 {}、視窗 2^{}）：{} KB，{:.1} 倍",
+        statefile::LEVEL,
+        statefile::WINDOW_LOG,
+        z.len() / 1024,
+        seed.len() as f64 / z.len() as f64
+    );
 
     // 每筆常駐記憶體：先載入一份用掉之前放掉的記憶體，再量第二份（要新配置）才準
     {

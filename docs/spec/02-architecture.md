@@ -100,9 +100,9 @@ kuroshio check-config <file>                     檢查設定檔
 |---|---|
 | `state/upstreams.json` | 每日評測結果 |
 | `state/benchmark/` | 評測過程資料 |
-| `state/cdn-domains.json` | 每個 CDN 網站的驗證 / ECS / 跨 CDN 結果 |
-| `state/cdn/pools.json` | 台灣節點池 |
-| `state/cdn/v6-nodes.json` | 永久保存的台灣 IPv6 節點 |
+| `state/cdn/domains/`（`manifest.json`、`{N}-{i}.json.zst`） | 每個 CDN 網站的驗證 / ECS / 跨 CDN 結果，分片、zstd 壓縮（規格 05 第 5.3 節；舊版的 `state/cdn-domains.json` 啟動時自動搬過來） |
+| `state/cdn/pools.json(.zst)` | 台灣節點池 |
+| `state/cdn/v6-nodes.json(.zst)` | 永久保存的台灣 IPv6 節點 |
 | `state/cdn/harvest.json`、`ip-zone.json` | 流量收集候選、IP 區域 |
 | `state/cdn/ranges/`、`state/cdn/scan/` | CDN 官方範圍、網段分類 |
 | `state/filters/` | 訂閱清單快取 |

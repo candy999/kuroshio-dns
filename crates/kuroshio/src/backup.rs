@@ -20,9 +20,9 @@
 //! - 上游評測結果、黑名單：不匯入。上游 DNS 能決定所有答案，只能由本機自己評測；別人的黑名單可以把好的上游全部排除。
 
 use crate::persist::write_atomic;
-use kuroshio_cdn::statefile;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use kuroshio_cdn::statefile;
 use kuroshio_config::get;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1355,7 +1355,11 @@ mod tests {
             statefile::compress(&serde_json::to_vec(&pools).unwrap()),
         )
         .unwrap();
-        std::fs::write(st.join(kuroshio_cdn::db::MANIFEST), br#"{"format":"kuroshio-cdn-domains","version":1,"shards":2}"#).unwrap();
+        std::fs::write(
+            st.join(kuroshio_cdn::db::MANIFEST),
+            br#"{"format":"kuroshio-cdn-domains","version":1,"shards":2}"#,
+        )
+        .unwrap();
         for i in 0..2 {
             let names: Vec<&str> = ["a.example", "b.example", "c.example", "d.example"]
                 .into_iter()
@@ -1377,10 +1381,8 @@ mod tests {
         assert_eq!(doms[0]["xFuture"], 1, "內容原樣保留");
         // 匯入到另一台已經分片的機器
         let mut inc = b.clone();
-        inc.files.insert(
-            DOMAINS.into(),
-            Data::Json(json!({ "domains": [domain("e.example", 5, 1)] })),
-        );
+        inc.files
+            .insert(DOMAINS.into(), Data::Json(json!({ "domains": [domain("e.example", 5, 1)] })));
         let r = merge(&loc, &inc);
         assert_eq!(r["ok"], true, "{r}");
         assert!(!st.join(kuroshio_cdn::db::SHARD_DIR).exists(), "分片作廢");

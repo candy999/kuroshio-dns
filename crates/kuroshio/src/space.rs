@@ -44,7 +44,7 @@ pub fn tier_of(rel: &str) -> Tier {
         "hot-names.json",
         "import-last.json",
     ];
-    const REBUILDABLE_DIRS: [&str; 3] = ["benchmark/", "cdn/ranges/", "cdn/classify/"];
+    const REBUILDABLE_DIRS: [&str; 3] = ["benchmark/", "cdn/ranges/", "cdn/scan/"];
     if REBUILDABLE.contains(&base) || REBUILDABLE_DIRS.iter().any(|d| base.starts_with(d)) {
         return Tier::Rebuildable;
     }
@@ -238,7 +238,12 @@ mod tests {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let put = |rel: &str, n: usize| {
             std::fs::write(d.join(rel), vec![b'x'; n]).unwrap();
-            std::fs::File::options().write(true).open(d.join(rel)).unwrap().set_modified(t).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(d.join(rel))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
         };
         put("cdn/domains/16-000.json.zst", 9000);
         put("cdn/pools.json.zst", 9000);
@@ -250,7 +255,11 @@ mod tests {
         std::fs::write(&ext, vec![b'y'; 200]).unwrap();
         let list = candidates(&d, &[(ext.clone(), Tier::Log), (d.join("cdn/pools.json.zst"), Tier::Core)]);
         let tiers: Vec<Tier> = list.iter().map(|c| c.tier).collect();
-        assert_eq!(tiers, vec![Tier::Log, Tier::Log, Tier::Rebuildable, Tier::Rebuildable], "日誌先、可重建其次、核心不列");
+        assert_eq!(
+            tiers,
+            vec![Tier::Log, Tier::Log, Tier::Rebuildable, Tier::Rebuildable],
+            "日誌先、可重建其次、核心不列"
+        );
         // 一樣舊的時候大的先刪
         assert_eq!(list[2].rel, "cdn/harvest.json.zst");
         // 要 250 bytes：刪兩個日誌就夠，不動可重建的

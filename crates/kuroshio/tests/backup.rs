@@ -107,11 +107,7 @@ async fn export_import_through_running_service() {
         !share.files.contains_key("blacklist.txt") && !share.files.contains_key("upstreams.json"),
         "分享檔不含上游評測與黑名單"
     );
-    assert_eq!(
-        store_json(&state)["domains"][0]["policy"],
-        "always",
-        "匯出前把記憶體裡的狀態寫出"
-    );
+    assert_eq!(store_json(&state)["domains"][0]["policy"], "always", "匯出前把記憶體裡的狀態寫出");
     assert!(
         !state.join("cdn-domains.json").exists() && state.join("cdn/domains/manifest.json").exists(),
         "舊版單一檔案搬進分片（壓縮）後刪掉"

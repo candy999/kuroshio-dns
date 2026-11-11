@@ -520,7 +520,7 @@ pub fn read_store_json(state_dir: &std::path::Path) -> Option<Vec<u8>> {
             continue;
         };
         if legacy {
-            list.retain(|d| d.get("name").and_then(Value::as_str).is_none_or(|k| shard_of(k, n) != i));
+            list.retain(|d| d.get("name").and_then(Value::as_str).map_or(true, |k| shard_of(k, n) != i));
         }
         if let Some(Value::Array(a)) = s.remove("domains") {
             list.extend(a);

@@ -349,7 +349,15 @@ fn shards_migrate_and_track_changes() {
     assert!(ch.changed.is_empty() && ch.manifest.is_none(), "內容沒變：什麼都不用寫");
 
     // (ii) 一個驗證結果的變動只重寫一片
-    let name = c2.state().db.domains.values().find(|d| d.provider().is_some()).unwrap().name.to_string();
+    let name = c2
+        .state()
+        .db
+        .domains
+        .values()
+        .find(|d| d.provider().is_some())
+        .unwrap()
+        .name
+        .to_string();
     c2.with_state(|st| st.db.set_verdict(&name, 4, |v| v.verdict = Some(crate::util::intern("fail"))));
     let (_, ch) = c2.snapshots_sharded(false);
     assert_eq!(ch.changed, vec![(crate::db::shard_of(&name, ch.shards), true)]);

@@ -80,7 +80,11 @@ impl Policy {
     pub fn with_max_age_hours(mut self, hours: u64) -> Policy {
         self.max_age = match self.class {
             StorageClass::Flash => {
-                let h = if hours == 0 { MAX_AGE_HOURS_CAP } else { hours.clamp(1, MAX_AGE_HOURS_CAP) };
+                let h = if hours == 0 {
+                    MAX_AGE_HOURS_CAP
+                } else {
+                    hours.clamp(1, MAX_AGE_HOURS_CAP)
+                };
                 h * 3600
             }
             StorageClass::Ram | StorageClass::Disk => self.min_interval,
@@ -416,7 +420,13 @@ impl Persister {
         if self.policy.min_free > 0 {
             return self.policy.min_free;
         }
-        let largest = self.entries.values().filter(|e| e.pending.is_some()).map(Self::size_of).max().unwrap_or(0);
+        let largest = self
+            .entries
+            .values()
+            .filter(|e| e.pending.is_some())
+            .map(Self::size_of)
+            .max()
+            .unwrap_or(0);
         (largest * 2).max(MIN_FREE_FLOOR)
     }
 
@@ -454,7 +464,7 @@ impl Persister {
     fn make_room(&mut self, need: u64, keep: Option<&Path>) -> u64 {
         let list: Vec<_> = space::candidates(&self.dir, &self.extra_files)
             .into_iter()
-            .filter(|c| keep.is_none_or(|k| c.path != k))
+            .filter(|c| keep.map_or(true, |k| c.path != k))
             .collect();
         let (gone, freed) = space::free_up(list, |f| f >= need);
         for rel in gone {
@@ -474,7 +484,11 @@ impl Persister {
     fn room_for(&mut self, name: &str, size: u64) -> bool {
         let Some(free) = (self.free_probe)(&self.dir) else { return true };
         let stored = self.stored(name);
-        let rel = stored.strip_prefix(&self.dir).unwrap_or(&stored).to_string_lossy().replace('\\', "/");
+        let rel = stored
+            .strip_prefix(&self.dir)
+            .unwrap_or(&stored)
+            .to_string_lossy()
+            .replace('\\', "/");
         let tier = space::tier_of(&rel);
         // 暫存檔寫好才改名：寫的期間新舊兩份並存
         let need = size.max(4096) + 64 * 1024;
@@ -523,7 +537,7 @@ impl Persister {
                     .opts
                     .after
                     .iter()
-                    .all(|d| self.entries.get(d).is_none_or(|x| x.pending.is_none()));
+                    .all(|d| self.entries.get(d).map_or(true, |x| x.pending.is_none()));
                 if !deps_ok {
                     continue;
                 }
@@ -794,7 +808,10 @@ mod tests {
         let fixed = Policy::new(StorageClass::Flash, 120, 4096, false);
         assert_eq!(effective_interval(&fixed, mem(1024, 700)), 2 * h);
         // 硬碟：照舊 10 分鐘
-        assert_eq!(effective_interval(&Policy::new(StorageClass::Disk, 0, 4096, false), mem(4096, 3000)), 600);
+        assert_eq!(
+            effective_interval(&Policy::new(StorageClass::Disk, 0, 4096, false), mem(4096, 3000)),
+            600
+        );
     }
 
     #[test]
