@@ -1203,7 +1203,7 @@
 		var rows = [
 			['開放對象', modeText],
 			['套用在', [].concat(a.applyTo || []).map(function (k) { return ACCESS_KIND[k] || k; }).join('、') || '（沒有，不限制）'],
-			['台灣 IP 資料', a.generatedAt ? el('span', {}, [a.generatedAt + ' 的資料（' + (a.dataOrigin || '公版') + '） ', a.autoUpdate ? badge('每月在本機更新', 'ok') : badge('跟著程式升級更新', 'off'), a.update && a.update.text ? ' ' + a.update.text : ''])
+			['台灣 IP 資料', a.generatedAt ? el('span', {}, [a.generatedAt + ' 的資料（' + (a.dataOrigin || '公版') + '） ', a.localUpdate ? badge('每月在本機更新', 'ok') : badge('跟著程式升級更新', 'off'), a.update && a.update.text ? ' ' + a.update.text : ''])
 				: badge('讀不到', 'err')],
 			['已拒絕', fmtNum(dn.total) + ' 次' + (dn.total ? '（' + Object.keys(by).filter(function (k) { return by[k]; }).map(function (k) { return (ACCESS_KIND[k] || k) + ' ' + fmtNum(by[k]); }).join('、') + '）' : '')]
 		];

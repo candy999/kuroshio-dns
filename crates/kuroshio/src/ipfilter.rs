@@ -163,7 +163,9 @@ impl Settings {
             deny: strings(get(cfg, "access.deny")),
             apply,
             log: flag("log", true),
-            auto_update: flag("autoUpdate", true) && get(cfg, "jobs.tw-ip.enabled").and_then(Value::as_bool) != Some(false),
+            // `localUpdate`（預設開）：每月在本機重新產生。舊的 `autoUpdate` 意思是「從 GitHub 下載」，已經不存在，
+            // 舊設定檔裡存的 false 不再影響（不然升級後會被舊的預設值默默關掉）
+            auto_update: flag("localUpdate", true) && get(cfg, "jobs.tw-ip.enabled").and_then(Value::as_bool) != Some(false),
             data_file: s("dataFile"),
         }
     }
@@ -692,7 +694,7 @@ impl Access {
         o.insert("allow".into(), json!(self.settings.allow));
         o.insert("deny".into(), json!(self.settings.deny));
         o.insert("log".into(), json!(self.settings.log));
-        o.insert("autoUpdate".into(), json!(self.settings.auto_update));
+        o.insert("localUpdate".into(), json!(self.settings.auto_update));
         o.insert("dataSource".into(), json!(source));
         o.insert("dataOrigin".into(), json!(if source == LOCAL_SOURCE { "本機產生" } else { "公版" }));
         o.insert("update".into(), self.update_status.get().map(|f| f()).unwrap_or(Value::Null));
@@ -986,8 +988,9 @@ mod tests {
         assert!(s.applies(Kind::Dot) && s.applies(Kind::Doh) && s.applies(Kind::Doq) && s.applies(Kind::Doh3) && s.applies(Kind::Site));
         assert!(!s.applies(Kind::Plain) && !s.applies(Kind::Community));
         assert!(s.auto_update, "預設每月在本機重新產生");
-        // 舊的鍵：autoUpdate=false 或 jobs.tw-ip.enabled=false 都關掉；updateUrl 不再使用
-        assert!(!Settings::from_cfg(&json!({ "access": { "autoUpdate": false } })).auto_update);
+        // localUpdate=false 或 jobs.tw-ip.enabled=false 關掉；舊的 autoUpdate（從 GitHub 下載）不再影響，updateUrl 不再使用
+        assert!(!Settings::from_cfg(&json!({ "access": { "localUpdate": false } })).auto_update);
+        assert!(Settings::from_cfg(&json!({ "access": { "autoUpdate": false } })).auto_update);
         assert!(!Settings::from_cfg(&json!({ "jobs": { "tw-ip": { "enabled": false } } })).auto_update);
         assert!(kuroshio_config::get(&kuroshio_config::defaults(), "access.updateUrl").is_none());
         // 沒有 access 區段（舊設定檔）也一樣
@@ -1248,7 +1251,7 @@ mod tests {
         )
         .unwrap();
         let newer = br#"{"generatedAt":"2026-11-01","groups":[{"id":"a","name":"A","v4":["1.0.0.0/16","2.0.0.0/20"]}]}"#.to_vec();
-        let a = Access::from_cfg(&json!({ "access": { "autoUpdate": true } }), &dir, Some(newer.clone()));
+        let a = Access::from_cfg(&json!({ "access": { "localUpdate": true } }), &dir, Some(newer.clone()));
         assert_eq!(a.data().unwrap().generated_at, "2026-11-01");
         assert!(a.data_and_origin().1, "本機產生");
         assert_eq!(a.api_json()["dataOrigin"], "本機產生");
@@ -1258,7 +1261,7 @@ mod tests {
         assert_eq!(a.data().unwrap().generated_at, "2026-10-01");
         assert!(!a.data_and_origin().1);
         assert_eq!(a.api_json()["dataOrigin"], "公版");
-        let a = Access::from_cfg(&json!({ "access": { "autoUpdate": false } }), &dir, Some(newer));
+        let a = Access::from_cfg(&json!({ "access": { "localUpdate": false } }), &dir, Some(newer));
         assert_eq!(a.data().unwrap().generated_at, "2026-10-01");
         let _ = std::fs::remove_dir_all(&dir);
     }

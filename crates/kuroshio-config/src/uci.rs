@@ -567,7 +567,7 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     out.insert("community".into(), Value::Object(cm));
 
     // ---------------- 來源 IP 存取控制（規格 08） ----------------
-    // `config access 'access'`：mode、list groups、list allow、list deny、list apply_to、log、auto_update。
+    // `config access 'access'`：mode、list groups、list allow、list deny、list apply_to、log、local_update。
     // 沒有這個區段 = 內建預設（只開放台灣）；`option groups ''` = 一組都不勾
     if sec("access").is_some() {
         let mut acc = Map::new();

@@ -627,7 +627,7 @@ fn start_scheduler(
     }));
     let saved = persister.lock().unwrap().load(JOBS_STATE_FILE);
     let mut scfg = cfg.clone();
-    // 舊的 access.autoUpdate=false 也關掉台灣 IP 清單的每月工作（排程清單裡顯示「已停用」）
+    // access.localUpdate=false 也關掉台灣 IP 清單的每月工作（排程清單裡顯示「已停用」）
     if access.map(|a| !a.settings.auto_update).unwrap_or(false) {
         if let Some(j) = scfg.pointer_mut("/jobs/tw-ip").and_then(Value::as_object_mut) {
             j.insert("enabled".into(), json!(false));

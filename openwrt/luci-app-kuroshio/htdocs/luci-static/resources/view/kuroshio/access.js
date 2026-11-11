@@ -272,7 +272,7 @@ return view.extend({
 
 		// ---------------- 台灣 IP 資料、套用範圍 ----------------
 		s = m.section(form.NamedSection, 'access', 'access', _('台灣 IP 資料'));
-		o = s.option(form.Flag, 'auto_update', _('每月在本機重新產生台灣 IP 資料'),
+		o = s.option(form.Flag, 'local_update', _('每月在本機重新產生台灣 IP 資料'),
 			_('排程工作「台灣 IP 清單」：每月一次（每台路由器錯開時間），慢慢向 RIR 與 RIPEstat 的公開資料查詢，在路由器上算出新的清單；不連本專案的任何伺服器。記憶體或 CPU 不夠會暫停稍後續跑，失敗就繼續用目前的清單；內容有變才寫入 Flash（約每月一次）。不開的話跟著套件升級更新。'));
 		o.default = '1';
 		o.rmempty = false;

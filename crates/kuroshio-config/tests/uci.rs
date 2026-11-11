@@ -371,7 +371,7 @@ fn access_section() {
     assert_eq!(g(&d, "access.groups"), &json!(["*"]));
     assert_eq!(g(&d, "access.applyTo"), &json!(["dot", "doh", "doq", "doh3", "site"]));
     let text = default_text()
-        + "\nconfig access 'access'\n\toption mode 'custom'\n\tlist groups 'cht'\n\tlist groups 'tanet'\n\tlist allow '203.0.113.0/24'\n\tlist deny '198.51.100.7'\n\tlist apply_to 'dot'\n\tlist apply_to 'plain'\n\toption log '0'\n\toption auto_update '1'\n";
+        + "\nconfig access 'access'\n\toption mode 'custom'\n\tlist groups 'cht'\n\tlist groups 'tanet'\n\tlist allow '203.0.113.0/24'\n\tlist deny '198.51.100.7'\n\tlist apply_to 'dot'\n\tlist apply_to 'plain'\n\toption log '0'\n\toption auto_update '0'\n\toption local_update '1'\n";
     let c = load(&text, &env());
     assert_eq!(g(&c, "access.mode"), &json!("custom"));
     assert_eq!(g(&c, "access.groups"), &json!(["cht", "tanet"]));
@@ -379,7 +379,11 @@ fn access_section() {
     assert_eq!(g(&c, "access.deny"), &json!(["198.51.100.7"]));
     assert_eq!(g(&c, "access.applyTo"), &json!(["dot", "plain"]));
     assert_eq!(g(&c, "access.log"), &json!(false));
-    assert_eq!(g(&c, "access.autoUpdate"), &json!(true));
+    assert_eq!(
+        g(&c, "access.localUpdate"),
+        &json!(true),
+        "舊的 auto_update 不影響新的 local_update"
+    );
     // 台灣 IP 清單改在本機每月產生，不再有下載網址
     assert!(kuroshio_config::get(&c, "access.updateUrl").is_none());
     // option groups '' = 一組都不勾；全開放

@@ -13,7 +13,7 @@
 | `deny` | `[]` | 自訂封鎖的 IP / CIDR：勝過一切（迴路位址除外） |
 | `applyTo` | `["dot","doh","doq","doh3","site"]` | 套用在哪些服務：`dot`、`doh`、`doq`、`doh3`、`site`（公開頁）、`community`（社群共享）、`plain`（區網 DNS 53 埠） |
 | `log` | `true` | 拒絕時記錄（每分鐘最多一行，含這一分鐘的次數） |
-| `autoUpdate` | `true` | 每月在本機重新產生台灣 IP 資料（排程工作 `tw-ip`，見第 5 節）；`false` = 只用隨程式附帶的公版 |
+| `localUpdate` | `true` | 每月在本機重新產生台灣 IP 資料（排程工作 `tw-ip`，見第 5 節）；`false` = 只用隨程式附帶的公版 |
 | `dataFile` | `""` | 指定資料檔；空白 = 唯讀資料目錄的 `geo/tw-ip.json` |
 
 **行為改變（3.0）**：沒有 `access` 區段的舊設定檔也會套用預設值，也就是「只開放台灣」。
@@ -30,7 +30,7 @@ config access 'access'
 	list deny '198.51.100.7'
 	list apply_to 'dot'             # 沒寫 = 預設的五個
 	option log '1'
-	option auto_update '0'
+	option local_update '0'
 ```
 
 沒有 `config access` 區段 = 預設值；`option groups ''` = 一組都不勾。
@@ -146,7 +146,7 @@ ASN 與持有者名稱對照 RIPE NCC 的 ASN 名稱表（`ftp.ripe.net/ripe/asn
 
 | 設定（`jobs.tw-ip.*`） | 預設 | 說明 |
 |---|---|---|
-| `enabled` | `true` | 也可以用 `access.autoUpdate`（預設 `true`）：兩個都開才會跑；舊設定檔的 `access.autoUpdate: false` = 停用 |
+| `enabled` | `true` | 也可以用 `access.localUpdate`（預設 `true`）：兩個都開才會跑；舊版的 `access.autoUpdate`（從 GitHub 下載）已移除，設定檔裡存的值不再影響 |
 | `at`、`monthDays` | `"00:50"`、`[1]` | 每月 1 日 00:50（台北時間）… |
 | `jitterDays`、`jitterMin` | `27`、`180` | …再依這台裝置的亂數種子往後挪 0–27 天、0–180 分鐘（種子存在 `jobs.json`，之後固定）：大家不會同時去打同一個來源 |
 | `minAgeDays` | `20` | 排程或補跑時，目前的清單（公版或本機產生）不到 20 天就不跑；「立即執行」照跑 |
@@ -206,7 +206,7 @@ ASN 與持有者名稱對照 RIPE NCC 的 ASN 名稱表（`ftp.ripe.net/ripe/asn
 - `/api/status` 多一個 `access`：`mode`、`applyTo`、`active`、`dataOk`、`failOpen`、`warning`、`generatedAt`、`ranges`、`memoryBytes`、`dataBytes`、
   `denied: { total, byListener: { dot, doh, doq, doh3, site, community, plain } }`、`topDenied: [{ net: "a.b.c.0/24" | "x:y:z::/48", count }]`（前 10）
 - `GET /api/access`：上面全部，加上 `groups: [{ id, name, note, asns, size: { v4, v6_48 }, cidrs: { v4, v6 }, enabled, checked }]`、
-  `selected`（設定的 `groups`）、`allow`、`deny`、`log`、`autoUpdate`、`dataSource`、`dataOrigin`、`update`（第 5.7 節）、`total`、`topDenied`（前 50）
+  `selected`（設定的 `groups`）、`allow`、`deny`、`log`、`localUpdate`、`dataSource`、`dataOrigin`、`update`（第 5.7 節）、`total`、`topDenied`（前 50）
 - `GET /api/access?ip=1.2.3.4`：`{ ip, allowed, reason, mode, applyTo }`
 - rpcd 的 `api` 白名單加了 `/api/access`
 - `kuroshio access check <IP> [--json]`、`kuroshio access groups`：照設定載入（不含好友 IP），不用啟動服務
@@ -241,5 +241,5 @@ ASN 與持有者名稱對照 RIPE NCC 的 ASN 名稱表（`ftp.ripe.net/ripe/asn
   這裡能減少的是連線數、握手、查詢造成的 CPU 與記憶體負擔，以及掃描與濫用。
 - 人在國外、漫遊（行動網路漫遊時常從國外的閘道出去）、用 VPN 或國外雲端主機的台灣使用者會被擋：改成 `open` 或加進 `allow`。
 - 台灣網段是 RIR 的登記國別，不是地理位置；少數登記在台灣的網段實際在國外使用，反之亦然。
-- 行動網路與業者合併後的網段會變動，所以資料每月在裝置上重新產生（`autoUpdate`，預設開）。
+- 行動網路與業者合併後的網段會變動，所以資料每月在裝置上重新產生（`localUpdate`，預設開）。
 - 好友的 IP 每 10 分鐘更新一次，好友剛換 IP 時可能有幾分鐘連不上（只影響有套用 `community` 的情況）。

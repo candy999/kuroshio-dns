@@ -111,7 +111,7 @@ const ACCESS = query => {
     return { mode, applyTo, active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt, ranges: 1003, memoryBytes: 16048, dataBytes: 21312,
         denied: { total: 57, byListener: { dot: 40, doh: 17, doq: 0, doh3: 0, site: 0, community: 0, plain: 0 } },
         topDenied: [{ net: '45.135.232.0/24', count: 31 }, { net: '2a06:4880:1000::/48', count: 26 }],
-        groups, selected: sel, allow: list(a.allow), deny: list(a.deny), log: a.log !== '0', autoUpdate: a.auto_update !== '0', dataSource: '/usr/share/kuroshio/geo/tw-ip.json', total: TWIP.total };
+        groups, selected: sel, allow: list(a.allow), deny: list(a.deny), log: a.log !== '0', localUpdate: a.local_update !== '0', dataSource: '/usr/share/kuroshio/geo/tw-ip.json', total: TWIP.total };
 };
 STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt,
     ranges: 1003, memoryBytes: 16048, dataBytes: 21312, denied: { total: 57, byListener: { dot: 40, doh: 17 } }, topDenied: [] };
