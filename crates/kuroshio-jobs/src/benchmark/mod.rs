@@ -715,10 +715,35 @@ impl Benchmark {
                 .filter(|(_, (_, info))| !info.is_unknown() && !valid.iter().any(|g| rules::is_same_group(Some(&g.rep), Some(info))))
                 .map(|(k, _)| k)
                 .collect();
-            let checks = self
-                .verify_answers(domain, suspects.iter().map(|k| ok[*k].1.clone()).collect(), &mut site_cache)
-                .await;
-            let mut verdict: HashMap<usize, (SiteCheck, String)> = suspects.into_iter().zip(checks).collect();
+            let mut verdict: HashMap<usize, (SiteCheck, String)> = HashMap::new();
+            if !suspects.is_empty() {
+                // 基準：多數群組的正常回答也要能用憑證驗證，這個網域才能用憑證判斷
+                // （例如 ctldl.windowsupdate.com 只有 HTTP，連正確的 CDN 也沒有對應的憑證）
+                let base: Vec<Ipv4Addr> = ok
+                    .iter()
+                    .zip(&infos)
+                    .filter(|(_, info)| !info.is_unknown() && valid.iter().any(|g| rules::is_same_group(Some(&g.rep), Some(info))))
+                    .flat_map(|((_, ips, _), _)| ips.iter().copied())
+                    .fold(Vec::new(), |mut v, ip| {
+                        if v.len() < VERIFY_IPS && !v.contains(&ip) {
+                            v.push(ip);
+                        }
+                        v
+                    });
+                let baseline = self.verify_answers(domain, vec![base], &mut site_cache).await.remove(0);
+                if baseline.0 == SiteCheck::Valid {
+                    let checks = self
+                        .verify_answers(domain, suspects.iter().map(|k| ok[*k].1.clone()).collect(), &mut site_cache)
+                        .await;
+                    verdict = suspects.into_iter().zip(checks).collect();
+                } else {
+                    info!(
+                        "   -> {domain} 的正常回答也無法用憑證驗證（{}），這個網域不判斷汙染（{} 個不同業者的回答照常計分）",
+                        baseline.1,
+                        suspects.len()
+                    );
+                }
+            }
             let (mut polluted, mut suspicious, mut rescued) = (0usize, 0usize, 0usize);
             let mut newly_bl: Vec<String> = Vec::new();
             for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {

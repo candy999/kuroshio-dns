@@ -3,6 +3,8 @@
 //! 每一筆：再問一次那台 DNS 當初被判汙染的網域（沒記網域的用幾個常被汙染的網域），然後
 //! - 回 0.0.0.0 / 私有位址 / 封鎖：確定竄改 → 保留
 //! - 連到回答的 IP 用網域檢查憑證：
+//!   - 先確認基準：公共 DNS（1.1.1.1、8.8.8.8）的正常回答要能通過憑證檢查，這個網域才能用憑證判斷；
+//!     不能的（例如只有 HTTP 的 ctldl.windowsupdate.com）→ 無法驗證
 //!   - 憑證不符 → 確定劫持 → 保留（註記證據）
 //!   - 憑證有效 → 規則誤殺 → 移除
 //!   - 連不上 → 無法驗證 → 移除（交給每日評測用新規則在本地重新判斷，累計 3 天才會再列入）
@@ -23,6 +25,30 @@ use std::time::Duration;
 /// 沒記網域的舊紀錄：用這些常被汙染的網域檢查（DNS 汙染常把它們指到別家的 IP；每一個都要通過才算誤殺）
 const FALLBACK_DOMAINS: [&str; 4] = ["www.google.com", "www.youtube.com", "twitter.com", "www.wikipedia.org"];
 const CONC: usize = 24;
+/// 基準：用這些公共 DNS 的回答確認網域本身能不能用憑證判斷（例如只有 HTTP 的網域不能）
+const REFERENCE: [&str; 2] = ["udp://1.1.1.1", "udp://8.8.8.8"];
+
+type Baselines = Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::OnceCell<bool>>>>>;
+
+/// 這個網域的正常回答能不能通過憑證檢查（同一個網域只算一次）
+async fn baseline(p: &NetProber, cache: &Baselines, domain: &str) -> bool {
+    let cell = cache.lock().await.entry(domain.to_string()).or_default().clone();
+    *cell
+        .get_or_init(|| async {
+            for r in REFERENCE {
+                let Ok(up) = Upstream::parse(r) else { continue };
+                if let Outcome::Ok(ips) = query(p, &up, domain, Duration::from_secs(4), 2).await.outcome {
+                    for ip in ips.iter().take(2) {
+                        if p.verify_site(IpAddr::V4(*ip), domain.to_string(), Duration::from_secs(6)).await.0 == SiteCheck::Valid {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        })
+        .await
+}
 
 #[derive(Clone)]
 struct Entry {
@@ -54,7 +80,7 @@ fn parse(text: &str) -> Vec<Entry> {
 }
 
 /// 一筆的結論：(類別, 是否保留, 說明)
-async fn audit(p: Arc<NetProber>, e: Entry) -> (&'static str, bool, String) {
+async fn audit(p: Arc<NetProber>, base: Baselines, e: Entry) -> (&'static str, bool, String) {
     let id = if e.id.contains("://") {
         e.id.clone()
     } else {
@@ -77,6 +103,10 @@ async fn audit(p: Arc<NetProber>, e: Entry) -> (&'static str, bool, String) {
             Outcome::Blocked(b) => return ("竄改（封鎖）", true, format!("{d}：{b}")),
             Outcome::Ok(ips) => {
                 answered += 1;
+                if !baseline(&p, &base, d).await {
+                    notes.push(format!("{d}：網域本身無法用憑證判斷（公共 DNS 的正常回答也不符，例如只有 HTTP）"));
+                    continue;
+                }
                 let mut verdicts = Vec::new();
                 for ip in ips.iter().take(2) {
                     let (c, why) = p.verify_site(IpAddr::V4(*ip), d.clone(), Duration::from_secs(6)).await;
@@ -111,13 +141,14 @@ async fn main() -> anyhow::Result<()> {
     let entries = parse(&std::fs::read_to_string(&input)?);
     eprintln!("體檢 {} 筆", entries.len());
     let p = Arc::new(NetProber);
+    let base: Baselines = Default::default();
     let sem = Arc::new(tokio::sync::Semaphore::new(CONC));
     let mut set = tokio::task::JoinSet::new();
     for (i, e) in entries.iter().cloned().enumerate() {
-        let (p, sem) = (p.clone(), sem.clone());
+        let (p, sem, base) = (p.clone(), sem.clone(), base.clone());
         set.spawn(async move {
             let _g = sem.acquire().await;
-            (i, audit(p, e).await)
+            (i, audit(p, base, e).await)
         });
     }
     let mut results: Vec<Option<(&'static str, bool, String)>> = vec![None; entries.len()];

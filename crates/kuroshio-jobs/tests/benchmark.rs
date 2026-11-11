@@ -80,11 +80,13 @@ impl Prober for LocalOnly {
     fn resolve_v4(&self, _host: String) -> BoxFuture<Option<Ipv4Addr>> {
         Box::pin(async { None })
     }
-    /// 網站驗證（假的）：96.4.x 是劫持（憑證不符）、97.5.x 是規則不認識但真的在服務網站的 CDN、其他連不上
+    /// 網站驗證（假的）：93–95 是正常回答（基準）、96.4.x 是劫持（憑證不符）、97.5.x 是規則不認識但真的在服務網站的 CDN、其他連不上
     fn verify_site(&self, ip: std::net::IpAddr, _domain: String, _t: Duration) -> BoxFuture<(SiteCheck, String)> {
         let s = ip.to_string();
         Box::pin(async move {
-            if s.starts_with("96.4.") {
+            if s.starts_with("93.1.") || s.starts_with("94.2.") || s.starts_with("95.3.") {
+                (SiteCheck::Valid, "OK".to_string()) // 多數群組的正常回答（基準）
+            } else if s.starts_with("96.4.") {
                 (SiteCheck::Invalid, "ERR_TLS_CERT_ALTNAME_INVALID".to_string())
             } else if s.starts_with("97.5.") {
                 (SiteCheck::Valid, "OK".to_string())
@@ -106,6 +108,7 @@ fn asn() -> Arc<dyn AsnSource> {
     add("96.4", "Evil Corp", "AS666 Evil Corp");
     add("97.5", "Unknown CDN", "AS777 Unknown CDN");
     add("98.6", "Quiet Hosting", "AS888 Quiet Hosting");
+    add("99.7", "Plain Web", "AS999 Plain Web");
     for i in 1..=9 {
         add(&format!("127.{i}"), &format!("Owner{i} Ltd"), &format!("AS90{i} Owner{i}"));
     }
@@ -366,22 +369,33 @@ async fn real_internet_smoke() {
 /// 連不上 → 今天不用、記一天，連續 3 天才列入永久黑名單
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pollution_requires_site_verification() {
-    let a = mock("127.1.0.21:0", 0, |n| honest(n, 1)).await;
-    let b = mock("127.2.0.21:0", 0, |n| honest(n, 2)).await;
-    let c = mock("127.3.0.21:0", 0, |n| honest(n, 3)).await;
-    let hijack = mock("127.4.0.21:0", 0, |n| match n {
+    // http.only.net：只有 HTTP 的網域，連正常回答（99.7.x）也無法用憑證驗證
+    let plain = |n: &str, k: u8| match n {
+        "http.only.net" => Reply::A(vec![Ipv4Addr::new(99, 7, 0, k)]),
+        _ => honest(n, k),
+    };
+    let a = mock("127.1.0.21:0", 0, move |n| plain(n, 1)).await;
+    let b = mock("127.2.0.21:0", 0, move |n| plain(n, 2)).await;
+    let c = mock("127.3.0.21:0", 0, move |n| plain(n, 3)).await;
+    // 只在只有 HTTP 的網域回別家業者：無法判斷，不能淘汰
+    let http_diff = mock("127.7.0.21:0", 0, move |n| match n {
+        "http.only.net" => Reply::A(vec![ip("96.4.0.7")]),
+        _ => plain(n, 1),
+    })
+    .await;
+    let hijack = mock("127.4.0.21:0", 0, move |n| match n {
         "www.alpha.com" => Reply::A(vec![ip("96.4.0.9")]),
-        _ => honest(n, 1),
+        _ => plain(n, 1),
     })
     .await;
-    let other_cdn = mock("127.5.0.21:0", 0, |n| match n {
+    let other_cdn = mock("127.5.0.21:0", 0, move |n| match n {
         "www.alpha.com" => Reply::A(vec![ip("97.5.0.9")]),
-        _ => honest(n, 1),
+        _ => plain(n, 1),
     })
     .await;
-    let quiet = mock("127.6.0.21:0", 0, |n| match n {
+    let quiet = mock("127.6.0.21:0", 0, move |n| match n {
         "www.alpha.com" => Reply::A(vec![ip("98.6.0.9")]),
-        _ => honest(n, 1),
+        _ => plain(n, 1),
     })
     .await;
     let root = tmp("verify");
@@ -389,9 +403,12 @@ async fn pollution_requires_site_verification() {
     let list = &p.list_dir;
     std::fs::create_dir_all(list).unwrap();
     std::fs::create_dir_all(root.join("state")).unwrap();
-    let ids: Vec<String> = [a, b, c, hijack, other_cdn, quiet].iter().map(|x| x.to_string()).collect();
+    let ids: Vec<String> = [a, b, c, hijack, other_cdn, quiet, http_diff]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
     std::fs::write(list.join("iplist.txt"), ids.join("\n")).unwrap();
-    std::fs::write(list.join("web.txt"), "www.alpha.com\ncdn.beta.com\n").unwrap();
+    std::fs::write(list.join("web.txt"), "www.alpha.com\ncdn.beta.com\nhttp.only.net\n").unwrap();
     // 「無法驗證」已經記了前兩天：今天是第 3 天 → 列入永久黑名單
     std::fs::write(
         root.join("state/blacklist-suspects.json"),
@@ -433,6 +450,8 @@ async fn pollution_requires_site_verification() {
     let elim = std::fs::read_to_string(p.out_root.clone().unwrap().join("2026-11-10/eliminated.csv")).unwrap();
     assert!(elim.contains(&hijack.to_string()) && elim.contains(&quiet.to_string()), "{elim}");
     assert!(!elim.contains(&other_cdn.to_string()), "規則外但憑證有效的 CDN 不該被淘汰：{elim}");
+    assert!(!elim.contains(&http_diff.to_string()), "網域本身無法用憑證判斷時不能淘汰：{elim}");
+    assert!(!bl.contains(&http_diff.to_string()), "{bl}");
     let up = read(&p.upstreams_file);
     assert_eq!(up["counts"]["eliminated"], 2, "{up:#}");
 }
