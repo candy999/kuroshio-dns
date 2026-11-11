@@ -527,6 +527,16 @@
 			});
 	}
 
+	function mbOf(kb) { return kb != null ? fmtNum(Math.round(kb / 1024)) : '-'; }
+	/** 記憶體控制動態決定的大小（規格 09） */
+	function memSizes(z) {
+		if (!z) return '';
+		var out = [];
+		if (z.cacheEntries != null) out.push('快取 ' + fmtNum(z.cacheEntries) + ' / ' + fmtNum(z.cacheMax) + ' 筆');
+		if (z.cdnInRam != null) out.push('CDN ' + fmtNum(z.cdnInRam) + ' 筆' + (z.cdnOnDiskOnly ? '（另 ' + fmtNum(z.cdnOnDiskOnly) + ' 筆在磁碟）' : ''));
+		if (z.filterListRules != null) out.push('清單 ' + fmtNum(z.filterListRules) + ' 條');
+		return out.join(' · ');
+	}
 	function renderStatus(st, acme) {
 		var s = S.session, d = (st.stats && st.stats.today) || {}, sys = st.system || {}, lat = d.latency || {};
 		var ms = function (x) { return x && x.p50 != null ? x.p50 + ' / ' + (x.p95 != null ? x.p95 : '>1000') + ' ms' : '-'; };
@@ -537,12 +547,14 @@
 		var shed = mem.shed || [], mb = $('st-mem');
 		if (mb) {
 			clear(mb);
-			mb.hidden = !(shed.length || (f && f.notice));
+			mb.hidden = !(shed.length || (f && f.notice) || mem.floor);
 			if (!mb.hidden) {
 				append(mb, [
 					el('h3', { text: '記憶體控制' }),
+					mem.protectedSuspended ? el('p', { class: 'msg err', text: '記憶體嚴重不足：連保護清單（惡意 / 反詐騙）都暫停了，只剩自訂規則；DNS 照常轉送。記憶體回來後自動恢復。' }) :
+						mem.floor ? el('p', { class: 'msg err', text: '記憶體不足：只轉送 DNS（暫停 CDN 調整、快取最小）。記憶體回來後自動恢復。' }) : null,
 					f && f.notice ? el('p', { class: 'msg warn', text: f.notice }) : null,
-					el('p', { class: 'muted', text: '目前：' + (mem.stateLabel || mem.state || '-') + '（常駐 ' + (mem.rssKB != null ? (mem.rssKB / 1024).toFixed(1) : '-') + ' MB / 預算 ' + (mem.budgetKB != null ? fmtNum(Math.round(mem.budgetKB / 1024)) : '-') + ' MB）' + (mem.waiting ? ' · ' + mem.waiting : '') }),
+					el('p', { class: 'muted', text: '目前：' + (mem.stateLabel || mem.state || '-') + '（系統可用 ' + mbOf(mem.availKB) + ' MB / 保留 ' + mbOf(mem.reserveKB) + ' MB）' + (mem.waiting ? ' · ' + mem.waiting : '') }),
 					shed.length ? el('ul', {}, shed.map(function (x) { return el('li', { text: x.label + ' ' + (x.detail || '') + '（約 ' + fmtBytes(x.freedBytes) + '，' + fmtTime(x.at) + '）' }); })) : null
 				].filter(Boolean));
 			}
@@ -550,9 +562,12 @@
 		clear($('st-tiles'));
 		append($('st-tiles'), [
 			tile('版本', st.version || s.version || '-', (s.mode === 'service' ? 'Windows 服務' : 'cmd 直接執行') + ' · ' + (s.os || '')),
-			tile('硬體等級', sys.tier || '-', [sys.memTotalMB ? fmtNum(sys.memTotalMB) + ' MB' : '', sys.cores ? sys.cores + ' 核' : '', sys.arch || ''].filter(Boolean).join(' · ')),
-			tile('記憶體', sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', '系統可用 ' + (sys.memAvailableMB != null ? fmtNum(sys.memAvailableMB) + ' MB' : '-') +
-				(mem.enabled ? ' · 預算 ' + fmtNum(Math.round(mem.budgetKB / 1024)) + ' MB · ' + (mem.stateLabel || mem.state) : (sys.pressure && sys.pressure !== 'normal' ? ' · 記憶體偏低' : ''))),
+			tile('硬體', [sys.memTotalMB ? fmtNum(sys.memTotalMB) + ' MB' : '', sys.cores ? sys.cores + ' 核' : ''].filter(Boolean).join(' · ') || '-', sys.arch || ''),
+			tile('系統記憶體', mem.availKB != null ? '可用 ' + mbOf(mem.availKB) + ' MB' : (sys.memAvailableMB != null ? '可用 ' + fmtNum(sys.memAvailableMB) + ' MB' : '-'),
+				'保留 ' + mbOf(mem.reserveKB) + ' MB（' + (mem.reserveAuto ? '自動' : '設定') + '）' + (mem.headroomKB != null ? ' · 保留以上 ' + mbOf(mem.headroomKB) + ' MB' : '') +
+				(mem.enabled ? ' · ' + (mem.stateLabel || mem.state) + (mem.growth === false ? '（不再長大）' : '') : '') +
+				(mem.psi ? ' · PSI ' + mem.psi.someAvg10 + '%' : '')),
+			tile('本程式記憶體', sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', memSizes(mem.sizes)),
 			tile('已執行', fmtUptime(st.stats && st.stats.uptimeSec), '今天：' + (d.date || '-')),
 			tile('今天查詢', fmtNum(d.query), '快取命中率 ' + (d.hitRate != null ? d.hitRate + '%' : '-')),
 			tile('攔截', fmtNum(d.blocked), '廣告 ' + fmtNum(d.blockedAds) + ' · 遙測 ' + fmtNum(d.blockedTelemetry) + ' · 惡意 ' + fmtNum(d.blockedMalware)),
@@ -565,7 +580,11 @@
 				st.access.failOpen ? '資料讀不到，暫時不擋' : '已拒絕 ' + fmtNum((st.access.denied || {}).total) + ' 次' + (st.access.generatedAt ? ' · 資料 ' + st.access.generatedAt : '')) : null,
 			tile('磁碟寫入（今天）', per.bytesToday != null ? fmtBytes(per.bytesToday) : '-', (per.storage || '') + (per.effectiveIntervalMin != null ? ' · 間隔 ' + per.effectiveIntervalMin + ' 分' : '') + (per.estimatedDailyBytes != null ? ' · 預估每天 ' + fmtBytes(per.estimatedDailyBytes) : '')),
 			tile('最久未存', fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? '上限 ' + per.maxAgeHours + ' 小時' : '') + (per.forcedByAge ? ' · 到期強制寫入 ' + fmtNum(per.forcedByAge) + ' 次' : '') +
-				(per.lowSpace ? ' · 儲存空間不足（只寫核心資料）' : ''))
+				(per.lowSpace ? ' · 儲存空間不足（只寫核心資料）' : '')),
+			per.space && per.space.reserveBytes != null ? tile('儲存空間', per.space.freeBytes != null ? '可用 ' + fmtBytes(per.space.freeBytes) : '-',
+				'保留 ' + fmtBytes(per.space.reserveBytes) + '（' + (per.space.reserveAuto ? '自動' : '設定') + '）' +
+				(per.space.optionalBytes ? ' · 可重建的資料 ' + fmtBytes(per.space.optionalBytes) : '') +
+				(per.space.keepingOptional === false ? ' · 空間吃緊：只留核心' : '')) : null
 		]);
 
 		// 監聽
@@ -1564,7 +1583,7 @@
 			})
 		])]);
 		box.appendChild(card);
-		var dcard = el('details', { class: 'card section' }, [el('summary', { text: '完整預設值（' + (S.cfg.tier || '') + ' 等級，唯讀）' }),
+		var dcard = el('details', { class: 'card section' }, [el('summary', { text: '完整預設值（並行數依這台的 CPU 核心數換算，唯讀）' }),
 			el('pre', { class: 'out', text: JSON.stringify(S.cfg.defaults, null, 2) })]);
 		box.appendChild(dcard);
 	}

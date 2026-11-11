@@ -54,13 +54,25 @@ start_service() {
 		KUROSHIO_LAN_IP4="$lan4" KUROSHIO_LAN_ULA="$ula" KUROSHIO_ACCESS_HOOK="$LIBEXEC/access.sh" NO_COLOR=1
 	# 背景工作（網段掃描）同時開很多連線
 	procd_set_param limits nofile="65535 65535"
-	procd_set_param respawn 3600 5 0
+	# 當掉立刻重新啟動（DNS 停了等於斷網）：1 秒後重啟、永不放棄（第三個參數 0 = 不限次數）。
+	# 程式自己把 oom_score_adj 設成 -500（system.oomScoreAdj），記憶體用完時核心不優先停掉它
+	procd_set_param respawn 3600 1 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	# 停止時給程式時間把快照寫出（Flash 寫入保護：關機時一定寫出）
 	procd_set_param term_timeout 15
 	procd_set_param file /etc/config/kuroshio
 	procd_close_instance
+
+	# 重新啟動期間的 DNS 備援：本程式沒有回答時暫時讓 dnsmasq 直接轉送（main.restart_fallback=0 關掉）
+	local fb
+	config_get_bool fb main restart_fallback 1
+	if [ "$fb" = 1 ]; then
+		procd_open_instance guard
+		procd_set_param command "$LIBEXEC/guard.sh"
+		procd_set_param respawn 3600 1 0
+		procd_close_instance
+	fi
 }
 
 # 程式停止後才還原 dnsmasq（取代 dnsmasq 模式下要等它放開 53 埠）

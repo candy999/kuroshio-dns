@@ -48,7 +48,9 @@ check "程式附帶的預設名單（含 DoT）" test -s /usr/share/kuroshio/ben
 check "預設值不帶個人網域" sh -c '! /usr/bin/kuroshio defaults | grep -q candy.moe'
 ubus call uci get '{"config":"kuroshio"}' > /tmp/uci.json 2>/dev/null || true
 check "UCI 轉換：dnsmasq 上游模式聽 5335" sh -c 'KUROSHIO_UCI_JSON=/tmp/uci.json /usr/bin/kuroshio check-config --uci | grep -q 5335 || /usr/bin/kuroshio check-config --uci | grep -q 5335'
-check "硬體等級偵測" sh -c '/usr/bin/kuroshio sysinfo --uci | grep -q 硬體等級'
+check "記憶體保留量（沒有硬體等級）" sh -c '/usr/bin/kuroshio sysinfo --uci | grep -q 記憶體保留量'
+check "重新啟動期間的 DNS 備援腳本" test -x /usr/libexec/kuroshio/guard.sh
+eq "DNS 備援預設開啟" "$(uci -q get kuroshio.main.restart_fallback)" "1"
 /usr/bin/kuroshio sysinfo --uci
 
 echo "== DNS 接管（takeover.sh）"
@@ -194,6 +196,7 @@ uci set kuroshio.doh.http3='1'
 uci set kuroshio.dot.enabled='1'
 uci set kuroshio.doq.enabled='1'
 uci set kuroshio.filter.enabled='0'
+# 舊版的硬體等級設定：照樣接受、不使用（不會啟動失敗）
 uci set kuroshio.system.profile='small'
 # 測試憑證的網域是 localhost：DNR 需要網域與涵蓋它的有效憑證
 uci set kuroshio.tls.domain='localhost'
@@ -217,7 +220,8 @@ check "DoQ 853（UDP）" $Q -s quic://127.0.0.1:853
 check "快取命中" $Q -s 127.0.0.1:5335
 ubus call kuroshio api '{"path":"/api/upstreams"}' | grep -q '"ok": true' && ok "rpcd → 管理 API" || bad "rpcd → 管理 API"
 ubus call kuroshio api '{"path":"/api/trace","query":"name=example.com&type=A"}' | grep -q '"ok": true' && ok "網域追蹤" || bad "網域追蹤"
-ubus call kuroshio api '{"path":"/api/sysinfo"}' | grep -q '"tier": "small"' && ok "硬體等級（UCI 指定）" || bad "硬體等級（UCI 指定）"
+ubus call kuroshio api '{"path":"/api/sysinfo"}' | grep -q '"reserveKB"' && ok "記憶體保留量（狀態）" || bad "記憶體保留量（狀態）"
+ubus call kuroshio api '{"path":"/api/sysinfo"}' | grep -q '"tier"' && bad "不應該再有硬體等級" || ok "沒有硬體等級"
 ubus call kuroshio defaults | grep -q '"resolver"' && ok "kuroshio.defaults（不用 node）" || bad "kuroshio.defaults（不用 node）"
 ubus call kuroshio acme_status | grep -q '"daysLeft"' && ok "憑證狀態（不用 node）" || bad "憑證狀態（不用 node）"
 # DNR（RFC 9463）：網域 + 有效憑證 + 加密監聽 → 用 DHCP 選項 162 通告

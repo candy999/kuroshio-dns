@@ -56,6 +56,7 @@ define Package/kuroshio/install
 	$(INSTALL_BIN) ./files/kuroshio.init $(1)/etc/init.d/kuroshio
 	$(INSTALL_BIN) ./files/kuroshio.uci-defaults $(1)/etc/uci-defaults/90-kuroshio
 	$(INSTALL_BIN) ./files/takeover.sh $(1)/usr/libexec/kuroshio/takeover.sh
+	$(INSTALL_BIN) ./files/guard.sh $(1)/usr/libexec/kuroshio/guard.sh
 	$(INSTALL_DATA) ./files/lan.sh $(1)/usr/libexec/kuroshio/lan.sh
 	$(INSTALL_BIN) ./files/acme.sh $(1)/usr/libexec/kuroshio/acme.sh
 	$(INSTALL_BIN) ./files/access.sh $(1)/usr/libexec/kuroshio/access.sh

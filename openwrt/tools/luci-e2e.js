@@ -81,7 +81,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         if (NAME === 'kuroshio' && p === 'status' && MOCK) {
             /連線來源/.test(text) && /只開放台灣/.test(text) && /已拒絕 57 次/.test(text) ? ok('狀態頁：連線來源摘要') : bad('狀態頁沒有連線來源摘要');
             /最久未存/.test(text) && /1\.5 小時/.test(text) && /上限 24 小時/.test(text) ? ok('狀態頁：最久未存') : bad('狀態頁沒有「最久未存」');
-            /記憶體控制/.test(text) && /暫時停用：大廣告 清單（3000 條規則）/.test(text) && /縮小 DNS 快取/.test(text) && /預算 24 MB · 不足/.test(text) ? ok('狀態頁：記憶體控制（釋出項目、停用中的清單）') : bad('狀態頁沒有記憶體控制');
+            /記憶體控制/.test(text) && /暫時停用：大廣告 清單（3000 條規則）/.test(text) && /縮小 DNS 快取/.test(text) && /保留 16 MB（自動）/.test(text) && /只轉送 DNS/.test(text) && /快取 64 \/ 64 筆/.test(text) && /儲存空間/.test(text) && !/硬體等級/.test(text) ? ok('狀態頁：記憶體控制（保留量、只轉送、動態大小、儲存空間、沒有硬體等級）') : bad('狀態頁沒有記憶體控制');
         }
     }
     // 黑潮：每頁最下方有「關於」（核心版本、介面版本、授權、原始碼），狀態頁一定要看得到
@@ -99,7 +99,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         if (p === 'advanced' && !/上游 DNS/.test(text)) bad('專業模式：進階頁沒有顯示參數');
         if (p === 'cdn' && !/跨 CDN 備援/.test(text)) bad('專業模式：CDN 頁沒有顯示細部參數');
         if (NAME === 'kuroshio' && p === 'settings' && !/多個監聽位址/.test(text)) bad('專業模式：設定頁沒有「多個監聽位址」');
-        if (NAME === 'kuroshio' && p === 'settings') /記憶體控制/.test(text) && /記憶體預算（MB）/.test(text) ? ok('專業模式：設定頁有記憶體控制與預算') : bad('專業模式：設定頁沒有記憶體控制');
+        if (NAME === 'kuroshio' && p === 'settings') /記憶體控制/.test(text) && /記憶體保留量（MB）/.test(text) && /OOM 分數調整/.test(text) && /儲存保留空間（MB）/.test(text) && !/硬體等級/.test(text) ? ok('專業模式：設定頁有記憶體 / 儲存保留量、OOM 分數，沒有硬體等級') : bad('專業模式：設定頁沒有記憶體控制');
         if (NAME === 'kuroshio' && p === 'filter') /保護/.test(text) ? ok('專業模式：訂閱清單有「保護」欄') : bad('專業模式：訂閱清單沒有「保護」欄');
     }
 

@@ -124,19 +124,21 @@ mod imp {
                 };
                 let svc = mgr.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
                 svc.set_description("把連線帶回台灣節點的 DNS 伺服器：區網 DNS、DoH / DoT / DoQ / DoH3、廣告過濾、CDN 台灣節點")?;
-                // 當掉自動重啟：5 秒後、最多連續 3 次，一天後計數歸零
+                // 當掉自動重啟（規格 09）：DNS 停了等於斷網，每次都 1 秒後立刻重啟、不放棄
+                // （次數超過動作數時服務管理員重複最後一個動作）；程式自己以錯誤結束也算失敗
                 svc.update_failure_actions(ServiceFailureActions {
-                    reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
+                    reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(3600)),
                     reboot_msg: None,
                     command: None,
                     actions: Some(vec![
                         ServiceAction {
                             action_type: ServiceActionType::Restart,
-                            delay: Duration::from_secs(5)
+                            delay: Duration::from_secs(1)
                         };
                         3
                     ]),
                 })?;
+                svc.set_failure_actions_on_non_crash_failures(true)?;
                 println!("已安裝服務 {NAME}（開機自動啟動），設定檔：{}", config.display());
                 println!("啟動：kuroshio service start；日誌：{}", log_path(&config).display());
             }

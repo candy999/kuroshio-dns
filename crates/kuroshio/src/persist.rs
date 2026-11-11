@@ -570,10 +570,10 @@ impl Persister {
         (v.len(), v.iter().map(|c| c.size).sum())
     }
 
-    /// `/api/status.persist.storage`：總量、可用、保留量（怎麼來的）、保留量以上還有多少、留著的可省略資料、刪掉的
+    /// `/api/status.persist.space`：總量、可用、保留量（怎麼來的）、保留量以上還有多少、留著的可省略資料、刪掉的
     pub fn storage_json(&self) -> Value {
         let r = self.reserve();
-        let free = self.stats.free_bytes;
+        let free = (self.free_probe)(&self.dir).or(self.stats.free_bytes);
         let (n, bytes) = self.optional_on_disk();
         json!({
             "totalBytes": self.fs_total,
@@ -838,7 +838,7 @@ impl Persister {
             "forcedByAge": st.forced_by_age,
             "freeBytes": st.free_bytes,
             "minFreeBytes": self.reserve().bytes,
-            "storage": self.storage_json(),
+            "space": self.storage_json(),
             "lowSpace": st.low_space,
             "freedBytes": st.freed_bytes,
             "skipped": st.skipped,

@@ -42,6 +42,18 @@ function table(head, rows) {
 	}) : [E('tr', { 'class': 'tr placeholder' }, E('td', { 'class': 'td', 'colspan': head.length }, E('em', {}, _('沒有資料'))))]));
 }
 
+function mbOf(kb) { return kb != null ? fmtNum(Math.round(kb / 1024)) : '-'; }
+
+/* 記憶體控制動態決定的大小（規格 09） */
+function memSizes(z) {
+	if (!z) return '';
+	var out = [];
+	if (z.cacheEntries != null) out.push(_('快取 %s / %s 筆').format(fmtNum(z.cacheEntries), fmtNum(z.cacheMax)));
+	if (z.cdnInRam != null) out.push(_('CDN %s 筆').format(fmtNum(z.cdnInRam)) + (z.cdnOnDiskOnly ? _('（另 %s 筆在 Flash）').format(fmtNum(z.cdnOnDiskOnly)) : ''));
+	if (z.filterListRules != null) out.push(_('清單 %s 條').format(fmtNum(z.filterListRules)));
+	return out.join(' · ');
+}
+
 function tile(label, value, sub) {
 	return E('div', { 'style': 'flex:1 1 9em;min-width:9em;padding:.6em .8em;border:1px solid var(--border-color-medium,#ddd);border-radius:6px' }, [
 		E('div', { 'style': 'font-size:12px;opacity:.75' }, label),
@@ -101,15 +113,23 @@ return view.extend({
 		var hw = E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('硬體與效能')),
 			E('div', { 'style': 'display:flex;gap:.6em;flex-wrap:wrap' }, [
-				tile(_('硬體等級'), sys.tier || '-', (sys.memTotalMB ? sys.memTotalMB + ' MB · ' : '') + (sys.cores || '?') + _(' 核 ') + (sys.arch || '')),
-				tile(_('記憶體'), sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', _('可用 ') + (sys.memAvailableMB != null ? sys.memAvailableMB + ' MB' : '-') +
-					(mem.enabled ? _(' · 預算 %s MB · %s').format((mem.budgetKB / 1024).toFixed(0), mem.stateLabel || mem.state) : (sys.pressure && sys.pressure !== 'normal' ? ' · ' + _('記憶體偏低') : ''))),
+				tile(_('硬體'), (sys.memTotalMB ? sys.memTotalMB + ' MB · ' : '') + (sys.cores || '?') + _(' 核'), sys.arch || ''),
+				tile(_('系統記憶體'), mem.availKB != null ? _('可用 %s MB').format(mbOf(mem.availKB)) : (sys.memAvailableMB != null ? _('可用 %s MB').format(sys.memAvailableMB) : '-'),
+					_('保留 %s MB（%s）').format(mbOf(mem.reserveKB), mem.reserveAuto ? _('自動') : _('設定')) +
+					(mem.headroomKB != null ? _(' · 保留以上 %s MB').format(mbOf(mem.headroomKB)) : '') +
+					(mem.enabled ? ' · ' + (mem.stateLabel || mem.state) + (mem.growth === false ? _('（不再長大）') : '') : '') +
+					(mem.psi ? ' · PSI ' + mem.psi.someAvg10 + '%' : '')),
+				tile(_('本程式記憶體'), sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', memSizes(mem.sizes)),
 				tile(_('快取命中率'), d.hitRate != null ? d.hitRate + '%' : '-', _('預取 %s · 斷線回舊資料 %s').format(fmtNum(d.prefetch), fmtNum(d.stale))),
 				tile(_('回應時間 p50 / p95'), ms(lat.hit), _('問上游 ') + ms(lat.miss)),
 				tile(_('Flash 寫入（今天）'), per.bytesToday != null ? (per.bytesToday / 1024).toFixed(0) + ' KB' : '-', (per.storage || '') + _(' · 間隔 ') + (per.effectiveIntervalMin != null ? per.effectiveIntervalMin : (per.intervalMin || '-')) + _(' 分') +
 					(per.estimatedDailyBytes != null ? _(' · 預估每天 ') + (per.estimatedDailyBytes / 1024).toFixed(0) + ' KB' : '')),
 				tile(_('最久未存'), fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? _('上限 %s 小時').format(per.maxAgeHours) : '') +
 					(per.forcedByAge ? _(' · 到期強制寫入 %s 次').format(fmtNum(per.forcedByAge)) : '') + (per.lowSpace ? _(' · 儲存空間不足（只寫核心資料）') : '')),
+				per.space && per.space.reserveBytes != null ? tile(_('儲存空間'), per.space.freeBytes != null ? _('可用 %s KB').format(fmtNum(Math.round(per.space.freeBytes / 1024))) : '-',
+					_('保留 %s KB（%s）').format(fmtNum(Math.round(per.space.reserveBytes / 1024)), per.space.reserveAuto ? _('自動') : _('設定')) +
+					(per.space.optionalBytes ? _(' · 可重建的資料 %s KB').format(fmtNum(Math.round(per.space.optionalBytes / 1024))) : '') +
+					(per.space.keepingOptional === false ? _(' · 空間吃緊：只留核心') : '')) : '',
 				tile(_('加密協議'), protos.length ? protos.length + _(' 種') : _('未開啟'), protos.join(' · ') + (ls.ddr ? ' · DDR' : '')),
 				tile(_('過濾記憶體'), api.filter && api.filter.memoryBytes != null ? (api.filter.memoryBytes / 1048576).toFixed(1) + ' MB' : '-', api.filter && api.filter.domains != null ? fmtNum(api.filter.domains) + _(' 個網域') : '')
 			])
@@ -117,10 +137,12 @@ return view.extend({
 
 		// 記憶體控制（規格 09）：釋出中的項目、停用中的過濾清單（停用期間少了這些保護，要明顯）
 		var shed = mem.shed || [], fl = api.filter || {};
-		var memSec = (shed.length || fl.notice) ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-memory' }, [
+		var memSec = (shed.length || fl.notice || mem.floor) ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-memory' }, [
 			E('h3', {}, _('記憶體控制')),
+			mem.protectedSuspended ? E('div', { 'class': 'alert-message danger' }, _('記憶體嚴重不足：連保護清單（惡意 / 反詐騙）都暫停了，只剩自訂規則；DNS 照常轉送。記憶體回來後自動恢復。'))
+				: (mem.floor ? E('div', { 'class': 'alert-message danger' }, _('記憶體不足：只轉送 DNS（暫停 CDN 調整、快取最小）。記憶體回來後自動恢復。')) : ''),
 			fl.notice ? E('div', { 'class': 'alert-message warning' }, fl.notice) : '',
-			E('p', {}, _('目前：%s（常駐 %s MB / 預算 %s MB）').format(mem.stateLabel || mem.state || '-', mem.rssKB != null ? (mem.rssKB / 1024).toFixed(1) : '-', mem.budgetKB != null ? (mem.budgetKB / 1024).toFixed(0) : '-') +
+			E('p', {}, _('目前：%s（系統可用 %s MB / 保留 %s MB）').format(mem.stateLabel || mem.state || '-', mbOf(mem.availKB), mbOf(mem.reserveKB)) +
 				(mem.waiting ? ' · ' + mem.waiting : '')),
 			shed.length ? table([_('已釋出'), _('內容'), _('約'), _('時間')], shed.map(function(x) {
 				return [x.label, x.detail || '', (x.freedBytes / 1024).toFixed(0) + ' KB', fmtTime(x.at)];

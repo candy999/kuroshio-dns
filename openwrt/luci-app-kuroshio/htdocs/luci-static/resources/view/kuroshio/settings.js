@@ -219,34 +219,45 @@ return view.extend({
 		o.rmempty = false;
 		common.panel(s, '_dnr_status', _('DNR 目前狀態'), function() { return dnrPanel(paths, dnr); });
 
-		// ---------------- 硬體等級 ----------------
-		var ss = m.section(form.NamedSection, 'system', 'system', _('硬體等級'),
-			_('依記憶體自動調整快取、同時連線數、背景工作規模，低階路由器開了重功能也不會卡死。狀態頁可以看到目前的等級與記憶體用量。'));
-		o = ss.option(form.ListValue, 'profile', _('等級'));
-		o.value('auto', _('自動（依記憶體判斷）'));
-		o.value('tiny', _('tiny（128 MB 級：基本功能，不開 QUIC、不掃網段）'));
-		o.value('small', _('small（256 MB 級）'));
-		o.value('standard', _('standard（512 MB – 1 GB）'));
-		o.value('large', _('large（1.5 GB 以上、x86）'));
-		o.default = 'auto';
+		// ---------------- 記憶體與儲存（沒有硬體等級，規格 09）----------------
+		var ss = m.section(form.NamedSection, 'system', 'system', _('記憶體與儲存'),
+			_('記憶體有空就多用（快取、CDN 資料庫、過濾清單），系統可用記憶體低於保留量就依序讓出來，DNS 轉送永遠不停；同時連線數依 CPU 核心數自動決定。狀態頁看得到保留量與目前的大小。'));
+		ss.option(form.DummyValue, '_auto', _('調整方式')).cfgvalue = function() { return _('自動（依系統可用記憶體與 CPU 核心數）'); };
+		o = ss.option(form.Flag, 'restart_fallback', _('重新啟動期間的 DNS 備援'));
+		o.uciconfig = 'kuroshio';
+		o.ucisection = 'main';
+		o.description = _('本程式重新啟動或沒有回答時，暫時讓 dnsmasq 直接用 WAN 的上游轉送（裝置一定有 DNS；這段期間沒有過濾與 CDN 調整），回來後自動接管。取代 dnsmasq（exchange）模式不支援。');
+		o.default = '1';
+		o.rmempty = false;
 		if (pro) {
 			o = ss.option(form.Value, 'persist_max_age_hours', _('最久未存（小時）'),
 				_('學到的資料至少每隔這麼久一定存一次（最多 24 小時）。越小，斷電時遺失越少，但 Flash 寫入越多。'));
 			o.datatype = 'range(1,24)';
 			o.placeholder = '24';
-			o = ss.option(form.Value, 'min_free_kb', _('保留空間（KB）'),
-				_('寫入後至少留下這麼多可用空間；不夠時先刪日誌與可以重建的資料，核心資料（CDN 驗證紀錄、節點、社群身分、設定）絕不自動刪除。空白或 0 = 自動。'));
+			o = ss.option(form.Value, 'storage_reserve_mb', _('儲存保留空間（MB）'),
+				_('Flash 至少留這麼多給系統（opkg 安裝、改設定、jffs2 回收）。空間在保留量以上時，過濾清單的本機副本、統計這類可重建的資料大方留著（重開機更快、少下載）；低於保留量就依序刪日誌 → 清單副本 → 可重建的資料，核心資料絕不自動刪除。空白或 0 = 自動（max(1 MB, 10%)）；跟百分比都填取大的。'));
 			o.datatype = 'uinteger';
 			o.placeholder = '0';
+			o = ss.option(form.Value, 'storage_reserve_percent', _('儲存保留空間（%）'), _('檔案系統大小的百分比（最多 90）。'));
+			o.datatype = 'range(0,90)';
+			o.placeholder = '0';
 			o = ss.option(form.Flag, 'memory_governor', _('記憶體控制'),
-				_('記憶體吃緊時依序縮小診斷緩衝、DNS 快取，把 CDN 冷資料移出記憶體（磁碟保留）；記憶體不足時最後才暫時停用優先順序最低的過濾清單（自訂規則與保護清單不停用），寬裕後自動恢復。狀態頁看得到釋出了什麼。'));
+				_('系統可用記憶體低於保留量時依序讓出：診斷緩衝 → DNS 快取 → CDN 冷資料移到 Flash → （真的不足時）優先順序最低的過濾清單 → 只轉送（暫停 CDN 調整、快取最小）→ 最後才暫停保護清單。區網的 DNS 轉送永遠不停，寬裕後依相反順序恢復。'));
 			o.default = '1';
 			o.rmempty = false;
-			o = ss.option(form.Value, 'memory_budget_mb', _('記憶體預算（MB）'),
-				_('黑潮 DNS 自己最多用多少記憶體；超過就開始釋出。空白或 0 = 依等級自動（tiny 24、small 48、standard 128 MB）。'));
+			o = ss.option(form.Value, 'memory_reserve_mb', _('記憶體保留量（MB）'),
+				_('系統可用記憶體至少留這麼多給其他程式；低於它就讓出記憶體，高於它 + 遲滯才恢復、才讓快取長大。空白或 0 = 自動：max(16 MB, 實體記憶體 5%, min_free_kbytes × 3)。'));
 			o.datatype = 'uinteger';
 			o.placeholder = '0';
 			o.depends('memory_governor', '1');
+			o = ss.option(form.Value, 'memory_reserve_percent', _('記憶體保留量（%）'), _('實體記憶體的百分比（最多 90）；跟 MB 都填取大的。'));
+			o.datatype = 'range(0,90)';
+			o.placeholder = '0';
+			o.depends('memory_governor', '1');
+			o = ss.option(form.Value, 'oom_score_adj', _('OOM 分數調整'),
+				_('記憶體用完時核心挑誰停掉：負數 = 不優先挑本程式（DNS 停了等於斷網）。預設 -500：本程式要吃掉超過一半記憶體才會跟一般程式同分；-1000 = 完全豁免（不建議：真的漏記憶體時整台會卡死）。'));
+			o.datatype = 'range(-1000,1000)';
+			o.placeholder = '-500';
 		}
 
 		o = s.option(form.Flag, 'listen_ipv6', _('同時處理 IPv6'),
