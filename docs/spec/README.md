@@ -10,11 +10,11 @@
 | [02-architecture.md](02-architecture.md) | 程式架構、設定、state 格式、管理 API、公開頁 / 設定頁、兩個平台 |
 | [03-community-v2.md](03-community-v2.md) | 社群共享協定 v2（不相容 v1，兩位使用者一起升級） |
 | [04-migration-and-testing.md](04-migration-and-testing.md) | 從 node 版遷移、驗收方式、CI、階段與完成條件 |
-| [05-resources.md](05-resources.md) | 資源預算：硬體等級、最低需求、記憶體、Flash 寫入、CPU |
+| [05-resources.md](05-resources.md) | 資源：沒有硬體等級（動態調整）、最低需求、Flash 寫入、儲存保留量、依 CPU 核心數換算的值 |
 | [06-optimizations.md](06-optimizations.md) | 體驗優化：命中率、回台灣機率、速度（含量測方式） |
 | [07-windows.md](07-windows.md) | Windows 版：cmd / 服務、跟 IIS 共用 443（HTTP.sys / 反向代理）、DoH3、憑證、權限、攜帶版 |
 | [08-access.md](08-access.md) | 來源 IP 存取控制：只開放台灣（依 ISP 勾選）、自訂允許 / 封鎖、OpenWrt 核心層丟棄 |
-| [09-memory.md](09-memory.md) | 記憶體控制：預算、寬裕 / 吃緊 / 不足、依序釋出（診斷緩衝、快取、CDN 冷資料、過濾清單）與恢復 |
+| [09-memory.md](09-memory.md) | 記憶體控制：系統保留量、PSI、依序釋出到「純轉送」的底線與恢復、OOM 分數、當掉後快速重啟與 DNS 備援 |
 
 ## 目標
 

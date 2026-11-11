@@ -190,7 +190,8 @@ Windows 設定頁用原生 JS（不用前端框架、不需要編譯步驟），
 - `luci-app-kuroshio` 仍是 `all`。
 - 2.x 的 `candydns.init`、`takeover.sh`、`lan.sh`、`acme.sh`、`rpcd.sh`、`uci-defaults` 改名後保留；只把 `node …/server.js` 換成 `/usr/bin/kuroshio run --uci`，`node -e config.js` 換成 `kuroshio defaults --json`。
 - 3.0 預覽版（`openwrt/kuroshio/`）可以跟 2.x 同時安裝：預設不啟用，啟用後只聽 `127.0.0.1:5336`，用來並行比對。
-- 記憶體、Flash 寫入、CPU 的預算與依硬體自動調整：見 [05-resources.md](05-resources.md)。
+- 記憶體、Flash 寫入、CPU：沒有硬體等級，記憶體依系統保留量動態控制（[09-memory.md](09-memory.md)），其他見 [05-resources.md](05-resources.md)。
+- procd：`kuroshio` 實例 `respawn 3600 1 0`（1 秒後重啟、不放棄）；`guard` 實例（`guard.sh`）在本程式沒有回答時暫時讓 dnsmasq 直接轉送（`main.restart_fallback`）。
 
 ### 8.2 Windows
 

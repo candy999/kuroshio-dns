@@ -1,4 +1,4 @@
-//! CDN 設定（`cdn.*`，預設值在 `kuroshio-config/defaults.json`，依硬體等級調整）
+//! CDN 設定（`cdn.*`，預設值在 `kuroshio-config/defaults.json`，並行數依 CPU 核心數換算）
 
 use crate::providers::{self, PROVIDERS};
 use serde_json::Value;

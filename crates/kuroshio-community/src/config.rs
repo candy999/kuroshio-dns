@@ -106,9 +106,28 @@ impl Config {
         }
     }
 
+    /// 一份好友資料解壓後最多多大：`maxBundleMB`（安全上限，最多 32 MB），
+    /// 再不超過記憶體控制提供的上限（[`set_memory_cap_mb`]：系統保留量以上可用空間的 1/4）
     pub fn max_plain_bytes(&self) -> usize {
-        (self.max_bundle_mb as usize * 1024 * 1024).min(crate::envelope::MAX_RESPONSE_PLAIN)
+        self.max_plain_bytes_with(MEM_CAP_MB.load(std::sync::atomic::Ordering::Relaxed))
     }
+
+    /// 同 [`Config::max_plain_bytes`]，指定記憶體上限（MB；0 = 不限制）
+    pub fn max_plain_bytes_with(&self, mem_cap_mb: u32) -> usize {
+        let base = (self.max_bundle_mb as usize * 1024 * 1024).min(crate::envelope::MAX_RESPONSE_PLAIN);
+        match mem_cap_mb {
+            0 => base,
+            mb => base.min(mb as usize * 1024 * 1024),
+        }
+    }
+}
+
+/// 記憶體控制提供的上限（MB；0 = 不限制）
+static MEM_CAP_MB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 記憶體控制（主程式）每次量測後更新：收好友資料時解壓後不超過這麼多 MB（至少 1 MB；0 = 不限制）
+pub fn set_memory_cap_mb(mb: u32) {
+    MEM_CAP_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 時間與速率參數。正式環境用預設值；測試可以縮短等待時間或放寬速率（不影響任何驗證）
@@ -163,6 +182,15 @@ impl Default for Tuning {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bundle_limit_follows_memory_cap() {
+        let c = Config::from_json(&json!({ "maxBundleMB": 8 }));
+        assert_eq!(c.max_plain_bytes_with(0), 8 << 20);
+        // 記憶體控制：保留量以上只剩一點空間 → 好友資料上限跟著縮小；不限制時回到設定值
+        assert_eq!(c.max_plain_bytes_with(2), 2 << 20);
+        assert_eq!(c.max_plain_bytes_with(64), 8 << 20, "設定值仍是上限");
+    }
 
     #[test]
     fn from_uci_shape() {

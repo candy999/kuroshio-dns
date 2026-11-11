@@ -171,7 +171,7 @@ enum Cmd {
         #[arg(long, default_value_t = true)]
         json: bool,
     },
-    /// 檢查設定檔並印出合併後的結果（含硬體等級調整）
+    /// 檢查設定檔並印出合併後的結果（含依 CPU 核心數換算的值）
     CheckConfig {
         /// JSON 設定檔（用 --uci 時可省略）
         file: Option<PathBuf>,
@@ -179,7 +179,7 @@ enum Cmd {
         #[arg(long)]
         uci: bool,
     },
-    /// 顯示偵測到的硬體、等級，以及哪些預設值因為硬體被調低
+    /// 顯示偵測到的硬體、記憶體 / 儲存保留量、依 CPU 核心數換算的值
     Sysinfo {
         #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,

@@ -1,7 +1,7 @@
 //! CDNtest Step2（對齊 2.x `jobs/cdn-scan.js`）：把 CDN 範圍展開成 /24，每段抽樣探測 POP，
 //! 分成 TW / Global / Dead 三類 → `state/cdn/scan/<cdn>-ipv4-TW.txt` 等。
 //!
-//! 同時數 `scan.concurrency`（依硬體等級），用固定數量的工作者輪流取網段（不會一次開幾萬個 task）。
+//! 同時數 `scan.concurrency`（預設依 CPU 核心數），用固定數量的工作者輪流取網段（不會一次開幾萬個 task）。
 //! 結果依網段排序後寫檔（2.x 是完成順序），內容沒變就不寫。
 
 use super::{v4_lines, JobCtx};

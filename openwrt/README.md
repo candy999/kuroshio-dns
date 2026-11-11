@@ -15,7 +15,9 @@
 
 相依套件（`ca-bundle`、`acme-acmesh`、`acme-acmesh-dnsapi`）會自動從官方套件庫安裝。不需要 node。
 
-最低需求與各硬體等級見 [`docs/spec/05-resources.md`](../docs/spec/05-resources.md)。
+最低需求見 [`docs/spec/05-resources.md`](../docs/spec/05-resources.md)。沒有硬體等級：記憶體依系統保留量動態使用與讓出（[`09-memory.md`](../docs/spec/09-memory.md)），
+最深到純 DNS 轉送；當掉時 procd 1 秒後重啟，重新啟動期間 `guard.sh` 讓 dnsmasq 暫時直接轉送（`kuroshio.main.restart_fallback`，預設開；
+`exchange` 模式不做）。舊設定的 `system.profile` 接受、不使用。
 
 ## 從 2.x（candydns）升級
 

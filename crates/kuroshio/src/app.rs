@@ -1165,6 +1165,9 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             };
             let p = pressure_of(&r, &reserve);
             PRESSURE.store(p as u8, Ordering::Relaxed);
+            // 好友資料（社群共享）：解壓後不超過保留量以上可用空間的 1/4（至少 1 MB）
+            let cap = crate::memgov::headroom(&r, &reserve).map_or(0, |h| ((h >> 20) / 4).clamp(1, u32::MAX as u64) as u32);
+            kuroshio_community::config::set_memory_cap_mb(cap);
             if p != last {
                 let (a, res) = (r.avail.unwrap_or(0) >> 20, reserve.bytes >> 20);
                 match p {
