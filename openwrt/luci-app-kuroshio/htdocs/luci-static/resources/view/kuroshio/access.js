@@ -220,7 +220,7 @@ return view.extend({
 		o.allLabel = _('全選（含日後新增的 ISP）');
 		o.allDesc = _('台灣 IP 資料更新後新加入的業者也自動開放。');
 		o.noneText = _('一組都沒有勾：只剩區網、好友與允許名單可以連進來。');
-		o.missingText = _('資料裡沒有這一組，不會生效');
+		o.missingText = groups.length ? _('資料裡沒有這一組，不會生效') : _('已勾選（讀不到 ISP 清單）');
 		o.items = groups.map(function(g) {
 			var sz = g.size || {}, body = [E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap;align-items:center' }, [
 				T('strong', {}, g.name || g.id),

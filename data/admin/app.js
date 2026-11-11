@@ -1119,6 +1119,7 @@
 			// 設定裡有、但資料裡沒有的群組（資料更新後改名或移除）：也列出來，可以取消勾選
 			cur.forEach(function (gid) {
 				if (gid === '*' || groups.some(function (g) { return g.id === gid; })) return;
+				if (!groups.length) { item(gid, [el('div', { class: 'agroup-name' }, [el('strong', { text: gid }), badge('已勾選', 'off')])]); return; }
 				item(gid, [el('div', { class: 'agroup-name' }, [el('strong', { text: gid }), badge('資料裡沒有這一組', 'warn')]),
 					el('div', { class: 'muted', text: '台灣 IP 資料裡找不到，不會生效。取消勾選就會從設定移除。' })], true);
 			});
