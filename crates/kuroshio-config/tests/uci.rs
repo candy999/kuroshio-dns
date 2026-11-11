@@ -201,6 +201,16 @@ fn tier_still_applies_and_user_wins() {
     );
     assert_eq!(kuroshio_config::requested_tier(&sys), Some(Tier::Small));
     assert_eq!(g(&sys, "system.allowHeavy"), &json!(true));
+    // 快照：最久未存（小時）、保留空間（KB）
+    let ps = overrides(
+        &parse_text(
+            &(default_text() + "\nconfig system 'system'\n\toption persist_max_age_hours '6'\n\toption min_free_kb '2048'\n"),
+        )
+        .unwrap(),
+        &env(),
+    );
+    assert_eq!(g(&ps, "system.persistMaxAgeHours"), &json!(6));
+    assert_eq!(g(&ps, "system.minFreeKB"), &json!(2048));
     let dd = overrides(
         &parse_text(&default_text().replace("option data_dir ''", "option data_dir '/mnt/usb/kuroshio'")).unwrap(),
         &env(),

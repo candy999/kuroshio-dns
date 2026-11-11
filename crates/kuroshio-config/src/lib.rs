@@ -229,19 +229,28 @@ mod tests {
     }
 
     #[test]
-    fn small_tiers_cdn_db_fits_flash_budget() {
-        // 網域資料庫快照每筆約 545 B、常駐記憶體約 850 B（kuroshio-cdn 的 bench_db_size 實測）：
-        // tiny / small 的上限要讓快照在每日 Flash 寫入上限內（每天至少寫得出去一次）、tiny 的記憶體只佔幾 MB
-        for t in [Tier::Tiny, Tier::Small] {
+    fn cdn_db_limits_follow_ram() {
+        // 網域資料庫的筆數上限由記憶體決定，不由 Flash 寫入量決定（Flash 靠分片、壓縮、最久未存上限保護）。
+        // 常駐記憶體每筆（kuroshio-cdn 的 bench_persist 實測）：32 位元 armv7 約 600 B、i686 約 520 B；x86_64 約 850 B
+        const PER_ENTRY_32: u64 = 600;
+        // 各等級給網域資料庫的記憶體（規格 05 第 3.1、7 節）：tiny 24 MB 總預算裡留 6 MB，其他留給執行檔、快取、過濾清單
+        let share = |t: Tier| match t {
+            Tier::Tiny => 6 << 20,
+            Tier::Small => 16 << 20,
+            Tier::Standard => 96 << 20,
+            Tier::Large => u64::MAX,
+        };
+        let mut last = 0;
+        for t in Tier::ALL {
             let c = build(t, &json!({}));
             let n = get(&c, "cdn.maxEntries").and_then(Value::as_u64).unwrap();
-            let budget = get(&c, "system.flashWriteBudgetKB").and_then(Value::as_u64).unwrap() * 1024;
-            assert!(n * 545 < budget, "{}：{n} 筆的快照超過每日寫入上限", t.name());
-            assert!(n >= 4000, "{}：要放得下種子資料（約 4,000 筆）", t.name());
-            if t == Tier::Tiny {
-                assert!(n * 850 <= 5 * 1024 * 1024, "tiny 的網域資料庫不超過 5 MB 記憶體");
-            }
+            assert!(n * PER_ENTRY_32 <= share(t), "{}：{n} 筆超過記憶體預算", t.name());
+            assert!(n >= 10_000, "{}：至少放得下種子資料（約 4,000 筆）的兩倍以上", t.name());
+            assert!(n >= last, "記憶體越多上限越高");
+            last = n;
         }
+        // 最久未存上限預設 24 小時（Flash 上最多 24 小時）
+        assert_eq!(get(&defaults(), "system.persistMaxAgeHours").and_then(Value::as_u64), Some(24));
     }
 
     #[test]

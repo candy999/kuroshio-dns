@@ -25,7 +25,7 @@ pub const MANIFEST_FORMAT: &str = "kuroshio-cdn-domains";
 /// 每個分片壓縮後的目標大小（上限筆數時）：64–128 KB，大約一兩個 Flash 抹除區塊
 pub const SHARD_TARGET_BYTES: usize = 128 * 1024;
 /// 每筆網域壓縮後約幾 bytes（實測，見規格 05 第 5.5 節）
-pub const COMPRESSED_BYTES_PER_ENTRY: usize = 64;
+pub const COMPRESSED_BYTES_PER_ENTRY: usize = 115;
 /// 分片數上限
 pub const MAX_SHARDS: usize = 256;
 pub const HARVEST_FILE: &str = "cdn/harvest.json";

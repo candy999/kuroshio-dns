@@ -605,7 +605,16 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     out.insert("benchmark".into(), Value::Object(bench));
     for name in ["scan", "pool", "system"] {
         let mut m = Map::new();
-        apply(&mut m, d.get(name), sec(name), &[]);
+        // 大部分 UCI 選項自動轉成駝峰式（persist_max_age_hours → persistMaxAgeHours）；KB 結尾的另外對應
+        apply(
+            &mut m,
+            d.get(name),
+            sec(name),
+            &[
+                ("min_free_kb", Some("minFreeKB")),
+                ("flash_write_budget_kb", Some("flashWriteBudgetKB")),
+            ],
+        );
         if !m.is_empty() {
             out.insert(name.into(), Value::Object(m));
         }

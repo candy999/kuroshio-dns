@@ -254,3 +254,133 @@ fn bench_db_size() {
     );
     std::hint::black_box(&db);
 }
+
+/// 用種子資料做出 `n` 筆「像真的」網域：名稱不同、時間 / 次數 / IP 最後一段打散（壓縮率才不會好得不真實）
+pub fn synthetic_domains(n: usize) -> Vec<u8> {
+    let seed: Value = serde_json::from_slice(&std::fs::read(repo().join("data/seed/cdn-domains.json")).unwrap()).unwrap();
+    let base = seed["domains"].as_array().unwrap();
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut rnd = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    fn walk(v: &mut Value, r: &mut dyn FnMut() -> u64) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m.iter_mut() {
+                    match (k.as_str(), &*x) {
+                        ("at" | "until" | "firstSeen" | "lastSeen" | "recheckAt", Value::Number(n)) if n.as_u64().is_some() => {
+                            *x = json!(n.as_u64().unwrap().saturating_sub(r() % (30 * 86_400_000)));
+                        }
+                        ("hits", _) => *x = json!(r() % 5000),
+                        _ => walk(x, r),
+                    }
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, r)),
+            Value::String(s) => {
+                if let Ok(std::net::IpAddr::V4(ip)) = s.parse::<std::net::IpAddr>() {
+                    let o = ip.octets();
+                    *s = std::net::Ipv4Addr::new(o[0], o[1], (r() % 256) as u8, (r() % 254 + 1) as u8).to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    const WORDS: [&str; 12] = ["img", "static", "cdn", "api", "www", "assets", "video", "m", "media", "s", "edge", "files"];
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut d = base[i % base.len()].clone();
+        let name = d["name"].as_str().unwrap().to_string();
+        let w = WORDS[(rnd() % 12) as usize];
+        d["name"] = json!(if i < base.len() { name } else { format!("{w}{}.{name}", rnd() % 100_000) });
+        walk(&mut d, &mut rnd);
+        out.push(d);
+    }
+    serde_json::to_vec(&json!({ "domains": out })).unwrap()
+}
+
+/// 壓縮率、分片大小、單一變動要寫多少、每筆常駐記憶體（決定 `cdn.maxEntries` 與分片數用；規格 05 第 5.5 節）。
+/// 32 位元：`cargo zigbuild --target i686-unknown-linux-musl` 編好測試程式，直接跑或用 qemu-arm 跑 armv7
+#[test]
+#[ignore]
+fn bench_persist() {
+    use crate::statefile;
+    let seed = std::fs::read(repo().join("data/seed/cdn-domains.json")).unwrap();
+    for level in [1, 3, 9] {
+        let t = Instant::now();
+        let z = zstd::bulk::compress(&seed, level).unwrap();
+        println!(
+            "種子 {} 筆 {} KB → zstd {level}：{} KB（{:.1} 倍，{:.0} ms）",
+            3961,
+            seed.len() / 1024,
+            z.len() / 1024,
+            seed.len() as f64 / z.len() as f64,
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let z = statefile::compress(&seed);
+    println!("種子（寫入器的設定：等級 {}、視窗 2^{}）：{} KB，{:.1} 倍", statefile::LEVEL, statefile::WINDOW_LOG, z.len() / 1024, seed.len() as f64 / z.len() as f64);
+
+    // 每筆常駐記憶體：先載入一份用掉之前放掉的記憶體，再量第二份（要新配置）才準
+    {
+        let n = 50_000;
+        let bytes = synthetic_domains(n);
+        let mut warm = crate::db::Db::new(n * 2);
+        warm.load_domains(&bytes, false).unwrap();
+        let before = rss_kb();
+        let mut db = crate::db::Db::new(n * 2);
+        db.load_domains(&bytes, false).unwrap();
+        let after = rss_kb();
+        std::hint::black_box((&warm, &db));
+        println!(
+            "{n} 筆（{}-bit）載入後常駐記憶體約 {} B/筆",
+            usize::BITS,
+            after.unwrap_or(0).saturating_sub(before.unwrap_or(0)) * 1024 / n as u64
+        );
+    }
+    let only: Option<usize> = std::env::var("BENCH_N").ok().and_then(|s| s.parse().ok());
+    for n in [5_000usize, 20_000, 50_000, 120_000, 200_000] {
+        if only.is_some_and(|o| o != n) {
+            continue;
+        }
+        let bytes = synthetic_domains(n);
+        let mut db = crate::db::Db::new(n * 2);
+        db.load_domains(&bytes, false).unwrap();
+        let rss = "";
+        let shards = crate::db::shards_for(n);
+        db.set_shards(shards);
+        // 每片寫出、壓縮
+        let mut raw_total = 0;
+        let mut z_total = 0;
+        let mut z_max = 0;
+        let t = Instant::now();
+        for i in 0..shards {
+            let (head, tail) = crate::db::Db::shard_frame(shards, i);
+            let mut keys = db.shard_keys(shards, i);
+            keys.sort_unstable();
+            let mut buf = head;
+            let mut first = true;
+            db.dump_names(&keys, &mut buf, &mut first);
+            buf.extend_from_slice(tail);
+            let z = statefile::compress(&buf);
+            raw_total += buf.len();
+            z_total += z.len();
+            z_max = z_max.max(z.len());
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "{n} 筆（{}-bit）：單一檔 {:.1} MB{rss}；{shards} 片，壓縮後合計 {:.2} MB（{:.0} B/筆、{:.1} 倍），每片平均 {} KB、最大 {} KB；全部重寫 {ms:.0} ms",
+            usize::BITS,
+            bytes.len() as f64 / 1e6,
+            z_total as f64 / 1e6,
+            z_total as f64 / n as f64,
+            raw_total as f64 / z_total as f64,
+            z_total / shards / 1024,
+            z_max / 1024,
+        );
+        drop(db);
+    }
+}
