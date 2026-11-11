@@ -97,6 +97,25 @@ pub(crate) struct TierData {
     pub texts: Box<[Box<str>]>,
     pub keyed: Box<[KeyedRule]>,
     pub patterns: Box<[PatternRule]>,
+    /// 複雜規則的索引：（固定字串開頭三個字元的雜湊，規則編號），依雜湊排序。
+    /// 查詢時只看「名稱裡有出現那個雜湊」的規則，不必每個查詢把幾千條規則全部掃一遍
+    pub by_tri: Box<[(u16, u32)]>,
+    /// 沒有固定字串可以先篩的規則（每個查詢都要比對），依編號排序
+    pub always: Box<[u32]>,
+}
+
+/// 建立複雜規則的索引（見 `TierData::by_tri` / `always`）
+pub(crate) fn pattern_index(patterns: &[PatternRule]) -> (Box<[(u16, u32)]>, Box<[u32]>) {
+    let mut by_tri = Vec::new();
+    let mut always = Vec::new();
+    for (i, p) in patterns.iter().enumerate() {
+        match (&p.lit, p.tri) {
+            (Some(_), Some((a, _))) => by_tri.push((a, i as u32)),
+            _ => always.push(i as u32),
+        }
+    }
+    by_tri.sort_unstable();
+    (by_tri.into_boxed_slice(), always.into_boxed_slice())
 }
 
 #[derive(Clone, Copy)]
@@ -184,7 +203,29 @@ impl TierData {
                 return hits[0];
             }
         }
-        for (pi, p) in self.patterns.iter().enumerate() {
+        if self.patterns.is_empty() {
+            return hits.into_iter().flatten().next();
+        }
+        // 候選：沒有固定字串的規則，加上「固定字串開頭的三字元雜湊有出現在名稱裡」的規則；
+        // 依編號排序後照原本的順序比對，結果跟全部掃一遍相同
+        let mut cand: Vec<u32> = self.always.to_vec();
+        if !self.by_tri.is_empty() {
+            let set = q.trigrams.get_or_init(|| name_trigrams(q.name));
+            for (wi, word) in set.iter().enumerate() {
+                let mut w = *word;
+                while w != 0 {
+                    let h = (wi as u16) << 6 | w.trailing_zeros() as u16;
+                    w &= w - 1;
+                    let i = self.by_tri.partition_point(|x| x.0 < h);
+                    cand.extend(self.by_tri[i..].iter().take_while(|x| x.0 == h).map(|x| x.1));
+                }
+            }
+            if cand.len() > self.always.len() {
+                cand.sort_unstable();
+            }
+        }
+        for pi in cand.into_iter().map(|i| i as usize) {
+            let p = &self.patterns[pi];
             let class = class_of(p.flags());
             // 已經有同等級或更高等級的命中時，這條不會改變結果
             if hits[..=class].iter().any(Option::is_some) {
@@ -231,6 +272,8 @@ impl TierData {
             + self.keyed.len() * size_of::<KeyedRule>()
             + self.keyed.iter().map(|k| k.text.len() + k.dnstype.heap_bytes()).sum::<usize>()
             + self.patterns.len() * size_of::<PatternRule>()
+            + self.by_tri.len() * size_of::<(u16, u32)>()
+            + self.always.len() * size_of::<u32>()
             + self
                 .patterns
                 .iter()
@@ -414,5 +457,77 @@ impl Filter {
             + self.list_sources.capacity() * std::mem::size_of::<usize>()
             + self.stats.sources.capacity() * std::mem::size_of::<crate::SourceStats>()
             + self.stats.sources.iter().map(|s| s.name.capacity()).sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{BuildOptions, Category, FilterBuilder, ListSpec};
+
+    /// 複雜規則用索引挑候選，結果要跟「每一條都掃」完全一樣（命中哪一條、動作、優先順序）
+    #[test]
+    fn pattern_index_matches_full_scan() {
+        let mut rules = String::new();
+        for i in 0..300 {
+            rules.push_str(&format!("||ad{i}*.track.test^\n"));
+            rules.push_str(&format!("/banner{}[0-9]+\\.example\\./\n", i % 7));
+            if i % 5 == 0 {
+                rules.push_str(&format!("@@||ad{i}*.track.test^\n"));
+            }
+            if i % 11 == 0 {
+                rules.push_str(&format!("||ad{i}x*.track.test^$important\n"));
+            }
+            if i % 13 == 0 {
+                rules.push_str(&format!("@@/^w{i}\\.(a|b)\\.test$/$important\n"));
+                rules.push_str("/^(a|b)[0-9]+\\.nolit\\./\n");
+            }
+        }
+        rules.push_str("||*.wild.example^\n/^x.z$/\n");
+        let build = || {
+            let mut b = FilterBuilder::new(BuildOptions::default());
+            b.add_custom(b"/^custom[0-9]\\.test$/\n@@||ok*.track.test^\n");
+            b.add_list(ListSpec::new("L", Category::Ads), rules.as_bytes()).unwrap();
+            b.finish()
+        };
+        let indexed = build();
+        let mut full = build();
+        assert!(indexed.lists.patterns.len() > 600 && !indexed.lists.by_tri.is_empty() && !indexed.lists.always.is_empty());
+        for t in [&mut full.custom, &mut full.lists] {
+            t.by_tri = Box::new([]);
+            t.always = (0..t.patterns.len() as u32).collect();
+        }
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..320 {
+            names.push(format!("ad{i}.track.test"));
+            names.push(format!("ad{i}x9.track.test"));
+            names.push(format!("ad{i}foo.sub.track.test"));
+            names.push(format!("banner{}77.example.com", i % 9));
+            names.push(format!("w{i}.a.test"));
+            names.push(format!("a{i}.nolit.example"));
+            names.push(format!("ok{i}.track.test"));
+        }
+        for n in [
+            "a.wild.example",
+            "xyz",
+            "custom5.test",
+            "plain.example",
+            "",
+            "a",
+            "ab",
+            "track.test",
+            "AD3.Track.Test.",
+        ] {
+            names.push(n.to_string());
+        }
+        let mut some = 0;
+        for n in &names {
+            for qtype in [1u16, 28] {
+                let (a, b) = (indexed.check(n, qtype), full.check(n, qtype));
+                assert_eq!(a, b, "{n}");
+                assert_eq!(a.as_ref().map(|v| v.rule()), b.as_ref().map(|v| v.rule()), "{n}");
+                some += a.is_some() as usize;
+            }
+        }
+        assert!(some > 500, "{some}");
     }
 }

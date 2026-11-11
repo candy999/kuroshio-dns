@@ -688,6 +688,7 @@ fn finish_tier(mut t: TierBuild, relaxed: bool, is_custom: bool) -> (TierData, T
         st.by_cat.add(Category::from_bits(p.meta >> 6), 1);
     }
     let patterns = t.patterns.into_boxed_slice();
+    let (by_tri, always) = crate::filter::pattern_index(&patterns);
     (
         TierData {
             keys,
@@ -695,6 +696,8 @@ fn finish_tier(mut t: TierBuild, relaxed: bool, is_custom: bool) -> (TierData, T
             texts,
             keyed,
             patterns,
+            by_tri,
+            always,
         },
         st,
     )
