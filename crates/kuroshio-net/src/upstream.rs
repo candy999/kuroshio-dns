@@ -1,7 +1,7 @@
 //! 上游（規格 01 第 1.2 節）。
 //!
-//! 第一階段：udp:// 與 tcp://（UDP 回應被截斷時自動改用 TCP）。
-//! tls:// https:// h3:// quic:// sdns:// 會被辨識，但還沒實作，啟動時略過並記警告。
+//! 支援 udp://、tcp://（UDP 回應被截斷時自動改用 TCP）、tls://（DoT）、https://（DoH）、
+//! quic://（DoQ）、h3://（DoH3）。sdns://（DNSCrypt）會被辨識但刻意不支援，啟動時略過並記警告。
 
 use anyhow::{anyhow, bail, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -172,7 +172,7 @@ impl Upstream {
             Kind::Doh => self.client.doh.exchange(&self.host, self.port, &self.path, &q, limit).await?,
             Kind::Doq => self.client.doq.exchange(&self.host, self.port, &q, limit).await?,
             Kind::Doh3 => self.client.doh3.exchange(&self.host, self.port, &self.path, &q, limit).await?,
-            _ => bail!("{} 還沒實作", self.id),
+            _ => bail!("{} 不支援（DNSCrypt）", self.id),
         };
         if !kuroshio_proto::matches(&q, &resp) {
             bail!("回應跟查詢不符");
