@@ -213,15 +213,237 @@ const IFADDRS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// 同一時間只讓一個讀取在進行：卡住的那一個沒結束前，不再開新的執行緒
 static IFADDRS_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `if_addrs::get_if_addrs()`，但在另一條執行緒做、最多等 `IFADDRS_TIMEOUT`
-pub fn if_addrs_bounded() -> std::io::Result<Vec<if_addrs::Interface>> {
+/// 一張網卡上的一個位址
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfEntry {
+    pub name: String,
+    /// 網卡已啟用而且有連線（IFF_UP + IFF_RUNNING）
+    pub up: bool,
+    pub loopback: bool,
+    pub ip: IpAddr,
+    /// 前綴長度（IPv4 由網路遮罩算出）
+    pub prefix: u8,
+}
+
+/// 讀本機所有網卡位址。
+///
+/// Linux 不經過 netlink（`getifaddrs`）：QEMU 模擬大端序 MIPS 時 netlink 的轉換有問題，會卡住或讓整個程式崩潰。
+/// 改用每個 Linux 都有的舊介面：IPv4 用 `ioctl(SIOCGIFCONF)`，IPv6 讀 `/proc/net/if_inet6`。
+/// 其他系統（Windows、BSD）照用 if-addrs。
+pub fn if_entries() -> std::io::Result<Vec<IfEntry>> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        linux::entries()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Ok(if_addrs::get_if_addrs()?
+            .into_iter()
+            .map(|i| {
+                let prefix = match &i.addr {
+                    if_addrs::IfAddr::V4(a) => u32::from(a.netmask).leading_ones() as u8,
+                    if_addrs::IfAddr::V6(a) => u128::from(a.netmask).leading_ones() as u8,
+                };
+                IfEntry {
+                    up: i.is_oper_up(),
+                    loopback: i.is_loopback(),
+                    ip: i.ip(),
+                    prefix,
+                    name: i.name,
+                }
+            })
+            .collect())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod linux {
+    use super::IfEntry;
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// `struct ifreq`：名稱 16 bytes + union。union 最大的成員是 `struct ifmap`
+    /// （兩個 unsigned long + 8 bytes），32 位元是 16 bytes、64 位元是 24 bytes
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct IfReq {
+        name: [u8; 16],
+        data: [libc::c_ulong; 2 + 8 / std::mem::size_of::<libc::c_ulong>()],
+    }
+
+    #[repr(C)]
+    struct IfConf {
+        len: libc::c_int,
+        buf: *mut IfReq,
+    }
+
+    struct Fd(libc::c_int);
+    impl Drop for Fd {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.0) };
+        }
+    }
+
+    fn bytes(r: &IfReq) -> &[u8] {
+        // SAFETY: IfReq 是 repr(C) 的純資料，長度固定
+        unsafe { std::slice::from_raw_parts(r.data.as_ptr() as *const u8, std::mem::size_of_val(&r.data)) }
+    }
+
+    /// union 裡的 `struct sockaddr_in`：family（本機位元組序）、port、位址（網路位元組序）
+    fn sockaddr_v4(r: &IfReq) -> Option<Ipv4Addr> {
+        let b = bytes(r);
+        let family = u16::from_ne_bytes([b[0], b[1]]);
+        (family == libc::AF_INET as u16).then(|| Ipv4Addr::new(b[4], b[5], b[6], b[7]))
+    }
+
+    fn name_of(r: &IfReq) -> String {
+        let end = r.name.iter().position(|&c| c == 0).unwrap_or(r.name.len());
+        String::from_utf8_lossy(&r.name[..end]).into_owned()
+    }
+
+    fn req_named(name: &str) -> Option<IfReq> {
+        let mut r = IfReq {
+            name: [0; 16],
+            data: [0; 2 + 8 / std::mem::size_of::<libc::c_ulong>()],
+        };
+        let n = name.as_bytes();
+        if n.is_empty() || n.len() >= 16 {
+            return None;
+        }
+        r.name[..n.len()].copy_from_slice(n);
+        Some(r)
+    }
+
+    /// （是否運作中, 是否迴路）
+    fn flags(fd: &Fd, name: &str) -> Option<(bool, bool)> {
+        let mut r = req_named(name)?;
+        // SAFETY: r 是有效的 ifreq；核心只寫回 union 的前兩個 bytes（short flags）
+        if unsafe { libc::ioctl(fd.0, libc::SIOCGIFFLAGS as _, &mut r) } != 0 {
+            return None;
+        }
+        let f = i16::from_ne_bytes([bytes(&r)[0], bytes(&r)[1]]) as libc::c_int;
+        Some((f & libc::IFF_UP != 0 && f & libc::IFF_RUNNING != 0, f & libc::IFF_LOOPBACK != 0))
+    }
+
+    fn netmask(fd: &Fd, name: &str) -> Option<u8> {
+        let mut r = req_named(name)?;
+        // SAFETY: 同上
+        if unsafe { libc::ioctl(fd.0, libc::SIOCGIFNETMASK as _, &mut r) } != 0 {
+            return None;
+        }
+        sockaddr_v4(&r).map(|m| u32::from(m).leading_ones() as u8)
+    }
+
+    pub fn entries() -> io::Result<Vec<IfEntry>> {
+        // SAFETY: 一般的 socket 呼叫；回傳值檢查過
+        let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = Fd(raw);
+        let mut out = Vec::new();
+
+        // IPv4：SIOCGIFCONF（只列有 IPv4 位址的網卡）；網卡很多時放大緩衝區再試
+        let mut cap = 32usize;
+        let reqs = loop {
+            let mut buf = vec![
+                IfReq {
+                    name: [0; 16],
+                    data: [0; 2 + 8 / std::mem::size_of::<libc::c_ulong>()],
+                };
+                cap
+            ];
+            let mut conf = IfConf {
+                len: (cap * std::mem::size_of::<IfReq>()) as libc::c_int,
+                buf: buf.as_mut_ptr(),
+            };
+            // SAFETY: conf 指向 cap 個 IfReq 的緩衝區，長度如實填寫
+            if unsafe { libc::ioctl(fd.0, libc::SIOCGIFCONF as _, &mut conf) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let n = conf.len.max(0) as usize / std::mem::size_of::<IfReq>();
+            if n < cap || cap >= 4096 {
+                buf.truncate(n);
+                break buf;
+            }
+            cap *= 4;
+        };
+        for r in &reqs {
+            let Some(ip) = sockaddr_v4(r) else { continue };
+            let name = name_of(r);
+            let (up, loopback) = flags(&fd, &name).unwrap_or((false, ip.is_loopback()));
+            let prefix = netmask(&fd, &name).unwrap_or(32);
+            out.push(IfEntry {
+                name,
+                up,
+                loopback,
+                ip: IpAddr::V4(ip),
+                prefix,
+            });
+        }
+
+        // IPv6：/proc/net/if_inet6（沒有 IPv6 時檔案不存在，不算錯誤）
+        if let Ok(text) = std::fs::read_to_string("/proc/net/if_inet6") {
+            for (ip, prefix, name) in parse_if_inet6(&text) {
+                let (up, loopback) = flags(&fd, &name).unwrap_or((false, ip.is_loopback()));
+                out.push(IfEntry {
+                    name,
+                    up,
+                    loopback,
+                    ip: IpAddr::V6(ip),
+                    prefix,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// `/proc/net/if_inet6` 每行：位址（32 個十六進位字元）、介面編號、前綴長度、範圍、旗標、名稱
+    pub(super) fn parse_if_inet6(text: &str) -> Vec<(Ipv6Addr, u8, String)> {
+        text.lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                if f.len() < 6 || f[0].len() != 32 {
+                    return None;
+                }
+                let ip = Ipv6Addr::from(u128::from_str_radix(f[0], 16).ok()?);
+                let prefix = u8::from_str_radix(f[2], 16).ok().filter(|p| *p <= 128)?;
+                Some((ip, prefix, f[5].to_string()))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn if_inet6_lines() {
+            let t = "fe800000000000000000000000000001 02 40 20 80     br-lan\n\
+                     00000000000000000000000000000001 01 80 10 80       lo\n\
+                     bad line\n";
+            let v = super::parse_if_inet6(t);
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0].0, "fe80::1".parse::<std::net::Ipv6Addr>().unwrap());
+            assert_eq!((v[0].1, v[0].2.as_str()), (64, "br-lan"));
+            assert_eq!((v[1].1, v[1].2.as_str()), (128, "lo"));
+        }
+
+        #[test]
+        fn real_interfaces_include_loopback() {
+            let v = super::entries().unwrap();
+            assert!(v.iter().any(|e| e.loopback && e.ip.is_loopback()), "{v:?}");
+        }
+    }
+}
+
+/// `if_entries()`，但在另一條執行緒做、最多等 `IFADDRS_TIMEOUT`
+pub fn if_addrs_bounded() -> std::io::Result<Vec<IfEntry>> {
     use std::sync::atomic::Ordering;
     if IFADDRS_BUSY.swap(true, Ordering::AcqRel) {
         return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "上一次讀取網卡清單還沒結束"));
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new().name("ifaddrs".into()).spawn(move || {
-        let r = if_addrs::get_if_addrs();
+        let r = if_entries();
         IFADDRS_BUSY.store(false, Ordering::Release);
         let _ = tx.send(r);
     });
@@ -236,7 +458,7 @@ pub fn if_addrs_bounded() -> std::io::Result<Vec<if_addrs::Interface>> {
 /// 列出本機所有有位址的網卡（讀不到時回空清單）
 pub fn list() -> Vec<Iface> {
     match if_addrs_bounded() {
-        Ok(v) => group(v.into_iter().map(|i| (i.name.clone(), i.is_oper_up(), i.ip())), &inet6_flags()),
+        Ok(v) => group(v.into_iter().map(|i| (i.name, i.up, i.ip)), &inet6_flags()),
         Err(e) => {
             tracing::warn!("讀不到本機網卡清單：{e}");
             Vec::new()

@@ -960,23 +960,14 @@ pub fn local_networks() -> Dual {
     match crate::netif::if_addrs_bounded() {
         Ok(ifs) => {
             for i in ifs {
-                if i.is_loopback() {
+                if i.loopback || i.ip.is_loopback() {
                     continue;
                 }
-                match i.addr {
-                    if_addrs::IfAddr::V4(a) => {
-                        let len = u32::from(a.netmask).leading_ones();
-                        // 網段太大（短於 /16）的只放自己這個位址
-                        list.push(format!("{}/{}", a.ip, if len >= 16 { len } else { 32 }));
-                    }
-                    if_addrs::IfAddr::V6(a) => {
-                        let len = u128::from(a.netmask).leading_ones();
-                        if len >= 48 {
-                            list.push(format!("{}/{len}", a.ip));
-                        } else {
-                            list.push(format!("{}/128", a.ip));
-                        }
-                    }
+                let len = i.prefix as u32;
+                match i.ip {
+                    // 網段太大（短於 /16）的只放自己這個位址
+                    IpAddr::V4(ip) => list.push(format!("{ip}/{}", if len >= 16 { len } else { 32 })),
+                    IpAddr::V6(ip) => list.push(format!("{ip}/{}", if len >= 48 { len } else { 128 })),
                 }
             }
         }
