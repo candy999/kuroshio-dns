@@ -1228,7 +1228,7 @@
 		var bc = toolCard('backup', '備份與分享', '換電腦、重灌，或把學到的資料分享給朋友。匯入是「合併」：本機比較新的資料會留著，不會被蓋掉。', true);
 		bc.insertBefore(el('ul', { class: 'notes' }, [
 			el('li', {}, [el('strong', { text: '完整備份' }), '：全部學習資料、自訂規則、社群身分與好友。含私鑰，請自己保管，不要給別人。']),
-			el('li', {}, [el('strong', { text: '分享給朋友' }), '：CDN 網域驗證紀錄（只有網域名稱與驗證結果，不含查詢次數與時間）、台灣節點池、上游評測結果、汙染 DNS 黑名單。沒有身分、金鑰、統計與自訂規則。'])
+			el('li', {}, [el('strong', { text: '分享給朋友' }), '：CDN 網域驗證紀錄（只有網域名稱與驗證結果，不含查詢次數與時間）、台灣節點池（匯入的一方只當候選，本機驗證通過才使用；上游評測與黑名單不會被匯入）。沒有身分、金鑰、統計與自訂規則。'])
 		]), bc.body);
 		var file = el('input', { type: 'file', accept: '.kuroshio', 'aria-label': '選擇要匯入的 .kuroshio 檔', id: 'backup-file' });
 		var imp = actBtn('匯入', '', function () {

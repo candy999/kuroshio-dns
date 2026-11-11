@@ -113,7 +113,7 @@ function backupSection() {
 		T('p', { 'class': 'cbi-section-descr' }, _('換路由器時把累積的學習資料帶過去，或分享給朋友手動匯入。匯入是「合併」：本機比較新的資料會留著，不會被蓋掉。')),
 		E('ul', { 'style': 'margin:.4em 0 .8em 1.2em;list-style:disc' }, [
 			E('li', {}, [T('strong', {}, _('完整備份')), T('span', {}, _('：全部學習資料、自訂規則、社群身分與好友。含私鑰，請自己保管，不要給別人。'))]),
-			E('li', {}, [T('strong', {}, _('分享給朋友')), T('span', {}, _('：CDN 網域驗證紀錄（只有網域名稱與驗證結果，不含查詢次數與時間）、台灣節點池、上游評測結果、汙染 DNS 黑名單。沒有身分、金鑰、統計與自訂規則。'))])
+			E('li', {}, [T('strong', {}, _('分享給朋友')), T('span', {}, _('：CDN 網域驗證紀錄（只有網域名稱與驗證結果，不含查詢次數與時間）、台灣節點池（匯入的一方只當候選，本機驗證通過才使用；上游評測與黑名單不會被匯入）。沒有身分、金鑰、統計與自訂規則。'))])
 		]),
 		E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap;align-items:center' }, [
 			btn(_('下載完整備份'), 'cbi-button-action', function(b) { return exportBackup('full', b, out); }),
