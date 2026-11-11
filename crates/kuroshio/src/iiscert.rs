@@ -131,26 +131,9 @@ pub fn pfx(m: &Material, password: &str) -> Result<Vec<u8>> {
 
 /// 黑潮 DNS 用的憑證與私鑰：DoH 自己指定的 → 共用的 `tls.cert` → DoT 的 → 內建 ACME 的輸出位置
 pub fn cert_files(cfg: &Value, base: &Path) -> (PathBuf, PathBuf) {
-    let s = |k: &str| get(cfg, k).and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let rel = |p: String| {
-        let p = PathBuf::from(p);
-        if p.is_absolute() {
-            p
-        } else {
-            base.join(p.strip_prefix("./").unwrap_or(&p))
-        }
-    };
-    for (c, k) in [
-        ("listen.doh.cert", "listen.doh.key"),
-        ("tls.cert", "tls.key"),
-        ("listen.dot.cert", "listen.dot.key"),
-    ] {
-        let (c, k) = (s(c), s(k));
-        if !c.is_empty() && !k.is_empty() {
-            return (rel(c), rel(k));
-        }
-    }
-    crate::acme::cert_paths(cfg, base)
+    crate::app::cert_for(cfg, "doh", base)
+        .or_else(|| crate::app::cert_for(cfg, "dot", base))
+        .unwrap_or_else(|| crate::acme::cert_paths(cfg, base))
 }
 
 pub fn domain(cfg: &Value) -> Option<String> {

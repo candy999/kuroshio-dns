@@ -63,15 +63,7 @@ fn covers(cfg: &Value, proto: &str, ip: IpAddr) -> bool {
 
 /// 這個監聽用的憑證檔（各自指定的優先，再來是共用的 `tls.cert`）
 fn cert_of(cfg: &Value, proto: &str, base: &Path) -> Option<std::path::PathBuf> {
-    let p = [s(cfg, &format!("listen.{proto}.cert")), s(cfg, "tls.cert")]
-        .into_iter()
-        .find(|p| !p.is_empty())?;
-    let p = Path::new(&p);
-    Some(if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        base.join(p.strip_prefix("./").unwrap_or(p))
-    })
+    crate::app::cert_for(cfg, proto, base).map(|(cert, _)| cert)
 }
 
 /// 依設定算出要發的內容。`lan`：路由器的區網位址；`base`：相對路徑的基準（設定檔所在的資料夾）
@@ -111,7 +103,7 @@ pub fn plan(cfg: &Value, lan: &[IpAddr], base: &Path) -> Plan {
     let mut eps: Vec<(&str, DdrEndpoint)> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
     // 順序同 DDR：DoH（同埠有 HTTP/3 就一起）、DoT、DoQ
-    if on(cfg, "listen.doh.enabled") && crate::console::doh_tls(cfg) {
+    if on(cfg, "listen.doh.enabled") && crate::app::doh_uses_tls(cfg, base) {
         match cert_ok("doh") {
             Ok(()) => {
                 let p = port(cfg, "listen.doh.port", 443);

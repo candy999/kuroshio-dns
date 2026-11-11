@@ -54,13 +54,7 @@ pub const HELP: &str = "可以用的指令：
 
 /// DoH 監聽是不是 HTTPS（有憑證）；DNR 也用這個判斷
 pub fn doh_tls(cfg: &Value) -> bool {
-    let s = |k: &str| get(cfg, k).and_then(Value::as_str).unwrap_or("");
-    match get(cfg, "listen.doh.tls") {
-        Some(Value::Bool(b)) => return *b,
-        _ if s("listen.doh.windowsMode") == "iis-proxy" => return false,
-        _ => {}
-    }
-    !s("listen.doh.cert").is_empty() || !s("tls.cert").is_empty() || get(cfg, "acme.enabled").and_then(Value::as_bool).unwrap_or(false)
+    crate::app::doh_uses_tls(cfg, &crate::app::config_dir(cfg))
 }
 
 fn with_port(scheme: &str, host: &str, port: u16) -> String {
