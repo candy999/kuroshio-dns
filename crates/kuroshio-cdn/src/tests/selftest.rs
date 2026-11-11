@@ -374,6 +374,37 @@ fn fastly_octet_and_quality() {
     };
     assert!(serve_with("151.101.77.6").is_empty());
     assert_eq!(serve_with("151.101.77.140"), ips(&["151.101.77.140"]));
+    // 節點池裡「別的網站驗證過」的同一段 IP 不能拿來頂替或當備援：只回針對這個網站驗證過的
+    // （回空的 → 呼叫端先回原始結果並重新驗證）
+    let serve_pool_with = |vip: &str, also: &[&str], pool: &[&str]| {
+        opt.with_state(|st| {
+            let v = st.db.get_mut("fx.test").unwrap().v4.as_mut().unwrap();
+            v.ip = Some(ip(vip));
+            v.ips = (!also.is_empty()).then(|| ips(also));
+        });
+        let st = opt.state();
+        opt.serve_pool(
+            &st,
+            "fastly",
+            4,
+            "fx.test",
+            &ips(pool),
+            Some(&ips(&["151.101.65.140"])),
+            &mut Vec::new(),
+        )
+    };
+    let pool = ["151.101.76.140", "151.101.78.140"];
+    assert!(serve_pool_with("151.101.77.6", &[], &pool).is_empty(), "網站換了憑證組");
+    assert!(
+        serve_pool_with("151.101.9.140", &[], &pool).is_empty(),
+        "驗證用的網段已經不在可用的 POP"
+    );
+    assert_eq!(serve_pool_with("151.101.77.140", &[], &pool), ips(&["151.101.77.140"]));
+    assert_eq!(
+        serve_pool_with("151.101.77.140", &["151.101.77.140", "151.101.78.140", "151.101.9.140"], &pool),
+        ips(&["151.101.77.140", "151.101.78.140"]),
+        "備援只用這個網站自己驗證過、而且還能用的"
+    );
 
     // 某網段連不上：該網段暫停 30 分鐘，候選跳過它
     opt.with_state(|st| st.pools.mark_bad("fastly", ip("151.101.78.140"), "測試"));

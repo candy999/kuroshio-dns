@@ -543,3 +543,34 @@ fn provider_by_cname_matches_plain_suffix_scan() {
         assert_eq!(provider_by_cname(host), naive(host), "{host}");
     }
 }
+
+#[tokio::test]
+async fn verifier_octet_mode_verifies_backup_ips_for_this_site() {
+    // Fastly（保留最後一段）：驗證通過後，備援 IP 也要逐一針對這個網站驗證，只記通過的
+    let (c, net) = setup(json!({ "providers": { "fastly": { "enabled": true, "serveCount": 3 } } }));
+    let pf = |s: &str| crate::util::parse_prefix24(s).unwrap();
+    c.with_state(|st| {
+        st.pools.zone.clear();
+        let d = st.pools.p.get_mut("fastly").unwrap();
+        let mut n = PoolNode::new(ip("151.101.76.2"));
+        n.pop = Some(intern("HKG"));
+        n.ms = Num::V(26.0);
+        n.score = Num::V(28.0);
+        d.pool4 = vec![n];
+        d.prefixes = [("HKG".to_string(), vec![pf("151.101.76"), pf("151.101.77"), pf("151.101.78")])]
+            .into_iter()
+            .collect();
+        st.db.touch("fo.test", "fastly", "ip", &ips(&["151.101.65.140"]), &[], None);
+    });
+    let ok = || resp(200, &[("x-served-by", "cache-hkg17920-HKG")], "<html>ok</html>");
+    // .78.140 的憑證不是這個網站的
+    net.on_https(move |i, _| match i.to_string().as_str() {
+        "151.101.78.140" => ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true),
+        _ => ok(),
+    });
+    assert_eq!(c.verify("fo.test", "fastly", 4, Some(ip("151.101.65.140"))).await, Some("ok"));
+    let v = c.state().db.get("fo.test").unwrap().v4.clone().unwrap();
+    assert_eq!(v.ip, Some(ip("151.101.76.140")));
+    assert_eq!(v.ips, Some(ips(&["151.101.76.140", "151.101.77.140"])), "憑證不符的 .78 不列入");
+    assert_eq!(net.calls("https 151.101.78.140").len(), 1);
+}

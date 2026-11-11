@@ -465,6 +465,27 @@ impl Cdn {
                         ips.push(ip2);
                     }
                 }
+            } else {
+                // 保留最後一段的 CDN（Fastly）：回給用戶端的備援 IP 也要針對這個網站驗證過
+                // （以前備援是節點池裡「別的網站驗證過」的同一段 IP）。只找同一個 POP 的，湊到要回的數量為止，最多多試 4 個
+                let want = self.cfg.serve_count_of(provider);
+                let pop_of = |x: IpAddr| self.state().pools.pop_of_ip(provider, x);
+                let my_pop = pop_of(ip);
+                let mut extra = 0;
+                for &ip2 in &candidates[idx + 1..] {
+                    if ips.len() >= want || extra >= 4 {
+                        break;
+                    }
+                    if pop_of(ip2) != my_pop {
+                        continue;
+                    }
+                    extra += 1;
+                    let ok = self.passes(provider, name, http_mode, ip2, base_ok, base_https.as_ref()).await;
+                    note(hinted_out, ip2, ok);
+                    if ok && self.state().pools.usable(provider, ip2) {
+                        ips.push(ip2);
+                    }
+                }
             }
             return Some(self.done(
                 name,

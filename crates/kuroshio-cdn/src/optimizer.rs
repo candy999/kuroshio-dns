@@ -685,17 +685,19 @@ impl Cdn {
         let v = entry.and_then(|e| e.verdict(family));
         if st.pools.octet_mode(provider) && family == 4 {
             let Some(v) = v.filter(|v| v.is("ok")) else { return pool.to_vec() };
-            let Some(vip) = v.ip.filter(|ip| st.pools.usable(provider, *ip)) else {
-                return pool.to_vec();
-            };
-            // 驗證用的 IP 最後一段要跟這次答案一樣才能用（網站換了憑證組就不能用舊的）
-            if let Some(o) = orig {
-                if !o.iter().any(|ip| util::last_octet(*ip) == util::last_octet(vip)) {
-                    return pool.to_vec();
+            // 只回「針對這個網站驗證過」的 IP：驗證時用的那個排第一，其餘驗證通過的當備援。
+            // 以前驗證用的 IP 不能用（POP 變差、網站換了憑證組）時會改回節點池裡「別的網站驗證過」的 IP，
+            // 那些沒有針對這個網站驗證過憑證；現在回空的，讓呼叫端先回原始結果並重新驗證
+            let mut out: Vec<IpAddr> = Vec::new();
+            for ip in v.ip.iter().chain(v.ips.iter().flatten()) {
+                // 最後一段要跟這次答案一樣才能用（網站換了憑證組就不能用舊的）
+                let same_octet = orig
+                    .map(|o| o.iter().any(|x| util::last_octet(*x) == util::last_octet(*ip)))
+                    .unwrap_or(true);
+                if same_octet && !out.contains(ip) && st.pools.usable(provider, *ip) {
+                    out.push(*ip);
                 }
             }
-            let mut out = vec![vip];
-            out.extend(pool.iter().copied().filter(|ip| *ip != vip));
             out.truncate(pool.len().max(1));
             return out;
         }
