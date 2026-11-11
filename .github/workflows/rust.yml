@@ -213,8 +213,8 @@ jobs:
           $r = Invoke-WebRequest http://127.0.0.1:18054/api/status -SkipHttpErrorCheck
           if ($r.StatusCode -ne 401) { throw "沒登入應該是 401，實際 $($r.StatusCode)" }
           $tok = (Get-Content (Join-Path $dir 'admin.token')).Trim()
-          $r = Invoke-WebRequest "http://127.0.0.1:18054/login?token=$tok" -SessionVariable s -MaximumRedirection 0 -SkipHttpErrorCheck
-          if ($r.StatusCode -ne 303) { throw "登入應該是 303，實際 $($r.StatusCode)" }
+          # 登入會 303 轉回首頁（MaximumRedirection 0 在 PowerShell 7 會直接丟例外）：照常跟著轉，再用 cookie 讀狀態確認
+          $null = Invoke-WebRequest "http://127.0.0.1:18054/login?token=$tok" -SessionVariable s -SkipHttpErrorCheck
           $status = Invoke-RestMethod http://127.0.0.1:18054/api/status -WebSession $s
           Write-Host "版本 $($status.version)，等級 $($status.system.tier)"
           $conf = Invoke-RestMethod http://127.0.0.1:18054/api/config -WebSession $s
