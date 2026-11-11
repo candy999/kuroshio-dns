@@ -902,12 +902,28 @@ pub fn merge(loc: &Locations, b: &Bundle) -> Value {
         if !comm.is_empty() {
             let mut it = Item::new(COMMUNITY);
             it.file = "community".into();
-            let has_key = loc.key_dir.join("key.pem").exists();
-            let has_peers = loc.community_dir().join("peers.json").exists();
-            if has_key || has_peers {
+            // 換路由器：新機器開了社群會先自己產生金鑰，但還沒有好友 → 用備份的身分（好友認得的那一個）。
+            // 已經有好友就不覆蓋（覆蓋會讓現有好友認不出這台）
+            let peers = read_json(&loc.community_dir().join("peers.json"));
+            let friends = peers
+                .as_ref()
+                .and_then(|v| v.get("peers"))
+                .map(|p| {
+                    p.as_object()
+                        .map(|o| o.len())
+                        .or_else(|| p.as_array().map(|a| a.len()))
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            if friends > 0 {
                 it.skipped = comm.len() as u64;
-                it.note = Some("已有社群身分，沒有覆蓋".into());
+                it.note = Some(format!("這台已經有 {friends} 位好友，社群身分沒有覆蓋"));
             } else {
+                let key = loc.key_dir.join("key.pem");
+                if key.exists() {
+                    // 新機器自己產生的金鑰留一份
+                    let _ = std::fs::copy(&key, loc.key_dir.join("key.pem.before-import"));
+                }
                 for (k, d) in comm {
                     let Some(p) = loc.path_of(k) else { continue };
                     write(&mut it, &p, &d.bytes());
@@ -1272,8 +1288,13 @@ mod tests {
         assert!(cr.contains("# ── 從備份匯入（") && cr.contains("||ads.example^\n||track.example^"));
         assert_eq!(read_json(&dst.join(STATS)).unwrap()["local"], true, "統計本機已有，不覆蓋");
         assert!(dst.join(HOT).exists(), "本機沒有的才用");
-        assert_eq!(item("community")["note"], "已有社群身分，沒有覆蓋");
-        assert_eq!(std::fs::read_to_string(dst.join("community/key.pem")).unwrap(), "LOCAL");
+        // 新機器自己產生了金鑰、但還沒有好友 → 換成備份的身分，原本的留一份
+        assert_eq!(item("community")["note"], "已還原社群身分與好友");
+        assert_ne!(std::fs::read_to_string(dst.join("community/key.pem")).unwrap(), "LOCAL");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("community/key.pem.before-import")).unwrap(),
+            "LOCAL"
+        );
         assert!(report_text(&r).contains("CDN 網域驗證紀錄：新增 1、更新 1"));
 
         // 再匯入一次：都已經有了
@@ -1281,6 +1302,16 @@ mod tests {
         assert_eq!(item_of(&r2, DOMAINS)["added"], 0);
         assert_eq!(item_of(&r2, BLACKLIST)["added"], 0);
         assert_eq!(std::fs::read_to_string(dst.join(CUSTOM)).unwrap(), cr, "規則不會重複附加");
+
+        // 已經有好友的機器：不覆蓋社群身分
+        std::fs::write(dst.join("community/key.pem"), "HAS-FRIENDS").unwrap();
+        wj(
+            &dst.join("community/peers.json"),
+            json!({ "peers": { "friend.example.net": { "rel": "friend" } } }),
+        );
+        let rf = merge(&dloc, &full);
+        assert_eq!(item_of(&rf, "community")["note"], "這台已經有 1 位好友，社群身分沒有覆蓋");
+        assert_eq!(std::fs::read_to_string(dst.join("community/key.pem")).unwrap(), "HAS-FRIENDS");
 
         // 舊的驗證結果不會蓋掉新的
         let mut old = full.clone();
