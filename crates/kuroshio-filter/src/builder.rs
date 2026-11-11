@@ -14,6 +14,10 @@ pub struct BuildOptions {
     /// 複雜規則（正規表示式、萬用字元、`$dnstype`）上限；超過的清單規則丟掉並計數。自訂規則不受限（但會佔額度）。
     /// 建議值：tiny 2,000、small 5,000、standard 以上 20,000。
     pub max_complex: u64,
+    /// 其中「沒有可用固定字串」（三字元索引用不上、每次查詢都要跑一次）的正規表示式 / 萬用字元規則上限
+    /// （設定 `filter.maxUnindexed`）。這種規則每 2,000 條約讓每次查詢多 0.5 ms；超過的清單規則丟掉並計數。
+    /// 自訂規則不受限（但會佔額度）。建議值：tiny 200、small 500、standard 1,000、large 2,000。
+    pub max_unindexed: u64,
     /// 設定 `filter.relaxedModifiers`：把 `||domain^$third-party` 之類當成整個網域封鎖（只套用在清單層）
     pub relaxed_modifiers: bool,
 }
@@ -23,6 +27,7 @@ impl Default for BuildOptions {
         BuildOptions {
             max_domains: 10_000_000,
             max_complex: 20_000,
+            max_unindexed: 2_000,
             relaxed_modifiers: false,
         }
     }
@@ -134,6 +139,8 @@ pub struct FilterBuilder {
     budget_used: u64,
     complex: u64,
     complex_dropped: u64,
+    unindexed: u64,
+    unindexed_dropped: u64,
 }
 
 impl FilterBuilder {
@@ -148,6 +155,8 @@ impl FilterBuilder {
             budget_used: 0,
             complex: 0,
             complex_dropped: 0,
+            unindexed: 0,
+            unindexed_dropped: 0,
         }
     }
 
@@ -170,6 +179,7 @@ impl FilterBuilder {
             unsupported: 0,
             regex_unsupported: 0,
             complex_dropped: 0,
+            unindexed_dropped: 0,
             badfilter: 0,
         });
         SourceWriter::new(self, idx, true, 0, Category::Custom, true)
@@ -198,6 +208,7 @@ impl FilterBuilder {
             unsupported: 0,
             regex_unsupported: 0,
             complex_dropped: 0,
+            unindexed_dropped: 0,
             badfilter: 0,
         });
         Ok(SourceWriter::new(self, idx, false, list_no, spec.category, spec.enabled))
@@ -230,6 +241,8 @@ impl FilterBuilder {
             budget_used,
             complex,
             complex_dropped,
+            unindexed,
+            unindexed_dropped,
             ..
         } = self;
         let mut stats = FilterStats {
@@ -238,6 +251,9 @@ impl FilterBuilder {
             complex,
             max_complex: opts.max_complex,
             complex_dropped,
+            unindexed,
+            max_unindexed: opts.max_unindexed,
+            unindexed_dropped,
             skipped: custom.skipped + lists.skipped,
             regex_unsupported: custom.regex_unsupported + lists.regex_unsupported,
             ..FilterStats::default()
@@ -252,6 +268,8 @@ impl FilterBuilder {
         stats.badfilter_removed = cs.bad_removed + ls.bad_removed;
         stats.domains = (custom.keys.len() + lists.keys.len()) as u64;
         stats.complex = (custom.keyed.len() + custom.patterns.len() + lists.keyed.len() + lists.patterns.len()) as u64;
+        // `$badfilter` 取消之後實際留下、每次查詢都要跑的（索引裡的 `always`）
+        stats.unindexed = (custom.always.len() + lists.always.len()) as u64;
         stats.sources = sources;
         Filter {
             custom,
@@ -434,10 +452,20 @@ impl<'b> SourceWriter<'b> {
         } = rule;
         match body {
             Body::Pattern { re, lit } => {
+                let tri = lit.as_deref().and_then(lit_trigrams);
+                // 沒有可用固定字串：三字元索引用不上，每次查詢都要跑一次正規表示式
+                if tri.is_none() {
+                    if !custom && self.b.unindexed >= self.b.opts.max_unindexed {
+                        self.b.unindexed_dropped += 1;
+                        self.b.sources[self.source].unindexed_dropped += 1;
+                        return;
+                    }
+                    self.b.unindexed += 1;
+                }
                 self.b.complex += 1;
                 self.tier().patterns.push(PatternRule {
                     re,
-                    tri: lit.as_deref().and_then(lit_trigrams),
+                    tri,
                     lit: lit.map(String::into_boxed_str),
                     allow,
                     important,

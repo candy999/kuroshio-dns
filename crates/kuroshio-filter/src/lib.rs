@@ -29,7 +29,8 @@
 //! - 正規表示式用內建的小引擎（不引入 regex crate）：反向參照 `\1` / `\k<name>`、舊式八進位跳脫不支援，
 //!   這類規則算「略過」（`skipped` 與 `regex_unsupported` 都會 +1）；回溯超過 10 萬步
 //!   就當作沒命中（node 版會一直跑）；非 ASCII 字元在字元類別裡的大小寫對應是近似的。
-//! - 新增的預算：`max_domains`（超過的清單整份不載入）與 `max_complex`（超過的清單複雜規則丟掉）。
+//! - 新增的預算：`max_domains`（超過的清單整份不載入）、`max_complex`（超過的清單複雜規則丟掉）與
+//!   `max_unindexed`（沒有可用固定字串、每次查詢都要跑的複雜規則，超過的清單規則丟掉並計數）。
 //! - 最多 64 份清單；單行超過 64 KB 的部分丟掉；分類只有四種（設定裡不認得的分類由整合端決定怎麼對應）。
 //! - 沒有 node 版那個 10 萬筆的判定快取（伺服器的 DNS 快取已經涵蓋）。
 //! - 61 位元雜湊理論上可能碰撞（1,000 萬筆時每查一層誤判機率約 4×10⁻¹²）。
@@ -185,6 +186,8 @@ pub struct SourceStats {
     pub regex_unsupported: u64,
     /// 超過複雜規則上限而丟掉
     pub complex_dropped: u64,
+    /// 沒有可用固定字串的複雜規則超過上限（`max_unindexed`）而丟掉
+    pub unindexed_dropped: u64,
     /// `$badfilter` 規則數
     pub badfilter: u64,
 }
@@ -217,6 +220,10 @@ pub struct FilterStats {
     pub complex: u64,
     pub max_complex: u64,
     pub complex_dropped: u64,
+    /// 其中沒有可用固定字串（每次查詢都要跑）的規則數（兩層合計）、上限、超過上限丟掉的數量
+    pub unindexed: u64,
+    pub max_unindexed: u64,
+    pub unindexed_dropped: u64,
     /// 各來源（依加入順序；自訂規則檔也在內）
     pub sources: Vec<SourceStats>,
 }

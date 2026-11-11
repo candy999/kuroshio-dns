@@ -243,7 +243,8 @@
     "updateIntervalHours": 24,
     "relaxedModifiers": false,
     "maxDomains": 10000000,
-    "maxComplex": 20000
+    "maxComplex": 20000,
+    "maxUnindexed": 2000
   },
   "cdn": {
     "enabled": true,

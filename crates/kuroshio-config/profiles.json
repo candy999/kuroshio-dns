@@ -39,7 +39,8 @@
     },
     "filter": {
       "maxDomains": 400000,
-      "maxComplex": 2000
+      "maxComplex": 2000,
+      "maxUnindexed": 200
     },
     "system": {
       "maxTlsConnections": 32,
@@ -85,7 +86,8 @@
     },
     "filter": {
       "maxDomains": 1500000,
-      "maxComplex": 5000
+      "maxComplex": 5000,
+      "maxUnindexed": 500
     },
     "system": {
       "maxTlsConnections": 128,
@@ -120,7 +122,8 @@
     },
     "filter": {
       "maxDomains": 4000000,
-      "maxComplex": 10000
+      "maxComplex": 10000,
+      "maxUnindexed": 1000
     },
     "system": {
       "maxTlsConnections": 512,

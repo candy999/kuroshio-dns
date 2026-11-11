@@ -166,6 +166,8 @@ USB 隨身碟也算 Flash，但通常容量大、可以更換，判定為 `disk`
 | `pool.speedTop` / `speedSeconds` | 6 / 3 | 10 / 4 | 16 / 5 | 16 / 5 |
 | 網段掃描 `jobs.cdn-scan` | 停用 | 每週 | 每週 | 每週 |
 | `filter.maxDomains` | 40 萬 | 150 萬 | 400 萬 | 1,000 萬 |
+| `filter.maxComplex`（正規表示式、萬用字元、`$dnstype`） | 2,000 | 5,000 | 10,000 | 20,000 |
+| `filter.maxUnindexed`（其中沒有固定字串、每次查詢都要跑的；每 2,000 條約 +0.5 ms/查詢） | 200 | 500 | 1,000 | 2,000 |
 | `system.maxTlsConnections` / `maxQuicConnections` | 32 / 0 | 128 / 32 | 512 / 128 | 2,048 / 512 |
 | `system.queryLogRing`（記憶體裡保留幾筆查詢紀錄） | 200 | 1,000 | 5,000 | 20,000 |
 | `community.maxBundleMB` | 4 | 8 | 32 | 32 |

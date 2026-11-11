@@ -231,6 +231,35 @@ fn complex_cap() {
 }
 
 #[test]
+fn unindexed_cap() {
+    // 沒有可用固定字串的規則（三字元索引用不上，每次查詢都要跑）另有上限；有固定字串的不受影響
+    let opts = BuildOptions {
+        max_unindexed: 2,
+        ..BuildOptions::default()
+    };
+    let mut b = FilterBuilder::new(opts);
+    // 自訂規則不受上限限制（但會佔額度）
+    b.add_custom(b"/^[0-9]+\\.x$/\n");
+    let st = b
+        .add_list(
+            ListSpec::new("l", Category::Ads),
+            b"/^a[0-9]+\\./\n/^b[0-9]+\\./\n/^c[0-9]+\\./\n||tracker*.example^\n/^d[0-9]+\\./\n||plain.example^\n",
+        )
+        .unwrap();
+    assert_eq!((st.complex_rules, st.complex_dropped, st.unindexed_dropped), (5, 0, 3));
+    let f = b.finish();
+    assert!(f.check("12.x", A).is_some(), "自訂規則照樣載入");
+    assert!(f.check("a1.y", A).is_some());
+    assert!(f.check("b1.y", A).is_none(), "超過上限的不載入");
+    assert!(f.check("d1.y", A).is_none());
+    assert!(f.check("tracker9.example", A).is_some(), "有固定字串的不算");
+    assert!(f.check("plain.example", A).is_some());
+    let s = f.stats();
+    assert_eq!((s.unindexed, s.max_unindexed, s.unindexed_dropped), (2, 2, 3));
+    assert_eq!(s.complex, 3);
+}
+
+#[test]
 fn unsupported_regex_is_counted() {
     let mut b = FilterBuilder::new(BuildOptions::default());
     let st = b

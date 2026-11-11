@@ -58,7 +58,8 @@ async fn resolve(r: &std::sync::Arc<kuroshio::resolver::Resolver>, name: &str) -
 
 #[tokio::test]
 async fn lists_custom_priority_and_reload() {
-    let lists = list_server("! 測試清單\n||ads.example^\n0.0.0.0 tracker.example\n||malware.example^\n").await;
+    let lists =
+        list_server("! 測試清單\n||ads.example^\n0.0.0.0 tracker.example\n||malware.example^\n/^[0-9]+\\.x$/\n/^[0-9]+\\.y$/\n").await;
     let up = upstream().await;
     let dir = std::env::temp_dir().join(format!("kuroshio-filter-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -72,6 +73,7 @@ async fn lists_custom_priority_and_reload() {
         "resolver": { "lastResort": [], "rankIps": false, "cacheMax": 1000 },
         "filter": {
             "customRules": ["./custom-rules.txt"],
+            "maxUnindexed": 1,
             "lists": [
                 { "name": "測試廣告", "url": format!("http://{lists}/ads.txt"), "category": "ads" },
                 { "name": "關掉的", "url": format!("http://{lists}/off.txt"), "category": "ads", "enabled": false }
@@ -111,7 +113,13 @@ async fn lists_custom_priority_and_reload() {
     let st = kuroshio::admin::route(&started.state, "/api/status", &Default::default())
         .await
         .body;
-    assert_eq!(st["filter"]["lists"], 3);
+    assert_eq!(st["filter"]["lists"], 4);
+    // 沒有固定字串的規則超過上限：不載入，但統計看得到（不會默默丟掉）
+    assert_eq!(st["filter"]["unindexed"], 1);
+    assert_eq!(st["filter"]["unindexedDropped"], 1);
+    assert_eq!(st["filter"]["sources"][0]["unindexedDropped"], 1);
+    assert_eq!(resolve(&r, "12.x").await, RData::A(Ipv4Addr::UNSPECIFIED));
+    assert_eq!(resolve(&r, "12.y").await, RData::A(Ipv4Addr::new(1, 2, 3, 4)));
     assert_eq!(st["filter"]["custom"], 1);
     assert_eq!(st["filter"]["sources"].as_array().unwrap().len(), 1, "停用的清單不下載");
     assert_eq!(st["stats"]["today"]["blockedAds"], 3, "清單命中");

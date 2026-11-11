@@ -69,6 +69,7 @@ impl FilterService {
         let opts = BuildOptions {
             max_domains: g("maxDomains").and_then(Value::as_u64).unwrap_or(10_000_000),
             max_complex: g("maxComplex").and_then(Value::as_u64).unwrap_or(20_000),
+            max_unindexed: g("maxUnindexed").and_then(Value::as_u64).unwrap_or(2_000),
             relaxed_modifiers: g("relaxedModifiers").and_then(Value::as_bool).unwrap_or(false),
         };
         let hours = g("updateIntervalHours").and_then(Value::as_u64).unwrap_or(24).max(1);
@@ -160,9 +161,14 @@ impl FilterService {
             }
         }
         // 2. 重建：自訂規則的網域數也算在預算裡
-        let custom_n = self.custom.read().unwrap().stats().custom;
+        let (custom_n, custom_unindexed) = {
+            let c = self.custom.read().unwrap();
+            (c.stats().custom, c.stats().unindexed)
+        };
         let mut b = FilterBuilder::new(BuildOptions {
             max_domains: self.opts.max_domains.saturating_sub(custom_n),
+            // 每次查詢都要跑的規則：自訂規則的也算在內（查詢時兩層都要跑）
+            max_unindexed: self.opts.max_unindexed.saturating_sub(custom_unindexed),
             ..self.opts
         });
         let mut errors = Vec::new();
@@ -191,6 +197,12 @@ impl FilterService {
             if let SourceStatus::OverBudget { rules, remaining } = s.status {
                 warn!("清單「{}」超過記憶體預算，未載入（{rules} 條，剩餘額度 {remaining}）", s.name);
             }
+        }
+        for s in st.sources.iter().filter(|s| s.complex_dropped > 0 || s.unindexed_dropped > 0) {
+            warn!(
+                "清單「{}」有 {} 條複雜規則超過上限（filter.maxComplex {}）、{} 條沒有固定字串的規則超過上限（filter.maxUnindexed {}），未載入",
+                s.name, s.complex_dropped, st.max_complex, s.unindexed_dropped, st.max_unindexed
+            );
         }
         if !errors.is_empty() && have {
             // 有清單下載失敗：保留舊的，避免少掉一整份清單
@@ -285,6 +297,7 @@ impl FilterCheck for FilterService {
             .map(|s| {
                 json!({
                     "name": s.name, "category": s.category.as_str(), "rules": s.domain_rules + s.complex_rules,
+                    "complexDropped": s.complex_dropped, "unindexedDropped": s.unindexed_dropped,
                     "status": match s.status { SourceStatus::Loaded => "loaded", SourceStatus::Disabled => "disabled", SourceStatus::OverBudget { .. } => "overBudget" },
                 })
             })
@@ -295,6 +308,11 @@ impl FilterCheck for FilterService {
             "byCategory": { "ads": ls.by_category.get(Category::Ads), "telemetry": ls.by_category.get(Category::Telemetry), "malware": ls.by_category.get(Category::Malware) },
             "customByCategory": { "custom": cs.custom_by_category.get(Category::Custom), "ads": cs.custom_by_category.get(Category::Ads), "telemetry": cs.custom_by_category.get(Category::Telemetry), "malware": cs.custom_by_category.get(Category::Malware) },
             "skipped": cs.skipped + ls.skipped,
+            // 超過上限沒載入的複雜規則（不會默默丟掉：這裡與紀錄檔都看得到）
+            "complex": cs.complex + ls.complex, "maxComplex": self.opts.max_complex,
+            "complexDropped": ls.complex_dropped,
+            "unindexed": cs.unindexed + ls.unindexed, "maxUnindexed": self.opts.max_unindexed,
+            "unindexedDropped": ls.unindexed_dropped,
             "domains": c.domain_count() + l.domain_count(),
             "memoryBytes": c.memory_bytes() + l.memory_bytes(),
             "maxDomains": self.opts.max_domains,
