@@ -51,7 +51,9 @@ jobs:
       - name: Playwright
         run: |
           npm i --no-save playwright@1.48.2
-          npx playwright install --with-deps chromium
+          # 系統套件伺服器偶爾連不到：重試三次，還是失敗就只裝瀏覽器本體（runner 本來就有 Chrome 需要的函式庫）
+          for i in 1 2 3; do timeout 300 npx playwright install --with-deps chromium && break; echo "::warning::playwright --with-deps 第 $i 次失敗"; sleep 20; done || true
+          npx playwright install chromium
       - name: 設定頁端對端測試
         run: node tools/admin-e2e.js
         env:
@@ -489,7 +491,9 @@ jobs:
       - name: Playwright
         run: |
           npm i --no-save playwright@1.48.2
-          npx playwright install --with-deps chromium
+          # 系統套件伺服器偶爾連不到：重試三次，還是失敗就只裝瀏覽器本體（runner 本來就有 Chrome 需要的函式庫）
+          for i in 1 2 3; do timeout 300 npx playwright install --with-deps chromium && break; echo "::warning::playwright --with-deps 第 $i 次失敗"; sleep 20; done || true
+          npx playwright install chromium
       - name: 打開每一頁（簡易 / 專業）、儲存
         run: node openwrt/tools/luci-e2e.js kuroshio
         env:
