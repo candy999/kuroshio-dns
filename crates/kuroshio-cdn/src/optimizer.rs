@@ -572,7 +572,7 @@ impl Cdn {
         let v6_policy = self.cfg.v6_policy_of(provider).to_string();
         let nearest = st.pools.is_nearest(provider);
         // 保留最後一段的 CDN：這組憑證還沒找到可用網段時 pool 是空的，但仍要走驗證流程
-        let octet = st.pools.octet_mode(provider) && family == 4 && !st.pools.active_pops(provider).is_empty();
+        let octet = st.pools.octet_mode(provider) && family == 4 && !st.pools.pop_view(provider).pops.is_empty();
         if pool.is_empty() && !octet {
             // 沒有台灣 v6 節點：只有在這家 CDN 的 v4 正在被導向台灣時才丟棄 v6，避免用戶端走 v6 繞出國
             if family == 6 && v6_policy == "drop" && st.pools.pool_size(provider, 4) > 0 {
@@ -591,7 +591,7 @@ impl Cdn {
             let orig_ms = self.served_ms_in(&st.pools, provider, &needs);
             let pop = match pool.first() {
                 Some(ip) => st.pools.pop_of_ip(provider, *ip),
-                None => st.pools.active_pops(provider).into_iter().next(),
+                None => st.pools.pop_view(provider).pops.first().map(|x| x.0.clone()),
             };
             let pool_ms = pop
                 .and_then(|p| st.pools.pop_score(provider, &p))

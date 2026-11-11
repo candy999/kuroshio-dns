@@ -667,3 +667,97 @@ fn pinned_upstream_alias() {
     // 只有路由器回答（其他上游都失敗）：仍用它的答案
     assert!(opt.pinned_alias(&ans(&["104.16.161.36"]), 1, Some(&[])).is_empty());
 }
+
+#[test]
+fn fastly_pop_view_cache_follows_changes() {
+    // Fastly 的 POP 排序與網段快取：節點池沒變就重複用，不管怎麼改（直接換欄位、暫停網段到期）都要跟上
+    let (opt, net) = setup(json!({}));
+    fastly_setup(&opt);
+    let pf = |s: &str| crate::util::parse_prefix24(s).unwrap();
+    let view = || {
+        let st = opt.state();
+        (st.pools.p.gen(), st.pools.pop_view("fastly"))
+    };
+    let (g1, v1) = view();
+    assert_eq!(
+        v1.pops,
+        vec![
+            ("HKG".to_string(), vec![pf("151.101.76"), pf("151.101.77"), pf("151.101.78")]),
+            ("NRT".to_string(), vec![pf("151.101.0"), pf("151.101.1")]),
+        ]
+    );
+    let (g2, v2) = view();
+    assert_eq!(g1, g2);
+    assert!(Arc::ptr_eq(&v1, &v2), "沒變就用同一份");
+
+    // 查詢路徑不會動到節點池的版本號（否則快取每次都失效）
+    opt.with_state(|st| {
+        st.db.touch("fc.test", "fastly", "ip", &ips(&["151.101.65.140"]), &[], None);
+        st.db.set_verdict("fc.test", 4, |v| {
+            v.verdict = Some(intern("ok"));
+            v.until = Some(now_ms() + 3_600_000);
+            v.ip = Some(ip("151.101.77.140"));
+        });
+        st.pools.zone_note("fastly", ip("151.101.77.140"), true);
+    });
+    net.set_cached("151.101.65.140", 80.0);
+    let g = view().0;
+    for _ in 0..3 {
+        let mut m = msg("fc.test", 1, &["151.101.65.140"], vec![]);
+        let r = opt.apply(&mut m, "fc.test", 1);
+        assert_eq!(r.rewritten, Some(Rewrite::Alias), "{:?}", r.tags);
+    }
+    assert_eq!(view().0, g, "apply() 不改節點池");
+
+    // 直接改節點的分數：NRT 變成最好
+    opt.with_state(|st| st.pools.p.get_mut("fastly").unwrap().pool4[2].score = Num::V(10.0));
+    let (g3, v3) = view();
+    assert_ne!(g3, g);
+    assert_eq!(v3.pops.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["NRT", "HKG"]);
+    assert_eq!(opt.state().pools.active_pops("fastly"), ["NRT", "HKG"]);
+
+    // 暫停中的網段：拿掉；時間到恢復（期間沒有人改節點池，版本號不變也要重算）
+    opt.with_state(|st| {
+        st.pools.p.get_mut("fastly").unwrap().bad24.insert(
+            pf("151.101.0"),
+            crate::pools::Bad {
+                at: now_ms() - crate::pools::BAD24_MS + 80,
+                reason: "測試".into(),
+                quality: false,
+            },
+        )
+    });
+    let (g4, v4) = view();
+    assert_eq!(v4.pops[0], ("NRT".to_string(), vec![pf("151.101.1")]));
+    assert!(!opt.state().pools.usable("fastly", ip("151.101.0.140")));
+    std::thread::sleep(Duration::from_millis(150));
+    let (g5, v5) = view();
+    assert_eq!(g4, g5);
+    assert_eq!(v5.pops[0], ("NRT".to_string(), vec![pf("151.101.0"), pf("151.101.1")]));
+
+    // 整個節點池換掉（新的 PoolMap）也不會撿到舊的快取
+    opt.with_state(|st| {
+        let mut m = crate::pools::PoolMap::default();
+        for (k, v) in st.pools.p.iter() {
+            let mut v = v.clone();
+            if *k == "fastly" {
+                v.pool4.truncate(2);
+            }
+            m.insert(k, v);
+        }
+        st.pools.p = m;
+    });
+    assert_eq!(view().1.pops.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["HKG"]);
+
+    // 不配置記憶體的 POP 比對跟 pop3() 一致
+    for (a, b) in [
+        ("hkg", "HKG"),
+        ("HKG17920", "HKG"),
+        ("hk", "HK"),
+        ("", ""),
+        ("tpe", "HKG"),
+        ("ß12", "SS1"),
+    ] {
+        assert_eq!(crate::pools::pop3_is(a, b), crate::pools::pop3(a) == b, "{a} {b}");
+    }
+}

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 pub const FILE: &str = "cdn/pools.json";
@@ -96,6 +98,11 @@ impl PoolNode {
 /// 2.x 的 `String(pop).substring(0, 3).toUpperCase()`
 pub fn pop3(pop: &str) -> String {
     pop.chars().take(3).collect::<String>().to_uppercase()
+}
+
+/// `pop3(pop) == p3`，不配置記憶體（每個 Fastly 回應都要對節點池逐一比對）
+pub fn pop3_is(pop: &str, p3: &str) -> bool {
+    pop.chars().take(3).flat_map(char::to_uppercase).eq(p3.chars())
 }
 
 /// 品質分數（越低越好，同 2.x `iprank.qscore`）：延遲 + 2×抖動 + 掉包懲罰；測過速度且低於 1 MB/s 另加懲罰
@@ -346,9 +353,88 @@ impl Classifier {
 /// 讀範圍與掃描檔用：相對於 `cdn/` 的路徑 → 內容（先找 state，再找隨程式附帶的 data）
 pub type RangeReader<'a> = &'a dyn Fn(&str) -> Option<String>;
 
+/// 版本號來源：全程式共用、只會往上加，換掉整個 `PoolMap` 也不會跟舊的版本號撞在一起
+static POOL_GEN: AtomicU32 = AtomicU32::new(1);
+
+fn next_gen() -> u32 {
+    POOL_GEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 各家 CDN 的節點池。用 `&mut` 取用（`get_mut`、`values_mut`、`insert`…）就換一個新的版本號：
+/// 依節點池算出來的東西（保留最後一段的 CDN 的 POP 排序與網段，見 `PopView`）看版本號決定要不要重算，
+/// 不管是誰、用什麼方式改的都會被發現，不需要每個改的地方記得通知（跟 `Classifier` 快照同樣的想法）
+#[derive(Debug)]
+pub struct PoolMap {
+    map: IndexMap<&'static str, ProviderPools>,
+    gen: u32,
+}
+
+impl Default for PoolMap {
+    fn default() -> PoolMap {
+        PoolMap {
+            map: IndexMap::new(),
+            gen: next_gen(),
+        }
+    }
+}
+
+impl PoolMap {
+    /// 目前的版本號（內容一改就換）
+    pub fn gen(&self) -> u32 {
+        self.gen
+    }
+}
+
+impl<'a> IntoIterator for &'a PoolMap {
+    type Item = (&'a &'static str, &'a ProviderPools);
+    type IntoIter = indexmap::map::Iter<'a, &'static str, ProviderPools>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl Deref for PoolMap {
+    type Target = IndexMap<&'static str, ProviderPools>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl DerefMut for PoolMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.gen = next_gen();
+        &mut self.map
+    }
+}
+
+/// 保留最後一段的 CDN（Fastly）：依品質排序的 POP 與各 POP 目前可用的網段。
+/// 每個 Fastly 回應要用好幾次，每次重算約 7 µs；節點池沒變（版本號相同）、也沒有暫停中的網段到期就重複用
+#[derive(Debug, Default)]
+pub struct PopView {
+    /// （POP，網段）依品質順序，同 `active_pops` / `pop_prefixes`
+    pub pops: Vec<(String, Vec<u32>)>,
+}
+
+impl PopView {
+    /// 這個網段在不在任何一個可用 POP 裡
+    pub fn has_prefix(&self, pf: u32) -> bool {
+        self.pops.iter().any(|(_, l)| l.contains(&pf))
+    }
+}
+
+struct PopCache {
+    provider: &'static str,
+    gen: u32,
+    /// 有暫停中的網段時：最早恢復的時間（到了要重算）
+    until: u64,
+    view: Arc<PopView>,
+}
+
 pub struct Pools {
     pub cfg: Arc<CdnConfig>,
-    pub p: IndexMap<&'static str, ProviderPools>,
+    pub p: PoolMap,
+    /// `pop_view` 的快取
+    pop_cache: Mutex<Vec<PopCache>>,
     /// pools.json 裡沒有啟用的 CDN：原封保留
     other: IndexMap<String, ProvEntry>,
     saved_at: Option<String>,
@@ -364,7 +450,8 @@ impl Pools {
     pub fn empty(cfg: Arc<CdnConfig>) -> Pools {
         Pools {
             cfg,
-            p: IndexMap::new(),
+            p: PoolMap::default(),
+            pop_cache: Mutex::new(Vec::new()),
             other: IndexMap::new(),
             saved_at: None,
             extra: Extra::default(),
@@ -650,10 +737,7 @@ impl Pools {
                 if self.bad24(provider, pf) || self.is_restricted(provider, ip) {
                     return false;
                 }
-                return self
-                    .active_pops(provider)
-                    .iter()
-                    .any(|pop| self.pop_prefixes(provider, pop).contains(&pf));
+                return self.pop_view(provider).has_prefix(pf);
             }
         }
         if d.bad.contains_key(&ip) {
@@ -665,6 +749,51 @@ impl Pools {
     /// 依品質排序的 POP：分數不超過第 1 名＋slack，且測過速度的不能低於 1 MB/s
     /// （實測香港延遲最低 26ms，但海纜壅塞時下載只剩 0.09 MB/s，不能拿來用）
     pub fn active_pops(&self, provider: &str) -> Vec<String> {
+        self.pop_view(provider).pops.iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    /// 依品質排序的 POP 與各 POP 的網段（快取；內容同 `active_pops` ＋ 每個 POP 的 `pop_prefixes`）
+    pub fn pop_view(&self, provider: &str) -> Arc<PopView> {
+        let gen = self.p.gen();
+        let mut cache = self.pop_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cache.iter().find(|c| c.provider == provider && c.gen == gen) {
+            if c.until == u64::MAX || now_ms() < c.until {
+                return c.view.clone();
+            }
+        }
+        let Some((&name, d)) = self.p.get_key_value(provider) else {
+            return Arc::default();
+        };
+        let now = now_ms();
+        // 暫停中的網段：最早恢復的那一刻內容會變（`bad24` 只看時間，不會動到版本號）
+        let until = d
+            .bad24
+            .values()
+            .filter(|b| now.saturating_sub(b.at) <= BAD24_MS)
+            .map(|b| b.at + BAD24_MS + 1)
+            .min()
+            .unwrap_or(u64::MAX);
+        let view = Arc::new(PopView {
+            pops: self
+                .calc_active_pops(provider)
+                .into_iter()
+                .map(|pop| {
+                    let l = self.pop_prefixes(provider, &pop);
+                    (pop, l)
+                })
+                .collect(),
+        });
+        cache.retain(|c| c.provider != name);
+        cache.push(PopCache {
+            provider: name,
+            gen,
+            until,
+            view: view.clone(),
+        });
+        view
+    }
+
+    fn calc_active_pops(&self, provider: &str) -> Vec<String> {
         let Some(d) = self.p.get(provider) else { return vec![] };
         let mut best: IndexMap<String, (f64, bool)> = IndexMap::new();
         for x in &d.pool4 {
@@ -701,7 +830,7 @@ impl Pools {
         let d = self.p.get(provider)?;
         d.pool4
             .iter()
-            .filter(|x| pop3(x.pop_str()) == pop && !d.bad.contains_key(&x.ip))
+            .filter(|x| pop3_is(x.pop_str(), pop) && !d.bad.contains_key(&x.ip))
             .map(node_score)
             .reduce(f64::min)
     }
@@ -713,7 +842,7 @@ impl Pools {
         let from_pool = d
             .pool4
             .iter()
-            .filter(|x| pop3(x.pop_str()) == pop && !d.bad.contains_key(&x.ip))
+            .filter(|x| pop3_is(x.pop_str(), pop) && !d.bad.contains_key(&x.ip))
             .filter_map(|x| util::prefix24(x.ip));
         for pf in from_pool.chain(d.prefixes.get(pop).into_iter().flatten().copied()) {
             if !out.contains(&pf) {
@@ -749,7 +878,7 @@ impl Pools {
         let pop = self.pop_of_ip(provider, ip)?;
         d.pool4
             .iter()
-            .find(|p| pop3(p.pop_str()) == pop && !d.bad.contains_key(&p.ip) && p.ms.truthy())
+            .find(|p| pop3_is(p.pop_str(), &pop) && !d.bad.contains_key(&p.ip) && p.ms.truthy())
             .and_then(|x| x.ms.get())
     }
 
@@ -766,11 +895,10 @@ impl Pools {
         }
         let n = self.cfg.serve_count_of(provider);
         // 同一次回應只用同一個 POP：依品質順序，找第一個「這組憑證已驗證可用」的 POP
-        for pop in self.active_pops(provider) {
-            let prefs = self.pop_prefixes(provider, &pop);
+        for (_, prefs) in &self.pop_view(provider).pops {
             let mut out: Vec<IpAddr> = Vec::new();
             for &o in &octs {
-                for &pf in &prefs {
+                for &pf in prefs {
                     let ip = util::ip_of(pf, o);
                     if self.zone_hit(provider, ip) && !out.contains(&ip) {
                         out.push(ip);
@@ -793,8 +921,8 @@ impl Pools {
             _ => return self.serve_ips(provider, if orig.map(|i| i.is_ipv6()).unwrap_or(false) { 6 } else { 4 }),
         };
         let mut out: Vec<IpAddr> = Vec::new();
-        for (i, pop) in self.active_pops(provider).iter().take(5).enumerate() {
-            let prefs = self.pop_prefixes(provider, pop);
+        let view = self.pop_view(provider);
+        for (i, (_, prefs)) in view.pops.iter().take(5).enumerate() {
             let mut order: Vec<u32> = prefs
                 .iter()
                 .copied()
@@ -809,7 +937,7 @@ impl Pools {
                     }
                 }
             }
-            for pf in &prefs {
+            for pf in prefs {
                 if !order.contains(pf) {
                     order.push(*pf);
                 }
