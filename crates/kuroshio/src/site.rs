@@ -661,6 +661,7 @@ impl Site {
         .map(|d| d.to_string_lossy().into_owned())
         .collect();
         scrub_dirs(&mut body, &mut dirs);
+        redact_upstream_urls(&mut body);
         json_resp(r.code, &body, "no-store")
     }
 
@@ -1020,6 +1021,110 @@ pub fn scrub_dirs(body: &mut Value, dirs: &mut Vec<String>) {
     }
 }
 
+/// 上游網址的協議與預設埠（`kuroshio_net::upstream::Upstream::parse` 認得的，加上 http）
+fn upstream_scheme(s: &str) -> Option<u16> {
+    Some(match s.to_ascii_lowercase().as_str() {
+        "udp" | "tcp" => 53,
+        "tls" | "quic" => 853,
+        "https" | "h3" | "sdns" => 443,
+        "http" => 80,
+        _ => return None,
+    })
+}
+
+/// 文字裡的上游網址只留「協議://主機」（不是預設埠的話加上埠）：個人 DoH 網址的路徑常帶帳號代碼
+/// （`https://dns.example/dns-query/abc123`），帳號密碼（`user:pass@`）也拿掉。DNSCrypt 的 `sdns://` 戳記整段藏起來
+pub fn redact_urls(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("://") {
+        return text.into();
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while let Some(k) = text[i..].find("://") {
+        let at = i + k;
+        // 往前找協議名稱（英數字與 + - .）
+        let mut st = at;
+        while st > last && (b[st - 1].is_ascii_alphanumeric() || matches!(b[st - 1], b'+' | b'-' | b'.')) {
+            st -= 1;
+        }
+        let scheme = &text[st..at];
+        let rest = &text[at + 3..];
+        // 網址到空白、引號、括號或全形標點為止
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '）' | '，' | '、' | '；' | '。'))
+            .unwrap_or(rest.len());
+        let Some(default_port) = upstream_scheme(scheme) else {
+            i = at + 3;
+            continue;
+        };
+        let url = &rest[..end];
+        let auth = &url[..url.find(['/', '?', '#']).unwrap_or(url.len())];
+        let auth = auth.rsplit_once('@').map(|x| x.1).unwrap_or(auth);
+        let kept = if scheme.eq_ignore_ascii_case("sdns") {
+            "…".to_string()
+        } else {
+            // 主機（IPv6 用中括號）與埠：預設埠拿掉
+            let (host, port) = match auth.strip_prefix('[').and_then(|x| x.split_once(']')) {
+                Some((h, p)) => (format!("[{h}]"), p.strip_prefix(':')),
+                None => match auth.rsplit_once(':') {
+                    Some((h, p)) if !h.contains(':') => (h.to_string(), Some(p)),
+                    _ => (auth.to_string(), None),
+                },
+            };
+            match port.filter(|p| !p.is_empty() && p.parse::<u16>().ok() != Some(default_port)) {
+                Some(p) => format!("{host}:{p}"),
+                None => host,
+            }
+        };
+        out.push_str(&text[last..st]);
+        out.push_str(scheme);
+        out.push_str("://");
+        out.push_str(&kept);
+        last = at + 3 + end;
+        i = last;
+    }
+    if last == 0 {
+        return text.into();
+    }
+    out.push_str(&text[last..]);
+    out.into()
+}
+
+/// 詳細頁（公開、唯讀）的回應：所有字串（含物件的鍵）裡的上游網址都換成 [`redact_urls`] 的樣子。
+/// 管理 API 本身（要登入）照樣回完整網址
+pub fn redact_upstream_urls(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if let std::borrow::Cow::Owned(n) = redact_urls(s) {
+                *s = n;
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(redact_upstream_urls),
+        Value::Object(o) => {
+            if o.keys().any(|k| k.contains("://")) {
+                let old = std::mem::take(o);
+                for (k, mut x) in old {
+                    redact_upstream_urls(&mut x);
+                    let base = redact_urls(&k).into_owned();
+                    // 同一台主機的兩個個人網址：鍵不能撞在一起
+                    let mut key = base.clone();
+                    let mut n = 2;
+                    while o.contains_key(&key) {
+                        key = format!("{base} #{n}");
+                        n += 1;
+                    }
+                    o.insert(key, x);
+                }
+            } else {
+                o.values_mut().for_each(redact_upstream_urls);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `/api/status` 的 `stats.topClients[].name` 打馬賽克
 pub fn mask_clients(body: &mut Value) {
     if let Some(list) = body.pointer_mut("/stats/topClients").and_then(Value::as_array_mut) {
@@ -1066,6 +1171,36 @@ mod tests {
             t["ranking"],
             json!([{ "ip": "203.0.113.7", "ok": true, "ms": 12.5 }, { "ip": "2606:4700::1", "ok": true, "ms": 9 }])
         );
+    }
+
+    #[test]
+    fn public_api_hides_upstream_paths() {
+        assert_eq!(redact_urls("https://dns.example/dns-query/abc123"), "https://dns.example");
+        assert_eq!(redact_urls("https://dns.example:8443/q/abc"), "https://dns.example:8443");
+        assert_eq!(redact_urls("h3://dns.example:443/dns-query/x"), "h3://dns.example");
+        assert_eq!(redact_urls("tls://1.1.1.1:853"), "tls://1.1.1.1");
+        assert_eq!(redact_urls("udp://[2001:db8::1]:5353"), "udp://[2001:db8::1]:5353");
+        assert_eq!(redact_urls("quic://[2001:db8::1]:853"), "quic://[2001:db8::1]");
+        assert_eq!(redact_urls("https://user:pw@dns.example/x"), "https://dns.example");
+        assert_eq!(redact_urls("sdns://AQcAAAAAAAAAFDE3Ni4xMDMu"), "sdns://…");
+        assert_eq!(
+            redact_urls("上游 https://dns.example/dns-query/abc 逾時；改用 tls://dns.example:853"),
+            "上游 https://dns.example 逾時；改用 tls://dns.example"
+        );
+        assert_eq!(redact_urls("沒有網址 1.2.3.4"), "沒有網址 1.2.3.4");
+        assert_eq!(redact_urls("ftp://x.example/a"), "ftp://x.example/a", "不是上游的協議不動");
+        let mut v = json!({
+            "upstreams": [{ "id": "https://dns.example/dns-query/abc123", "ok": 1 }],
+            "results": { "https://dns.example/p/one": { "ms": 1 }, "https://dns.example/p/two": { "ms": 2 }, "tls://9.9.9.9:853": {} },
+            "errors": { "recent": [{ "msg": "https://dns.example/p/one 連線失敗" }] },
+        });
+        redact_upstream_urls(&mut v);
+        assert_eq!(v["upstreams"][0]["id"], "https://dns.example");
+        let keys: Vec<&String> = v["results"].as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 3, "同一台主機的鍵不會撞在一起：{keys:?}");
+        assert!(keys.iter().all(|k| !k.contains("/p/")));
+        assert!(v["results"].get("tls://9.9.9.9").is_some());
+        assert_eq!(v["errors"]["recent"][0]["msg"], "https://dns.example 連線失敗");
     }
 
     #[test]

@@ -389,6 +389,29 @@ async fn public_stats_ranges() {
 }
 
 #[tokio::test]
+async fn read_only_api_hides_personal_doh_paths() {
+    // 個人 DoH 網址的路徑常帶帳號代碼：詳細頁（公開）只給協議 + 主機（+ 非預設埠），管理 API 照樣給完整網址
+    let dir = tmp("doh-path");
+    let cfg = config(
+        &dir,
+        json!({ "upstream": { "pinned": ["https://doh.example/dns-query/secret-token", "https://doh.example:8443/q/other-token"] } }),
+    );
+    let (s, st, _) = site(&cfg);
+    for p in ["/detail/api/upstreams", "/detail/api/status"] {
+        let r = get(&s, p).await.unwrap();
+        assert_eq!(r.status, 200);
+        let body = text(&r);
+        assert!(!body.contains("token"), "{p}：{body}");
+    }
+    let v = json_of(&get(&s, "/detail/api/upstreams").await.unwrap());
+    let ids: Vec<&str> = v.as_array().unwrap().iter().map(|u| u["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["https://doh.example", "https://doh.example:8443"]);
+    let raw = kuroshio::admin::route(&st, "/api/upstreams", &Default::default()).await.body;
+    assert_eq!(raw[0]["id"], "https://doh.example/dns-query/secret-token");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn read_only_api_and_masking() {
     let dir = tmp("readonly");
     let (s, st, _) = site(&config(&dir, json!({})));
