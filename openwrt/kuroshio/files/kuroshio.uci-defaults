@@ -29,7 +29,7 @@ fi
 touch /etc/config/kuroshio
 for s in main:kuroshio doh:doh dot:dot doq:doq tls:tls cf_account:cf_account ddns:ddns site:site \
 	upstream:upstream resolver:resolver iprank:iprank filter:filter cdn:cdn ecs:ecs \
-	benchmark:benchmark scan:scan pool:pool community:community system:system; do
+	benchmark:benchmark scan:scan pool:pool community:community system:system access:access; do
 	name=${s%%:*}
 	type=${s#*:}
 	uci -q get "kuroshio.$name" >/dev/null || uci set "kuroshio.$name=$type"

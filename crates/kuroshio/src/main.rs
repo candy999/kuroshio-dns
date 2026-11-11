@@ -237,6 +237,20 @@ enum AccessCmd {
         #[arg(long)]
         uci: bool,
     },
+    /// OpenWrt：產生核心層丟棄用的 nftables 集合與規則（fw4 include；access.sh 呼叫）。
+    /// 不需要過濾時兩個檔案都是空的
+    Nft {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 集合（放 /usr/share/nftables.d/table-pre/）
+        #[arg(long)]
+        sets: PathBuf,
+        /// 規則（放 /usr/share/nftables.d/chain-pre/input_wan/）
+        #[arg(long)]
+        rules: PathBuf,
+    },
 }
 
 fn default_config_path() -> PathBuf {
@@ -639,10 +653,21 @@ fn user_config(config: &std::path::Path, uci: bool) -> Result<serde_json::Value>
 /// `kuroshio access …`：照設定載入存取控制（台灣 IP 資料、本機網段），不啟動服務
 fn access_cmd(cmd: AccessCmd) -> Result<()> {
     let (config, uci) = match &cmd {
-        AccessCmd::Check { config, uci, .. } | AccessCmd::Groups { config, uci } => (config.clone(), *uci),
+        AccessCmd::Check { config, uci, .. } | AccessCmd::Groups { config, uci } | AccessCmd::Nft { config, uci, .. } => {
+            (config.clone(), *uci)
+        }
     };
     let (cfg, ..) = effective(&config, uci)?;
-    let saved = std::fs::read(kuroshio::app::persist_dir(&cfg).join(kuroshio::ipfilter::STATE_FILE)).ok();
+    // 自動更新下載的資料：快照目錄（Flash）與執行期目錄（記憶體）取比較新的
+    let saved = [
+        kuroshio::app::persist_dir(&cfg).join(kuroshio::ipfilter::STATE_FILE),
+        kuroshio::app::runtime_dir(&cfg).join(kuroshio::ipfilter::STATE_FILE),
+    ]
+    .iter()
+    .filter_map(|p| std::fs::read(p).ok())
+    .filter_map(|b| kuroshio_jobs::geo::TwIp::parse(&b).ok().map(|t| (t.generated_at, b)))
+    .max_by(|a, b| a.0.cmp(&b.0))
+    .map(|(_, b)| b);
     let a = kuroshio::ipfilter::Access::from_cfg(&cfg, &kuroshio::app::share_dir(&cfg), saved);
     match cmd {
         AccessCmd::Check { ip, json, .. } => {
@@ -651,8 +676,7 @@ fn access_cmd(cmd: AccessCmd) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!(
-                    "{ip}：{}（{}）
-模式 {}，套用在 {}",
+                    "{ip}：{}（{}）\n模式 {}，套用在 {}",
                     if v["allowed"] == true { "允許" } else { "拒絕" },
                     v["reason"].as_str().unwrap_or(""),
                     v["mode"].as_str().unwrap_or(""),
@@ -664,6 +688,22 @@ fn access_cmd(cmd: AccessCmd) -> Result<()> {
             }
         }
         AccessCmd::Groups { .. } => println!("{}", serde_json::to_string_pretty(&a.api_json())?),
+        AccessCmd::Nft { sets, rules, .. } => {
+            let (s, r) = kuroshio::ipfilter::nft_render(&cfg, &a);
+            std::fs::write(&sets, &s).with_context(|| format!("寫入 {}", sets.display()))?;
+            std::fs::write(&rules, &r).with_context(|| format!("寫入 {}", rules.display()))?;
+            if s.is_empty() {
+                println!("不需要核心層過濾（全開放且沒有自訂封鎖，或沒有開啟的加密監聽）");
+            } else {
+                let st = a.status_json();
+                println!(
+                    "核心層過濾：{} 模式，資料 {}，規則 {} 行",
+                    st["mode"].as_str().unwrap_or(""),
+                    st["generatedAt"].as_str().unwrap_or("（讀不到，只套用自訂封鎖）"),
+                    r.lines().filter(|l| !l.starts_with('#')).count()
+                );
+            }
+        }
     }
     Ok(())
 }

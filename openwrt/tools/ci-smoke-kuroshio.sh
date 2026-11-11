@@ -143,6 +143,38 @@ eq "lan 補上 ip6assign" "$(uci -q get network.lan.ip6assign)" "60"
 ( set +e; . /usr/libexec/kuroshio/lan.sh; ensure_ula )
 eq "已有 ULA 前綴就不再改" "$(uci -q get network.globals.ula_prefix)" "$NEW_ULA"
 
+echo "== 存取控制：核心層丟棄（access.sh，容器沒有 nftables 權限，只檢查產生的 fw4 include）"
+A=/usr/libexec/kuroshio/access.sh
+NFTD=/usr/share/nftables.d
+ASETS=$NFTD/table-pre/30-kuroshio-access.nft
+ARULES=$NFTD/chain-pre/input_wan/30-kuroshio-access.nft
+check "台灣 IP 資料已打包" test -s /usr/share/kuroshio/geo/tw-ip.json
+eq "預設模式：只開放台灣" "$(uci -q get kuroshio.access.mode)" "taiwan"
+check "access check：國外拒絕" sh -c '/usr/bin/kuroshio access check 8.8.8.8 --uci | grep -q 拒絕'
+check "access check：中華電信允許" sh -c '/usr/bin/kuroshio access check 168.95.1.1 --uci | grep -q 允許'
+$A apply
+check "集合已建立（table-pre）" grep -q 'set kuroshio_allow4' "$ASETS"
+check "IPv6 集合已建立" grep -q 'set kuroshio_allow6' "$ASETS"
+check "WAN 輸入規則：不在台灣網段就丟棄" grep -q 'tcp dport { 853, 8443 } ip saddr != @kuroshio_allow4 counter drop' "$ARULES"
+eq "規則只針對黑潮 DNS 的埠（不碰 LuCI 的 22 / 80 / 443）" "$(grep -v '^#' "$ARULES" | grep -vc 'dport { 853, 8443 }')" "0"
+cp "$ASETS" /tmp/access-sets.before
+$A apply
+check "內容沒變：不重寫" cmp "$ASETS" /tmp/access-sets.before
+uci set kuroshio.access.mode='open'
+uci commit kuroshio
+$A apply
+check "全開放：移除集合與規則" sh -c "test ! -e '$ASETS' && test ! -e '$ARULES'"
+uci add_list kuroshio.access.deny='198.51.100.0/24'
+uci commit kuroshio
+$A apply
+check "全開放 + 自訂封鎖：只有封鎖集合" sh -c "grep -q 'set kuroshio_deny4' '$ASETS' && ! grep -q kuroshio_allow4 '$ASETS'"
+check "自訂封鎖的網段" grep -q '198.51.100.0/24' "$ASETS"
+$A remove
+check "remove：集合與規則都移除" sh -c "test ! -e '$ASETS' && test ! -e '$ARULES'"
+uci set kuroshio.access.mode='taiwan'
+uci -q delete kuroshio.access.deny
+uci commit kuroshio
+
 echo "== rpcd / ubus"
 ubusd &
 sleep 1

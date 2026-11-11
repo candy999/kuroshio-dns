@@ -1189,7 +1189,7 @@ pub async fn start(cfg: &Value, tier: Tier) -> Result<Started> {
         crate::ipfilter::Access::from_cfg(cfg, &share_dir(cfg), saved)
     };
     let _ = resolver.access.set(access.clone());
-    crate::ipfilter::spawn_tasks(access, persister.clone());
+    crate::ipfilter::spawn_tasks(access, persister.clone(), runtime_dir(cfg));
     // 統計歷史（公開頁 7 / 30 天）：重開機後接續
     if tiny {
         resolver.stats.set_limits(crate::stats::Limits::tiny());

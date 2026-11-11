@@ -743,7 +743,9 @@ pub fn request_check(r: &crate::resolver::Resolver, path: &str, doh_path: &str, 
 }
 
 /// 背景工作：每 10 分鐘重新讀本機網卡的網段；`access.autoUpdate` 開著時每天檢查一次新的台灣 IP 資料
-pub fn spawn_tasks(a: Arc<Access>, persister: Arc<Mutex<crate::persist::Persister>>) {
+/// 更新成功後：新資料另外寫一份到執行期目錄（記憶體，不寫 Flash），再執行 `KUROSHIO_ACCESS_HOOK`
+/// （OpenWrt：access.sh apply，重新產生核心層的 nftables 集合）
+pub fn spawn_tasks(a: Arc<Access>, persister: Arc<Mutex<crate::persist::Persister>>, runtime_dir: PathBuf) {
     if a.settings.mode == Mode::Open && !a.settings.auto_update {
         return;
     }
@@ -760,7 +762,12 @@ pub fn spawn_tasks(a: Arc<Access>, persister: Arc<Mutex<crate::persist::Persiste
                         info!("存取控制：台灣 IP 資料更新到 {}", t.generated_at);
                         a.set_data(t, &format!("自動更新（{STATE_FILE}）"));
                         // 經過快照寫入器（跟其他狀態一樣受 Flash 寫入間隔與每日上限限制）
+                        let _ = std::fs::create_dir_all(&runtime_dir);
+                        let _ = crate::persist::write_atomic(&runtime_dir.join(STATE_FILE), &bytes);
                         persister.lock().unwrap().stage(STATE_FILE, bytes);
+                        if let Some(hook) = std::env::var_os("KUROSHIO_ACCESS_HOOK").filter(|h| !h.is_empty()) {
+                            let _ = tokio::task::spawn_blocking(move || std::process::Command::new(hook).arg("apply").status()).await;
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => warn!("存取控制：台灣 IP 資料更新失敗：{e:#}"),
@@ -803,6 +810,133 @@ pub fn accept_update(cur: Option<&TwIp>, new: TwIp) -> Option<TwIp> {
         }
         Some(_) => Some(new),
     }
+}
+
+// ---------------- OpenWrt：核心層丟棄（nftables，fw4 include） ----------------
+
+/// 一個對外監聽的埠與上面的服務
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenPort {
+    pub udp: bool,
+    pub port: u16,
+    pub kinds: Vec<Kind>,
+}
+
+/// 設定裡開著的加密監聽埠（DoT / DoQ / DoH / DoH3），以及同一個埠上的公開頁、社群共享
+pub fn listen_ports(cfg: &Value) -> Vec<ListenPort> {
+    let on = |k: &str| get(cfg, k).and_then(Value::as_bool).unwrap_or(false);
+    let port = |k: &str, d: u64| get(cfg, k).and_then(Value::as_u64).filter(|p| *p > 0).unwrap_or(d) as u16;
+    let community = on("community.enabled");
+    let site = on("site.enabled");
+    let mut out: Vec<ListenPort> = Vec::new();
+    let mut add = |udp: bool, port: u16, first: Kind, with_site: bool| {
+        let mut kinds = vec![first];
+        if with_site && site {
+            kinds.push(Kind::Site);
+        }
+        if community {
+            kinds.push(Kind::Community);
+        }
+        match out.iter_mut().find(|p| p.udp == udp && p.port == port) {
+            Some(p) => p
+                .kinds
+                .extend(kinds.into_iter().filter(|k| !p.kinds.contains(k)).collect::<Vec<_>>()),
+            None => out.push(ListenPort { udp, port, kinds }),
+        }
+    };
+    if on("listen.dot.enabled") {
+        add(false, port("listen.dot.port", 853), Kind::Dot, false);
+    }
+    if on("listen.doq.enabled") {
+        add(true, port("listen.doq.port", 853), Kind::Doq, false);
+    }
+    if on("listen.doh.enabled") {
+        let p = port("listen.doh.port", 8053);
+        add(false, p, Kind::Doh, true);
+        if on("listen.doh.http3") {
+            add(true, port("listen.doh.http3Port", p as u64), Kind::Doh3, true);
+        }
+    }
+    out
+}
+
+impl Access {
+    /// 核心層允許的來源：勾選的台灣網段 + 自訂允許 + 私有網段 + 本機網段；None = 不做台灣過濾
+    fn kernel_allow(&self) -> Option<Dual> {
+        let r = self.rules();
+        let g = r.geo.as_ref()?;
+        Some(g.union(&r.allow).union(&r.private).union(&r.local))
+    }
+}
+
+fn nft_set(name: &str, v6: bool, d: &Dual) -> String {
+    let elems = if v6 { d.v6_cidrs() } else { d.v4_cidrs() };
+    let mut s = format!(
+        "set {name} {{\n\ttype {}_addr\n\tflags interval\n\tauto-merge\n",
+        if v6 { "ipv6" } else { "ipv4" }
+    );
+    if !elems.is_empty() {
+        s += "\telements = {\n";
+        for c in elems.chunks(8) {
+            s += &format!("\t\t{},\n", c.join(", "));
+        }
+        s += "\t}\n";
+    }
+    s += "}\n";
+    s
+}
+
+/// 產生 fw4 的 include：(table-pre 的集合, WAN 輸入鏈開頭的規則)。兩個都是空字串 = 不需要過濾。
+///
+/// - 自訂封鎖：所有加密監聽埠都丟棄
+/// - 台灣過濾（taiwan / custom 模式、資料讀得到）：只在「上面每個服務都有套用、而且沒有社群共享」的埠丟棄
+///   不在允許集合裡的來源（社群好友的 IP 會變，核心層不知道，所以社群共享的埠交給程式自己判斷）
+/// - 只放在 WAN 區域的輸入鏈：區網連進來的完全不受影響；也不會碰到 LuCI 的 22 / 80 / 443
+pub fn nft_render(cfg: &Value, a: &Access) -> (String, String) {
+    let ports = listen_ports(cfg);
+    let (deny, _) = Dual::parse(a.settings.deny.iter().map(String::as_str));
+    let allow = a.kernel_allow();
+    let geo_ports: Vec<&ListenPort> = ports
+        .iter()
+        .filter(|p| p.kinds.iter().all(|k| a.applies(*k) && *k != Kind::Community))
+        .collect();
+    let do_deny = !deny.is_empty() && !ports.is_empty();
+    let do_geo = allow.is_some() && !geo_ports.is_empty();
+    if !do_deny && !do_geo {
+        return (String::new(), String::new());
+    }
+    let list = |ps: &[&ListenPort], udp: bool| -> String {
+        let mut v: Vec<u16> = ps.iter().filter(|p| p.udp == udp).map(|p| p.port).collect();
+        v.sort_unstable();
+        v.dedup();
+        v.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+    };
+    let mut sets = String::from("# 黑潮 DNS 存取控制（kuroshio access nft 產生，不要手動修改）\n");
+    let mut rules = sets.clone();
+    let mut emit = |ps: &[&ListenPort], set4: &str, set6: &str, neg: bool, tag: &str| {
+        for udp in [false, true] {
+            let l = list(ps, udp);
+            if l.is_empty() {
+                continue;
+            }
+            let proto = if udp { "udp" } else { "tcp" };
+            let op = if neg { "!= " } else { "" };
+            rules += &format!("{proto} dport {{ {l} }} ip saddr {op}@{set4} counter drop comment \"{tag}\"\n");
+            rules += &format!("{proto} dport {{ {l} }} ip6 saddr {op}@{set6} counter drop comment \"{tag}\"\n");
+        }
+    };
+    if do_deny {
+        sets += &nft_set("kuroshio_deny4", false, &deny);
+        sets += &nft_set("kuroshio_deny6", true, &deny);
+        let all: Vec<&ListenPort> = ports.iter().collect();
+        emit(&all, "kuroshio_deny4", "kuroshio_deny6", false, "kuroshio-access-deny");
+    }
+    if let (true, Some(allow)) = (do_geo, &allow) {
+        sets += &nft_set("kuroshio_allow4", false, allow);
+        sets += &nft_set("kuroshio_allow6", true, allow);
+        emit(&geo_ports, "kuroshio_allow4", "kuroshio_allow6", true, "kuroshio-access-geo");
+    }
+    (sets, rules)
 }
 
 /// 自動更新的新資料是否合理：IPv4 總量跟目前的差在 ±20% 以內
@@ -1039,6 +1173,78 @@ mod tests {
         assert_eq!(a.check_json(ip("8.8.8.8"))["reason"], json!("社群好友目前的 IP"));
         a.set_friends(&[]);
         assert!(!a.allow(Kind::Dot, ip("8.8.8.8")));
+    }
+
+    #[test]
+    fn nft_rules_follow_mode_and_ports() {
+        let listen = json!({
+            "listen": { "dot": { "enabled": true, "port": 853 }, "doq": { "enabled": true, "port": 853 },
+                        "doh": { "enabled": true, "port": 8443, "http3": true } },
+            "site": { "enabled": true }
+        });
+        let with = |extra: Value| {
+            let mut c = listen.clone();
+            kuroshio_config::merge(&mut c, &extra);
+            c
+        };
+        assert_eq!(
+            listen_ports(&listen),
+            vec![
+                ListenPort {
+                    udp: false,
+                    port: 853,
+                    kinds: vec![Kind::Dot]
+                },
+                ListenPort {
+                    udp: true,
+                    port: 853,
+                    kinds: vec![Kind::Doq]
+                },
+                ListenPort {
+                    udp: false,
+                    port: 8443,
+                    kinds: vec![Kind::Doh, Kind::Site]
+                },
+                ListenPort {
+                    udp: true,
+                    port: 8443,
+                    kinds: vec![Kind::Doh3, Kind::Site]
+                },
+            ]
+        );
+        // 預設（taiwan，全部套用）：DoT / DoQ / DoH / DoH3 都丟棄不在台灣網段的
+        let cfg = with(json!({}));
+        let a = Access::new(Settings::from_cfg(&cfg), Some(data()), String::new(), None);
+        let (sets, rules) = nft_render(&cfg, &a);
+        assert!(sets.contains("set kuroshio_allow4") && sets.contains("1.160.0.0/12") && sets.contains("10.0.0.0/8"));
+        assert!(sets.contains("set kuroshio_allow6") && sets.contains("2001:b000::/20"));
+        assert!(!sets.contains("kuroshio_deny"));
+        assert!(rules.contains("tcp dport { 853, 8443 } ip saddr != @kuroshio_allow4 counter drop"));
+        assert!(rules.contains("udp dport { 853, 8443 } ip6 saddr != @kuroshio_allow6 counter drop"));
+        // 公開頁不套用：DoH 的埠交給程式判斷，DoT / DoQ 照樣在核心層丟棄
+        let cfg = with(json!({ "access": { "applyTo": ["dot", "doq", "doh", "doh3"] } }));
+        let a = Access::new(Settings::from_cfg(&cfg), Some(data()), String::new(), None);
+        let (_, rules) = nft_render(&cfg, &a);
+        assert!(rules.contains("tcp dport { 853 } ip saddr != @kuroshio_allow4"), "{rules}");
+        assert!(!rules.contains("8443"), "{rules}");
+        // 社群共享開著：好友的 IP 會變，核心層不做台灣過濾（只剩自訂封鎖）
+        let cfg = with(json!({ "community": { "enabled": true }, "access": { "deny": ["198.51.100.0/24"] } }));
+        let a = Access::new(Settings::from_cfg(&cfg), Some(data()), String::new(), None);
+        let (sets, rules) = nft_render(&cfg, &a);
+        assert!(!sets.contains("kuroshio_allow4"));
+        assert!(sets.contains("198.51.100.0/24"));
+        assert!(rules.contains("tcp dport { 853, 8443 } ip saddr @kuroshio_deny4 counter drop"));
+        // 全開放、沒有封鎖：什麼都不用
+        let cfg = with(json!({ "access": { "mode": "open" } }));
+        let a = Access::new(Settings::from_cfg(&cfg), Some(data()), String::new(), None);
+        assert_eq!(nft_render(&cfg, &a), (String::new(), String::new()));
+        // 資料讀不到：不擋（只剩自訂封鎖；沒有封鎖就什麼都不用）
+        let cfg = with(json!({}));
+        let a = Access::new(Settings::from_cfg(&cfg), None, String::new(), Some("x".into()));
+        assert_eq!(nft_render(&cfg, &a), (String::new(), String::new()));
+        // 沒有加密監聽：不用
+        let a = Access::new(Settings::from_cfg(&json!({})), Some(data()), String::new(), None);
+        assert_eq!(nft_render(&json!({}), &a), (String::new(), String::new()));
     }
 
     #[test]

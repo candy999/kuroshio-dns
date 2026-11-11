@@ -38,7 +38,7 @@ jobs:
       - name: Shell 腳本
         run: |
           shellcheck -s sh -e SC2034,SC2154,SC1008,SC3043,SC1091 openwrt/kuroshio/files/kuroshio.init
-          shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/kuroshio.uci-defaults
+          shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/access.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/kuroshio.uci-defaults
           shellcheck -s sh -e SC3043,SC2015,SC2086,SC1091 openwrt/tools/ci-smoke-kuroshio.sh openwrt/tools/ci-luci-setup.sh
       - uses: actions/setup-node@v4
         with:
