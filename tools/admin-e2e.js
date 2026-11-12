@@ -611,6 +611,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.setViewportSize({ width: 1280, height: 900 });
 
         const lastPost = () => posted[posted.length - 1] || {};
+        // 等到送出指定的動作（清單會在每個動作後重新讀取、重畫：CI 機器慢時不能只看「最後一筆」）
+        const waitPost = async (name, ms = 8000) => {
+            const end = Date.now() + ms;
+            while (Date.now() < end) { if (lastPost().name === name) return lastPost(); await page.waitForTimeout(100); }
+            return lastPost();
+        };
         await page.click(`${card('in.example.net')} button:has-text("同意")`);
         await page.waitForFunction(s => !/待我審核/.test(document.querySelector(s).textContent), card('in.example.net'), { timeout: 5000 }).catch(() => {});
         check(lastPost().name === 'accept' && lastPost().domain === 'in.example.net' && lastPost().method === 'POST' && !/待我審核/.test(await page.textContent(card('in.example.net'))),
@@ -621,9 +627,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.click(`${card('friend.example.com')} button:has-text("立即同步")`);
         await page.waitForFunction(() => /已同步/.test(document.getElementById('toast').textContent), null, { timeout: 5000 }).catch(() => {});
         check(lastPost().name === 'sync' && lastPost().domain === 'friend.example.com' && /已同步/.test(await page.textContent('#toast')), '立即同步', JSON.stringify(lastPost()));
-        await page.selectOption(`${card('friend.example.com')} select.cm-channel`, 'dot');
+        // 「立即同步」之後清單會重新讀取並重畫：等重畫完再選，選到的才是新的選單；還是被重畫蓋掉就再選一次
+        await page.waitForLoadState('networkidle').catch(() => {});
+        for (let i = 0; i < 3 && lastPost().name !== 'channel'; i++) {
+            await page.selectOption(`${card('friend.example.com')} select.cm-channel`, 'dot').catch(() => {});
+            await waitPost('channel', 3000);
+        }
         await page.waitForFunction(() => /已指定管道/.test(document.getElementById('toast').textContent), null, { timeout: 5000 }).catch(() => {});
         check(lastPost().name === 'channel' && lastPost().channel === 'dot', '指定管道（DoT 優先）', JSON.stringify(lastPost()));
+        await page.waitForLoadState('networkidle').catch(() => {});
         page.once('dialog', dl => dl.dismiss());
         await page.click(`${card('friend.example.com')} button:has-text("刪除並封鎖")`);
         await page.waitForTimeout(300);
