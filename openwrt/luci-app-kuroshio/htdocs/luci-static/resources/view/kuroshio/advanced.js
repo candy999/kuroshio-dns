@@ -108,7 +108,7 @@ function backupSection() {
 		b.addEventListener('click', function(ev) { ev.preventDefault(); fn(b); });
 		return b;
 	};
-	return E('div', { 'class': 'cbi-section', 'id': 'kuroshio-backup' }, [
+	return E('div', { 'class': 'cbi-section kuroshio-sec', 'id': 'kuroshio-backup' }, [
 		T('h3', {}, _('備份與分享')),
 		T('p', { 'class': 'cbi-section-descr' }, _('換路由器時把累積的學習資料帶過去，或分享給朋友手動匯入。匯入是「合併」：本機比較新的資料會留著，不會被蓋掉。')),
 		E('ul', { 'style': 'margin:.4em 0 .8em 1.2em;list-style:disc' }, [
@@ -147,7 +147,7 @@ return view.extend({
 		if (!common.isPro()) {
 			return E([], [
 				common.modeBar(),
-				E('div', { 'class': 'cbi-section' }, [
+				E('div', { 'class': 'cbi-section kuroshio-sec' }, [
 					E('h2', {}, _('黑潮 DNS · 進階')),
 					E('p', {}, _('這裡是上游、解析時間、測速、排程與評測的細部參數。為了避免誤改，請先切換到「專業」模式。'))
 				]),

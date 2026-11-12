@@ -156,7 +156,7 @@ return view.extend({
 		var btn = function(label, fn, cls) { return E('button', { 'class': 'btn cbi-button ' + (cls || ''), 'click': ui.createHandlerFn(null, fn) }, label); };
 
 		var tools = E([], [
-			E('div', { 'class': 'cbi-section' }, [
+			E('div', { 'class': 'cbi-section kuroshio-sec' }, [
 				E('h3', {}, _('台灣節點池')),
 				E('p', { 'class': 'cbi-section-descr' }, _('每天 05:30 重建，每 30 分鐘健檢。')),
 				poolBox,
@@ -165,7 +165,7 @@ return view.extend({
 					btn(_('立即重建節點池'), function() { return common.action('/api/jobs/run', { name: 'cdn-pool' }).then(function(r) { common.notify(r, _('已排入背景執行，完成後自動套用')); }); }, 'cbi-button-action')
 				])
 			]),
-			E('div', { 'class': 'cbi-section' }, [
+			E('div', { 'class': 'cbi-section kuroshio-sec' }, [
 				E('h3', {}, _('網域工具')),
 				E('p', { 'class': 'cbi-section-descr' }, _('追蹤一個網域的完整解析過程，或手動指定要不要換台灣節點。')),
 				E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap;align-items:center' }, [

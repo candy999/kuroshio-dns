@@ -20,7 +20,7 @@ return view.extend({
 		poll.add(function() { return L.resolveDefault(callLog(300), []).then(show); }, 5);
 		return E([], [
 			E('h2', {}, _('黑潮 DNS · 日誌')),
-			E('div', { 'class': 'cbi-section' }, [
+			E('div', { 'class': 'cbi-section kuroshio-sec' }, [
 				E('label', { 'style': 'display:inline-flex;gap:.4em;align-items:center' }, [follow, _('自動捲到最新')]),
 				E('p', { 'class': 'cbi-section-descr' }, _('要看每一筆查詢，請在「基本設定 → 專業模式 → 記錄每筆查詢」打開。')),
 				pre

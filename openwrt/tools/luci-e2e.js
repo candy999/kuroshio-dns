@@ -211,6 +211,24 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         if (NAME === 'kuroshio' && p === 'status' && MOCK) {
             /連線來源/.test(text) && /只開放台灣/.test(text) && /已拒絕 57 次/.test(text) ? ok('狀態頁：連線來源摘要') : bad('狀態頁沒有連線來源摘要');
             /最久未存/.test(text) && /1\.5 小時/.test(text) && /上限 24 小時/.test(text) ? ok('狀態頁：最久未存') : bad('狀態頁沒有「最久未存」');
+            // 數字卡片不能超出、也不能貼著所在區塊的邊緣（寬螢幕與手機寬度）
+            for (const w of [1280, 390]) {
+                await page.setViewportSize({ width: w, height: w === 390 ? 844 : 900 });
+                await page.waitForTimeout(400);
+                const r = await page.evaluate(() => {
+                    const out = { n: 0, bad: [] };
+                    document.querySelectorAll('#view .kuroshio-tile').forEach(t => {
+                        const sec = t.closest('.cbi-section'), a = t.getBoundingClientRect(), b = sec.getBoundingClientRect();
+                        out.n++;
+                        if (a.left < b.left + 4 || a.right > b.right - 4) out.bad.push(`${t.innerText.split('\n')[0]}（卡片 ${Math.round(a.left)}–${Math.round(a.right)}，區塊 ${Math.round(b.left)}–${Math.round(b.right)}）`);
+                    });
+                    out.sw = document.documentElement.scrollWidth;
+                    return out;
+                });
+                r.n >= 6 && !r.bad.length && r.sw <= w + 1 ? ok(`狀態頁 ${w} px：${r.n} 張數字卡片都在區塊內、沒有水平捲動`)
+                    : bad(`狀態頁 ${w} px：數字卡片 ${r.n} 張，超出或貼邊：${r.bad.join('、') || '-'}（scrollWidth = ${r.sw}）`);
+            }
+            await page.setViewportSize({ width: 1280, height: 900 });
             /記憶體控制/.test(text) && /暫時停用：大廣告 清單（3000 條規則）/.test(text) && /縮小 DNS 快取/.test(text) && /保留 16 MB（自動）/.test(text) && /只轉送 DNS/.test(text) && /快取 64 \/ 64 筆/.test(text) && /儲存空間/.test(text) && !/硬體等級/.test(text) ? ok('狀態頁：記憶體控制（保留量、只轉送、動態大小、儲存空間、沒有硬體等級）') : bad('狀態頁沒有記憶體控制');
         }
     }

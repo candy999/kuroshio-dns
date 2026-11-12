@@ -9,6 +9,11 @@
 //        curl -sS -o luci/cascade.css $B/themes/luci-theme-bootstrap/htdocs/luci-static/bootstrap/cascade.css
 //   2. LUCI_DIR=luci PORT=8080 node openwrt/tools/luci-mock.js          （SERVICE=down：模擬服務沒有執行）
 //   3. BASE=http://127.0.0.1:8080 MOCK=1 node openwrt/tools/luci-e2e.js kuroshio
+//
+// 換主題看（只是近似：用主題自己的 CSS 與它 header 範本的 HTML 骨架，不跑主題的選單 JS）：
+//   THEMES='argon=/path/luci-theme-argon,vantage=/path/luci-theme-vantage/luci-theme-vantage,material=/path/material'
+//   主題目錄是原始碼（有 htdocs/luci-static/<名稱>/）或只放 cascade.css 的資料夾；網址加 ?theme=argon&dark=1（dark=0 淺色、
+//   不加跟著系統）。支援 bootstrap（預設）、argon、vantage、material、openwrt2020。
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -19,6 +24,7 @@ const LUCI = path.resolve(process.env.LUCI_DIR || 'luci');
 const APP = path.join(ROOT, 'openwrt', 'luci-app-kuroshio', 'htdocs', 'luci-static', 'resources');
 const PORT = +(process.env.PORT || 8080);
 const DOWN = process.env.SERVICE === 'down';
+const THEMES = Object.fromEntries((process.env.THEMES || '').split(',').filter(Boolean).map(kv => { const i = kv.indexOf('='); return [kv.slice(0, i), path.resolve(kv.slice(i + 1))]; }));
 const BIN = process.env.KUROSHIO_BIN || path.join(ROOT, 'target', 'debug', 'kuroshio');
 
 // ---------------- UCI（記憶體） ----------------
@@ -324,24 +330,61 @@ function ubus(obj, method, a) {
     return [0, {}];
 }
 
-const MIME = { '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json' };
-function page(view) {
+const MIME = { '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json',
+    '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf' };
+/** 主題的 HTML 骨架（照各主題 header.ut / footer.ut 的結構，選單、指示燈留空） */
+const SKELETON = {
+    bootstrap: (dark, body) => ({ html: dark == null ? '' : ` data-darkmode="${dark}"`, css: ['/luci-static/bootstrap/cascade.css'], autoDark: dark == null,
+        body: `<body class="lang_zh-tw"><header><a class="brand" href="/">OpenWrt（mock）</a></header><div id="maincontent" class="container">${body}</div>` }),
+    material: (dark, body) => ({ css: ['/luci-static/material/cascade.css'],
+        body: `<body class="lang_zh-tw logged-in"><header><div class="fill"><div class="container"><span class="showSide"></span><a class="brand" href="#">OpenWrt（mock）</a><span class="status" id="indicators"></span></div></div></header>
+<div class="main"><div class="main-left" id="mainmenu"></div><div class="main-right"><div class="darkMask"></div><div id="maincontent"><div class="container">${body}</div></div></div></div>` }),
+    openwrt2020: (dark, body) => ({ css: ['/luci-static/openwrt2020/cascade.css'],
+        body: `<body class="lang_zh-tw"><div id="menubar"><span class="hostname"><a href="/">OpenWrt（mock）</a></span><span id="indicators"></span></div>
+<div id="maincontainer"><div id="mainmenu"></div><div id="maincontent">${body}</div></div>` }),
+    // argon：data-argon-mode normal = 跟著系統，dark / light 固定；側邊選單由 menu-argon.js 打開（這裡放一個空的，寬度才接近實機）
+    argon: (dark, body) => ({ html: ` data-argon-mode="${dark == null ? 'normal' : dark ? 'dark' : 'light'}"`, css: ['/luci-static/argon/css/cascade.css'],
+        head: `<style>:root{--light-primary:#5e72e4;--dark-primary:#483d8b;--dark-on-primary:#fff;--dark-link-color:#9d94e0;--dark-focus-ring:#9d94e0;--dark-control-focus:#9d94e0;--dark-progress-fill:#7b6fd0;--dark-control-ring:#7b6fd0;--dark-selected-bg:#2c2650;--dark-selected-hover-bg:#352e60;--dark-accent-ring:#7b6fd0;--dark-accent-shadow:rgba(72,61,139,.4);--blur-radius-light:10px;--blur-opacity-light:.5;--blur-radius-dark:10px;--blur-opacity-dark:.5}</style>`,
+        body: `<body class="lang_zh-tw logged-in" data-page="admin-services-kuroshio"><div class="main"><div class="main-left" id="mainmenu"><div class="sidenav-header d-flex align-items-center"><a class="brand" href="#">OpenWrt</a></div><div class="sidenav"><div class="nav-container"><ul class="nav"><li class="slide active"><a class="menu" href="#">服務</a><ul class="slide-menu active"><li class="active"><a href="#">黑潮 DNS</a></li></ul></li></ul></div></div></div>
+<div class="main-right"><header class="bg-primary"><div class="fill"><div class="container"><div class="flex1"><button type="button" class="showSide"></button><a class="brand" href="#">OpenWrt（mock）</a></div><div class="header-actions"><div class="status" id="indicators"></div></div></div></div></header><div class="darkMask"></div>
+<div id="maincontent"><div class="container">${body}</div><footer class="mobile-hide"><div class="footer-content"><a href="#">Powered by LuCI（mock）</a></div></footer></div></div></div>` }),
+    // vantage：header.ut 在 <head> 裡依偏好設 data-darkmode（預設深色）
+    vantage: (dark, body) => ({ html: ` data-darkmode="${dark == null ? 'true' : dark}" data-theme="${dark == null ? 'auto' : dark ? 'dark' : 'light'}"`, autoDark: dark == null,
+        css: ['/luci-static/vantage/vantage.css', '/luci-static/vantage/icons.css'],
+        body: `<body class="lang_zh-tw vt-auth" data-page="admin-services-kuroshio"><div class="vt-shell"><nav class="vt-rail" id="vt-rail"><ul class="vt-rail-list" id="vt-rail-list"></ul></nav>
+<div class="vt-frame"><header class="vt-topbar"><nav class="vt-crumbs"><span class="vt-crumb vt-crumb-current">黑潮 DNS</span></nav><div class="vt-top-actions"><div id="indicators" class="vt-indicators"></div></div></header>
+<main id="maincontent" class="vt-main">${body}</main><footer class="vt-foot"><span>OpenWrt（mock）</span></footer></div></div>` })
+};
+
+function page(view, theme, dark) {
+    const media = '/luci-static/' + (SKELETON[theme] ? theme : 'bootstrap');
     const env = {
-        media: '/luci-static/bootstrap', resource: '/luci-static/resources', scriptname: '/cgi-bin/luci', pathinfo: `/admin/services/kuroshio/${view}`,
+        media, resource: '/luci-static/resources', scriptname: '/cgi-bin/luci', pathinfo: `/admin/services/kuroshio/${view}`,
         documentroot: '/www', requestpath: ['admin', 'services', 'kuroshio', view], dispatchpath: ['admin', 'services', 'kuroshio', view],
         pollinterval: 5, ubuspath: '/ubus/', sessionid: '0123456789abcdef0123456789abcdef', token: 'mocktoken',
         nodespec: { action: { type: 'view', path: `kuroshio/${view}` }, satisfied: true, readonly: false, title: '黑潮 DNS' },
         apply_rollback: 90, apply_holdoff: 1, apply_timeout: 1, apply_display: 1
     };
-    return `<!DOCTYPE html><html lang="zh-tw"><head><meta charset="utf-8"><title>OpenWrt - 黑潮 DNS - LuCI（mock）</title>
-<meta name="viewport" content="initial-scale=1.0"><link rel="stylesheet" href="/luci-static/bootstrap/cascade.css">
-<script>(function(){ var m = window.matchMedia('(prefers-color-scheme: dark)'), r = document.documentElement; var set = function(x) { r.setAttribute('data-darkmode', x.matches); }; set(m); m.addListener(set); })();</script>
-<script src="/cgi-bin/luci/admin/translations/zh-tw"></script><script src="/luci-static/resources/cbi.js"></script></head>
-<body class="lang_zh-tw"><header><a class="brand" href="/">OpenWrt（mock）</a></header>
-<div id="maincontent" class="container"><div id="tabmenu" style="display:none"></div>
+    const sk = (SKELETON[theme] || SKELETON.bootstrap)(dark, `<div id="tabmenu" style="display:none"></div>
 <script src="/luci-static/resources/luci.js"></script><script>L = new LuCI(${JSON.stringify(env)});</script>
-<div id="view"><div class="spinning">Loading view…</div><script>L.require('ui').then(function(ui) { ui.instantiateView('kuroshio/${view}'); });</script></div>
-</div></body></html>`;
+<div id="view"><div class="spinning">Loading view…</div><script>L.require('ui').then(function(ui) { ui.instantiateView('kuroshio/${view}'); });</script></div>`);
+    // bootstrap / vantage 的「自動」：跟著系統的深淺色設 data-darkmode（跟主題自己的 header 一樣）
+    const auto = sk.autoDark ? `<script>(function(){ var m = window.matchMedia('(prefers-color-scheme: dark)'), r = document.documentElement; var set = function(x) { r.setAttribute('data-darkmode', x.matches); }; set(m); m.addListener(set); })();</script>` : '';
+    return `<!DOCTYPE html><html lang="zh-tw"${sk.html || ''}><head><meta charset="utf-8"><title>OpenWrt - 黑潮 DNS - LuCI（mock）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">${sk.css.map(c => `<link rel="stylesheet" href="${c}">`).join('')}${sk.head || ''}
+${auto}<script src="/cgi-bin/luci/admin/translations/zh-tw"></script><script src="/luci-static/resources/cbi.js"></script></head>
+${sk.body}</body></html>`;
+}
+
+/** 主題的靜態檔：/luci-static/<主題>/<檔名> → 主題原始碼的 htdocs/luci-static/<主題>/，或主題資料夾本身 */
+function themeFile(name, rel) {
+    const dir = THEMES[name];
+    if (!dir || rel.includes('..')) return null;
+    for (const base of [path.join(dir, 'htdocs', 'luci-static', name), dir]) {
+        const f = path.join(base, rel);
+        if (fs.existsSync(f) && fs.statSync(f).isFile()) return f;
+    }
+    return null;
 }
 
 http.createServer((req, res) => {
@@ -383,9 +426,16 @@ http.createServer((req, res) => {
     }
     if (/\/admin\/translations\//.test(url.pathname)) return send(200, MIME['.js'], '');
     let m;
-    if ((m = /^\/cgi-bin\/luci\/admin\/services\/kuroshio\/(\w+)$/.exec(url.pathname))) return send(200, 'text/html; charset=utf-8', page(m[1]));
+    if ((m = /^\/cgi-bin\/luci\/admin\/services\/kuroshio\/(\w+)$/.exec(url.pathname))) {
+        const d = url.searchParams.get('dark');
+        return send(200, 'text/html; charset=utf-8', page(m[1], url.searchParams.get('theme') || process.env.THEME || 'bootstrap', d == null ? null : d === '1'));
+    }
     if (url.pathname === '/cgi-bin/luci/' || url.pathname === '/') return send(200, 'text/html; charset=utf-8', '<!DOCTYPE html><meta charset="utf-8"><title>LuCI mock</title><p>LuCI mock：/cgi-bin/luci/admin/services/kuroshio/settings</p>');
-    if (url.pathname === '/luci-static/bootstrap/cascade.css') return send(200, MIME['.css'], fs.readFileSync(path.join(LUCI, 'cascade.css')));
+    if (url.pathname === '/luci-static/bootstrap/cascade.css' && !THEMES.bootstrap) return send(200, MIME['.css'], fs.readFileSync(path.join(LUCI, 'cascade.css')));
+    if ((m = /^\/luci-static\/(\w+)\/([\w./-]+)$/.exec(url.pathname)) && m[1] !== 'resources') {
+        const f = themeFile(m[1], m[2]);
+        if (f) return send(200, MIME[path.extname(f)] || 'application/octet-stream', fs.readFileSync(f));
+    }
     if ((m = /^\/luci-static\/resources\/([\w./-]+)$/.exec(url.pathname)) && !m[1].includes('..')) {
         if (/^kuroshio\/dashboard\.(js|css)$/.test(m[1])) return send(200, MIME[path.extname(m[1])], fs.readFileSync(path.join(ROOT, 'data', 'dashboard', m[1].slice(9))));
         for (const base of [APP, path.join(LUCI, 'res')]) {

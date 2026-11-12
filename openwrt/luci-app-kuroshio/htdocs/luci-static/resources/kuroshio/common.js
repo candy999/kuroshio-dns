@@ -79,6 +79,95 @@ function getPath(obj, path) {
 	return String(path).split('.').reduce(function(a, k) { return (a == null) ? undefined : a[k]; }, obj);
 }
 
+/*
+ * 各頁共用的樣式（固定字串，不含任何資料）。顏色一律從主題的文字顏色（currentColor）調出來，
+ * 淺色 / 深色、bootstrap / argon / material / openwrt2020 / vantage 都跟著主題走，不寫死白底。
+ * 不支援 color-mix() 的舊瀏覽器用前一行的半透明灰色。
+ */
+var CSS = [
+	/* 區塊：主題本身沒有內距（argon 的 .cbi-section 是 padding: 0，只有標題自己縮排）時，fitSections() 會在 <html> 加上
+	   kuroshio-pad，並把 --kuroshio-inset 設成主題標題的縮排，內容才不會貼著區塊邊緣 */
+	':root.kuroshio-pad #view .cbi-section.kuroshio-sec{padding:0 var(--kuroshio-inset,1rem) var(--kuroshio-inset,1rem)}',
+	/* 主題的標題列自己有縮排（argon 深色時還有底色）：往外推回區塊邊緣，照主題原樣顯示 */
+	':root.kuroshio-pad:not(.kuroshio-flat) #view .kuroshio-sec>h3:first-child{margin-left:calc(-1 * var(--kuroshio-inset));margin-right:calc(-1 * var(--kuroshio-inset));width:auto}',
+	':root.kuroshio-pad #view .kuroshio-sec>p:first-child,:root.kuroshio-pad #view .kuroshio-sec>.cbi-section-descr{padding-left:0;padding-right:0}',
+	':root.kuroshio-pad.kuroshio-flat #view .kuroshio-sec>h3:first-child{padding-top:var(--kuroshio-inset,1rem)}',
+	':root.kuroshio-pad #view .cbi-section.kuroshio-sec:not(:has(>h3:first-child)){padding-top:var(--kuroshio-inset,1rem)}',
+	'#view .cbi-section .cbi-section.kuroshio-sec{padding-left:0;padding-right:0}',
+	'#view .kuroshio-footer{border-top:1px solid rgba(128,128,128,.25);border-top-color:color-mix(in srgb,currentColor 14%,transparent)}',
+	'.kuroshio-sec{min-width:0}',
+	/* 數字卡片：淡淡的底色（文字顏色的 5%）＋很淡的框，寬度不夠時自動換行，不會超出區塊 */
+	'.kuroshio-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,10.5em),1fr));gap:.6em;margin:.2em 0 .4em}',
+	'.kuroshio-tile{min-width:0;box-sizing:border-box;padding:.65em .85em .7em;border-radius:8px;' +
+		'background:rgba(128,128,128,.07);background:color-mix(in srgb,currentColor 5%,transparent);' +
+		'border:1px solid rgba(128,128,128,.14);border-color:color-mix(in srgb,currentColor 10%,transparent);box-shadow:none;color:inherit}',
+	'.kuroshio-tile-l{font-size:12px;line-height:1.4;opacity:.72;overflow-wrap:anywhere}',
+	'.kuroshio-tile-v{font-size:1.35em;font-weight:600;line-height:1.3;margin:.1em 0;font-variant-numeric:tabular-nums;word-break:keep-all;overflow-wrap:break-word}',
+	'.kuroshio-nb{white-space:nowrap}',
+	'.kuroshio-tile-s{font-size:12px;line-height:1.45;opacity:.72;overflow-wrap:anywhere}',
+	/* 表格：外面包一層可以左右捲動的框；文字靠左、數字靠右 */
+	'.kuroshio-scroll{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}',
+	'.kuroshio-scroll>table{margin:0}',
+	'#view .kuroshio-scroll .th,#view .kuroshio-scroll .td{text-align:left}',
+	/* 窄螢幕主題把表格改成一格一格的卡片（標題在左），這時數字不靠右 */
+	'@media (min-width:601px){#view .kuroshio-scroll .th.kuroshio-num,#view .kuroshio-scroll .td.kuroshio-num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}}',
+	'.kuroshio-row{display:flex;flex-direction:row;gap:.5em;flex-wrap:wrap;align-items:center;justify-content:flex-start}',
+	'.kuroshio-modebar .cbi-value-description{margin:0;padding:0}'
+].join('\n');
+
+/** 把共用樣式放進頁面（一次） */
+function injectCss() {
+	if (document.getElementById('kuroshio-css')) return;
+	var st = document.createElement('style');
+	st.id = 'kuroshio-css';
+	st.textContent = CSS;
+	document.head.appendChild(st);
+}
+injectCss();
+
+/**
+ * 主題的區塊有沒有內距：看第一個 .kuroshio-sec 的 padding-left。沒有的話（argon）用主題標題的縮排當內距；
+ * 標題也沒有縮排（不認識的主題）就用 16px，標題一起縮排。視窗大小改變時重新量（主題在手機寬度可能改縮排）。
+ */
+var fitTimer = null;
+function fitSections(tries) {
+	window.clearTimeout(fitTimer);
+	var sec = document.querySelector('#view .cbi-section.kuroshio-sec');
+	if (!sec || !sec.getBoundingClientRect().width) {
+		if ((tries || 0) < 100) fitTimer = window.setTimeout(function() { fitSections((tries || 0) + 1); }, 100);
+		return;
+	}
+	var root = document.documentElement;
+	root.classList.remove('kuroshio-pad', 'kuroshio-flat');
+	root.style.removeProperty('--kuroshio-inset');
+	if (parseFloat(window.getComputedStyle(sec).paddingLeft) >= 4) return;
+	var h = sec.firstElementChild && sec.firstElementChild.tagName === 'H3' ? sec.firstElementChild : null;
+	var hp = h ? parseFloat(window.getComputedStyle(h).paddingLeft) : 0;
+	root.style.setProperty('--kuroshio-inset', (hp >= 4 ? Math.min(hp, 32) : 16) + 'px');
+	root.classList.add('kuroshio-pad');
+	if (hp < 4) root.classList.add('kuroshio-flat');
+}
+window.addEventListener('resize', function() { window.clearTimeout(fitTimer); fitTimer = window.setTimeout(fitSections, 200); });
+fitSections();
+
+/**
+ * 數字＋單位不要拆成兩行：「7,370 MB」「1 / 2 ms」「1.5 小時」包成不換行的 <span>（文字本身不變，複製、搜尋都正常）
+ * 回傳節點陣列，字串一律當文字放進去
+ */
+var NUM_UNIT = /[>\d][\d,.]*(?:\s*\/\s*[>\d][\d,.]*)*\s*(?:MB|KB|GB|ms|%|筆|條|種|核|次|天|小時|分鐘|分)?/g;
+function keepNumbers(text) {
+	var s = String(text), out = [], last = 0, m;
+	NUM_UNIT.lastIndex = 0;
+	while ((m = NUM_UNIT.exec(s))) {
+		if (!m[0]) { NUM_UNIT.lastIndex++; continue; }
+		if (m.index > last) out.push(document.createTextNode(s.slice(last, m.index)));
+		out.push(T('span', { 'class': 'kuroshio-nb' }, m[0]));
+		last = m.index + m[0].length;
+	}
+	if (last < s.length) out.push(document.createTextNode(s.slice(last)));
+	return out;
+}
+
 var SCOPE = { 'public': _('公網'), 'private': _('私有'), 'cgnat': _('電信商 CGNAT'), 'linklocal': _('鏈路本地'), 'ula': _('區網 IPv6'), 'loopback': _('本機') };
 var BADGE = { ok: '#19733a', warn: '#8a5a00', err: '#b42318', off: '#6b7785' };
 
@@ -93,13 +182,47 @@ return baseclass.extend({
 			'style': 'display:inline-block;padding:0 .6em;border-radius:1em;font-size:12px;line-height:1.7;white-space:nowrap;color:#fff;background:' + (BADGE[kind] || BADGE.off) }, text);
 	},
 
-	/** 表格：head = 標題陣列，rows = 每列的儲存格（字串或節點） */
-	table: function(head, rows, empty) {
+	/**
+	 * 自己組的區塊（不是 form.js 產生的）：主題沒有區塊內距時自動補上（見 fitSections）
+	 * attrs 可以帶 id 等屬性；children 可以是節點陣列
+	 */
+	section: function(title, children, attrs) {
+		var a = Object.assign({}, attrs || {});
+		a['class'] = 'cbi-section kuroshio-sec' + (a['class'] ? ' ' + a['class'] : '');
+		window.setTimeout(fitSections, 0);
+		return E('div', a, [title != null ? T('h3', {}, title) : ''].concat(children || []));
+	},
+
+	/** 數字卡片：label 標題、value 數字（數字與單位不會被拆開）、sub 小字說明 */
+	tile: function(label, value, sub) {
+		return E('div', { 'class': 'kuroshio-tile' }, [
+			T('div', { 'class': 'kuroshio-tile-l' }, label),
+			E('div', { 'class': 'kuroshio-tile-v' }, keepNumbers(value == null ? '-' : value)),
+			sub ? E('div', { 'class': 'kuroshio-tile-s' }, keepNumbers(sub)) : ''
+		]);
+	},
+
+	/** 一組數字卡片（寬度不夠自動換行） */
+	tiles: function(list) {
+		return E('div', { 'class': 'kuroshio-tiles' }, list.filter(Boolean));
+	},
+
+	/** 包一層可以左右捲動的框（表格太寬時不撐破區塊） */
+	scroll: function(node) {
+		return E('div', { 'class': 'kuroshio-scroll' }, node);
+	},
+
+	/**
+	 * 表格：head = 標題陣列，rows = 每列的儲存格（字串或節點）
+	 * num = 數字欄的索引（靠右對齊）；表格外面包 scroll() 才會套用對齊與捲動
+	 */
+	table: function(head, rows, empty, num) {
+		var isNum = function(i) { return !!num && num.indexOf(i) >= 0; };
 		return E('table', { 'class': 'table' }, [
-			E('tr', { 'class': 'tr table-titles' }, head.map(function(h) { return T('th', { 'class': 'th' }, h); }))
+			E('tr', { 'class': 'tr table-titles' }, head.map(function(h, i) { return T('th', { 'class': 'th' + (isNum(i) ? ' kuroshio-num' : '') }, h); }))
 		].concat(rows.length ? rows.map(function(r) {
 			return E('tr', { 'class': 'tr' }, r.map(function(c, i) {
-				var td = E('td', { 'class': 'td', 'data-title': head[i] || '' });
+				var td = E('td', { 'class': 'td' + (isNum(i) ? ' kuroshio-num' : ''), 'data-title': head[i] || '' });
 				if (c != null && c.nodeType) td.appendChild(c);
 				else td.textContent = (c == null) ? '-' : String(c);
 				return td;
@@ -179,7 +302,7 @@ return baseclass.extend({
 		var self = this, P = { doh: 'DoH（TCP）', doh3: 'DoH3（UDP）', dot: 'DoT（TCP）', doq: 'DoQ（UDP）' };
 		return this.table([_('協議'), _('位址'), _('埠號'), _('狀態')], [].concat(detail || []).map(function(x) {
 			return [P[x.proto] || x.proto, x.bind, x.port, self.listenerState(x)];
-		}), _('沒有開啟任何加密協議（DoH / DoT / DoQ）'));
+		}), _('沒有開啟任何加密協議（DoH / DoT / DoQ）'), [2]);
 	},
 
 	/**
@@ -240,14 +363,15 @@ return baseclass.extend({
 				}
 			}, label);
 		};
-		return E('div', { 'class': 'cbi-section', 'style': 'display:flex;gap:.5em;align-items:center;flex-wrap:wrap' }, [
+		// 主題可能把 .cbi-section 設成直向 flex（argon），所以橫排放在裡面一層
+		return E('div', { 'class': 'cbi-section kuroshio-sec' }, E('div', { 'class': 'kuroshio-row kuroshio-modebar' }, [
 			E('strong', {}, _('介面模式')),
 			btn(false, _('簡易')),
 			btn(true, _('專業')),
 			E('span', { 'class': 'cbi-value-description', 'style': 'margin:0' },
 				pro ? _('顯示全部參數。不確定的欄位請保持空白，會使用程式內建的預設值。')
 				    : _('只顯示常用設定，避免誤改細部參數。需要微調時切換到「專業」。'))
-		]);
+		]));
 	},
 
 	/**
@@ -310,7 +434,7 @@ return baseclass.extend({
 		var qr = c ? svgImg(c.qrSource, _('原始碼網址 QR 碼')) : null;
 		return E('div', { 'class': 'kuroshio-about', 'style': 'display:flex;gap:1.2em;flex-wrap:wrap;align-items:flex-start' }, [
 			E('div', { 'style': 'flex:1 1 22em;min-width:0' }, [
-				E('table', { 'class': 'table' }, rows),
+				E('div', { 'class': 'kuroshio-scroll' }, E('table', { 'class': 'table' }, rows)),
 				T('p', { 'class': 'cbi-section-descr', 'style': 'margin-top:.6em' },
 					_('黑潮 DNS 是開放原始碼軟體，採用 GPL-3.0-or-later 授權：可以自由使用、修改與分享；如果把修改過的版本散布給別人，必須用同樣的授權一併提供原始碼。'))
 			]),
@@ -335,7 +459,7 @@ return baseclass.extend({
 			body.style.display = show ? '' : 'none';
 			toggle.setAttribute('aria-expanded', String(show));
 		});
-		var box = E('div', { 'class': 'cbi-section kuroshio-footer', 'style': 'margin-top:1.5em;border-top:1px solid var(--border-color-medium,#ddd);padding-top:.6em' }, [line, body]);
+		var box = E('div', { 'class': 'cbi-section kuroshio-sec kuroshio-footer', 'style': 'margin-top:1.5em;padding-top:.6em' }, [line, body]);
 
 		this.loadAbout().then(function(a) {
 			var c = a.core;

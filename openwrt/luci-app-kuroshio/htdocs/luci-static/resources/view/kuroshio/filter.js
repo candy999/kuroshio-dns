@@ -104,7 +104,7 @@ return view.extend({
 		};
 		input.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); check(); } });
 
-		var tools = E('div', { 'class': 'cbi-section' }, [
+		var tools = E('div', { 'class': 'cbi-section kuroshio-sec' }, [
 			E('h3', {}, _('規則檢查')),
 			E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap' }, [
 				input,

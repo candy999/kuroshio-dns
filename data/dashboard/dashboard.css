@@ -1,7 +1,8 @@
 /* 黑潮 DNS 共用儀表板（data/dashboard/dashboard.js）的樣式。
  * 全部限定在 .kd 底下，不影響主機頁面的其他部分。
  * 顏色用主機頁面的變數（--text、--s1…）：公開頁 / 詳細頁有自己的黑潮配色；
- * LuCI 與 Windows 設定頁沒有這些變數，容器再加上 .kd-theme 套用下面這組（淺色 / 深色跟著系統，LuCI 跟著 data-darkmode）。 */
+ * LuCI 與 Windows 設定頁沒有這些變數，容器再加上 .kd-theme 套用下面這組（淺色 / 深色跟著系統，LuCI 跟著 data-darkmode）。
+ * LuCI 儀表板另外量目前主題的卡片底色、框線、文字顏色，直接寫在容器上（蓋過這組），並設 data-kd-host="light|dark"。 */
 
 /* ---------- 配色（LuCI、Windows 設定頁） ---------- */
 .kd-theme {
@@ -18,7 +19,7 @@
   color: var(--text); font-family: var(--font);
 }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-darkmode="false"]) .kd-theme {
+  :root:not([data-darkmode="false"]) .kd-theme:not([data-kd-host="light"]) {
     --bg: #0d141c; --text: #e4ebf3; --text-2: #b4c2d2; --text-3: #8d9db0;
     --line: rgba(160,200,255,.13); --grid: rgba(160,200,255,.08);
     --glass: #151f2b; --glass-2: #151f2b; --glass-hi: rgba(255,255,255,.03); --glass-edge: rgba(160,200,255,.14);
@@ -28,8 +29,8 @@
     --ok: #5fd08a; --bad: #ff8a80; --warn: #f0c060;
   }
 }
-/* LuCI 選了深色主題（bootstrap-dark，或自動模式偵測到深色） */
-:root[data-darkmode="true"] .kd-theme {
+/* LuCI 選了深色主題（bootstrap-dark，或自動模式偵測到深色）；data-kd-host = LuCI 儀表板量到的主題深淺色（argon 等沒有 data-darkmode） */
+:root[data-darkmode="true"] .kd-theme:not([data-kd-host="light"]), .kd-theme[data-kd-host="dark"] {
   --bg: #0d141c; --text: #e4ebf3; --text-2: #b4c2d2; --text-3: #8d9db0;
   --line: rgba(160,200,255,.13); --grid: rgba(160,200,255,.08);
   --glass: #151f2b; --glass-2: #151f2b; --glass-hi: rgba(255,255,255,.03); --glass-edge: rgba(160,200,255,.14);
@@ -38,7 +39,9 @@
   --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #2f9e2f; --s7: #9085e9; --s8: #e66767;
   --ok: #5fd08a; --bad: #ff8a80; --warn: #f0c060;
 }
-.kd-theme .glass { position: relative; background: var(--glass); border: 1px solid var(--glass-edge); border-radius: 10px; box-shadow: var(--shadow); }
+.kd-theme .glass { position: relative; background: var(--glass); border: 1px solid var(--glass-edge); border-radius: var(--kd-radius, 10px); box-shadow: var(--shadow); }
+/* 主題（例如 argon）把所有 h2 / h3 畫成有底色、有內距的標題列：儀表板裡的標題只是文字 */
+.kd-theme.kd h2, .kd-theme.kd h3 { background: none; padding: 0; border: 0; border-radius: 0; box-shadow: none; width: auto; min-height: 0; display: block; color: var(--text); }
 .kd-theme .card { margin: 0; }
 .kd-theme .tile { margin: 0; }
 

@@ -86,9 +86,9 @@ return view.extend({
 	},
 
 	renderStatus: function(st) {
-		if (!st || st.ok === false || !st.result) return E('div', { 'class': 'cbi-section' }, E('em', {}, _('服務沒有在執行，或社群模式沒有啟用。')));
+		if (!st || st.ok === false || !st.result) return E('div', { 'class': 'cbi-section kuroshio-sec' }, E('em', {}, _('服務沒有在執行，或社群模式沒有啟用。')));
 		var s = st.result;
-		if (!s.enabled) return E('div', { 'class': 'cbi-section' }, E('em', {}, _('社群模式沒有啟用：在下方打開並「儲存並套用」。')));
+		if (!s.enabled) return E('div', { 'class': 'cbi-section kuroshio-sec' }, E('em', {}, _('社群模式沒有啟用：在下方打開並「儲存並套用」。')));
 		var c = s.check || {}, ep = s.endpoints || {}, n = s.counts || {};
 		var rows = [
 			[_('狀態'), s.ready ? common.badge(_('就緒'), 'ok') : E('div', {}, [common.badge(_('未就緒'), 'err'),
@@ -106,7 +106,7 @@ return view.extend({
 				E('code', { 'style': 'word-break:break-all' }, s.txt.name + '  TXT  "' + s.txt.value + '"'),
 				E('div', { 'style': MUTED }, _('有設定時好友會多比對一次金鑰（第二管道）；沒設定也可以。'))])]);
 		if (s.rotation) rows.push([_('金鑰輪替'), _('已換新金鑰，舊金鑰到 %s 前仍有效（好友會自動更新）').format(fmtTime(s.rotation.until))]);
-		return E('div', { 'class': 'cbi-section', 'id': 'kuroshio-community-status' }, [
+		return E('div', { 'class': 'cbi-section kuroshio-sec', 'id': 'kuroshio-community-status' }, [
 			E('h3', {}, _('我的身分')),
 			E('table', { 'class': 'table' }, rows.map(function(r) {
 				return E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left', 'width': '25%' }, r[0]), E('td', { 'class': 'td left', 'style': 'overflow-wrap:anywhere' }, r[1])]);
@@ -383,7 +383,7 @@ return view.extend({
 		});
 
 		var tools = E([], [
-			E('div', { 'class': 'cbi-section', 'id': 'kuroshio-invite' }, [
+			E('div', { 'class': 'cbi-section kuroshio-sec', 'id': 'kuroshio-invite' }, [
 				E('h3', {}, _('好友邀請碼')),
 				E('p', { 'class': 'cbi-section-descr' }, _('互加好友最快的方法：把「我的邀請碼」傳給朋友，朋友貼到他的黑潮 DNS 就會自動成為好友，馬上開始交換資料。雙方都要先符合社群條件（網域、DoH / DoT / DoQ 至少一種、網域解析得到）。')),
 				E('h4', {}, _('我的邀請碼')),
@@ -393,14 +393,14 @@ return view.extend({
 					E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(this, useInvite) }, _('加好友'))]),
 				inviteOut
 			]),
-			E('div', { 'class': 'cbi-section' }, [
+			E('div', { 'class': 'cbi-section kuroshio-sec' }, [
 				E('h3', {}, _('新增好友')),
 				E('p', { 'class': 'cbi-section-descr' }, _('輸入對方的網域（非標準埠可以寫成 網域:埠）。對方會回連驗證你的網域與憑證；你的出口 IP 必須跟網域解析出的 IP 一樣。')),
 				E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap' }, [input,
 					E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(this, add) }, _('送出請求'))])
 			]),
-			E('div', { 'class': 'cbi-section' }, [E('h3', {}, _('好友與請求')), this.peerBox]),
-			E('div', { 'class': 'cbi-section' }, [E('h3', {}, _('事件紀錄')), this.eventBox])
+			E('div', { 'class': 'cbi-section kuroshio-sec' }, [E('h3', {}, _('好友與請求')), this.peerBox]),
+			E('div', { 'class': 'cbi-section kuroshio-sec' }, [E('h3', {}, _('事件紀錄')), this.eventBox])
 		]);
 
 		this.refresh();

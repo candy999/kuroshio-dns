@@ -26,6 +26,58 @@ function call(path, params) {
 	});
 }
 
+/** 'rgb(1, 2, 3)' / 'rgba(1, 2, 3, .5)' → [r, g, b, a]；看不懂回 null */
+function rgba(s) {
+	var m = /^rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)(?:,\s*([\d.]+))?\)$/.exec(String(s || '').trim());
+	return m ? [+m[1], +m[2], +m[3], m[4] == null ? 1 : +m[4]] : null;
+}
+/** a 疊在 b 上（a 的透明度）、或 a 與 b 依比例 t 混合 */
+function over(a, b) { return [0, 1, 2].map(function(i) { return a[i] * a[3] + b[i] * (1 - a[3]); }).concat(1); }
+function mix(a, b, t) { return [0, 1, 2].map(function(i) { return a[i] * t + b[i] * (1 - t); }).concat(1); }
+function css(c) { return 'rgb(' + c.slice(0, 3).map(Math.round).join(', ') + ')'; }
+
+/**
+ * 儀表板的顏色跟著目前的 LuCI 主題（bootstrap / argon / material / vantage…，淺色或深色）：
+ * 放一個看不見的 .cbi-section 量主題的卡片底色、框線、圓角、陰影與文字顏色，算成儀表板的變數（只用量到的顏色，不含任何資料）。
+ * 主題的區塊是透明的（bootstrap）就用頁面底色加一點文字色當卡片底色。深淺色由文字亮度判斷，不看 data-darkmode（argon 沒有）。
+ */
+function followTheme(root, tries) {
+	if (!root.isConnected) {
+		if ((tries || 0) < 100) window.setTimeout(function() { followTheme(root, (tries || 0) + 1); }, 50);
+		return;
+	}
+	var host = root.parentNode;
+	var probe = E('div', { 'class': 'cbi-section', 'aria-hidden': 'true' }, E('h3', {}, 'x'));
+	probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;left:0;top:0;width:200px';
+	host.appendChild(probe);
+	var ps = window.getComputedStyle(probe), hs = window.getComputedStyle(probe.firstChild);
+	// 頁面底色：往上找第一個不透明的背景
+	var page = null;
+	for (var n = host; n && n.nodeType === 1 && !page; n = n.parentNode) {
+		var c = rgba(window.getComputedStyle(n).backgroundColor);
+		if (c && c[3] > 0.9) page = c;
+	}
+	var fg = rgba(hs.color) || rgba(ps.color) || [0, 0, 0, 1];
+	var dark = (0.2126 * fg[0] + 0.7152 * fg[1] + 0.0722 * fg[2]) > 140;
+	page = page || (dark ? [24, 24, 27, 1] : [255, 255, 255, 1]);
+	var sec = rgba(ps.backgroundColor), themed = !!(sec && sec[3] > 0.05);
+	var card = themed ? over(sec, page) : mix(fg, page, 0.04);
+	var bw = parseFloat(ps.borderTopWidth) || 0, bc = rgba(ps.borderTopColor);
+	// 框線：主題卡片有框就用主題的；主題卡片沒框（靠陰影或底色區分）就不加；透明卡片加一條很淡的
+	var edge = bw > 0 && bc && bc[3] > 0 ? css(over(bc, card)) : (themed ? 'transparent' : css(mix(fg, card, 0.1)));
+	var radius = parseFloat(ps.borderTopLeftRadius);
+	var vars = {
+		'--text': css(fg), '--text-2': css(mix(fg, card, 0.8)), '--text-3': css(mix(fg, card, 0.64)),
+		'--bg': css(page), '--glass': css(card), '--glass-2': css(mix(fg, card, 0.06)), '--glass-edge': edge,
+		'--line': css(mix(fg, card, 0.13)), '--grid': css(mix(fg, card, 0.07)), '--chip': css(mix(fg, card, 0.07)), '--track': css(mix(fg, card, 0.09)),
+		'--shadow': (ps.boxShadow && ps.boxShadow !== 'none') ? ps.boxShadow : 'none',
+		'--kd-radius': (radius >= 0 && radius <= 24 ? radius : 10) + 'px'
+	};
+	host.removeChild(probe);
+	Object.keys(vars).forEach(function(k) { root.style.setProperty(k, vars[k]); });
+	root.setAttribute('data-kd-host', dark ? 'dark' : 'light');
+}
+
 return view.extend({
 	load: function() {
 		if (window.KuroshioDashboard) return Promise.resolve(true);
@@ -37,6 +89,9 @@ return view.extend({
 
 	render: function(ok) {
 		var root = E('div', { 'class': 'kd-theme', 'id': 'kuroshio-dashboard' });
+		followTheme(root);
+		// 主題跟著系統切換深淺色時重新量
+		try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function() { window.setTimeout(function() { followTheme(root); }, 50); }); } catch (e) {}
 		if (ok) {
 			var KD = window.KuroshioDashboard;
 			KD.mount(root, {

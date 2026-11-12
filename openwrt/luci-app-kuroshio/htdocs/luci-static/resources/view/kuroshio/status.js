@@ -34,12 +34,9 @@ function fmtUptime(s) {
 	return (d ? d + _('天') + ' ' : '') + h + _('小時') + ' ' + m + _('分');
 }
 
-function table(head, rows) {
-	return E('table', { 'class': 'table' }, [
-		E('tr', { 'class': 'tr table-titles' }, head.map(function(h) { return E('th', { 'class': 'th' }, h); }))
-	].concat(rows.length ? rows.map(function(r) {
-		return E('tr', { 'class': 'tr' }, r.map(function(c) { return E('td', { 'class': 'td' }, c); }));
-	}) : [E('tr', { 'class': 'tr placeholder' }, E('td', { 'class': 'td', 'colspan': head.length }, E('em', {}, _('沒有資料'))))]));
+/** 表格（外面包一層可以左右捲動的框）；num = 數字欄（靠右） */
+function table(head, rows, num) {
+	return common.scroll(common.table(head, rows, null, num));
 }
 
 function mbOf(kb) { return kb != null ? fmtNum(Math.round(kb / 1024)) : '-'; }
@@ -54,13 +51,7 @@ function memSizes(z) {
 	return out.join(' · ');
 }
 
-function tile(label, value, sub) {
-	return E('div', { 'style': 'flex:1 1 9em;min-width:9em;padding:.6em .8em;border:1px solid var(--border-color-medium,#ddd);border-radius:6px' }, [
-		E('div', { 'style': 'font-size:12px;opacity:.75' }, label),
-		E('div', { 'style': 'font-size:1.5em;font-weight:600' }, value),
-		sub ? E('div', { 'style': 'font-size:12px;opacity:.75' }, sub) : ''
-	]);
-}
+var tile = function(label, value, sub) { return common.tile(label, value, sub); };
 
 return view.extend({
 	load: function() {
@@ -77,11 +68,9 @@ return view.extend({
 		var mode = uci.get('kuroshio', 'main', 'redirect') || 'dnsmasq-upstream';
 		var api = st && st.api && st.api.ok ? st.api.result : null;
 
-		var head = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('服務')),
+		var head = common.section(_('服務'), [
 			E('p', {}, [
-				E('strong', { 'style': 'color:' + (st && st.running ? 'green' : 'red') },
-					st && st.running ? _('執行中') : (enabled ? _('未執行（請看日誌）') : _('已停用'))),
+				common.badge(st && st.running ? _('執行中') : (enabled ? _('未執行（請看日誌）') : _('已停用')), st && st.running ? 'ok' : (enabled ? 'err' : 'off')),
 				' · ', _('DNS 接管：'), MODES[mode] || mode,
 				api ? ' · ' + _('已執行 ') + fmtUptime(api.stats && api.stats.uptimeSec) : ''
 			])
@@ -94,9 +83,8 @@ return view.extend({
 		var routeAcc = 0, routeN = 0;
 		Object.keys(d.route || {}).forEach(function(k) { routeAcc += d.route[k].acc || 0; routeN += d.route[k].n || 0; });
 
-		var tiles = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('今天')),
-			E('div', { 'style': 'display:flex;gap:.6em;flex-wrap:wrap' }, [
+		var tiles = common.section(_('今天'), [
+			common.tiles([
 				tile(_('查詢'), fmtNum(q), _('快取命中 ') + pct(d.hit || 0, q)),
 				tile(_('攔截'), fmtNum(d.blocked), _('廣告 %s · 遙測 %s · 惡意 %s').format(fmtNum(d.blockedAds), fmtNum(d.blockedTelemetry), fmtNum(d.blockedMalware))),
 				tile(_('拉回台灣'), fmtNum(routeAcc), _('CDN 連線的 ') + pct(routeAcc, routeN)),
@@ -110,9 +98,8 @@ return view.extend({
 		var sys = api.system || {}, per = sys.persist || {}, lat = d.latency || {}, ls = api.listeners || {}, mem = sys.memory || {};
 		var ms = function(x) { return x && x.p50 != null ? x.p50 + ' / ' + (x.p95 != null ? x.p95 : '>1000') + ' ms' : '-'; };
 		var protos = ['doh', 'doh3', 'dot', 'doq'].filter(function(k) { return ls[k]; }).map(function(k) { return { doh: 'DoH', doh3: 'DoH3', dot: 'DoT', doq: 'DoQ' }[k] + ':' + ls[k]; });
-		var hw = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('硬體與效能')),
-			E('div', { 'style': 'display:flex;gap:.6em;flex-wrap:wrap' }, [
+		var hw = common.section(_('硬體與效能'), [
+			common.tiles([
 				tile(_('硬體'), (sys.memTotalMB ? sys.memTotalMB + ' MB · ' : '') + (sys.cores || '?') + _(' 核'), sys.arch || ''),
 				tile(_('系統記憶體'), mem.availKB != null ? _('可用 %s MB').format(mbOf(mem.availKB)) : (sys.memAvailableMB != null ? _('可用 %s MB').format(sys.memAvailableMB) : '-'),
 					_('保留 %s MB（%s）').format(mbOf(mem.reserveKB), mem.reserveAuto ? _('自動') : _('設定')) +
@@ -137,8 +124,7 @@ return view.extend({
 
 		// 記憶體控制（規格 09）：釋出中的項目、停用中的過濾清單（停用期間少了這些保護，要明顯）
 		var shed = mem.shed || [], fl = api.filter || {};
-		var memSec = (shed.length || fl.notice || mem.floor) ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-memory' }, [
-			E('h3', {}, _('記憶體控制')),
+		var memSec = (shed.length || fl.notice || mem.floor) ? common.section(_('記憶體控制'), [
 			mem.protectedSuspended ? E('div', { 'class': 'alert-message danger' }, _('記憶體嚴重不足：連保護清單（惡意 / 反詐騙）都暫停了，只剩自訂規則；DNS 照常轉送。記憶體回來後自動恢復。'))
 				: (mem.floor ? E('div', { 'class': 'alert-message danger' }, _('記憶體不足：只轉送 DNS（暫停 CDN 調整、快取最小）。記憶體回來後自動恢復。')) : ''),
 			fl.notice ? E('div', { 'class': 'alert-message warning' }, fl.notice) : '',
@@ -146,13 +132,12 @@ return view.extend({
 				(mem.waiting ? ' · ' + mem.waiting : '')),
 			shed.length ? table([_('已釋出'), _('內容'), _('約'), _('時間')], shed.map(function(x) {
 				return [x.label, x.detail || '', (x.freedBytes / 1024).toFixed(0) + ' KB', fmtTime(x.at)];
-			})) : ''
-		]) : '';
+			}), [2]) : ''
+		], { 'id': 'kuroshio-memory' }) : '';
 
 		// 連線來源限制（規格 08）：模式、拒絕次數、資料日期；資料讀不到時不擋，要明顯提醒
 		var ac = api.access;
-		var accSec = ac ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-access' }, [
-			E('h3', {}, _('連線來源')),
+		var accSec = ac ? common.section(_('連線來源'), [
 			ac.failOpen ? E('div', { 'class': 'alert-message danger' }, _('台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）') + (ac.warning ? '：' + ac.warning : ''))
 				: (ac.warning ? E('div', { 'class': 'alert-message warning' }, ac.warning) : ''),
 			E('p', {}, [
@@ -161,23 +146,21 @@ return view.extend({
 				ac.generatedAt ? ' · ' + _('台灣 IP 資料 %s').format(ac.generatedAt) : '',
 				' · ', E('a', { 'href': L.url('admin/services/kuroshio/access') }, _('設定'))
 			])
-		]) : '';
+		], { 'id': 'kuroshio-access' }) : '';
 
 		// 加密監聽：每個位址一列，綁定失敗列出原因
 		var detail = [].concat(api.listenersDetail || []);
-		var lsSec = detail.length ? E('div', { 'class': 'cbi-section', 'id': 'kuroshio-listeners' }, [
-			E('h3', {}, _('加密監聽')),
-			E('div', { 'style': 'overflow-x:auto' }, common.listenerTable(detail))
-		]) : '';
+		var lsSec = detail.length ? common.section(_('加密監聽'), [
+			common.scroll(common.listenerTable(detail))
+		], { 'id': 'kuroshio-listeners' }) : '';
 
 		var ups = (api.upstreams || []).map(function(u) {
 			var role = { pinned: _('固定'), auto: _('自動'), fallback: _('備援') }[u.role] || u.role;
 			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', u.paused ? _('暫停中') : ''];
 		});
-		var upSec = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('上游')),
+		var upSec = common.section(_('上游'), [
 			E('p', { 'class': 'cbi-section-descr' }, api.autoUpstreams ? _('自動上游來自 %s 的評測').format(api.autoUpstreams.generatedAt) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
-			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups)
+			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups, [2, 3, 4])
 		]);
 
 		var jobs = api.jobs || {};
@@ -192,7 +175,7 @@ return view.extend({
 				E('button', { 'class': 'btn cbi-button', 'disabled': running ? '' : null, 'click': ui.createHandlerFn(self, 'runJob', n) }, _('立即執行'))
 			];
 		});
-		var jobSec = E('div', { 'class': 'cbi-section' }, [E('h3', {}, _('排程工作')), table([_('工作'), _('排程'), _('上次結束'), _('結果'), ''], jobRows)]);
+		var jobSec = common.section(_('排程工作'), [table([_('工作'), _('排程'), _('上次結束'), _('結果'), ''], jobRows)]);
 
 		var extra = [];
 		if (acme) {
@@ -200,11 +183,10 @@ return view.extend({
 			extra.push([_('憑證'), c ? _('%s · 到期 %s（剩 %d 天）').format(c.san || c.subject, c.validTo, c.daysLeft) : (acme.certError || '-')]);
 		}
 		if (api.ownIp) extra.push([_('網域目前指向'), (api.ownIp.ips || []).join(', ') + (api.ownIp.changedAt ? _('（%s 變更）').format(fmtTime(api.ownIp.changedAt)) : '')]);
-		var infoSec = E('div', { 'class': 'cbi-section' }, [E('h3', {}, _('其他')), table([_('項目'), _('內容')], extra)]);
+		var infoSec = common.section(_('其他'), [table([_('項目'), _('內容')], extra)]);
 
-		var actions = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('操作')),
-			E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap' }, [
+		var actions = common.section(_('操作'), [
+			E('div', { 'class': 'kuroshio-row' }, [
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/cache/flush').then(function(r) { common.notify(r, _('快取已清除')); }); }) }, _('清除快取')),
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/filter/update').then(function(r) { common.notify(r, _('已重新下載過濾清單')); }); }) }, _('更新過濾清單')),
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/ddns/update').then(function(r) { common.notify(r, _('DDNS 已更新')); }); }) }, _('立即更新 DDNS'))
@@ -212,8 +194,7 @@ return view.extend({
 		]);
 
 		var errs = (api.errors && api.errors.recent) || [];
-		var errSec = errs.length ? E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('最近的錯誤（共 %d 次）').format(api.errors.count)),
+		var errSec = errs.length ? common.section(_('最近的錯誤（共 %d 次）').format(api.errors.count), [
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at) + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
