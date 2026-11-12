@@ -9,6 +9,8 @@
 <title>黑潮 DNS 設定</title>
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="community.css">
+<link rel="stylesheet" href="dashboard/dashboard.css">
+<script src="dashboard/dashboard.js" defer></script>
 <script src="app.js" defer></script>
 <script src="community.js" defer></script>
 </head>
@@ -46,6 +48,7 @@
   <div id="main" hidden>
     <nav class="tabs" id="tabs" role="tablist">
       <a href="#status" role="tab" data-tab="status">狀態</a>
+      <a href="#dashboard" role="tab" data-tab="dashboard">儀表板</a>
       <a href="#settings" role="tab" data-tab="settings">設定</a>
       <a href="#tools" role="tab" data-tab="tools">工具</a>
       <a href="#log" role="tab" data-tab="log">日誌</a>
@@ -76,6 +79,16 @@
       <p class="muted" id="st-up-desc"></p>
       <div class="table-wrap"><table id="st-up"><thead><tr><th>上游</th><th>角色</th><th>成功</th><th>失敗</th><th>平均延遲</th><th>健康</th></tr></thead><tbody></tbody></table></div>
       <div id="st-extra"></div>
+    </section>
+
+    <!-- 儀表板（跟公開頁、LuCI 共用 dashboard/dashboard.js；管理 API 的完整資料） -->
+    <section class="tab" id="tab-dashboard" hidden>
+      <div class="row-head">
+        <h2>儀表板</h2>
+        <span class="muted">查詢量、加速成效、上游、CDN 節點與網域、過濾、排程；公開頁沒開也看得到</span>
+      </div>
+      <p class="msg err" id="dash-err" hidden></p>
+      <div id="dash-root" class="kd-theme"></div>
     </section>
 
     <!-- 設定 -->

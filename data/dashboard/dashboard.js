@@ -7,7 +7,7 @@
  *   - Windows 設定頁：KuroshioDashboard.httpAdapter('/api/', 取資料的函式)（登入後的管理 API，完整資料）
  *   - LuCI：KuroshioDashboard.callAdapter(呼叫 rpcd 的函式)（透過 rpcd 轉送到本機管理 API，不開任何埠）
  *
- * 安全：伺服器給的字串一律用 textContent 放進頁面，不組 HTML、不用 innerHTML；樣式只用 CSSOM（el.style.x），
+ * 安全：伺服器給的字串一律用 textContent 放進頁面，不組 HTML 字串；樣式只用 CSSOM（el.style.x），
  * 不寫 style 屬性，Windows 設定頁的嚴格 CSP（style-src 'self'）下也能用。
  */
 (function (root) {
@@ -850,7 +850,8 @@
           const c = el('div', 'card glass');
           c.appendChild(el('h3', '', `${LABEL[name] || name}`));
           c.appendChild(el('div', 'muted', `掃描：TW / Global / Dead 共 ${d.scan.tw + d.scan.global + d.scan.dead} 段 · 官方範圍 v4 ${d.ranges.v4} / v6 ${d.ranges.v6} 段 · 永久 v6 ${Object.keys((v6.providers || {})[name] || {}).length} 個`));
-          const t = el('table'); const w = el('div', 'tbl kd-mt8'); w.appendChild(t); c.appendChild(w);
+          // 管理介面：節點可能有幾百個，表格限制高度、在框裡捲動（詳細頁維持原樣）
+          const t = el('table'); const w = el('div', o.rich ? 'tbl scroll kd-mt8' : 'tbl kd-mt8'); w.appendChild(t); c.appendChild(w);
           const rows = [...d.v4.map(x => ({ ...x, fam: 'v4' })), ...d.v6.map(x => ({ ...x, fam: 'v6' }))];
           table(t, rows, [
             { h: '', v: r => tag(r.fam) }, { h: 'IP', v: r => r.ip, cls: 'mono' }, { h: 'POP', v: r => r.pop || '—' },

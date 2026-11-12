@@ -72,6 +72,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     fs.writeFileSync(path.join(dir, 'state', 'cdn-domains.json'), JSON.stringify({ domains: [
         { name: 'a.example', provider: 'cloudflare', hits: 12, firstSeen: 1, lastSeen: 2, policy: 'always', v4: { verdict: 'ok', at: 100 } }] }));
     fs.writeFileSync(path.join(dir, 'state', 'blacklist.txt'), '# 測試\n203.0.113.9\n');
+    // 儀表板用的統計（31 天的範例資料，見 tools/dashboard-seed.js）
+    fs.writeFileSync(path.join(dir, 'state', 'stats.json'), JSON.stringify(require('./dashboard-seed.js').stats()));
 
     let out = '';
     const child = spawn(BIN, ['run', '-c', cfgFile], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NO_COLOR: '1' } });
@@ -777,9 +779,80 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.fill('#log-filter', '');
         await shot('09-log');
 
+        console.log('儀表板（共用 dashboard.js、管理 API 的完整資料）');
+        {
+            const dj = await raw(adminPort, 'GET', '/dashboard/dashboard.js');
+            check(dj.status === 200 && /javascript/.test(dj.headers['content-type']), '靜態檔 dashboard/dashboard.js');
+            check(!/innerHTML|insertAdjacentHTML|document\.write|outerHTML|setAttribute\('style'/.test(dj.body), 'dashboard.js 不用 innerHTML、不寫 style 屬性（嚴格 CSP）');
+            check((await raw(adminPort, 'GET', '/dashboard/dashboard.css')).status === 200, '靜態檔 dashboard/dashboard.css');
+            check((await raw(adminPort, 'GET', '/api/dashboard')).status === 401, '沒登入時 /api/dashboard 回 401');
+            // 不略過 CSP 的另一個瀏覽器分頁（帶同一個登入 cookie）：CSP 擋下任何東西都會在主控台留下錯誤
+            const strict = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: 'zh-TW' });
+            await strict.addCookies(await ctx.cookies());
+            const sp = await strict.newPage();
+            const csp = [];
+            sp.on('pageerror', e => csp.push(e.message));
+            // CDN 沒開時節點池等 API 回 404（畫面上說明「沒有啟用」），不算錯誤
+            sp.on('console', m => { if ((m.type() === 'error' && !/Failed to load resource/.test(m.text())) || /Content Security Policy|Refused to/.test(m.text())) csp.push(m.text()); });
+            await sp.goto(`${BASE}/#dashboard`);
+            await sp.waitForSelector('#dash-root .tiles .tile');
+            await sp.waitForSelector('#dash-root #kd-live .rank-row');
+            await sp.waitForTimeout(1500);
+            const dt = await sp.textContent('#dash-root');
+            check(/DNS 查詢/.test(dt) && /拉回台灣/.test(dt) && /已驗證可加速網站/.test(dt), '儀表板：總覽', dt.slice(0, 200));
+            check(await sp.locator('#kd-overview .chart svg').count() === 1 && await sp.locator('#kd-live .chart svg').count() === 1, '儀表板：最近 60 分鐘、近 30 天的圖');
+            const live = await sp.textContent('#kd-live');
+            check(/youtube\.com/.test(live) && /doubleclick\.net/.test(live) && /Cloudflare/.test(live), '儀表板：熱門網站、被擋網域、CDN 排行（範例資料）', live.slice(0, 300));
+            // 範例資料裡只有 1 位使用者造訪的網站：公開頁預設也列（minClients = 1），管理介面一定列
+            check(/cloudflare\.com/.test(live), '儀表板：排行不受 site.minClients 限制');
+            check(/快取直接回應/.test(live) && /\d+\.\d%/.test(live), '儀表板：查詢去向');
+            const routing = await sp.textContent('#kd-routing');
+            check(/Cloudflare/.test(routing) && /CloudFront/.test(routing) && await sp.locator('#kd-routing .gauge').count() >= 3, '儀表板：機會成本（表格與環形儀表）', routing.slice(0, 200));
+            check(await sp.locator('#kd-map svg').count() >= 1, '儀表板：路由地圖');
+            check((await sp.textContent('#kd-upstreams')).includes('udp://127.0.0.1:9'), '儀表板：上游（完整網址）');
+            check(/沒有啟用/.test(await sp.textContent('#kd-pools')), '儀表板：CDN 沒開時說明「沒有啟用」');
+            const jobs = JSON.parse((await raw(adminPort, 'GET', '/api/jobs', { Authorization: `Bearer ${token}` })).body || 'null');
+            const jobNames = Object.keys((jobs && jobs.config) || {});
+            const jt = await sp.textContent('#kd-jobs');
+            check(jobNames.every(n => jt.includes(n)), '儀表板：排程工作', `${jobNames} / ${jt.slice(0, 200)}`);
+            await sp.fill('#kd-filter input', 'ads.example.com');
+            await sp.click('#kd-filter button');
+            await sp.waitForSelector('#kd-filter pre:not(:empty)');
+            check(/不會被擋|過濾|失敗/.test(await sp.textContent('#kd-filter pre')), '儀表板：規則檢查有結果');
+            await sp.click('#dash-root .kd-seg button[data-range="7d"]');
+            await sp.waitForTimeout(800);
+            check(/近 7 天共/.test(await sp.textContent('#kd-live')), '儀表板：切換 7 天');
+            await sp.screenshot({ path: path.join(SHOTS, '13-dashboard.png'), fullPage: true });
+            await sp.setViewportSize({ width: 390, height: 844 });
+            await sp.waitForTimeout(800);
+            const dw = await sp.evaluate(() => document.documentElement.scrollWidth);
+            check(dw <= 391, '儀表板：390 px 寬沒有水平捲動（寬表格在框裡捲動）', `scrollWidth = ${dw}`);
+            await sp.screenshot({ path: path.join(SHOTS, '14-dashboard-mobile.png'), fullPage: true });
+            await sp.emulateMedia({ colorScheme: 'dark' });
+            await sp.setViewportSize({ width: 1280, height: 900 });
+            await sp.waitForTimeout(500);
+            const cardBg = await sp.evaluate(() => getComputedStyle(document.querySelector('#dash-root .tile')).backgroundColor);
+            const crgb = (cardBg.match(/\d+/g) || []).slice(0, 3).map(Number);
+            check(crgb.length === 3 && crgb[0] + crgb[1] + crgb[2] < 150, '儀表板：深色模式', cardBg);
+            await sp.screenshot({ path: path.join(SHOTS, '15-dashboard-dark.png'), fullPage: true });
+            await sp.setViewportSize({ width: 390, height: 844 });
+            await sp.waitForTimeout(500);
+            await sp.screenshot({ path: path.join(SHOTS, '16-dashboard-dark-mobile.png'), fullPage: true });
+            check(csp.length === 0, '儀表板：沒有 JavaScript 錯誤、沒有違反 CSP', csp.join('\n     '));
+            await strict.close();
+            // 切到別的分頁：自動更新暫停（不再呼叫 API）
+            await page.goto(`${BASE}/#dashboard`);
+            await page.waitForSelector('#dash-root .tiles .tile');
+            const calls = [];
+            page.on('request', r => { if (/\/api\/dashboard/.test(r.url())) calls.push(r.url()); });
+            await page.goto(`${BASE}/#log`);
+            await page.waitForTimeout(16000);
+            check(calls.length === 0, '離開儀表板分頁後不再自動更新', calls.join(' '));
+        }
+
         console.log('手機寬度、深色模式');
         await page.setViewportSize({ width: 360, height: 740 });
-        for (const t of ['status', 'settings', 'tools', 'log', 'about']) {
+        for (const t of ['status', 'dashboard', 'settings', 'tools', 'log', 'about']) {
             await page.goto(`${BASE}/#${t}`);
             await page.waitForTimeout(t === 'status' || t === 'tools' ? 1200 : 500);
             const w = await page.evaluate(() => document.documentElement.scrollWidth);

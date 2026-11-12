@@ -352,6 +352,7 @@
 
 	function showLogin(msg) {
 		stopTimers();
+		if (dash) dash.pause();
 		$('main').hidden = true;
 		$('login').hidden = false;
 		$('logout').hidden = true;
@@ -398,7 +399,7 @@
 	}
 
 	// ---------------------------------------------------------------- 分頁
-	var TABS = ['status', 'settings', 'tools', 'log', 'about'];
+	var TABS = ['status', 'dashboard', 'settings', 'tools', 'log', 'about'];
 	function route() {
 		var t = location.hash.replace('#', '');
 		if (TABS.indexOf(t) < 0) t = 'status';
@@ -408,6 +409,7 @@
 		});
 		TABS.forEach(function (x) { $('tab-' + x).hidden = x !== t; });
 		if (t === 'status') refreshStatus();
+		showDashboard(t === 'dashboard');
 		if (t === 'settings') renderSettings();
 		noticeVisibility();
 		if (t === 'tools') renderTools();
@@ -487,6 +489,37 @@
 		if (document.visibilityState !== 'visible' || S.saving) return;
 		if (S.tab === 'status') refreshStatus();
 		if (S.tab === 'log' && $('log-auto').checked) refreshLog();
+	}
+
+	// ---------------------------------------------------------------- 儀表板分頁
+	// 共用儀表板（dashboard/dashboard.js，跟公開頁、LuCI 同一份）＋管理 API 的完整資料（排行不受 site.minClients 限制、上游網址不遮）。
+	// 第一次打開才建立；切到別的分頁就暫停自動更新
+	var dash = null;
+	function showDashboard(on) {
+		if (!on) { if (dash) dash.pause(); return; }
+		if (dash) { dash.resume(); return; }
+		var KD = window.KuroshioDashboard;
+		if (!KD) {
+			$('dash-err').textContent = '讀不到 dashboard/dashboard.js（設定頁的檔案不完整？）';
+			$('dash-err').hidden = false;
+			return;
+		}
+		var get = function (url) {
+			return api(url).then(function (r) {
+				if (!r.ok) throw new Error(errText(r));
+				return r.data;
+			});
+		};
+		dash = KD.mount($('dash-root'), {
+			adapter: KD.httpAdapter('/api/', get),
+			sections: KD.ADMIN_SECTIONS,
+			idPrefix: 'kd-',
+			rich: true,
+			toolbar: true,
+			domainsMode: 'server',
+			showErrors: true,
+			refreshMs: 15000
+		});
 	}
 
 	// ---------------------------------------------------------------- 狀態分頁
