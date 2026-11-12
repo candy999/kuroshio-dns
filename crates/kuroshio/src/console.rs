@@ -106,7 +106,16 @@ impl Info {
         // 對外的網址：IIS 反向代理時走 IIS 的 443
         let public = domain.as_ref().and_then(|d| match (iis, doh_port) {
             (true, _) => Some(format!("https://{d}")),
-            (false, Some(p)) => Some(with_port(if tls { "https" } else { "http" }, d, p)),
+            // listen.doh.publicPort：外面看到的埠號跟監聽的不同（埠號轉送）
+            (false, Some(p)) => Some(with_port(
+                if tls { "https" } else { "http" },
+                d,
+                get(cfg, "listen.doh.publicPort")
+                    .and_then(Value::as_u64)
+                    .filter(|x| *x > 0 && *x <= 65535)
+                    .map(|x| x as u16)
+                    .unwrap_or(p),
+            )),
             (false, None) => None,
         });
         let local = doh_port
@@ -188,7 +197,14 @@ pub fn handle(line: &str, ctx: Option<&Ctx>) -> (String, Action) {
                 v.push(format!("DoH（瀏覽器、Windows、iOS）：{d}"));
             }
             if let Some(d) = &i.dot_host {
-                v.push(format!("DoT（Android 私人 DNS）：{d}"));
+                // Android「私人 DNS」只支援 DoT、只能填主機名稱（固定 853 埠，不能帶埠號、也不能填 DoH 網址）
+                if d.contains(':') {
+                    v.push(format!(
+                        "DoT：{d}（Android「私人 DNS」只能用 853 埠，這個埠號沒辦法在 Android 使用）"
+                    ));
+                } else {
+                    v.push(format!("DoT（Android 私人 DNS）：{d}"));
+                }
             }
             if i.doh_url.is_none() && i.dot_host.is_none() {
                 v.push("還沒有設定網域（domain），或加密監聽沒有開，所以沒有可以給裝置填的 DoH / DoT 位址".into());
@@ -352,6 +368,17 @@ mod tests {
         let i = Info::build_with(&cfg, None, None, Some(443), None, true, true);
         assert_eq!(i.site_urls, vec!["https://dns.example.net/"]);
         assert_eq!(i.doh_url.as_deref(), Some("https://dns.example.net/dns-query"));
+        // DoH 在 8443（443 被占用）：網址都帶埠號
+        let cfg = json!({ "domain": "dns.example.net", "site": { "enabled": true }, "tls": { "cert": "c.pem", "key": "k.pem" } });
+        let i = Info::build(&cfg, None, None, Some(8443), Some(853), true);
+        assert_eq!(i.doh_url.as_deref(), Some("https://dns.example.net:8443/dns-query"));
+        assert_eq!(i.detail_url.as_deref(), Some("https://dns.example.net:8443/detail/"));
+        // 路由器把 443 轉到本機 8443（listen.doh.publicPort = 443）：對外網址不帶埠號，本機網址照實際的埠
+        let cfg = json!({ "domain": "dns.example.net", "site": { "enabled": true }, "tls": { "cert": "c.pem", "key": "k.pem" },
+            "listen": { "doh": { "publicPort": 443 } } });
+        let i = Info::build(&cfg, None, None, Some(8443), Some(853), true);
+        assert_eq!(i.site_urls, vec!["https://dns.example.net/", "https://127.0.0.1:8443/"]);
+        assert_eq!(i.doh_url.as_deref(), Some("https://dns.example.net/dns-query"));
         // 公開頁沒開
         let i = Info::build(&json!({ "domain": "dns.example.net" }), None, None, Some(443), None, false);
         assert!(i.site_urls.is_empty() && i.site_off.is_some());
@@ -392,5 +419,17 @@ mod tests {
             ..Default::default()
         });
         assert!(handle("site", Some(&off)).0.contains("公開頁沒有開"));
+        // DoT 不在 853：Android 私人 DNS 不能用，要講清楚
+        let odd = ctx(Info {
+            doh_url: Some("https://dns.example.net:8443/dns-query".into()),
+            dot_host: Some("dns.example.net:8853".into()),
+            state_dir: "s".into(),
+            ..Default::default()
+        });
+        let out = handle("site", Some(&odd)).0;
+        assert!(
+            out.contains("https://dns.example.net:8443/dns-query") && out.contains("只能用 853 埠"),
+            "{out}"
+        );
     }
 }

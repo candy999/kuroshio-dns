@@ -264,6 +264,14 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
             listen[uci_sec][key] = json!(b);
         }
     }
+    // DoH 開放外網、而且外網埠跟本機埠不同（防火牆把 WAN 的 443 轉到本機 8443）：
+    // 公開頁、描述檔、Alt-Svc、HTTPS 記錄要用外面看到的埠號
+    if flag("doh", "open_wan", false) {
+        let wan = port_of("doh", "wan_port", 443);
+        if wan != port_of("doh", "port", 8443) && (1..=65535).contains(&wan) {
+            listen["doh"]["publicPort"] = json!(wan);
+        }
+    }
     match s("doh", "tls").as_str() {
         "" => {}
         "auto" => listen["doh"]["tls"] = json!("auto"),

@@ -694,6 +694,13 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
         }
         // 每日各 CDN 的機會成本（最多 31 天）
         "/api/routing" => ok(r.stats.routing_json()),
+        // 儀表板（LuCI、Windows 設定頁）：跟公開頁同一份統計，但排行不受 site.minClients 限制、列得比較多
+        "/api/dashboard" => ok(crate::site::dashboard_stats(
+            st,
+            q.get("range").map(String::as_str).unwrap_or("today"),
+            1,
+            crate::site::ADMIN_TOP,
+        )),
         p if p.starts_with("/api/cdn/") => match r.cdn() {
             None => bad("CDN 台灣節點沒有啟用", 404),
             Some(c) => cdn_route(&c, p, q).await,
@@ -730,6 +737,9 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
                 verdict: q.get("verdict").cloned().filter(|s| !s.is_empty()),
                 limit: Some(q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(1000usize).min(200_000)),
                 sort: q.get("sort").cloned(),
+                search: q.get("q").map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()),
+                offset: q.get("offset").and_then(|o| o.parse().ok()).unwrap_or(0),
+                cross: q.get("cross").map(String::as_str) == Some("1"),
             };
             if q.get("format").map(String::as_str) == Some("csv") {
                 let file = safe_filename(&format!("cdn-domains-{}.csv", query.provider.as_deref().unwrap_or("all")));

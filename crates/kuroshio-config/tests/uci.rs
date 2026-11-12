@@ -180,6 +180,25 @@ fn community_endpoints_and_rules() {
         &json!([{ "enabled": true, "name": "同業者", "action": "accept", "colo": ["TPE"], "same_asn": "1", "max_rtt_ms": "30" }])
     );
     assert_eq!(g(&cm, "community.dir"), &json!("/etc/kuroshio/community"));
+    // 開放外網、外網 443 轉到本機 8443：對外的 DoH 埠號是 443
+    assert_eq!(g(&cm, "listen.doh.publicPort"), &json!(443));
+
+    // DoH 不開放外網（只給區網用 8443）：社群網址帶埠號，沒有 publicPort
+    let lan_only = text.replace("option open_wan '1'", "option open_wan '0'");
+    let cm = load(&lan_only, &env());
+    assert_eq!(
+        g(&cm, "community.endpoints.doh"),
+        &json!("https://dns.example.com:8443/.well-known/kuroshio")
+    );
+    assert_eq!(g(&cm, "listen.doh.publicPort"), &json!(0), "預設 0 = 跟監聽的埠號一樣");
+    // 外網埠跟本機埠一樣（443 被占用，直接開 8443 給外面）：不用另外寫 publicPort
+    let same = text.replace("option wan_port '443'", "option wan_port '8443'");
+    let cm = load(&same, &env());
+    assert_eq!(
+        g(&cm, "community.endpoints.doh"),
+        &json!("https://dns.example.com:8443/.well-known/kuroshio")
+    );
+    assert_eq!(g(&cm, "listen.doh.publicPort"), &json!(0), "預設 0 = 跟監聽的埠號一樣");
 }
 
 #[test]

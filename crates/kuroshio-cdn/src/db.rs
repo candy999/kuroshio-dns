@@ -463,6 +463,12 @@ pub struct Query {
     pub limit: Option<usize>,
     /// 依哪個欄位遞減排序：hits（預設）、lastSeen、firstSeen
     pub sort: Option<String>,
+    /// 網域名稱包含這段文字（小寫）
+    pub search: Option<String>,
+    /// 排序後跳過前幾筆（分頁）
+    pub offset: usize,
+    /// 只要試過跨 CDN 備援的網域（`cross4` 有結果、不是 none）
+    pub cross: bool,
 }
 
 /// 分段寫快照時要寫的網域：（查詢次數，名稱）
@@ -1388,6 +1394,8 @@ impl Db {
                     .map(|v| e.v4.as_ref().map(|x| x.is(v)).unwrap_or(false) || e.v6.as_ref().map(|x| x.is(v)).unwrap_or(false))
                     .unwrap_or(true)
             })
+            .filter(|e| q.search.as_deref().map(|t| e.name.contains(t)).unwrap_or(true))
+            .filter(|e| !q.cross || e.cross4.as_ref().is_some_and(|c| c.verdict.as_deref().is_some_and(|v| v != "none")))
             .collect();
         let key = |e: &Domain| -> u64 {
             match q.sort.as_deref().unwrap_or("hits") {
@@ -1397,6 +1405,7 @@ impl Db {
             }
         };
         arr.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.name.cmp(&b.name)));
+        arr.drain(..q.offset.min(arr.len()));
         arr.truncate(q.limit.unwrap_or(1000));
         arr
     }
@@ -1496,6 +1505,65 @@ mod tests {
         db.touch("a.test", "cloudflare", "ip", &[], &[], None);
         let (k, v) = db.domains.iter().next().unwrap();
         assert!(Arc::ptr_eq(k, &v.name), "名稱只存一份");
+    }
+
+    #[test]
+    fn query_search_offset_cross() {
+        let mut db = Db::new(100);
+        for i in 0..10u32 {
+            db.touch(&format!("d{i}.example"), "fastly", "ip", &[], &[], None);
+            db.get_mut(&format!("d{i}.example")).unwrap().hits = 100 - i;
+        }
+        db.touch("other.test", "cloudflare", "ip", &[], &[], None);
+        fn names(db: &Db, q: &Query) -> Vec<String> {
+            db.query(q).iter().map(|d| d.name.to_string()).collect()
+        }
+        let page = Query {
+            search: Some("example".into()),
+            limit: Some(3),
+            offset: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            names(&db, &page),
+            ["d3.example", "d4.example", "d5.example"],
+            "依查詢次數排序後分頁"
+        );
+        let past = Query {
+            search: Some("example".into()),
+            offset: 50,
+            ..Default::default()
+        };
+        assert!(names(&db, &past).is_empty());
+        assert_eq!(
+            names(
+                &db,
+                &Query {
+                    search: Some("other".into()),
+                    ..Default::default()
+                }
+            ),
+            ["other.test"]
+        );
+        // 只要試過跨 CDN 的
+        db.get_mut("d7.example").unwrap().cross4 = Some(Box::new(Cross {
+            verdict: Some("ok".into()),
+            ..Default::default()
+        }));
+        db.get_mut("d8.example").unwrap().cross4 = Some(Box::new(Cross {
+            verdict: Some("none".into()),
+            ..Default::default()
+        }));
+        assert_eq!(
+            names(
+                &db,
+                &Query {
+                    cross: true,
+                    ..Default::default()
+                }
+            ),
+            ["d7.example"]
+        );
     }
 
     #[test]

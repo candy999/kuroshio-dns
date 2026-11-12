@@ -192,6 +192,31 @@ pub fn request_host(h: &str) -> Option<String> {
     ok.then_some(name)
 }
 
+/// 請求的 Host 標頭裡的埠號（`dns.example.net:8443`、`[2001:db8::1]:8443`）；沒寫埠號回 None
+pub fn request_port(h: &str) -> Option<u16> {
+    let h = h.trim();
+    let rest = match h.strip_prefix('[') {
+        Some(r) => r.split_once(']')?.1,
+        None => h,
+    };
+    let (_, p) = rest.rsplit_once(':')?;
+    p.parse::<u16>().ok().filter(|p| *p > 0)
+}
+
+/// `https://網域[:埠號]`（443 不寫埠號；IPv6 位址加中括號）
+pub fn https_origin(host: &str, port: u16) -> String {
+    let h = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == 443 {
+        format!("https://{h}")
+    } else {
+        format!("https://{h}:{port}")
+    }
+}
+
 fn html_escape(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -219,16 +244,17 @@ pub fn uuid_from(s: &str) -> String {
     format!("{}-{}-5{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32]).to_uppercase()
 }
 
-/// Apple 描述檔（`kind`：`doh` / `dot`）
-pub fn mobileconfig(kind: &str, host: &str, doh_path: &str) -> String {
+/// Apple 描述檔（`kind`：`doh` / `dot`）。`doh_port`：DoH 的埠號（不是 443 時寫進 ServerURL）；
+/// DoT 的描述檔沒有埠號欄位（Apple 固定用 853）
+pub fn mobileconfig(kind: &str, host: &str, doh_path: &str, doh_port: u16) -> String {
     let h = host;
     let id: Vec<&str> = h.split('.').rev().collect();
     let id = id.join(".");
     let (settings, label) = if kind == "doh" {
         (
             format!(
-                "<key>DNSProtocol</key><string>HTTPS</string>\n\t\t\t\t<key>ServerURL</key><string>https://{}{}</string>",
-                xml_escape(h),
+                "<key>DNSProtocol</key><string>HTTPS</string>\n\t\t\t\t<key>ServerURL</key><string>{}{}</string>",
+                xml_escape(&https_origin(h, doh_port)),
                 xml_escape(doh_path)
             ),
             "DNS over HTTPS",
@@ -291,13 +317,14 @@ pub fn detail_path(configured: &str, doh_path: &str) -> String {
         "",
         "/api",
         "/apple",
+        "/assets",
         "/dns-query",
         "/robots.txt",
         "/index.html",
         "/favicon.ico",
         "/favicon.svg",
     ];
-    if reserved.contains(&p.as_str()) || p == doh_path || p.starts_with("/api/") || p.starts_with("/apple/") {
+    if reserved.contains(&p.as_str()) || p == doh_path || p.starts_with("/api/") || p.starts_with("/apple/") || p.starts_with("/assets/") {
         return DEFAULT_DETAIL_PATH.to_string();
     }
     p
@@ -336,7 +363,11 @@ pub struct Site {
     detail_file: PathBuf,
     detail_path: String,
     doh_path: String,
+    /// 設定算出來的對外 DoH 埠號（請求的 Host 標頭沒帶網域時用，見 [`Site::port_for`]）
+    doh_port: u16,
     dot_port: u16,
+    /// 共用儀表板（`share/dashboard/`：dashboard.js、dashboard.css），公開頁與詳細頁從 `/assets/` 載入
+    dash_dir: PathBuf,
     files: Mutex<HashMap<PathBuf, FileCache>>,
     /// 網域自己的 IP（每小時更新）
     ips: RwLock<(Vec<IpAddr>, Vec<IpAddr>)>,
@@ -397,12 +428,14 @@ impl Site {
         Some(Arc::new(Site {
             presence,
             about: crate::about::json(cfg),
-            min_clients: get(cfg, "site.minClients").and_then(Value::as_u64).unwrap_or(2).max(1),
+            min_clients: get(cfg, "site.minClients").and_then(Value::as_u64).unwrap_or(1).max(1),
             html_file: page_file(cfg, "site.htmlFile", "index.html"),
             detail_file: page_file(cfg, "site.detailFile", "detail.html"),
             detail_path: dp,
             doh_path,
+            doh_port: crate::app::public_doh_port(cfg, crate::app::doh_uses_tls(cfg, &crate::app::config_dir(cfg))),
             dot_port: get(cfg, "listen.dot.port").and_then(Value::as_u64).unwrap_or(853) as u16,
+            dash_dir: crate::app::share_dir(cfg).join("dashboard"),
             hostname,
             state,
             files: Mutex::new(HashMap::new()),
@@ -475,6 +508,22 @@ impl Site {
         req_host.and_then(request_host).unwrap_or_else(|| PLACEHOLDER_HOST.to_string())
     }
 
+    /// 這個請求要顯示的 DoH 埠號。公開頁跟 DoH 共用同一個監聽，所以瀏覽器連進來的埠號就是 DoH 的埠號：
+    /// Host 標頭的網域跟要顯示的網域一樣時，帶了埠號就用它、沒帶就是 443（https 的預設埠）。
+    /// 沒有 Host、或 Host 是別的名稱（例如反向代理改寫成 `127.0.0.1:8053`）時用設定算出來的對外埠號
+    pub fn port_for(&self, req_host: Option<&str>) -> u16 {
+        let shown = self.host_for(req_host);
+        match req_host {
+            Some(h) if request_host(h).as_deref() == Some(shown.as_str()) => request_port(h).unwrap_or(443),
+            _ => self.doh_port,
+        }
+    }
+
+    /// DoH 網址（`https://網域[:埠號]/dns-query`）
+    fn doh_url(&self, host: &str, port: u16) -> String {
+        format!("{}{}", https_origin(host, port), self.doh_path)
+    }
+
     /// 處理一個 HTTP 請求；不是網頁的請求（DoH 查詢、POST…）回 None，交給 DoH 處理
     pub async fn handle(&self, method: &str, path: &str, query: &str, client: IpAddr, host: Option<&str>) -> Option<SiteResponse> {
         let head = method.eq_ignore_ascii_case("HEAD");
@@ -506,11 +555,12 @@ impl Site {
             return None; // 交給 DoH（說明文字或查詢）
         }
         let host = self.host_for(req_host);
+        let port = self.port_for(req_host);
         // 不認識的期間由 public_stats 當成 today
         let range = || q.get("range").map(String::as_str).unwrap_or("today");
         Some(match p {
             "/robots.txt" => send(200, "text/plain; charset=utf-8", "User-agent: *\nDisallow: /\n", &[]),
-            "/" | "/index.html" => match self.page(&self.html_file, &host) {
+            "/" | "/index.html" => match self.page(&self.html_file, &host, port) {
                 Some(html) => send(200, "text/html; charset=utf-8", html, &[("cache-control", "no-cache".into())]),
                 None => send(500, "text/plain; charset=utf-8", "error", &[]),
             },
@@ -523,13 +573,13 @@ impl Site {
                 };
                 json_resp(200, &st, "no-store")
             }
-            "/api/public/info" => json_resp(200, &self.info(&host), "no-cache"),
+            "/api/public/info" => json_resp(200, &self.info(&host, port), "no-cache"),
             "/apple/doh.mobileconfig" | "/apple/dot.mobileconfig" => {
                 let kind = if p.contains("doh") { "doh" } else { "dot" };
                 send(
                     200,
                     "application/x-apple-aspen-config",
-                    mobileconfig(kind, &host, &self.doh_path),
+                    mobileconfig(kind, &host, &self.doh_path, port),
                     &[
                         (
                             "content-disposition",
@@ -548,9 +598,9 @@ impl Site {
             // QR 碼只給固定的三種內容（不當成任意文字的產生器）
             "/qr.svg" => {
                 let text = match q.get("for").map(String::as_str) {
-                    Some("doh") => format!("https://{host}{}", self.doh_path),
+                    Some("doh") => self.doh_url(&host, port),
                     Some("source") => self.about["source"].as_str().unwrap_or(crate::about::DEFAULT_SOURCE).to_string(),
-                    _ => format!("https://{host}/"),
+                    _ => format!("{}/", https_origin(&host, port)),
                 };
                 match crate::about::qr_svg(&text) {
                     // 沒設定網域時內容跟著 Host 標頭變：只讓瀏覽器自己快取，中間的代理不要存
@@ -559,6 +609,8 @@ impl Site {
                 }
             }
             "/favicon.ico" | "/favicon.svg" => send(200, "image/svg+xml", FAVICON, &[("cache-control", "max-age=86400".into())]),
+            // 共用儀表板（公開頁與詳細頁的圖表、表格）：瀏覽器自己畫，伺服器只給 JSON
+            "/assets/dashboard.js" | "/assets/dashboard.css" => self.asset(p),
             _ => send(404, "text/plain; charset=utf-8", "Not found", &[]),
         })
     }
@@ -574,7 +626,7 @@ impl Site {
                 ],
                 body: Bytes::new(),
             },
-            "/" | "/index.html" => match self.page(&self.detail_file, &self.host_for(req_host)) {
+            "/" | "/index.html" => match self.page(&self.detail_file, &self.host_for(req_host), self.port_for(req_host)) {
                 Some(html) => send(200, "text/html; charset=utf-8", html, &[no_store()]),
                 None => send(500, "text/plain; charset=utf-8", "error", &[]),
             },
@@ -665,8 +717,25 @@ impl Site {
         json_resp(r.code, &body, "no-store")
     }
 
-    /// 讀網頁檔並代入網域（檔案有改就重新讀）
-    fn page(&self, file: &Path, host: &str) -> Option<String> {
+    /// 共用儀表板的檔案（`/assets/dashboard.js`、`/assets/dashboard.css`）
+    fn asset(&self, p: &str) -> SiteResponse {
+        let (name, ctype) = match p {
+            "/assets/dashboard.js" => ("dashboard.js", "text/javascript; charset=utf-8"),
+            _ => ("dashboard.css", "text/css; charset=utf-8"),
+        };
+        match std::fs::read(self.dash_dir.join(name)) {
+            Ok(b) => send(200, ctype, b, &[("cache-control", "no-cache".into())]),
+            Err(e) => {
+                warn!("讀取 {} 失敗：{e}", self.dash_dir.join(name).display());
+                send(404, "text/plain; charset=utf-8", "Not found", &[])
+            }
+        }
+    }
+
+    /// 讀網頁檔並代入網域（檔案有改就重新讀）。佔位字：`{{HOST}}` 網域、`{{DOH_PATH}}` DoH 路徑、
+    /// `{{DOH_URL}}` 完整的 DoH 網址（埠號不是 443 時帶埠號）、`{{SITE_URL}}` 這一頁的網址、`{{DOH_PORT}}` DoH 埠號、
+    /// `{{DOH_HOSTPORT}}` 網域加埠號（443 時只有網域）
+    fn page(&self, file: &Path, host: &str, port: u16) -> Option<String> {
         let modified = std::fs::metadata(file).and_then(|m| m.modified()).ok();
         let text = {
             let mut files = self.files.lock().unwrap();
@@ -686,17 +755,25 @@ impl Site {
             }
         };
         Some(
-            text.replace("{{HOST}}", &html_escape(host))
+            text.replace("{{DOH_URL}}", &html_escape(&self.doh_url(host, port)))
+                .replace("{{SITE_URL}}", &html_escape(&format!("{}/", https_origin(host, port))))
+                .replace("{{DOH_PORT}}", &port.to_string())
+                .replace(
+                    "{{DOH_HOSTPORT}}",
+                    &html_escape(https_origin(host, port).trim_start_matches("https://")),
+                )
+                .replace("{{HOST}}", &html_escape(host))
                 .replace("{{DOH_PATH}}", &html_escape(&self.doh_path)),
         )
     }
 
-    /// `/api/public/info`：連線資訊
-    pub fn info(&self, host: &str) -> Value {
+    /// `/api/public/info`：連線資訊（`port`：這個請求看到的 DoH 埠號，見 [`Site::port_for`]）
+    pub fn info(&self, host: &str, port: u16) -> Value {
         let (v4, v6) = self.ips.read().unwrap().clone();
         let e = &self.state.encrypted;
         json!({
-            "host": host, "doh": format!("https://{host}{}", self.doh_path), "dot": host, "dotPort": self.dot_port,
+            "host": host, "doh": self.doh_url(host, port), "dohPort": port, "site": format!("{}/", https_origin(host, port)),
+            "dot": host, "dotPort": self.dot_port,
             "ipv4": v4, "ipv6": v6,
             "presence": self.presence.as_ref().map(|p| p.info()),
             "protocols": { "doh": e.doh.is_some(), "doh3": e.doh3.is_some(), "dot": e.dot.is_some(), "doq": e.doq.is_some() },
@@ -722,236 +799,253 @@ impl Site {
     }
 
     fn build_public_stats(&self, range: &str) -> Value {
-        let days = match range {
-            "30d" => 30,
-            "7d" => 7,
-            _ => 1,
-        };
-        let r = &self.state.resolver;
-        let stats = &r.stats;
-        let daily = stats.daily();
-        let keys = &daily[daily.len().saturating_sub(days)..];
-        let n = |d: &Value, k: &str| d.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let f = |d: &Value, k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-        const SUM: [&str; 12] = [
-            "query",
-            "hit",
-            "miss",
-            "blocked",
-            "blockedAds",
-            "blockedMalware",
-            "blockedTelemetry",
-            "blockedCustom",
-            "cdnServed",
-            "cdnRewrite",
-            "ecsRewrite",
-            "crossRewrite",
-        ];
-        let mut sum: HashMap<&str, u64> = SUM.iter().map(|k| (*k, 0)).collect();
-        let mut cdn_agg: BTreeMap<String, u64> = BTreeMap::new();
-        // 機會成本：一般 DNS 會把多少 CDN 連線送出國、我們拉回台灣多少
-        let mut route_agg: BTreeMap<String, [f64; 6]> = BTreeMap::new();
-        let mut cross_pairs: BTreeMap<String, u64> = BTreeMap::new();
-        for (_, d) in keys {
-            for k in SUM {
-                *sum.get_mut(k).expect("SUM") += n(d, k);
-            }
-            for (p, c) in d.get("cdn").and_then(Value::as_object).into_iter().flatten() {
-                *cdn_agg.entry(p.clone()).or_default() += c.as_u64().unwrap_or(0);
-            }
-            for (p, rt) in d.get("route").and_then(Value::as_object).into_iter().flatten() {
-                let a = route_agg.entry(p.clone()).or_default();
-                for (i, k) in ["n", "abroad", "acc", "miss", "saved", "savedN"].iter().enumerate() {
-                    a[i] += f(rt, k);
-                }
-            }
-            for (pair, c) in d.get("cross").and_then(Value::as_object).into_iter().flatten() {
-                *cross_pairs.entry(pair.clone()).or_default() += c.as_u64().unwrap_or(0);
-            }
-        }
-        let s = |k: &str| sum[k];
-        let label = |p: &str| kuroshio_cdn::providers::label(p).to_string();
-        let trend: Vec<Value> = daily[daily.len().saturating_sub(30)..]
-            .iter()
-            .map(|(date, d)| json!({ "date": date, "queries": n(d, "query"), "blocked": n(d, "blocked") }))
-            .collect();
-        let cdn_total: u64 = cdn_agg.values().sum();
-        let mut cdn_list: Vec<(String, u64)> = cdn_agg.into_iter().collect();
-        cdn_list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let cdn: Vec<Value> = cdn_list
-            .iter()
-            .take(8)
-            .map(|(p, c)| {
-                json!({ "provider": p, "label": label(p), "count": c, "share": if cdn_total > 0 { r4(*c as f64 / cdn_total as f64) } else { 0.0 } })
-            })
-            .collect();
-
-        // CDN 加速成效（只有統計數字，不列網域）；原本被導去哪個 POP → 改到哪個台灣 POP（依查詢次數加權）
-        let (mut verified, mut was_abroad, mut v4nodes, mut v6nodes) = (0u64, 0u64, 0usize, 0usize);
-        let mut saved: Vec<f64> = Vec::new();
-        let mut from_pops: HashMap<String, (u64, u64)> = HashMap::new();
-        let mut to_pops: BTreeMap<String, u64> = BTreeMap::new();
-        let mut cs = json!({ "explored": 0, "ok": 0, "fail": 0, "byTo": {}, "byFrom": {}, "also": {} });
-        if let Some(c) = r.cdn() {
-            use kuroshio_cdn::providers::is_tw_pop;
-            let st = c.state();
-            for e in st.db.domains.values() {
-                let ok4 = e.v4.as_ref().is_some_and(|v| v.verdict.as_deref() == Some("ok"));
-                let ok_ecs = e.ecs.as_ref().is_some_and(|v| v.verdict.as_deref() == Some("ok"));
-                if ok4 || ok_ecs {
-                    verified += 1;
-                }
-                let base_pop = e.base.as_ref().and_then(|b| b.pop.as_deref()).filter(|p| !p.is_empty());
-                let abroad = base_pop.is_some_and(|p| !is_tw_pop(p));
-                if abroad {
-                    was_abroad += 1;
-                }
-                if ok4 && abroad {
-                    let bms = e.base.as_ref().and_then(|b| b.ms.get()).filter(|m| *m != 0.0);
-                    let vms = e.v4.as_ref().and_then(|v| v.ms.get()).filter(|m| *m != 0.0);
-                    if let (Some(b), Some(v)) = (bms, vms) {
-                        if b > v {
-                            saved.push(b - v);
-                        }
-                    }
-                }
-                if ok_ecs {
-                    if let Some(g) = e.ecs.as_ref().and_then(|x| x.gain_ms.get()).filter(|g| *g > 0.0) {
-                        saved.push(g);
-                    }
-                }
-                if let (true, Some(pop)) = (abroad, base_pop) {
-                    let w = (e.hits as u64).max(1);
-                    let fp = from_pops.entry(pop.to_string()).or_default();
-                    fp.0 += w;
-                    let tw_pop = e.v4.as_ref().and_then(|v| v.pop.as_deref()).filter(|p| is_tw_pop(p));
-                    if let (true, Some(tp)) = (ok4, tw_pop) {
-                        fp.1 += w;
-                        *to_pops.entry(tp.chars().take(3).collect()).or_default() += w;
-                    }
-                }
-            }
-            for d in st.pools.p.values() {
-                v4nodes += d.pool4.iter().filter(|x| !d.bad.contains_key(&x.ip)).count();
-                v6nodes += d.pool6.iter().filter(|x| !d.bad.contains_key(&x.ip)).count();
-            }
-            cs = st.db.cross_summary();
-        }
-        saved.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = saved.get(saved.len() / 2).copied();
-
-        let mut routing_rows: Vec<(String, [f64; 6])> = route_agg.into_iter().filter(|(_, a)| a[0] > 0.0).collect();
-        routing_rows.sort_by(|a, b| {
-            b.1[0]
-                .partial_cmp(&a.1[0])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        let mut rt = [0f64; 6];
-        for (_, a) in &routing_rows {
-            for i in 0..6 {
-                rt[i] += a[i];
-            }
-        }
-        let routing: Vec<Value> = routing_rows
-            .iter()
-            .map(|(p, a)| {
-                json!({
-                    "provider": p, "label": label(p),
-                    "connections": a[0], "wouldGoAbroad": a[1], "accelerated": a[2], "stillAbroad": a[3],
-                    "abroadShare": if a[0] > 0.0 { r4(a[1] / a[0]) } else { 0.0 },
-                    "successRate": if a[1] > 0.0 { json!(r4(a[2] / a[1])) } else { Value::Null },
-                    "avgSavedMs": if a[5] > 0.0 { json!(r1(a[4] / a[5])) } else { Value::Null },
-                })
-            })
-            .collect();
-
-        // 跨 CDN 備援：原本的 CDN 沒有台灣節點時，同一個網站能不能改走別家的台灣節點
-        let cross_serves = s("crossRewrite");
-        let obj = |k: &str| cs.get(k).and_then(Value::as_object).cloned().unwrap_or_default();
-        let mut by_to: Vec<(String, u64)> = obj("byTo").into_iter().map(|(k, v)| (k, v.as_u64().unwrap_or(0))).collect();
-        by_to.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let mut by_from: Vec<(String, u64, u64)> = obj("byFrom")
-            .into_iter()
-            .map(|(k, v)| (k, n(&v, "explored"), n(&v, "ok")))
-            .filter(|x| x.1 > 0)
-            .collect();
-        by_from.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let mut pairs: Vec<(String, u64)> = cross_pairs.into_iter().collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let explored = n(&cs, "explored");
-        let cross_cdn = json!({
-            "explored": explored, "ok": n(&cs, "ok"), "fail": n(&cs, "fail"),
-            "successRate": if explored > 0 { json!(r4(n(&cs, "ok") as f64 / explored as f64)) } else { Value::Null },
-            "byTo": by_to.iter().map(|(p, c)| json!({ "provider": p, "label": label(p), "sites": c })).collect::<Vec<_>>(),
-            "byFrom": by_from.iter().map(|(p, e, o)| json!({ "provider": p, "label": label(p), "explored": e, "ok": o })).collect::<Vec<_>>(),
-            "serves": cross_serves,
-            "pairs": pairs.iter().take(8).map(|(k, c)| {
-                let (f, t) = k.split_once('>').unwrap_or((k.as_str(), ""));
-                json!({ "from": f, "fromLabel": label(f), "to": t, "toLabel": label(t), "count": c })
-            }).collect::<Vec<_>>(),
-        });
-
-        // 跨 CDN 的連線也是「原本出國、改走台灣」：算進加速次數
-        let opportunity = json!({
-            "connections": rt[0], "wouldGoAbroad": rt[1], "accelerated": rt[2] + cross_serves as f64, "stillAbroad": rt[3],
-            "otherDnsAbroadShare": if rt[0] > 0.0 { r4(rt[1] / rt[0]) } else { 0.0 },
-            "oursAbroadShare": if rt[0] > 0.0 { r4(rt[3] / rt[0]) } else { 0.0 },
-            "avgSavedMs": if rt[5] > 0.0 { json!(r1(rt[4] / rt[5])) } else { Value::Null },
-            "totalSavedSec": r1(rt[4] / 1000.0),
-            "crossAccelerated": cross_serves,
-        });
-
-        let mut flows: Vec<(String, (u64, u64))> = from_pops.into_iter().collect();
-        flows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
-        let flows: Vec<Value> = flows
-            .into_iter()
-            .take(12)
-            .map(|(pop, (c, fx))| json!({ "pop": pop, "count": c, "fixed": fx }))
-            .collect();
-
-        let filter = r.filter.read().unwrap().as_ref().map(|f| f.stats());
-        let rules = filter.filter(|v| !v.is_null()).map(|v| {
-            json!({ "custom": v.get("custom").cloned().unwrap_or(json!(0)), "lists": v.get("lists").cloned().unwrap_or(json!(0)), "byCategory": v.get("byCategory").cloned().unwrap_or(json!({})) })
-        });
-        let auto = r.upstreams.auto_info();
-        let q = s("query");
-        let blocked = s("blocked");
-        let min_c = self.min_clients;
-        json!({
-            "generatedAt": crate::stats::iso_utc(now_ms()),
-            "range": range, "days": keys.len(),
-            "totals": {
-                "queries": q, "blocked": blocked, "blockedAds": s("blockedAds"), "blockedMalware": s("blockedMalware"),
-                "blockedTelemetry": s("blockedTelemetry"), "blockedCustom": s("blockedCustom"),
-                "blockRate": if q > 0 { r4(blocked as f64 / q as f64) } else { 0.0 },
-                "cacheHitRate": if q > 0 { r4(s("hit") as f64 / q as f64) } else { 0.0 },
-                "cdnServed": s("cdnServed"), "cdnAccelerated": s("cdnRewrite") + s("ecsRewrite") + cross_serves,
-                "accelerated": rt[2] + cross_serves as f64,
-            },
-            "acceleration": {
-                "verifiedSites": verified, "sitesRoutedAbroad": was_abroad, "medianSavedMs": median.map(r1), "samples": saved.len(),
-                "twNodesV4": v4nodes, "twNodesV6": v6nodes,
-            },
-            "trend": trend, "cdn": cdn, "routing": routing, "opportunity": opportunity, "flows": flows,
-            "toPops": Value::Object(to_pops.into_iter().map(|(k, v)| (k, json!(v))).collect::<Map<_, _>>()),
-            "crossCdn": cross_cdn,
-            "realtime": stats.realtime(),
-            "outcomes": {
-                "cache": s("hit"), "upstream": q.saturating_sub(s("hit") + blocked),
-                "ads": s("blockedAds") + s("blockedCustom") + s("blockedTelemetry"), "malware": s("blockedMalware"),
-            },
-            "topSites": stats.anon_ranking(days, false, min_c, 15),
-            "topBlocked": stats.anon_ranking(days, true, min_c, 10),
-            "privacy": { "minClients": min_c },
-            "system": {
-                "uptimeSec": stats.uptime_sec(),
-                "rules": rules,
-                "upstreams": r.upstreams.pinned.len() as u64 + auto.get("count").and_then(Value::as_u64).unwrap_or(0),
-                "benchmarkAt": auto.get("generatedAt").cloned().unwrap_or(Value::Null),
-            },
-        })
+        dashboard_stats(&self.state, range, self.min_clients, PUBLIC_TOP)
     }
+}
+
+/// 公開頁的排行筆數：（熱門網站, 被擋網站）
+pub const PUBLIC_TOP: (usize, usize) = (15, 10);
+/// 管理介面儀表板的排行筆數（不受 `site.minClients` 限制）
+pub const ADMIN_TOP: (usize, usize) = (30, 30);
+
+/// 儀表板的統計（公開頁 `/api/public/stats` 與管理 API `/api/dashboard` 共用）。
+/// `range`：today / 7d / 30d（其他當成 today）；`min_clients`：網站排行最少要有幾位不同使用者；
+/// `top`：（熱門網站, 被擋網站）各列幾筆。內容只有彙總數字與網站名稱，不含任何 IP
+pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (usize, usize)) -> Value {
+    let range = match range {
+        "7d" => "7d",
+        "30d" => "30d",
+        _ => "today",
+    };
+    let days = match range {
+        "30d" => 30,
+        "7d" => 7,
+        _ => 1,
+    };
+    let r = &state.resolver;
+    let stats = &r.stats;
+    let daily = stats.daily();
+    let keys = &daily[daily.len().saturating_sub(days)..];
+    let n = |d: &Value, k: &str| d.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let f = |d: &Value, k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    const SUM: [&str; 12] = [
+        "query",
+        "hit",
+        "miss",
+        "blocked",
+        "blockedAds",
+        "blockedMalware",
+        "blockedTelemetry",
+        "blockedCustom",
+        "cdnServed",
+        "cdnRewrite",
+        "ecsRewrite",
+        "crossRewrite",
+    ];
+    let mut sum: HashMap<&str, u64> = SUM.iter().map(|k| (*k, 0)).collect();
+    let mut cdn_agg: BTreeMap<String, u64> = BTreeMap::new();
+    // 機會成本：一般 DNS 會把多少 CDN 連線送出國、我們拉回台灣多少
+    let mut route_agg: BTreeMap<String, [f64; 6]> = BTreeMap::new();
+    let mut cross_pairs: BTreeMap<String, u64> = BTreeMap::new();
+    for (_, d) in keys {
+        for k in SUM {
+            *sum.get_mut(k).expect("SUM") += n(d, k);
+        }
+        for (p, c) in d.get("cdn").and_then(Value::as_object).into_iter().flatten() {
+            *cdn_agg.entry(p.clone()).or_default() += c.as_u64().unwrap_or(0);
+        }
+        for (p, rt) in d.get("route").and_then(Value::as_object).into_iter().flatten() {
+            let a = route_agg.entry(p.clone()).or_default();
+            for (i, k) in ["n", "abroad", "acc", "miss", "saved", "savedN"].iter().enumerate() {
+                a[i] += f(rt, k);
+            }
+        }
+        for (pair, c) in d.get("cross").and_then(Value::as_object).into_iter().flatten() {
+            *cross_pairs.entry(pair.clone()).or_default() += c.as_u64().unwrap_or(0);
+        }
+    }
+    let s = |k: &str| sum[k];
+    let label = |p: &str| kuroshio_cdn::providers::label(p).to_string();
+    let trend: Vec<Value> = daily[daily.len().saturating_sub(30)..]
+        .iter()
+        .map(|(date, d)| json!({ "date": date, "queries": n(d, "query"), "blocked": n(d, "blocked") }))
+        .collect();
+    let cdn_total: u64 = cdn_agg.values().sum();
+    let mut cdn_list: Vec<(String, u64)> = cdn_agg.into_iter().collect();
+    cdn_list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let cdn: Vec<Value> = cdn_list
+        .iter()
+        .take(8)
+        .map(|(p, c)| {
+            json!({ "provider": p, "label": label(p), "count": c, "share": if cdn_total > 0 { r4(*c as f64 / cdn_total as f64) } else { 0.0 } })
+        })
+        .collect();
+
+    // CDN 加速成效（只有統計數字，不列網域）；原本被導去哪個 POP → 改到哪個台灣 POP（依查詢次數加權）
+    let (mut verified, mut was_abroad, mut v4nodes, mut v6nodes) = (0u64, 0u64, 0usize, 0usize);
+    let mut saved: Vec<f64> = Vec::new();
+    let mut from_pops: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut to_pops: BTreeMap<String, u64> = BTreeMap::new();
+    let mut cs = json!({ "explored": 0, "ok": 0, "fail": 0, "byTo": {}, "byFrom": {}, "also": {} });
+    if let Some(c) = r.cdn() {
+        use kuroshio_cdn::providers::is_tw_pop;
+        let st = c.state();
+        for e in st.db.domains.values() {
+            let ok4 = e.v4.as_ref().is_some_and(|v| v.verdict.as_deref() == Some("ok"));
+            let ok_ecs = e.ecs.as_ref().is_some_and(|v| v.verdict.as_deref() == Some("ok"));
+            if ok4 || ok_ecs {
+                verified += 1;
+            }
+            let base_pop = e.base.as_ref().and_then(|b| b.pop.as_deref()).filter(|p| !p.is_empty());
+            let abroad = base_pop.is_some_and(|p| !is_tw_pop(p));
+            if abroad {
+                was_abroad += 1;
+            }
+            if ok4 && abroad {
+                let bms = e.base.as_ref().and_then(|b| b.ms.get()).filter(|m| *m != 0.0);
+                let vms = e.v4.as_ref().and_then(|v| v.ms.get()).filter(|m| *m != 0.0);
+                if let (Some(b), Some(v)) = (bms, vms) {
+                    if b > v {
+                        saved.push(b - v);
+                    }
+                }
+            }
+            if ok_ecs {
+                if let Some(g) = e.ecs.as_ref().and_then(|x| x.gain_ms.get()).filter(|g| *g > 0.0) {
+                    saved.push(g);
+                }
+            }
+            if let (true, Some(pop)) = (abroad, base_pop) {
+                let w = (e.hits as u64).max(1);
+                let fp = from_pops.entry(pop.to_string()).or_default();
+                fp.0 += w;
+                let tw_pop = e.v4.as_ref().and_then(|v| v.pop.as_deref()).filter(|p| is_tw_pop(p));
+                if let (true, Some(tp)) = (ok4, tw_pop) {
+                    fp.1 += w;
+                    *to_pops.entry(tp.chars().take(3).collect()).or_default() += w;
+                }
+            }
+        }
+        for d in st.pools.p.values() {
+            v4nodes += d.pool4.iter().filter(|x| !d.bad.contains_key(&x.ip)).count();
+            v6nodes += d.pool6.iter().filter(|x| !d.bad.contains_key(&x.ip)).count();
+        }
+        cs = st.db.cross_summary();
+    }
+    saved.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = saved.get(saved.len() / 2).copied();
+
+    let mut routing_rows: Vec<(String, [f64; 6])> = route_agg.into_iter().filter(|(_, a)| a[0] > 0.0).collect();
+    routing_rows.sort_by(|a, b| {
+        b.1[0]
+            .partial_cmp(&a.1[0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut rt = [0f64; 6];
+    for (_, a) in &routing_rows {
+        for i in 0..6 {
+            rt[i] += a[i];
+        }
+    }
+    let routing: Vec<Value> = routing_rows
+        .iter()
+        .map(|(p, a)| {
+            json!({
+                "provider": p, "label": label(p),
+                "connections": a[0], "wouldGoAbroad": a[1], "accelerated": a[2], "stillAbroad": a[3],
+                "abroadShare": if a[0] > 0.0 { r4(a[1] / a[0]) } else { 0.0 },
+                "successRate": if a[1] > 0.0 { json!(r4(a[2] / a[1])) } else { Value::Null },
+                "avgSavedMs": if a[5] > 0.0 { json!(r1(a[4] / a[5])) } else { Value::Null },
+            })
+        })
+        .collect();
+
+    // 跨 CDN 備援：原本的 CDN 沒有台灣節點時，同一個網站能不能改走別家的台灣節點
+    let cross_serves = s("crossRewrite");
+    let obj = |k: &str| cs.get(k).and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut by_to: Vec<(String, u64)> = obj("byTo").into_iter().map(|(k, v)| (k, v.as_u64().unwrap_or(0))).collect();
+    by_to.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut by_from: Vec<(String, u64, u64)> = obj("byFrom")
+        .into_iter()
+        .map(|(k, v)| (k, n(&v, "explored"), n(&v, "ok")))
+        .filter(|x| x.1 > 0)
+        .collect();
+    by_from.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut pairs: Vec<(String, u64)> = cross_pairs.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let explored = n(&cs, "explored");
+    let cross_cdn = json!({
+        "explored": explored, "ok": n(&cs, "ok"), "fail": n(&cs, "fail"),
+        "successRate": if explored > 0 { json!(r4(n(&cs, "ok") as f64 / explored as f64)) } else { Value::Null },
+        "byTo": by_to.iter().map(|(p, c)| json!({ "provider": p, "label": label(p), "sites": c })).collect::<Vec<_>>(),
+        "byFrom": by_from.iter().map(|(p, e, o)| json!({ "provider": p, "label": label(p), "explored": e, "ok": o })).collect::<Vec<_>>(),
+        "serves": cross_serves,
+        "pairs": pairs.iter().take(8).map(|(k, c)| {
+            let (f, t) = k.split_once('>').unwrap_or((k.as_str(), ""));
+            json!({ "from": f, "fromLabel": label(f), "to": t, "toLabel": label(t), "count": c })
+        }).collect::<Vec<_>>(),
+    });
+
+    // 跨 CDN 的連線也是「原本出國、改走台灣」：算進加速次數
+    let opportunity = json!({
+        "connections": rt[0], "wouldGoAbroad": rt[1], "accelerated": rt[2] + cross_serves as f64, "stillAbroad": rt[3],
+        "otherDnsAbroadShare": if rt[0] > 0.0 { r4(rt[1] / rt[0]) } else { 0.0 },
+        "oursAbroadShare": if rt[0] > 0.0 { r4(rt[3] / rt[0]) } else { 0.0 },
+        "avgSavedMs": if rt[5] > 0.0 { json!(r1(rt[4] / rt[5])) } else { Value::Null },
+        "totalSavedSec": r1(rt[4] / 1000.0),
+        "crossAccelerated": cross_serves,
+    });
+
+    let mut flows: Vec<(String, (u64, u64))> = from_pops.into_iter().collect();
+    flows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+    let flows: Vec<Value> = flows
+        .into_iter()
+        .take(12)
+        .map(|(pop, (c, fx))| json!({ "pop": pop, "count": c, "fixed": fx }))
+        .collect();
+
+    let filter = r.filter.read().unwrap().as_ref().map(|f| f.stats());
+    let rules = filter.filter(|v| !v.is_null()).map(|v| {
+        json!({ "custom": v.get("custom").cloned().unwrap_or(json!(0)), "lists": v.get("lists").cloned().unwrap_or(json!(0)), "byCategory": v.get("byCategory").cloned().unwrap_or(json!({})) })
+    });
+    let auto = r.upstreams.auto_info();
+    let q = s("query");
+    let blocked = s("blocked");
+    let min_c = min_clients.max(1);
+    json!({
+        "generatedAt": crate::stats::iso_utc(now_ms()),
+        "range": range, "days": keys.len(),
+        "totals": {
+            "queries": q, "blocked": blocked, "blockedAds": s("blockedAds"), "blockedMalware": s("blockedMalware"),
+            "blockedTelemetry": s("blockedTelemetry"), "blockedCustom": s("blockedCustom"),
+            "blockRate": if q > 0 { r4(blocked as f64 / q as f64) } else { 0.0 },
+            "cacheHitRate": if q > 0 { r4(s("hit") as f64 / q as f64) } else { 0.0 },
+            "cdnServed": s("cdnServed"), "cdnAccelerated": s("cdnRewrite") + s("ecsRewrite") + cross_serves,
+            "accelerated": rt[2] + cross_serves as f64,
+        },
+        "acceleration": {
+            "verifiedSites": verified, "sitesRoutedAbroad": was_abroad, "medianSavedMs": median.map(r1), "samples": saved.len(),
+            "twNodesV4": v4nodes, "twNodesV6": v6nodes,
+        },
+        "trend": trend, "cdn": cdn, "routing": routing, "opportunity": opportunity, "flows": flows,
+        "toPops": Value::Object(to_pops.into_iter().map(|(k, v)| (k, json!(v))).collect::<Map<_, _>>()),
+        "crossCdn": cross_cdn,
+        "realtime": stats.realtime(),
+        "outcomes": {
+            "cache": s("hit"), "upstream": q.saturating_sub(s("hit") + blocked),
+            "ads": s("blockedAds") + s("blockedCustom") + s("blockedTelemetry"), "malware": s("blockedMalware"),
+        },
+        "topSites": stats.anon_ranking(days, false, min_c, top.0),
+        "topBlocked": stats.anon_ranking(days, true, min_c, top.1),
+        "privacy": { "minClients": min_c },
+        "system": {
+            "uptimeSec": stats.uptime_sec(),
+            "rules": rules,
+            "upstreams": r.upstreams.pinned.len() as u64 + auto.get("count").and_then(Value::as_u64).unwrap_or(0),
+            "benchmarkAt": auto.get("generatedAt").cloned().unwrap_or(Value::Null),
+        },
+    })
 }
 
 /// 區網、本機、連結本地之類不是公開網路的位址
@@ -1139,6 +1233,23 @@ pub fn mask_clients(body: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_ports() {
+        assert_eq!(request_port("dns.example.net:8443"), Some(8443));
+        assert_eq!(request_port("dns.example.net"), None);
+        assert_eq!(request_port("[2001:db8::1]:8443"), Some(8443));
+        assert_eq!(request_port("[2001:db8::1]"), None);
+        assert_eq!(request_port("dns.example.net:0"), None);
+        assert_eq!(request_port("dns.example.net:99999"), None);
+        assert_eq!(https_origin("dns.example.net", 443), "https://dns.example.net");
+        assert_eq!(https_origin("dns.example.net", 8443), "https://dns.example.net:8443");
+        assert_eq!(https_origin("2001:db8::1", 8443), "https://[2001:db8::1]:8443");
+        assert!(
+            mobileconfig("doh", "dns.example.net", "/dns-query", 8443).contains("<string>https://dns.example.net:8443/dns-query</string>")
+        );
+        assert_eq!(detail_path("/assets", "/dns-query"), "/detail", "儀表板檔案的路徑保留給 /assets");
+    }
 
     #[test]
     fn masking() {

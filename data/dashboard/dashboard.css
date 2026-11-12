@@ -1,0 +1,175 @@
+/* 黑潮 DNS 共用儀表板（data/dashboard/dashboard.js）的樣式。
+ * 全部限定在 .kd 底下，不影響主機頁面的其他部分。
+ * 顏色用主機頁面的變數（--text、--s1…）：公開頁 / 詳細頁有自己的黑潮配色；
+ * LuCI 與 Windows 設定頁沒有這些變數，容器再加上 .kd-theme 套用下面這組（淺色 / 深色跟著系統，LuCI 跟著 data-darkmode）。 */
+
+/* ---------- 配色（LuCI、Windows 設定頁） ---------- */
+.kd-theme {
+  --bg: #f4f6f9; --text: #1b2430; --text-2: #3d4b5c; --text-3: #5d6b7c;
+  --line: rgba(10,40,90,.12); --grid: rgba(10,40,90,.08);
+  --glass: #ffffff; --glass-2: #ffffff; --glass-hi: rgba(255,255,255,0); --glass-edge: rgba(10,40,90,.14);
+  --chip: rgba(10,50,110,.06); --track: rgba(10,50,110,.08);
+  --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+  --accent: #0b5cad; --btn: #0b5cad;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #b07a00; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --ok: #18864b; --bad: #cf222e; --warn: #9a6700;
+  --font: system-ui, -apple-system, "Segoe UI", "Microsoft JhengHei UI", "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, monospace;
+  color: var(--text); font-family: var(--font);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-darkmode="false"]) .kd-theme {
+    --bg: #0d141c; --text: #e4ebf3; --text-2: #b4c2d2; --text-3: #8d9db0;
+    --line: rgba(160,200,255,.13); --grid: rgba(160,200,255,.08);
+    --glass: #151f2b; --glass-2: #151f2b; --glass-hi: rgba(255,255,255,.03); --glass-edge: rgba(160,200,255,.14);
+    --chip: rgba(140,190,255,.09); --track: rgba(140,190,255,.10); --shadow: none;
+    --accent: #5aa6f0; --btn: #2f6fb3;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #2f9e2f; --s7: #9085e9; --s8: #e66767;
+    --ok: #5fd08a; --bad: #ff8a80; --warn: #f0c060;
+  }
+}
+/* LuCI 選了深色主題（bootstrap-dark，或自動模式偵測到深色） */
+:root[data-darkmode="true"] .kd-theme {
+  --bg: #0d141c; --text: #e4ebf3; --text-2: #b4c2d2; --text-3: #8d9db0;
+  --line: rgba(160,200,255,.13); --grid: rgba(160,200,255,.08);
+  --glass: #151f2b; --glass-2: #151f2b; --glass-hi: rgba(255,255,255,.03); --glass-edge: rgba(160,200,255,.14);
+  --chip: rgba(140,190,255,.09); --track: rgba(140,190,255,.10); --shadow: none;
+  --accent: #5aa6f0; --btn: #2f6fb3;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #2f9e2f; --s7: #9085e9; --s8: #e66767;
+  --ok: #5fd08a; --bad: #ff8a80; --warn: #f0c060;
+}
+.kd-theme .glass { position: relative; background: var(--glass); border: 1px solid var(--glass-edge); border-radius: 10px; box-shadow: var(--shadow); }
+.kd-theme .card { margin: 0; }
+.kd-theme .tile { margin: 0; }
+
+/* ---------- 版面 ---------- */
+.kd { min-width: 0; max-width: 100%; }
+.kd section { padding: 34px 0 0; scroll-margin-top: 80px; }
+.kd h2 { font-size: 22px; margin: 0 0 14px; }
+.kd h3 { font-size: 15.5px; margin: 0 0 10px; }
+.kd .grid { display: grid; gap: 12px; }
+.kd .g2 { grid-template-columns: 1fr 1fr; } .kd .g3 { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 900px) { .kd .g2, .kd .g3 { grid-template-columns: 1fr; } }
+.kd .card { padding: 18px; min-width: 0; }
+.kd .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+.kd .tile { padding: 14px 16px; }
+.kd .tile .l { font-size: 13px; color: var(--text-2); }
+.kd .tile .v { font-size: 26px; font-weight: 750; font-variant-numeric: tabular-nums; line-height: 1.3; }
+.kd .tile .n { font-size: 12.5px; color: var(--text-3); }
+.kd .tbl { width: 100%; overflow-x: auto; }
+.kd table { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+.kd th, .kd td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; vertical-align: middle; }
+.kd th { color: var(--text-3); font-weight: 600; position: sticky; top: 0; background: color-mix(in srgb, var(--bg) 70%, transparent); cursor: default; font-size: inherit; }
+.kd th.sort { cursor: pointer; }
+.kd td.num, .kd th.num { text-align: right; }
+.kd td.mono { font-family: var(--mono); font-size: 12.5px; }
+.kd .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: var(--chip); color: var(--text-2); }
+.kd .tag.ok { color: var(--ok); } .kd .tag.bad { color: var(--bad); } .kd .tag.warn { color: var(--warn); }
+.kd .scroll { max-height: 520px; overflow: auto; border-radius: 12px; }
+.kd .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center; }
+.kd input, .kd select, .kd .btn { font: inherit; font-size: 14px; color: var(--text); background: var(--chip); border: 1px solid var(--line); border-radius: 10px; padding: 7px 12px; width: auto; max-width: 100%; min-height: 0; box-shadow: none; height: auto; margin: 0; }
+.kd .btn { cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; line-height: inherit; }
+.kd .btn:hover { background: var(--glass-2); }
+.kd .btn:disabled { opacity: .5; cursor: default; }
+.kd .muted { color: var(--text-3); font-size: 13px; }
+.kd .chart { position: relative; }
+.kd .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.kd .axis { fill: var(--text-3); font: 11px var(--font); }
+.kd .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--text-2); margin-bottom: 6px; }
+.kd .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
+.kd .tip { position: absolute; pointer-events: none; z-index: 5; padding: 8px 10px; border-radius: 12px; font-size: 12.5px; white-space: nowrap; opacity: 0; background: color-mix(in srgb, var(--bg) 75%, transparent); -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); box-shadow: 0 8px 24px rgba(0,0,0,.3), inset 0 1px 0 var(--glass-hi); }
+.kd .tip .r { display: flex; gap: 8px; align-items: center; } .kd .tip .r i { width: 12px; height: 3px; border-radius: 3px; } .kd .tip b { min-width: 48px; }
+.kd .tip .d { color: var(--text-3); margin-bottom: 4px; font-size: 12px; }
+.kd .tip .d ~ .r { line-height: 1.6; }
+.kd .tip .d ~ .r b { font-weight: 700; min-width: 56px; font-variant-numeric: tabular-nums; }
+.kd .tip .d ~ .r span { color: var(--text-2); }
+.kd .bar { height: 8px; border-radius: 999px; background: var(--chip); overflow: hidden; min-width: 80px; }
+.kd .bar > div { height: 100%; border-radius: 999px; }
+.kd pre { white-space: pre-wrap; font: 12.5px/1.5 var(--mono); margin: 0; background: none; color: inherit; padding: 0; border: 0; }
+.kd .empty { color: var(--text-3); font-size: 14px; padding: 26px 0; text-align: center; }
+.kd .cap { font-size: 13.5px; color: var(--text-3); margin: 2px 0 14px; }
+.kd .kd-mt0 { margin-top: 0; } .kd .kd-mt8 { margin-top: 8px; } .kd .kd-mt10 { margin-top: 10px; } .kd .kd-mt12 { margin-top: 12px; }
+.kd .kd-mb8 { margin-bottom: 8px; } .kd .kd-my10 { margin: 10px 0; }
+.kd .kd-grow { flex: 1; min-width: 180px; } .kd .kd-grow2 { flex: 1; min-width: 200px; } .kd .kd-flex1 { flex: 1; }
+.kd .kd-err { margin: 0; }
+
+/* 期間切換（管理介面用；詳細頁用自己導覽列上的按鈕） */
+.kd .kd-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+.kd .kd-seg { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--chip); }
+.kd .kd-seg button { border: 0; background: transparent; color: var(--text-2); padding: 5px 14px; border-radius: 999px; font: inherit; font-size: 13.5px; cursor: pointer; min-height: 0; }
+.kd .kd-seg button[aria-pressed="true"] { background: var(--btn); color: #fff; font-weight: 650; }
+
+/* ---------- 公開頁的圖表元件（管理介面也用） ---------- */
+.kd details.table { margin-top: 12px; font-size: 13px; color: var(--text-2); }
+.kd details.table summary { cursor: pointer; }
+.kd details.table table { margin-top: 8px; }
+.kd details.table th, .kd details.table td { text-align: right; padding: 4px 8px; }
+.kd details.table th:first-child, .kd details.table td:first-child { text-align: left; }
+.kd .stack { display: flex; height: 18px; gap: 2px; border-radius: 999px; overflow: hidden; background: var(--track); }
+.kd .stack > div { height: 100%; min-width: 2px; cursor: default; }
+.kd .stack > div:first-child { border-radius: 999px 0 0 999px; }
+.kd .stack > div:last-child { border-radius: 0 999px 999px 0; }
+.kd .stack-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 14px; }
+.kd .stack-legend div { font-size: 13px; color: var(--text-2); }
+.kd .stack-legend b { display: block; font-size: 20px; color: var(--text); font-variant-numeric: tabular-nums; }
+.kd .stack-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.kd .rank { display: grid; gap: 9px; }
+.kd .rank-row { display: grid; grid-template-columns: 24px minmax(80px, 42%) 1fr; align-items: center; gap: 10px; font-size: 14px; }
+.kd .rank-row .n { color: var(--text-3); font: 12px var(--mono); }
+.kd .rank-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kd .rank-row .bar-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.kd .rank-row .bar { height: 10px; border-radius: 0 4px 4px 0; min-width: 3px; background: none; overflow: visible; }
+.kd .rank-row .val { font: 12.5px var(--mono); color: var(--text-2); white-space: nowrap; }
+.kd .gauges { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.kd .gauge { padding: 16px; display: grid; grid-template-columns: 92px 1fr; gap: 14px; align-items: center; min-width: 0; }
+.kd .gauge svg { width: 92px; height: 92px; }
+.kd .ring-val { font: 750 19px var(--font); fill: var(--text); }
+.kd .ring-sub { font: 11px var(--font); fill: var(--text-3); }
+.kd .gauge .name { font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.kd .gauge .name i { width: 10px; height: 10px; border-radius: 3px; }
+.kd .gauge dl { margin: 6px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
+.kd .gauge dt { color: var(--text-3); }
+.kd .gauge dd { margin: 0; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text); }
+.kd .cross { padding: 18px; display: grid; grid-template-columns: 120px 1fr; gap: 22px; align-items: center; }
+.kd .cross svg.ring { width: 120px; height: 120px; }
+.kd .cross .ring-val { font-size: 22px; }
+.kd .cross .ring-sub { font-size: 11.5px; }
+.kd .cross .lead { font-size: 15px; margin: 0 0 12px; color: var(--text-2); }
+.kd .cross .lead b { color: var(--text); font-variant-numeric: tabular-nums; }
+.kd .cross .pairs { display: grid; gap: 8px; }
+.kd .cross .pair { display: grid; grid-template-columns: minmax(150px, 38%) 1fr; gap: 10px; align-items: center; font-size: 14px; }
+.kd .cross .pair .lbl { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; }
+.kd .cross .pair .lbl i { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.kd .cross .pair .arrow { color: var(--text-3); }
+.kd .cross .pair .bar { overflow: visible; background: none; min-width: 0; }
+.kd .cross .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.kd .cross .chip { font-size: 12.5px; padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--text-2); }
+.kd .cross .chip b { color: var(--text); font-variant-numeric: tabular-nums; }
+@media (max-width: 600px) { .kd .cross { grid-template-columns: 1fr; justify-items: center; gap: 14px; } .kd .cross > div { width: 100%; } .kd .cross .pair { grid-template-columns: 1fr; gap: 4px; } .kd .cross svg.ring { width: 104px; height: 104px; } }
+
+/* 路由地圖 */
+.kd .mapwrap { position: relative; overflow: hidden; border-radius: 10px; }
+.kd .mapwrap.chart svg { width: 100%; height: auto; display: block; overflow: hidden; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+.kd .mapwrap.chart svg.drag { cursor: grabbing; }
+.kd .map-city.minor { opacity: 0; transition: opacity .2s; }
+.kd .zin .map-city.minor { opacity: 1; }
+.kd .map-hint.off { opacity: 0; transition: opacity .4s; }
+.kd .map-ctl { position: absolute; right: 8px; bottom: 8px; display: flex; gap: 6px; z-index: 2; }
+.kd .map-ctl button { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--line); background: var(--glass-2); color: var(--text); font: 600 17px/1 var(--font); cursor: pointer; display: grid; place-items: center; padding: 0; min-height: 0; }
+.kd .map-ctl button[hidden] { display: none; }
+.kd .map-hint { position: absolute; left: 10px; bottom: 12px; font: 11px var(--font); color: var(--text-3); pointer-events: none; padding: 3px 8px; border-radius: 999px; background: var(--glass); }
+.kd .map-land { fill: var(--s1); fill-opacity: .05; stroke: var(--text-3); stroke-opacity: .35; stroke-width: .7; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.kd .map-dot { fill: var(--text-3); fill-opacity: .6; }
+.kd .map-grat { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 7; }
+.kd .map-grat.eq { stroke-dasharray: 4 6; }
+.kd .map-lead { stroke: var(--text-3); stroke-opacity: .5; stroke-width: 1; }
+.kd .map-city { font: 12px var(--font); fill: var(--text-2); paint-order: stroke; stroke: var(--glass); stroke-width: 3px; stroke-linejoin: round; }
+.kd .map-city.tw { fill: var(--text); font-weight: 700; font-size: 13px; }
+.kd .map-num { font: 600 11px var(--mono); fill: var(--text-3); paint-order: stroke; stroke: var(--glass); stroke-width: 3px; stroke-linejoin: round; }
+.kd .flow { animation: kd-flow 2.2s linear infinite; }
+@keyframes kd-flow { to { stroke-dashoffset: -28; } }
+.kd .pulse { transform-box: fill-box; transform-origin: center; animation: kd-pulse 2.4s ease-out infinite; }
+@keyframes kd-pulse { 0% { transform: scale(.6); opacity: .9; } 100% { transform: scale(3.2); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .kd .flow, .kd .pulse { animation: none !important; } }
+.kd .map-legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--text-2); margin-top: 8px; }
+.kd .map-legend i { display: inline-block; width: 22px; height: 3px; border-radius: 3px; vertical-align: middle; margin-right: 6px; background: linear-gradient(90deg, var(--s2), var(--s1)); }

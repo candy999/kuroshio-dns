@@ -68,6 +68,8 @@ pub struct Config {
     pub api: String,
     /// 發布 HTTPS 記錄（alpn h3,h2）的網域；空白 = 不發布
     pub https_record: Option<String>,
+    /// 裝置從外面連 DoH 的埠號：（TCP, DoH3 的 UDP），見 [`crate::app::public_doh_port`]
+    pub https_ports: (u16, u16),
     /// 連續幾次確定不在了才刪除（預設 `GONE_RUNS`）
     pub gone_runs: u32,
 }
@@ -90,9 +92,35 @@ impl Default for Config {
             url6: "https://[2606:4700:4700::1111]/cdn-cgi/trace".into(),
             api: "https://api.cloudflare.com/client/v4".into(),
             https_record: None,
+            https_ports: (443, 443),
             gone_runs: GONE_RUNS,
         }
     }
+}
+
+/// HTTPS 記錄（RFC 9460）的（名稱, target, SvcParams）。
+///
+/// - DoH 在 443：記錄放在網域本身，`target = "."`（同一個名稱）
+/// - DoH 在其他埠（例如 8443）：瀏覽器查的是 `_8443._https.<網域>`（RFC 9460 第 9.1 節），
+///   target 要寫網域本身（`_8443._https…` 沒有 A / AAAA），並加上 `port=`
+/// - DoH3 的 UDP 埠跟 TCP 不同：記錄只宣告 h3（`no-default-alpn`，不支援 HTTP/3 的用戶端會略過這筆、直接連原本的埠），
+///   `port=` 是 UDP 的埠號
+pub fn https_record(domain: &str, tcp: u16, udp: u16) -> (String, String, String) {
+    let (name, target) = if tcp == 443 {
+        (domain.to_string(), ".".to_string())
+    } else {
+        (format!("_{tcp}._https.{domain}"), format!("{domain}."))
+    };
+    let value = if udp == tcp {
+        if tcp == 443 {
+            "alpn=\"h3,h2\"".to_string()
+        } else {
+            format!("alpn=\"h3,h2\" port={tcp}")
+        }
+    } else {
+        format!("alpn=\"h3\" no-default-alpn port={udp}")
+    };
+    (name, target, value)
 }
 
 /// `ddns.interfaces`；沒寫時，`ipSource = interface` 沿用舊的 `iface4` / `iface6`
@@ -179,6 +207,10 @@ impl Config {
             url6: s("url6", &d.url6),
             api: s("api", &d.api),
             https_record: (b("httpsRecord", true) && h3 && !domain.is_empty()).then_some(domain),
+            https_ports: {
+                let tls = crate::app::doh_uses_tls(cfg, &crate::app::config_dir(cfg));
+                (crate::app::public_doh_port(cfg, tls), crate::app::public_doh3_port(cfg, tls))
+            },
             gone_runs: GONE_RUNS,
         })
     }
@@ -725,7 +757,8 @@ impl Ddns {
             }
             // HTTPS 記錄：一天確認一次
             if let Some(domain) = &c.https_record {
-                let key = format!("HTTPS|{domain}");
+                let (name, target, value) = https_record(domain, c.https_ports.0, c.https_ports.1);
+                let key = format!("HTTPS|{name}|{value}");
                 let fresh = self
                     .mem
                     .lock()
@@ -735,21 +768,23 @@ impl Ddns {
                     .map(|(_, at, _)| at.elapsed() < Duration::from_secs(86400))
                     .unwrap_or(false);
                 if force || !fresh {
-                    let value = "alpn=\"h3,h2\"";
                     let body =
-                        json!({ "type": "HTTPS", "name": domain, "ttl": 300, "data": { "priority": 1, "target": ".", "value": value } });
+                        json!({ "type": "HTTPS", "name": name, "ttl": 300, "data": { "priority": 1, "target": target, "value": value } });
+                    // Cloudflare 可能把參數整理成別的寫法（加引號、空白）：去掉引號與空白再比
+                    let norm = |v: &str| v.chars().filter(|c| *c != '"' && !c.is_whitespace()).collect::<String>();
                     match self
-                        .upsert(domain, "HTTPS", body, |r| {
-                            r["data"]["value"].as_str().map(|v| v.contains("h3")).unwrap_or(false)
+                        .upsert(&name, "HTTPS", body, |r| {
+                            r["data"]["value"].as_str().map(norm) == Some(norm(&value))
+                                && r["data"]["target"].as_str().map(|t| t.trim_end_matches('.')) == Some(target.trim_end_matches('.'))
                         })
                         .await
                     {
                         Ok((action, _)) => {
                             self.mem.lock().unwrap().last.insert(key, (String::new(), Instant::now(), false));
-                            results.push(json!({ "name": domain, "type": "HTTPS", "ok": true, "action": action }));
+                            results.push(json!({ "name": name, "type": "HTTPS", "ok": true, "action": action }));
                         }
                         Err(e) => {
-                            results.push(json!({ "name": domain, "type": "HTTPS", "ok": false, "action": "error", "error": e.to_string() }))
+                            results.push(json!({ "name": name, "type": "HTTPS", "ok": false, "action": "error", "error": e.to_string() }))
                         }
                     }
                 }
@@ -770,6 +805,57 @@ impl Ddns {
                 tokio::time::sleep(me.cfg.interval).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod https_record_tests {
+    use super::*;
+
+    #[test]
+    fn port_443_and_others() {
+        assert_eq!(
+            https_record("dns.example.net", 443, 443),
+            ("dns.example.net".into(), ".".into(), "alpn=\"h3,h2\"".into())
+        );
+        // DoH 在 8443（443 被占用）：瀏覽器查 _8443._https，target 是網域本身
+        assert_eq!(
+            https_record("dns.example.net", 8443, 8443),
+            (
+                "_8443._https.dns.example.net".into(),
+                "dns.example.net.".into(),
+                "alpn=\"h3,h2\" port=8443".into()
+            )
+        );
+        // DoH3 另外用 UDP 8444：只宣告 h3
+        assert_eq!(
+            https_record("dns.example.net", 443, 8444).2,
+            "alpn=\"h3\" no-default-alpn port=8444"
+        );
+    }
+
+    #[test]
+    fn ports_from_config() {
+        let c = |over: Value| {
+            let mut cfg = kuroshio_config::build(&json!({ "domain": "dns.example.net", "ddns": { "enabled": true } }));
+            kuroshio_config::merge(&mut cfg, &over);
+            Config::from_cfg(&cfg).unwrap().https_ports
+        };
+        // 自己做 TLS（明確給了憑證）、聽 8443：外面也是 8443，DoH3 預設同一個埠號
+        let tls = json!({ "listen": { "doh": { "enabled": true, "host": "0.0.0.0", "port": 8443, "tls": true, "http3": true } } });
+        assert_eq!(c(tls.clone()), (8443, 8443));
+        let mut sep = tls.clone();
+        sep["listen"]["doh"]["http3Port"] = json!(8444);
+        assert_eq!(c(sep), (8443, 8444));
+        // 路由器把 WAN 443 轉到本機 8443
+        let mut fwd = tls;
+        fwd["listen"]["doh"]["publicPort"] = json!(443);
+        assert_eq!(c(fwd), (443, 443));
+        // 反向代理在前面（DoH 本身是明文）：外面是 443
+        assert_eq!(
+            c(json!({ "listen": { "doh": { "enabled": true, "host": "127.0.0.1", "port": 8053, "tls": false, "http3": true } } })),
+            (443, 443)
+        );
     }
 }
 

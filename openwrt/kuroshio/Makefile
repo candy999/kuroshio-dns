@@ -61,13 +61,14 @@ define Package/kuroshio/install
 	$(INSTALL_BIN) ./files/acme.sh $(1)/usr/libexec/kuroshio/acme.sh
 	$(INSTALL_BIN) ./files/access.sh $(1)/usr/libexec/kuroshio/access.sh
 	$(INSTALL_BIN) ./files/rpcd.sh $(1)/usr/libexec/rpcd/kuroshio
-	# 唯讀資料：種子、評測名單、CDN 官方範圍、公開網頁、預設自訂規則
+	# 唯讀資料：種子、評測名單、CDN 官方範圍、公開網頁、共用儀表板、預設自訂規則
 	$(INSTALL_DIR) $(1)/usr/share/kuroshio
 	$(CP) $(REPO_ROOT)/data/seed $(1)/usr/share/kuroshio/seed
 	$(CP) $(REPO_ROOT)/data/benchmark $(1)/usr/share/kuroshio/benchmark
 	$(CP) $(REPO_ROOT)/data/cdn $(1)/usr/share/kuroshio/cdn
 	$(CP) $(REPO_ROOT)/data/geo $(1)/usr/share/kuroshio/geo
 	$(CP) $(REPO_ROOT)/data/site $(1)/usr/share/kuroshio/site
+	$(CP) $(REPO_ROOT)/data/dashboard $(1)/usr/share/kuroshio/dashboard
 	$(INSTALL_DATA) $(REPO_ROOT)/rules/default-custom-rules.txt $(1)/usr/share/kuroshio/default-custom-rules.txt
 endef
 

@@ -33,6 +33,8 @@ pub struct WebUi {
     pub token_file: Option<PathBuf>,
     sessions: Sessions,
     pub static_dir: PathBuf,
+    /// 共用儀表板（dashboard.js、dashboard.css）：設定頁用 `/dashboard/<檔名>` 載入
+    pub dashboard_dir: PathBuf,
     /// 用 JSON 設定檔執行時的路徑（UCI 時沒有：設定走 LuCI）
     pub config_file: OnceLock<PathBuf>,
     /// 執行方式（cmd / 服務），給設定頁顯示
@@ -229,11 +231,18 @@ impl WebUi {
             .map(PathBuf::from)
             .unwrap_or_else(|| share_dir.join("admin"));
         let sessions = token.as_deref().map(session_store).unwrap_or_default();
+        // 設定頁資料夾旁邊的 dashboard/（開發時 admin.webDir 指到原始碼的 data/admin），沒有再用 share/dashboard
+        let dashboard_dir = static_dir
+            .parent()
+            .map(|p| p.join("dashboard"))
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| share_dir.join("dashboard"));
         WebUi {
             token,
             token_file,
             sessions,
             static_dir,
+            dashboard_dir,
             config_file: OnceLock::new(),
             run_mode: OnceLock::new(),
             about: crate::about::json(cfg),
@@ -311,11 +320,14 @@ impl WebUi {
             .is_some_and(|c| self.sessions.lock().unwrap().get(c).is_some_and(|at| at.elapsed() < SESSION_TTL))
     }
 
-    /// 讀靜態檔（只允許 static_dir 底下的一層檔名）
+    /// 讀靜態檔（只允許 static_dir 底下的一層檔名；`dashboard/<檔名>` 是共用儀表板）
     pub fn static_file(&self, path: &str) -> Option<(&'static str, Vec<u8>)> {
-        let name = match path.trim_start_matches('/') {
-            "" => "index.html",
-            p => p,
+        let (dir, name) = match path.trim_start_matches('/') {
+            "" => (&self.static_dir, "index.html"),
+            p => match p.strip_prefix("dashboard/") {
+                Some(n) => (&self.dashboard_dir, n),
+                None => (&self.static_dir, p),
+            },
         };
         if name.contains('/') || name.contains('\\') || name.starts_with('.') {
             return None;
@@ -329,7 +341,7 @@ impl WebUi {
             "png" => "image/png",
             _ => return None,
         };
-        std::fs::read(self.static_dir.join(name)).ok().map(|b| (ctype, b))
+        std::fs::read(dir.join(name)).ok().map(|b| (ctype, b))
     }
 
     pub fn session_json(&self, req: &Req, uci: bool) -> Value {
@@ -477,6 +489,25 @@ mod tests {
         assert!(w.static_file("/../etc/passwd").is_none());
         assert!(w.static_file("/.hidden.js").is_none());
         assert!(w.static_file("/a/b.js").is_none());
+        // 共用儀表板：設定頁資料夾旁的 dashboard/，一樣只認一層檔名
+        let base = std::env::temp_dir().join(format!("kuroshio-webui-dash-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("admin")).unwrap();
+        std::fs::create_dir_all(base.join("dashboard")).unwrap();
+        std::fs::write(base.join("dashboard/dashboard.js"), "x").unwrap();
+        std::fs::write(base.join("admin/index.html"), "<p>").unwrap();
+        let w = WebUi::new(
+            &json!({ "admin": { "auth": false, "webDir": base.join("admin").to_string_lossy() } }),
+            std::path::Path::new("/nonexistent"),
+            std::path::Path::new("/nonexistent"),
+        );
+        assert_eq!(
+            w.static_file("/dashboard/dashboard.js").unwrap(),
+            ("text/javascript; charset=utf-8", b"x".to_vec())
+        );
+        assert!(w.static_file("/dashboard/../admin/index.html").is_none());
+        assert!(w.static_file("/dashboard/nope.js").is_none());
+        assert!(w.static_file("/").is_some());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

@@ -196,6 +196,11 @@ async fn empty_hostname_uses_host_header() {
     let (s, _, p) = site(&config(&dir, json!({ "site": { "hostname": "" } })));
     let c = ip("192.0.2.10");
     let html = text(&s.handle("GET", "/", "", c, Some("Router.Example:8443")).await.unwrap());
+    assert!(
+        html.contains("https://router.example:8443/dns-query"),
+        "Host 帶的埠號就是 DoH 的埠號"
+    );
+    let html = text(&s.handle("GET", "/", "", c, Some("router.example")).await.unwrap());
     assert!(html.contains("https://router.example/dns-query"));
     let html = text(&s.handle("GET", "/", "", c, Some("<script>")).await.unwrap());
     assert!(html.contains(kuroshio::site::PLACEHOLDER_HOST), "奇怪的 Host 改用佔位網域");
@@ -204,6 +209,12 @@ async fn empty_hostname_uses_host_header() {
     assert!(html.contains("https://dns.example/dns-query"));
     let info: Value = json_of(&s.handle("GET", "/api/public/info", "", c, Some("[2001:db8::1]:443")).await.unwrap());
     assert_eq!(info["doh"], "https://[2001:db8::1]/dns-query");
+    let info: Value = json_of(
+        &s.handle("GET", "/api/public/info", "", c, Some("[2001:db8::1]:8443"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(info["doh"], "https://[2001:db8::1]:8443/dns-query");
     // 沒有網域：TTL 不壓、只能判斷到 network
     let p = p.unwrap();
     assert_eq!(p.own_host_ttl("router.example"), None);
@@ -304,7 +315,7 @@ async fn mobileconfig() {
     assert_eq!(uuids(&x).len(), 2);
     assert_ne!(uuids(&x), uuids(&dot), "DoH 與 DoT 的 UUID 不同");
     // XML 跳脫
-    let odd = kuroshio::site::mobileconfig("dot", "a&b.test", "/dns-query");
+    let odd = kuroshio::site::mobileconfig("dot", "a&b.test", "/dns-query", 443);
     assert!(odd.contains("<string>a&amp;b.test</string>"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -386,6 +397,98 @@ async fn public_stats_ranges() {
     assert_eq!(json_of(&r)["days"], 30);
     let body = text(&r);
     assert!(!body.contains("192.0.2."), "公開統計不含 IP");
+
+    // 管理介面的儀表板（LuCI、Windows 設定頁）：同一份統計，但排行不受 site.minClients 限制
+    let q = kuroshio::admin::parse_query("range=today");
+    let a = kuroshio::admin::route(&st, "/api/dashboard", &q).await.body;
+    assert_eq!(a["range"], "today");
+    assert_eq!(a["totals"]["queries"], 4);
+    assert_eq!(a["privacy"]["minClients"], 1);
+    let names: Vec<&str> = a["topSites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["site"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"example.com") && names.contains(&"example.net"), "{names:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // 預設 site.minClients = 1：只有一個人造訪的網站也列出來（站長可以調高）
+    let dir = tmp("stats-default");
+    let (s, st, _) = site(&config(&dir, json!({})));
+    st.resolver.stats.site("www.example.com", ip("192.0.2.1"));
+    st.resolver.stats.site("only.example.net", ip("192.0.2.1"));
+    let t = s.public_stats("today");
+    assert_eq!(t["privacy"]["minClients"], 1);
+    assert_eq!(t["topSites"].as_array().unwrap().len(), 2, "{}", t["topSites"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// DoH 用 443 以外的埠號（例如 443 被占用改用 8443）：公開頁、描述檔、QR 碼、連線資訊都要帶埠號
+#[tokio::test]
+async fn doh_on_other_port() {
+    let dir = tmp("port");
+    let (s, _, _) = site(&config(
+        &dir,
+        json!({ "listen": { "doh": { "enabled": true, "host": "0.0.0.0", "port": 8443, "tls": true } } }),
+    ));
+    let at = |host: &'static str, target: &'static str| {
+        let s = s.clone();
+        async move {
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            s.handle("GET", path, query, ip("192.0.2.10"), Some(host)).await.unwrap()
+        }
+    };
+    // 瀏覽器連 https://dns.example:8443/：Host 標頭帶 8443
+    let info = json_of(&at("dns.example:8443", "/api/public/info").await);
+    assert_eq!(info["doh"], "https://dns.example:8443/dns-query");
+    assert_eq!(info["dohPort"], 8443);
+    assert_eq!(info["site"], "https://dns.example:8443/");
+    assert_eq!(info["dot"], "dns.example", "Android 私人 DNS 只填主機名稱");
+    let html = text(&at("dns.example:8443", "/").await);
+    assert!(html.contains("https://dns.example:8443/dns-query"), "設定教學的 DoH 網址帶埠號");
+    assert!(html.contains("https://dns.example:8443/"), "分享區的網址帶埠號");
+    assert!(!html.contains("https://dns.example/dns-query"), "沒有漏掉埠號的 DoH 網址");
+    assert!(html.contains("853"), "說明 Android 私人 DNS 只能用 DoT 853");
+    let apple = text(&at("dns.example:8443", "/apple/doh.mobileconfig").await);
+    assert!(apple.contains("<key>ServerURL</key><string>https://dns.example:8443/dns-query</string>"));
+    let qr = |t: &str| kuroshio::about::qr_svg(t).unwrap();
+    assert_eq!(
+        text(&at("dns.example:8443", "/qr.svg?for=doh").await),
+        qr("https://dns.example:8443/dns-query")
+    );
+    assert_eq!(
+        text(&at("dns.example:8443", "/qr.svg?for=site").await),
+        qr("https://dns.example:8443/")
+    );
+    // 詳細頁也一樣
+    let detail = text(&at("dns.example:8443", "/detail/").await);
+    assert!(!detail.contains("{{"));
+
+    // 埠號轉送（外面 443 → 本機 8443）：瀏覽器連的是 443，Host 標頭沒有埠號
+    let info = json_of(&at("dns.example", "/api/public/info").await);
+    assert_eq!(info["doh"], "https://dns.example/dns-query");
+    assert_eq!(info["dohPort"], 443);
+    // Host 是反向代理改寫過的本機位址（不是這個網域）：用設定的埠號
+    let info = json_of(&at("127.0.0.1:8053", "/api/public/info").await);
+    assert_eq!(info["doh"], "https://dns.example:8443/dns-query");
+    // 設定了對外埠號
+    let (s2, _, _) = site(&config(
+        &dir,
+        json!({ "listen": { "doh": { "enabled": true, "host": "0.0.0.0", "port": 8443, "tls": true, "publicPort": 443 } } }),
+    ));
+    let r = s2.handle("GET", "/api/public/info", "", ip("192.0.2.10"), None).await.unwrap();
+    assert_eq!(json_of(&r)["doh"], "https://dns.example/dns-query");
+
+    // 共用儀表板的檔案
+    for (p, ct) in [
+        ("/assets/dashboard.js", "text/javascript; charset=utf-8"),
+        ("/assets/dashboard.css", "text/css; charset=utf-8"),
+    ] {
+        let r = at("dns.example:8443", p).await;
+        assert_eq!((r.status, r.header("content-type")), (200, Some(ct)), "{p}");
+    }
+    assert_eq!(at("dns.example:8443", "/assets/other.js").await.status, 404);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -616,7 +719,7 @@ fn parity_with_node() {
     let v: Value = serde_json::from_slice(&std::fs::read(root().join("tests/vectors/site/cases.json")).unwrap()).unwrap();
     for c in v["mobileconfig"].as_array().unwrap() {
         let (host, kind) = (c["host"].as_str().unwrap(), c["kind"].as_str().unwrap());
-        let x = kuroshio::site::mobileconfig(kind, host, "/dns-query");
+        let x = kuroshio::site::mobileconfig(kind, host, "/dns-query", 443);
         let pick = |key: &str| -> Vec<String> {
             let pat = format!("<key>{key}</key><string>");
             x.match_indices(&pat)

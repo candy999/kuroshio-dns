@@ -171,6 +171,41 @@ fn parse_host(h: &str) -> Option<IpAddr> {
     h.trim_start_matches('[').trim_end_matches(']').parse().ok()
 }
 
+fn cfg_port(cfg: &Value, key: &str) -> Option<u16> {
+    get(cfg, key)
+        .and_then(Value::as_u64)
+        .filter(|p| *p > 0 && *p <= 65535)
+        .map(|p| p as u16)
+}
+
+/// 裝置從外面連 DoH 用的 TCP 埠號（公開頁、描述檔、QR 碼、Cloudflare HTTPS 記錄、Alt-Svc 都用這個）：
+/// 1. `listen.doh.publicPort`（> 0）：外面看到的埠號跟監聽的不同時（例如路由器把 WAN 443 轉到本機 8443）
+/// 2. DoH 自己做 TLS（`tls`）：`listen.doh.port`——DoH 可以用任何埠號，例如 443 被占用時改用 8443
+/// 3. 前面有反向代理（IIS、nginx…，DoH 本身是明文）：443
+pub fn public_doh_port(cfg: &Value, tls: bool) -> u16 {
+    if let Some(p) = cfg_port(cfg, "listen.doh.publicPort") {
+        return p;
+    }
+    if tls {
+        cfg_port(cfg, "listen.doh.port").unwrap_or(443)
+    } else {
+        443
+    }
+}
+
+/// 裝置從外面連 DoH3（HTTP/3，UDP）用的埠號：
+/// `listen.doh.altSvcPort` → DoH3 跟 DoH 同一個埠號（`http3Port` 是 0 或一樣）時同 [`public_doh_port`] → `listen.doh.http3Port`
+pub fn public_doh3_port(cfg: &Value, tls: bool) -> u16 {
+    if let Some(p) = cfg_port(cfg, "listen.doh.altSvcPort") {
+        return p;
+    }
+    let listen = cfg_port(cfg, "listen.doh.port").unwrap_or(443);
+    match cfg_port(cfg, "listen.doh.http3Port") {
+        Some(h3) if h3 != listen => h3,
+        _ => public_doh_port(cfg, tls),
+    }
+}
+
 /// DoH 的 TCP 監聽要不要自己做 TLS（`listen.doh.tls`：`"auto"` / `true` / `false`）。
 ///
 /// auto：
@@ -391,7 +426,14 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             }
         }
         // 對外埠號可能不同（例如 WAN 443 → 本機 8443）：listen.doh.altSvcPort 可以指定
-        let adv = get(cfg, "listen.doh.altSvcPort").and_then(Value::as_u64).unwrap_or(0) as u16;
+        // 沒有指定時：DoH3 跟 DoH 同埠號、而且設定了 listen.doh.publicPort（埠號轉送）→ 宣告外面看到的埠號
+        let adv = match cfg_port(cfg, "listen.doh.altSvcPort") {
+            Some(p) => p,
+            None => match cfg_port(cfg, "listen.doh.publicPort") {
+                Some(p) if out.doh3.map(|b| b.port()) == Some(port) => p,
+                _ => 0,
+            },
+        };
         opts.alt_svc = crate::httpsys::alt_svc(plan3, out.doh3.map(|b| b.port()), port, sys_alt, adv);
         let mut urls_json = Vec::new();
         if mode == WinMode::HttpSys {

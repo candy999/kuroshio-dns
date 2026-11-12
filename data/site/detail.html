@@ -8,6 +8,7 @@
 <meta name="color-scheme" content="dark light">
 <title>黑潮 DNS · 詳細數據</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/dashboard.css">
 <style>
 :root {
   color-scheme: dark;
@@ -46,43 +47,6 @@ header { position: sticky; top: 10px; z-index: 10; padding: 0 10px; }
 .seg button { border: 0; background: transparent; color: var(--text-2); padding: 5px 12px; border-radius: 999px; font: inherit; font-size: 13.5px; cursor: pointer; }
 .seg button[aria-pressed="true"] { background: var(--btn); color: #fff; font-weight: 650; box-shadow: inset 0 1px 0 rgba(255,255,255,.3); }
 .nav .logo { width: 24px; height: 24px; flex: none; }
-section { padding: 34px 0 0; scroll-margin-top: 80px; }
-h2 { font-size: 22px; margin: 0 0 14px; }
-h3 { font-size: 15.5px; margin: 0 0 10px; }
-.grid { display: grid; gap: 12px; }
-.g2 { grid-template-columns: 1fr 1fr; } .g3 { grid-template-columns: repeat(3, 1fr); }
-@media (max-width: 900px) { .g2, .g3 { grid-template-columns: 1fr; } }
-.card { padding: 18px; min-width: 0; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
-.tile { padding: 14px 16px; }
-.tile .l { font-size: 13px; color: var(--text-2); }
-.tile .v { font-size: 26px; font-weight: 750; font-variant-numeric: tabular-nums; line-height: 1.3; }
-.tile .n { font-size: 12.5px; color: var(--text-3); }
-.tbl { width: 100%; overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
-th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
-th { color: var(--text-3); font-weight: 600; position: sticky; top: 0; background: color-mix(in srgb, var(--bg) 70%, transparent); cursor: default; }
-th.sort { cursor: pointer; }
-td.num, th.num { text-align: right; }
-td.mono { font-family: var(--mono); font-size: 12.5px; }
-.tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: var(--chip); color: var(--text-2); }
-.tag.ok { color: var(--ok); } .tag.bad { color: var(--bad); } .tag.warn { color: var(--warn); }
-.scroll { max-height: 520px; overflow: auto; border-radius: 12px; }
-.toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center; }
-input, select, .btn { font: inherit; font-size: 14px; color: var(--text); background: var(--chip); border: 1px solid var(--line); border-radius: 10px; padding: 7px 12px; }
-.btn { cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
-.btn:hover { background: var(--glass-2); }
-.muted { color: var(--text-3); font-size: 13px; }
-.chart { position: relative; }
-.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
-.axis { fill: var(--text-3); font: 11px var(--font); }
-.legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--text-2); margin-bottom: 6px; }
-.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
-.tip { position: absolute; pointer-events: none; z-index: 5; padding: 8px 10px; border-radius: 12px; font-size: 12.5px; white-space: nowrap; opacity: 0; background: color-mix(in srgb, var(--bg) 75%, transparent); -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); box-shadow: 0 8px 24px rgba(0,0,0,.3), inset 0 1px 0 var(--glass-hi); }
-.tip .r { display: flex; gap: 8px; align-items: center; } .tip .r i { width: 12px; height: 3px; border-radius: 3px; } .tip b { min-width: 48px; }
-.bar { height: 8px; border-radius: 999px; background: var(--chip); overflow: hidden; min-width: 80px; }
-.bar > div { height: 100%; border-radius: 999px; }
-pre { white-space: pre-wrap; font: 12.5px/1.5 var(--mono); margin: 0; }
 footer { padding: 40px 0; color: var(--text-3); font-size: 13px; }
 .about { padding: 20px; display: grid; grid-template-columns: 1fr auto; gap: 20px; align-items: start; }
 @media (max-width: 640px) { .about { grid-template-columns: 1fr; } .about figure { justify-self: center; } }
@@ -106,94 +70,8 @@ footer { padding: 40px 0; color: var(--text-3); font-size: 13px; }
   <div class="seg" role="group" aria-label="期間"><button data-range="today" aria-pressed="true">今天</button><button data-range="7d" aria-pressed="false">7 天</button><button data-range="30d" aria-pressed="false">30 天</button></div>
 </div></header>
 
-<main class="wrap">
-<section id="overview">
-  <h2>總覽</h2>
-  <div class="tiles" id="tiles"></div>
-  <div class="card glass" style="margin-top:12px">
-    <h3>最近 60 分鐘</h3>
-    <div class="legend"><span><i style="background:var(--s1)"></i>查詢</span><span><i style="background:var(--s3)"></i>拉回台灣</span><span><i style="background:var(--s2)"></i>攔截</span></div>
-    <div class="chart" id="rt"></div>
-  </div>
-</section>
-
-<section id="upstreams">
-  <h2>上游 DNS</h2>
-  <div class="grid g2">
-    <div class="card glass"><h3>執行中的上游</h3><div class="tbl"><table id="upTable"></table></div>
-    <div class="muted" id="errBox" style="margin-top:8px"></div></div>
-    <div class="card glass"><h3>每日評測結果</h3><div id="bench" class="muted">載入中…</div></div>
-  </div>
-</section>
-
-<section id="routing">
-  <h2>機會成本（各 CDN）</h2>
-  <div class="card glass">
-    <p class="muted" style="margin-top:0">「一般 DNS 出國」= 固定上游以外的其他上游給的答案在國外節點；「拉回」= 這裡回給用戶的是台灣節點。每次回應算一次連線。</p>
-    <div class="tbl"><table id="routeTable"></table></div>
-  </div>
-</section>
-
-<section id="pools">
-  <h2>台灣節點池</h2>
-  <div class="grid g2" id="poolCards"></div>
-</section>
-
-<section id="domains">
-  <h2>CDN 網域資料庫</h2>
-  <div class="card glass">
-    <div class="toolbar">
-      <input id="q" placeholder="搜尋網域…" style="flex:1;min-width:180px">
-      <select id="fProv"><option value="">全部 CDN</option></select>
-      <select id="fVer"><option value="">全部判定</option><option value="ok">可置換</option><option value="fail">不可置換</option><option value="unknown">未判定</option><option value="abroad">原本在國外</option><option value="cross-ok">跨 CDN 可用</option><option value="cross-fail">跨 CDN 不可用</option></select>
-      <a class="btn" id="csv" href="api/cdn/domains?format=csv&limit=200000">下載 CSV</a>
-      <span class="muted" id="domCount"></span>
-    </div>
-    <div class="scroll"><table id="domTable"></table></div>
-  </div>
-</section>
-
-<section id="crosscdn">
-  <h2>跨 CDN 備援</h2>
-  <div class="card glass">
-    <div class="muted" id="crossSum" style="margin-bottom:8px"></div>
-    <div class="scroll"><table id="crossTable"></table></div>
-  </div>
-</section>
-
-<section id="top">
-  <h2>排行（未匿名，僅限本頁）</h2>
-  <div class="grid g3">
-    <div class="card glass"><h3>熱門網域</h3><div class="tbl scroll"><table id="topDom"></table></div></div>
-    <div class="card glass"><h3>被擋最多</h3><div class="tbl scroll"><table id="topBlk"></table></div></div>
-    <div class="card glass"><h3>用戶端</h3><div class="tbl scroll"><table id="topCli"></table></div></div>
-  </div>
-</section>
-
-<section id="filter">
-  <h2>過濾規則</h2>
-  <div class="grid g2">
-    <div class="card glass"><h3>規則來源</h3><div class="tbl"><table id="filterTable"></table></div></div>
-    <div class="card glass"><h3>查詢某個網域會不會被擋</h3>
-      <div class="toolbar"><input id="fcName" placeholder="ads.example.com" style="flex:1"><button class="btn" id="fcBtn">檢查</button></div>
-      <pre id="fcOut" class="muted"></pre>
-    </div>
-  </div>
-</section>
-
-<section id="jobs">
-  <h2>排程工作</h2>
-  <div class="card glass"><div class="tbl"><table id="jobTable"></table></div></div>
-</section>
-
-<section id="trace">
-  <h2>追蹤網域</h2>
-  <div class="card glass">
-    <div class="toolbar"><input id="trName" placeholder="www.example.com" style="flex:1;min-width:200px"><select id="trType"><option>A</option><option>AAAA</option><option>HTTPS</option></select><button class="btn" id="trBtn">追蹤</button></div>
-    <div id="trOut"></div>
-  </div>
-</section>
-</main>
+<!-- 圖表與表格由共用儀表板（/assets/dashboard.js）畫出來 -->
+<main class="wrap" id="dash"></main>
 <footer id="about">
   <div class="wrap">
     <div class="about glass">
@@ -213,237 +91,19 @@ footer { padding: 40px 0; color: var(--text-3); font-size: 13px; }
   </div>
 </footer>
 
+<script src="/assets/dashboard.js"></script>
 <script>
 (() => {
   const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
-  const nf = new Intl.NumberFormat('zh-TW');
-  const pct = (x, d = 1) => x === null || x === undefined ? '—' : (x * 100).toFixed(d) + '%';
-  const el = (t, c, x) => { const e = document.createElement(t); if (c) e.className = c; if (x !== undefined) e.textContent = x; return e; };
-  const NS = 'http://www.w3.org/2000/svg';
-  const sv = (t, a = {}, p) => { const n = document.createElementNS(NS, t); for (const k in a) n.setAttribute(k, a[k]); if (p) p.appendChild(n); return n; };
-  const ago = ms => { if (!ms) return '—'; const s = (Date.now() - ms) / 1000; return s < 60 ? Math.round(s) + ' 秒前' : s < 3600 ? Math.round(s / 60) + ' 分前' : s < 86400 ? Math.round(s / 3600) + ' 小時前' : Math.round(s / 86400) + ' 天前'; };
-  const api = p => fetch('api/' + p).then(r => r.json());
-  const LABEL = { cloudflare: 'Cloudflare', cloudfront: 'CloudFront', fastly: 'Fastly', gcore: 'Gcore', azure: 'Azure', akamai: 'Akamai' };
-
-  /** 建表：cols = [{ h, v(row), cls, num }] */
-  function table(node, rows, cols, empty = '沒有資料') {
-    node.textContent = '';
-    const hr = el('tr'); cols.forEach(c => { const th = el('th', c.num ? 'num' : '', c.h); hr.appendChild(th); }); node.appendChild(hr);
-    if (!rows.length) { const tr = el('tr'); const td = el('td', 'muted', empty); td.colSpan = cols.length; tr.appendChild(td); node.appendChild(tr); return; }
-    rows.forEach(r => {
-      const tr = el('tr');
-      cols.forEach(c => {
-        const td = el('td', (c.num ? 'num ' : '') + (c.cls || ''));
-        const v = c.v(r);
-        if (v instanceof Node) td.appendChild(v); else td.textContent = v === null || v === undefined ? '—' : v;
-        tr.appendChild(td);
-      });
-      node.appendChild(tr);
-    });
-  }
-  const tag = (txt, kind) => el('span', 'tag ' + (kind || ''), txt);
-  const verdictTag = v => !v ? tag('—') : v.verdict === 'ok' ? tag('可置換', 'ok') : v.verdict === 'fail' ? tag('不可', 'bad') : tag('未判定', 'warn');
-
-  function lineChart(container, data, series) {
-    container.textContent = '';
-    const W = Math.max(300, container.clientWidth || 800), H = 190, L = 40, R = 8, T = 8, B = 22;
-    const maxV = Math.max(1, ...data.flatMap(d => series.map(s => d[s.key])));
-    const mag = Math.pow(10, Math.floor(Math.log10(maxV))); const top = Math.ceil(maxV / mag * 2) / 2 * mag;
-    const x = i => L + (W - L - R) * i / (data.length - 1), y = v => T + (H - T - B) * (1 - v / top);
-    const svg = sv('svg', { viewBox: `0 0 ${W} ${H}` });
-    for (let k = 0; k <= 4; k++) { const yy = y(top * k / 4); sv('line', { x1: L, x2: W - R, y1: yy, y2: yy, stroke: 'var(--grid)' }, svg); sv('text', { x: L - 6, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = nf.format(top * k / 4); }
-    const hm = t => new Date(t).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false });
-    [0, 15, 30, 45, 59].forEach(i => sv('text', { x: x(i), y: H - 4, 'text-anchor': i === 0 ? 'start' : i === 59 ? 'end' : 'middle', class: 'axis' }, svg).textContent = hm(data[i].t));
-    series.forEach((s, idx) => {
-      const d = data.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p[s.key]).toFixed(1)}`).join('');
-      if (!idx) sv('path', { d: d + `L${x(data.length - 1)},${y(0)}L${x(0)},${y(0)}Z`, fill: s.color, opacity: .12 }, svg);
-      sv('path', { d, fill: 'none', stroke: s.color, 'stroke-width': 2, 'stroke-linejoin': 'round' }, svg);
-    });
-    const cross = sv('line', { y1: T, y2: H - B, stroke: 'var(--text-3)', opacity: 0 }, svg);
-    const hit = sv('rect', { x: L, y: T, width: W - L - R, height: H - T - B, fill: 'transparent' }, svg);
-    container.appendChild(svg);
-    const tip = el('div', 'tip'); container.appendChild(tip);
-    hit.addEventListener('pointermove', e => {
-      const b = svg.getBoundingClientRect(); const i = Math.max(0, Math.min(data.length - 1, Math.round(((e.clientX - b.left) / b.width * W - L) / (W - L - R) * (data.length - 1))));
-      cross.setAttribute('x1', x(i)); cross.setAttribute('x2', x(i)); cross.setAttribute('opacity', .6);
-      tip.textContent = ''; tip.appendChild(el('div', 'muted', hm(data[i].t)));
-      series.forEach(s => { const r = el('div', 'r'); const ii = el('i'); ii.style.background = s.color; r.appendChild(ii); r.appendChild(el('b', '', nf.format(data[i][s.key]))); r.appendChild(el('span', '', s.name)); tip.appendChild(r); });
-      tip.style.left = Math.min(x(i) / W * b.width + 12, b.width - 140) + 'px'; tip.style.top = '6px'; tip.style.opacity = 1;
-    });
-    hit.addEventListener('pointerleave', () => { tip.style.opacity = 0; cross.setAttribute('opacity', 0); });
-  }
-
-  let range = 'today', domains = [];
-  $$('.seg button').forEach(b => b.addEventListener('click', () => { range = b.dataset.range; $$('.seg button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); loadPublic(); }));
-
-  async function loadPublic() {
-    const p = await fetch('api/public?range=' + range).then(r => r.json());
-    const t = p.totals, o = p.opportunity;
-    const tiles = [
-      ['DNS 查詢', nf.format(t.queries), `快取命中 ${pct(t.cacheHitRate)}`],
-      ['攔截', nf.format(t.blocked), `廣告 ${nf.format(t.blockedAds)} · 惡意 ${nf.format(t.blockedMalware)} · 自訂 ${nf.format(t.blockedCustom)}`],
-      ['CDN 連線比對', nf.format(o.connections), `一般 DNS 出國 ${pct(o.otherDnsAbroadShare)}`],
-      ['拉回台灣', nf.format(o.accelerated), `仍在國外 ${nf.format(o.stillAbroad)}（${pct(o.oursAbroadShare)}）`],
-      ['平均縮短', o.avgSavedMs !== null ? o.avgSavedMs + ' ms' : '—', `合計 ${o.totalSavedSec} 秒`],
-      ['已驗證可加速網站', nf.format(p.acceleration.verifiedSites), `台灣節點 v4 ${p.acceleration.twNodesV4} · v6 ${p.acceleration.twNodesV6}`]
-    ];
-    const tn = $('#tiles'); tn.textContent = '';
-    tiles.forEach(([l, v, n]) => { const d = el('div', 'tile glass'); d.appendChild(el('div', 'l', l)); d.appendChild(el('div', 'v', v)); d.appendChild(el('div', 'n', n)); tn.appendChild(d); });
-    lineChart($('#rt'), p.realtime, [{ key: 'queries', name: '查詢', color: 'var(--s1)' }, { key: 'accelerated', name: '拉回台灣', color: 'var(--s3)' }, { key: 'blocked', name: '攔截', color: 'var(--s2)' }]);
-    table($('#routeTable'), p.routing, [
-      { h: 'CDN', v: r => r.label },
-      { h: '連線', v: r => nf.format(r.connections), num: 1 },
-      { h: '一般 DNS 出國', v: r => nf.format(r.wouldGoAbroad), num: 1 },
-      { h: '出國比例', v: r => pct(r.abroadShare), num: 1 },
-      { h: '拉回台灣', v: r => nf.format(r.accelerated), num: 1 },
-      { h: '仍在國外', v: r => nf.format(r.stillAbroad), num: 1 },
-      { h: '成功率', v: r => { const w = el('div', 'bar'); const f = el('div'); f.style.width = ((r.successRate || 0) * 100) + '%'; f.style.background = 'var(--s1)'; w.appendChild(f); const box = el('div'); box.style.display = 'flex'; box.style.gap = '8px'; box.style.alignItems = 'center'; box.appendChild(w); box.appendChild(el('span', '', pct(r.successRate))); return box; } },
-      { h: '平均縮短', v: r => r.avgSavedMs !== null ? r.avgSavedMs + ' ms' : '—', num: 1 }
-    ], '資料累積中');
-  }
-
-  async function loadStatus() {
-    const s = await api('status');
-    table($('#upTable'), s.upstreams, [
-      { h: '上游', v: u => u.id, cls: 'mono' },
-      { h: '角色', v: u => tag(u.role === 'pinned' ? '固定' : u.role === 'auto' ? '自動' : u.role === 'fallback' ? '備援' : u.role, u.paused ? 'bad' : '') },
-      { h: '成功', v: u => nf.format(u.ok), num: 1 }, { h: '失敗', v: u => nf.format(u.fail), num: 1 },
-      { h: '平均 ms', v: u => u.avgMs ?? '—', num: 1 }
-    ]);
-    const er = s.errors || { count: 0, recent: [] };
-    const eb = $('#errBox'); eb.textContent = er.count ? `處理例外 ${nf.format(er.count)} 次（已回 SERVFAIL，沒有讓裝置乾等）· 最近：${er.recent.slice(0, 3).map(x => ago(x.at) + ' ' + x.msg.slice(0, 120)).join('；')}` : '處理例外 0 次';
-    eb.style.color = er.count ? 'var(--s8, #e66767)' : '';
-    const tb = n => Object.entries(n).map(([k, v]) => ({ k, v }));
-    table($('#topDom'), s.stats.topDomains || [], [{ h: '網域', v: r => r.name, cls: 'mono' }, { h: '次數', v: r => nf.format(r.count), num: 1 }]);
-    table($('#topBlk'), s.stats.topBlocked || [], [{ h: '網域', v: r => r.name, cls: 'mono' }, { h: '次數', v: r => nf.format(r.count), num: 1 }]);
-    table($('#topCli'), s.stats.topClients || [], [{ h: '用戶端', v: r => r.name, cls: 'mono' }, { h: '次數', v: r => nf.format(r.count), num: 1 }]);
-    const f = s.filter;
-    if (f) table($('#filterTable'), [{ name: '自訂過濾規則.txt', category: 'custom', lines: f.custom, updated: f.loadedAt || f.updatedAt, url: '' }, ...(f.sources || []).map(x => ({ ...x, lines: x.lines ?? x.rules, updated: x.updated || f.updatedAt }))], [
-      { h: '來源', v: r => r.name || r.url },
-      { h: '類別', v: r => tag(r.category === 'malware' ? '惡意' : r.category === 'custom' ? '自訂' : r.category === 'telemetry' ? '追蹤' : '廣告', r.category === 'malware' ? 'bad' : '') },
-      { h: '行數', v: r => nf.format(r.lines), num: 1 },
-      { h: '更新', v: r => r.updated ? new Date(r.updated).toLocaleString('zh-TW', { hour12: false }) : '尚未下載' }
-    ]);
-    const j = s.jobs;
-    if (j) table($('#jobTable'), Object.entries(j.config).map(([name, c]) => ({ name, c, st: j.state[name] || {} })), [
-      { h: '工作', v: r => r.name, cls: 'mono' },
-      { h: '排程', v: r => [].concat(r.c.at || []).join(', ') + (r.c.weekdays ? ' · 週' + r.c.weekdays.map(d => '日一二三四五六'[d]).join('') : ' · 每天') },
-      { h: '狀態', v: r => j.running && j.running.name === r.name ? tag('執行中', 'warn') : r.st.lastCode === 0 ? tag('成功', 'ok') : r.st.lastCode === undefined ? tag('未執行') : tag('失敗 ' + r.st.lastCode, 'bad') },
-      { h: '上次結束', v: r => r.st.lastEnd ? new Date(r.st.lastEnd).toLocaleString('zh-TW', { hour12: false }) + '（' + ago(r.st.lastEnd) + '）' : '—' },
-      { h: '原因', v: r => r.st.reason || '—' }
-    ]);
-  }
-
-  async function loadBench() {
-    const b = await api('benchmark');
-    const box = $('#bench'); box.textContent = '';
-    if (!b || !b.selected) { box.textContent = '尚無評測結果'; return; }
-    box.className = '';
-    box.appendChild(el('div', 'muted', `${new Date(b.generatedAt).toLocaleString('zh-TW', { hour12: false })} · 測試 ${b.counts.total} 台 · 存活 ${b.counts.survivors} · 淘汰 ${b.counts.eliminated} · 涵蓋率 ${pct(b.coverage)}`));
-    const t = el('table'); const w = el('div', 'tbl'); w.style.marginTop = '8px'; w.appendChild(t); box.appendChild(w);
-    table(t, [...b.selected.map(x => ({ ...x, role: '自動' })), ...b.pinned.map(x => ({ ...x, role: '固定', type: '', newItems: x.coverageItems, reason: x.issues.length ? x.issues.length + ' 個問題' : '' }))], [
-      { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 }, { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
-    ]);
-    if (b.blocked && b.blocked.length) box.appendChild(el('div', 'muted', `封殺紀錄 ${b.blocked.length} 筆（例：${b.blocked.slice(0, 3).map(x => x.dns + ' → ' + x.domain).join('、')}）`));
-  }
-
-  async function loadPools() {
-    const [pools, v6] = await Promise.all([api('cdn/pools'), api('cdn/v6nodes')]);
-    const wrap = $('#poolCards'); wrap.textContent = '';
-    Object.entries(pools).forEach(([name, d]) => {
-      const card = el('div', 'card glass');
-      card.appendChild(el('h3', '', `${LABEL[name] || name}`));
-      card.appendChild(el('div', 'muted', `掃描：TW / Global / Dead 共 ${d.scan.tw + d.scan.global + d.scan.dead} 段 · 官方範圍 v4 ${d.ranges.v4} / v6 ${d.ranges.v6} 段 · 永久 v6 ${Object.keys((v6.providers || {})[name] || {}).length} 個`));
-      const t = el('table'); const w = el('div', 'tbl'); w.style.marginTop = '8px'; w.appendChild(t); card.appendChild(w);
-      const rows = [...d.v4.map(x => ({ ...x, fam: 'v4' })), ...d.v6.map(x => ({ ...x, fam: 'v6' }))];
-      table(t, rows, [
-        { h: '', v: r => tag(r.fam) }, { h: 'IP', v: r => r.ip, cls: 'mono' }, { h: 'POP', v: r => r.pop || '—' },
-        { h: 'ms', v: r => r.ms ?? '—', num: 1 }, { h: 'MB/s', v: r => r.speed ?? '—', num: 1 },
-        { h: '狀態', v: r => r.bad ? tag(r.bad, 'bad') : r.permanent ? tag('永久', 'ok') : tag('可用', 'ok') }
-      ], '尚無節點');
-      wrap.appendChild(card);
-    });
-  }
-
-  function renderDomains() {
-    const q = $('#q').value.trim().toLowerCase(), pv = $('#fProv').value, vf = $('#fVer').value;
-    const rows = domains.filter(e => (!q || e.name.includes(q)) && (!pv || e.provider === pv) &&
-      (!vf || (vf.startsWith('cross-') ? e.cross4 && e.cross4.verdict === vf.slice(6) : vf === 'abroad' ? e.base && e.base.pop && !/^(TPE|KHH|TSA|RMQ)/.test(e.base.pop) : vf === 'unknown' ? !(e.v4 && (e.v4.verdict === 'ok' || e.v4.verdict === 'fail')) : e.v4 && e.v4.verdict === vf)));
-    $('#domCount').textContent = `${nf.format(rows.length)} / ${nf.format(domains.length)} 筆`;
-    table($('#domTable'), rows.slice(0, 600), [
-      { h: '網域', v: e => e.name, cls: 'mono' },
-      { h: 'CDN', v: e => LABEL[e.provider] || e.provider || '—' },
-      { h: '辨識', v: e => e.via === 'cname' ? 'CNAME' : 'IP' },
-      { h: '查詢', v: e => nf.format(e.hits || 0), num: 1 },
-      { h: '原始 POP', v: e => e.base && e.base.pop ? tag(e.base.pop, /^(TPE|KHH)/.test(e.base.pop) ? 'ok' : 'warn') : '—' },
-      { h: '原始 ms', v: e => e.base && e.base.ms ? e.base.ms : '—', num: 1 },
-      { h: '台灣 POP', v: e => e.v4 && e.v4.pop ? e.v4.pop : '—' },
-      { h: '台灣 ms', v: e => e.v4 && e.v4.ms ? e.v4.ms : '—', num: 1 },
-      { h: 'IPv4', v: e => verdictTag(e.v4) },
-      { h: 'IPv6', v: e => verdictTag(e.v6) },
-      { h: 'ECS', v: e => e.ecs ? (e.ecs.verdict === 'ok' ? tag(`−${e.ecs.gainMs}ms`, 'ok') : tag(e.ecs.verdict)) : '—' },
-      { h: '跨 CDN', v: e => e.cross4 ? (e.cross4.verdict === 'ok' ? tag('→' + (LABEL[e.cross4.to] || e.cross4.to), 'ok') : tag(e.cross4.verdict === 'fail' ? '無' : e.cross4.verdict)) : '—' },
-      { h: '說明', v: e => (e.v4 && e.v4.reason) || (e.ecs && e.ecs.reason) || '' },
-      { h: '最後查詢', v: e => ago(e.lastSeen) }
-    ], '沒有符合的網域');
-  }
-  function renderCross() {
-    const rows = domains.filter(e => e.cross4 && e.cross4.verdict && e.cross4.verdict !== 'none')
-      .sort((a, b) => ((b.cross4.verdict === 'ok') - (a.cross4.verdict === 'ok')) || (b.hits || 0) - (a.hits || 0));
-    const ok = rows.filter(e => e.cross4.verdict === 'ok').length;
-    $('#crossSum').textContent = rows.length ? `試過 ${nf.format(rows.length)} 個網站，${nf.format(ok)} 個找到別家 CDN 的台灣節點（${pct(ok / rows.length)}）` : '還沒有網站需要跨 CDN（原本的 CDN 沒有台灣節點、而且有人連線後才會測試）';
-    const why = e => (e.cross4.tried || []).map(x => `${LABEL[x.to] || x.to}：${x.ok ? `可用 ${x.ms ?? '?'}ms` : x.reason}`).join('；');
-    table($('#crossTable'), rows.slice(0, 400), [
-      { h: '網域', v: e => e.name, cls: 'mono' },
-      { h: '原本', v: e => LABEL[e.cross4.from] || e.cross4.from || LABEL[e.provider] || '—' },
-      { h: '結果', v: e => e.cross4.verdict === 'ok' ? tag('→ ' + (LABEL[e.cross4.to] || e.cross4.to), 'ok') : tag('沒有可用的', 'warn') },
-      { h: '原本 ms', v: e => e.cross4.origMs ?? '—', num: 1 },
-      { h: '改走 ms', v: e => e.cross4.ms ?? '—', num: 1 },
-      { h: '查詢', v: e => nf.format(e.hits || 0), num: 1 },
-      { h: '各家測試結果', v: e => e.cross4.verdict === 'ok' ? why(e) : (e.cross4.reason + (why(e) ? '｜' + why(e) : '')) },
-      { h: '測試時間', v: e => ago(e.cross4.at) }
-    ], '尚無資料');
-  }
-  async function loadDomains() {
-    domains = await api('cdn/domains?limit=20000');
-    renderCross();
-    const provs = [...new Set(domains.map(d => d.provider).filter(Boolean))].sort();
-    const sel = $('#fProv'); const cur = sel.value; sel.length = 1; provs.forEach(p => sel.appendChild(new Option(LABEL[p] || p, p))); sel.value = cur;
-    renderDomains();
-  }
-  ['#q', '#fProv', '#fVer'].forEach(s => $(s).addEventListener('input', renderDomains));
-  $('#fProv').addEventListener('change', () => { $('#csv').href = 'api/cdn/domains?format=csv&limit=200000' + ($('#fProv').value ? '&provider=' + $('#fProv').value : ''); });
-
-  $('#fcBtn').addEventListener('click', async () => {
-    const n = $('#fcName').value.trim(); if (!n) return;
-    const r = await api('filter/check?name=' + encodeURIComponent(n));
-    $('#fcOut').textContent = r.action === 'block' ? `會被擋（${r.tier === 'custom' ? '自訂規則' : r.cat === 'malware' ? '惡意清單' : '廣告清單'}）\n規則：${r.rule}` : r.action === 'allow' ? `白名單放行（${r.tier === 'custom' ? '自訂規則' : '清單'}）\n規則：${r.rule}` : '不會被擋';
+  // 共用儀表板：資料來自這一頁底下的唯讀 API（api/…，已經打過馬賽克）
+  const dash = KuroshioDashboard.mount($('#dash'), {
+    adapter: KuroshioDashboard.publicAdapter('api/'),
+    sections: KuroshioDashboard.DETAIL_SECTIONS,
+    domainsMode: 'client',
+    showErrors: false,
+    refreshMs: 15000
   });
-
-  $('#trBtn').addEventListener('click', async () => {
-    const n = $('#trName').value.trim(); if (!n) return;
-    const out = $('#trOut'); out.textContent = '查詢中…';
-    const r = await api(`trace?name=${encodeURIComponent(n)}&type=${$('#trType').value}`);
-    out.textContent = '';
-    if (r.error) { out.textContent = r.error; return; }
-    out.appendChild(el('div', 'muted', `過濾：${r.filter ? (r.filter.action === 'block' ? '封鎖 ' + r.filter.rule : r.filter.action === 'allow' ? '白名單 ' + r.filter.rule : '不處理') : '—'}`));
-    const t1 = el('table'); const w1 = el('div', 'tbl'); w1.style.margin = '10px 0'; w1.appendChild(t1); out.appendChild(w1);
-    table(t1, r.upstreams, [
-      { h: '上游', v: u => u.id, cls: 'mono' }, { h: '角色', v: u => u.role }, { h: 'ms', v: u => u.ms, num: 1 },
-      { h: '結果', v: u => u.error ? tag(u.error, 'bad') : tag(u.cls, u.cls === 'ok' ? 'ok' : u.cls === 'blocked' ? 'bad' : 'warn') },
-      { h: '答案', v: u => (u.answers || []).map(a => a.split(' ').slice(0, 1).concat(a.split(' ').slice(3)).join(' ')).join('\n'), cls: 'mono' }
-    ]);
-    const t2 = el('table'); const w2 = el('div', 'tbl'); w2.appendChild(t2); out.appendChild(w2);
-    const cls = Object.fromEntries((r.cdn || []).map(c => [c.ip, c.cls]));
-    table(t2, r.ranking || [], [
-      { h: 'IP', v: x => x.ip, cls: 'mono' }, { h: '延遲', v: x => x.ok ? x.ms.toFixed(1) + ' ms' : '不通', num: 1 },
-      { h: 'CDN 分類', v: x => cls[x.ip] ? `${LABEL[cls[x.ip].provider] || cls[x.ip].provider} · ${cls[x.ip].cls === 'tw' ? '台灣' : cls[x.ip].cls === 'global' ? '國外' : cls[x.ip].cls}` : '—' }
-    ], '沒有 IP');
-    if (r.cdnDb) { const p = el('pre', 'muted'); p.style.marginTop = '10px'; p.textContent = 'CDN 資料庫：' + JSON.stringify(r.cdnDb, null, 2); out.appendChild(p); }
-    if (r.cache) { const p = el('pre', 'muted'); p.style.marginTop = '10px'; p.textContent = `快取（剩 ${r.cache.expiresInSec} 秒，來源 ${r.cache.source}）：\n` + r.cache.answers.join('\n'); out.appendChild(p); }
-  });
-  $('#trName').addEventListener('keydown', e => { if (e.key === 'Enter') $('#trBtn').click(); });
-  $('#fcName').addEventListener('keydown', e => { if (e.key === 'Enter') $('#fcBtn').click(); });
+  $$('.seg button').forEach(b => b.addEventListener('click', () => { $$('.seg button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); dash.setRange(b.dataset.range); }));
 
   // 關於：版本、授權、原始碼（詳細頁的唯讀 API 沒有這項，改問公開頁的 /api/public/info；字串一律用 textContent）
   const FEAT = { doh: 'DoH', doh3: 'DoH3', dot: 'DoT', doq: 'DoQ', cdn: 'CDN 台灣節點', community: '好友社群', filter: '過濾', acme: '自動憑證', 'windows-service': 'Windows 服務' };
@@ -460,10 +120,7 @@ footer { padding: 40px 0; color: var(--text-3); font-size: 13px; }
     if (su) { $('#abSrc').href = su; $('#abSrc').textContent = su; }
     if (Array.isArray(a.features) && a.features.length) $('#abFeat').textContent = a.features.map(f => FEAT[f] || String(f)).join('、');
   }
-
-  const all = () => Promise.allSettled([loadPublic(), loadStatus(), loadBench(), loadPools(), loadDomains(), loadAbout()]);
-  all();
-  setInterval(() => { if (!document.hidden) { loadPublic(); loadStatus(); } }, 15000);
+  loadAbout().catch(() => {});
 })();
 </script>
 </body>

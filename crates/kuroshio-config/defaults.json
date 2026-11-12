@@ -40,6 +40,7 @@
       "path": "/dns-query",
       "http3Port": 0,
       "altSvcPort": 0,
+      "publicPort": 0,
       "windowsMode": "auto"
     },
     "dot": {
@@ -97,7 +98,7 @@
   "site": {
     "enabled": false,
     "hostname": "",
-    "minClients": 2,
+    "minClients": 1,
     "htmlFile": "",
     "detailFile": "",
     "detailPath": "/detail"
