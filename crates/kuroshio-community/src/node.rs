@@ -112,6 +112,10 @@ pub(crate) struct State {
     pub rl_req_ip: RateLimit,
     pub rl_req_global: RateLimit,
     pub rl_callback: RateLimit,
+    /// 帶邀請證明的請求：每 IP 每小時（同好友請求的上限）
+    pub rl_invite_ip: RateLimit,
+    /// 邀請碼自動同意：全域每小時
+    pub rl_invite_accept: RateLimit,
     pub id_cache: HashMap<String, (PeerIdentity, u64)>,
     pub busy: HashSet<String>,
     pub pending: HashSet<String>,
@@ -133,6 +137,10 @@ pub struct Community {
     pub(crate) provider: Arc<dyn DataProvider>,
     pub(crate) resolver: Arc<dyn Resolver>,
     pub(crate) tuning: Tuning,
+    /// 金鑰目錄（邀請密鑰 invite.json 也放這裡）
+    pub(crate) key_dir: PathBuf,
+    /// 邀請密鑰（沒有 = 還沒產生過）
+    pub(crate) invite: Mutex<Option<crate::invite::Stored>>,
     jobs: mpsc::UnboundedSender<(u64, Job)>,
     jobs_rx: Mutex<Option<mpsc::UnboundedReceiver<(u64, Job)>>>,
 }
@@ -197,6 +205,8 @@ impl Community {
             rl_req_ip: RateLimit::new(t.requests_per_ip_hour, HOUR),
             rl_req_global: RateLimit::new(t.requests_global_hour, HOUR),
             rl_callback: RateLimit::new(t.callbacks_per_domain_hour, HOUR),
+            rl_invite_ip: RateLimit::new(t.requests_per_ip_hour, HOUR),
+            rl_invite_accept: RateLimit::new(t.invite_accepts_hour, HOUR),
             id_cache: HashMap::new(),
             busy: HashSet::new(),
             pending: HashSet::new(),
@@ -212,6 +222,7 @@ impl Community {
             pow_need: HashMap::new(),
             last_hourly: now,
         };
+        let invite = crate::invite::Stored::load(&opts.key_dir);
         let (tx, rx) = mpsc::unbounded_channel();
         let c = Arc::new_cyclic(|me| Community {
             me: me.clone(),
@@ -221,6 +232,8 @@ impl Community {
             provider: opts.provider,
             resolver: opts.resolver,
             tuning: opts.tuning,
+            key_dir: opts.key_dir,
+            invite: Mutex::new(invite),
             jobs: tx,
             jobs_rx: Mutex::new(Some(rx)),
         });
@@ -915,6 +928,24 @@ impl Community {
         if let Err(e) = self.reconcile_keys(&from, &idn, now) {
             return Ok(self.relation_reply(&from, &View::of("key-mismatch"), Some(req.req_id), Some(e)));
         }
+        // 邀請碼（擴充）：證明對了才算；不對就當成一般請求照自動規則處理，回應跟沒帶邀請碼時一樣，
+        // 不透露這台有沒有邀請碼。帶證明的請求每 IP 每小時另外限次（同好友請求的上限）
+        let invited = match &req.invite {
+            None => false,
+            Some(p) => {
+                let allowed = self.lock().rl_invite_ip.take(&ip.to_string(), now);
+                let ok = allowed && self.invite_proof_ok(&from, &req.to, &req.nonce, &req.req_id, p);
+                if !ok {
+                    let why = if allowed {
+                        "邀請碼不符或已重新產生"
+                    } else {
+                        "邀請碼嘗試太頻繁"
+                    };
+                    self.lock().store.event(&from, why, "當成一般好友請求處理");
+                }
+                ok
+            }
+        };
         let cfg = self.config();
         let my_friends: HashSet<Vec<u8>> = self.lock().store.friends().map(|p| friend_hash(&p.domain).to_vec()).collect();
         let info = PeerInfo {
@@ -940,6 +971,10 @@ impl Community {
             let v = st
                 .store
                 .on_request(&from, &req.req_id, idn.endpoints.clone(), info, now, |p, friend_count| {
+                    // 邀請碼有效：不套用自動規則，下面直接同意
+                    if invited {
+                        return Action::Manual;
+                    }
                     let (a, name) = rules::decide(
                         &cfg.rules,
                         &rules::Ctx {
@@ -958,6 +993,24 @@ impl Community {
                 });
             if !rule_name.is_empty() {
                 st.store.event(&from, "套用規則", &rule_name);
+            }
+            // 邀請碼有效 → 自動同意；但尊重既有的封鎖 / 拒絕（上面已經回 blocked / rejected）與墓碑（我刪除過的一律人工審核），
+            // 好友數上限、每小時自動同意上限到了也改成人工審核
+            let mut v = v;
+            if invited && v.status == "pending" {
+                let tomb = st.store.get(&from).map(|p| p.deleted_at > 0).unwrap_or(false);
+                if tomb {
+                    st.store.event(&from, "邀請碼有效", "曾被你刪除，等待人工審核");
+                } else if st.store.friend_count() >= cfg.max_friends {
+                    st.store.event(&from, "邀請碼有效", "好友數已達上限，等待人工審核");
+                } else if !st.rl_invite_accept.take("all", now) {
+                    st.store.event(&from, "邀請碼有效", "邀請碼自動同意已達每小時上限，等待人工審核");
+                } else {
+                    v = st.store.accept(&from, "透過邀請碼加入", now);
+                    if let Some(p) = st.store.get_mut(&from) {
+                        p.invited_at = now;
+                    }
+                }
             }
             v
         };

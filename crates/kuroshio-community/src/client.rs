@@ -2,7 +2,7 @@
 
 use crate::envelope::*;
 use crate::identity::KeyInfo;
-use crate::node::{Community, Job, OldVersion, State};
+use crate::node::{Community, Job, OldVersion, PeerIdentity, State};
 use crate::peers::{Rel, View};
 use crate::provider::{CrossHint, NodeCandidate, RangeCheck, Received, SiteHint, UpstreamCandidate};
 use crate::score::{self, Kind, Outcome};
@@ -207,42 +207,62 @@ impl Community {
         if !valid_domain(&domain) || domain == self.domain() || (s.contains(':') && port.is_none()) {
             return fail("網域格式錯誤");
         }
+        self.request_start(&domain, port, manual, None).await
+    }
+
+    /// 送出請求（網域已檢查過）；`invite` = 邀請碼流程：已經驗過指紋的身分文件與邀請密鑰
+    pub(crate) async fn request_start(
+        &self,
+        domain: &str,
+        port: Option<u16>,
+        manual: bool,
+        invite: Option<(PeerIdentity, [u8; 16])>,
+    ) -> Value {
         let now = now_ms();
-        let st = self.lock().store.start_request(&domain, manual, now);
+        let st = self.lock().store.start_request(domain, manual, now);
         if !st.ok {
             return fail(st.reason);
         }
         if st.accept_incoming {
-            return self.decide(&domain, "accept").await;
+            return self.decide(domain, "accept").await;
         }
         if !self.lock().busy.insert(format!("req:{domain}")) {
             return json!({ "ok": true, "status": "pending" });
         }
-        let r = self.request_inner(&domain, port).await;
+        let r = self.request_inner(domain, port, invite).await;
         self.lock().busy.remove(&format!("req:{domain}"));
         r
     }
 
-    async fn request_inner(&self, domain: &str, port: Option<u16>) -> Value {
+    async fn request_inner(&self, domain: &str, port: Option<u16>, invite: Option<(PeerIdentity, [u8; 16])>) -> Value {
         let now = now_ms();
-        let mut cands = match port {
-            Some(p) => Endpoint::defaults(domain, Some(p)),
-            None => self.peer_endpoints(domain),
+        let (pre, secret) = match invite {
+            Some((i, s)) => (Some(i), Some(s)),
+            None => (None, None),
         };
-        for e in Endpoint::defaults(domain, port) {
-            if !cands.contains(&e) {
-                cands.push(e);
-            }
-        }
-        let idn = match self.fetch_identity(domain, cands, false, true).await {
-            Ok(x) => x,
-            Err(e) if e.downcast_ref::<OldVersion>().is_some() => {
-                self.mark_old_version(domain, now);
-                return fail("對方版本較舊（v1），每 6 小時重試");
-            }
-            Err(e) => {
-                self.lock().store.note_failure(domain, &e.to_string(), now);
-                return fail(e);
+        let idn = match pre {
+            Some(i) => i,
+            None => {
+                let mut cands = match port {
+                    Some(p) => Endpoint::defaults(domain, Some(p)),
+                    None => self.peer_endpoints(domain),
+                };
+                for e in Endpoint::defaults(domain, port) {
+                    if !cands.contains(&e) {
+                        cands.push(e);
+                    }
+                }
+                match self.fetch_identity(domain, cands, false, true).await {
+                    Ok(x) => x,
+                    Err(e) if e.downcast_ref::<OldVersion>().is_some() => {
+                        self.mark_old_version(domain, now);
+                        return fail("對方版本較舊（v1），每 6 小時重試");
+                    }
+                    Err(e) => {
+                        self.lock().store.note_failure(domain, &e.to_string(), now);
+                        return fail(e);
+                    }
+                }
             }
         };
         if let Err(e) = self.reconcile_keys(domain, &idn, now) {
@@ -266,15 +286,20 @@ impl Community {
         };
         for attempt in 0..2 {
             let req_id = self.lock().store.get(domain).and_then(|p| p.out_req_id.clone()).unwrap_or_default();
+            let (from, nonce) = (self.domain(), random_bytes::<12>().to_vec());
+            let invite = secret
+                .as_ref()
+                .map(|s| serde_bytes::ByteBuf::from(crate::invite::proof(s, &from, domain, &nonce, &req_id)));
             let body = RequestBody {
                 t: "request".into(),
-                from: self.domain(),
+                from,
                 to: domain.to_string(),
                 ts: now_ms(),
-                nonce: random_bytes::<12>().to_vec(),
+                nonce,
                 kid: self.kid().to_vec(),
                 endpoints: self.my_endpoints(),
                 req_id,
+                invite,
                 pow: vec![0; 8],
             };
             let raw = to_cbor(&body);

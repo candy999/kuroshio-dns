@@ -156,6 +156,8 @@ pub struct Tuning {
     pub callbacks_per_domain_hour: u32,
     /// 量連線品質的次數
     pub probes: u32,
+    /// 邀請碼自動同意：全域每小時最多幾次（超過改成人工審核）
+    pub invite_accepts_hour: u32,
 }
 
 impl Default for Tuning {
@@ -174,6 +176,7 @@ impl Default for Tuning {
             all_per_ip_minute: 120,
             callbacks_per_domain_hour: 6,
             probes: 3,
+            invite_accepts_hour: 10,
         }
     }
 }

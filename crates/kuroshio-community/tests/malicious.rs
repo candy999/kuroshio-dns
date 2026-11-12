@@ -42,6 +42,7 @@ fn request_body(from: &Community, to: &str, kid: Vec<u8>) -> RequestBody {
         kid,
         endpoints: from.config().endpoints,
         req_id: "r1".into(),
+        invite: None,
         pow: vec![0; 8],
     }
 }

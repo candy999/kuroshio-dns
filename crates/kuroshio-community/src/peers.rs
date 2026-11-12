@@ -187,6 +187,9 @@ pub struct Peer {
     pub malformed: Vec<u64>,
     #[serde(default)]
     pub note: String,
+    /// 透過我的邀請碼加入的時間（0 = 不是）
+    #[serde(default, skip_serializing_if = "is_zero", deserialize_with = "lenient_u64")]
+    pub invited_at: u64,
     /// 不認識的欄位原樣保留（新舊版本來回切換不遺失資料）
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -230,6 +233,7 @@ impl Peer {
             old_version_since: 0,
             malformed: vec![],
             note: String::new(),
+            invited_at: 0,
             extra: Map::new(),
         }
     }

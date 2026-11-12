@@ -199,6 +199,7 @@ pub fn fast_tuning() -> Tuning {
         all_per_ip_minute: 100_000,
         callbacks_per_domain_hour: 1000,
         probes: 3,
+        invite_accepts_hour: 1000,
     }
 }
 

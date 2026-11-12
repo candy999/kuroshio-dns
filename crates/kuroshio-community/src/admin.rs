@@ -45,6 +45,9 @@ impl Community {
             "rotate" => self.rotate(),
             "accept-key" => self.accept_key(&d),
             "scores" => self.scores_json(),
+            "invite" => self.invite_json(),
+            "invite/refresh" => self.refresh_invite(),
+            "invite/use" => self.use_invite(q.get("code").map(String::as_str).unwrap_or("")).await,
             "channel" => match q.get("channel") {
                 Some(c) => self.set_channel(&d, c),
                 None => self
@@ -72,6 +75,7 @@ impl Community {
         let (fp, public, kid, txt) = (id.key.fingerprint(), spki_b64(&id.key.public), hex(&id.key.kid), id.txt_value());
         drop(id);
         let check = self.check_json();
+        let invite_at = self.invite_created_at();
         let st = self.lock();
         let peers: Vec<&Peer> = st.store.peers.values().collect();
         let count = |f: &dyn Fn(&&Peer) -> bool| peers.iter().filter(|p| f(p)).count();
@@ -105,6 +109,8 @@ impl Community {
             },
             "hints": { "domains": site_keys.len(), "cross": cross_keys.len(), "nodes": nodes, "upstreams": crate::client::upstream_ids(&st).len() },
             "share": { "epoch": hex(&st.share.epoch), "seq": st.share.seq, "records": st.share.len() },
+            // 邀請碼本身只在 /api/community/invite 給
+            "invite": { "createdAt": invite_at },
         })
     }
 
@@ -137,6 +143,7 @@ impl Community {
             "oldVersion": p.old_version_since != 0, "oldVersionSince": nz(p.old_version_since),
             "friendSince": nz(p.friend_since), "lastContact": nz(p.last_contact), "lastSyncOk": nz(p.last_sync_ok),
             "lastError": p.last_error, "nextTry": nz(p.next_try), "shared": shared, "note": p.note,
+            "invitedAt": nz(p.invited_at),
         })
     }
 

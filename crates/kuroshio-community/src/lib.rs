@@ -15,6 +15,7 @@ pub mod client;
 pub mod config;
 pub mod envelope;
 pub mod identity;
+pub mod invite;
 pub mod limits;
 pub mod node;
 pub mod peers;

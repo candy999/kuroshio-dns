@@ -114,6 +114,7 @@ fn build() -> Vec<Value> {
         kid: k.kid.to_vec(),
         endpoints: vec!["doq://a.example".into(), "https://a.example".into()],
         req_id: "000102030405060708090a0b".into(),
+        invite: None,
         pow: vec![0; 8],
     };
     let body = solve_pow(to_cbor(&req), 12);

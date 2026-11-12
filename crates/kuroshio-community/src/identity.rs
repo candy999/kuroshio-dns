@@ -30,16 +30,28 @@ pub fn kid_of(public: &[u8]) -> Kid {
     k
 }
 
-/// v1 的公鑰指紋（例如 3F2A-91C0-…，8 組）
-pub fn fingerprint(public: &[u8]) -> String {
+/// 指紋的原始 16 bytes：SHA-256(SPKI DER) 前 16 bytes（邀請碼放這個）
+pub fn fingerprint_bytes(public: &[u8]) -> [u8; 16] {
     let mut der = SPKI_PREFIX.to_vec();
     der.extend_from_slice(public);
-    let h = hex(&sha256(&[&der])[..16]).to_ascii_uppercase();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&sha256(&[&der])[..16]);
+    out
+}
+
+/// 指紋原始 bytes → 顯示格式（每 4 個十六進位字一組）
+pub fn fingerprint_text(fp: &[u8; 16]) -> String {
+    let h = hex(fp).to_ascii_uppercase();
     h.as_bytes()
         .chunks(4)
         .map(|c| String::from_utf8_lossy(c).to_string())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// v1 的公鑰指紋（例如 3F2A-91C0-…，8 組）
+pub fn fingerprint(public: &[u8]) -> String {
+    fingerprint_text(&fingerprint_bytes(public))
 }
 
 /// v1 的公鑰（base64 SPKI DER）→ 32 bytes 原始公鑰

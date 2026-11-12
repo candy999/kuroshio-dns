@@ -259,6 +259,10 @@ pub struct RequestBody {
     pub kid: Vec<u8>,
     pub endpoints: Vec<String>,
     pub req_id: String,
+    /// 邀請碼證明（擴充欄位，舊版不認得會略過）：HMAC-SHA256(邀請密鑰, …)，見 [`crate::invite::proof`]。
+    /// 密鑰本身不上線
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<serde_bytes::ByteBuf>,
     /// 一定要是最後一個欄位（solve_pow 直接改 body 的最後 8 bytes）
     #[serde(with = "serde_bytes")]
     pub pow: Vec<u8>,
@@ -424,6 +428,7 @@ mod tests {
             kid: vec![1; 8],
             endpoints: vec![],
             req_id: "r".into(),
+            invite: None,
             pow: vec![0; 8],
         };
         let b = solve_pow(to_cbor(&body), 10);
