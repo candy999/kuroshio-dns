@@ -1,4 +1,4 @@
-# LuCI 介面：狀態、基本設定、廣告過濾、CDN 台灣節點、進階、日誌
+# LuCI 介面：狀態、儀表板、基本設定、廣告過濾、CDN 台灣節點、進階、日誌
 
 include $(TOPDIR)/rules.mk
 
@@ -9,6 +9,9 @@ PKG_MAINTAINER:=Kuroshio DNS contributors
 PKG_LICENSE:=GPL-3.0-or-later
 
 include $(INCLUDE_DIR)/package.mk
+
+# 共用儀表板（data/dashboard：公開頁、Windows 設定頁、LuCI 同一份）在 repo 的 data/ 底下
+REPO_ROOT:=$(CURDIR)/../..
 
 define Package/luci-app-kuroshio
   SECTION:=luci
@@ -21,7 +24,7 @@ define Package/luci-app-kuroshio
 endef
 
 define Package/luci-app-kuroshio/description
-  LuCI pages for kuroshio: status, settings (simple / pro mode),
+  LuCI pages for kuroshio: status, dashboard, settings (simple / pro mode),
   filter lists and custom rules, CDN Taiwan nodes, advanced tuning, log.
 endef
 
@@ -32,6 +35,7 @@ define Package/luci-app-kuroshio/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/kuroshio $(1)/www/luci-static/resources/kuroshio
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/kuroshio/*.js $(1)/www/luci-static/resources/view/kuroshio/
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/kuroshio/*.js $(1)/www/luci-static/resources/kuroshio/
+	$(INSTALL_DATA) $(REPO_ROOT)/data/dashboard/dashboard.js $(REPO_ROOT)/data/dashboard/dashboard.css $(1)/www/luci-static/resources/kuroshio/
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-kuroshio.json $(1)/usr/share/luci/menu.d/
 	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-kuroshio.json $(1)/usr/share/rpcd/acl.d/

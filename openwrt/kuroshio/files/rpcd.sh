@@ -3,7 +3,7 @@
 #  kuroshio — rpcd 外掛（LuCI 透過 ubus 呼叫 kuroshio.*）
 #  轉送到本機管理 API（127.0.0.1:admin_port），只開放白名單內的路徑。
 #    status        執行狀態＋/api/status
-#    api           查看類 API（追蹤、規則檢查、上游、節點池…）
+#    api           查看類 API（追蹤、規則檢查、上游、節點池、儀表板統計…）
 #    action        會改變狀態的 API（清快取、更新清單、執行工作、驗證…）     ← ACL 寫入權限
 #    defaults      內建預設值（kuroshio defaults --json，LuCI 顯示成提示文字）
 #    acme_status   憑證資訊與申請紀錄
@@ -76,6 +76,7 @@ call)
 		read_input
 		case "$P_PATH" in
 		/api/status|/api/access|/api/sysinfo|/api/upstreams|/api/benchmark|/api/cdn/pools|/api/cdn/v6nodes|/api/cdn/summary|/api/cdn/domains|/api/jobs|/api/trace|/api/filter/check|/api/routing|/api/ddns|/api/paths|/api/interfaces) ;;
+		/api/dashboard) ;;
 		/api/community/status|/api/community/peers|/api/community/events|/api/community/invite) ;;
 		*) echo '{"ok":false,"error":"不允許的路徑"}'; exit 0 ;;
 		esac

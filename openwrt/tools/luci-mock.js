@@ -179,7 +179,77 @@ const COMMUNITY_ACTION = (p, query) => {
     if (p === '/api/community/add' && q.get('domain') === 'bad.example.com') return { ok: false, reason: 'bad.example.com 沒有回應（連線逾時）' };
     return { ok: true };
 };
-const API = { '/api/access': ACCESS, '/api/community/status': COMMUNITY_STATUS, '/api/community/peers': () => community.peers, '/api/community/events': COMMUNITY_EVENTS, '/api/community/invite': INVITE, '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS };
+// 儀表板（/api/dashboard 等）：用 tools/dashboard-seed.js 的範例統計算出跟 kuroshio 一樣格式的資料
+const SEED = require(path.join(ROOT, 'tools', 'dashboard-seed.js'));
+const LABELS = { cloudflare: 'Cloudflare', cloudfront: 'Amazon CloudFront', fastly: 'Fastly', akamai: 'Akamai', gcore: 'Gcore' };
+const r4 = x => Math.round(x * 1e4) / 1e4, r1 = x => Math.round(x * 10) / 10;
+function DASH(query) {
+    const range = new URLSearchParams(query || '').get('range') || 'today';
+    const days = SEED.stats().days, n = range === '30d' ? 30 : range === '7d' ? 7 : 1, keys = days.slice(-n);
+    const sum = k => keys.reduce((a, d) => a + (d[k] || 0), 0);
+    const route = {}, cdn = {}, sites = {}, blocked = {};
+    keys.forEach(d => {
+        Object.entries(d.route).forEach(([p, r]) => { const a = route[p] = route[p] || { n: 0, abroad: 0, acc: 0, miss: 0, saved: 0, savedN: 0 }; Object.keys(a).forEach(k => { a[k] += r[k]; }); });
+        Object.entries(d.cdn).forEach(([p, c]) => { cdn[p] = (cdn[p] || 0) + c; });
+        Object.entries(d.sites).forEach(([k, v]) => { sites[k] = (sites[k] || 0) + v[0]; });
+        Object.entries(d.blockedSites).forEach(([k, v]) => { blocked[k] = (blocked[k] || 0) + v[0]; });
+    });
+    const rows = Object.entries(route).sort((a, b) => b[1].n - a[1].n);
+    const t = rows.reduce((a, [, r]) => { Object.keys(a).forEach(k => { a[k] += r[k]; }); return a; }, { n: 0, abroad: 0, acc: 0, miss: 0, saved: 0, savedN: 0 });
+    const cross = sum('crossRewrite'), q = sum('query'), blk = sum('blocked'), hit = sum('hit');
+    const cdnTotal = Object.values(cdn).reduce((a, b) => a + b, 0);
+    const top = (o, k) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, k).map(([site, count]) => ({ site, count }));
+    const now = Date.now();
+    return {
+        generatedAt: new Date(now).toISOString(), range, days: keys.length,
+        totals: { queries: q, blocked: blk, blockedAds: sum('blockedAds'), blockedMalware: sum('blockedMalware'), blockedTelemetry: sum('blockedTelemetry'), blockedCustom: sum('blockedCustom'),
+            blockRate: q ? r4(blk / q) : 0, cacheHitRate: q ? r4(hit / q) : 0, cdnServed: sum('cdnServed'), cdnAccelerated: sum('cdnRewrite') + sum('ecsRewrite') + cross, accelerated: t.acc + cross },
+        acceleration: { verifiedSites: 1283, sitesRoutedAbroad: 1058, medianSavedMs: 178.2, samples: 979, twNodesV4: 37, twNodesV6: 626 },
+        trend: days.slice(-30).map(d => ({ date: d.date, queries: d.query, blocked: d.blocked })),
+        cdn: Object.entries(cdn).sort((a, b) => b[1] - a[1]).map(([p, c]) => ({ provider: p, label: LABELS[p] || p, count: c, share: r4(c / cdnTotal) })),
+        routing: rows.map(([p, a]) => ({ provider: p, label: LABELS[p] || p, connections: a.n, wouldGoAbroad: a.abroad, accelerated: a.acc, stillAbroad: a.miss,
+            abroadShare: a.n ? r4(a.abroad / a.n) : 0, successRate: a.abroad ? r4(a.acc / a.abroad) : null, avgSavedMs: a.savedN ? r1(a.saved / a.savedN) : null })),
+        opportunity: { connections: t.n, wouldGoAbroad: t.abroad, accelerated: t.acc + cross, stillAbroad: t.miss, otherDnsAbroadShare: t.n ? r4(t.abroad / t.n) : 0,
+            oursAbroadShare: t.n ? r4(t.miss / t.n) : 0, avgSavedMs: t.savedN ? r1(t.saved / t.savedN) : null, totalSavedSec: r1(t.saved / 1000), crossAccelerated: cross },
+        flows: [{ pop: 'HKG', count: 21997, fixed: 14629 }, { pop: 'NRT', count: 15891, fixed: 9576 }, { pop: 'SIN', count: 6120, fixed: 3011 }, { pop: 'LAX', count: 2410, fixed: 1203 }],
+        toPops: { TPE: 26000, KHH: 2400 },
+        crossCdn: { explored: 689, ok: 54, fail: 635, successRate: 0.0784, serves: cross,
+            byTo: [{ provider: 'cloudflare', label: 'Cloudflare', sites: 24 }, { provider: 'cloudfront', label: 'Amazon CloudFront', sites: 4 }],
+            byFrom: [{ provider: 'fastly', label: 'Fastly', explored: 196, ok: 31 }, { provider: 'akamai', label: 'Akamai', explored: 123, ok: 3 }],
+            pairs: [{ from: 'fastly', fromLabel: 'Fastly', to: 'cloudflare', toLabel: 'Cloudflare', count: 23 }, { from: 'fastly', fromLabel: 'Fastly', to: 'cloudfront', toLabel: 'Amazon CloudFront', count: 7 }] },
+        realtime: Array.from({ length: 60 }, (_, i) => { const qq = Math.round(60 + 25 * Math.sin(i / 5) + (i % 7) * 3); return { t: now - (59 - i) * 60000, queries: qq, blocked: Math.round(qq * 0.1), accelerated: Math.round(qq * 0.18) }; }),
+        outcomes: { cache: hit, upstream: Math.max(0, q - hit - blk), ads: sum('blockedAds') + sum('blockedCustom') + sum('blockedTelemetry'), malware: sum('blockedMalware') },
+        topSites: top(sites, 30), topBlocked: top(blocked, 30),
+        privacy: { minClients: 1 },
+        system: { uptimeSec: 3700, rules: { custom: 3, lists: 100000, byCategory: {} }, upstreams: 3, benchmarkAt: null }
+    };
+}
+const POOLS = {
+    cloudflare: { ranges: { v4: 14, v6: 7 }, scan: { tw: 78, global: 56, dead: 89 },
+        v4: [{ ip: '104.18.22.203', pop: 'TPE', ms: 2.68, speed: 55.3 }, { ip: '104.18.143.105', pop: 'TPE', ms: 2.95, speed: 56.8 }, { ip: '172.67.70.39', pop: 'KHH', ms: 3.29, speed: null, bad: '速度太慢' }],
+        v6: [{ ip: '2606:4700:4408::9bd1', pop: 'TPE', ms: 3.36, permanent: true }] },
+    fastly: { ranges: { v4: 17, v6: 3 }, scan: { tw: 0, global: 87, dead: 0 }, v4: [{ ip: '151.101.203.124', pop: 'IAD', ms: 0.08, speed: null }], v6: [] }
+};
+const V6NODES = { providers: { cloudflare: { '2606:4700:4408::9bd1': { ms: 3.36, pop: 'TPE', fails: 0 } } } };
+const DOMAINS = Array.from({ length: 12 }, (_, i) => ({ name: `www${i}.example.com`, provider: i % 3 ? 'cloudflare' : 'fastly', via: i % 2 ? 'cname' : 'ip', hits: 5000 - i * 300,
+    firstSeen: Date.now() - 86400e3 * 9, lastSeen: Date.now() - 60e3 * (i + 1),
+    base: { pop: i % 3 ? 'HKG' : 'NRT', ms: 38 + i }, v4: i % 4 === 3 ? { verdict: 'fail', reason: '憑證不符' } : { verdict: 'ok', pop: 'TPE', ms: 3.1 + i / 10 },
+    cross4: i % 3 ? undefined : { verdict: i === 0 ? 'ok' : 'fail', from: 'fastly', to: 'cloudflare', origMs: 41.7, ms: 3.9, at: Date.now() - 3600e3, reason: '其他 CDN 都沒有這個網站', tried: [{ to: 'cloudflare', ok: i === 0, ms: 3.9, reason: '憑證不符' }] } }));
+const DOMAINS_API = query => {
+    const p = new URLSearchParams(query || ''), qq = p.get('q') || '', off = +(p.get('offset') || 0), lim = +(p.get('limit') || 1000);
+    return DOMAINS.filter(d => (!qq || d.name.includes(qq)) && (!p.get('provider') || d.provider === p.get('provider')) && (p.get('cross') !== '1' || (d.cross4 && d.cross4.verdict !== 'none'))).slice(off, off + lim);
+};
+const BENCH = { generatedAt: Date.now() - 3 * 3600e3, counts: { total: 120, survivors: 40, eliminated: 80 }, coverage: 0.93,
+    selected: [{ id: 'https://dns.example.org/dns-query', avgMs: 14.2, newItems: 12, reason: '涵蓋率最高', owner: 'Example_Org' }],
+    pinned: [{ id: 'udp://1.1.1.1', avgMs: 12.4, coverageItems: 3, issues: [] }], blocked: [] };
+STATUS.jobs = { config: { 'dns-benchmark': { at: ['04:10'] }, 'filter-update': { at: ['03:30'], weekdays: [1, 4] } }, state: { 'dns-benchmark': { lastCode: 0, lastEnd: Date.now() - 3600e3 } }, running: null };
+STATUS.stats.topDomains = [{ name: 'www.youtube.com', count: 812 }, { name: 'i.ytimg.com', count: 640 }];
+STATUS.stats.topBlocked = [{ name: 'googleads.g.doubleclick.net', count: 120 }];
+STATUS.stats.topClients = [{ name: '192.168.1.23', count: 900 }, { name: 'fd12:3456::8', count: 400 }];
+const API = { '/api/access': ACCESS, '/api/community/status': COMMUNITY_STATUS, '/api/community/peers': () => community.peers, '/api/community/events': COMMUNITY_EVENTS, '/api/community/invite': INVITE, '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS,
+    '/api/dashboard': DASH, '/api/benchmark': () => BENCH, '/api/cdn/pools': () => POOLS, '/api/cdn/v6nodes': () => V6NODES, '/api/cdn/domains': DOMAINS_API,
+    '/api/filter/check': query => (/ads\./.test(new URLSearchParams(query || '').get('name') || '') ? { action: 'block', rule: '||ads.example.com^', cat: 'ads', tier: 'list' } : { action: 'none' }),
+    '/api/trace': () => ({ filter: { action: 'none' }, upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ms: 12, cls: 'ok', answers: ['www.example.com 300 IN A 192.0.2.80'] }], ranking: [{ ip: '192.0.2.80', ok: true, ms: 3.2 }], cdn: [] }) };
 let defaults = null;
 try { defaults = JSON.parse(execFileSync(BIN, ['defaults', '--json'], { encoding: 'utf-8' })); } catch (e) { console.log('（沒有 kuroshio 執行檔：預設值提示不顯示）'); }
 
@@ -265,6 +335,7 @@ function page(view) {
     };
     return `<!DOCTYPE html><html lang="zh-tw"><head><meta charset="utf-8"><title>OpenWrt - 黑潮 DNS - LuCI（mock）</title>
 <meta name="viewport" content="initial-scale=1.0"><link rel="stylesheet" href="/luci-static/bootstrap/cascade.css">
+<script>(function(){ var m = window.matchMedia('(prefers-color-scheme: dark)'), r = document.documentElement; var set = function(x) { r.setAttribute('data-darkmode', x.matches); }; set(m); m.addListener(set); })();</script>
 <script src="/cgi-bin/luci/admin/translations/zh-tw"></script><script src="/luci-static/resources/cbi.js"></script></head>
 <body class="lang_zh-tw"><header><a class="brand" href="/">OpenWrt（mock）</a></header>
 <div id="maincontent" class="container"><div id="tabmenu" style="display:none"></div>
@@ -316,6 +387,7 @@ http.createServer((req, res) => {
     if (url.pathname === '/cgi-bin/luci/' || url.pathname === '/') return send(200, 'text/html; charset=utf-8', '<!DOCTYPE html><meta charset="utf-8"><title>LuCI mock</title><p>LuCI mock：/cgi-bin/luci/admin/services/kuroshio/settings</p>');
     if (url.pathname === '/luci-static/bootstrap/cascade.css') return send(200, MIME['.css'], fs.readFileSync(path.join(LUCI, 'cascade.css')));
     if ((m = /^\/luci-static\/resources\/([\w./-]+)$/.exec(url.pathname)) && !m[1].includes('..')) {
+        if (/^kuroshio\/dashboard\.(js|css)$/.test(m[1])) return send(200, MIME[path.extname(m[1])], fs.readFileSync(path.join(ROOT, 'data', 'dashboard', m[1].slice(9))));
         for (const base of [APP, path.join(LUCI, 'res')]) {
             const f = path.join(base, m[1]);
             if (fs.existsSync(f) && fs.statSync(f).isFile()) return send(200, MIME[path.extname(f)] || 'application/octet-stream', fs.readFileSync(f));

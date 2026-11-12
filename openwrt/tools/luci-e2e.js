@@ -12,7 +12,7 @@ const SHOTS = process.env.SHOTS || 'screenshots';
 // 用法：node luci-e2e.js [candydns|kuroshio]
 const NAME = process.argv[2] || 'candydns';
 const TITLE = NAME === 'kuroshio' ? /黑潮 DNS/ : /優選 DNS/;
-const PAGES = ['status', 'settings', 'filter', 'cdn', 'community', 'advanced', 'log'].concat(NAME === 'kuroshio' ? ['access'] : []);
+const PAGES = ['status', 'settings', 'filter', 'cdn', 'community', 'advanced', 'log'].concat(NAME === 'kuroshio' ? ['access', 'dashboard'] : []);
 const MOCK = !!process.env.MOCK;
 const mockGet = async (p) => { const r = await fetch(BASE + p); if (!r.ok) throw new Error(`mock ${p}: HTTP ${r.status}`); return r.text(); };
 /** uci -q get <key>；list 用空白隔開 */
@@ -214,6 +214,55 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
             /記憶體控制/.test(text) && /暫時停用：大廣告 清單（3000 條規則）/.test(text) && /縮小 DNS 快取/.test(text) && /保留 16 MB（自動）/.test(text) && /只轉送 DNS/.test(text) && /快取 64 \/ 64 筆/.test(text) && /儲存空間/.test(text) && !/硬體等級/.test(text) ? ok('狀態頁：記憶體控制（保留量、只轉送、動態大小、儲存空間、沒有硬體等級）') : bad('狀態頁沒有記憶體控制');
         }
     }
+    // 黑潮：儀表板（共用 kuroshio/dashboard.js，資料經 rpcd 轉送；淺色 / 深色、1280 / 390 px）
+    if (NAME === 'kuroshio') {
+        for (const [scheme, w] of [['light', 1280], ['dark', 1280], ['light', 390], ['dark', 390]]) {
+            errors = [];
+            await page.emulateMedia({ colorScheme: scheme });
+            await page.setViewportSize({ width: w, height: w === 390 ? 844 : 900 });
+            await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/dashboard`);
+            await page.waitForLoadState('networkidle');
+            const ready = await page.waitForSelector('#kuroshio-dashboard .tiles .tile', { timeout: 20000 }).then(() => true, () => false);
+            await page.waitForTimeout(1500);
+            const text = await page.locator('#view').innerText().catch(() => '');
+            const sw = await page.evaluate(() => document.documentElement.scrollWidth);
+            await page.screenshot({ path: `${SHOTS}/dashboard-${scheme}-${w}.png`, fullPage: true });
+            const tag = `儀表板（${scheme === 'dark' ? '深色' : '淺色'} ${w} px）`;
+            if (!ready) { bad(`${tag}：沒有畫出總覽\n     ${text.slice(0, 300)}`); continue; }
+            /總覽/.test(text) && /DNS 查詢/.test(text) && /上游 DNS/.test(text) && /台灣節點池/.test(text) && /CDN 網域資料庫/.test(text) && /過濾規則/.test(text) && /排程工作/.test(text)
+                ? ok(`${tag}：各區塊都有`) : bad(`${tag}：缺少區塊\n     ${text.slice(0, 300)}`);
+            if (MOCK) {
+                /youtube\.com/.test(text) && /doubleclick\.net/.test(text) && /Cloudflare/.test(text) && /udp:\/\/1\.1\.1\.1/.test(text) && /www0\.example\.com/.test(text) && /104\.18\.22\.203/.test(text) && /dns-benchmark/.test(text)
+                    ? ok(`${tag}：資料來自 rpcd（統計、排行、上游、網域、節點、工作）`) : bad(`${tag}：資料不完整\n     ${text.slice(0, 400)}`);
+                (await page.locator('#kuroshio-dashboard .chart svg').count()) >= 2 && (await page.locator('#kuroshio-dashboard .gauge').count()) >= 3
+                    ? ok(`${tag}：圖表`) : bad(`${tag}：圖表沒有畫出來`);
+            }
+            sw <= w + 1 ? ok(`${tag}：沒有水平捲動`) : bad(`${tag}：頁面被撐寬（scrollWidth = ${sw}）`);
+            if (scheme === 'dark') {
+                const bg = await page.evaluate(() => getComputedStyle(document.querySelector('#kuroshio-dashboard .tile')).backgroundColor);
+                const rgb = (bg.match(/\d+/g) || []).slice(0, 3).map(Number);
+                rgb.length === 3 && rgb[0] + rgb[1] + rgb[2] < 150 ? ok(`${tag}：深色卡片`) : bad(`${tag}：深色模式沒有套用（${bg}）`);
+            }
+            if (errors.length) bad(`${tag}：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+        }
+        // 網域搜尋（伺服器分頁）與規則檢查
+        await page.emulateMedia({ colorScheme: 'light' });
+        await page.setViewportSize({ width: 1280, height: 900 });
+        await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/dashboard`);
+        await page.waitForSelector('#kuroshio-dashboard #kd-domains table tr', { timeout: 20000 }).catch(() => {});
+        if (MOCK) {
+            await page.fill('#kd-domains input', 'www1');
+            await page.waitForTimeout(1200);
+            const dt = await page.locator('#kd-domains table').innerText();
+            /www1\.example\.com/.test(dt) && !/www2\.example\.com/.test(dt) ? ok('儀表板：網域搜尋（rpcd 帶 q 參數）') : bad(`儀表板：網域搜尋結果不對\n     ${dt.slice(0, 200)}`);
+            await page.fill('#kd-filter input', 'ads.example.com');
+            await page.click('#kd-filter button');
+            await page.waitForTimeout(800);
+            /會被擋/.test(await page.locator('#kd-filter pre').innerText()) ? ok('儀表板：規則檢查') : bad('儀表板：規則檢查沒有結果');
+        }
+        await page.setViewportSize({ width: 1280, height: 900 });
+    }
+
     // 黑潮：每頁最下方有「關於」（核心版本、介面版本、授權、原始碼），狀態頁一定要看得到
     if (NAME === 'kuroshio') {
         await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/status`);

@@ -790,8 +790,16 @@
       return A.stats(range).then(renderStats, e => { fail(sec.tiles || sec.live, e); });
     }
 
+    // 第一次讀到的服務狀態：CDN 相關的 API 失敗時，用它判斷是「CDN 沒有啟用」還是真的讀取失敗
+    // （LuCI 經 rpcd 轉送時，管理 API 回 404 只會變成「服務沒有回應」）
+    let firstStatus = null;
+    const cdnFail = (box, e) => (firstStatus || Promise.resolve(null)).then(st => {
+      if (st && st.cdn === null && o.showErrors && box) { box.textContent = ''; box.appendChild(el('p', 'muted kd-err', 'CDN 台灣節點沒有啟用')); } else fail(box, e);
+    });
     function loadStatus() {
-      return A.status().then(s => {
+      const p = A.status();
+      if (!firstStatus) firstStatus = p.catch(() => null);
+      return p.then(s => {
         if (sec.upTable) {
           table(sec.upTable, s.upstreams, [
             { h: '上游', v: u => u.id, cls: 'mono' },
@@ -860,7 +868,7 @@
           ], '尚無節點');
           wrap.appendChild(c);
         });
-      }, e => fail(sec.poolCards, e));
+      }, e => cdnFail(sec.poolCards, e));
     }
 
     // ---- CDN 網域資料庫 ----
@@ -936,9 +944,9 @@
           renderCross(domains);
           fillProviders([...new Set(domains.map(x => x.provider).filter(Boolean))]);
           renderDomains();
-        }, e => fail(sec.domTable && sec.domTable.parentNode, e));
+        }, e => cdnFail(sec.domTable && sec.domTable.parentNode, e));
       }
-      return Promise.all([loadDomainPage(), sec.crossTable ? A.domains({ cross: 1, limit: 400 }).then(renderCross, e => fail(sec.crossTable.parentNode, e)) : null]);
+      return Promise.all([loadDomainPage(), sec.crossTable ? A.domains({ cross: 1, limit: 400 }).then(renderCross, e => cdnFail(sec.crossTable.parentNode, e)) : null]);
     }
     let domSeq = 0;
     function loadDomainPage() {
@@ -949,7 +957,7 @@
         domains = d;
         fillProviders([...new Set(d.map(x => x.provider).filter(Boolean))]);
         renderDomains();
-      }, e => { if (my === domSeq) fail(sec.domTable.parentNode, e); });
+      }, e => { if (my === domSeq) cdnFail(sec.domTable.parentNode, e); });
     }
     if (sec.domTable) {
       if (o.domainsMode === 'client') {
@@ -1011,7 +1019,8 @@
       timer = setInterval(() => { if (alive && !document.hidden) refresh(); }, o.refreshMs);
     }
     function pause() { if (timer) clearInterval(timer); timer = null; }
-    const all = Promise.allSettled([loadStats(), loadStatus(), loadBench(), loadPools(), loadDomains()]);
+    const st0 = loadStatus();
+    const all = Promise.allSettled([loadStats(), st0, loadBench(), loadPools(), loadDomains()]);
     start();
     // 視窗寬度改變：圖表依寬度重畫
     let rz = 0;

@@ -7,6 +7,14 @@
 			"path": "kuroshio/status"
 		}
 	},
+	"admin/services/kuroshio/dashboard": {
+		"title": "儀表板",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "kuroshio/dashboard"
+		}
+	},
 	"admin/services/kuroshio/settings": {
 		"title": "基本設定",
 		"order": 20,
