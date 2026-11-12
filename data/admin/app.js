@@ -3,7 +3,7 @@
 // 原生 JS、不需要編譯。伺服器給的字串一律用 textContent 放進頁面，不組 HTML。
 (function () {
 	/** 這個設定頁本身的版本（核心版本由 /api/about 提供；兩者不同時「關於」分頁兩個都會顯示） */
-	var UI_VERSION = '3.0.0-alpha.2';
+	var UI_VERSION = '3.0.0';
 
 	// ---------------------------------------------------------------- 小工具
 	var $ = function (id) { return document.getElementById(id); };

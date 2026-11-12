@@ -191,20 +191,22 @@
 
 完整設計見 [`docs/spec/`](docs/spec/README.md)。
 
-## 安裝（預覽版）
+## 安裝
 
-GitHub **Actions → Kuroshio DNS (Rust)** 每次執行都有產出（Artifacts），`v3.*` 標籤會自動建立 Release。
+到 GitHub **[Releases](https://github.com/candy999/kuroshio-dns/releases)** 下載。
+
+**OpenWrt**：先在路由器執行 `cat /etc/openwrt_release`，看 `DISTRIB_RELEASE`（OpenWrt 版本）和 `DISTRIB_ARCH`（套件架構），下載 `kuroshio-openwrt-<版本>-<架構>.zip`，例如 OpenWrt 24.10 的 NanoPi R2S 下載 `kuroshio-openwrt-24.10-aarch64_generic.zip`。不知道選哪個見 [選硬體、選套件](docs/hardware.md)。
+
+壓縮檔裡有 `kuroshio`、`luci-app-kuroshio` 兩個套件與一鍵安裝腳本：
 
 ```sh
-# OpenWrt 24.10
-opkg install ./kuroshio_*.ipk
-# OpenWrt 25.12 以後
-apk add --allow-untrusted ./kuroshio-*.apk
-
-# 預覽版預設不啟用；啟用後聽 127.0.0.1:5336，不會動到 dnsmasq 與防火牆
-uci set kuroshio.main.enabled=1 && uci commit kuroshio && /etc/init.d/kuroshio restart
-kuroshio query example.com -s 127.0.0.1:5336
+# 在電腦上解壓縮，把整個資料夾傳到路由器
+scp -O -r kuroshio-openwrt-24.10-x86_64 root@192.168.1.1:/tmp/
+# SSH 登入路由器：先檢查架構與版本，符合才兩個一起裝好
+sh /tmp/kuroshio-openwrt-24.10-x86_64/install.sh
 ```
+
+裝好後到 LuCI「服務 → 黑潮 DNS」確認設定、按「啟用」。預設不啟用，因為啟用後會接管路由器的 DNS（預設由 dnsmasq 把查詢轉給黑潮 DNS）；從 2.x（candydns）升級的話，舊的設定、自訂規則、憑證、社群金鑰會自動帶入。也可以用 LuCI「系統 → 軟體套件 → 上傳套件」依序上傳兩個套件。
 
 Windows：解壓 `kuroshio-windows-x86_64.zip`，在命令提示字元執行：
 

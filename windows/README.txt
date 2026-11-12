@@ -1,4 +1,4 @@
-黑潮 DNS（Kuroshio DNS）Windows 版：3.0 預覽
+黑潮 DNS（Kuroshio DNS）Windows 版 3.0
 
 功能：區網 DNS、DoH / DoH3 / DoT / DoQ、廣告 / 遙測 / 詐騙過濾、CDN 台灣節點置換、
 每日上游評測、Cloudflare DDNS、內建 Let's Encrypt（Cloudflare DNS 驗證）、本機設定頁、
