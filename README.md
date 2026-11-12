@@ -108,7 +108,7 @@ DNSCrypt 不支援：採用的伺服器少，而且都同時提供 DoH / DoT。
 | 功能 | 狀態 |
 |---|---|
 | 區網 UDP / TCP、並行上游、來源存取控制、診斷指令 `query` | ✅ 可用 |
-| 硬體分級與自動調整、Flash 寫入保護、記憶體看門狗、`sysinfo` | ✅ 可用 |
+| 動態記憶體控制（系統保留量、依序讓出、最低保留 DNS 轉發）、Flash 寫入保護（最久未存、壓縮、分片、儲存保留量）、`sysinfo` | ✅ 可用（實機待測） |
 | 快取（自適應預取、開機預熱、斷線回舊資料）、並行上游、IP 測速、管理 API | ✅ 可用 |
 | 各平台自動編譯（OpenWrt 套件、Windows、靜態執行檔） | ✅ |
 | DoT / DoH 上游（持久連線、HTTP/2）、OpenWrt UCI 設定轉換、清單下載 | ✅ 可用 |
@@ -121,8 +121,11 @@ DNSCrypt 不支援：採用的伺服器少，而且都同時提供 DoH / DoT。
 | Cloudflare DDNS（含 HTTPS 記錄）、內建 ACME（Windows）/ acme.sh（OpenWrt） | ✅ 可用 |
 | OpenWrt 正式套件與 LuCI（沿用 2.x 介面） | ✅ 可用 |
 | 公開頁、「這台裝置有沒有在用」偵測、統計歷史 | ✅ 可用 |
-| Windows：服務、攜帶版、防火牆 `setup`、IIS 反向代理 `iis setup`、設定頁（登入、存檔即重新載入） | 🚧 設定頁介面製作中 |
+| Windows：服務（當掉 1 秒內重啟）、攜帶版、防火牆 `setup`、IIS 反向代理 `iis setup` 與憑證自動匯入、設定頁（登入、存檔即重新載入）、cmd 互動指令（`help`、`url`、`open`…） | ✅ 可用 |
 | Windows：HTTP.sys 共用 443（模式 B，`listen.doh.windowsMode = httpsys / auto`） | ✅ 可用（CI 實機驗證 IIS 共存） |
+| 綁定網域、自備憑證、多網卡 / 多位址監聽、多出口 DDNS（IPv6 可選）、存放位置一覽 | ✅ 可用 |
+| 連線來源限制（預設只開放台灣 ISP + 區網、自訂允許 / 封鎖；OpenWrt 在核心層丟棄）、台灣 IP 清單每月在本機產生 | ✅ 可用 |
+| 學習資料匯出 / 匯入（完整備份、分享給朋友：只當候選，本機驗證後才使用） | ✅ 可用 |
 
 完整設計見 [`docs/spec/`](docs/spec/README.md)。
 
