@@ -1,6 +1,7 @@
 'use strict';
 // CI：Windows 本機設定頁（data/admin）端對端測試。自己啟動 kuroshio（暫存設定檔、空著的埠號），用 Playwright 實際操作：
-// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、網域與憑證 / 多網卡 / 多位址監聽 / 存放位置、連線來源、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
+// 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、網域與憑證 / 多網卡 / 多位址監聽 / 存放位置、連線來源、
+// 社群（邀請碼、我的身分、新增好友、好友清單與動作〔模擬資料〕、事件紀錄、自動規則）、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
 //
 //   cargo build -p kuroshio && node tools/admin-e2e.js
 //   KUROSHIO_BIN=path/to/kuroshio SHOTS=screenshots-admin node tools/admin-e2e.js
@@ -539,6 +540,149 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         check(cw <= 391, '390 px 寬沒有水平捲動：設定 → 社群（邀請碼）', `scrollWidth = ${cw}`);
         await shot('06f-mobile-community');
         await page.setViewportSize({ width: 1280, height: 900 });
+        console.log('社群：我的身分、新增好友、好友與請求、事件紀錄、自動規則');
+        // 真的服務：社群已啟用但還沒就緒（沒有網域），自我檢查列出缺什麼；用網域加好友 → 服務回「未就緒」
+        await page.waitForFunction(() => /未就緒/.test((document.getElementById('community-status') || {}).textContent || ''), null, { timeout: 10000 }).catch(() => {});
+        check(/未就緒/.test(await page.textContent('#community-status')) && await page.locator('#cm-problems li').count() >= 1,
+            '我的身分：未就緒時逐條列出自我檢查的問題（真的服務）', await page.textContent('#community-status'));
+        await page.click('#community-status button:has-text("重新檢查")');
+        await page.waitForFunction(() => /已重新檢查/.test(document.getElementById('toast').textContent), null, { timeout: 15000 }).catch(() => {});
+        check(/已重新檢查/.test(await page.textContent('#toast')), '我的身分：重新檢查（POST /api/community/check）', await page.textContent('#toast'));
+        await page.fill('#community-add-input', 'friend.example.com');
+        await page.click('#community-add button:has-text("送出請求")');
+        await page.waitForSelector('#community-add-result .msg', { timeout: 15000 }).catch(() => {});
+        check(/未就緒/.test(await page.textContent('#community-add-result').catch(() => '')), '新增好友：服務回覆的原因顯示出來（真的服務：未就緒）', await page.textContent('#community-add-result').catch(() => ''));
+
+        // 好友清單與動作用模擬資料（真的好友需要公開網域與憑證）：攔截 /api/community/peers、events 與各動作，記下送出的請求
+        const now = Date.now();
+        let peers = [
+            { domain: 'in.example.net', rel: 'in', info: { asn: 3462, colo: 'TPE', rttMs: 12, jitterMs: 2, lossPct: 0 }, stats: {}, fingerprint: 'AB:CD:EF:01:23:45:67:89:AB:CD' },
+            { domain: 'in2.example.net', rel: 'in', info: { asn: 17421, colo: 'KHH' }, stats: {} },
+            { domain: 'friend.example.com', rel: 'friend', channel: 'doq', invitedAt: now - 86400000, friendSince: now - 86400000, lastSyncOk: now - 60000,
+                info: { asn: 4780, colo: 'TPE', rttMs: 25, jitterMs: 3, lossPct: 1 }, stats: { offered: 120, invalid: 2, tried: 40, ok: 38, fail: 2 },
+                scores: { node: { score: 0.9, ok: 9, fail: 0, invalid: 0 }, site: { score: 0.95, ok: 38, fail: 2, invalid: 0 } } },
+            { domain: 'keys.example.org', rel: 'friend', channel: 'https', preferChannel: 'https', lastError: '連線逾時', pendingKey: { kid: 'aa', fingerprint: '11:22:33' }, stats: {} },
+            { domain: 'out.example.org', rel: 'out', stats: {} },
+            { domain: 'blocked.example.net', rel: 'none', myBlock: true, stats: {} }
+        ];
+        const posted = [];
+        await page.route('**/api/community/**', async r => {
+            const u = new URL(r.request().url());
+            const name = u.pathname.replace('/api/community/', ''), d = u.searchParams.get('domain');
+            const json = v => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(v) });
+            if (name === 'peers') return json(peers);
+            if (name === 'events') return json([{ at: now, domain: 'friend.example.com', type: '成為好友', detail: '透過邀請碼加入' }, { at: now - 1000, domain: 'in.example.net', type: '收到請求', detail: '' }]);
+            if (r.request().method() !== 'POST' || name === 'check' || name.startsWith('invite')) return r.continue();
+            posted.push({ name, domain: d, block: u.searchParams.get('block'), channel: u.searchParams.get('channel'), method: r.request().method() });
+            const p = peers.find(x => x.domain === d);
+            if (name === 'accept' && p) p.rel = 'friend';
+            else if (name === 'reject' && p) { p.rel = 'none'; p.rejectedUntil = now + 7 * 86400000; }
+            else if (name === 'delete' && p) peers = peers.filter(x => x !== p);
+            else if (name === 'unblock' && p) p.myBlock = false;
+            else if (name === 'channel' && p) p.preferChannel = u.searchParams.get('channel') === 'auto' ? null : u.searchParams.get('channel');
+            else if (name === 'add') peers.push({ domain: d, rel: 'out', stats: {} });
+            return json({ ok: true });
+        });
+        const card = dm => `#community-peers .cm-peer[data-domain="${dm}"]`;
+        // 重新進入分類（面板重新讀取，拿到模擬資料）
+        await page.click('#cfg-groups button[data-group=community]');
+        await page.waitForSelector(card('friend.example.com'), { timeout: 10000 }).catch(() => {});
+        check(await page.locator('#community-peers .cm-peer').count() === 6, '好友與請求：每個對象一張卡片', String(await page.locator('#community-peers .cm-peer').count()));
+        const fr = await page.textContent(card('friend.example.com')).catch(() => '');
+        check(/好友/.test(fr) && /AS4780 · TPE/.test(fr) && /25 ms（抖動 3、掉包 1%）/.test(fr) && /DoQ/.test(fr) && /透過邀請碼/.test(fr) && /95%（38\/40）/.test(fr)
+            && /120 \/ 違規 2/.test(fr) && /節點池 90%/.test(fr) && /網站驗證 95%/.test(fr), '好友：狀態、業者 · 機房、連線品質、管道、邀請碼加入、命中率、提供筆數、資料品質', fr);
+        check(/待我審核/.test(await page.textContent(card('in.example.net'))) && /AS3462 · TPE/.test(await page.textContent(card('in.example.net'))), '待我審核的請求');
+        check(/等待對方同意/.test(await page.textContent(card('out.example.org'))) && /已封鎖/.test(await page.textContent(card('blocked.example.net'))), '等待對方同意、已封鎖');
+        const kc = await page.textContent(card('keys.example.org'));
+        check(/連線逾時/.test(kc) && /沒有用舊金鑰簽名/.test(kc) && /指定 HTTPS/.test(kc), '最後錯誤、待確認的新金鑰、指定的管道', kc);
+        check(/成為好友.*透過邀請碼加入/.test(await page.textContent('#community-events')), '事件紀錄');
+        await shot('06g-community-peers');
+        await page.emulateMedia({ colorScheme: 'dark' });
+        await shot('06g-dark-community-peers');
+        await page.setViewportSize({ width: 390, height: 800 });
+        await page.waitForTimeout(300);
+        const pw = await page.evaluate(() => document.documentElement.scrollWidth);
+        check(pw <= 391, '390 px 寬沒有水平捲動：設定 → 社群（好友與請求）', `scrollWidth = ${pw}`);
+        await page.locator('#community-peers').screenshot({ path: path.join(SHOTS, '06g-mobile-dark-community-peers.png') });
+        await page.emulateMedia({ colorScheme: 'light' });
+        await page.locator('#community-peers').screenshot({ path: path.join(SHOTS, '06g-mobile-community-peers.png') });
+        await page.setViewportSize({ width: 1280, height: 900 });
+
+        const lastPost = () => posted[posted.length - 1] || {};
+        await page.click(`${card('in.example.net')} button:has-text("同意")`);
+        await page.waitForFunction(s => !/待我審核/.test(document.querySelector(s).textContent), card('in.example.net'), { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'accept' && lastPost().domain === 'in.example.net' && lastPost().method === 'POST' && !/待我審核/.test(await page.textContent(card('in.example.net'))),
+            '同意請求：POST /api/community/accept?domain=…，清單重新讀取', JSON.stringify(lastPost()));
+        await page.click(`${card('in2.example.net')} button:has-text("拒絕")`);
+        await page.waitForFunction(s => /已拒絕/.test(document.querySelector(s).textContent), card('in2.example.net'), { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'reject' && /已拒絕（.* 前不能再請求）/.test(await page.textContent(card('in2.example.net'))), '拒絕請求：顯示幾天內不能再請求', JSON.stringify(lastPost()));
+        await page.click(`${card('friend.example.com')} button:has-text("立即同步")`);
+        await page.waitForFunction(() => /已同步/.test(document.getElementById('toast').textContent), null, { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'sync' && lastPost().domain === 'friend.example.com' && /已同步/.test(await page.textContent('#toast')), '立即同步', JSON.stringify(lastPost()));
+        await page.selectOption(`${card('friend.example.com')} select.cm-channel`, 'dot');
+        await page.waitForFunction(() => /已指定管道/.test(document.getElementById('toast').textContent), null, { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'channel' && lastPost().channel === 'dot', '指定管道（DoT 優先）', JSON.stringify(lastPost()));
+        page.once('dialog', dl => dl.dismiss());
+        await page.click(`${card('friend.example.com')} button:has-text("刪除並封鎖")`);
+        await page.waitForTimeout(300);
+        check(lastPost().name === 'channel' && await page.locator(card('friend.example.com')).count() === 1, '刪除：按取消就不送出');
+        page.once('dialog', dl => dl.accept());
+        await page.click(`${card('friend.example.com')} button:has-text("刪除並封鎖")`);
+        await page.waitForFunction(s => !document.querySelector(s), card('friend.example.com'), { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'delete' && lastPost().block === '1' && await page.locator(card('friend.example.com')).count() === 0, '刪除並封鎖：確認後送出 block=1，清單少一筆', JSON.stringify(lastPost()));
+        page.once('dialog', dl => dl.accept());
+        await page.click(`${card('keys.example.org')} button:text-is("刪除")`);
+        await page.waitForFunction(s => !document.querySelector(s), card('keys.example.org'), { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'delete' && lastPost().domain === 'keys.example.org' && !lastPost().block, '刪除好友', JSON.stringify(lastPost()));
+        await page.click(`${card('blocked.example.net')} button:has-text("解除封鎖")`);
+        await page.waitForFunction(s => !/已封鎖/.test(document.querySelector(s).textContent), card('blocked.example.net'), { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'unblock' && await page.locator(`${card('blocked.example.net')} button:has-text("加好友")`).count() === 1, '解除封鎖後可以再加好友', JSON.stringify(lastPost()));
+        await page.fill('#community-add-input', 'new.example.com');
+        await page.press('#community-add-input', 'Enter');
+        await page.waitForSelector(card('new.example.com'), { timeout: 5000 }).catch(() => {});
+        check(lastPost().name === 'add' && lastPost().domain === 'new.example.com' && /已送出好友請求/.test(await page.textContent('#community-add-result'))
+            && /等待對方同意/.test(await page.textContent(card('new.example.com')).catch(() => '')) && await page.inputValue('#community-add-input') === '',
+            '新增好友（網域）：送出後清單出現「等待對方同意」', JSON.stringify(lastPost()));
+        check(posted.every(x => x.method === 'POST'), '所有動作都用 POST');
+        await page.unroute('**/api/community/**');
+
+        // 自動規則：存在 community.rules，跟其他設定一起儲存
+        await page.click('#community-rule-add');
+        await page.fill('.cm-rule[data-index="0"] .cm-rule-name', '中華電信');
+        await page.fill('#cm-r0-asn', '3462, 4780');
+        await page.fill('#cm-r0-colo', 'tpe');
+        await page.fill('#cm-r0-max_rtt_ms', '30');
+        await page.fill('#cm-r0-min_mutual', 'abc');
+        check(/格式不正確/.test(await page.textContent('#save-msg')) && await page.locator('#cm-r0-min_mutual.invalid').count() === 1, '自動規則：格式錯誤時標出來、不能儲存', await page.textContent('#save-msg'));
+        await page.fill('#cm-r0-min_mutual', '');
+        await page.click('#community-rule-add');
+        await page.fill('.cm-rule[data-index="1"] .cm-rule-name', '封鎖測試');
+        await page.selectOption('.cm-rule[data-index="1"] select', 'block');
+        await page.fill('#cm-r1-domain_suffix', 'bad.example.net');
+        await page.click('.cm-rule[data-index="1"] button[aria-label="第 2 條規則往上移"]');
+        await page.click('.cm-rule[data-index="1"] summary');
+        await shot('06h-community-rules');
+        await page.setViewportSize({ width: 390, height: 800 });
+        await page.waitForTimeout(300);
+        const rw = await page.evaluate(() => document.documentElement.scrollWidth);
+        check(rw <= 391, '390 px 寬沒有水平捲動：設定 → 社群（自動規則）', `scrollWidth = ${rw}`);
+        await page.locator('#community-rules').screenshot({ path: path.join(SHOTS, '06h-mobile-community-rules.png') });
+        await page.setViewportSize({ width: 1280, height: 900 });
+        await page.click('#btn-save');
+        await page.waitForFunction(() => /已儲存並套用|失敗|沒有在 30 秒/.test(document.getElementById('save-msg').textContent), null, { timeout: 40000 });
+        const rules = (JSON.parse(fs.readFileSync(cfgFile, 'utf-8')).community || {}).rules;
+        // 設定檔的鍵依字母排序：比對前先排好
+        const canon = v => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.keys(x).sort().reduce((o, key) => { o[key] = x[key]; return o; }, {}) : x));
+        check(canon(rules) === canon([
+            { enabled: true, name: '封鎖測試', action: 'block', domain_suffix: ['bad.example.net'] },
+            { enabled: true, name: '中華電信', action: 'accept', asn: [3462, 4780], colo: ['TPE'], max_rtt_ms: 30 }]),
+        '自動規則：存進 community.rules（順序、數字、清單、大寫機房代碼）', JSON.stringify(rules));
+        await page.click('#cfg-groups button[data-group=community]');
+        await page.waitForSelector('.cm-rule[data-index="1"]', { timeout: 10000 }).catch(() => {});
+        check(await page.inputValue('#cm-r1-asn').catch(() => '') === '3462, 4780', '自動規則：儲存後重新讀取顯示一樣的內容');
+        await page.click('.cm-rule[data-index="0"] button:text-is("刪除")');
+        await page.click('.cm-rule[data-index="0"] button:text-is("刪除")');
+        check(/沒有規則/.test(await page.textContent('#community-rules')), '自動規則：刪除全部');
         // 關回來（後面的測試不需要社群）
         await page.uncheck(`${field('community.enabled')} input[type=checkbox]`);
         await page.click('#btn-save');

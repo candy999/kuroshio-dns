@@ -1445,6 +1445,21 @@
 		}
 	};
 
+	/** 給其他檔案（community.js）用：共用小工具、掛上自己的面板（WIDGETS）、編輯不是單一欄位的設定值 */
+	window.KuroshioAdmin = {
+		el: el, append: append, clear: clear, api: api, qs: qs, errText: errText, toast: toast, badge: badge, actBtn: actBtn,
+		fmtTime: fmtTime, fmtNum: fmtNum, copyText: copyText, isPro: isPro, widgets: WIDGETS,
+		/** 編輯中的值（沒寫 = 預設值） */
+		value: function (key) { return effOf({ key: key }); },
+		/** 改值（undefined = 用預設值）；err = 格式錯誤訊息（有錯就不能儲存） */
+		setValue: function (key, v, err) {
+			var f = { key: key };
+			setValue(f, v);
+			if (err) S.errors[key] = err;
+			changed(f, null);
+		}
+	};
+
 	/** 物件陣列（訂閱清單）：每一列的欄位依 columns；不認識的屬性保留 */
 	function renderTable(f, row) {
 		var pro = isPro();

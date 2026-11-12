@@ -463,9 +463,26 @@
       "desc": "跟好友交換台灣節點池、網站驗證結果、上游 DNS。只分享自己驗證過的資料；收到的資料一律在本機驗證後才使用。需要先設好網域、憑證，並打開 DoH 或 DoT 其中一種（共享走同一個加密連線，不另開埠）。",
       "sections": [
         {
+          "title": "我的身分",
+          "widget": "communityStatus"
+        },
+        {
           "title": "好友邀請碼",
-          "desc": "互加好友最快的方法：把「我的邀請碼」傳給朋友，朋友貼到他的設定頁就會自動成為好友，馬上開始交換資料。雙方都要先符合社群條件（網域、DoH / DoT / DoQ 至少一種、網域解析得到）。也可以用網域加好友（LuCI 或指令列）。",
+          "desc": "互加好友最快的方法：把「我的邀請碼」傳給朋友，朋友貼到他的設定頁就會自動成為好友，馬上開始交換資料。雙方都要先符合社群條件（網域、DoH / DoT / DoQ 至少一種、網域解析得到）。也可以在下方「新增好友」用網域加好友。",
           "widget": "communityInvite"
+        },
+        {
+          "title": "新增好友",
+          "desc": "輸入對方的網域（非標準埠可以寫成 網域:埠）。對方會回連驗證你的網域與憑證；你的出口 IP 必須跟網域解析出的 IP 一樣。",
+          "widget": "communityAdd"
+        },
+        {
+          "title": "好友與請求",
+          "widget": "communityPeers"
+        },
+        {
+          "title": "事件紀錄",
+          "widget": "communityEvents"
         },
         {
           "title": "設定",
@@ -481,6 +498,11 @@
             { "key": "community.autoDeleteLowHitRate", "type": "bool", "label": "命中率太低時自動刪除好友", "help": "試過 20 次以上還低於命中率下限就自動刪除。", "pro": true },
             { "key": "community.powBits", "type": "int", "label": "好友請求的工作量證明難度", "help": "越高越難灌請求，但對方送請求也越久。", "pro": true, "min": 0 }
           ]
+        },
+        {
+          "title": "自動規則",
+          "desc": "收到好友請求時由上往下比對，第一條「所有有填的條件都符合」的規則決定動作；都不符合就等人工審核。你刪除過的對象一律人工審核。",
+          "widget": "communityRules"
         }
       ]
     },
