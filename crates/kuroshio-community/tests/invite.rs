@@ -38,13 +38,10 @@ fn logs() -> Arc<Mutex<Vec<u8>>> {
     .clone()
 }
 
-/// 不開 DoQ：QUIC 用戶端端點是整個程式共用的（綁在第一個建立它的 tokio runtime 上），
-/// 同一個測試程式裡每個測試各有一個 runtime，第一個測試結束後別的測試就不能再用
+/// 三種管道都開（DoQ、DoT、HTTPS）：同一個測試程式裡每個測試各有一個 runtime，
+/// QUIC 用戶端端點跟著 runtime 走，前一個測試結束後別的測試照樣能用 DoQ
 fn spec() -> Spec {
-    Spec {
-        channels: vec![Scheme::Dot, Scheme::Https],
-        ..Default::default()
-    }
+    Spec::default()
 }
 
 fn code_of(n: &Node) -> String {
@@ -93,8 +90,8 @@ async fn join_with_valid_code() {
     let inv = Invite::parse(&code).unwrap();
     assert_eq!(inv.domain, "ia.test");
     assert_eq!(kuroshio_community::identity::fingerprint_text(&inv.fingerprint), a.c.fingerprint());
-    // 測試的端點都不在預設埠：邀請碼帶第一個端點（DoT）
-    assert_eq!(inv.endpoint.as_ref().map(|e| (e.scheme, e.port)), Some((Scheme::Dot, a.dot)));
+    // 測試的端點都不在預設埠：邀請碼帶第一個端點（DoQ）
+    assert_eq!(inv.endpoint.as_ref().map(|e| (e.scheme, e.port)), Some((Scheme::Doq, a.doq)));
     // 固定：再查一次一樣
     assert_eq!(code_of(&a), code);
 

@@ -1082,6 +1082,7 @@ dependencies = [
  "kuroshio-config",
  "kuroshio-proto",
  "quinn",
+ "rcgen 0.13.2",
  "rustls",
  "serde_json",
  "tokio",

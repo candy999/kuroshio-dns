@@ -2,34 +2,79 @@
 //!
 //! - 每個上游一條持久 QUIC 連線，每筆查詢一條串流（多工，不會互相卡住）
 //! - 連線斷掉就重新連線再試一次
-//! - 用戶端端點（UDP socket）IPv4 / IPv6 各一個，全部上游共用
+//! - 用戶端端點（UDP socket）每個 tokio runtime 的 IPv4 / IPv6 各一個，同一個 runtime 的全部上游共用
 
 use crate::tls::{client_config, resolve_host};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Buf, Bytes};
 use quinn::crypto::rustls::QuicClientConfig;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::debug;
 
-type Endpoints = Mutex<(Option<quinn::Endpoint>, Option<quinn::Endpoint>)>;
-
-fn endpoints() -> &'static Endpoints {
-    static E: OnceLock<Endpoints> = OnceLock::new();
-    E.get_or_init(|| Mutex::new((None, None)))
+/// 用戶端端點表的一格：依（tokio runtime、位址家族）分開。
+///
+/// quinn 的端點驅動工作跑在「建立端點的那個 runtime」上；那個 runtime 結束後（設定頁存檔後重新載入、
+/// 匯入備份後重新啟動、Windows 服務停止再啟動、測試程式的每個 `#[tokio::test]`）端點就變成
+/// 「endpoint stopping」，之後每次連線都失敗。所以每個 runtime 各自建立自己的端點，
+/// runtime 結束時從表裡移除（socket 跟著關閉，不會一直累積）。
+struct Slot {
+    rt: tokio::runtime::Id,
+    v6: bool,
+    /// 這個端點的序號：移除時比對，runtime 編號被重複使用時不會刪到新的端點
+    token: u32,
+    ep: quinn::Endpoint,
 }
 
-/// 用戶端端點（依位址家族共用）
+fn endpoints() -> &'static Mutex<Vec<Slot>> {
+    static E: OnceLock<Mutex<Vec<Slot>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 放在建立端點的 runtime 裡的一個永遠不結束的工作：runtime 結束時工作被丟掉，順便把端點從表裡移除
+struct Remove(u32);
+
+impl Drop for Remove {
+    fn drop(&mut self) {
+        if let Ok(mut v) = endpoints().lock() {
+            v.retain(|s| s.token != self.0);
+        }
+    }
+}
+
+/// 這個 runtime 在表裡有幾個用戶端端點（測試用：確認 runtime 結束後沒有留下 socket）
+#[doc(hidden)]
+pub fn endpoints_of(rt: tokio::runtime::Id) -> usize {
+    endpoints().lock().map(|v| v.iter().filter(|s| s.rt == rt).count()).unwrap_or(0)
+}
+
+/// 用戶端端點（同一個 runtime、同一個位址家族共用）
 fn endpoint(v6: bool) -> Result<quinn::Endpoint> {
-    let mut e = endpoints().lock().unwrap();
-    let slot = if v6 { &mut e.1 } else { &mut e.0 };
-    if let Some(ep) = slot {
-        return Ok(ep.clone());
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let handle = tokio::runtime::Handle::try_current().context("QUIC 必須在 tokio runtime 裡執行")?;
+    let rt = handle.id();
+    let mut v = endpoints().lock().unwrap();
+    if let Some(s) = v.iter().find(|s| s.rt == rt && s.v6 == v6) {
+        return Ok(s.ep.clone());
     }
     let bind: SocketAddr = if v6 { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
     let ep = quinn::Endpoint::client(bind).context("建立 QUIC 端點失敗")?;
-    *slot = Some(ep.clone());
+    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    v.push(Slot {
+        rt,
+        v6,
+        token,
+        ep: ep.clone(),
+    });
+    // 先放開鎖再 spawn：runtime 正在關閉時 spawn 會當場丟掉工作，Remove::drop 要拿同一把鎖
+    drop(v);
+    let guard = Remove(token);
+    handle.spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await
+    });
     Ok(ep)
 }
 

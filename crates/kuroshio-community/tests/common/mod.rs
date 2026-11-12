@@ -119,6 +119,8 @@ pub struct Faults {
     pub quic_down: AtomicBool,
     /// 假裝還是 2.x（v1）：v2 路徑 404、/.well-known/candydns 200、TLS / QUIC 的 kuroshio/2 不通
     pub v1_mode: AtomicBool,
+    /// HTTPS 與 TLS（TCP）都不通：連上就斷（只剩 QUIC）
+    pub tcp_down: AtomicBool,
     pub requests: AtomicUsize,
 }
 
@@ -288,6 +290,10 @@ pub async fn node(domain: &str, r: &Arc<StaticResolver>, spec: Spec) -> Node {
         tokio::spawn(async move {
             loop {
                 let Ok((tcp, peer)) = https_l.accept().await else { return };
+                if f.tcp_down.load(Ordering::SeqCst) {
+                    drop(tcp); // HTTPS / DoT 不通：連上就斷
+                    continue;
+                }
                 let (c, f, acc) = (c.clone(), f.clone(), acc.clone());
                 tokio::spawn(async move {
                     let Ok(mut s) = acc.accept(tcp).await else { return };
@@ -366,6 +372,10 @@ pub async fn node(domain: &str, r: &Arc<StaticResolver>, spec: Spec) -> Node {
         tokio::spawn(async move {
             loop {
                 let Ok((tcp, peer)) = dot_l.accept().await else { return };
+                if f.tcp_down.load(Ordering::SeqCst) {
+                    drop(tcp); // HTTPS / DoT 不通：連上就斷
+                    continue;
+                }
                 let (c, f, acc) = (c.clone(), f.clone(), acc.clone());
                 tokio::spawn(async move {
                     let Ok(mut s) = acc.accept(tcp).await else { return };
