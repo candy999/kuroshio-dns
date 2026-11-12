@@ -798,6 +798,44 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
     });
 }
 
+/// 社群的對外端點（好友連過來的網址）。OpenWrt 的 UCI 轉換會依 LuCI 的設定填好；
+/// JSON 設定（Windows、其他 Linux）沒寫 `community.endpoints` 時，依實際開啟的 DoH / DoT / DoQ 與網域自動產生：
+/// `https://<網域>[:對外埠]/.well-known/kuroshio`、`dot://<網域>:<埠>`、`doq://<網域>:<埠>`。有明確填寫的一律不動。
+pub fn community_section(cfg: &Value, base: &std::path::Path) -> Option<Value> {
+    let mut c = get(cfg, "community")?.clone();
+    let given = match c.get("endpoints") {
+        Some(Value::Array(a)) => a.iter().any(|x| x.as_str().is_some_and(|s| !s.trim().is_empty())),
+        Some(Value::Object(o)) => o.values().any(|x| x.as_str().is_some_and(|s| !s.trim().is_empty())),
+        _ => false,
+    };
+    let domain = c
+        .get("domain")
+        .and_then(Value::as_str)
+        .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| kuroshio_config::bound_domain(cfg));
+    if given || domain.is_empty() {
+        return Some(c);
+    }
+    let on = |p: &str| get(cfg, &format!("listen.{p}.enabled")).and_then(Value::as_bool).unwrap_or(false);
+    let mut eps = serde_json::Map::new();
+    if on("doh") {
+        let port = public_doh_port(cfg, doh_uses_tls(cfg, base));
+        let p = if port == 443 { String::new() } else { format!(":{port}") };
+        eps.insert("doh".into(), json!(format!("https://{domain}{p}/.well-known/kuroshio")));
+    }
+    if on("dot") {
+        eps.insert("dot".into(), json!(format!("dot://{domain}:{}", cfg_port(cfg, "listen.dot.port").unwrap_or(853))));
+    }
+    if on("doq") {
+        eps.insert("doq".into(), json!(format!("doq://{domain}:{}", cfg_port(cfg, "listen.doq.port").unwrap_or(853))));
+    }
+    if let Some(o) = c.as_object_mut() {
+        o.insert("endpoints".into(), Value::Object(eps));
+    }
+    Some(c)
+}
+
 /// 社群共享 v2（規格 03）：金鑰在 community.dir，狀態經快照寫入器存在 state/community/
 fn start_community(
     cfg: &Value,
@@ -806,7 +844,7 @@ fn start_community(
     cdn: Option<Arc<kuroshio_cdn::Cdn>>,
 ) -> Option<Arc<kuroshio_community::Community>> {
     use kuroshio_community::{Community, Config, Options};
-    let c = Config::from_json(get(cfg, "community")?);
+    let c = Config::from_json(&community_section(cfg, base_dir)?);
     if !c.enabled {
         return None;
     }
@@ -1618,6 +1656,44 @@ pub async fn start(cfg: &Value) -> Result<Started> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn community_endpoints_from_listeners() {
+        let base = std::path::Path::new("/tmp/k");
+        let c = kuroshio_config::build(&json!({
+            "domain": "dns.example.net",
+            "tls": { "cert": "/c.pem", "key": "/k.pem" },
+            "listen": { "doh": { "enabled": true, "port": 443, "tls": true }, "dot": { "enabled": true }, "doq": { "enabled": true } },
+            "community": { "enabled": true }
+        }));
+        let s = community_section(&c, base).unwrap();
+        assert_eq!(s["endpoints"]["doh"], json!("https://dns.example.net/.well-known/kuroshio"));
+        assert_eq!(s["endpoints"]["dot"], json!("dot://dns.example.net:853"));
+        assert_eq!(s["endpoints"]["doq"], json!("doq://dns.example.net:853"));
+        let cc = kuroshio_community::Config::from_json(&s);
+        assert_eq!(cc.endpoints.len(), 3);
+
+        // 非 443 埠：網址帶埠號；DoT 沒開就不列
+        let c = kuroshio_config::build(&json!({
+            "domain": "dns.example.net",
+            "tls": { "cert": "/c.pem", "key": "/k.pem" },
+            "listen": { "doh": { "enabled": true, "port": 8443, "tls": true } }
+        }));
+        let s = community_section(&c, base).unwrap();
+        assert_eq!(s["endpoints"]["doh"], json!("https://dns.example.net:8443/.well-known/kuroshio"));
+        assert!(s["endpoints"].get("dot").is_none());
+
+        // 明確填寫的不動；沒有網域不產生
+        let c = kuroshio_config::build(&json!({
+            "domain": "dns.example.net",
+            "listen": { "dot": { "enabled": true } },
+            "community": { "endpoints": { "dot": "dot://other.example.net:853" } }
+        }));
+        assert_eq!(community_section(&c, base).unwrap()["endpoints"]["dot"], json!("dot://other.example.net:853"));
+        let c = kuroshio_config::build(&json!({ "listen": { "dot": { "enabled": true } } }));
+        let e = &community_section(&c, base).unwrap()["endpoints"];
+        assert!(e.get("dot").map(Value::is_null).unwrap_or(true));
+    }
+
     use super::*;
     use std::path::Path;
 
