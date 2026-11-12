@@ -51,11 +51,13 @@ CPU 方面：DNS 本身很輕，單核 MIPS 也跑得動；差別在 DoT / DoH �
 | Qualcomm IPQ50xx | 雙核 Cortex-A53 | 256–512 MB / NAND | 部分 Wi-Fi 6 入門機 | `aarch64_cortex-a53` |
 | **Rockchip RK3328** | 四核 Cortex-A53 1.3 GHz | 1 GB / microSD | NanoPi R2S、R2C | `aarch64_generic` |
 | Rockchip RK3399 | 雙核 A72 + 四核 A53 | 1–4 GB / microSD | NanoPi R4S | `aarch64_generic` |
-| Rockchip RK3568 / RK3588 | 四核 A55 / 八核 A76+A55 | 2–8 GB / eMMC | NanoPi R5S、R6S | `aarch64_generic` |
+| Rockchip RK3568 | 四核 Cortex-A55 2.0 GHz | 2–4 GB / eMMC | NanoPi R5S、R5C | `aarch64_generic` |
+| **Rockchip RK3588 / RK3588S** | 八核：四核 Cortex-A76 2.4 GHz + 四核 Cortex-A55 | 4–32 GB / eMMC 或 NVMe | NanoPi R6S、R6C、Radxa ROCK 5B、Orange Pi 5 Plus | `aarch64_generic` |
 | Raspberry Pi 3 | 四核 Cortex-A53 1.2 GHz | 1 GB / microSD | — | `aarch64_cortex-a53` |
 | Raspberry Pi 4 | 四核 Cortex-A72 1.5 GHz | 1–8 GB / microSD | — | `aarch64_cortex-a72` |
 | Raspberry Pi 5 | 四核 Cortex-A76 2.4 GHz | 2–16 GB / microSD | — | `aarch64_cortex-a76` |
 
+- **RK3588** 是目前 ARM 軟路由裡效能最強的一級，多埠 2.5G 機種很多，黑潮 DNS 所有功能、大型清單同時開都綽綽有餘。官方 OpenWrt 支援的 RK3588 機種還在陸續增加，很多人跑 FriendlyWrt、ImmortalWrt 等分支；套件架構一樣是 `aarch64_generic`，依分支的 OpenWrt 版本選 `.ipk`（24.10）或 `.apk`（25.12 以後）。
 - 這一類全部用同一個黑潮 DNS 執行檔，只是依 OpenWrt 的套件架構名稱包成不同的套件；請下載跟 `DISTRIB_ARCH` 同名的那一個。
 - IPQ60xx / IPQ807x 很多機種跑的是 ImmortalWrt 等分支；套件架構一樣是 `aarch64_cortex-a53`，但請依分支的 OpenWrt 版本選 `.ipk`（24.10）或 `.apk`（25.12 以後）。
 
@@ -102,7 +104,7 @@ MIPS 分**小端序**（`mipsel`）和**大端序**（`mips`）兩種，互不�
 | 需求 | 建議 |
 |---|---|
 | 一般家庭、要 Wi-Fi | **MediaTek Filogic（MT7981 / MT7986）**：價格親民、記憶體 256 MB 以上、OpenWrt 官方支援完整 |
-| 效能優先、不在意 Wi-Fi | **x86_64 小主機（N100）** 或 **NanoPi R4S / R5S / R6S** |
+| 效能優先、不在意 Wi-Fi | **x86_64 小主機（N100）** 或 **Rockchip 軟路由（NanoPi R5S / R6S、RK3588 系列）** |
 | 手邊已有舊機 | **MT7621、IPQ40xx、IPQ806x、Armada 385** 都很適合 |
 | 避開 | 記憶體 64 MB 以下、儲存 8 MB 的機種 |
 
