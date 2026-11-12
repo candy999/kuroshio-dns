@@ -228,7 +228,18 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
             const sw = await page.evaluate(() => document.documentElement.scrollWidth);
             await page.screenshot({ path: `${SHOTS}/dashboard-${scheme}-${w}.png`, fullPage: true });
             const tag = `儀表板（${scheme === 'dark' ? '深色' : '淺色'} ${w} px）`;
-            if (!ready) { bad(`${tag}：沒有畫出總覽\n     ${text.slice(0, 300)}`); continue; }
+            if (!ready) {
+                // 真正的 OpenWrt 容器沒有 procd，黑潮 DNS 服務沒有跑：儀表板要載入，並清楚說明讀不到資料的原因
+                const down = /服務沒有回應/.test(text) && /儀表板/.test(text);
+                if (!MOCK && down) {
+                    ok(`${tag}：服務沒啟動時顯示原因（${text.match(/[^\n]*服務沒有回應[^\n]*/)[0].trim()}）`);
+                    sw <= w + 1 ? ok(`${tag}：沒有水平捲動`) : bad(`${tag}：頁面被撐寬（scrollWidth = ${sw}）`);
+                } else {
+                    bad(`${tag}：沒有畫出總覽\n     ${text.slice(0, 300)}`);
+                }
+                if (errors.length) bad(`${tag}：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+                continue;
+            }
             /總覽/.test(text) && /DNS 查詢/.test(text) && /上游 DNS/.test(text) && /台灣節點池/.test(text) && /CDN 網域資料庫/.test(text) && /過濾規則/.test(text) && /排程工作/.test(text)
                 ? ok(`${tag}：各區塊都有`) : bad(`${tag}：缺少區塊\n     ${text.slice(0, 300)}`);
             if (MOCK) {
