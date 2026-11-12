@@ -1,0 +1,7 @@
+# Windows：把 C 執行階段（VCRUNTIME140.dll 等）靜態連結進 kuroshio.exe，
+# 使用者的電腦不必另外安裝 Visual C++ Redistributable。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

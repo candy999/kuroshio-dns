@@ -4,6 +4,8 @@
 每日上游評測、Cloudflare DDNS、內建 Let's Encrypt（Cloudflare DNS 驗證）、本機設定頁、
 公開頁、社群共享、Windows 服務、IIS 共存。
 
+系統需求：Windows 10 / 11（64 位元）。單一執行檔，不需要另外安裝 Visual C++ 執行階段或其他元件。
+
 快速開始（命令提示字元）：
   kuroshio.exe run                           前景執行（Ctrl+C 正常結束並寫出快照）
                                              啟動時會印出設定頁的登入網址與公開頁網址

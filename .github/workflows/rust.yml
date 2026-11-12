@@ -173,6 +173,14 @@ jobs:
         run: cargo test --workspace --features kuroshio/acme
       - name: 編譯（含內建 ACME）
         run: cargo build --release -p kuroshio --features acme
+      - name: 不需要另外安裝 Visual C++ 執行階段
+        shell: pwsh
+        run: |
+          # C 執行階段要靜態連結（.cargo/config.toml 的 crt-static）：匯入表裡不能有 VCRUNTIME / MSVCP / api-ms-win-crt
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("target/release/kuroshio.exe"))
+          $bad = [regex]::Matches($text, '(?i)(vcruntime\d+\.dll|msvcp\d+\.dll|api-ms-win-crt-[a-z0-9-]+\.dll)') | ForEach-Object { $_.Value.ToLower() } | Sort-Object -Unique
+          if ($bad) { Write-Host "仍依賴：$($bad -join ', ')"; exit 1 }
+          Write-Host "沒有依賴 Visual C++ 執行階段的 DLL"
       - name: 實際執行
         shell: pwsh
         run: |
