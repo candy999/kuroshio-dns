@@ -124,7 +124,7 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         "/api/cache/flush" | "/api/jobs/run" | "/api/acme/issue" | "/api/ddns/update" | "/api/filter/update" | "/api/cdn/verify"
         | "/api/cdn/policy" | "/api/cdn/ecs" => true,
         p => match p.strip_prefix("/api/community/") {
-            Some("status" | "peers" | "events" | "scores") => false,
+            Some("status" | "peers" | "events" | "scores" | "invite") => false,
             // 不帶 channel 是查詢，帶了是指定管道
             Some("channel") => q.contains_key("channel"),
             Some(_) => true,
@@ -422,7 +422,16 @@ async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
                     Out::json(200, &json!({ "lines": crate::logring::lines(n) }))
                 }
                 ("GET" | "POST" | "HEAD", _) => {
-                    let q = parse_query(&req.query);
+                    let mut q = parse_query(&req.query);
+                    // 貼上邀請碼也可以放在 JSON 內容 {"code": "..."}（網址參數優先）
+                    if m == "POST" && p == "/api/community/invite/use" && !q.contains_key("code") {
+                        if let Some(c) = serde_json::from_slice::<Value>(&req.body)
+                            .ok()
+                            .and_then(|v| v["code"].as_str().map(String::from))
+                        {
+                            q.insert("code".into(), c);
+                        }
+                    }
                     if m != "POST" && is_action(p, &q) {
                         let mut out = Out::from_response(bad("這個動作只接受 POST", 405));
                         out.headers.push("allow: POST".into());
@@ -692,6 +701,13 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
         p if p.starts_with("/api/community/") => match &st.community {
             None => bad("社群共享沒有啟用", 404),
             Some(c) => match c.admin(p, q).await {
+                // 邀請碼另外附 QR 碼（SVG，跟關於頁同一個產生器）
+                Some(mut v) if matches!(p, "/api/community/invite" | "/api/community/invite/refresh") => {
+                    if let Some(code) = v["code"].as_str() {
+                        v["qr"] = json!(crate::about::qr_svg(code));
+                    }
+                    ok(v)
+                }
                 Some(v) => ok(v),
                 None => bad("not found", 404),
             },
@@ -873,6 +889,8 @@ mod tests {
             "/api/community/accept-key",
             "/api/community/check",
             "/api/community/sync",
+            "/api/community/invite/refresh",
+            "/api/community/invite/use",
         ] {
             assert!(is_action(p, &none), "{p}");
         }
@@ -889,6 +907,7 @@ mod tests {
             "/api/community/events",
             "/api/community/scores",
             "/api/community/channel",
+            "/api/community/invite",
         ] {
             assert!(!is_action(p, &none), "{p}");
         }

@@ -96,6 +96,41 @@ async fn community_rides_on_encrypted_listeners() {
     // 管理 API
     let v = kuroshio::admin::route(&started.state, "/api/community/status", &Default::default()).await;
     assert_eq!(v.code, 200, "{}", v.body);
+
+    // 邀請碼：附 QR 碼（SVG）；狀態頁只有建立時間，沒有邀請碼本身
+    let v = kuroshio::admin::route(&started.state, "/api/community/invite", &Default::default()).await;
+    assert_eq!(v.code, 200, "{}", v.body);
+    let code = v.body["code"].as_str().unwrap().to_string();
+    assert!(code.starts_with("KRS1."), "{}", v.body);
+    assert!(v.body["qr"].as_str().unwrap().contains("<svg"), "{}", v.body);
+    assert!(dir.join("community").join("invite.json").exists(), "邀請密鑰放在金鑰目錄");
+    let st = kuroshio::admin::route(&started.state, "/api/community/status", &Default::default()).await;
+    assert!(st.body["invite"]["createdAt"].as_u64().is_some());
+    assert!(!st.body.to_string().contains(&code));
+    // 貼上邀請碼也可以放在 JSON 內容（打錯一個字：檢查碼擋下）
+    let mut typo = code.clone().into_bytes();
+    let i = typo.len() / 2;
+    typo[i] = if typo[i] == b'Q' { b'R' } else { b'Q' };
+    let body = serde_json::to_vec(&json!({ "code": String::from_utf8(typo).unwrap() })).unwrap();
+    let admin = started.admin.unwrap();
+    let mut s = tokio::net::TcpStream::connect(admin).await.unwrap();
+    let head = format!(
+        "POST /api/community/invite/use HTTP/1.1\r\nHost: {admin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(&body).await.unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut resp))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.contains("\"stage\": \"format\"") && text.contains("檢查碼"), "{text}");
+    // 重新產生：換一個新的
+    let v2 = kuroshio::admin::route(&started.state, "/api/community/invite/refresh", &Default::default()).await;
+    assert_ne!(v2.body["code"].as_str().unwrap(), code);
+    assert!(v2.body["qr"].as_str().unwrap().contains("<svg"));
     started.shutdown();
     assert!(dir.join("state").join("community").exists() || std::fs::read_dir(dir.join("state")).is_ok());
     let _ = std::fs::remove_dir_all(&dir);

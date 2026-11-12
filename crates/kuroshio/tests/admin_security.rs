@@ -73,6 +73,8 @@ async fn state_changing_routes_need_post_and_same_origin() {
         "/api/community/add?domain=evil.example",
         "/api/community/delete?domain=friend.example",
         "/api/community/rotate",
+        "/api/community/invite/refresh",
+        "/api/community/invite/use?code=KRS1.AAAA",
     ] {
         let (code, head, _) = http(admin, "GET", p, &[], b"").await;
         assert_eq!(code, 405, "{p}");

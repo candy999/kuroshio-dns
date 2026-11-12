@@ -51,7 +51,8 @@ const HOT: &str = crate::app::HOT_NAMES;
 const CUSTOM: &str = "custom-rules.txt";
 const COMMUNITY: &str = "community/";
 const KEYS: &str = "community-keys/";
-const KEY_FILES: [&str; 3] = ["key.pem", "key.old.pem", "identity.json"];
+/// 金鑰目錄的檔案：私鑰、身分資料、好友邀請密鑰
+const KEY_FILES: [&str; 4] = ["key.pem", "key.old.pem", "identity.json", "invite.json"];
 
 /// 分享檔只能有這些
 /// 分享檔只放 CDN 網域與節點；上游評測與黑名單由每台機器自己判定，不放進分享檔

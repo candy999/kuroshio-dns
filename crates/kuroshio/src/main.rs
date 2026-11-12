@@ -214,6 +214,32 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AccessCmd,
     },
+    /// 社群好友的邀請碼（要服務執行中）
+    Community {
+        #[command(subcommand)]
+        cmd: CommunityCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommunityCmd {
+    /// 顯示我的邀請碼（給好友貼上）；--refresh 重新產生，舊的立刻失效
+    Invite {
+        #[arg(long)]
+        refresh: bool,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
+    /// 貼上好友的邀請碼：驗證對方身分指紋後送出好友請求
+    Join {
+        code: String,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -742,6 +768,7 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
         }
         Cmd::Sysinfo { config, uci } => sysinfo_report(&config, uci)?,
         Cmd::Access { cmd } => access_cmd(cmd)?,
+        Cmd::Community { cmd } => community_cmd(cmd).await?,
         Cmd::Paths { config, uci } => {
             let (cfg, ..) = effective(&config, uci)?;
             let file = (!uci).then(|| std::fs::canonicalize(&config).unwrap_or(config));
@@ -1130,6 +1157,76 @@ fn api_error(code: u16, body: &[u8]) -> String {
         .ok()
         .and_then(|v| v["error"].as_str().map(String::from))
         .unwrap_or_else(|| format!("HTTP {code}"))
+}
+
+/// `kuroshio community invite / join`：交給執行中的服務（邀請碼放在內容裡，不放網址）
+async fn community_cmd(cmd: CommunityCmd) -> Result<()> {
+    let (config, uci) = match &cmd {
+        CommunityCmd::Invite { config, uci, .. } | CommunityCmd::Join { config, uci, .. } => (config.clone(), *uci),
+    };
+    let (cfg, ..) = effective(&config, uci)?;
+    let ep = admin_endpoint(&cfg).ok_or_else(|| anyhow::anyhow!("管理 API 沒有開啟（admin.enabled = false），無法操作社群"))?;
+    if !admin_up(&ep).await {
+        anyhow::bail!("服務沒有在執行：邀請碼要服務執行中才能查看或使用");
+    }
+    let t = std::time::Duration::from_secs(120);
+    let json = |code: u16, b: &[u8]| -> Result<serde_json::Value> {
+        if code != 200 {
+            anyhow::bail!("{}", api_error(code, b));
+        }
+        Ok(serde_json::from_slice(b)?)
+    };
+    match cmd {
+        CommunityCmd::Invite { refresh, .. } => {
+            let (code, b) = if refresh {
+                admin_call(&ep, "POST", "/api/community/invite/refresh", Some(b"_"), t).await?
+            } else {
+                admin_call(&ep, "GET", "/api/community/invite", None, t).await?
+            };
+            let v = json(code, &b)?;
+            if v["ok"] != true {
+                anyhow::bail!("{}", v["reason"].as_str().unwrap_or("無法取得邀請碼"));
+            }
+            println!("{}", v["code"].as_str().unwrap_or(""));
+            eprintln!(
+                "網域 {}，身分指紋 {}{}",
+                v["domain"].as_str().unwrap_or(""),
+                v["fingerprint"].as_str().unwrap_or(""),
+                if refresh {
+                    "；已重新產生，舊的邀請碼已失效"
+                } else {
+                    ""
+                }
+            );
+            eprintln!("邀請碼等同好友密碼：只給想加的好友，可以重複使用；外流了就用 --refresh 重新產生。");
+            if v["ready"] != true {
+                let p: Vec<&str> = v["problems"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                eprintln!("注意：社群模式還沒就緒（{}），好友暫時無法用這個邀請碼加你", p.join("；"));
+            }
+        }
+        CommunityCmd::Join { code, .. } => {
+            let body = serde_json::to_vec(&serde_json::json!({ "code": code }))?;
+            let (status, b) = admin_call(&ep, "POST", "/api/community/invite/use", Some(&body), t).await?;
+            let v = json(status, &b)?;
+            for s in v["steps"].as_array().into_iter().flatten() {
+                println!(
+                    "{} {}",
+                    if s["ok"] == true { "[完成]" } else { "[失敗]" },
+                    s["text"].as_str().unwrap_or("")
+                );
+            }
+            for p in v["problems"].as_array().into_iter().flatten() {
+                println!("  - {}", p.as_str().unwrap_or(""));
+            }
+            if v["ok"] != true {
+                anyhow::bail!("{}", v["reason"].as_str().unwrap_or("加好友失敗"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `kuroshio export`：服務執行中跟服務拿（先寫出記憶體裡的最新狀態），沒有執行就從磁碟組

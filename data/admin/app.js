@@ -1402,6 +1402,9 @@
 			});
 		},
 
+		// 好友邀請碼：我的邀請碼（複製、QR 碼、重新產生）、貼上好友的邀請碼
+		communityInvite: communityInvite,
+
 		// 連線來源：目前狀態、被拒絕最多的網段
 		access: function () { return panel('access', loadAccess, accessPanel); },
 		accessTest: accessTest,
@@ -1723,6 +1726,72 @@
 		});
 		return b;
 	}
+	/** 好友邀請碼（社群）：邀請碼只出現在這裡，其他 API 都沒有 */
+	function communityInvite() {
+		var mine = el('div', { id: 'invite-mine' }, el('p', { class: 'muted', text: '讀取中…' }));
+		var off = function (box) {
+			box.appendChild(el('p', { class: 'msg info', text: '社群模式沒有啟用：在下方「設定」打開「啟用社群模式」並儲存後才有邀請碼。' }));
+		};
+		var drawMine = function (r) {
+			clear(mine);
+			if (r.status === 404) { off(mine); return; }
+			if (!r.ok) { mine.appendChild(el('p', { class: 'msg err', text: '讀取失敗：' + errText(r) })); return; }
+			var d = r.data || {};
+			if (!d.ok) { mine.appendChild(el('p', { class: 'msg warn', text: d.reason || '無法產生邀請碼' })); return; }
+			if (!d.ready) {
+				mine.appendChild(el('p', { class: 'msg warn', id: 'invite-notready', text: '社群模式還沒就緒（' + [].concat(d.problems || []).join('；') + '）：好友暫時無法用這個邀請碼加你。' }));
+			}
+			mine.appendChild(el('h4', { text: '我的邀請碼' }));
+			mine.appendChild(el('div', { class: 'invite-row' }, [
+				d.qr ? el('div', { class: 'qr' }, el('img', { src: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(d.qr), alt: '我的邀請碼 QR 碼', id: 'invite-qr' })) : null,
+				el('div', { class: 'invite-text' }, [
+					el('p', { class: 'mono invite-code', id: 'invite-code', text: d.code }),
+					el('p', { class: 'muted', text: '建立於 ' + fmtTime(d.createdAt) + '　身分指紋 ' + (d.fingerprint || '-') }),
+					el('div', { class: 'tbl-actions' }, [
+						actBtn('複製邀請碼', 'small', function () { return copyText(d.code); }),
+						actBtn('重新產生', 'small danger', function () {
+							if (!window.confirm('重新產生後，舊的邀請碼立刻失效（已經加入的好友不受影響）。確定要重新產生嗎？')) return;
+							return api('/api/community/invite/refresh', { method: 'POST' }).then(function (x) {
+								drawMine(x);
+								if (x.ok && x.data && x.data.ok) toast('已重新產生邀請碼，舊的已失效');
+							});
+						})
+					]),
+					el('p', { class: 'muted', text: '邀請碼等同好友密碼：只給想加的好友，可以重複使用；外流時按「重新產生」，舊的立刻失效。' })
+				])
+			]));
+		};
+		api('/api/community/invite').then(drawMine);
+
+		var input = el('input', { type: 'text', id: 'invite-input', placeholder: 'KRS1.…', 'aria-label': '好友的邀請碼', spellcheck: 'false', autocomplete: 'off' });
+		var result = el('div', { id: 'invite-result', 'aria-live': 'polite' });
+		var join = function () {
+			var code = input.value.replace(/\s+/g, '');
+			clear(result);
+			if (!code) { result.appendChild(el('p', { class: 'msg warn', id: 'invite-verdict', text: '請先貼上好友的邀請碼' })); return; }
+			result.appendChild(el('p', { class: 'muted', text: '驗證中…（會回連對方確認身分，最多約 30 秒）' }));
+			return api('/api/community/invite/use', { method: 'POST', body: { code: code } }).then(function (r) {
+				clear(result);
+				if (r.status === 404) { off(result); return; }
+				if (!r.ok) { result.appendChild(el('p', { class: 'msg err', id: 'invite-verdict', text: '失敗：' + errText(r) })); return; }
+				var d = r.data || {};
+				result.appendChild(el('ol', { class: 'invite-steps' }, [].concat(d.steps || []).map(function (s) {
+					return el('li', {}, [badge(s.ok ? '完成' : '失敗', s.ok ? 'ok' : 'err'), ' ', s.text]);
+				})));
+				if ((d.problems || []).length) result.appendChild(el('ul', { class: 'invite-problems' }, d.problems.map(function (p) { return el('li', { text: p }); })));
+				var kind = d.ok ? (d.stage === 'accepted' ? 'ok' : 'info') : 'err';
+				var text = d.ok ? (d.stage === 'accepted' ? '已成為好友：' + d.domain : '已送出請求，等待 ' + d.domain + ' 審核') : (d.reason || '加好友失敗');
+				result.appendChild(el('p', { class: 'msg ' + kind, id: 'invite-verdict', text: text }));
+				if (d.ok) input.value = '';
+			});
+		};
+		input.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); join(); } });
+		return el('div', { id: 'community-invite' }, [mine,
+			el('h4', { text: '貼上好友的邀請碼' }),
+			el('div', { class: 'tbl-actions invite-join' }, [input, actBtn('加好友', 'primary', join)]),
+			result]);
+	}
+
 	function typeSelect() {
 		var s = el('select', { 'aria-label': '查詢類型' });
 		QTYPES.forEach(function (t) { s.appendChild(el('option', { value: t, text: t })); });
