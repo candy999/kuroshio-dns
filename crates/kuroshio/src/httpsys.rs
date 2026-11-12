@@ -135,6 +135,8 @@ pub fn url_prefixes(domain: &str, port: u16, doh_path: &str, site: Option<&str>)
                 "/qr.svg",
                 "/api/public",
                 "/apple",
+                // 共用儀表板（公開頁與詳細頁的圖表）
+                "/assets",
                 detail,
             ]
             .iter()
@@ -955,6 +957,7 @@ mod tests {
         assert!(p.site_paths.contains(&"https://dns.example.net:8443/api/public/".to_string()));
         assert!(p.site_paths.contains(&"https://dns.example.net:8443/stats/".to_string()));
         assert!(p.site_paths.contains(&"https://dns.example.net:8443/apple/".to_string()));
+        assert!(p.site_paths.contains(&"https://dns.example.net:8443/assets/".to_string()));
         assert!(p.site_paths.iter().all(|u| u.ends_with('/')));
         // urlacl 登記首頁就涵蓋底下所有路徑
         assert_eq!(p.acl().len(), 3);

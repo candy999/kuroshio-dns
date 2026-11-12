@@ -206,6 +206,18 @@ pub fn public_doh3_port(cfg: &Value, tls: bool) -> u16 {
     }
 }
 
+/// Alt-Svc 要宣告的埠號（0 = 用 DoH3 實際綁定的埠）：`listen.doh.altSvcPort`；沒有指定時，
+/// DoH3 跟 DoH 同埠號、而且設定了 `listen.doh.publicPort`（埠號轉送）→ 宣告外面看到的埠號
+pub fn alt_svc_port(cfg: &Value, h3_bound: Option<u16>, doh_port: u16) -> u16 {
+    match cfg_port(cfg, "listen.doh.altSvcPort") {
+        Some(p) => p,
+        None => match cfg_port(cfg, "listen.doh.publicPort") {
+            Some(p) if h3_bound == Some(doh_port) => p,
+            _ => 0,
+        },
+    }
+}
+
 /// DoH 的 TCP 監聽要不要自己做 TLS（`listen.doh.tls`：`"auto"` / `true` / `false`）。
 ///
 /// auto：
@@ -426,14 +438,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             }
         }
         // 對外埠號可能不同（例如 WAN 443 → 本機 8443）：listen.doh.altSvcPort 可以指定
-        // 沒有指定時：DoH3 跟 DoH 同埠號、而且設定了 listen.doh.publicPort（埠號轉送）→ 宣告外面看到的埠號
-        let adv = match cfg_port(cfg, "listen.doh.altSvcPort") {
-            Some(p) => p,
-            None => match cfg_port(cfg, "listen.doh.publicPort") {
-                Some(p) if out.doh3.map(|b| b.port()) == Some(port) => p,
-                _ => 0,
-            },
-        };
+        let adv = alt_svc_port(cfg, out.doh3.map(|b| b.port()), port);
         opts.alt_svc = crate::httpsys::alt_svc(plan3, out.doh3.map(|b| b.port()), port, sys_alt, adv);
         let mut urls_json = Vec::new();
         if mode == WinMode::HttpSys {
@@ -1657,6 +1662,29 @@ mod tests {
         assert_eq!(cert_for(&c, "doh", base), Some(crate::acme::cert_paths(&c, base)));
         let c = cfg(json!({ "domain": "dns.example.com", "acme": { "enabled": false, "certFile": "/a/c.pem", "keyFile": "/a/k.pem" } }));
         assert_eq!(cert_for(&c, "dot", base), None);
+    }
+
+    #[test]
+    fn public_ports_and_alt_svc() {
+        let c = |doh: Value| json!({ "listen": { "doh": doh } });
+        // DoH 自己做 TLS、聽 8443（443 被占用）：外面也是 8443，DoH3 同一個數字
+        let cfg = c(json!({ "port": 8443 }));
+        assert_eq!((public_doh_port(&cfg, true), public_doh3_port(&cfg, true)), (8443, 8443));
+        assert_eq!(alt_svc_port(&cfg, Some(8443), 8443), 0, "沒指定：宣告實際綁定的埠");
+        // DoH3 另外用 UDP 8444（UDP 8443 被占用）
+        let cfg = c(json!({ "port": 8443, "http3Port": 8444 }));
+        assert_eq!((public_doh_port(&cfg, true), public_doh3_port(&cfg, true)), (8443, 8444));
+        // 埠號轉送：外面 443 → 本機 8443（TCP 與 UDP 一起轉）
+        let cfg = c(json!({ "port": 8443, "publicPort": 443 }));
+        assert_eq!((public_doh_port(&cfg, true), public_doh3_port(&cfg, true)), (443, 443));
+        assert_eq!(alt_svc_port(&cfg, Some(8443), 8443), 443);
+        assert_eq!(alt_svc_port(&cfg, Some(8444), 8443), 0, "DoH3 在別的埠：不套用 TCP 的對外埠號");
+        // altSvcPort 優先
+        let cfg = c(json!({ "port": 8443, "publicPort": 443, "altSvcPort": 9443 }));
+        assert_eq!((alt_svc_port(&cfg, Some(8443), 8443), public_doh3_port(&cfg, true)), (9443, 9443));
+        // 反向代理在前面（DoH 本身是明文）：外面是 443
+        let cfg = c(json!({ "port": 8053 }));
+        assert_eq!(public_doh_port(&cfg, false), 443);
     }
 
     #[test]

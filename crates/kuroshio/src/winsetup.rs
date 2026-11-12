@@ -124,8 +124,10 @@ pub fn web_config(o: &IisOptions) -> String {
             "index\\.html".into(),
             "robots\\.txt".into(),
             "favicon\\.(ico|svg)".into(),
+            "qr\\.svg".into(),
             "api/public/.*".into(),
             "apple/.*".into(),
+            "assets/dashboard\\.(js|css)".into(),
         ];
         if !detail.is_empty() {
             parts.push(format!("{}(/.*)?", regex_escape(detail)));
@@ -393,7 +395,7 @@ mod tests {
         let cfg = json!({ "listen": { "doh": { "port": 8053 } }, "site": { "enabled": true, "detailPath": "/stats" } });
         let x = web_config(&IisOptions::from_cfg(&cfg));
         assert!(!x.contains("Alt-Svc"));
-        assert!(x.contains(r#"<match url="^(dns-query|\.well-known/kuroshio/.*||index\.html|robots\.txt|favicon\.(ico|svg)|api/public/.*|apple/.*|stats(/.*)?)$" />"#), "{x}");
+        assert!(x.contains(r#"<match url="^(dns-query|\.well-known/kuroshio/.*||index\.html|robots\.txt|favicon\.(ico|svg)|qr\.svg|api/public/.*|apple/.*|assets/dashboard\.(js|css)|stats(/.*)?)$" />"#), "{x}");
     }
 
     #[test]
