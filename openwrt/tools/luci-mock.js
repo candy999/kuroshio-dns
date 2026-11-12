@@ -122,7 +122,10 @@ const ACCESS = query => {
 STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt,
     ranges: 1003, memoryBytes: 16048, dataBytes: 21312, denied: { total: 57, byListener: { dot: 40, doh: 17 } }, topDenied: [] };
 // 好友邀請碼（假的）：重新產生換一個；貼上時 KRS1.MOCKGOOD 開頭當成成功，其他當成檢查碼不符
-const QR = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#fff"/><rect x="1" y="1" width="3" height="3"/></svg>';
+// QR 碼：有 kuroshio 執行檔時借用 `kuroshio about --qr` 的真 QR 碼（內容是原始碼網址，只是讓畫面像實機），沒有就畫一個方塊
+let QR = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#fff"/><rect x="1" y="1" width="3" height="3"/></svg>';
+let QR_SOURCE = null;
+try { QR_SOURCE = JSON.parse(execFileSync(BIN, ['about', '--qr'], { encoding: 'utf-8' })).qrSource || null; if (QR_SOURCE) QR = QR_SOURCE; } catch (e) { /* 沒有執行檔 */ }
 let inviteN = 1;
 const INVITE = () => ({ ok: true, code: 'KRS1.MOCKAAAA' + 'QZ'.repeat(20) + inviteN, createdAt: Date.now() - 3600000, domain: 'dns.example.com',
     fingerprint: '7197-1882-14EA-0AF1-8FCC-0C6C-00A3-7A4A', ready: true, problems: [], qr: QR });
@@ -277,7 +280,7 @@ function kuroshio(method, args) {
         if (args.path === '/api/community/invite/use') return { ok: true, result: INVITE_USE(args.query) };
         return { ok: true, result: { ok: true } };
     case 'defaults': return { result: defaults };
-    case 'about': return { core: { name: '黑潮 DNS', version: '3.0.0', language: 'Rust', target: 'mock', features: ['doh', 'dot'], license: 'GPL-3.0-or-later', licenseUrl: 'https://www.gnu.org/licenses/gpl-3.0.html', source: 'https://github.com/candy999/kuroshio-dns' }, ui: '3.0.0-r1' };
+    case 'about': return { core: { name: '黑潮 DNS', version: '3.0.0', language: 'Rust', target: 'mock', features: ['doh', 'dot'], license: 'GPL-3.0-or-later', licenseUrl: 'https://www.gnu.org/licenses/gpl-3.0.html', source: 'https://github.com/candy999/kuroshio-dns', qrSource: QR_SOURCE }, ui: '3.0.0-r1' };
     case 'acme_status': return { running: false, log: '', cert: PATHS.tls.info };
     case 'acme_issue': return { started: true };
     case 'log': return { lines: ['kuroshio: mock'] };
@@ -329,6 +332,29 @@ function ubus(obj, method, a) {
     if (obj === 'network.interface' && method === 'dump') return [0, { interface: [] }];
     return [0, {}];
 }
+
+// LuCI 核心字串的繁中翻譯（只放截圖常看到的幾個）：跟 cbi.js 的 sfh() 同一個雜湊，translations 端點送 window.TR
+function sfh(str) {
+    const b = Buffer.from(str, 'utf-8');
+    if (!b.length) return null;
+    const u16 = o => ((b[o + 1] << 8) + b[o]) >>> 0, s8 = o => (b[o] > 0x7F ? (b[o] - 256) >>> 0 : b[o]);
+    let hash = b.length >>> 0, len = b.length >>> 2, off = 0, tmp;
+    while (len--) {
+        hash += u16(off); tmp = ((u16(off + 2) << 11) ^ hash) >>> 0; hash = ((hash << 16) ^ tmp) >>> 0; hash += hash >>> 11; off += 4;
+    }
+    switch (b.length & 3) {
+    case 3: hash += u16(off); hash = (hash ^ (hash << 16)) >>> 0; hash = (hash ^ (s8(off + 2) << 18)) >>> 0; hash += hash >>> 11; break;
+    case 2: hash += u16(off); hash = (hash ^ (hash << 11)) >>> 0; hash += hash >>> 17; break;
+    case 1: hash += s8(off); hash = (hash ^ (hash << 10)) >>> 0; hash += hash >>> 1; break;
+    }
+    hash = (hash ^ (hash << 3)) >>> 0; hash += hash >>> 5; hash = (hash ^ (hash << 4)) >>> 0; hash += hash >>> 17;
+    hash = (hash ^ (hash << 25)) >>> 0; hash += hash >>> 6;
+    return (0x100000000 + hash).toString(16).substr(1);
+}
+const ZH = { 'Edit': '編輯', 'Delete': '刪除', 'Name': '名稱', 'Add': '新增', 'Save': '儲存', 'Save & Apply': '儲存並套用', 'Reset': '重設',
+    'Dismiss': '關閉', 'Refreshing': '更新中', 'This section contains no values yet': '這個區段還沒有任何設定', 'Drag to reorder': '拖曳以排序',
+    'Expand/Collapse': '展開／收合', 'Loading view…': '載入中…' };
+const TR_JS = 'window.TR=' + JSON.stringify(Object.fromEntries(Object.entries(ZH).map(([k, v]) => [sfh(k), v]))) + ';';
 
 const MIME = { '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json',
     '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf' };
@@ -424,7 +450,7 @@ http.createServer((req, res) => {
         const p = url.searchParams.get('path');
         return send(p in files ? 200 : 404, 'text/plain; charset=utf-8', files[p] || '');
     }
-    if (/\/admin\/translations\//.test(url.pathname)) return send(200, MIME['.js'], '');
+    if (/\/admin\/translations\//.test(url.pathname)) return send(200, MIME['.js'], TR_JS);
     let m;
     if ((m = /^\/cgi-bin\/luci\/admin\/services\/kuroshio\/(\w+)$/.exec(url.pathname))) {
         const d = url.searchParams.get('dark');
