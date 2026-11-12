@@ -296,6 +296,38 @@ pub fn open_browser(url: &str) -> bool {
     r.is_ok()
 }
 
+/// 日誌要不要帶顏色碼：標準輸出不是終端機（導向檔案、管線）就不帶。
+///
+/// Windows 的主控台（cmd、ConEmu 底下的主控台）預設不解讀顏色碼，要先開啟
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`（Windows 10 1511 起支援，Node.js 也是這樣做）；
+/// 開不了就不帶顏色碼，畫面上才不會出現 `[32m` 這種亂碼。
+pub fn enable_ansi() -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+        };
+        // SAFETY: GetStdHandle 回傳的是行程的標準輸出代碼，不用關閉；mode 由我們配置
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(h, &mut mode) == 0 {
+                // 不是 Windows 主控台（例如 mintty 的虛擬終端機）：有 TERM 的通常認得顏色碼
+                return std::env::var_os("TERM").is_some();
+            }
+            mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 /// 標準輸入是終端機時，開一條執行緒逐行讀取（讀到結尾就結束）
 pub fn spawn_reader() -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
     use std::io::{BufRead, IsTerminal};

@@ -323,7 +323,7 @@ fn init_log_to(cfg: Option<&serde_json::Value>, file: Option<&std::path::Path>) 
             return;
         }
     }
-    let ansi = std::env::var_os("NO_COLOR").is_none();
+    let ansi = std::env::var_os("NO_COLOR").is_none() && kuroshio::console::enable_ansi();
     // 設定頁的「日誌」分頁另外存一份不含色碼的
     tracing_subscriber::registry()
         .with(filter)
@@ -656,6 +656,11 @@ fn user_config(config: &std::path::Path, uci: bool) -> Result<serde_json::Value>
     if uci {
         kuroshio_config::uci::load(&kuroshio_config::uci::Env::from_process()).with_context(|| "讀取 UCI 設定失敗")
     } else {
+        if !config.exists() {
+            // 打錯路徑、記事本存成 config.json.txt 時，不提示的話只會看到「功能都沒開」
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| eprintln!("注意：設定檔 {} 不存在，全部使用預設值", config.display()));
+        }
         kuroshio_config::read_user_file(config).with_context(|| "載入設定失敗")
     }
 }

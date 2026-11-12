@@ -141,12 +141,10 @@ mod win {
     }
 }
 
-/// 讀 /proc/meminfo：(MemTotal, MemAvailable)，單位 MB
+/// 實體記憶體與可用記憶體（MB）：Linux 讀 /proc/meminfo，Windows 用 GlobalMemoryStatusEx（[`mem_bytes`]）
 pub fn meminfo() -> (Option<u64>, Option<u64>) {
-    match std::fs::read_to_string("/proc/meminfo") {
-        Ok(t) => parse_meminfo(&t),
-        Err(_) => (None, None),
-    }
+    let (total, avail) = mem_bytes();
+    (total.map(|b| b >> 20), avail.map(|b| b >> 20))
 }
 
 pub fn parse_meminfo(text: &str) -> (Option<u64>, Option<u64>) {
