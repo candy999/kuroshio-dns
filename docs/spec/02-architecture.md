@@ -205,7 +205,7 @@ Windows 設定頁用原生 JS（不用前端框架、不需要編譯步驟），
 ### 8.1 OpenWrt
 
 - 套件 `kuroshio`：只放執行檔、init、shell 腳本、預設設定、種子、預設規則。**不再需要 node**，24.10、25.12 以後都能裝。
-- 每種 CPU 各一個套件（不再是 `all`）。執行檔由 `cargo-zigbuild` 先編好（靜態 musl），SDK 只打包：x86_64、i386_pentium4、aarch64_generic、aarch64_cortex-a53、aarch64_cortex-a72、arm_cortex-a7_neon-vfpv4、arm_cortex-a9_vfpv3-d16、arm_cortex-a15_neon-vfpv4、mipsel_24kc、mips_24kc（見 `.github/workflows/rust.yml`）。
+- 每種 CPU 各一個套件（不再是 `all`）。執行檔由 `cargo-zigbuild` 先編好（靜態 musl），SDK 只打包：x86_64、aarch64_generic、aarch64_cortex-a53、aarch64_cortex-a72、aarch64_cortex-a76、arm_cortex-a7_neon-vfpv4、arm_cortex-a9_vfpv3-d16、arm_cortex-a15_neon-vfpv4、mipsel_24kc、mips_24kc（見 `.github/workflows/rust.yml`）。
 - `luci-app-kuroshio` 仍是 `all`。
 - 2.x 的 `candydns.init`、`takeover.sh`、`lan.sh`、`acme.sh`、`rpcd.sh`、`uci-defaults` 改名後保留；只把 `node …/server.js` 換成 `/usr/bin/kuroshio run --uci`，`node -e config.js` 換成 `kuroshio defaults --json`。
 - 3.0 預覽版（`openwrt/kuroshio/`）可以跟 2.x 同時安裝：預設不啟用，啟用後只聽 `127.0.0.1:5336`，用來並行比對。

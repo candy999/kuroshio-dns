@@ -161,7 +161,7 @@
 | **64 位元 ARM**（ARMv8 / AArch64） | MediaTek Filogic MT7981 / MT7986 / MT7988、MT7622、Qualcomm IPQ807x / IPQ60xx / IPQ50xx、Rockchip（NanoPi R2S / R4S / R5S / R6S）、Raspberry Pi 3 / 4 / 5 | `aarch64_cortex-a53`、`aarch64_generic`、`aarch64_cortex-a72`、`aarch64_cortex-a76` |
 | **32 位元 ARM**（ARMv7） | Qualcomm IPQ4018 / IPQ4019、IPQ806x、Marvell Armada 385、Allwinner H3 | `arm_cortex-a7_neon-vfpv4`、`arm_cortex-a15_neon-vfpv4`、`arm_cortex-a9_vfpv3-d16` |
 | **MIPS**（32 位元） | MediaTek MT7621 / MT7620 / MT7628（小端序）、Qualcomm Atheros、Lantiq（大端序） | `mipsel_24kc`、`mips_24kc` |
-| **x86** | 軟路由小主機（N100、J4125…）、虛擬機 | `x86_64`、`i386_pentium4` |
+| **x86**（64 位元） | 軟路由小主機（N100、J4125…）、虛擬機 | `x86_64` |
 
 - OpenWrt 24.10 用 `.ipk`、25.12 以後用 `.apk`；Windows 10 / 11（x86_64）有 Windows 版，其他 Linux 用上面各 CPU 的靜態執行檔。
 - **不知道該選哪個、想知道各晶片的規格夠不夠用：見 [選硬體、選套件](docs/hardware.md)**（常見機種的 CPU、記憶體、儲存，以及跑黑潮 DNS 的建議）。

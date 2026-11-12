@@ -87,7 +87,6 @@ jobs:
       matrix:
         include:
           - { target: x86_64-unknown-linux-musl,      qemu: '' }
-          - { target: i686-unknown-linux-musl,        qemu: qemu-i386 }
           - { target: aarch64-unknown-linux-musl,     qemu: qemu-aarch64 }
           - { target: armv7-unknown-linux-musleabihf, qemu: qemu-arm }
           # MIPS 在 Rust 是 tier 3：用 nightly 自己編標準函式庫（OpenWrt 的 mips_24kc / mipsel_24kc 都是軟體浮點，跟這兩個 target 相同）
@@ -421,7 +420,6 @@ jobs:
           # sdk = OpenWrt SDK 的架構名稱；arch = OpenWrt 編譯時的 $(ARCH)；target = Rust 執行檔
           ALL='[
             {"sdk":"x86_64","arch":"x86_64","target":"x86_64-unknown-linux-musl"},
-            {"sdk":"i386_pentium4","arch":"i386","target":"i686-unknown-linux-musl"},
             {"sdk":"aarch64_generic","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
             {"sdk":"aarch64_cortex-a53","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
             {"sdk":"aarch64_cortex-a72","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
