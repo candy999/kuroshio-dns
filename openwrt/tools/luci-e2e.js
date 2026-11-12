@@ -73,6 +73,33 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
             (MOCK ? /dns\.example\.com/.test(dnr) && /DoH \+ DoH3/.test(dnr) && /192\.168\.1\.1/.test(dnr) : /網域/.test(dnr))
                 ? ok('設定頁：DNR 顯示 kuroshio dnr 的結果') : bad(`設定頁：DNR 內容不對\n     ${dnr}`);
         }
+        if (NAME === 'kuroshio' && p === 'community') {
+            /好友邀請碼/.test(text) && /我的邀請碼/.test(text) && /貼上好友的邀請碼/.test(text) && /新增好友/.test(text)
+                ? ok('社群頁：好友邀請碼與手動新增') : bad(`社群頁沒有邀請碼區塊\n     ${text.slice(0, 300)}`);
+            if (MOCK) {
+                await page.waitForSelector('#kuroshio-invite-code', { timeout: 10000 }).catch(() => {});
+                const c1 = await page.inputValue('#kuroshio-invite-code').catch(() => '');
+                /^KRS1\./.test(c1) && /^data:image\/svg\+xml/.test(await page.getAttribute('#kuroshio-invite-qr', 'src').catch(() => '') || '')
+                    ? ok('社群頁：我的邀請碼與 QR 碼') : bad(`社群頁：邀請碼沒有出來（${c1}）`);
+                await page.click('#kuroshio-invite button:has-text("複製邀請碼")');
+                await page.waitForFunction(() => /已複製邀請碼|手動選取/.test(document.body.innerText), null, { timeout: 5000 })
+                    .then(() => ok('社群頁：複製邀請碼'), () => bad('社群頁：複製邀請碼沒有反應'));
+                await page.click('#kuroshio-invite button:has-text("重新產生")');
+                await page.click('#kuroshio-invite-confirm');
+                await page.waitForFunction(c => { const e = document.getElementById('kuroshio-invite-code'); return e && e.value !== c; }, c1, { timeout: 10000 })
+                    .then(() => ok('社群頁：確認後重新產生邀請碼'), () => bad('社群頁：重新產生後邀請碼沒有換'));
+                await page.fill('#kuroshio-invite-input', 'KRS1.TYPO');
+                await page.click('#kuroshio-invite button:has-text("加好友")');
+                await page.waitForSelector('#kuroshio-invite-result', { timeout: 10000 }).catch(() => {});
+                /檢查碼不符/.test(await page.locator('#kuroshio-invite-out').innerText().catch(() => '')) ? ok('社群頁：貼上打錯的邀請碼顯示原因') : bad('社群頁：貼上打錯的邀請碼沒有顯示原因');
+                await page.fill('#kuroshio-invite-input', ' KRS1.MOCKGOODAAAA ');
+                await page.press('#kuroshio-invite-input', 'Enter');
+                await page.waitForFunction(() => /已成為好友/.test((document.getElementById('kuroshio-invite-out') || {}).innerText || ''), null, { timeout: 10000 })
+                    .then(() => ok('社群頁：貼上邀請碼逐步顯示結果'), () => bad('社群頁：貼上邀請碼沒有顯示結果'));
+                await page.screenshot({ path: `${SHOTS}/simple-community-invite.png`, fullPage: true });
+                if (errors.length) bad(`社群頁操作後 JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+            }
+        }
         if (NAME === 'kuroshio' && p === 'access') {
             /只開放台灣（建議）/.test(text) && /全開放/.test(text) && /允許名單/.test(text) && /封鎖名單/.test(text) && /一律允許/.test(text) && /VPN/.test(text) && /優先於一切/.test(text)
                 ? ok('連線來源頁：模式、名單與說明') : bad(`連線來源頁內容不對\n     ${text.slice(0, 300)}`);

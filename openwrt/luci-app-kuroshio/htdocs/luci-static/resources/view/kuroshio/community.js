@@ -93,6 +93,86 @@ return view.extend({
 				: [E('tr', { 'class': 'tr placeholder' }, E('td', { 'class': 'td', 'colspan': head.length }, E('em', {}, _('還沒有好友'))))]));
 	},
 
+	/** 我的邀請碼：只有這裡拿得到（其他 API 都沒有邀請碼本身） */
+	loadInvite: function() {
+		var self = this;
+		return L.resolveDefault(common.api('/api/community/invite'), null).then(function(r) { self.drawInvite(r); });
+	},
+
+	drawInvite: function(r) {
+		var self = this, box = this.inviteBox, res = r && r.result;
+		if (!r || r.ok === false || !res || (res.ok === undefined && !res.code)) {
+			box.replaceChildren(E('em', {}, _('服務沒有在執行，或社群模式沒有啟用：啟用並「儲存並套用」後才有邀請碼。')));
+			return;
+		}
+		if (!res.ok) {
+			box.replaceChildren(E('em', {}, res.reason || _('無法產生邀請碼')));
+			return;
+		}
+		var code = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'id': 'kuroshio-invite-code', 'readonly': 'readonly', 'value': res.code,
+			'style': 'width:100%;font-family:monospace;font-size:12px' });
+		var copy = function() {
+			var done = function() { ui.addNotification(null, E('p', {}, _('已複製邀請碼')), 'info'); };
+			// LuCI 常常用 http 開（不是安全環境，沒有 Clipboard API）：退回選取文字 + execCommand
+			var legacy = function() {
+				code.focus();
+				code.select();
+				var ok = false;
+				try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+				if (ok) done(); else ui.addNotification(null, E('p', {}, _('無法自動複製，請手動選取邀請碼')), 'warning');
+			};
+			if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(res.code).then(done, legacy);
+			legacy();
+		};
+		var refresh = function() {
+			ui.showModal(_('重新產生邀請碼'), [
+				E('p', {}, _('重新產生後，舊的邀請碼立刻失效（已經加入的好友不受影響）。確定要重新產生嗎？')),
+				E('div', { 'class': 'right' }, [
+					E('button', { 'class': 'btn', 'click': ui.hideModal }, _('取消')), ' ',
+					E('button', { 'class': 'btn cbi-button-negative', 'id': 'kuroshio-invite-confirm', 'click': ui.createHandlerFn(self, function() {
+						ui.hideModal();
+						return common.action('/api/community/invite/refresh', {}).then(function(x) {
+							self.drawInvite(x);
+							if (x && x.result && x.result.ok) ui.addNotification(null, E('p', {}, _('已重新產生邀請碼，舊的已失效')), 'info');
+						});
+					}) }, _('重新產生'))
+				])
+			]);
+		};
+		var qr = res.qr ? E('img', { 'id': 'kuroshio-invite-qr', 'alt': _('我的邀請碼 QR 碼'), 'width': 160, 'height': 160,
+			'style': 'background:#fff;padding:4px;border-radius:4px', 'src': 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(res.qr) }) : '';
+		box.replaceChildren(E('div', {}, [
+			res.ready ? '' : E('p', { 'style': 'color:#b36b00' }, _('社群模式還沒就緒（%s）：好友暫時無法用這個邀請碼加你。').format((res.problems || []).join('；'))),
+			E('div', { 'style': 'display:flex;gap:1em;flex-wrap:wrap;align-items:flex-start' }, [qr,
+				E('div', { 'style': 'flex:1 1 18em;min-width:0' }, [code,
+					E('div', { 'style': 'font-size:12px;opacity:.75;margin:.3em 0' }, _('建立於 %s　身分指紋 %s').format(fmtTime(res.createdAt), res.fingerprint || '-')),
+					E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap' }, [
+						E('button', { 'class': 'btn cbi-button', 'click': copy }, _('複製邀請碼')),
+						E('button', { 'class': 'btn cbi-button cbi-button-negative', 'click': refresh }, _('重新產生'))]),
+					E('p', { 'style': 'font-size:12px;opacity:.75' }, _('邀請碼等同好友密碼：只給想加的好友，可以重複使用；外流時按「重新產生」，舊的立刻失效。'))])])
+		]));
+	},
+
+	useInvite: function(input, out) {
+		var self = this, code = input.value.replace(/\s+/g, '');
+		if (!code) { out.replaceChildren(E('em', {}, _('請先貼上好友的邀請碼'))); return; }
+		out.replaceChildren(E('em', {}, _('驗證中…（會回連對方確認身分，最多約 30 秒）')));
+		return common.action('/api/community/invite/use', { code: code }).then(function(r) {
+			var d = r && r.result;
+			if (!r || r.ok === false || !d) { out.replaceChildren(E('p', { 'style': 'color:#c00' }, (r && r.error) || _('服務沒有在執行，或社群模式沒有啟用'))); return; }
+			if (d.error && !d.steps) { out.replaceChildren(E('p', { 'style': 'color:#c00' }, d.error)); return; }
+			var steps = (d.steps || []).map(function(s) {
+				return E('li', {}, [E('strong', { 'style': 'color:' + (s.ok ? 'green' : '#c00') }, s.ok ? _('完成') : _('失敗')), ' ', s.text]);
+			});
+			var verdict = d.ok ? (d.stage === 'accepted' ? _('已成為好友：%s').format(d.domain) : _('已送出請求，等待 %s 審核').format(d.domain)) : (d.reason || _('加好友失敗'));
+			out.replaceChildren(E('div', { 'id': 'kuroshio-invite-result' }, [
+				E('ol', {}, steps),
+				(d.problems || []).length ? E('ul', { 'class': 'kuroshio-invite-problems' }, d.problems.map(function(p) { return E('li', {}, p); })) : '',
+				E('p', { 'style': 'font-weight:bold;color:' + (d.ok ? 'green' : '#c00') }, verdict)]));
+			if (d.ok) { input.value = ''; return self.refresh(); }
+		});
+	},
+
 	refresh: function() {
 		var self = this;
 		return Promise.all([
@@ -116,6 +196,12 @@ return view.extend({
 		this.statusBox = E('div', {}, this.renderStatus(data[1]));
 		this.peerBox = E('div', {}, E('em', {}, _('讀取中…')));
 		this.eventBox = E('div');
+		this.inviteBox = E('div', {}, E('em', {}, _('讀取中…')));
+		var inviteInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'id': 'kuroshio-invite-input', 'placeholder': 'KRS1.…',
+			'spellcheck': 'false', 'autocomplete': 'off', 'style': 'flex:1 1 18em;min-width:0;font-family:monospace' });
+		var inviteOut = E('div', { 'id': 'kuroshio-invite-out' });
+		var useInvite = function() { return self.useInvite(inviteInput, inviteOut); };
+		inviteInput.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); useInvite(); } });
 
 		var input = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': 'dns.friend.com', 'style': 'max-width:22em' });
 		var add = function() {
@@ -194,6 +280,16 @@ return view.extend({
 		o.modalonly = true;
 
 		var tools = E([], [
+			E('div', { 'class': 'cbi-section', 'id': 'kuroshio-invite' }, [
+				E('h3', {}, _('好友邀請碼')),
+				E('p', { 'class': 'cbi-section-descr' }, _('互加好友最快的方法：把「我的邀請碼」傳給朋友，朋友貼到他的黑潮 DNS 就會自動成為好友，馬上開始交換資料。雙方都要先符合社群條件（網域、DoH / DoT / DoQ 至少一種、網域解析得到）。')),
+				E('h4', {}, _('我的邀請碼')),
+				this.inviteBox,
+				E('h4', {}, _('貼上好友的邀請碼')),
+				E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap' }, [inviteInput,
+					E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(this, useInvite) }, _('加好友'))]),
+				inviteOut
+			]),
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('新增好友')),
 				E('p', { 'class': 'cbi-section-descr' }, _('輸入對方的網域（非標準埠可以寫成 網域:埠）。對方會回連驗證你的網域與憑證；你的出口 IP 必須跟網域解析出的 IP 一樣。')),
@@ -205,6 +301,7 @@ return view.extend({
 		]);
 
 		this.refresh();
+		this.loadInvite();
 		poll.add(L.bind(this.refresh, this), 15);
 		return m.render().then(function(node) { return E([], [common.modeBar(), header, self.statusBox, tools, node, common.footer()]); });
 	}

@@ -115,7 +115,21 @@ const ACCESS = query => {
 };
 STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt,
     ranges: 1003, memoryBytes: 16048, dataBytes: 21312, denied: { total: 57, byListener: { dot: 40, doh: 17 } }, topDenied: [] };
-const API = { '/api/access': ACCESS, '/api/community/peers': () => [], '/api/community/events': () => [], '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS };
+// 好友邀請碼（假的）：重新產生換一個；貼上時 KRS1.MOCKGOOD 開頭當成成功，其他當成檢查碼不符
+const QR = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#fff"/><rect x="1" y="1" width="3" height="3"/></svg>';
+let inviteN = 1;
+const INVITE = () => ({ ok: true, code: 'KRS1.MOCKAAAA' + 'QZ'.repeat(20) + inviteN, createdAt: Date.now() - 3600000, domain: 'dns.example.com',
+    fingerprint: '7197-1882-14EA-0AF1-8FCC-0C6C-00A3-7A4A', ready: true, problems: [], qr: QR });
+const INVITE_USE = query => {
+    const code = new URLSearchParams(query || '').get('code') || '';
+    const fmt = { step: 'format', ok: true, text: '邀請碼格式正確：friend.example.net' };
+    if (!code.startsWith('KRS1.MOCKGOOD')) return { ok: false, stage: 'format', reason: '邀請碼檢查碼不符：可能打錯字或少貼了一段，請直接複製貼上',
+        steps: [{ step: 'format', ok: false, text: '邀請碼檢查碼不符：可能打錯字或少貼了一段，請直接複製貼上' }] };
+    return { ok: true, stage: 'accepted', status: 'accepted', domain: 'friend.example.net', steps: [fmt, { step: 'ready', ok: true, text: '你的社群模式已就緒' },
+        { step: 'identity', ok: true, text: '已取得 friend.example.net 的身分文件（經 dot）' }, { step: 'fingerprint', ok: true, text: '身分指紋相符：1111-2222-3333-4444-5555-6666-7777-8888' },
+        { step: 'request', ok: true, text: '已送出好友請求（附邀請證明）' }, { step: 'accepted', ok: true, text: '對方已自動同意，成為好友；馬上開始第一次同步' }] };
+};
+const API = { '/api/access': ACCESS, '/api/community/peers': () => [], '/api/community/events': () => [], '/api/community/invite': INVITE, '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS };
 let defaults = null;
 try { defaults = JSON.parse(execFileSync(BIN, ['defaults', '--json'], { encoding: 'utf-8' })); } catch (e) { console.log('（沒有 kuroshio 執行檔：預設值提示不顯示）'); }
 
@@ -129,7 +143,11 @@ function kuroshio(method, args) {
         : { ok: true, reason: null, adn: 'dns.example.com', dhcpv4: '00:2b', odhcpd: [], protocols: [
             { priority: 1, alpn: ['h2', 'h3'], port: 8443, dohpath: '/dns-query{?dns}', addrs: ['192.168.1.1', 'fd12:3456::1'] },
             { priority: 2, alpn: ['dot'], port: 853, dohpath: null, addrs: ['192.168.1.1'] }] };
-    case 'action': return args.path === '/api/ddns/update' ? wrap('/api/ddns') : { ok: true, result: { ok: true } };
+    case 'action':
+        if (args.path === '/api/ddns/update') return wrap('/api/ddns');
+        if (args.path === '/api/community/invite/refresh') { inviteN++; return wrap('/api/community/invite'); }
+        if (args.path === '/api/community/invite/use') return { ok: true, result: INVITE_USE(args.query) };
+        return { ok: true, result: { ok: true } };
     case 'defaults': return { result: defaults };
     case 'about': return { core: { name: '黑潮 DNS', version: '3.0.0-alpha.2', language: 'Rust', target: 'mock', features: ['doh', 'dot'], license: 'GPL-3.0-or-later', licenseUrl: 'https://www.gnu.org/licenses/gpl-3.0.html', source: 'https://github.com/candy999/kuroshio-dns' }, ui: '3.0.0_alpha2-r1' };
     case 'acme_status': return { running: false, log: '', cert: PATHS.tls.info };
