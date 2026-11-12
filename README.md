@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/banner.png" width="100%" alt="黑潮 DNS（Kuroshio DNS）橫幅：深藍色海洋裡的洋流流向台灣島，標語「像黑潮把魚群帶到台灣，把你的連線帶回台灣節點。」"></p>
+
 # 黑潮 DNS（Kuroshio DNS）
 
 > 像黑潮把魚群帶到台灣，把你的連線帶回台灣節點。
@@ -21,6 +23,29 @@
 | **DNS 不能斷** | 記憶體再緊也一定保留 DNS 轉發；當掉 1 秒內重啟，OpenWrt 重新啟動期間由 dnsmasq 暫時接手 |
 | **保護 Flash，該存的一定存** | 壓縮、分片、只寫有變動的部分；同時保證學到的資料最久 24 小時一定存檔 |
 
+## 畫面
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/luci-dashboard.webp" alt="LuCI 儀表板：今天的查詢、攔截、拉回台灣次數，最近 60 分鐘與近 30 天的查詢趨勢圖"></td>
+<td width="50%"><img src="docs/images/site-home.webp" alt="公開頁：給親友的設定說明，DoH / DoT 網址、今日拉回台灣與攔截次數、CDN 連線原本會被送去哪裡的地圖"></td>
+</tr>
+<tr>
+<td>OpenWrt LuCI「儀表板」</td>
+<td>給親友的公開頁</td>
+</tr>
+<tr>
+<td><img src="docs/images/luci-status.webp" alt="LuCI 狀態頁：服務狀態、今天的查詢與攔截、硬體與效能（記憶體、快取命中率、回應時間、Flash 寫入）"></td>
+<td><img src="docs/images/luci-dashboard-dark.webp" alt="LuCI 儀表板的深色模式"></td>
+</tr>
+<tr>
+<td>LuCI「狀態」</td>
+<td>儀表板也跟著主題切換深色</td>
+</tr>
+</table>
+
+<sub>LuCI 畫面是 Vantage 主題（Bootstrap、Argon 等主題也會跟著主題的配色），資料為範例。</sub>
+
 ## 功能細節
 
 ### 把連線帶回台灣（CDN 節點置換）
@@ -31,6 +56,10 @@
 - **IPv6 節點**：驗證過的台灣 IPv6 節點永久保存。
 - **持續複驗**：每小時抽樣重新驗證已置換的網域（熱門的優先）；某個節點對某網站開始出錯時，幾小時內就換回原始答案，不必等驗證過期。
 - **尖峰時段加權**：晚上壅塞的節點會降低優先順序。
+
+![儀表板的「機會成本（各 CDN）」：每家 CDN 一般 DNS 出國的比例、拉回台灣的次數與成功率，以及原本會被送去東京、香港、新加坡、洛杉磯，改走台灣節點的路線地圖](docs/images/luci-dashboard-cdn.webp)
+
+![LuCI「CDN 台灣節點」頁：啟用節點置換、未驗證網站的處理方式、各家 CDN（任播型用 IP 置換、DNS 分流型用 ECS）](docs/images/luci-cdn.webp)
 
 ### 自動挑最快、最乾淨的上游
 - **每日評測**：測試數十個公共 DNS（UDP、DoT、DoH、DoQ、DoH3）的速度與穩定度。
@@ -51,6 +80,8 @@
 - **自訂規則永遠優先**，可以用 `! @begin 分類` / `! @end` 把規則分段歸類；存檔 3 秒內生效。
 - 緊湊結構，每個網域約 9 bytes（預設清單約 16 萬條 ≈ 1.5 MB；105 萬條的 HaGeZi ≈ 10 MB）；複雜規則用索引挑候選，不會每個查詢都掃過全部規則。
 - 被擋時回傳 Extended DNS Errors，裝置與日誌看得到原因。
+
+![LuCI「廣告過濾」頁：訂閱清單與分類（ads / telemetry），可以個別啟用](docs/images/luci-filter.webp)
 
 ### 現代協議
 
@@ -76,12 +107,16 @@
 - **這是 3.0 的行為改變**：沒有 `access` 設定的舊設定檔也會套用「只開放台灣」。台灣 IP 是「登記國別」，不是地理定位；人在國外、漫遊、用出口在國外的 VPN 時會被擋（為台灣調校的 DNS 在國外本來就沒有優勢），需要時把 IP 加進 `access.allow` 或改成 `access.mode = "open"`。
 - 應用層過濾擋不了塞滿對外頻寬的流量型 DDoS（那要靠 ISP 或 Cloudflare 之類的服務）。詳見 [規格 08](docs/spec/08-access.md)。
 
+![LuCI「連線來源」頁：目前套用「只開放台灣」、台灣 IP 資料日期、已拒絕次數、被拒絕最多的網段（可一鍵加入封鎖或允許），以及只開放台灣 / 自訂 ISP / 全開放三種模式](docs/images/luci-access.webp)
+
 ### 好友互助（社群共享）
 - 跟朋友的路由器互加好友，交換台灣節點、網站驗證結果。
 - 每則訊息都有 Ed25519 簽名，收到的資料一定在本機驗證後才使用；只分享網域雜湊，不公開網站名稱。
 - 點對點，沒有中央伺服器：透過 HTTPS、DoT、DoQ 三種管道直接連到對方的路由器。
 - **邀請碼**：把「我的邀請碼」（`KRS1.` 開頭的一串字，也有 QR 碼）傳給朋友，朋友貼到他的 LuCI 社群頁 / Windows 設定頁「社群」/ `kuroshio community join <邀請碼>`，就會驗證你的身分指紋、自動成為好友並馬上同步。雙方都要先符合社群條件（網域、DoH / DoT / DoQ 至少一種、網域解析得到），沒就緒會直接列出缺什麼。邀請碼固定、可以重複使用；外流了就按「重新產生」，舊的立刻失效。你封鎖、拒絕、刪除過的對象不會因為邀請碼自動加入。也可以照舊輸入網域加好友。
 - 增量同步、自動規則（電信業者、延遲、共同好友…）、資料品質評分、封鎖與拒絕；陌生人的紀錄與自動封鎖都有上限，不會被灌爆。
+
+![LuCI「社群」頁：我的邀請碼與 QR 碼、貼上好友的邀請碼、新增好友，以及好友與請求清單（業者、連線品質、提供筆數、命中率、資料品質）](docs/images/luci-community.webp)
 
 ### 學習資料的備份、換機與分享
 黑潮 DNS 用久了會累積很多學習資料：驗證過的 CDN 網域、台灣節點池、永久 IPv6 節點、每日評測結果、汙染 DNS 黑名單。換路由器或重灌時可以帶過去，也可以分享給朋友，讓他不用從頭學。
@@ -90,6 +125,8 @@
 - **分享給朋友**：CDN 網域驗證紀錄（只有網域名稱與驗證結果，不含查詢次數、時間與手動設定）、台灣節點池、永久 IPv6 節點。朋友匯入後只當候選，他的機器自己驗證通過才使用。沒有身分、金鑰、統計、自訂規則，也沒有上游評測與黑名單（這兩項由每台機器自己判定）。
 - 在哪裡操作：OpenWrt 是 LuCI「黑潮 DNS → 進階 → 備份與分享」；Windows 是設定頁「工具 → 備份與分享」；指令列是 `kuroshio export`（完整）、`kuroshio export --share`（分享）、`kuroshio import 檔案.kuroshio`（OpenWrt 加 `--uci`）。服務執行中時會跟服務拿最新的資料、匯入時交給服務；服務停著時直接讀寫磁碟。
 - 匯入是**合併**，不會直接覆蓋：同一個網域以驗證時間比較新的為準，但你自己的查詢次數與手動設定保留；節點池、黑名單取聯集；評測結果比較新才用；自訂規則改過的話只把沒有的規則加在最後；社群身分只在新機器還沒有好友時才換成備份的身分（新機器自己產生的金鑰另存 `key.pem.before-import`）。服務執行中匯入時，服務會在程式內重新啟動（約幾秒）再合併，完成後列出每一類資料新增、更新、保留了多少。
+
+![LuCI「進階」頁的「備份與分享」：下載完整備份、下載分享檔、匯入 .kuroshio 檔](docs/images/luci-advanced.webp)
 
 ### 網域、憑證與 DDNS
 - **固定網域**：只填 `domain` 就能用固定網域，不需要 DDNS。
@@ -103,6 +140,8 @@
 - 五種 DNS 接管方式（不接管、dnsmasq 上游、重定向、積極劫持、取代 dnsmasq），IPv4 / IPv6 分開處理並自動建立 ULA；停用時自動還原。
 - MIPS（大端序 / 小端序）、ARM、x86 都有套件，支援 OpenWrt 24.10（ipk）與 25.12 以後（apk）。
 
+![LuCI「基本設定」簡易模式：啟用、DNS 接管方式、DNS 埠號、DDR、DNR（目前發布中的 DoH + DoH3、DoT 位址）、IPv6 處理、記憶體與儲存](docs/images/luci-settings.webp)
+
 ### Windows
 - Windows 服務（任何失敗 1 秒後重啟）或攜帶版；本機設定頁（需要登入，存檔立即重新載入）。
 - `kuroshio setup`：系統管理員執行一次，加防火牆規則、登記網址。
@@ -110,6 +149,8 @@
   - **HTTP.sys 共用 443**（建議）：黑潮 DNS 只向 HTTP.sys 登記自己的網址（`/dns-query`、`/.well-known/kuroshio`、公開頁），IIS 其他網站不受影響；少一層轉送、直接拿到用戶端 IP，IIS 開了 HTTP/3 時由 HTTP.sys 提供 DoH3。
   - **IIS 反向代理**：`kuroshio iis setup <站台>`，憑證自動匯入 Windows 憑證存放區並綁到 IIS 站台，續期後自動更新。
 - 在命令提示字元執行時，可以輸入 `help`、`url`、`open`、`site`、`status`、`paths`、`reload`、`quit`，直接取得設定頁與公開頁的網址。
+
+![Windows 本機設定頁的「儀表板」分頁：狀態、儀表板、設定、工具、日誌、關於，以及近 7 天的查詢、攔截、拉回台灣](docs/images/windows-dashboard.webp)
 
 ### 公開頁
 - 可以開一個設定說明頁給親友，依實際開啟的協議產生 iPhone 描述檔、Android 私人 DNS、Windows 設定方式，附 QR 碼。
