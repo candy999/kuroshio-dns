@@ -13,6 +13,41 @@ var callAction = rpc.declare({ object: 'kuroshio', method: 'action', params: ['p
 var callAbout = rpc.declare({ object: 'kuroshio', method: 'about' });
 var aboutPromise = null;
 
+// 儀表板一打開就要讀七、八個 API，實機上第一次載入偶爾出現「XHR request aborted by browser」（連線被中斷）。
+// 同時最多送 2 個（低階路由器的 uhttpd / rpcd 負擔也比較小），其餘排隊；讀取類的請求被中斷、逾時時再試兩次。
+var MAX_INFLIGHT = 2;
+var inflight = 0;
+var waiting = [];
+
+function pump() {
+	while (inflight < MAX_INFLIGHT && waiting.length) {
+		var job = waiting.shift();
+		inflight++;
+		job.fn().then(function(v) { inflight--; pump(); return v; }, function(e) { inflight--; pump(); throw e; })
+			.then(job.resolve, job.reject);
+	}
+}
+
+function limited(fn) {
+	return new Promise(function(resolve, reject) {
+		waiting.push({ fn: fn, resolve: resolve, reject: reject });
+		pump();
+	});
+}
+
+/** 連線被中斷、逾時這類暫時性的錯誤（服務沒啟動、路徑不允許不算，不重試） */
+function transient(e) {
+	return /abort|timed? ?out|XHR|NetworkError|Failed to fetch|Load failed/i.test(String((e && e.message) || e));
+}
+
+function rpcCall(fn, path, query, retries) {
+	return limited(function() { return fn(path, query); }).catch(function(e) {
+		if (retries > 0 && transient(e))
+			return new Promise(function(r) { setTimeout(r, 400 * (3 - retries)); }).then(function() { return rpcCall(fn, path, query, retries - 1); });
+		throw e;
+	});
+}
+
 /** 文字一律用 textContent 放進去（核心回傳的字串不當成 HTML） */
 function T(tag, attrs, text) {
 	var n = E(tag, attrs || {});
@@ -181,8 +216,9 @@ return baseclass.extend({
 
 	def: function(path) { return getPath(this.defaults, path); },
 
-	api: function(path, params) { return callApi(path, this.query(params)); },
-	action: function(path, params) { return callAction(path, this.query(params)); },
+	api: function(path, params) { return rpcCall(callApi, path, this.query(params), 2); },
+	// 動作（加好友、同步…）不自動重試：可能已經送到、只是回應被斷掉，重送會重複執行
+	action: function(path, params) { return rpcCall(callAction, path, this.query(params), 0); },
 
 	query: function(params) {
 		return Object.keys(params || {}).map(function(k) {
