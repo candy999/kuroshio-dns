@@ -20,7 +20,7 @@ var JOBS = { 'dns-benchmark': _('DNS 評測'), 'cdn-ranges': _('CDN IP 範圍'),
 
 function fmtNum(n) { return (n == null) ? '-' : Number(n).toLocaleString(); }
 function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
-function fmtTime(t) { return t ? new Date(t).toLocaleString() : '-'; }
+function fmtTime(t, mode) { return common.time(t, mode); }
 /* 還沒存的時間：0 = 都存了 */
 function fmtAge(s) {
 	if (s == null) return '-';
@@ -195,7 +195,7 @@ return view.extend({
 
 		var errs = (api.errors && api.errors.recent) || [];
 		var errSec = errs.length ? common.section(_('最近的錯誤（共 %d 次）').format(api.errors.count), [
-			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at) + '  ' + e.msg; }).join('\n'))
+			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at, 'sec') + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
 		return E([], [head, tiles, hw, memSec, accSec, lsSec, upSec, jobSec, infoSec, actions, errSec]);

@@ -185,10 +185,10 @@ mod tests {
             mutual: Some(2),
             ..Default::default()
         };
-        let c = ctx("dns.friend.com", &info);
-        assert!(matches(&json!({ "domain_suffix": ["friend.com"] }), &c));
-        assert!(matches(&json!({ "domain_suffix": ".friend.com" }), &c));
-        assert!(!matches(&json!({ "domain_suffix": ["other.com"] }), &c));
+        let c = ctx("dns.friend.example.net", &info);
+        assert!(matches(&json!({ "domain_suffix": ["friend.example.net"] }), &c));
+        assert!(matches(&json!({ "domain_suffix": ".friend.example.net" }), &c));
+        assert!(!matches(&json!({ "domain_suffix": ["example.org"] }), &c));
         assert!(matches(&json!({ "asn": ["AS3462", "4780"] }), &c));
         assert!(!matches(&json!({ "asn": [9924] }), &c));
         assert!(matches(&json!({ "same_asn": "1" }), &c));

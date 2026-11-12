@@ -170,6 +170,21 @@ function keepNumbers(text) {
 	return out;
 }
 
+/**
+ * 日期時間一律用台灣習慣的固定格式，不跟瀏覽器語系（英文瀏覽器原本會顯示 11/12/2026, 10:22:03 AM）：
+ * fmtTime(t) = 2026-11-12 10:22（24 小時制）；mode 'sec' 加秒、'date' 只有日期、'time' = 10:22、'timesec' = 10:22:03。
+ * 跟共用儀表板 data/dashboard/dashboard.js 的 KuroshioDashboard.fmtTime 同一份規則（LuCI 其他頁沒有載入儀表板，所以放一份在這裡）。
+ */
+function p2(n) { return (n < 10 ? '0' : '') + n; }
+function fmtTime(t, mode) {
+	if (t == null || t === '' || t === 0) return '-';
+	var d = new Date(typeof t === 'number' || /^\d+$/.test(t) ? Number(t) : t);
+	if (isNaN(d)) return String(t);
+	var date = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
+	var hm = p2(d.getHours()) + ':' + p2(d.getMinutes()), sec = ':' + p2(d.getSeconds());
+	return mode === 'date' ? date : mode === 'time' ? hm : mode === 'timesec' ? hm + sec : date + ' ' + hm + (mode === 'sec' ? sec : '');
+}
+
 var SCOPE = { 'public': _('公網'), 'private': _('私有'), 'cgnat': _('電信商 CGNAT'), 'linklocal': _('鏈路本地'), 'ula': _('區網 IPv6'), 'loopback': _('本機') };
 var BADGE = { ok: '#19733a', warn: '#8a5a00', err: '#b42318', off: '#6b7785' };
 
@@ -177,6 +192,9 @@ return baseclass.extend({
 	defaults: {},
 
 	T: T,
+
+	/** 日期時間（固定格式，見上方 fmtTime） */
+	time: fmtTime,
 
 	/** 小標籤（狀態用）：kind = ok / warn / err / off */
 	badge: function(text, kind) {

@@ -27,7 +27,21 @@
   const LABEL = { cloudflare: 'Cloudflare', cloudfront: 'CloudFront', fastly: 'Fastly', gcore: 'Gcore', azure: 'Azure', akamai: 'Akamai' };
   const SHORT = { cloudflare: 'Cloudflare', cloudfront: 'CloudFront', fastly: 'Fastly', akamai: 'Akamai', gcore: 'Gcore', azure: 'Azure' };
   const CDN_COLOR = { cloudflare: 'var(--s1)', cloudfront: 'var(--s2)', fastly: 'var(--s3)', akamai: 'var(--s4)', gcore: 'var(--s5)', azure: 'var(--s6)' };
-  Object.assign(KD, { nf, cf, compact, pct, el, sv, ago, LABEL, SHORT, CDN_COLOR });
+  /**
+   * 日期時間一律用台灣習慣的固定格式，不跟瀏覽器語系（英文瀏覽器原本會顯示 11/12/2026, 10:22:03 AM）：
+   * fmtTime(t) = 2026-11-12 10:22（24 小時制）；mode 'sec' 加秒、'date' 只有日期、'time' = 10:22、'timesec' = 10:22:03。
+   * t 可以是毫秒、毫秒字串或 ISO 字串；空的回 '-'，看不懂的原樣回傳。LuCI 的 kuroshio/common.js 有一份相同的實作。
+   */
+  const p2 = n => String(n).padStart(2, '0');
+  const fmtTime = (t, mode) => {
+    if (t === null || t === undefined || t === '' || t === 0) return '-';
+    const d = new Date(typeof t === 'number' || /^\d+$/.test(t) ? Number(t) : t);
+    if (isNaN(d)) return String(t);
+    const date = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
+    const hm = p2(d.getHours()) + ':' + p2(d.getMinutes()), sec = ':' + p2(d.getSeconds());
+    return mode === 'date' ? date : mode === 'time' ? hm : mode === 'timesec' ? hm + sec : date + ' ' + hm + (mode === 'sec' ? sec : '');
+  };
+  Object.assign(KD, { nf, cf, compact, pct, el, sv, ago, fmtTime, LABEL, SHORT, CDN_COLOR });
 
   // ---------- 共用：提示框 ----------
   function tooltip(container) { const t = el('div', 'tip'); container.appendChild(t); return t; }
@@ -100,7 +114,7 @@
     const x = i => L + (W - L - R) * i / (data.length - 1), y = v => T + (H - T - B) * (1 - v / top);
     const svg = sv('svg', { viewBox: `0 0 ${W} ${H}` });
     for (let k = 0; k <= 4; k++) { const yy = y(top * k / 4); sv('line', { x1: L, x2: W - R, y1: yy, y2: yy, stroke: 'var(--grid)' }, svg); sv('text', { x: L - 6, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = nf.format(top * k / 4); }
-    const hm = t => new Date(t).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const hm = t => fmtTime(t, 'time');
     [0, 15, 30, 45, 59].forEach(i => sv('text', { x: x(i), y: H - 4, 'text-anchor': i === 0 ? 'start' : i === 59 ? 'end' : 'middle', class: 'axis' }, svg).textContent = hm(data[i].t));
     series.forEach((s, idx) => {
       const d = data.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p[s.key]).toFixed(1)}`).join('');
@@ -497,7 +511,7 @@
     }
   }
 
-  const fmtHM = (ms) => new Date(ms).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const fmtHM = (ms) => fmtTime(ms, 'time');
   const RT_SERIES = [
     { key: 'queries', name: '查詢', color: 'var(--s1)' },
     { key: 'accelerated', name: '拉回台灣', color: 'var(--s3)' },
@@ -784,7 +798,7 @@
         const c = p.crossCdn || {};
         sec.crossSum.textContent = c.explored ? `試過 ${nf.format(c.explored)} 個網站，${nf.format(c.ok)} 個找到別家 CDN 的台灣節點（${pct1(c.ok / c.explored)}）` : '還沒有網站需要跨 CDN（原本的 CDN 沒有台灣節點、而且有人連線後才會測試）';
       }
-      if (sec.updated) sec.updated.textContent = '更新於 ' + new Date(p.generatedAt || Date.now()).toLocaleTimeString('zh-TW', { hour12: false });
+      if (sec.updated) sec.updated.textContent = '更新於 ' + fmtTime(p.generatedAt || Date.now(), 'timesec');
     }
     function loadStats() {
       return A.stats(range).then(renderStats, e => { fail(sec.tiles || sec.live, e); });
@@ -821,7 +835,7 @@
           { h: '來源', v: r => r.name || r.url },
           { h: '類別', v: r => tag(r.category === 'malware' ? '惡意' : r.category === 'custom' ? '自訂' : r.category === 'telemetry' ? '追蹤' : '廣告', r.category === 'malware' ? 'bad' : '') },
           { h: '行數', v: r => nf.format(r.lines), num: 1 },
-          { h: '更新', v: r => r.updated ? new Date(r.updated).toLocaleString('zh-TW', { hour12: false }) : '尚未下載' }
+          { h: '更新', v: r => r.updated ? fmtTime(r.updated) : '尚未下載' }
         ]);
         else if (sec.filterTable && o.showErrors) table(sec.filterTable, [], [{ h: '來源', v: r => r }], '過濾沒有啟用');
         const j = s.jobs;
@@ -829,7 +843,7 @@
           { h: '工作', v: r => r.name, cls: 'mono' },
           { h: '排程', v: r => [].concat(r.c.at || []).join(', ') + (r.c.weekdays ? ' · 週' + r.c.weekdays.map(d => '日一二三四五六'[d]).join('') : ' · 每天') },
           { h: '狀態', v: r => j.running && j.running.name === r.name ? tag('執行中', 'warn') : r.st.lastCode === 0 ? tag('成功', 'ok') : r.st.lastCode === undefined ? tag('未執行') : tag('失敗 ' + r.st.lastCode, 'bad') },
-          { h: '上次結束', v: r => r.st.lastEnd ? new Date(r.st.lastEnd).toLocaleString('zh-TW', { hour12: false }) + '（' + ago(r.st.lastEnd) + '）' : '—' },
+          { h: '上次結束', v: r => r.st.lastEnd ? fmtTime(r.st.lastEnd) + '（' + ago(r.st.lastEnd) + '）' : '—' },
           { h: '原因', v: r => r.st.reason || '—' }
         ]);
       }, e => { fail(sec.upTable && sec.upTable.parentNode, e); });
@@ -841,7 +855,7 @@
         const box = sec.bench; box.textContent = '';
         if (!b || !b.selected) { box.textContent = '尚無評測結果'; return; }
         box.className = '';
-        box.appendChild(el('div', 'muted', `${new Date(b.generatedAt).toLocaleString('zh-TW', { hour12: false })} · 測試 ${b.counts.total} 台 · 存活 ${b.counts.survivors} · 淘汰 ${b.counts.eliminated} · 涵蓋率 ${pct1(b.coverage)}`));
+        box.appendChild(el('div', 'muted', `${fmtTime(b.generatedAt)} · 測試 ${b.counts.total} 台 · 存活 ${b.counts.survivors} · 淘汰 ${b.counts.eliminated} · 涵蓋率 ${pct1(b.coverage)}`));
         const t = el('table'); const w = el('div', 'tbl kd-mt8'); w.appendChild(t); box.appendChild(w);
         table(t, [...b.selected.map(x => ({ ...x, role: '自動' })), ...b.pinned.map(x => ({ ...x, role: '固定', type: '', newItems: x.coverageItems, reason: x.issues.length ? x.issues.length + ' 個問題' : '' }))], [
           { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 }, { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }

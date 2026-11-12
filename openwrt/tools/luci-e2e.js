@@ -88,6 +88,9 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         // 我的身分
         const st = (await page.locator('#kuroshio-community-status').innerText().catch(() => '')).replace(/\s+/g, ' ');
         /未就緒/.test(st) && /198\.51\.100\.7/.test((await page.locator('#kuroshio-community-problems').innerText().catch(() => ''))) ? ok('社群頁：未就緒時逐條列出問題') : bad(`社群頁：未就緒的問題沒有列出\n     ${st}`);
+        // 時間用固定的台灣格式（2026-11-12 10:22），不跟瀏覽器語系（Playwright 預設是英文）
+        /已由 friend\.example\.net 於 \d{4}-\d{2}-\d{2} \d{2}:\d{2} 連入確認/.test(st) && !/\b[AP]M\b|\d{1,2}\/\d{1,2}\/\d{4}/.test(st)
+            ? ok('社群頁：時間是 YYYY-MM-DD HH:mm（不跟瀏覽器語系）') : bad(`社群頁：時間格式不對\n     ${st}`);
         /doq:\/\/dns\.example\.com:853/.test(st) && /好友 2 待我審核 1 等待對方同意 1 已封鎖 1/.test(st) && /自我檢查/.test(st)
             ? ok('社群頁：對外網址含 DoQ、好友數、自我檢查時間') : bad(`社群頁：我的身分內容不對\n     ${st}`);
         /_kuroshio\.dns\.example\.com TXT "v=k1; fp=719718821"/.test(await page.locator('#kuroshio-community-txt').innerText().catch(() => '')) && /第二管道/.test(st)

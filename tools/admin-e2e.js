@@ -550,6 +550,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.click('#community-status button:has-text("重新檢查")');
         await page.waitForFunction(() => /已重新檢查/.test(document.getElementById('toast').textContent), null, { timeout: 15000 }).catch(() => {});
         check(/已重新檢查/.test(await page.textContent('#toast')), '我的身分：重新檢查（POST /api/community/check）', await page.textContent('#toast'));
+        {
+            // 時間用固定的台灣格式（2026-11-12 10:22），不跟瀏覽器語系（Playwright 預設是英文，舊寫法會變成 11/12/2026, 10:22:03 AM）
+            const t = await page.textContent('#community-status');
+            check(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(t) && !/\d{1,2}\/\d{1,2}\/\d{4}|\b[AP]M\b/.test(t), '我的身分：時間是 YYYY-MM-DD HH:mm（不跟瀏覽器語系）', t);
+        }
         await page.fill('#community-add-input', 'friend.example.com');
         await page.click('#community-add button:has-text("送出請求")');
         await page.waitForSelector('#community-add-result .msg', { timeout: 15000 }).catch(() => {});

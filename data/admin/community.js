@@ -13,7 +13,7 @@
 	var KIND = { node: '節點池', site: '網站驗證', cross: '跨 CDN', upstream: '上游 DNS' };
 	var POLL_MS = 15000;
 
-	function day(t) { return new Date(t).toLocaleDateString('zh-TW'); }
+	function day(t) { return fmtTime(t, 'date'); }
 
 	/** 狀態文字（跟 LuCI 的 peerState 一樣） */
 	function peerState(p) {
@@ -131,7 +131,7 @@
 
 	// ---------------------------------------------------------------- 新增好友（網域）
 	function communityAdd() {
-		var input = el('input', { type: 'text', id: 'community-add-input', placeholder: 'dns.friend.com', 'aria-label': '好友的網域', spellcheck: 'false', autocomplete: 'off' });
+		var input = el('input', { type: 'text', id: 'community-add-input', placeholder: 'dns.example.net', 'aria-label': '好友的網域', spellcheck: 'false', autocomplete: 'off' });
 		var out = el('div', { id: 'community-add-result', 'aria-live': 'polite' });
 		var add = function () {
 			var d = input.value.trim();
@@ -237,7 +237,7 @@
 		if (!r.ok) { failBox(box, r); return; }
 		var ev = [].concat(r.data || []);
 		box.appendChild(el('pre', { class: 'out cm-events', text: ev.slice(0, 80).map(function (e) {
-			return fmtTime(e.at) + '  ' + e.domain + '  ' + e.type + (e.detail ? '（' + e.detail + '）' : '');
+			return fmtTime(e.at, 'sec') + '  ' + e.domain + '  ' + e.type + (e.detail ? '（' + e.detail + '）' : '');
 		}).join('\n') || '沒有紀錄' }));
 	};
 	function communityEvents() {
@@ -248,7 +248,7 @@
 	var ACTIONS = [['accept', '同意'], ['manual', '人工審核'], ['reject', '拒絕'], ['block', '封鎖']];
 	// 條件：跟 LuCI 的自動規則欄位一樣（list = 一行一個或用逗號分開；uint = 非負整數）
 	var CONDS = [
-		{ key: 'domain_suffix', type: 'list', label: '網域結尾', help: '例如 friend.com' },
+		{ key: 'domain_suffix', type: 'list', label: '網域結尾', help: '例如 example.net' },
 		{ key: 'asn', type: 'list', num: true, label: '電信業者 ASN', help: '例如 3462（中華電信）、4780（Seednet）、9924（台灣固網）、17421（遠傳）' },
 		{ key: 'same_asn', type: 'bool', label: '跟我同一家電信業者' },
 		{ key: 'colo', type: 'list', upper: true, label: 'Cloudflare 機房', help: '對方自報，例如 TPE、KHH' },

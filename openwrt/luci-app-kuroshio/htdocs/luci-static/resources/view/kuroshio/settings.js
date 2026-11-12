@@ -58,7 +58,7 @@ function ddnsPanel(st) {
 	var bad = function(x) { return E('span', {}, [common.badge(DDNS_ACTION[x.action] || _('失敗'), x.action === 'skip' ? 'warn' : 'err'), T('div', { 'style': 'color:#b42318;font-size:12px' }, x.error || '')]); };
 	return E('div', { 'id': 'kuroshio-ddns' }, [
 		st.error ? T('p', { 'class': 'alert-message warning' }, _('上次更新有錯誤：') + st.error) : '',
-		T('p', {}, _('上次檢查：') + (st.lastRun ? new Date(st.lastRun).toLocaleString() : '-')),
+		T('p', {}, _('上次檢查：') + common.time(st.lastRun)),
 		common.table([_('出口（網卡）'), _('類型'), _('偵測到的 IP'), _('狀態')], [].concat(st.sources || []).map(function(x) {
 			return [x.interface || _('自動（預設路由）'), 'IPv' + x.family, x.ip || '-', x.ok ? common.badge(_('正常'), 'ok') : bad(x)];
 		}), _('還沒有偵測結果')),

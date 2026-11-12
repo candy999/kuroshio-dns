@@ -12,14 +12,14 @@ var CHANNEL = { doq: 'DoQ', dot: 'DoT', https: 'HTTPS' };
 var KIND = { node: _('節點池'), site: _('網站驗證'), cross: _('跨 CDN'), upstream: _('上游 DNS') };
 var MUTED = 'font-size:12px;opacity:.75';
 
-function fmtTime(t) { return t ? new Date(t).toLocaleString() : '-'; }
+function fmtTime(t, mode) { return common.time(t, mode); }
 
 function peerState(p) {
 	if (p.rel === 'friend') return REL.friend;
 	if (p.myBlock) return _('已封鎖');
 	if (p.theirBlock) return _('對方已封鎖你');
-	if (p.rel === 'none' && p.rejectedUntil && p.rejectedUntil > Date.now()) return _('已拒絕（%s 前不能再請求）').format(new Date(p.rejectedUntil).toLocaleDateString());
-	if (p.rel === 'none' && p.theirRejectUntil && p.theirRejectUntil > Date.now()) return _('對方拒絕（%s 前不能再請求）').format(new Date(p.theirRejectUntil).toLocaleDateString());
+	if (p.rel === 'none' && p.rejectedUntil && p.rejectedUntil > Date.now()) return _('已拒絕（%s 前不能再請求）').format(fmtTime(p.rejectedUntil, 'date'));
+	if (p.rel === 'none' && p.theirRejectUntil && p.theirRejectUntil > Date.now()) return _('對方拒絕（%s 前不能再請求）').format(fmtTime(p.theirRejectUntil, 'date'));
 	if (p.rel === 'none' && p.deletedAt) return _('已刪除');
 	return REL[p.rel] || p.rel;
 }
@@ -279,7 +279,7 @@ return view.extend({
 			self.peerBox.replaceChildren(self.renderPeers(r[1] && r[1].result));
 			var ev = (r[2] && Array.isArray(r[2].result)) ? r[2].result : [];
 			self.eventBox.replaceChildren(common.pre(ev.slice(0, 80).map(function(e) {
-				return fmtTime(e.at) + '  ' + e.domain + '  ' + e.type + (e.detail ? '（' + e.detail + '）' : '');
+				return fmtTime(e.at, 'sec') + '  ' + e.domain + '  ' + e.type + (e.detail ? '（' + e.detail + '）' : '');
 			}).join('\n') || _('沒有紀錄')));
 		});
 	},
@@ -298,7 +298,7 @@ return view.extend({
 		var useInvite = function() { return self.useInvite(inviteInput, inviteOut); };
 		inviteInput.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); useInvite(); } });
 
-		var input = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'id': 'kuroshio-community-add-input', 'placeholder': 'dns.friend.com', 'style': 'max-width:22em' });
+		var input = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'id': 'kuroshio-community-add-input', 'placeholder': 'dns.example.net', 'style': 'max-width:22em' });
 		var add = function() {
 			var d = input.value.trim();
 			if (!d) return;
@@ -347,7 +347,7 @@ return view.extend({
 		o.value('reject', _('拒絕'));
 		o.value('block', _('封鎖'));
 		o.default = 'accept';
-		o = s.option(form.DynamicList, 'domain_suffix', _('網域結尾'), _('例如 friend.com'));
+		o = s.option(form.DynamicList, 'domain_suffix', _('網域結尾'), _('例如 example.net'));
 		o.modalonly = true;
 		o = s.option(form.DynamicList, 'asn', _('電信業者 ASN'), _('例如 3462（中華電信）、4780（Seednet）、9924（台灣固網）、17421（遠傳）'));
 		o.datatype = 'uinteger';

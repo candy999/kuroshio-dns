@@ -97,10 +97,14 @@
 	var nf = new Intl.NumberFormat('zh-TW');
 	function fmtNum(n) { return n == null || n === '' || isNaN(n) ? '-' : nf.format(n); }
 	function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
-	function fmtTime(t) {
+	/** 日期時間：共用儀表板的 fmtTime（2026-11-12 10:22，固定格式、不跟瀏覽器語系）；mode 見 dashboard.js */
+	function fmtTime(t, mode) {
 		if (!t) return '-';
+		if (window.KuroshioDashboard && window.KuroshioDashboard.fmtTime) return window.KuroshioDashboard.fmtTime(t, mode);
 		var d = new Date(typeof t === 'number' || /^\d+$/.test(t) ? Number(t) : t);
-		return isNaN(d) ? String(t) : d.toLocaleString('zh-TW', { hour12: false });
+		// 儀表板沒載入時的備用（同樣的格式，不含 mode）
+		var p2 = function(n) { return (n < 10 ? '0' : '') + n; };
+		return isNaN(d) ? String(t) : d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
 	}
 	function fmtUptime(s) {
 		if (s == null) return '-';
@@ -556,7 +560,7 @@
 				$('st-err').hidden = r.ok;
 				if (!r.ok) { $('st-err').textContent = '讀取狀態失敗：' + errText(r); return; }
 				renderStatus(r.data, res[1] && res[1].ok ? res[1].data : null);
-				$('st-updated').textContent = '更新於 ' + new Date().toLocaleTimeString('zh-TW', { hour12: false }) + '（每 5 秒自動更新）';
+				$('st-updated').textContent = '更新於 ' + fmtTime(Date.now(), 'timesec') + '（每 5 秒自動更新）';
 			});
 	}
 
@@ -682,7 +686,7 @@
 		var errs = (st.errors && st.errors.recent) || [];
 		if (errs.length) {
 			ex.appendChild(el('h3', { text: '最近的錯誤（共 ' + fmtNum(st.errors.count) + ' 次）' }));
-			ex.appendChild(el('pre', { class: 'out', text: errs.slice(0, 10).map(function (e) { return fmtTime(e.at) + '  ' + (e.msg || pretty(e)); }).join('\n') }));
+			ex.appendChild(el('pre', { class: 'out', text: errs.slice(0, 10).map(function (e) { return fmtTime(e.at, 'sec') + '  ' + (e.msg || pretty(e)); }).join('\n') }));
 		}
 	}
 
@@ -1720,7 +1724,7 @@
 					if (S.session.auth && !S.session.loggedIn) { showLogin('設定已套用，請重新登入。'); return; }
 					loadConfig().then(function () {
 						renderSettings();
-						updateSaveBar('已儲存並套用（' + new Date().toLocaleTimeString('zh-TW', { hour12: false }) + '）', 'ok');
+						updateSaveBar('已儲存並套用（' + fmtTime(Date.now(), 'timesec') + '）', 'ok');
 						toast('設定已儲存並套用');
 					});
 				});

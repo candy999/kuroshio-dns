@@ -33,9 +33,7 @@ function T(tag, attrs, text) {
 	return n;
 }
 
-function fmtTime(ms) {
-	return ms ? new Date(ms).toLocaleString('zh-TW', { hour12: false }) : '-';
-}
+function fmtTime(ms) { return common.time(ms); }
 
 /** 匯入結果：一類一行 */
 function reportLines(r) {

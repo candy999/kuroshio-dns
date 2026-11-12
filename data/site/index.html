@@ -1011,7 +1011,7 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
     KD.rank($('#blockRank'), s.topBlocked, { label: r => r.site, value: r => r.count, valueText: r => compact(r.count), color: 'var(--s2)' });
     $('#sitesCap').textContent = s.privacy.minClients > 1 ? `至少 ${s.privacy.minClients} 位不同使用者造訪過` : '大家最常造訪的網站';
     const sys = s.system; const rules = sys.rules ? sys.rules.custom + sys.rules.lists : 0;
-    $('#privacy').textContent = `統計只保存匿名數字，不含 IP 或個人紀錄 · 過濾規則 ${nf.format(rules)} 條 · 上游 DNS ${sys.upstreams} 組${sys.benchmarkAt ? '（每日體檢 ' + new Date(sys.benchmarkAt).toLocaleDateString('zh-TW') + '）' : ''} · 已連續運作 ${Math.floor(s.system.uptimeSec / 3600)} 小時 · 更新於 ${new Date(s.generatedAt).toLocaleTimeString('zh-TW', { hour12: false })}`;
+    $('#privacy').textContent = `統計只保存匿名數字，不含 IP 或個人紀錄 · 過濾規則 ${nf.format(rules)} 條 · 上游 DNS ${sys.upstreams} 組${sys.benchmarkAt ? '（每日體檢 ' + KuroshioDashboard.fmtTime(sys.benchmarkAt, 'date') + '）' : ''} · 已連續運作 ${Math.floor(s.system.uptimeSec / 3600)} 小時 · 更新於 ${KuroshioDashboard.fmtTime(s.generatedAt, 'timesec')}`;
   }
 
   async function load() {
