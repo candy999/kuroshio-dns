@@ -3,9 +3,14 @@
 'require form';
 'require poll';
 'require ui';
+'require uci';
 'require kuroshio.common as common';
 
+// 功能、用語跟 Windows 設定頁（data/admin/community.js）一樣（規格 03 第 10 節）
 var REL = { friend: _('好友'), out: _('等待對方同意'), 'in': _('待我審核'), none: '-' };
+var CHANNEL = { doq: 'DoQ', dot: 'DoT', https: 'HTTPS' };
+var KIND = { node: _('節點池'), site: _('網站驗證'), cross: _('跨 CDN'), upstream: _('上游 DNS') };
+var MUTED = 'font-size:12px;opacity:.75';
 
 function fmtTime(t) { return t ? new Date(t).toLocaleString() : '-'; }
 
@@ -19,78 +24,168 @@ function peerState(p) {
 	return REL[p.rel] || p.rel;
 }
 
+/** 狀態標籤的顏色（跟 Windows 設定頁一樣） */
+function stateKind(p) {
+	if (p.rel === 'friend') return 'ok';
+	if (p.rel === 'in') return 'warn';
+	if (p.myBlock || p.theirBlock) return 'err';
+	return p.rel === 'out' ? 'warn' : 'off';
+}
+
+/** 資料品質：各種資料的分數（有試過的才列） */
+function quality(p) {
+	var sc = p.scores || {};
+	var parts = Object.keys(KIND).map(function(k) {
+		var x = sc[k];
+		if (!x || !((x.ok || 0) + (x.fail || 0) + (x.invalid || 0))) return null;
+		return KIND[k] + ' ' + Math.round(100 * x.score) + '%' + (x.paused ? _('（暫停）') : '');
+	}).filter(Boolean);
+	return parts.length ? parts.join('、') : '-';
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
 			common.loadDefaults(),
-			L.resolveDefault(common.api('/api/community/status'), null)
+			L.resolveDefault(common.api('/api/community/status'), null),
+			L.resolveDefault(uci.load('kuroshio'), null)
 		]);
 	},
 
+	/** 送出動作；成功後重新讀取全部面板。回傳 Promise<是否成功> */
 	act: function(path, params, okText) {
 		var self = this;
 		return common.action(path, params).then(function(r) {
 			var res = r && r.result;
-			if (!r || r.ok === false) return common.notify(r);
-			if (res && res.ok === false) return ui.addNotification(null, E('p', {}, res.reason || _('操作失敗')), 'warning');
+			if (!r || r.ok === false) {
+				ui.addNotification(null, E('p', {}, (r && r.error) || _('操作失敗')), 'danger');
+				return false;
+			}
+			if (res && res.ok === false) {
+				ui.addNotification(null, E('p', {}, res.reason || _('操作失敗')), 'warning');
+				return self.refresh().then(function() { return false; });
+			}
 			ui.addNotification(null, E('p', {}, okText || _('完成')), 'info');
-			return self.refresh();
+			return self.refresh().then(function() { return true; });
 		});
+	},
+
+	/** 先跳確認視窗，按確認按鈕才送出 */
+	confirmAct: function(title, text, okLabel, path, params, okText) {
+		var self = this;
+		ui.showModal(title, [
+			E('p', {}, text),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, _('取消')), ' ',
+				E('button', { 'class': 'btn cbi-button-negative', 'id': 'kuroshio-confirm', 'click': ui.createHandlerFn(self, function() {
+					ui.hideModal();
+					return self.act(path, params, okText);
+				}) }, okLabel)
+			])
+		]);
 	},
 
 	renderStatus: function(st) {
 		if (!st || st.ok === false || !st.result) return E('div', { 'class': 'cbi-section' }, E('em', {}, _('服務沒有在執行，或社群模式沒有啟用。')));
 		var s = st.result;
 		if (!s.enabled) return E('div', { 'class': 'cbi-section' }, E('em', {}, _('社群模式沒有啟用：在下方打開並「儲存並套用」。')));
-		var c = s.check || {};
-		return E('div', { 'class': 'cbi-section' }, [
+		var c = s.check || {}, ep = s.endpoints || {}, n = s.counts || {};
+		var rows = [
+			[_('狀態'), s.ready ? common.badge(_('就緒'), 'ok') : E('div', {}, [common.badge(_('未就緒'), 'err'),
+				E('ul', { 'id': 'kuroshio-community-problems', 'style': 'margin:.3em 0 0 1.2em' }, (c.problems || []).map(function(p) { return E('li', {}, p); }))])],
+			[_('網域'), s.domain || '-'],
+			[_('公鑰指紋'), E('code', {}, s.fingerprint || '-')],
+			[_('對外網址'), [ep.doh, ep.dot, ep.doq].filter(Boolean).join('　') || '-'],
+			[_('憑證'), c.cert && c.cert.validTo ? _('%s 到期（剩 %d 天）').format(c.cert.validTo, c.cert.daysLeft) : '-'],
+			[_('外部連線'), s.externalConfirmed ? _('已由 %s 於 %s 連入確認').format(s.externalConfirmed.from, fmtTime(s.externalConfirmed.at)) : _('還沒有其他節點連進來過（加好友時對方會回連驗證）')],
+			[_('好友'), _('好友 %d　待我審核 %d　等待對方同意 %d　已封鎖 %d').format(n.friends || 0, n.incoming || 0, n.outgoing || 0, n.blocked || 0)],
+			[_('自我檢查'), fmtTime(c.at)]
+		];
+		if (s.txt && s.txt.value && s.domain)
+			rows.push([_('TXT 記錄（選用）'), E('div', { 'id': 'kuroshio-community-txt' }, [
+				E('code', { 'style': 'word-break:break-all' }, s.txt.name + '  TXT  "' + s.txt.value + '"'),
+				E('div', { 'style': MUTED }, _('有設定時好友會多比對一次金鑰（第二管道）；沒設定也可以。'))])]);
+		if (s.rotation) rows.push([_('金鑰輪替'), _('已換新金鑰，舊金鑰到 %s 前仍有效（好友會自動更新）').format(fmtTime(s.rotation.until))]);
+		return E('div', { 'class': 'cbi-section', 'id': 'kuroshio-community-status' }, [
 			E('h3', {}, _('我的身分')),
-			E('table', { 'class': 'table' }, [
-				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left', 'width': '25%' }, _('狀態')),
-					E('td', { 'class': 'td left' }, s.ready ? E('strong', { 'style': 'color:green' }, _('就緒')) : E('span', { 'style': 'color:#c00' }, _('未就緒：') + (c.problems || []).join('；')))]),
-				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left' }, _('網域')), E('td', { 'class': 'td left' }, s.domain || '-')]),
-				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left' }, _('公鑰指紋')), E('td', { 'class': 'td left' }, E('code', {}, s.fingerprint))]),
-				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left' }, _('對外網址')), E('td', { 'class': 'td left' }, [s.endpoints.doh, s.endpoints.dot].filter(Boolean).join('　') || '-')]),
-				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left' }, _('憑證')), E('td', { 'class': 'td left' }, c.cert ? _('%s 到期（剩 %d 天）').format(c.cert.validTo, c.cert.daysLeft) : '-')]),
-				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left' }, _('外部連線')), E('td', { 'class': 'td left' },
-					s.externalConfirmed ? _('已由 %s 於 %s 連入確認').format(s.externalConfirmed.from, fmtTime(s.externalConfirmed.at)) : _('還沒有其他節點連進來過（加好友時對方會回連驗證）'))])
+			E('table', { 'class': 'table' }, rows.map(function(r) {
+				return E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left', 'width': '25%' }, r[0]), E('td', { 'class': 'td left', 'style': 'overflow-wrap:anywhere' }, r[1])]);
+			})),
+			E('div', { 'style': 'margin-top:.5em;display:flex;gap:.5em;flex-wrap:wrap' }, [
+				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, 'act', '/api/community/check', {}, _('已重新檢查')) }, _('重新檢查')),
+				E('button', { 'class': 'btn cbi-button cbi-button-negative', 'click': ui.createHandlerFn(this, 'confirmAct', _('更換金鑰'),
+					_('產生新的身分金鑰並通知所有好友（舊金鑰在過渡期內仍有效）。確定要更換嗎？'), _('更換金鑰'), '/api/community/rotate', {}, _('已更換金鑰並通知好友')) }, _('更換金鑰'))
+			])
+		]);
+	},
+
+	renderPeer: function(p) {
+		var self = this, d = p.domain, info = p.info || {}, st = p.stats || {};
+		var btn = function(label, path, params, cls, ok, confirmText) {
+			var fn = confirmText ? ui.createHandlerFn(self, 'confirmAct', label, confirmText, label, path, params, ok)
+				: ui.createHandlerFn(self, 'act', path, params, ok);
+			return E('button', { 'class': 'btn cbi-button ' + (cls || ''), 'click': fn }, label);
+		};
+		var acts = [];
+		if (p.rel === 'in') acts.push(btn(_('同意'), '/api/community/accept', { domain: d }, 'cbi-button-positive', _('已同意')),
+			btn(_('拒絕'), '/api/community/reject', { domain: d }, '', _('已拒絕')),
+			btn(_('封鎖'), '/api/community/block', { domain: d }, 'cbi-button-negative', _('已封鎖'), _('封鎖 %s？對方之後的請求一律不受理。').format(d)));
+		else if (p.rel === 'friend') acts.push(btn(_('立即同步'), '/api/community/sync', { domain: d }, '', _('已同步')),
+			btn(_('刪除'), '/api/community/delete', { domain: d }, 'cbi-button-negative', _('已刪除'), _('刪除好友 %s？').format(d)),
+			btn(_('刪除並封鎖'), '/api/community/delete', { domain: d, block: '1' }, 'cbi-button-negative', _('已刪除並封鎖'), _('刪除並封鎖 %s？對方之後的請求一律不受理。').format(d)));
+		else if (p.rel === 'out') acts.push(btn(_('取消'), '/api/community/delete', { domain: d }, '', _('已取消')));
+		if (p.myBlock) acts.push(btn(_('解除封鎖'), '/api/community/unblock', { domain: d }, '', _('已解除封鎖')));
+		else if (p.rel === 'none') acts.push(btn(_('加好友'), '/api/community/add', { domain: d }, 'cbi-button-action', _('已送出請求')));
+		if (p.pendingKey) acts.push(btn(_('接受新金鑰'), '/api/community/accept-key', { domain: d }, '', _('已接受新金鑰'),
+			_('確定是 %s 本人換的金鑰嗎？新指紋：%s').format(d, p.pendingKey.fingerprint || '-')));
+		if (p.rel === 'friend') {
+			var sel = E('select', { 'class': 'cbi-input-select kuroshio-channel', 'aria-label': _('指定管道'), 'style': 'width:auto' },
+				[['', _('管道：自動')], ['doq', _('DoQ 優先')], ['dot', _('DoT 優先')], ['https', _('HTTPS 優先')]].map(function(o) {
+					return E('option', { 'value': o[0] }, o[1]);
+				}));
+			sel.value = p.preferChannel || '';
+			sel.addEventListener('change', function() {
+				sel.disabled = true;
+				self.act('/api/community/channel', { domain: d, channel: sel.value || 'auto' }, _('已指定管道')).then(function() { sel.disabled = false; });
+			});
+			acts.push(sel);
+		}
+
+		var hit = st.tried ? Math.round(100 * (st.ok || 0) / st.tried) + '%（' + st.ok + '/' + st.tried + '）' : '-';
+		var kv = [
+			[_('業者 · 機房'), (info.asn ? 'AS' + info.asn : '-') + (info.colo ? ' · ' + info.colo : '')],
+			[_('連線品質'), info.rttMs != null ? _('%d ms（抖動 %d、掉包 %d%%）').format(info.rttMs, info.jitterMs || 0, info.lossPct || 0) : '-'],
+			[_('最後同步'), fmtTime(p.lastSyncOk)],
+			[_('提供筆數'), (st.offered || 0) + (st.invalid ? ' / ' + _('違規 %d').format(st.invalid) : '')],
+			[_('命中率'), hit],
+			[_('資料品質'), quality(p)],
+			[_('管道'), p.channel ? (CHANNEL[p.channel] || p.channel) + (p.preferChannel ? _('（指定 %s）').format(CHANNEL[p.preferChannel] || p.preferChannel) : '') : '-'],
+			[_('加入'), p.invitedAt ? _('透過邀請碼，%s').format(fmtTime(p.invitedAt)) : (p.friendSince ? _('成為好友 %s').format(fmtTime(p.friendSince)) : '-')]
+		];
+		var notes = [];
+		if (p.lastError) notes.push(E('div', { 'class': 'kuroshio-peer-error', 'style': 'color:#c00;font-size:12px' }, p.lastError));
+		if (p.oldVersion) notes.push(E('div', { 'style': 'color:#b36b00;font-size:12px' }, _('對方版本較舊（v1），每 6 小時重試')));
+		if (p.pendingKey) notes.push(E('div', { 'style': 'color:#b36b00;font-size:12px' }, _('對方換了金鑰，但沒有用舊金鑰簽名：確認是對方本人換的才接受。新指紋 %s').format(p.pendingKey.fingerprint || '-')));
+		if (p.autoBlockAt) notes.push(E('div', { 'style': MUTED }, _('自動封鎖於 %s').format(fmtTime(p.autoBlockAt))));
+		return E('div', { 'class': 'kuroshio-peer', 'data-domain': d, 'data-rel': p.rel,
+			'style': 'border:1px solid rgba(127,127,127,.35);border-radius:6px;padding:.6em .8em;margin:.6em 0' }, [
+			E('div', { 'style': 'display:flex;gap:.6em;align-items:center;flex-wrap:wrap' }, [
+				E('strong', { 'style': 'font-family:monospace;word-break:break-all' }, d),
+				common.badge(peerState(p), stateKind(p)),
+				p.fingerprint ? E('span', { 'style': MUTED + ';font-family:monospace' }, String(p.fingerprint).slice(0, 19) + '…') : ''
 			]),
-			E('div', { 'style': 'margin-top:.5em' }, E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, 'act', '/api/community/check', {}, _('已重新檢查')) }, _('重新檢查')))
+			notes.length ? E('div', { 'style': 'margin-top:.3em' }, notes) : '',
+			E('dl', { 'style': 'display:grid;grid-template-columns:repeat(auto-fill,minmax(13em,1fr));gap:.4em 1.2em;margin:.5em 0' }, kv.map(function(x) {
+				return E('div', { 'style': 'min-width:0' }, [E('dt', { 'style': MUTED + ';font-weight:normal' }, x[0]), E('dd', { 'style': 'margin:0;overflow-wrap:anywhere' }, x[1])]);
+			})),
+			acts.length ? E('div', { 'class': 'kuroshio-peer-actions', 'style': 'display:flex;gap:.4em;flex-wrap:wrap;align-items:center' }, acts) : ''
 		]);
 	},
 
 	renderPeers: function(peers) {
-		var self = this;
-		var btn = function(label, path, params, cls, ok) {
-			return E('button', { 'class': 'btn cbi-button ' + (cls || ''), 'click': ui.createHandlerFn(self, 'act', path, params, ok) }, label);
-		};
-		var rows = (peers || []).map(function(p) {
-			var d = p.domain, acts = [];
-			if (p.rel === 'in') acts.push(btn(_('同意'), '/api/community/accept', { domain: d }, 'cbi-button-positive', _('已同意')),
-				btn(_('拒絕'), '/api/community/reject', { domain: d }, '', _('已拒絕')), btn(_('封鎖'), '/api/community/block', { domain: d }, 'cbi-button-negative', _('已封鎖')));
-			else if (p.rel === 'friend') acts.push(btn(_('立即同步'), '/api/community/sync', { domain: d }, '', _('已同步')),
-				btn(_('刪除'), '/api/community/delete', { domain: d }, 'cbi-button-negative', _('已刪除')),
-				btn(_('刪除並封鎖'), '/api/community/delete', { domain: d, block: '1' }, 'cbi-button-negative', _('已刪除並封鎖')));
-			else if (p.rel === 'out') acts.push(btn(_('取消'), '/api/community/delete', { domain: d }, '', _('已取消')));
-			if (p.myBlock) acts.push(btn(_('解除封鎖'), '/api/community/unblock', { domain: d }, '', _('已解除封鎖')));
-			else if (p.rel === 'none') acts.push(btn(_('加好友'), '/api/community/add', { domain: d }, 'cbi-button-action', _('已送出請求')));
-			var info = p.info || {}, st = p.stats || {};
-			var hit = st.tried ? Math.round(100 * (st.ok || 0) / st.tried) + '%（' + st.ok + '/' + st.tried + '）' : '-';
-			return [
-				E('div', {}, [E('strong', {}, d), p.fingerprint ? E('div', { 'style': 'font-size:11px;opacity:.7' }, p.fingerprint.slice(0, 19) + '…') : '']),
-				E('div', {}, [peerState(p), p.lastError ? E('div', { 'style': 'font-size:11px;color:#c00' }, p.lastError) : '']),
-				(info.asn ? 'AS' + info.asn : '-') + (info.colo ? ' · ' + info.colo : ''),
-				info.rttMs != null ? _('%d ms（抖動 %d、掉包 %d%%）').format(info.rttMs, info.jitterMs || 0, info.lossPct || 0) : '-',
-				fmtTime(p.lastSyncOk),
-				(st.offered || 0) + (st.violations ? ' / ' + _('違規 %d').format(st.violations) : ''),
-				hit,
-				E('div', { 'style': 'display:flex;gap:.3em;flex-wrap:wrap' }, acts)
-			];
-		});
-		var head = [_('網域'), _('狀態'), _('業者 · 機房'), _('連線品質'), _('最後同步'), _('提供筆數'), _('命中率'), ''];
-		return E('table', { 'class': 'table' }, [E('tr', { 'class': 'tr table-titles' }, head.map(function(h) { return E('th', { 'class': 'th' }, h); }))]
-			.concat(rows.length ? rows.map(function(r) { return E('tr', { 'class': 'tr' }, r.map(function(c) { return E('td', { 'class': 'td' }, c); })); })
-				: [E('tr', { 'class': 'tr placeholder' }, E('td', { 'class': 'td', 'colspan': head.length }, E('em', {}, _('還沒有好友'))))]));
+		var list = Array.isArray(peers) ? peers : [];
+		if (!list.length) return E('em', {}, _('還沒有好友'));
+		return E('div', { 'id': 'kuroshio-community-peers' }, list.map(L.bind(this.renderPeer, this)));
 	},
 
 	/** 我的邀請碼：只有這裡拿得到（其他 API 都沒有邀請碼本身） */
@@ -182,7 +277,7 @@ return view.extend({
 		]).then(function(r) {
 			self.statusBox.replaceChildren(self.renderStatus(r[0]));
 			self.peerBox.replaceChildren(self.renderPeers(r[1] && r[1].result));
-			var ev = (r[2] && r[2].result) || [];
+			var ev = (r[2] && Array.isArray(r[2].result)) ? r[2].result : [];
 			self.eventBox.replaceChildren(common.pre(ev.slice(0, 80).map(function(e) {
 				return fmtTime(e.at) + '  ' + e.domain + '  ' + e.type + (e.detail ? '（' + e.detail + '）' : '');
 			}).join('\n') || _('沒有紀錄')));
@@ -203,11 +298,11 @@ return view.extend({
 		var useInvite = function() { return self.useInvite(inviteInput, inviteOut); };
 		inviteInput.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); useInvite(); } });
 
-		var input = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': 'dns.friend.com', 'style': 'max-width:22em' });
+		var input = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'id': 'kuroshio-community-add-input', 'placeholder': 'dns.friend.com', 'style': 'max-width:22em' });
 		var add = function() {
 			var d = input.value.trim();
 			if (!d) return;
-			return self.act('/api/community/add', { domain: d }, _('已送出好友請求')).then(function() { input.value = ''; });
+			return self.act('/api/community/add', { domain: d }, _('已送出好友請求')).then(function(ok) { if (ok) input.value = ''; });
 		};
 		input.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); add(); } });
 
@@ -229,7 +324,8 @@ return view.extend({
 			common.num(s, null, 'reject_days', _('拒絕後幾天才能再請求'), 'community.rejectDays');
 			common.num(s, null, 'sync_interval', _('多久向好友拉一次資料（分鐘）'), 'community.syncIntervalMin');
 			common.num(s, null, 'max_friends', _('好友數上限'), 'community.maxFriends', _('達到上限後，自動同意的請求改成人工審核。'));
-			common.num(s, null, 'min_hit_rate', _('命中率下限'), 'community.minHitRate', _('好友給的資料在我這邊驗證成功的比例（0～1），試過 20 次以上還低於這個就自動刪除。0 = 不檢查。'), 'ufloat');
+			common.num(s, null, 'min_hit_rate', _('命中率下限'), 'community.minHitRate', _('好友給的資料在我這邊驗證成功的比例（0～1）。0 = 不檢查。'), 'range(0,1)');
+			common.flag(s, null, 'auto_delete_low_hit_rate', _('命中率太低時自動刪除好友'), 'community.autoDeleteLowHitRate', _('試過 20 次以上還低於命中率下限就自動刪除。'));
 			common.num(s, null, 'pow_bits', _('好友請求的工作量證明難度'), 'community.powBits', _('越高越難灌請求，但對方送請求也越久。'));
 		}
 
@@ -278,6 +374,13 @@ return view.extend({
 		o = s.option(form.Value, 'max_friends', _('我的好友數少於'));
 		o.datatype = 'uinteger';
 		o.modalonly = true;
+		// 專業模式才有的條件；簡易模式下已經有規則用到時也顯示（跟 Windows 設定頁一樣，不讓設定藏起來）
+		var rules = uci.sections('kuroshio', 'community_rule');
+		[['require_ip_match', _('來源 IP 要在對方網域的解析結果裡')], ['has_txt', _('對方有設定 _kuroshio TXT 記錄')]].forEach(function(c) {
+			if (!pro && !rules.some(function(r) { return r[c[0]] != null; })) return;
+			o = s.option(form.Flag, c[0], c[1]);
+			o.modalonly = true;
+		});
 
 		var tools = E([], [
 			E('div', { 'class': 'cbi-section', 'id': 'kuroshio-invite' }, [

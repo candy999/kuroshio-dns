@@ -129,7 +129,57 @@ const INVITE_USE = query => {
         { step: 'identity', ok: true, text: '已取得 friend.example.net 的身分文件（經 dot）' }, { step: 'fingerprint', ok: true, text: '身分指紋相符：1111-2222-3333-4444-5555-6666-7777-8888' },
         { step: 'request', ok: true, text: '已送出好友請求（附邀請證明）' }, { step: 'accepted', ok: true, text: '對方已自動同意，成為好友；馬上開始第一次同步' }] };
 };
-const API = { '/api/access': ACCESS, '/api/community/peers': () => [], '/api/community/events': () => [], '/api/community/invite': INVITE, '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS };
+// 社群（好友）：每一種狀態各一個對象。「重新檢查」後從未就緒變成就緒，「同意」把待審核的請求變成好友，「更換金鑰」後出現輪替；
+// 其他動作只記下呼叫（luci-e2e.js 用 /__mock/calls 檢查送出的路徑與參數）
+const NOW = Date.now(), H = 3600000, D = 24 * H;
+const SCORE = (score, ok, fail, invalid, paused) => ({ score, ok, fail, invalid, paused: !!paused });
+const NOSCORE = { node: SCORE(0, 0, 0, 0), site: SCORE(0, 0, 0, 0), cross: SCORE(0, 0, 0, 0), upstream: SCORE(0, 0, 0, 0) };
+const PEER = (o) => Object.assign({ rel: 'none', myBlock: false, autoBlockAt: null, theirBlock: false, rejectedUntil: null, theirRejectUntil: null, deletedAt: null,
+    fingerprint: null, endpoint: null, endpoints: [], channel: null, preferChannel: null, info: {}, ipMatch: null, hasTxt: null, proto: null,
+    stats: { offered: 0, invalid: 0, tried: 0, ok: 0, fail: 0 }, scores: NOSCORE, keys: [], pendingKey: null, oldVersion: false, oldVersionSince: null,
+    friendSince: null, lastContact: null, lastSyncOk: null, lastError: null, nextTry: null, shared: null, note: null, invitedAt: null }, o);
+const community = {
+    ready: false, rotated: false,
+    peers: [
+        PEER({ domain: 'req.example.net', rel: 'in', fingerprint: 'AAAA-1111-2222-3333-4444-5555-6666-7777', info: { asn: 3462, colo: 'TPE', rttMs: 9, jitterMs: 2, lossPct: 0 } }),
+        PEER({ domain: 'friend.example.net', rel: 'friend', fingerprint: '1111-2222-3333-4444-5555-6666-7777-8888', channel: 'doq', preferChannel: 'dot',
+            info: { asn: 4780, colo: 'TPE', rttMs: 12, jitterMs: 3, lossPct: 1 }, stats: { offered: 420, invalid: 3, tried: 50, ok: 45, fail: 5 },
+            scores: { node: SCORE(0.97, 120, 2, 1), site: SCORE(0.9, 45, 5, 0), cross: SCORE(0, 0, 0, 0), upstream: SCORE(0.5, 2, 1, 1, true) },
+            friendSince: NOW - 20 * D, invitedAt: NOW - 20 * D, lastSyncOk: NOW - 5 * 60000 }),
+        PEER({ domain: 'keyswap.example.org', rel: 'friend', fingerprint: '9999-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-0000', channel: 'https',
+            info: { asn: 9924, colo: 'KHH', rttMs: 25, jitterMs: 8, lossPct: 2 }, stats: { offered: 10, invalid: 0, tried: 0, ok: 0, fail: 0 },
+            pendingKey: { kid: 'ab12', fingerprint: 'NEW0-KEY1-2222-3333-4444-5555-6666-7777' }, oldVersion: true, oldVersionSince: NOW - 2 * D,
+            lastError: '同步失敗：連線逾時', friendSince: NOW - 3 * D, lastSyncOk: NOW - 2 * D }),
+        PEER({ domain: 'wait.example.com', rel: 'out' }),
+        PEER({ domain: 'spam.example.com', myBlock: true, autoBlockAt: NOW - H }),
+        PEER({ domain: 'blockedme.example.net', theirBlock: true }),
+        PEER({ domain: 'rejected.example.com', rejectedUntil: NOW + 30 * D }),
+        PEER({ domain: 'theyrejected.example.org', theirRejectUntil: NOW + 30 * D }),
+        PEER({ domain: 'gone.example.net', deletedAt: NOW - D })
+    ]
+};
+const COMMUNITY_STATUS = () => {
+    const n = f => community.peers.filter(f).length;
+    return { enabled: true, ready: community.ready, domain: 'dns.example.com', fingerprint: '7197-1882-14EA-0AF1-8FCC-0C6C-00A3-7A4A',
+        check: { at: NOW - 10 * 60000, ready: community.ready, problems: community.ready ? [] : ['dns.example.com 解析出的 IP（198.51.100.7）跟出口 IP（203.0.113.25）不一樣'],
+            cert: { validTo: '2027-01-31', daysLeft: 80 } },
+        txt: { name: '_kuroshio.dns.example.com', value: 'v=k1; fp=719718821' },
+        rotation: community.rotated ? { at: NOW, oldKid: 'aa', until: NOW + 7 * D } : null,
+        endpoints: { doh: 'https://dns.example.com/.well-known/kuroshio', dot: 'dot://dns.example.com:853', doq: 'doq://dns.example.com:853' },
+        externalConfirmed: { from: 'friend.example.net', at: NOW - H },
+        counts: { friends: n(p => p.rel === 'friend'), incoming: n(p => p.rel === 'in'), outgoing: n(p => p.rel === 'out'), blocked: n(p => p.myBlock), pendingKeys: n(p => p.pendingKey) } };
+};
+const COMMUNITY_EVENTS = () => [{ at: NOW - H, domain: 'req.example.net', type: '收到請求', detail: '人工審核' }, { at: NOW - 2 * H, domain: 'spam.example.com', type: '自動封鎖', detail: null }];
+const calls = [];
+const COMMUNITY_ACTION = (p, query) => {
+    const q = new URLSearchParams(query || '');
+    if (p === '/api/community/check') community.ready = true;
+    if (p === '/api/community/rotate') community.rotated = true;
+    if (p === '/api/community/accept') community.peers.filter(x => x.domain === q.get('domain')).forEach(x => { x.rel = 'friend'; x.friendSince = Date.now(); });
+    if (p === '/api/community/add' && q.get('domain') === 'bad.example.com') return { ok: false, reason: 'bad.example.com 沒有回應（連線逾時）' };
+    return { ok: true };
+};
+const API = { '/api/access': ACCESS, '/api/community/status': COMMUNITY_STATUS, '/api/community/peers': () => community.peers, '/api/community/events': COMMUNITY_EVENTS, '/api/community/invite': INVITE, '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS };
 let defaults = null;
 try { defaults = JSON.parse(execFileSync(BIN, ['defaults', '--json'], { encoding: 'utf-8' })); } catch (e) { console.log('（沒有 kuroshio 執行檔：預設值提示不顯示）'); }
 
@@ -144,6 +194,8 @@ function kuroshio(method, args) {
             { priority: 1, alpn: ['h2', 'h3'], port: 8443, dohpath: '/dns-query{?dns}', addrs: ['192.168.1.1', 'fd12:3456::1'] },
             { priority: 2, alpn: ['dot'], port: 853, dohpath: null, addrs: ['192.168.1.1'] }] };
     case 'action':
+        calls.push({ path: args.path, query: args.query || '' });
+        if (/^\/api\/community\/(check|add|accept|reject|block|unblock|delete|sync|rotate|accept-key|channel)$/.test(args.path)) return { ok: true, result: COMMUNITY_ACTION(args.path, args.query) };
         if (args.path === '/api/ddns/update') return wrap('/api/ddns');
         if (args.path === '/api/community/invite/refresh') { inviteN++; return wrap('/api/community/invite'); }
         if (args.path === '/api/community/invite/use') return { ok: true, result: INVITE_USE(args.query) };
@@ -240,9 +292,18 @@ http.createServer((req, res) => {
         return;
     }
     // 給 luci-e2e.js（MOCK=1）讀結果
+    // kuroshio action 呼叫紀錄（?since=N 只回第 N 筆之後的）
+    if (url.pathname === '/__mock/calls') return send(200, MIME['.json'], JSON.stringify(calls.slice(+(url.searchParams.get('since') || 0))));
     if (url.pathname === '/__mock/uci') {
         const [c, sct, o] = (url.searchParams.get('key') || '').split('.');
-        const v = ((uci[c] || {})[sct] || {})[o];
+        // 跟 uci 指令一樣支援 @type[i]（負數從後面算）
+        let sec = (uci[c] || {})[sct];
+        const at = /^@(\w+)\[(-?\d+)\]$/.exec(sct || '');
+        if (at) {
+            const list = Object.values(uci[c] || {}).filter(x => x['.type'] === at[1]).sort((a, b) => a['.index'] - b['.index']);
+            sec = list[+at[2] < 0 ? list.length + +at[2] : +at[2]];
+        }
+        const v = (sec || {})[o];
         return send(v === undefined ? 404 : 200, 'text/plain; charset=utf-8', v === undefined ? '' : [].concat(v).join(' '));
     }
     if (url.pathname === '/__mock/file') {

@@ -60,6 +60,108 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         return text;
     };
 
+    /**
+     * 社群頁（MOCK）：我的身分、每一種好友狀態、資料品質 / 管道 / 違規、每個動作送出的 rpcd 呼叫（路徑與參數）、確認視窗。
+     * mock 的 /__mock/calls 記下所有 kuroshio action 呼叫
+     */
+    const communityMock = async () => {
+        const callsSince = async n => JSON.parse(await mockGet('/__mock/calls?since=' + n));
+        const card = d => page.locator(`.kuroshio-peer[data-domain="${d}"]`);
+        const cardText = async d => (await card(d).innerText().catch(() => '')).replace(/\s+/g, ' ');
+        /** 執行 fn，等到 mock 收到一個 action 呼叫，檢查路徑與參數 */
+        const expectCall = async (label, fn, path, query) => {
+            const n = (await callsSince(0)).length;
+            try {
+                await fn();
+                let got = [];
+                for (let i = 0; i < 50 && !got.length; i++) { await page.waitForTimeout(100); got = await callsSince(n); }
+                const c = got[0];
+                c && got.length === 1 && c.path === path && c.query === query ? ok(`社群頁：${label} → ${path}${query ? '?' + query : ''}`)
+                    : bad(`社群頁：${label} 應該送出 ${path}?${query}，實際 ${JSON.stringify(got)}`);
+            } catch (e) { bad(`社群頁：${label} 操作中斷：${e.message.split('\n')[0]}`); }
+            await page.waitForTimeout(300);   // 等重新讀取完成
+        };
+        const button = (d, name) => card(d).getByRole('button', { name, exact: true });
+        const confirm = () => page.click('#kuroshio-confirm');
+
+        await page.waitForSelector('.kuroshio-peer', { timeout: 10000 }).catch(() => {});
+        // 我的身分
+        const st = (await page.locator('#kuroshio-community-status').innerText().catch(() => '')).replace(/\s+/g, ' ');
+        /未就緒/.test(st) && /198\.51\.100\.7/.test((await page.locator('#kuroshio-community-problems').innerText().catch(() => ''))) ? ok('社群頁：未就緒時逐條列出問題') : bad(`社群頁：未就緒的問題沒有列出\n     ${st}`);
+        /doq:\/\/dns\.example\.com:853/.test(st) && /好友 2 待我審核 1 等待對方同意 1 已封鎖 1/.test(st) && /自我檢查/.test(st)
+            ? ok('社群頁：對外網址含 DoQ、好友數、自我檢查時間') : bad(`社群頁：我的身分內容不對\n     ${st}`);
+        /_kuroshio\.dns\.example\.com TXT "v=k1; fp=719718821"/.test(await page.locator('#kuroshio-community-txt').innerText().catch(() => '')) && /第二管道/.test(st)
+            ? ok('社群頁：TXT 記錄建議值') : bad('社群頁：沒有 TXT 記錄建議值');
+
+        // 每一種狀態
+        const states = { 'req.example.net': '待我審核', 'friend.example.net': '好友', 'wait.example.com': '等待對方同意', 'spam.example.com': '已封鎖',
+            'blockedme.example.net': '對方已封鎖你', 'rejected.example.com': '已拒絕（', 'theyrejected.example.org': '對方拒絕（', 'gone.example.net': '已刪除' };
+        for (const d of Object.keys(states)) {
+            const b = await card(d).locator('.kuroshio-badge').innerText().catch(() => '');
+            b.startsWith(states[d]) ? ok(`社群頁：${d} 狀態「${b}」`) : bad(`社群頁：${d} 狀態應該是 ${states[d]}，實際「${b}」`);
+        }
+        const fr = await cardText('friend.example.net');
+        /420 \/ 違規 3/.test(fr) ? ok('社群頁：提供筆數 / 違規（stats.invalid）') : bad(`社群頁：沒有違規筆數\n     ${fr}`);
+        /節點池 97%、網站驗證 90%、上游 DNS 50%（暫停）/.test(fr) && !/跨 CDN/.test(fr) ? ok('社群頁：資料品質（各 kind 分數、暫停、沒試過的不列）') : bad(`社群頁：資料品質不對\n     ${fr}`);
+        /DoQ（指定 DoT）/.test(fr) && /透過邀請碼/.test(fr) && /90%（45\/50）/.test(fr) && /AS4780 · TPE/.test(fr) ? ok('社群頁：目前管道、指定管道、加入方式、命中率、業者') : bad(`社群頁：好友細節不對\n     ${fr}`);
+        (await card('friend.example.net').locator('select.kuroshio-channel').inputValue().catch(() => '')) === 'dot' ? ok('社群頁：指定管道選單顯示目前的指定') : bad('社群頁：指定管道選單不對');
+        const ks = await cardText('keyswap.example.org');
+        /同步失敗：連線逾時/.test(ks) && /對方版本較舊（v1）/.test(ks) && /NEW0-KEY1-2222/.test(ks) && /成為好友/.test(ks) ? ok('社群頁：最後錯誤、舊版本、待確認的新金鑰') : bad(`社群頁：好友提醒不對\n     ${ks}`);
+        /自動封鎖於/.test(await cardText('spam.example.com')) ? ok('社群頁：自動封鎖時間') : bad('社群頁：沒有自動封鎖時間');
+        // 每種狀態的按鈕
+        const btns = async d => (await card(d).locator('.kuroshio-peer-actions button').allInnerTexts()).join(',');
+        const want = { 'req.example.net': '同意,拒絕,封鎖', 'friend.example.net': '立即同步,刪除,刪除並封鎖', 'keyswap.example.org': '立即同步,刪除,刪除並封鎖,接受新金鑰',
+            'wait.example.com': '取消', 'spam.example.com': '解除封鎖', 'blockedme.example.net': '加好友', 'gone.example.net': '加好友' };
+        for (const d of Object.keys(want)) {
+            const b = await btns(d);
+            b === want[d] ? ok(`社群頁：${d} 的按鈕 ${b}`) : bad(`社群頁：${d} 的按鈕應該是 ${want[d]}，實際 ${b}`);
+        }
+        await page.screenshot({ path: `${SHOTS}/simple-community-peers.png`, fullPage: true });
+
+        // 動作與送出的 rpcd 呼叫
+        await expectCall('重新檢查', () => page.click('#kuroshio-community-status button:has-text("重新檢查")'), '/api/community/check', '');
+        await page.waitForFunction(() => /就緒/.test(document.getElementById('kuroshio-community-status').innerText) && !document.getElementById('kuroshio-community-problems'), null, { timeout: 5000 })
+            .then(() => ok('社群頁：重新檢查後重新讀取（變成就緒）'), () => bad('社群頁：重新檢查後沒有重新讀取'));
+        // 確認視窗按「取消」不送出
+        const n0 = (await callsSince(0)).length;
+        await page.click('#kuroshio-community-status button:has-text("更換金鑰")');
+        /產生新的身分金鑰並通知所有好友/.test(await page.locator('.modal').innerText().catch(() => '')) ? ok('社群頁：更換金鑰先確認') : bad('社群頁：更換金鑰沒有確認視窗');
+        await page.locator('.modal button:has-text("取消")').click();
+        await page.waitForTimeout(500);
+        (await callsSince(n0)).length === 0 ? ok('社群頁：確認視窗按取消不送出') : bad('社群頁：確認視窗按取消還是送出了');
+        await expectCall('更換金鑰（確認）', async () => { await page.click('#kuroshio-community-status button:has-text("更換金鑰")'); await confirm(); }, '/api/community/rotate', '');
+        await page.waitForFunction(() => /已換新金鑰，舊金鑰到 .* 前仍有效/.test(document.getElementById('kuroshio-community-status').innerText), null, { timeout: 5000 })
+            .then(() => ok('社群頁：金鑰輪替狀態'), () => bad('社群頁：更換金鑰後沒有顯示輪替狀態'));
+
+        await expectCall('拒絕', () => button('req.example.net', '拒絕').click(), '/api/community/reject', 'domain=req.example.net');
+        await expectCall('封鎖（確認）', async () => { await button('req.example.net', '封鎖').click(); await confirm(); }, '/api/community/block', 'domain=req.example.net');
+        await expectCall('同意', () => button('req.example.net', '同意').click(), '/api/community/accept', 'domain=req.example.net');
+        await page.waitForFunction(() => { const c = document.querySelector('.kuroshio-peer[data-domain="req.example.net"]'); return c && c.dataset.rel === 'friend'; }, null, { timeout: 5000 })
+            .then(() => ok('社群頁：同意後重新讀取（變成好友）'), () => bad('社群頁：同意後沒有重新讀取'));
+        await expectCall('立即同步', () => button('friend.example.net', '立即同步').click(), '/api/community/sync', 'domain=friend.example.net');
+        await expectCall('刪除（確認）', async () => { await button('friend.example.net', '刪除').click(); await confirm(); }, '/api/community/delete', 'domain=friend.example.net');
+        await expectCall('刪除並封鎖（確認）', async () => { await button('friend.example.net', '刪除並封鎖').click(); await confirm(); }, '/api/community/delete', 'domain=friend.example.net&block=1');
+        await expectCall('指定管道 DoQ', () => card('friend.example.net').locator('select.kuroshio-channel').selectOption('doq'), '/api/community/channel', 'domain=friend.example.net&channel=doq');
+        await expectCall('指定管道 自動', () => card('friend.example.net').locator('select.kuroshio-channel').selectOption(''), '/api/community/channel', 'domain=friend.example.net&channel=auto');
+        await button('keyswap.example.org', '接受新金鑰').click();
+        /NEW0-KEY1-2222-3333-4444-5555-6666-7777/.test(await page.locator('.modal').innerText().catch(() => '')) ? ok('社群頁：接受新金鑰的確認視窗顯示新指紋') : bad('社群頁：接受新金鑰的確認視窗沒有新指紋');
+        await expectCall('接受新金鑰（確認）', confirm, '/api/community/accept-key', 'domain=keyswap.example.org');
+        await expectCall('取消請求', () => button('wait.example.com', '取消').click(), '/api/community/delete', 'domain=wait.example.com');
+        await expectCall('解除封鎖', () => button('spam.example.com', '解除封鎖').click(), '/api/community/unblock', 'domain=spam.example.com');
+        await expectCall('加好友（已刪除的對象）', () => button('gone.example.net', '加好友').click(), '/api/community/add', 'domain=gone.example.net');
+        // 用網域加好友：失敗時顯示原因、輸入框保留；成功後清空
+        await page.fill('#kuroshio-community-add-input', 'bad.example.com');
+        await expectCall('新增好友（失敗）', () => page.press('#kuroshio-community-add-input', 'Enter'), '/api/community/add', 'domain=bad.example.com');
+        await page.waitForFunction(() => /bad\.example\.com 沒有回應/.test(document.body.innerText), null, { timeout: 5000 })
+            .then(() => ok('社群頁：新增好友失敗顯示原因'), () => bad('社群頁：新增好友失敗沒有顯示原因'));
+        (await page.inputValue('#kuroshio-community-add-input')) === 'bad.example.com' ? ok('社群頁：失敗時輸入框保留') : bad('社群頁：失敗時輸入框被清空');
+        await page.fill('#kuroshio-community-add-input', 'new.example.net');
+        await expectCall('新增好友', () => page.click('button:has-text("送出請求")'), '/api/community/add', 'domain=new.example.net');
+        (await page.inputValue('#kuroshio-community-add-input')) === '' ? ok('社群頁：送出成功後清空輸入框') : bad('社群頁：送出成功後沒有清空輸入框');
+        /收到請求（人工審核）/.test(await page.locator('#view').innerText()) ? ok('社群頁：事件紀錄') : bad('社群頁：沒有事件紀錄');
+        await page.screenshot({ path: `${SHOTS}/simple-community-actions.png`, fullPage: true });
+    };
+
     for (const p of PAGES) {
         const text = await visit(p, 'simple');
         // 黑潮：基本設定頁要有網域與憑證、固定網域 / DDNS、DNR、存放位置
@@ -97,6 +199,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
                 await page.waitForFunction(() => /已成為好友/.test((document.getElementById('kuroshio-invite-out') || {}).innerText || ''), null, { timeout: 10000 })
                     .then(() => ok('社群頁：貼上邀請碼逐步顯示結果'), () => bad('社群頁：貼上邀請碼沒有顯示結果'));
                 await page.screenshot({ path: `${SHOTS}/simple-community-invite.png`, fullPage: true });
+                await communityMock();
                 if (errors.length) bad(`社群頁操作後 JavaScript 錯誤\n     ${errors.join('\n     ')}`);
             }
         }
@@ -299,6 +402,44 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         } catch (e) { bad(`連線來源頁操作中斷：${e.message.split('\n')[0]}`); }
         await page.screenshot({ path: `${SHOTS}/access-saved.png`, fullPage: true });
         if (errors.length) bad(`連線來源頁：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+    }
+
+    // 黑潮：社群自動規則，專業模式有 require_ip_match / has_txt；存進 UCI 後簡易模式也看得到（不讓設定藏起來）
+    if (NAME === 'kuroshio') {
+        errors = [];
+        const ruleKey = k => `${NAME}.@community_rule[-1].${k}`;
+        const modalCheck = async opt => {
+            const c = page.locator(`.modal [id$=".${opt}"] input[type=checkbox]`).first();
+            if (!(await c.isChecked())) await c.evaluate(el => el.click());
+        };
+        try {
+            await page.evaluate((n) => localStorage.setItem(n + '-ui-mode', 'pro'), NAME);
+            await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/community`);
+            await page.waitForLoadState('networkidle');
+            await page.locator(`[id="cbi-${NAME}-community_rule"] .cbi-section-create .cbi-button-add`).first().click();
+            await page.waitForSelector('.modal [id$=".has_txt"]', { timeout: 10000 });
+            const mt = await page.locator('.modal').innerText();
+            /來源 IP 要在對方網域的解析結果裡/.test(mt) && /對方有設定 _kuroshio TXT 記錄/.test(mt) ? ok('自動規則（專業）：有 require_ip_match、has_txt') : bad(`自動規則（專業）：沒有 require_ip_match / has_txt\n     ${mt.slice(0, 300)}`);
+            await page.locator('.modal [id$=".name"] input[type=text], .modal input[id$=".name"]').first().fill('e2e 規則');
+            await modalCheck('require_ip_match');
+            await modalCheck('has_txt');
+            await page.locator('.modal .cbi-button-positive').first().click();
+            await page.waitForTimeout(500);
+            await page.locator('.cbi-page-actions .cbi-button-apply, .cbi-page-actions button:has-text("Save & Apply")').first().click();
+            await page.waitForTimeout(6000);
+            const got = {};
+            for (const k of ['name', 'require_ip_match', 'has_txt']) { try { got[k] = await uciGet(ruleKey(k)); } catch (e) { got[k] = `（${e.message.split('\n')[0]}）`; } }
+            got.name === 'e2e 規則' && got.require_ip_match === '1' && got.has_txt === '1' ? ok('自動規則：require_ip_match、has_txt 寫進 UCI') : bad(`自動規則寫進 UCI 不對：${JSON.stringify(got)}`);
+            await page.evaluate((n) => localStorage.setItem(n + '-ui-mode', 'simple'), NAME);
+            await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/community`);
+            await page.waitForLoadState('networkidle');
+            await page.locator(`[id="cbi-${NAME}-community_rule"] .cbi-section-table-row .cbi-button-edit`).last().click();
+            await page.waitForSelector('.modal', { timeout: 10000 });
+            /對方有設定 _kuroshio TXT 記錄/.test(await page.locator('.modal').innerText()) ? ok('自動規則（簡易）：已經用到的專業條件仍然顯示') : bad('自動規則（簡易）：已經用到的專業條件被藏起來');
+            await page.screenshot({ path: `${SHOTS}/community-rule-modal.png`, fullPage: true });
+            await page.locator('.modal button:has-text("Dismiss"), .modal .cbi-button:not(.cbi-button-positive)').first().click().catch(() => {});
+        } catch (e) { bad(`自動規則操作中斷：${e.message.split('\n')[0]}`); }
+        if (errors.length) bad(`自動規則：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
     }
 
     // 自訂規則：編輯後存檔應寫進 /etc/<名稱>/custom-rules.txt

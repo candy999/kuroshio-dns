@@ -88,6 +88,7 @@ call)
 		/api/cache/flush|/api/filter/update|/api/jobs/run|/api/cdn/verify|/api/cdn/policy|/api/cdn/ecs|/api/ddns/update) ;;
 		/api/community/check|/api/community/add|/api/community/accept|/api/community/reject|/api/community/block|/api/community/unblock|/api/community/delete|/api/community/sync) ;;
 		/api/community/invite/refresh|/api/community/invite/use) ;;
+		/api/community/rotate|/api/community/accept-key|/api/community/channel) ;;
 		*) echo '{"ok":false,"error":"不允許的路徑"}'; exit 0 ;;
 		esac
 		valid_query "$P_QUERY" || { echo '{"ok":false,"error":"參數格式錯誤"}'; exit 0; }
