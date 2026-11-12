@@ -152,13 +152,19 @@
 | Flash | 16 MB（安裝後剩 4 MB 以上） | 32 MB 以上或 NAND | 128 MB 以上，或外接儲存 |
 | CPU | MIPS 24Kc 單核 ~575 MHz | 雙核（MT7621、Cortex-A53） | ARMv8 四核、x86 |
 
+各平台常見機種的規格與建議見 [選硬體、選套件](docs/hardware.md)。
+
 ## 支援平台
 
-| 平台 | CPU |
-|---|---|
-| OpenWrt 24.10（ipk）、25.12 以後（apk） | x86_64、i386、aarch64（generic / Cortex-A53 / Cortex-A72）、ARMv7（Cortex-A7 / A9 / A15）、**MIPS / MIPSel**（24Kc） |
-| Windows 10 / 11 | x86_64 |
-| 其他 Linux | 上面所有 CPU 的靜態執行檔 |
+| 平台 | 常見晶片 | 套件架構 |
+|---|---|---|
+| **64 位元 ARM**（ARMv8 / AArch64） | MediaTek Filogic MT7981 / MT7986 / MT7988、MT7622、Qualcomm IPQ807x / IPQ60xx / IPQ50xx、Rockchip（NanoPi R2S / R4S / R5S / R6S）、Raspberry Pi 3 / 4 / 5 | `aarch64_cortex-a53`、`aarch64_generic`、`aarch64_cortex-a72`、`aarch64_cortex-a76` |
+| **32 位元 ARM**（ARMv7） | Qualcomm IPQ4018 / IPQ4019、IPQ806x、Marvell Armada 385、Allwinner H3 | `arm_cortex-a7_neon-vfpv4`、`arm_cortex-a15_neon-vfpv4`、`arm_cortex-a9_vfpv3-d16` |
+| **MIPS**（32 位元） | MediaTek MT7621 / MT7620 / MT7628（小端序）、Qualcomm Atheros、Lantiq（大端序） | `mipsel_24kc`、`mips_24kc` |
+| **x86** | 軟路由小主機（N100、J4125…）、虛擬機 | `x86_64`、`i386_pentium4` |
+
+- OpenWrt 24.10 用 `.ipk`、25.12 以後用 `.apk`；Windows 10 / 11（x86_64）有 Windows 版，其他 Linux 用上面各 CPU 的靜態執行檔。
+- **不知道該選哪個、想知道各晶片的規格夠不夠用：見 [選硬體、選套件](docs/hardware.md)**（常見機種的 CPU、記憶體、儲存，以及跑黑潮 DNS 的建議）。
 
 ## 開發進度
 

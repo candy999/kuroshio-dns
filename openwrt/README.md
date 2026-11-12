@@ -6,7 +6,9 @@
 
 ## 安裝
 
-到 GitHub 的 **Actions → Kuroshio DNS (Rust)**（或 Releases）下載對應 OpenWrt 版本與 CPU 的套件：
+到 GitHub 的 **Actions → Kuroshio DNS (Rust)**（或 Releases）下載對應 OpenWrt 版本與 CPU 的套件。
+要下載哪一個：在路由器執行 `cat /etc/openwrt_release`，選檔名跟 `DISTRIB_ARCH` 同名的套件；各晶片對照與規格建議見 [選硬體、選套件](../docs/hardware.md)。
+
 
 | OpenWrt 版本 | 套件格式 | 安裝指令 |
 |---|---|---|

@@ -425,6 +425,7 @@ jobs:
             {"sdk":"aarch64_generic","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
             {"sdk":"aarch64_cortex-a53","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
             {"sdk":"aarch64_cortex-a72","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
+            {"sdk":"aarch64_cortex-a76","arch":"aarch64","target":"aarch64-unknown-linux-musl"},
             {"sdk":"arm_cortex-a7_neon-vfpv4","arch":"arm","target":"armv7-unknown-linux-musleabihf"},
             {"sdk":"arm_cortex-a9_vfpv3-d16","arch":"arm","target":"armv7-unknown-linux-musleabihf"},
             {"sdk":"arm_cortex-a15_neon-vfpv4","arch":"arm","target":"armv7-unknown-linux-musleabihf"},
