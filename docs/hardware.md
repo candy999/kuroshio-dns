@@ -108,4 +108,4 @@ MIPS 分**小端序**（`mipsel`）和**大端序**（`mips`）兩種，互不�
 
 ## 下載與安裝
 
-到 GitHub **Actions → Kuroshio DNS (Rust)**（或 Releases）下載檔名符合你的 OpenWrt 版本與套件架構的套件，安裝方式見 [`openwrt/README.md`](../openwrt/README.md)。每次推送只會自動產生 x86_64 的套件；發布版本或手動執行「編譯所有 CPU 的 OpenWrt 套件」時，才會產生所有架構的套件。
+到 GitHub **Releases**（或 **Actions → Kuroshio DNS (Rust)**）下載 `kuroshio-openwrt-<OpenWrt 版本>-<套件架構>.zip`，例如 OpenWrt 24.10 的 NanoPi R2S 下載 `kuroshio-openwrt-24.10-aarch64_generic.zip`。壓縮檔裡有兩個套件與一鍵安裝腳本 `install.sh`，安裝方式見 [`openwrt/README.md`](../openwrt/README.md)。每次推送只會自動產生 x86_64 的套件；發布版本或手動執行「編譯所有 CPU 的 OpenWrt 套件」時，才會產生所有架構的套件。

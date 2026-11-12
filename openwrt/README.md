@@ -9,6 +9,11 @@
 到 GitHub 的 **Actions → Kuroshio DNS (Rust)**（或 Releases）下載對應 OpenWrt 版本與 CPU 的套件。
 要下載哪一個：在路由器執行 `cat /etc/openwrt_release`，選檔名跟 `DISTRIB_ARCH` 同名的套件；各晶片對照與規格建議見 [選硬體、選套件](../docs/hardware.md)。
 
+每個 `kuroshio-openwrt-<OpenWrt 版本>-<架構>.zip` 裡有兩個套件（`kuroshio`、`luci-app-kuroshio`）、一鍵安裝腳本 `install.sh` 與說明。
+在電腦上解壓後把整個資料夾傳到路由器（例如 `scp -O -r kuroshio-openwrt-24.10-x86_64 root@192.168.1.1:/tmp/`），
+再執行 `sh /tmp/kuroshio-openwrt-24.10-x86_64/install.sh`：腳本會先檢查架構與 OpenWrt 版本，不符合就停下來告訴你該下載哪一個，符合就兩個一起裝好。
+也可以用 LuCI「系統 → 軟體套件 → 上傳套件」，先上傳 `kuroshio` 再上傳 `luci-app-kuroshio`。手動安裝的指令：
+
 
 | OpenWrt 版本 | 套件格式 | 安裝指令 |
 |---|---|---|

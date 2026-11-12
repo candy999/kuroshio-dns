@@ -21,8 +21,11 @@ eq() { # eq <說明> <實際> <預期>
 
 mkdir -p /var/lock /var/run /tmp/lock
 
-echo "== 安裝套件（不需要 node）"
-if command -v apk >/dev/null 2>&1; then
+echo "== 安裝套件（不需要 node）：用壓縮檔裡的一鍵安裝腳本，順便驗證它"
+if [ -f /pkgs/install.sh ]; then
+	sh /pkgs/install.sh || exit 1
+	check "LuCI 介面也一起裝好" test -f /usr/share/luci/menu.d/luci-app-kuroshio.json
+elif command -v apk >/dev/null 2>&1; then
 	apk update >/dev/null
 	apk add --allow-untrusted /pkgs/kuroshio-[0-9]*.apk || exit 1
 else

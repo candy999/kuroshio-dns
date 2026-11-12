@@ -38,7 +38,7 @@ jobs:
       - name: Shell 腳本
         run: |
           shellcheck -s sh -e SC2034,SC2154,SC1008,SC3043,SC1091 openwrt/kuroshio/files/kuroshio.init
-          shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/access.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/guard.sh openwrt/kuroshio/files/kuroshio.uci-defaults
+          shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/access.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/guard.sh openwrt/kuroshio/files/kuroshio.uci-defaults openwrt/install.sh
           shellcheck -s sh -e SC3043,SC2015,SC2086,SC1091 openwrt/tools/ci-smoke-kuroshio.sh openwrt/tools/ci-luci-setup.sh
       - uses: actions/setup-node@v4
         with:
@@ -468,8 +468,11 @@ jobs:
         run: |
           mkdir -p dist
           find bin/packages \( -name "kuroshio*.${{ matrix.format }}" -o -name "luci-app-kuroshio*.${{ matrix.format }}" \) -exec cp {} dist/ \;
+          test "$(ls dist | wc -l)" -eq 2
+          # 下載下來的 kuroshio-openwrt-<版本>-<架構>.zip：兩個套件 + 一鍵安裝腳本 + 說明
+          cp openwrt/install.sh openwrt/README-install.txt dist/
+          printf 'ARCH=%s\nOPENWRT=%s\n' "${{ matrix.sdk }}" "${{ matrix.release }}" > dist/PACKAGE_INFO
           ls -la dist
-          test -n "$(ls dist)"
       - uses: actions/upload-artifact@v4
         with:
           name: kuroshio-openwrt-${{ matrix.release }}-${{ matrix.sdk }}
@@ -548,7 +551,8 @@ jobs:
       - name: 整理
         run: |
           mkdir -p dist
-          find art -path '*kuroshio-openwrt-*' -type f -exec cp {} dist/ \;
+          # OpenWrt：每個「版本 × 架構」一個 zip，裡面是兩個套件 + 一鍵安裝腳本（跟 Actions 的下載一樣）
+          for d in art/kuroshio-openwrt-*; do n=$(basename "$d"); mkdir -p "pack/$n"; cp "$d"/* "pack/$n/"; chmod +x "pack/$n/install.sh"; ( cd pack && zip -qr "../dist/$n.zip" "$n" ); done
           cp art/kuroshio-windows-x86_64/*.zip dist/
           for d in art/bin-*; do t=${d#art/bin-}; cp "$d/kuroshio" "dist/kuroshio-$t"; done
           ( cd dist && sha256sum * > SHA256SUMS )
