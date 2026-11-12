@@ -249,25 +249,16 @@ sh /tmp/kuroshio-openwrt-24.10-x86_64/install.sh
 
 裝好後到 LuCI「服務 → 黑潮 DNS」確認設定、按「啟用」。預設不啟用，因為啟用後會接管路由器的 DNS（預設由 dnsmasq 把查詢轉給黑潮 DNS）；從 2.x（candydns）升級的話，舊的設定、自訂規則、憑證、社群金鑰會自動帶入。也可以用 LuCI「系統 → 軟體套件 → 上傳套件」依序上傳兩個套件。
 
-Windows：解壓 `kuroshio-windows-x86_64.zip`，在命令提示字元執行：
+Windows：解壓 `kuroshio-windows-x86_64.zip`，`kuroshio.exe` 與 `data\` 放在一起，在旁邊放一份 `config.json`（只寫跟預設值不同的欄位），在命令提示字元執行：
 
-```bat
-kuroshio.exe run -c config.json
-kuroshio.exe query example.com -s 127.0.0.1:5336
+```
+kuroshio.exe paths              確認讀到的設定檔、狀態資料夾、data\、憑證
+kuroshio.exe setup              系統管理員執行一次：防火牆、HTTP.sys 網址登記與憑證綁定
+kuroshio.exe run                前景執行；輸入 url 打開設定頁、quit 結束
+kuroshio.exe service install    長期執行：裝成 Windows 服務
 ```
 
-執行時輸入 `url` 會列出設定頁、公開頁的網址，`open` 直接用瀏覽器打開設定頁。要當成 Windows 服務：系統管理員執行 `kuroshio.exe service install`。
-
-有 IIS 占用 TCP 443 時，DoH 可以跟 IIS 共用 443：設定 `domain`、`listen.doh.port = 443`、`listen.doh.windowsMode = httpsys`（或保持 `auto`，443 被 IIS 占用時自動切換），用系統管理員執行一次 `kuroshio.exe setup`（登記網址、把憑證綁到 HTTP.sys）。`kuroshio.exe httpsys status` 看設定，`kuroshio.exe httpsys cert` 立即同步憑證。詳見 [規格 07](docs/spec/07-windows.md) 第 2 節。
-
-設定檔只要寫跟預設值不同的欄位，例如：
-
-```json
-{
-  "listen": { "plain": { "binds": ["127.0.0.1", "::1"], "port": 5336 } },
-  "upstream": { "pinned": ["udp://1.1.1.1", "udp://8.8.8.8"] }
-}
-```
+**[Windows 使用說明](docs/windows.md)**：設定檔放哪裡、`config.json` 怎麼寫（只給本機、給區網、對外提供加密 DNS、跟 IIS 共用 443、IIS 反向代理）、憑證（內建申請或沿用 win-acme）、cmd 自動重啟腳本、服務、測試與常見問題。
 
 ## 指令
 

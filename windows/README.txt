@@ -6,6 +6,16 @@
 
 系統需求：Windows 10 / 11（64 位元）。單一執行檔，不需要另外安裝 Visual C++ 執行階段或其他元件。
 
+完整說明（設定檔放哪裡、config.json 怎麼寫、跟 IIS 共用 443、憑證、服務、常見問題）：
+  https://github.com/candy999/kuroshio-dns/blob/main/docs/windows.md
+
+檔案擺放：
+  kuroshio.exe 與 data\ 要放在同一個資料夾（data\ 是台灣 IP 清單、種子資料、設定頁、公開頁，不要刪）。
+  在 kuroshio.exe 旁邊放 config.json 就是攜帶版：設定、state\、自訂規則都在這個資料夾。
+  config.json 只寫跟預設值不同的欄位；路徑用 / 或 \\；記事本存檔注意不要變成 config.json.txt。
+  kuroshio.exe paths          列出實際讀的設定檔、狀態資料夾、data\、憑證位置
+  kuroshio.exe check-config config.json   檢查設定檔
+
 快速開始（命令提示字元）：
   kuroshio.exe run                           前景執行（Ctrl+C 正常結束並寫出快照）
                                              啟動時會印出設定頁的登入網址與公開頁網址
@@ -37,7 +47,8 @@
 
 IIS 已經占用 443 時（建議：HTTP.sys 共用，模式 B）：
   設定 domain、listen.doh.enabled = true、listen.doh.port = 443、
-  listen.doh.windowsMode = "httpsys"（預設 "auto"：TCP 443 被 IIS / HTTP.sys 占用時自動用這個模式）
+  listen.doh.windowsMode = "httpsys"（預設 "auto"：TCP 443 被 IIS / HTTP.sys 占用時自動用這個模式）、
+  listen.doh.http3Binds = ["0.0.0.0"]（DoH3 的 UDP 443 由黑潮 DNS 自己聽；不寫會只聽 127.0.0.1，外面連不到）
   kuroshio.exe setup                         系統管理員執行一次：登記 urlacl（之後一般權限也能登記網址）、
                                              把憑證匯入「本機電腦\個人」並綁到 HTTP.sys（hostnameport，SNI）
   kuroshio.exe httpsys status                要登記的網址、HTTP.sys 的 HTTP/3 設定、目前綁定的憑證
