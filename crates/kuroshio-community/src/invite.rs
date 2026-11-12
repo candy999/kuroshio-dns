@@ -395,7 +395,7 @@ impl Community {
         let inv = match Invite::parse(code) {
             Ok(x) => x,
             Err(e) => {
-                steps.push(step("format", false, &e));
+                steps.push(step("format", false, e));
                 return fail("format", e, steps);
             }
         };
@@ -542,7 +542,7 @@ mod tests {
             assert!(code[PREFIX.len()..].bytes().all(|c| B32.contains(&c)), "{code}");
             assert_eq!(Invite::parse(&code).unwrap(), inv);
             // 小寫、前後空白、中間換行都可以
-            let messy = format!("  {}\n{}  ", &code[..20].to_ascii_lowercase(), &code[20..]);
+            let messy = format!("  {}\n{}  ", code[..20].to_ascii_lowercase(), &code[20..]);
             assert_eq!(Invite::parse(&messy).unwrap(), inv);
         }
     }
