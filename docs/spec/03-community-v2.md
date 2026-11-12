@@ -148,6 +148,38 @@ A（請求者）                                   B（接收者）
 
   v1 的條件全部保留：`domain_suffix`、`asn`、`same_asn`、`colo`、`max_rtt_ms`、`max_jitter_ms`、`max_loss`、`min_age_days`、`min_mutual`、`max_friends`。
 
+### 6.1 好友邀請碼
+
+不另做公開下載：分享一律走好友同步（雜湊、本機驗證、增量）。邀請碼只是讓「加好友」變成貼一次就好。
+
+- **雙方都要已經符合社群條件**（有網域、DoH / DoT / DoQ 至少一種、網域解析得到；即第 3 節自我檢查的 `problems` 是空的）。沒有單向訂閱。貼上的一方沒就緒時，直接列出 `problems`，什麼都不送。
+- **格式**：`KRS1.` + base32（RFC 4648 大寫、不補 `=`）。內容：
+
+  | 欄位 | 長度 | 說明 |
+  |---|---|---|
+  | 版本 | 1 | `1` |
+  | 指紋 | 16 | 擁有者身分金鑰的指紋原始 bytes（SHA-256(SPKI DER) 前 16 bytes，跟顯示用的指紋同一個） |
+  | 密鑰 | 16 | 128 位元亂數 |
+  | 端點 | 1（+2） | `0` = 照預設（443 / 853）找；`1` doq / `2` dot / `3` https + 埠（big-endian）。只有全部端點都不在預設埠時才放第一個 |
+  | 網域 | 1 + n | 長度 + 小寫網域 |
+  | 檢查碼 | 4 | SHA-256(`"kuroshio-invite\0"` ‖ 前面全部)[0..4] |
+
+  解析時忽略空白與換行、大小寫不分、`0` / `1` / `8` 當成 `O` / `I` / `B`；最後一個字多出來的位元必須是 0。打錯任何一個字都會被檢查碼（或多出來的位元）擋下。管理介面同時顯示 QR 碼（跟關於頁同一個產生器）。
+- **固定、可重複使用**：密鑰存在金鑰目錄的 `invite.json`（`{secret, createdAt}`，只有擁有者能讀寫，跟 `key.pem` 同一套寫法；只在第一次查看與「重新產生」時寫入，不是定時寫入），重新啟動不變，完整備份會帶著。按「重新產生」換新密鑰，舊的立刻失效。邀請碼的指紋是顯示時用目前金鑰算的：輪替金鑰後邀請碼會跟著變，舊的在 7 天重疊期內還能用（見下）。
+- **流程**（B 貼上 A 的邀請碼）：
+  1. B 檢查格式與檢查碼。
+  2. B 自己要就緒（不然列出 `problems`，結束）。
+  3. B 用一般的社群管道回連 A 的網域取身分文件（TLS 驗證憑證），**簽名金鑰必須是邀請碼裡的指紋**，或由那一把金鑰簽的輪替聲明換過來的；不符就中止、不送任何東西、也不記住這份身分文件（可能是 DNS 被冒充）。
+  4. B 送一般的好友請求，body 多一個選用欄位 `invite`（放在 `pow` 前面；舊版不認得會略過）：`HMAC-SHA256(密鑰, "kuroshio/2-invite\0" ‖ from ‖ 0 ‖ to ‖ 0 ‖ nonce ‖ 0 ‖ reqId)`。密鑰本身不上線，證明綁在這一則請求上。
+  5. A 照第 6 節驗完請求，再用常數時間比對證明。對了就**自動同意**（不管自動規則），記一筆「成為好友（透過邀請碼加入）」、好友紀錄的 `invitedAt`；雙方照常在 `followUp` 後開始第一次同步。
+- **例外（照既有的語意）**：
+  - A 封鎖了 B（`myBlock`）→ 照樣回 `blocked`；A 拒絕過 B（`rejectedUntil`）→ 照樣回 `rejected`（提早重送照樣計數）。
+  - A 刪除過 B（墓碑 `deletedAt`）→ 等人工審核（`pending`），記一筆「邀請碼有效：曾被你刪除」。
+  - 好友數已達 `maxFriends`、或這一小時的邀請碼自動同意已達上限（10 次）→ 等人工審核。
+- **證明不對**（密鑰錯誤、已經重新產生過）：記一筆「邀請碼不符或已重新產生」，接著**當成一般請求照自動規則處理**。回應跟沒帶邀請碼時完全一樣，不透露這台有沒有邀請碼、邀請碼對不對。
+- **防濫用**：沿用第 9 節的請求限制（PoW、每 IP / 全域每小時）；帶證明的請求每 IP 每小時另外最多 6 次（超過就不檢查證明，當成一般請求）；自動同意全域每小時 10 次。
+- **密鑰不外流**：只有擁有者自己的 `GET /api/community/invite` 給邀請碼；`status` 只給 `invite.createdAt`；事件、日誌、`peers.json` 都不含密鑰或邀請碼。
+
 ## 7. 同步（增量）
 
 ### 7.1 我的分享集合
@@ -244,6 +276,7 @@ poke { t:"poke", from, to, ts, nonce, pairId, what:"data"|"relation"|"rotate", s
 | 舊關係復活 | `pairId`：刪除後舊配對的訊息一律忽略 |
 | 灌爆資料 | 每種 kind 有上限；回應壓縮後 8 MB、解壓後 32 MB；邊解壓邊計數 |
 | 用資料指使我去打不相干的主機 | 節點只交給每日工作做小量測試；網站提示只在真的有人查時才用；範圍外節點每次最多 100 筆 |
+| 邀請碼外流 / 猜邀請碼 | 128 位元密鑰；請求只帶 HMAC 證明；證明不對時當成一般請求，回應一樣；帶證明的請求每 IP 每小時 6 次；自動同意每小時 10 次；擁有者可以隨時重新產生 |
 | 洩漏瀏覽紀錄 | 只分享 CDN 網站的驗證結果、網域只給雜湊；`shareDomains` 可關 |
 
 ## 10. 管理 API 與 LuCI 的變化
@@ -253,6 +286,10 @@ poke { t:"poke", from, to, ts, nonce, pairId, what:"data"|"relation"|"rotate", s
 - 新增：
   - `/api/community/rotate`：產生新金鑰並通知好友。
   - `/api/community/accept-key?domain=`：人工接受未經舊金鑰簽名的金鑰變更。
+  - `GET /api/community/invite`：我的邀請碼 `{ok, code, qr（SVG）, createdAt, domain, fingerprint, ready, problems}`；第一次查看時產生密鑰。
+  - `POST /api/community/invite/refresh`：重新產生（回應同上），舊的立刻失效。
+  - `POST /api/community/invite/use?code=`（或 JSON 內容 `{code}`）：貼上好友的邀請碼。回 `{ok, stage, status, domain, steps:[{step, ok, text}], problems?, reason?}`；`stage` = `format` / `ready` / `self` / `identity` / `fingerprint` / `request` / `sent`（送出了、等對方審核）/ `accepted`。
+  - rpcd：`invite` 在查看白名單，`invite/refresh`、`invite/use` 在動作白名單。指令列：`kuroshio community invite [--refresh]`、`kuroshio community join <邀請碼>`（交給執行中的服務）。
 - LuCI 社群頁：
   - 好友表加「資料品質」欄（各 kind 的分數）與「管道」欄。
   - 自動規則加 `require_ip_match`、`has_txt`。

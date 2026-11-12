@@ -80,6 +80,7 @@
 - 跟朋友的路由器互加好友，交換台灣節點、網站驗證結果。
 - 每則訊息都有 Ed25519 簽名，收到的資料一定在本機驗證後才使用；只分享網域雜湊，不公開網站名稱。
 - 點對點，沒有中央伺服器：透過 HTTPS、DoT、DoQ 三種管道直接連到對方的路由器。
+- **邀請碼**：把「我的邀請碼」（`KRS1.` 開頭的一串字，也有 QR 碼）傳給朋友，朋友貼到他的 LuCI 社群頁 / Windows 設定頁「社群」/ `kuroshio community join <邀請碼>`，就會驗證你的身分指紋、自動成為好友並馬上同步。雙方都要先符合社群條件（網域、DoH / DoT / DoQ 至少一種、網域解析得到），沒就緒會直接列出缺什麼。邀請碼固定、可以重複使用；外流了就按「重新產生」，舊的立刻失效。你封鎖、拒絕、刪除過的對象不會因為邀請碼自動加入。也可以照舊輸入網域加好友。
 - 增量同步、自動規則（電信業者、延遲、共同好友…）、資料品質評分、封鎖與拒絕；陌生人的紀錄與自動封鎖都有上限，不會被灌爆。
 
 ### 學習資料的備份、換機與分享
@@ -228,6 +229,8 @@ kuroshio access check <IP>                  這個 IP 能不能連進來、符�
 kuroshio access groups                      台灣 IP 群組（ISP）、大小、是否生效
 kuroshio export [--share] [-o 檔案]          匯出學習資料（.kuroshio）
 kuroshio import <檔案>                      匯入（合併）
+kuroshio community invite [--refresh]       顯示（或重新產生）我的好友邀請碼
+kuroshio community join <邀請碼>            貼上好友的邀請碼加好友
 kuroshio compare                            2.x 與 3.0 並行比對（換版前驗證）
 kuroshio acme issue [--force]               內建 ACME 立即申請 / 續期
 kuroshio cert-info                          憑證資訊
