@@ -106,8 +106,10 @@ var CSS = [
 	'.kuroshio-nb{white-space:nowrap}',
 	'.kuroshio-tile-s{font-size:12px;line-height:1.45;opacity:.72;overflow-wrap:anywhere}',
 	/* 表格：外面包一層可以左右捲動的框；文字靠左、數字靠右 */
-	'.kuroshio-scroll{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}',
+	'.kuroshio-scroll{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:2px}',
 	'.kuroshio-scroll>table{margin:0}',
+	/* 捲動框裡的表頭不能 sticky（vantage 的表頭會黏在捲動框頂端、往下蓋住第一列） */
+	'#view .kuroshio-scroll .table .th,#view .kuroshio-scroll .table .tr>.th{position:static}',
 	'#view .kuroshio-scroll .th,#view .kuroshio-scroll .td{text-align:left}',
 	/* 窄螢幕主題把表格改成一格一格的卡片（標題在左），這時數字不靠右 */
 	'@media (min-width:601px){#view .kuroshio-scroll .th.kuroshio-num,#view .kuroshio-scroll .td.kuroshio-num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}}',
@@ -315,7 +317,7 @@ return baseclass.extend({
 			var n = (typeof node === 'function') ? node() : node;
 			return E('div', { 'class': 'cbi-value', 'id': 'kuroshio-panel-' + name.replace(/^_/, '') }, [
 				T('label', { 'class': 'cbi-value-title' }, title),
-				E('div', { 'class': 'cbi-value-field', 'style': 'overflow-x:auto' }, [n, desc ? T('div', { 'class': 'cbi-value-description' }, desc) : ''])
+				E('div', { 'class': 'cbi-value-field kuroshio-scroll' }, [n, desc ? T('div', { 'class': 'cbi-value-description' }, desc) : ''])
 			]);
 		};
 		o.write = function() {};

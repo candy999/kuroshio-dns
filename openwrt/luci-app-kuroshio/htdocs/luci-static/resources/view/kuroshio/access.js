@@ -124,7 +124,7 @@ var CheckList = form.Value.extend({
 function block(s, name, node) {
 	var o = s.option(form.DummyValue, name);
 	o.render = function() {
-		return E('div', { 'class': 'cbi-value', 'id': 'kuroshio-panel-' + name.replace(/^_/, '') }, E('div', { 'style': 'overflow-x:auto;width:100%' }, node()));
+		return E('div', { 'class': 'cbi-value', 'id': 'kuroshio-panel-' + name.replace(/^_/, '') }, E('div', { 'class': 'kuroshio-scroll', 'style': 'width:100%' }, node()));
 	};
 	o.write = function() {};
 	o.remove = function() {};

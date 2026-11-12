@@ -137,7 +137,7 @@ function pathsSection(p) {
 	return E('div', { 'class': 'cbi-section kuroshio-sec', 'id': 'kuroshio-paths' }, [
 		T('h3', {}, _('存放位置')),
 		T('div', { 'class': 'cbi-section-descr' }, _('各種檔案實際放在哪裡（已套用的設定）。其他服務（例如 uhttpd、nginx）要共用憑證時，直接讀取下面的憑證檔與私鑰檔即可。這裡只顯示路徑，不會顯示密鑰內容。')),
-		E('div', { 'style': 'overflow-x:auto' }, body)
+		E('div', { 'class': 'kuroshio-scroll' }, body)
 	]);
 }
 
