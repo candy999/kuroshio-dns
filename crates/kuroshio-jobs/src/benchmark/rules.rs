@@ -632,10 +632,7 @@ pub fn is_trusted_partner(winner: Option<&AsnInfo>, cand: Option<&AsnInfo>) -> b
             return true;
         }
     }
-    if w.any_in(GIANTS_ALLOWING_ISPS) && (c.any_in(GENERIC_ISP_KEYWORDS) || c.any_in(SPECIFIC_ISPS)) {
-        return true;
-    }
-    false
+    w.any_in(GIANTS_ALLOWING_ISPS) && (c.any_in(GENERIC_ISP_KEYWORDS) || c.any_in(SPECIFIC_ISPS))
 }
 
 /// 同一組：AS 號碼相同，或關鍵字有交集
