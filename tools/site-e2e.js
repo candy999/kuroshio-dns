@@ -128,6 +128,14 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
             check(/youtube\.com/.test(sites) && /大家最常造訪的網站/.test(await page.textContent('#sitesCap')), '熱門網站（預設 site.minClients = 1）', sites.slice(0, 120));
             const sw = await page.evaluate(() => document.documentElement.scrollWidth);
             check(sw <= w + 1, '沒有水平捲動', `scrollWidth = ${sw}`);
+            const dupAxes = await page.evaluate(() => [...document.querySelectorAll('.chart svg')].map((s, i) => {
+                const ends = [...s.querySelectorAll('text.axis[text-anchor="end"]')];
+                // y 軸刻度在左側同一個 x（L - 8）；最後一個 x 軸標籤也是靠右對齊，但在圖的右邊，排除掉
+                const lx = Math.min(...ends.map(t => +t.getAttribute('x')));
+                const labels = ends.filter(t => +t.getAttribute('x') === lx).map(t => t.textContent);
+                return labels.some((v, j) => labels.indexOf(v) !== j) ? `第 ${i + 1} 張圖：${labels.join(', ')}` : '';
+            }).filter(Boolean));
+            check(dupAxes.length === 0, `公開頁（${scheme} ${w} px）：折線圖的 y 軸刻度沒有重複`, dupAxes.join(' / '));
             await page.screenshot({ path: path.join(SHOTS, `index-${scheme}-${w}.png`), fullPage: true });
 
             console.log(`詳細頁（${tag}）`);

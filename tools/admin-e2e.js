@@ -826,6 +826,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             const routing = await sp.textContent('#kd-routing');
             check(/Cloudflare/.test(routing) && /CloudFront/.test(routing) && await sp.locator('#kd-routing .gauge').count() >= 3, '儀表板：機會成本（表格與環形儀表）', routing.slice(0, 200));
             check(await sp.locator('#kd-map svg').count() >= 1, '儀表板：路由地圖');
+            // 每張折線圖的 y 軸刻度（text-anchor = end 的 axis 標籤）不能重複；剛啟動的服務流量幾乎為 0，涵蓋最大值 0～1 的情況
+            const dupAxes = await sp.evaluate(() => [...document.querySelectorAll('#tab-dashboard .chart svg')].map((s, i) => {
+                const ends = [...s.querySelectorAll('text.axis[text-anchor="end"]')];
+                // y 軸刻度在左側同一個 x（L - 8）；最後一個 x 軸標籤也是靠右對齊，但在圖的右邊，排除掉
+                const lx = Math.min(...ends.map(t => +t.getAttribute('x')));
+                const labels = ends.filter(t => +t.getAttribute('x') === lx).map(t => t.textContent);
+                const dup = labels.filter((v, j) => labels.indexOf(v) !== j);
+                return dup.length ? `第 ${i + 1} 張圖（${s.getAttribute('aria-label') || s.closest('[id]')?.id || ''}）：${labels.join(', ')}` : '';
+            }).filter(Boolean));
+            check(dupAxes.length === 0, '儀表板：折線圖的 y 軸刻度沒有重複', dupAxes.join(' / '));
             check((await sp.textContent('#kd-upstreams')).includes('udp://127.0.0.1:9'), '儀表板：上游（完整網址）');
             check(/沒有啟用/.test(await sp.textContent('#kd-pools')), '儀表板：CDN 沒開時說明「沒有啟用」');
             const jobs = JSON.parse((await raw(adminPort, 'GET', '/api/jobs', { Authorization: `Bearer ${token}` })).body || 'null');

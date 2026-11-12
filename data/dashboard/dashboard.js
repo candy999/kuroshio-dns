@@ -60,23 +60,46 @@
     tip.style.opacity = 1;
   }
 
+  // ---------- y 軸刻度 ----------
+  /**
+   * 從 0 到涵蓋 maxV 的刻度，標籤不重複。
+   * integer（預設，計數類）：刻度都是整數；最大值 3 以下用 0,1,2(,3)，其他用 1-2-5 規則的間距，畫 4～6 條。
+   * integer = false（毫秒這類）：一樣用 1-2-5 規則，間距可以是小數。
+   * 回傳 { top, ticks, digits }：top 是軸的最大值，digits 是標籤要顯示的小數位數。
+   */
+  function niceTicks(maxV, integer = true) {
+    const m = Math.max(0, Number(maxV) || 0);
+    if (integer && m <= 3) {
+      const top = Math.max(2, Math.ceil(m));
+      return { top, ticks: Array.from({ length: top + 1 }, (_, i) => i), digits: 0 };
+    }
+    const raw = Math.max(m, integer ? 1 : 1e-9) / 5;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const n = raw / mag;
+    let step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+    if (integer) step = Math.max(1, Math.round(step));
+    const count = Math.max(1, Math.ceil(m / step - 1e-9));
+    const digits = integer ? 0 : Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+    const ticks = Array.from({ length: count + 1 }, (_, i) => +(i * step).toFixed(digits));
+    return { top: ticks[ticks.length - 1], ticks, digits };
+  }
+
   // ---------- 折線圖（含十字準線；公開頁的樣式） ----------
   function lineChart(container, data, series, { xLabel, area = 0, height } = {}) {
     container.textContent = '';
     if (data.length < 2) { container.appendChild(el('div', 'empty', '資料累積中')); return; }
     const W = Math.max(300, Math.round(container.clientWidth || 700)), H = height || (W < 520 ? 190 : 230);
     const L = 44, R = 10, T = 10, B = 24;
-    const maxV = Math.max(1, ...data.flatMap(d => series.map(s => d[s.key])));
-    const mag = Math.pow(10, Math.floor(Math.log10(maxV)));
-    const niceMax = Math.ceil(maxV / mag * 2) / 2 * mag;
+    const integer = !series.some(s => s.integer === false);
+    const ax = niceTicks(Math.max(...data.flatMap(d => series.map(s => d[s.key] || 0))), integer);
     const x = i => L + (W - L - R) * i / (data.length - 1);
-    const y = v => T + (H - T - B) * (1 - v / niceMax);
+    const y = v => T + (H - T - B) * (1 - v / ax.top);
     const svg = sv('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': series.map(s => s.name).join('、') + '折線圖' });
-    for (let k = 0; k <= 4; k++) {
-      const v = niceMax * k / 4, yy = y(v);
+    ax.ticks.forEach(v => {
+      const yy = y(v);
       sv('line', { x1: L, x2: W - R, y1: yy, y2: yy, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
-      sv('text', { x: L - 8, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = compact(v);
-    }
+      sv('text', { x: L - 8, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = ax.digits ? v.toFixed(ax.digits) : compact(v);
+    });
     const every = Math.ceil(data.length / (W < 520 ? 4 : 7));
     data.forEach((d, i) => {
       const lastI = data.length - 1;
@@ -109,11 +132,11 @@
   function lineChartCompact(container, data, series) {
     container.textContent = '';
     const W = Math.max(300, container.clientWidth || 800), H = 190, L = 40, R = 8, T = 8, B = 22;
-    const maxV = Math.max(1, ...data.flatMap(d => series.map(s => d[s.key])));
-    const mag = Math.pow(10, Math.floor(Math.log10(maxV))); const top = Math.ceil(maxV / mag * 2) / 2 * mag;
-    const x = i => L + (W - L - R) * i / (data.length - 1), y = v => T + (H - T - B) * (1 - v / top);
+    const integer = !series.some(s => s.integer === false);
+    const ax = niceTicks(Math.max(...data.flatMap(d => series.map(s => d[s.key] || 0))), integer);
+    const x = i => L + (W - L - R) * i / (data.length - 1), y = v => T + (H - T - B) * (1 - v / ax.top);
     const svg = sv('svg', { viewBox: `0 0 ${W} ${H}` });
-    for (let k = 0; k <= 4; k++) { const yy = y(top * k / 4); sv('line', { x1: L, x2: W - R, y1: yy, y2: yy, stroke: 'var(--grid)' }, svg); sv('text', { x: L - 6, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = nf.format(top * k / 4); }
+    ax.ticks.forEach(v => { const yy = y(v); sv('line', { x1: L, x2: W - R, y1: yy, y2: yy, stroke: 'var(--grid)' }, svg); sv('text', { x: L - 6, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = ax.digits ? v.toFixed(ax.digits) : nf.format(v); });
     const hm = t => fmtTime(t, 'time');
     [0, 15, 30, 45, 59].forEach(i => sv('text', { x: x(i), y: H - 4, 'text-anchor': i === 0 ? 'start' : i === 59 ? 'end' : 'middle', class: 'axis' }, svg).textContent = hm(data[i].t));
     series.forEach((s, idx) => {
@@ -520,7 +543,7 @@
   /** 最近 60 分鐘（公開頁的樣式） */
   function realtime(container, rows) { lineChart(container, rows, RT_SERIES, { xLabel: (d) => fmtHM(d.t), height: 200 }); }
 
-  Object.assign(KD, { tooltip, tipRows, placeTip, lineChart, lineChartCompact, routeMap, gauges, crossCard, rank, outcomes, trend, realtime, POPS });
+  Object.assign(KD, { niceTicks, tooltip, tipRows, placeTip, lineChart, lineChartCompact, routeMap, gauges, crossCard, rank, outcomes, trend, realtime, POPS });
 
   // =====================================================================================
   // 表格類（詳細頁、管理介面）
