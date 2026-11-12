@@ -307,7 +307,7 @@ return view.extend({
 		o.rmempty = false;
 		o = s.option(form.Flag, 'open_wan', _('開放外網連線'), _('在防火牆加入規則，讓外網可以連到 DoH。'));
 		o.rmempty = false;
-		o = s.option(form.Value, 'wan_port', _('外網埠號'), _('外面看到的埠號（一般用 443）。'));
+		o = s.option(form.Value, 'wan_port', _('外網埠號'), _('外面看到的埠號（一般用 443；443 被占用時可以用其他埠，例如 8443）。公開頁的網址、iPhone 描述檔、Alt-Svc、HTTPS 記錄都用這個埠號。'));
 		o.datatype = 'port';
 		o.placeholder = '443';
 		o.depends('open_wan', '1');
@@ -499,9 +499,10 @@ return view.extend({
 			s = m.section(form.NamedSection, 'site', 'site', _('公開網頁'), _('Windows 版的官網與統計頁。OpenWrt 上建議關閉，改用 LuCI 狀態頁；關閉不影響 DoH。'));
 			o = s.option(form.Flag, 'enabled', _('啟用'));
 			o.rmempty = false;
-			o = s.option(form.Value, 'min_clients', _('排行最少人數'));
-			o.datatype = 'uinteger';
-			o.placeholder = String(common.def('site.minClients') || 2);
+			o = s.option(form.Value, 'min_clients', _('排行最少人數'),
+				_('公開頁的網站排行只列出至少這麼多位不同使用者造訪過的網站。預設 1 = 全部列出；不想讓訪客看到只有一台裝置去過的網站，就調高（例如 2）。LuCI 的儀表板不受限制。'));
+			o.datatype = 'and(uinteger,min(1))';
+			o.placeholder = String(common.def('site.minClients') || 1);
 			o.depends('enabled', '1');
 		}
 

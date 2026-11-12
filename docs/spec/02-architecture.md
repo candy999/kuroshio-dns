@@ -65,6 +65,9 @@ kuroshio check-config <file>                     檢查設定檔
   |---|---|---|
   | `listen.doq` | `{ enabled:false, port:853 }` | 共用 DoT 的憑證 |
   | `listen.doh.http3` | `false` | 開啟 DoH3（同埠 UDP） |
+  | `listen.doh.http3Port` | `0` | DoH3 改用的 UDP 埠（0 = 跟 DoH 同一個數字）；只有那個 UDP 埠被占用時才需要（見 01 第 1.1.1 節） |
+  | `listen.doh.publicPort` | `0` | 外面看到的 DoH 埠號（0 = 跟 `listen.doh.port` 一樣）：埠號轉送時填；公開頁、描述檔、Alt-Svc、HTTPS 記錄用它 |
+  | `site.minClients` | `1` | 公開頁網站排行最少要有幾位不同使用者造訪過（2.x 是 2）。1 = 全部列出；不想讓訪客看到只有一台裝置去過的網站就調高。管理介面的儀表板不受限制 |
   | `listen.ddr` | `false` | DDR 自動發現 |
   | `listen.proxyProtocol` | `false` | PROXY protocol v2 |
   | `resolver.stripEch` | `false` | 移除 HTTPS 記錄的 ECH |
@@ -166,11 +169,13 @@ kuroshio check-config <file>                     檢查設定檔
 | `/api/public/stats`、`/presence`、`/info` | 匿名統計、使用偵測、連線資訊 |
 | `/apple/doh.mobileconfig`、`/apple/dot.mobileconfig` | Apple 描述檔 |
 | `site.detailPath`（預設 `/detail`） | 詳細資料頁（唯讀管理 API，用戶端 IP 打馬賽克） |
+| `/assets/dashboard.js`、`/assets/dashboard.css` | 共用儀表板（見 7.3） |
 | `/robots.txt` | 禁止收錄 |
 
 3.0 新增：
 - 設定教學依實際開啟的協議產生：DoH、DoH3、DoT、DoQ 網址，`sdns://` stamp，Android「私人 DNS」主機名稱，Windows 11 DoH 範本，各平台 App 建議。
-- 頁面檔案放在 `data/site/`（安裝後是 `/usr/share/kuroshio/site/`），可以用 `site.htmlFile` / `site.detailFile` 換成自己的版本（同 2.x）；`{{HOST}}` 代入 `site.hostname`，沒設定時用請求的 Host。實作見 `crates/kuroshio/src/site.rs`、`presence.rs`。
+- 頁面檔案放在 `data/site/`（安裝後是 `/usr/share/kuroshio/site/`），可以用 `site.htmlFile` / `site.detailFile` 換成自己的版本（同 2.x）；`{{HOST}}` 代入 `site.hostname`，沒設定時用請求的 Host。DoH 不在 443 時網址要帶埠號，用 `{{DOH_URL}}`（完整 DoH 網址）、`{{SITE_URL}}`（這一頁的網址）、`{{DOH_HOSTPORT}}`（網域加埠號）、`{{DOH_PORT}}`；舊的 `{{HOST}}{{DOH_PATH}}` 寫法不會帶埠號。實作見 `crates/kuroshio/src/site.rs`、`presence.rs`。
+- 網站排行（`topSites`、`topBlocked`）只列出至少 `site.minClients` 位不同使用者造訪過的網站，預設 1（全部列出）。
 
 ### 7.2 設定頁
 
@@ -179,7 +184,21 @@ kuroshio check-config <file>                     檢查設定檔
 | OpenWrt | LuCI（`luci-app-kuroshio`），只新增 3.0 的協議與選項；`common.js` 改呼叫 `/api/defaults` |
 | Windows | 核心內建，`http://127.0.0.1:8054/`；頁面跟 LuCI 相同分頁：狀態、基本設定、廣告過濾、社群、CDN 台灣節點、進階、日誌，也有簡易 / 專業模式 |
 
-Windows 設定頁用原生 JS（不用前端框架、不需要編譯步驟），透過 `/api/*` 操作。頁面的欄位定義（名稱、說明、預設值、簡易 / 專業）整理成一份 `web/fields.json`，Windows 設定頁直接用；LuCI 的說明文字之後也可以從同一份產生，避免兩邊說明不一致。
+Windows 設定頁用原生 JS（不用前端框架、不需要編譯步驟），透過 `/api/*` 操作。頁面有嚴格的 CSP（只載入自己的檔案、不允許行內程式與樣式），伺服器給的字串一律用 `textContent`。頁面的欄位定義（名稱、說明、預設值、簡易 / 專業）整理成一份 `web/fields.json`，Windows 設定頁直接用；LuCI 的說明文字之後也可以從同一份產生，避免兩邊說明不一致。
+
+### 7.3 共用儀表板（`data/dashboard/`）
+
+公開頁的圖表與詳細頁的表格（查詢趨勢、查詢去向、上游、CDN 機會成本、路由地圖、台灣節點池、CDN 網域資料庫、跨 CDN 備援、排行、過濾規則、排程工作、追蹤網域）是同一份 `dashboard.js` + `dashboard.css`，三個地方共用：
+
+| 主機 | 載入位置 | 資料（轉接器） |
+|---|---|---|
+| 公開頁、詳細頁 | `/assets/dashboard.js`、`/assets/dashboard.css` | 公開的唯讀 API：`/api/public/stats`、詳細頁的 `…/api/*`（匿名、IP 打馬賽克、上游網址遮掉） |
+| LuCI「黑潮 DNS → 儀表板」 | `/luci-static/resources/kuroshio/`（`luci-app-kuroshio` 從 `data/dashboard/` 安裝） | rpcd `kuroshio.api` 轉送本機管理 API；公開頁關著也能用，不開任何埠 |
+| Windows 設定頁「儀表板」分頁 | `/dashboard/dashboard.js`（設定頁靜態檔） | 登入後的管理 API |
+
+- 管理介面是完整資料：統計用 `/api/dashboard?range=today|7d|30d`（跟 `/api/public/stats` 同一份，但排行不受 `site.minClients` 限制、各列 30 筆），上游完整網址、用戶端不打馬賽克。
+- 圖表在瀏覽器畫，路由器只給 JSON。CDN 網域資料庫可能有 20 萬筆：管理介面用 `/api/cdn/domains?limit=300&offset=…&q=…&provider=…` 分頁搜尋，跨 CDN 用 `cross=1`；詳細頁維持一次載入 2 萬筆在瀏覽器篩選。
+- 安全：不組 HTML 字串、不寫 `style` 屬性（只用 CSSOM），在設定頁的嚴格 CSP 下可用。淺色 / 深色跟著系統（LuCI 跟著 `data-darkmode`），手機寬度下寬表格在框裡捲動。
 
 ## 8. 平台層
 

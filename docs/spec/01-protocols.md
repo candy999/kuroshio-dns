@@ -21,6 +21,7 @@
 
 - **DoH**：同一個 TCP 埠同時支援 HTTP/1.1 與 HTTP/2（ALPN `h2`、`http/1.1`）。路徑 `/dns-query`，GET `?dns=` 與 POST `application/dns-message`。
 - **DoH3**：UDP，埠號預設跟 DoH 的 TCP 埠相同。DoH 的回應加上 `Alt-Svc: h3=":埠"; ma=86400`。
+- **DoH 可以用任何埠號**（見 1.1.1）：443 被其他程式占用時（IIS、HTTP.sys、路由器的 LuCI…）改用例如 8443，網址寫成 `https://dns.example.net:8443/dns-query`，公開頁也在同一個埠。
 - **DoT 與 DoQ**：共用埠號 853（DoT 是 TCP、DoQ 是 UDP）。
 - **憑證**：DoH、DoH3、DoT、DoQ 共用同一張憑證；檔案變更 10 秒內自動換上（同 2.x 的 `watchCerts`）。
 - **ALPN 對照**：
@@ -33,6 +34,25 @@
   | UDP 853 | `kuroshio/2` | 社群共享（QUIC） |
   | TCP 443/8443 | `h2`、`http/1.1` | DoH / 公開頁 / 社群 `/.well-known/kuroshio` |
   | UDP 443/8443 | `h3` | DoH3 / 公開頁 / 社群 |
+
+#### 1.1.1 DoH 的埠號
+
+- **TCP**：`listen.doh.port` 可以是任何埠號；公開頁跟 DoH 共用同一個監聽，所以兩者的網址一定同埠。
+- **DoH3（UDP）**：預設跟 DoH 用同一個數字（`listen.doh.http3Port = 0`）。只有那個 UDP 埠已經被占用時才另外指定（例如 Windows 的 HTTP.sys 開了 HTTP/3、或另一個 QUIC 服務聽著 UDP 443）。用戶端不用另外設定：從 DoH 回應的 `Alt-Svc: h3=":埠"`、或網域的 HTTPS 記錄知道有 HTTP/3、在哪個埠。
+- **對外埠號**（`listen.doh.publicPort`，0 = 跟監聽的一樣）：外面看到的埠號跟本機監聽的不同時填（例如路由器把 WAN 443 轉到本機 8443；OpenWrt 開放外網、`wan_port` 跟 `port` 不同時自動帶入）。DoH 本身是明文、前面有反向代理時視為 443。`listen.doh.altSvcPort` 只改 Alt-Svc 宣告的 UDP 埠。
+- 用到埠號的地方都跟著實際的埠：
+
+  | 地方 | 埠號 |
+  |---|---|
+  | 公開頁的網址、複製按鈕、QR 碼、`/api/public/info`（`doh`、`dohPort`、`site`） | 瀏覽器連進來的埠（請求的 Host 標頭；沒帶埠號 = 443），Host 不是這個網域時用對外埠號 |
+  | iPhone / Mac 描述檔（`DNSSettings` 的 `ServerURL`） | 同上：`https://網域:8443/dns-query`；DoT 描述檔沒有埠號欄位（固定 853），DoT 不在 853 時公開頁不提供 |
+  | Windows 11 DoH 範本、瀏覽器、路由器 | 公開頁上的完整網址（帶埠號） |
+  | Android「私人 DNS」 | **只支援 DoT、固定 853 埠**：只能填主機名稱，不能帶埠號、不能填 DoH 網址。DoT 不在 853 時公開頁直接說明不能用、改用瀏覽器（Chrome 的安全 DNS） |
+  | `kuroshio url` / 主控台的 `site` | 對外網址帶埠號；DoT 不在 853 時註明 Android 不能用 |
+  | DDR（SVCB `port=`）、DNR（`port=`） | 實際監聽的埠（區網裝置直接連本機）；DoH3 另外的 UDP 埠另外列一筆 `alpn=h3` |
+  | `Alt-Svc: h3=":埠"` | `altSvcPort` → DoH3 跟 DoH 同埠時用 `publicPort` → DoH3 實際綁定的埠 |
+  | Cloudflare HTTPS 記錄（DDNS） | 443：記錄在網域本身、`alpn="h3,h2"`；其他埠（例如 8443）：瀏覽器查的是 `_8443._https.網域`（RFC 9460 第 9.1 節），記錄放那裡、target 是網域、加 `port=8443`；DoH3 另外的 UDP 埠：`alpn="h3" no-default-alpn port=UDP 埠` |
+  | 社群 `endpoints.doh` | OpenWrt 由 UCI 轉出（開放外網用 `wan_port`，否則用 `port`；443 不寫埠號）；JSON 設定檔照使用者寫的 |
 
 - **來源 IP**：`trustProxy` 時讀 `X-Forwarded-For`（同 2.x）。另外支援 PROXY protocol v2（⚙️，給前面有反向代理的情況）。
 - **限制**：每個來源 IP 的同時連線數與每秒查詢數上限；TCP / TLS / QUIC 閒置逾時。

@@ -39,8 +39,9 @@
             ] },
             { "key": "listen.doh.http3", "type": "bool", "label": "HTTP/3（DoH3）", "help": "同一個埠號的 UDP 也提供 DoH3（QUIC），掉包環境比較穩。DoH 回應會帶 Alt-Svc 告訴用戶端。路由器的埠轉發記得也要加 UDP。" },
             { "key": "listen.doh.http3Binds", "type": "list", "label": "DoH3 的監聽位址", "help": "一行一個 IP。空白 = 跟 DoH 同樣的位址。IIS 反向代理模式下 DoH 只聽本機，DoH3 要直接對外時在這裡填 0.0.0.0。", "pro": true, "validate": "ip", "picker": "addrs" },
-            { "key": "listen.doh.http3Port", "type": "port", "label": "DoH3 改用的 UDP 埠", "help": "UDP 443 被其他程式占用時改用其他埠（例如 8443）。0 = 跟 DoH 同一個埠。", "pro": true, "allowZero": true },
-            { "key": "listen.doh.altSvcPort", "type": "port", "label": "Alt-Svc 對外埠號", "help": "外面看到的埠號跟監聽的不同（例如路由器把 443 轉到 8443）時填外面的埠號。0 = 自動。", "pro": true, "allowZero": true },
+            { "key": "listen.doh.http3Port", "type": "port", "label": "DoH3 改用的 UDP 埠", "help": "DoH3 預設用跟 DoH 同一個數字的 UDP 埠；只有那個 UDP 埠被其他程式占用時（例如 HTTP.sys 開了 HTTP/3、或另一個 QUIC 服務）才改用其他埠（例如 8444）。用戶端從 Alt-Svc 或 HTTPS 記錄知道。0 = 跟 DoH 同一個埠。", "pro": true, "allowZero": true },
+            { "key": "listen.doh.publicPort", "type": "port", "label": "對外的 DoH 埠號", "help": "外面看到的埠號跟監聽的不同（例如路由器把 443 轉到本機 8443）時填外面的埠號；公開頁的網址、QR 碼、iPhone 描述檔、Alt-Svc、HTTPS 記錄都用它。0 = 跟監聽的埠號一樣（DoH 可以用任何埠號，例如 443 被占用時直接開 8443）。", "pro": true, "allowZero": true },
+            { "key": "listen.doh.altSvcPort", "type": "port", "label": "Alt-Svc 對外埠號", "help": "只改 Alt-Svc 宣告的 DoH3（UDP）埠號。0 = 自動（DoH3 跟 DoH 同埠時用上面的對外埠號，否則用 DoH3 實際的埠）。", "pro": true, "allowZero": true },
             { "key": "listen.doh.path", "type": "text", "label": "路徑", "pro": true },
             { "key": "listen.doh.trustProxy", "type": "bool", "label": "信任 X-Forwarded-For", "help": "只有前面還有反向代理（例如 IIS 反向代理模式）時才打開，否則用戶端可以偽造來源 IP。只信任來自 127.0.0.1 的代理。", "pro": true }
           ]
@@ -448,7 +449,7 @@
           "fields": [
             { "key": "site.enabled", "type": "bool", "label": "啟用" },
             { "key": "site.hostname", "type": "host", "label": "網域", "placeholder": "dns.example.com" },
-            { "key": "site.minClients", "type": "int", "label": "排行最少人數", "pro": true, "min": 0 },
+            { "key": "site.minClients", "type": "int", "label": "排行最少人數", "help": "公開頁的網站排行只列出至少這麼多位不同使用者造訪過的網站。預設 1 = 全部列出；不想讓訪客看到只有一台裝置去過的網站，就調高（例如 2）。儀表板不受限制。", "pro": true, "min": 1 },
             { "key": "site.detailPath", "type": "text", "label": "詳細資料頁路徑", "pro": true },
             { "key": "site.htmlFile", "type": "path", "label": "自訂首頁檔", "help": "空白 = 內建首頁。", "pro": true },
             { "key": "site.detailFile", "type": "path", "label": "自訂詳細資料頁檔", "pro": true },

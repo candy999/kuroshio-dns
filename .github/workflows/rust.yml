@@ -65,6 +65,18 @@ jobs:
           name: admin-ui-screenshots
           path: screenshots-admin
           if-no-files-found: ignore
+      # 公開頁、詳細頁（共用儀表板）：DoH 用 TLS 開在 443 以外的埠，網址、描述檔、QR 碼都要帶埠號
+      - name: 公開頁端對端測試
+        run: node tools/site-e2e.js
+        env:
+          KUROSHIO_BIN: target/debug/kuroshio
+          SHOTS: screenshots-site
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: site-screenshots
+          path: screenshots-site
+          if-no-files-found: ignore
 
   binaries:
     name: 執行檔 ${{ matrix.target }}

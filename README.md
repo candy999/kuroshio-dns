@@ -113,8 +113,13 @@
 
 ### 公開頁
 - 可以開一個設定說明頁給親友，依實際開啟的協議產生 iPhone 描述檔、Android 私人 DNS、Windows 設定方式，附 QR 碼。
-- 「這台裝置有沒有在用黑潮 DNS」偵測、統計歷史、匿名的網站排行；每個網頁都顯示版本、原始碼網址與授權。
+- 「這台裝置有沒有在用黑潮 DNS」偵測、統計歷史、匿名的網站排行（預設全部列出；`site.minClients` 調高後只列出多位使用者共同造訪的網站，不想讓訪客看到只有一台裝置去過的網站時用）；每個網頁都顯示版本、原始碼網址與授權。
 - 公開的詳細頁不顯示本機路徑，上游只顯示主機名稱（個人化的 DoH 路徑不會外流）。
+- **DoH 可以用任何埠號**：443 被占用時改用例如 8443，網址寫成 `https://dns.example.net:8443/dns-query`，公開頁也在同一個埠。公開頁的網址、QR 碼、iPhone 描述檔、Windows 範本、`kuroshio url`、Alt-Svc、Cloudflare HTTPS 記錄都跟著帶埠號。DoH3 預設用同一個數字的 UDP 埠，只有那個 UDP 埠被占用時（例如 HTTP.sys 開了 HTTP/3、或另一個 QUIC 服務）才用 `listen.doh.http3Port` 另外指定；用戶端從 Alt-Svc 或 HTTPS 記錄知道 HTTP/3 在哪裡。路由器把外面的 443 轉到本機其他埠時填 `listen.doh.publicPort`（OpenWrt 開放外網時自動帶入）。注意 Android「私人 DNS」只支援 DoT、固定 853 埠（不能帶埠號、不能填 DoH 網址），公開頁會說明。
+
+### 儀表板（LuCI、Windows 設定頁、公開頁共用）
+- 查詢趨勢、查詢去向、上游、各 CDN 的機會成本與路由地圖、台灣節點池、CDN 網域資料庫、跨 CDN 備援、排行、過濾規則、排程工作、追蹤網域，三個地方是同一份程式（`data/dashboard/`），圖表在瀏覽器畫、路由器只給 JSON。
+- LuCI「黑潮 DNS → 儀表板」與 Windows 設定頁「儀表板」分頁看的是完整資料（排行不受人數門檻限制、上游完整網址）；**公開頁不用開**，LuCI 經 rpcd 讀取，不開任何埠。
 
 ### 資源與可靠性
 
@@ -272,7 +277,7 @@ RUSTFLAGS="-C relocation-model=static" \
 | `crates/kuroshio-community` | 社群共享 |
 | `openwrt/` | OpenWrt 套件與 LuCI |
 | `windows/` | Windows 版說明 |
-| `data/` | 設定頁、公開頁、種子資料、評測名單、CDN 官方範圍、台灣 IP 公版 |
+| `data/` | 設定頁、公開頁、共用儀表板、種子資料、評測名單、CDN 官方範圍、台灣 IP 公版 |
 | `rules/` | 預設自訂過濾規則 |
 | `docs/spec/` | 規格 |
 
