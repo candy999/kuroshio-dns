@@ -1,0 +1,18 @@
+# 黑潮 DNS：Docker Compose（說明：docs/docker.md）
+#   docker compose up -d
+# 第一次啟動會在 ./config/ 建立 config.json（預設：明文 DNS 開在 53、設定頁 8054 要登入），
+# 改完設定後 docker restart kuroshio。備份就是備份 ./config/ 這個資料夾。
+services:
+  kuroshio:
+    image: ghcr.io/candy999/kuroshio-dns:latest
+    container_name: kuroshio
+    # 一定要用 host 網路：
+    #  - 伺服器才看得到用戶端真正的 IP（存取控制「只開放台灣」、區網限定、統計都靠它；
+    #    用 bridge 網路的埠對應，來源 IP 可能全部變成 Docker 的閘道位址）
+    #  - 53 埠直接開在主機上（Ubuntu 的 systemd-resolved 佔用 53 時見 docs/docker.md）
+    network_mode: host
+    volumes:
+      - ./config:/config
+    restart: unless-stopped
+    # 結束時會寫出快照（快取、統計、評測結果），給它一點時間
+    stop_grace_period: 15s

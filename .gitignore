@@ -9,3 +9,4 @@ legacy-node/state/cdn/*
 !legacy-node/state/cdn/v6-nodes.json
 .uci-config.test.js
 .claude/worktrees/
+docker/bin/

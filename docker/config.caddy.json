@@ -1,0 +1,28 @@
+{
+  "domain": "dns.example.net",
+  "system": {
+    "persistDir": "/config/state",
+    "dataDir": "/usr/share/kuroshio"
+  },
+  "listen": {
+    "plain": {
+      "binds": ["0.0.0.0", "::"],
+      "port": 53
+    },
+    "doh": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8053,
+      "tls": false,
+      "trustProxy": true
+    }
+  },
+  "admin": {
+    "host": "0.0.0.0",
+    "auth": true,
+    "tokenFile": "/config/admin.token"
+  },
+  "filter": {
+    "customRules": ["/config/custom-rules.txt"]
+  }
+}

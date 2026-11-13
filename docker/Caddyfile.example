@@ -1,0 +1,13 @@
+# Caddy 放在黑潮 DNS 前面（搭配 compose.caddy.yml 與 config.caddy.json；說明：docs/docker.md）
+# 複製成 Caddyfile，把 dns.example.net 換成你自己的子網域（DNS 的 A / AAAA 要先指到這台主機）。
+#
+# - 用專屬的子網域：整個子網域都交給黑潮 DNS（/dns-query、/.well-known/kuroshio/、公開頁）
+# - Caddy 自動申請 / 續期 Let's Encrypt 憑證，HTTP/3（UDP 443）預設就開著
+# - 黑潮 DNS 的 DoH 開在 127.0.0.1:8053、不加密（listen.doh.tls false），
+#   Caddy 預設會帶 X-Forwarded-For，黑潮 DNS 看到 listen.doh.trustProxy true 且連線來自本機時才採用
+# - DoT（853/TCP）、DoQ（853/UDP）不經過 Caddy，黑潮 DNS 要自己讀憑證檔：
+#   把 tls.cert / tls.key 指到 Caddy 存放的憑證（見 compose.caddy.yml），或乾脆不開 DoT / DoQ
+
+dns.example.net {
+	reverse_proxy 127.0.0.1:8053
+}

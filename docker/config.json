@@ -1,0 +1,20 @@
+{
+  "system": {
+    "persistDir": "/config/state",
+    "dataDir": "/usr/share/kuroshio"
+  },
+  "listen": {
+    "plain": {
+      "binds": ["0.0.0.0", "::"],
+      "port": 53
+    }
+  },
+  "admin": {
+    "host": "0.0.0.0",
+    "auth": true,
+    "tokenFile": "/config/admin.token"
+  },
+  "filter": {
+    "customRules": ["/config/custom-rules.txt"]
+  }
+}

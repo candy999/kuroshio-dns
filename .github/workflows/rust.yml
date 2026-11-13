@@ -1,7 +1,7 @@
 name: Kuroshio DNS (Rust)
 
 # 推送：測試 + 所有 CPU 的執行檔 + Windows + x86_64 的 OpenWrt 套件與實機測試
-# v3.* 標籤或手動執行（full = true）：所有 CPU 的 OpenWrt 套件，標籤時建立 Release
+# v3.* 標籤或手動執行（full = true）：所有 CPU 的 OpenWrt 套件，標籤時建立 Release 並推送容器映像檔
 on:
   push:
     branches: [ main, rust-3.0 ]
@@ -16,6 +16,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # MIPS 在 Rust 是 tier 3，只能用 nightly 的 -Zbuild-std 自己編標準函式庫。nightly 每天都在變、偶爾會壞，
+  # 所以固定在已知能編、QEMU 實際執行也通過的那一天（v3.0.2 Release 用的 rustc 1.102.0-nightly 8eb778d04 2026-11-12）。
+  # 要更新：改這個日期推一次，兩個 MIPS 執行檔的編譯與 QEMU 測試都通過就好（說明：docs/building.md）
+  MIPS_NIGHTLY: nightly-2026-11-13
+  # 容器映像檔（說明：docs/docker.md）
+  IMAGE: ghcr.io/candy999/kuroshio-dns
 
 jobs:
   test:
@@ -40,6 +46,7 @@ jobs:
           shellcheck -s sh -e SC2034,SC2154,SC1008,SC3043,SC1091 openwrt/kuroshio/files/kuroshio.init
           shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/access.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/guard.sh openwrt/kuroshio/files/kuroshio.uci-defaults openwrt/install.sh
           shellcheck -s sh -e SC3043,SC2015,SC2086,SC1091 openwrt/tools/ci-smoke-kuroshio.sh openwrt/tools/ci-luci-setup.sh
+          shellcheck docker/test.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -98,9 +105,10 @@ jobs:
         if: ${{ !matrix.nightly }}
         with:
           targets: ${{ matrix.target }}
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         if: ${{ matrix.nightly }}
         with:
+          toolchain: ${{ env.MIPS_NIGHTLY }}
           components: rust-src
       - uses: Swatinem/rust-cache@v2
         with:
@@ -171,6 +179,21 @@ jobs:
         with:
           name: bin-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/kuroshio
+      # Linux 通用版：kuroshio/ 資料夾裡有執行檔、data/（執行檔旁的 data/ 會自動使用）、授權、說明
+      - name: 打包 Linux 通用版
+        run: |
+          mkdir -p dist/kuroshio
+          install -m 755 target/${{ matrix.target }}/release/kuroshio dist/kuroshio/kuroshio
+          cp -r data dist/kuroshio/data
+          cp rules/default-custom-rules.txt dist/kuroshio/data/
+          cp LICENSE dist/kuroshio/
+          cp linux/README.txt dist/kuroshio/README-linux.txt
+          tar -C dist --owner=0 --group=0 --numeric-owner -czf dist/kuroshio-linux-${{ matrix.target }}.tar.gz kuroshio
+          tar -tvzf dist/kuroshio-linux-${{ matrix.target }}.tar.gz | sed -n "1,5p"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kuroshio-linux-${{ matrix.target }}
+          path: dist/kuroshio-linux-${{ matrix.target }}.tar.gz
 
   windows:
     name: Windows
@@ -409,6 +432,25 @@ jobs:
           name: kuroshio-windows-x86_64
           path: dist/kuroshio-windows-x86_64.zip
 
+  # 容器映像檔（amd64）：用上面編好的靜態執行檔建置（映像檔裡不編譯），每次推送都測試
+  docker:
+    name: 容器映像檔
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86_64-unknown-linux-musl
+          path: docker/bin/amd64
+      - run: chmod +x docker/bin/amd64/kuroshio
+      - name: 建置（amd64）
+        run: docker build -f docker/Dockerfile --build-arg VERSION=${{ github.sha }} -t kuroshio-dns:test .
+      - name: 第一次啟動、健康檢查、查詢、重新啟動、Caddy 反向代理
+        run: docker/test.sh kuroshio-dns:test
+        env:
+          KUROSHIO_BIN: docker/bin/amd64/kuroshio
+
   plan:
     name: 套件清單
     runs-on: ubuntu-latest
@@ -538,11 +580,15 @@ jobs:
   release:
     name: 發布
     if: startsWith(github.ref, 'refs/tags/v3.')
-    needs: [ smoke, luci, windows ]
+    needs: [ smoke, luci, windows, docker ]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write      # 上傳 Release
+      packages: write      # 推送 ghcr.io 映像檔
+      id-token: write      # 建置來源證明（attestation）
+      attestations: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: art
@@ -552,9 +598,51 @@ jobs:
           # OpenWrt：每個「版本 × 架構」一個 zip，裡面是兩個套件 + 一鍵安裝腳本（跟 Actions 的下載一樣）
           for d in art/kuroshio-openwrt-*; do n=$(basename "$d"); mkdir -p "pack/$n"; cp "$d"/* "pack/$n/"; chmod +x "pack/$n/install.sh"; ( cd pack && zip -qr "../dist/$n.zip" "$n" ); done
           cp art/kuroshio-windows-x86_64/*.zip dist/
+          cp art/kuroshio-linux-*/*.tar.gz dist/
+          # 單獨的執行檔 kuroshio-<target>：檔名不能改（下游韌體固定了檔名與雜湊）
           for d in art/bin-*; do t=${d#art/bin-}; cp "$d/kuroshio" "dist/kuroshio-$t"; done
           ( cd dist && sha256sum * > SHA256SUMS )
           ls -la dist
+      # 驗證：gh attestation verify <檔案> --repo candy999/kuroshio-dns
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      # 容器映像檔（三種 CPU）：用同一批靜態執行檔，映像檔裡不編譯
+      - name: 映像檔標籤
+        id: meta
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          mm=$(echo "$v" | cut -d. -f1-2)
+          tags="$IMAGE:$v,$IMAGE:$mm"
+          # 預覽版（標籤有 -，例如 v3.1.0-rc1）不更新 latest
+          case "$v" in *-*) ;; *) tags="$tags,$IMAGE:latest" ;; esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          mkdir -p docker/bin/amd64 docker/bin/arm64 docker/bin/armv7
+          cp art/bin-x86_64-unknown-linux-musl/kuroshio docker/bin/amd64/
+          cp art/bin-aarch64-unknown-linux-musl/kuroshio docker/bin/arm64/
+          cp art/bin-armv7-unknown-linux-musleabihf/kuroshio docker/bin/armv7/
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true
+      # 驗證：gh attestation verify oci://ghcr.io/candy999/kuroshio-dns:<版本> --repo candy999/kuroshio-dns
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
       - uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,0 +1,7 @@
+# 建置內容是 repo 根目錄：只送映像檔需要的檔案（不送 target/ 之類的大資料夾）
+*
+!LICENSE
+!data/
+!rules/default-custom-rules.txt
+!docker/config.json
+!docker/bin/

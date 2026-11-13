@@ -1,0 +1,34 @@
+# 黑潮 DNS + Caddy（自動 HTTPS、HTTP/3）：DoH 用專屬子網域 dns.example.net（說明：docs/docker.md）
+#   cp Caddyfile.example Caddyfile        # 改成你的子網域
+#   mkdir -p config && cp config.caddy.json config/config.json   # 同樣改 domain
+#   docker compose -f compose.caddy.yml up -d
+#
+# 兩個都用 host 網路：黑潮 DNS 只在連線來自本機（127.0.0.1）時才採用 Caddy 帶來的 X-Forwarded-For，
+# 存取控制「只開放台灣」、統計才看得到用戶端真正的 IP。
+services:
+  kuroshio:
+    image: ghcr.io/candy999/kuroshio-dns:latest
+    container_name: kuroshio
+    network_mode: host
+    volumes:
+      - ./config:/config
+      # 要開 DoT / DoQ 時：讓黑潮 DNS 讀 Caddy 申請的憑證（唯讀；Caddy 續期後會自動重新載入），
+      # config.json 裡設定
+      #   "tls": {
+      #     "cert": "/caddy-certs/acme-v02.api.letsencrypt.org-directory/dns.example.net/dns.example.net.crt",
+      #     "key":  "/caddy-certs/acme-v02.api.letsencrypt.org-directory/dns.example.net/dns.example.net.key"
+      #   }
+      # 再把 listen.dot.enabled / listen.doq.enabled 設成 true
+      - ./caddy-data/caddy/certificates:/caddy-certs:ro
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    restart: unless-stopped
