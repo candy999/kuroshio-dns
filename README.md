@@ -264,6 +264,9 @@ kuroshio.exe service install    長期執行：裝成 Windows 服務
 
 ```
 kuroshio run [-c 設定檔]                    執行（設定檔只寫跟預設值不同的欄位）
+kuroshio health [--json] [--timeout 毫秒]    健康檢查：本機 DNS 有沒有在回答（結束碼 0 / 1 / 2）
+kuroshio status [--json]                    執行中服務的狀態（--json 是給其他程式用的固定格式）
+kuroshio notify wan-changed                 通知服務 WAN 變了：DDNS 立即檢查、重新偵測對外 IP
 kuroshio defaults                           印出完整預設設定
 kuroshio check-config <檔案>                檢查設定檔並印出合併後的結果
 kuroshio sysinfo [-c 設定檔]                 偵測到的硬體、記憶體 / 儲存保留量、依 CPU 核心數換算的值
@@ -286,6 +289,9 @@ kuroshio setup                              Windows：防火牆規則、網址�
 kuroshio iis setup <站台> | cert             Windows：IIS 反向代理、憑證匯入與綁定
 kuroshio httpsys status | cert              Windows：HTTP.sys 共用 443
 ```
+
+Linux / OpenWrt 執行中可以送訊號：`SIGHUP` 重新載入設定（同設定頁存檔），`SIGUSR1` 立刻寫出快照（不結束），`SIGTERM` 寫出快照後結束。
+Docker、第三方路由器韌體等平台的整合方式（指令的結束碼、`status --json` 的欄位、環境變數、系統時間沒對時的行為）見 [docs/integration.md](docs/integration.md)。
 
 ## 開發
 
