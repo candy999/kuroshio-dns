@@ -116,7 +116,7 @@ servers-file=/tmp/kuroshio-servers   # 內容：server=127.0.0.1#5335
 
 整合腳本要做三件事：**啟動、當掉自動重開、黑潮停擺時讓 DNS 照常可用**。
 
-健康檢查用 `kuroshio health`（結束碼 0 = 正常回答；1 = 沒有回答或沒在執行）。它查的是黑潮自己回答的 `_dns.resolver.arpa`，不經過上游，所以 WAN 斷線不會誤判成黑潮停擺。
+健康檢查用 `kuroshio health`（結束碼 0 = 正常回答；1 = 沒有回答或沒在執行；2 = 設定錯誤）。指令、結束碼、`status --json` 的欄位與訊號的完整說明在 [整合介面](docs/integration.md)。它查的是黑潮自己回答的 `_dns.resolver.arpa`，不經過上游，所以 WAN 斷線不會誤判成黑潮停擺。
 
 建議的退回規則（OpenWrt 的 `guard.sh` 就是這樣）：程序不在，或連續 3 次（每次逾時 0.8 秒）沒有回答 → 把 servers-file 換成業者 DNS、SIGHUP dnsmasq；第一次恢復回答 → 換回 `server=127.0.0.1#5335`。程序是否存在每秒檢查，實際查詢每 10 秒一次。
 
