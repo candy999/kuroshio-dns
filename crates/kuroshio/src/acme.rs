@@ -188,6 +188,10 @@ impl Acme {
     /// 需要時申請；force = 不管到期日都重新申請
     pub async fn ensure(self: &Arc<Self>, force: bool) -> Result<bool> {
         let _g = self.busy.lock().await;
+        if !crate::clock::synced() {
+            // 不記進狀態（不是申請失敗）：對時之後背景會再檢查
+            bail!("系統時間還沒對時，延後申請憑證");
+        }
         self.cfg.check()?;
         let reason = if force {
             Some("手動要求".to_string())
@@ -218,6 +222,8 @@ impl Acme {
         let me = self.clone();
         tokio::spawn(async move {
             loop {
+                // 系統時間沒對時：到期日算不準、ACME 伺服器的 TLS 也驗不過，等對時之後再檢查（不記成失敗）
+                crate::clock::wait_synced().await;
                 let wait = match me.ensure(false).await {
                     Err(_) => Duration::from_secs(3600),
                     Ok(_) => Duration::from_secs(86400),

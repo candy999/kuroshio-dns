@@ -662,7 +662,8 @@ fn start_scheduler(
     use kuroshio_jobs::{BenchPaths, Benchmark, Options, Scheduler, JOBS_STATE_FILE};
     let state_dir = persist_dir(cfg);
     let mut o = Options::new(&state_dir, base_dir);
-    o.should_defer = Some(Arc::new(|| pressure() != Pressure::Normal));
+    // 記憶體吃緊、或系統時間還沒對時（排程與 TLS 都靠正確的時間）：不啟動新工作，執行中的在 checkpoint 暫停
+    o.should_defer = Some(Arc::new(|| pressure() != Pressure::Normal || !crate::clock::synced()));
     o.lock_dir = Some(runtime_dir(cfg).join("locks"));
     let slot: Arc<std::sync::OnceLock<std::sync::Weak<Scheduler>>> = Arc::new(std::sync::OnceLock::new());
     let (s2, p2) = (slot.clone(), persister.clone());
@@ -701,7 +702,12 @@ fn start_scheduler(
     if let Some(a) = access {
         register_twip_job(&sched, a, persister, runtime_dir(cfg));
     }
-    sched.start();
+    // 排定時間、補跑計畫都用牆上時間算：系統時間對時之後才開始排程（1970 年算出來的時間點沒有意義）
+    let s2 = sched.clone();
+    tokio::spawn(async move {
+        crate::clock::wait_synced().await;
+        s2.start();
+    });
     sched
 }
 
@@ -880,14 +886,15 @@ fn start_community(
     }
     let n = node.clone();
     tokio::spawn(async move {
-        // 加密監聽啟動後再做自我檢查（回連自己的網域）
+        // 加密監聽啟動後再做自我檢查（回連自己的網域）；好友之間都是 TLS，系統時間對時之後才開始
         tokio::time::sleep(Duration::from_secs(10)).await;
+        crate::clock::wait_synced().await;
         n.check().await;
         let mut minute = 0u64;
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
             minute += 1;
-            if pressure() == Pressure::Critical {
+            if pressure() == Pressure::Critical || !crate::clock::synced() {
                 continue;
             }
             // tick 內含每小時的維護（長期失聯的好友、品質分數、過期資料）
@@ -925,7 +932,8 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
         tokio::spawn(async move {
             tokio::time::sleep(first).await;
             loop {
-                if pressure() == Pressure::Normal {
+                // 系統時間沒對時：驗證、量測的結果帶著錯的時間，不做（不寫進學到的資料）
+                if pressure() == Pressure::Normal && crate::clock::synced() {
                     f(c.clone()).await;
                 }
                 tokio::time::sleep(every).await;
@@ -949,15 +957,18 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
             c.recheck();
         })
     });
-    spawn_wan_subnet(resolver.clone(), Some(cdn.clone()));
+    spawn_wan_subnet(resolver.clone(), 5);
     Some(cdn)
 }
 
-/// 偵測本機對外 IPv4（Cloudflare /cdn-cgi/trace），用它的 /24 當 ECS 子網路
-fn spawn_wan_subnet(resolver: Arc<Resolver>, cdn: Option<Arc<kuroshio_cdn::Cdn>>) {
+/// 偵測本機對外 IPv4（Cloudflare /cdn-cgi/trace），用它的 /24 當 ECS 子網路。
+/// 第一次在 `first_delay` 秒後，失敗再試 4 次（間隔漸長）；系統時間沒對時（TLS 驗不過）時先等，不算一次失敗。
+/// WAN 變動（`kuroshio notify wan-changed`）時用 `first_delay = 0` 重新偵測
+pub fn spawn_wan_subnet(resolver: Arc<Resolver>, first_delay: u64) {
     tokio::spawn(async move {
         for attempt in 0..5u64 {
-            tokio::time::sleep(Duration::from_secs(5 + attempt * 30)).await;
+            tokio::time::sleep(Duration::from_secs(if attempt == 0 { first_delay } else { 5 + attempt * 30 })).await;
+            crate::clock::wait_synced().await;
             let req = crate::fetch::Request {
                 method: "GET",
                 headers: vec![],
@@ -974,7 +985,7 @@ fn spawn_wan_subnet(resolver: Arc<Resolver>, cdn: Option<Arc<kuroshio_cdn::Cdn>>
             let o = ip.octets();
             let net = std::net::Ipv4Addr::new(o[0], o[1], o[2], 0);
             *resolver.ecs_subnet.write().unwrap() = Some((IpAddr::V4(net), 24));
-            if let Some(c) = &cdn {
+            if let Some(c) = resolver.cdn() {
                 c.ecs_add_subnet(&format!("{net}/24"));
             }
             info!(
@@ -1152,6 +1163,15 @@ pub struct Started {
     pub persister: Arc<Mutex<Persister>>,
 }
 
+impl AppState {
+    /// 把有變動的快照全部寫出，回傳寫了幾份（關機、SIGUSR1）
+    pub fn flush_now(&self) -> std::io::Result<usize> {
+        stage_hot_names(&self.resolver, &self.persister, self.warm_names);
+        stage_sources(&self.persister, &self.snap_sources);
+        self.persister.lock().unwrap().flush_all(crate::persist::now_secs())
+    }
+}
+
 impl Started {
     /// 關機：把有變動的快照全部寫出（規格 05 第 5.3 節）
     pub fn shutdown(&self) {
@@ -1159,10 +1179,7 @@ impl Started {
         if let Some(h) = &self.encrypted.httpsys {
             h.stop();
         }
-        stage_hot_names(&self.resolver, &self.persister, self.state.warm_names);
-        stage_sources(&self.persister, &self.state.snap_sources);
-        let mut p = self.persister.lock().unwrap();
-        match p.flush_all(crate::persist::now_secs()) {
+        match self.state.flush_now() {
             Ok(n) if n > 0 => info!("關機前寫出 {n} 份快照"),
             Ok(_) => {}
             Err(e) => warn!("關機前寫出快照失敗：{e}"),
@@ -1480,6 +1497,11 @@ fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>, reserv
 }
 
 pub async fn start(cfg: &Value) -> Result<Started> {
+    // 系統時間有沒有對時（沒有 RTC 的路由器開機時是 1970 年）：決定能不能用加密上游、背景工作要不要延後
+    crate::clock::refresh();
+    crate::clock::spawn_monitor();
+    // data/ 的版本標記：跟執行檔不同版時提醒（不拒絕執行）
+    crate::manifest::check(&share_dir(cfg)).log();
     // 記憶用完時核心不優先停掉 DNS（規格 09）：代價是本程式自己要先讓出記憶體
     crate::memgov::apply_oom_from_cfg(cfg);
     let reserve = crate::memgov::reserve_from_cfg(cfg);
@@ -1564,7 +1586,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     }
     let cdn = start_cdn(cfg, &resolver, &persister).await;
     if cdn.is_none() {
-        spawn_wan_subnet(resolver.clone(), None);
+        spawn_wan_subnet(resolver.clone(), 5);
     }
     let mut snap_sources: Vec<SnapSource> = Vec::new();
     {
@@ -1585,7 +1607,8 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     let acme = crate::acme::AcmeConfig::from_cfg(cfg, &base_dir, &persist_dir(cfg)).map(crate::acme::Acme::new);
     match &acme {
         Some(a) => {
-            if crate::acme::renewal_reason(&a.cfg.cert, &a.cfg.domains, a.cfg.renew_days).is_some() {
+            // 系統時間沒對時：到期日算不準、ACME 伺服器也連不上（TLS），交給背景等對時之後再處理
+            if crate::clock::synced() && crate::acme::renewal_reason(&a.cfg.cert, &a.cfg.domains, a.cfg.renew_days).is_some() {
                 let _ = tokio::time::timeout(Duration::from_secs(180), a.ensure(false)).await;
             }
             a.spawn();

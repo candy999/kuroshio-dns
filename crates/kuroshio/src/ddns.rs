@@ -642,6 +642,13 @@ impl Ddns {
     /// 立即檢查並更新；force = 不管 IP 有沒有變都呼叫 API 確認
     pub async fn update(&self, force: bool) -> Value {
         let c = &self.cfg;
+        if !crate::clock::synced() {
+            // 系統時間沒對時：TLS 驗不過，不做也不蓋掉上次的狀態
+            let mut st = self.status();
+            st["deferred"] = json!(true);
+            st["note"] = json!("系統時間還沒對時，DDNS 延後到對時之後");
+            return st;
+        }
         let mut st = json!({
             "enabled": true, "lastRun": kuroshio_net::fetch::now_ms(), "ip4": null, "ip6": null,
             "ips4": [], "ips6": [], "sources": [], "records": [], "error": null,
@@ -801,6 +808,8 @@ impl Ddns {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
+                // Cloudflare API 與 web 偵測都是 TLS：系統時間對時之後才做（不記成失敗）
+                crate::clock::wait_synced().await;
                 me.update(false).await;
                 tokio::time::sleep(me.cfg.interval).await;
             }

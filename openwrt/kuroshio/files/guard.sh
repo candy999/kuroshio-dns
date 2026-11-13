@@ -16,9 +16,7 @@ BIN=/usr/bin/kuroshio
 T=/usr/libexec/kuroshio/takeover.sh
 
 mode=$(uci -q get kuroshio.main.redirect)
-port=$(uci -q get kuroshio.main.dns_port)
-: "${mode:=dnsmasq-upstream}" "${port:=5335}"
-[ "$mode" = exchange ] && port=53
+: "${mode:=dnsmasq-upstream}"
 
 case "$mode" in
 dnsmasq-upstream | redirect | hijack) ;;
@@ -29,10 +27,11 @@ dnsmasq-upstream | redirect | hijack) ;;
 	;;
 esac
 
-# 本程式有沒有在回答（_dns.resolver.arpa 由本程式自己回答，不經上游）
+# 本程式有沒有在回答（kuroshio health：對 127.0.0.1 的區網 DNS 埠問 _dns.resolver.arpa，由本程式自己回答，不經上游；
+# 埠號跟 UCI 轉換一致：exchange 模式 53，其他 main.dns_port）
 answering() {
 	pidof kuroshio >/dev/null 2>&1 || return 1
-	"$BIN" query -s "127.0.0.1:$port" --timeout 800 -t SVCB _dns.resolver.arpa 2>/dev/null | grep -q rcode
+	"$BIN" health --uci --timeout 800 >/dev/null 2>&1
 }
 
 fallback=0

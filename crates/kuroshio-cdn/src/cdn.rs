@@ -775,6 +775,10 @@ impl Cdn {
             }
             return;
         }
+        // 系統時間沒對時：HTTPS 驗證、ECS 探測的結果帶著錯的時間，不做（之後查詢時會再排）
+        if !kuroshio_net::clock::synced() {
+            return;
+        }
         let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
         let me = self.clone();
         match t {
@@ -952,7 +956,9 @@ impl Cdn {
             let st = self.state();
             st.db.get(&name).map(|e| (e.ips4.clone(), e.ips6.clone())).unwrap_or_default()
         };
-        self.ecs_probe(&name, &i4, &i6).await;
+        if kuroshio_net::clock::synced() {
+            self.ecs_probe(&name, &i4, &i6).await;
+        }
         self.domain(&name).unwrap_or_else(|| json!({}))
     }
 

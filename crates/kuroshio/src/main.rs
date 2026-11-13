@@ -219,6 +219,47 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CommunityCmd,
     },
+    /// 健康檢查：對本機明文 DNS 問 _dns.resolver.arpa（不經上游）。
+    /// 結束碼 0 = 有回答，1 = 沒有回答 / 沒在執行 / 明文 DNS 沒開，2 = 設定讀不到
+    Health {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 逾時（毫秒）
+        #[arg(long, default_value_t = 800)]
+        timeout: u64,
+        /// 輸出一行 JSON：{"ok","server","ms","rcode","error"}
+        #[arg(long)]
+        json: bool,
+    },
+    /// 執行中服務的狀態（經管理 API）。結束碼 0 = 執行中，1 = 沒有回應，2 = 設定讀不到。
+    /// --json 的欄位見 docs/integration.md
+    Status {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 輸出一行 JSON（給其他程式用；欄位固定）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 通知執行中的服務發生了某件事（例如 WAN 變動）。結束碼 0 = 已送達，1 = 服務沒有回應，2 = 設定讀不到
+    Notify {
+        #[command(subcommand)]
+        event: NotifyEvent,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotifyEvent {
+    /// WAN 變了（重新撥號、換 IP、換線路）：DDNS 立即檢查、重新偵測 ECS 用的對外 IP
+    WanChanged {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -384,6 +425,8 @@ pub async fn serve(
     let console: ConsoleSlot = Default::default();
     let mut console_rx = if mode == "cmd" { kuroshio::console::spawn_reader() } else { None };
     let mut first = true;
+    // SIGHUP：重新載入設定；SIGUSR1：立刻寫出快照（只有 Unix）
+    let mut signals = Signals::new();
     // 上一份成功啟動的設定檔內容：設定頁存了一份啟動不了的設定時改回來（不讓服務整個停掉）
     let mut last_good: Option<Vec<u8>> = None;
     loop {
@@ -424,6 +467,20 @@ pub async fn serve(
                     break (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false);
                 }
                 r = &mut done_rx => break r.unwrap_or(Ok(false)),
+                sig = signals.next() => {
+                    let state = console.lock().unwrap().as_ref().and_then(|c| c.state.clone());
+                    match (sig, state) {
+                        (_, None) => info!("收到 {}：服務還在啟動，略過", sig.name()),
+                        (Sig::Reload, Some(st)) => {
+                            info!("收到 SIGHUP：重新載入設定");
+                            st.reload.notify_one();
+                        }
+                        (Sig::Flush, Some(st)) => match st.flush_now() {
+                            Ok(n) => info!("收到 SIGUSR1：立刻寫出快照，寫了 {n} 份"),
+                            Err(e) => tracing::warn!("收到 SIGUSR1：寫出快照失敗：{e}"),
+                        },
+                    }
+                }
                 Some(line) = console_line(&mut console_rx) => {
                     use kuroshio::console::Action;
                     let (out, act, url, reload) = {
@@ -622,6 +679,19 @@ async fn generation(
 
 fn main() {
     let cli = Cli::parse();
+    // 容器：設定檔不存在時從 KUROSHIO_INIT_CONFIG 複製映像附的預設設定（之後使用者可以自己改）
+    if let Cmd::Run { config, uci: false } = &cli.cmd {
+        let init = std::env::var("KUROSHIO_INIT_CONFIG").ok();
+        match kuroshio::integration::apply_init_config(config, init.as_deref()) {
+            Ok(Some(src)) => eprintln!(
+                "設定檔 {} 不存在，已從 KUROSHIO_INIT_CONFIG（{}）複製預設設定",
+                config.display(),
+                src.display()
+            ),
+            Ok(None) => {}
+            Err(e) => eprintln!("無法把 KUROSHIO_INIT_CONFIG 複製到 {}：{e}", config.display()),
+        }
+    }
     // 執行緒數依硬體決定：單核心用單執行緒 runtime（規格 05 第 3.2 節）
     let threads = match &cli.cmd {
         Cmd::Run { config, uci } => thread_count(config, *uci),
@@ -851,6 +921,14 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             }
         }
         Cmd::Run { config, uci } => serve(config, uci, threads, None, shutdown_signal()).await?,
+        Cmd::Health {
+            config,
+            uci,
+            timeout,
+            json,
+        } => std::process::exit(health_cmd(&config, uci, timeout, json).await),
+        Cmd::Status { config, uci, json } => std::process::exit(status_cmd(&config, uci, json).await),
+        Cmd::Notify { event } => std::process::exit(notify_cmd(event).await),
         Cmd::ServiceRun { .. } => unreachable!(),
         Cmd::Service { action, config } => winsvc::control(&action, &config)?,
         Cmd::Acme { action, force, config } => {
@@ -1349,6 +1427,213 @@ async fn import_cmd(file: &std::path::Path, config: &std::path::Path, uci: bool,
     }
     report["preview"] = preview;
     Ok(report)
+}
+
+/// 設定讀不到時：結束碼 2
+fn config_for_cli(config: &std::path::Path, uci: bool) -> std::result::Result<serde_json::Value, String> {
+    user_config(config, uci)
+        .map(|u| kuroshio_config::build(&u))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// `kuroshio health`：結束碼 0 = 有回答，1 = 沒有回答，2 = 設定讀不到
+async fn health_cmd(config: &std::path::Path, uci: bool, timeout_ms: u64, json: bool) -> i32 {
+    use kuroshio::integration::{health_json, health_target};
+    let fail = |server: Option<std::net::SocketAddr>, msg: String, code: i32| {
+        if json {
+            let v = serde_json::json!({ "ok": false, "server": server.map(|s| s.to_string()), "ms": null, "rcode": null, "error": msg });
+            println!("{v}");
+        } else {
+            match server {
+                Some(s) => println!("{s} 沒有回答：{msg}"),
+                None => println!("無法檢查：{msg}"),
+            }
+        }
+        code
+    };
+    let cfg = match config_for_cli(config, uci) {
+        Ok(c) => c,
+        Err(e) => return fail(None, e, 2),
+    };
+    let server = match health_target(&cfg) {
+        Ok(s) => s,
+        Err(e) => return fail(None, e, 1),
+    };
+    let up = match kuroshio::upstream::Upstream::parse(&format!("udp://{server}")) {
+        Ok(u) => u,
+        Err(e) => return fail(Some(server), format!("{e:#}"), 2),
+    };
+    // SVCB _dns.resolver.arpa：服務自己回答（DDR），不經上游，上游全斷也照樣有答案
+    let q = kuroshio_proto::build_query(0x4b48, "_dns.resolver.arpa", 64);
+    let t0 = std::time::Instant::now();
+    let r = up.exchange(&q, std::time::Duration::from_millis(timeout_ms.max(1))).await;
+    let ms = t0.elapsed().as_millis() as u64;
+    let header = r
+        .map_err(|e| format!("{e:#}"))
+        .and_then(|b| kuroshio_proto::header(&b).map_err(|e| format!("回應格式錯誤：{e}")));
+    let rcode = match header {
+        Ok(h) => h.rcode,
+        Err(e) => return fail(Some(server), e, 1),
+    };
+    if json {
+        println!("{}", health_json(server, Some(ms), Some(rcode), None));
+    } else {
+        println!("{server} 有回答（rcode {rcode}，{ms} ms）");
+    }
+    0
+}
+
+/// `kuroshio status [--json]`：結束碼 0 = 執行中，1 = 沒有回應（或讀不到狀態），2 = 設定讀不到
+async fn status_cmd(config: &std::path::Path, uci: bool, json: bool) -> i32 {
+    let fail = |running: bool, msg: String, code: i32| {
+        if json {
+            println!("{}", serde_json::json!({ "running": running, "error": msg }));
+        } else if running {
+            println!("黑潮 DNS 執行中，但{msg}");
+        } else {
+            println!("黑潮 DNS 沒有在執行：{msg}");
+        }
+        code
+    };
+    let cfg = match config_for_cli(config, uci) {
+        Ok(c) => c,
+        Err(e) => return fail(false, e, 2),
+    };
+    let Some(ep) = admin_endpoint(&cfg) else {
+        return fail(false, "管理 API 沒有開啟（admin.enabled = false），無法查詢狀態".into(), 1);
+    };
+    match admin_call(&ep, "GET", "/api/status", None, std::time::Duration::from_secs(5)).await {
+        Err(e) => fail(false, format!("管理 API 沒有回應（{}）：{e:#}", ep.0), 1),
+        Ok((401, _)) => fail(
+            true,
+            "管理 API 需要登入，讀不到登入 token（請用同一個設定檔、有權限讀 token 檔的帳號執行）".into(),
+            1,
+        ),
+        Ok((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(api) => {
+                let s = kuroshio::integration::summarize_status(&api);
+                if json {
+                    println!("{s}");
+                } else {
+                    println!("{}", kuroshio::integration::status_text(&s));
+                }
+                0
+            }
+            Err(e) => fail(true, format!("狀態格式錯誤：{e}"), 1),
+        },
+        Ok((code, body)) => fail(true, format!("讀不到狀態：{}", api_error(code, &body)), 1),
+    }
+}
+
+/// `kuroshio notify <事件>`：結束碼 0 = 已送達，1 = 服務沒有回應，2 = 設定讀不到
+async fn notify_cmd(event: NotifyEvent) -> i32 {
+    let NotifyEvent::WanChanged { config, uci } = event;
+    let cfg = match config_for_cli(&config, uci) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("錯誤：{e}");
+            return 2;
+        }
+    };
+    let Some(ep) = admin_endpoint(&cfg) else {
+        eprintln!("管理 API 沒有開啟（admin.enabled = false），無法通知服務");
+        return 1;
+    };
+    let r = admin_call(
+        &ep,
+        "POST",
+        "/api/notify/wan-changed",
+        Some(b"{}"),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    match r {
+        Err(e) => {
+            eprintln!("服務沒有回應（{}）：{e:#}", ep.0);
+            1
+        }
+        Ok((200, body)) => {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            println!(
+                "已通知服務：WAN 變動。{}；重新偵測對外 IP（ECS）{}",
+                if v["ddns"] == "disabled" {
+                    "DDNS 沒有啟用"
+                } else {
+                    "DDNS 立即檢查（背景進行）"
+                },
+                if v["clockSynced"] == false {
+                    "（系統時間還沒對時，等對時之後才做）"
+                } else {
+                    ""
+                }
+            );
+            0
+        }
+        Ok((code, body)) => {
+            eprintln!("服務拒絕通知：{}", api_error(code, &body));
+            1
+        }
+    }
+}
+
+/// 執行中可以收的訊號（只有 Unix；Windows 沒有）
+#[derive(Clone, Copy)]
+enum Sig {
+    /// SIGHUP：重新載入設定（同設定頁存檔、主控台的 reload）
+    Reload,
+    /// SIGUSR1：立刻寫出快照（不結束）
+    Flush,
+}
+
+impl Sig {
+    fn name(self) -> &'static str {
+        match self {
+            Sig::Reload => "SIGHUP",
+            Sig::Flush => "SIGUSR1",
+        }
+    }
+}
+
+struct Signals {
+    #[cfg(unix)]
+    hup: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    usr1: Option<tokio::signal::unix::Signal>,
+}
+
+impl Signals {
+    fn new() -> Signals {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Signals {
+                hup: signal(SignalKind::hangup()).ok(),
+                usr1: signal(SignalKind::user_defined1()).ok(),
+            }
+        }
+        #[cfg(not(unix))]
+        Signals {}
+    }
+
+    /// 下一個訊號；沒有（或不是 Unix）時永遠不會回來
+    async fn next(&mut self) -> Sig {
+        #[cfg(unix)]
+        {
+            async fn recv(s: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
+                match s {
+                    Some(s) => s.recv().await,
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                Some(_) = recv(&mut self.hup) => Sig::Reload,
+                Some(_) = recv(&mut self.usr1) => Sig::Flush,
+                else => std::future::pending().await,
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending().await
+    }
 }
 
 async fn shutdown_signal() {

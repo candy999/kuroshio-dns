@@ -69,6 +69,8 @@ define Package/kuroshio/install
 	$(CP) $(REPO_ROOT)/data/geo $(1)/usr/share/kuroshio/geo
 	$(CP) $(REPO_ROOT)/data/site $(1)/usr/share/kuroshio/site
 	$(CP) $(REPO_ROOT)/data/dashboard $(1)/usr/share/kuroshio/dashboard
+	# data/ 的版本標記（跟執行檔同一版；啟動時檢查，見 docs/integration.md）
+	$(INSTALL_DATA) $(REPO_ROOT)/data/manifest.json $(1)/usr/share/kuroshio/manifest.json
 	$(INSTALL_DATA) $(REPO_ROOT)/rules/default-custom-rules.txt $(1)/usr/share/kuroshio/default-custom-rules.txt
 endef
 

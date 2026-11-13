@@ -110,6 +110,28 @@ pub fn kind_name(k: Kind) -> &'static str {
     }
 }
 
+/// 明文上游（UDP / TCP）：不需要 TLS，系統時間沒對時也能用
+pub fn is_plain(k: Kind) -> bool {
+    matches!(k, Kind::Udp | Kind::Tcp)
+}
+
+/// 純函式：這次查詢要用的上游。
+/// - 已對時：`list`（固定 + 自動），空的就用備援（原本的行為）
+/// - 沒對時：加密上游的憑證驗不過，只留明文的；`list` 裡沒有明文上游時依序改用備援、最後手段裡的明文上游。
+///   加密上游完全不問，所以也不會被記成失敗、暫停
+pub fn select_active(list: Vec<Arc<Up>>, fallback: &[Arc<Up>], last_resort: &[Arc<Up>], synced: bool) -> Vec<Arc<Up>> {
+    if synced {
+        return if list.is_empty() { fallback.to_vec() } else { list };
+    }
+    let plain = |v: &[Arc<Up>]| -> Vec<Arc<Up>> { v.iter().filter(|u| is_plain(u.up.kind)).cloned().collect() };
+    for v in [plain(&list), plain(fallback), plain(last_resort)] {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    Vec::new()
+}
+
 fn build(specs: &[String], role: Role) -> Vec<Arc<Up>> {
     let mut out = Vec::new();
     for s in specs {
@@ -219,21 +241,24 @@ impl Manager {
         *self.auto.write().unwrap() = Auto { list, generated_at, mtime };
     }
 
-    /// 這次查詢要用的上游：固定上游一律參與、暫停中的自動上游跳過；都沒有就用備援
+    /// 這次查詢要用的上游：固定上游一律參與、暫停中的自動上游跳過；都沒有就用備援。
+    /// 系統時間還沒對時（見 `crate::clock`）：只用明文上游，見 [`select_active`]
     pub fn active(&self) -> Vec<Arc<Up>> {
         let now = Instant::now();
         let mut list: Vec<Arc<Up>> = self.pinned.clone();
         list.extend(self.auto.read().unwrap().list.iter().filter(|u| !u.paused(now)).cloned());
-        if list.is_empty() {
-            self.fallback.clone()
-        } else {
-            list
-        }
+        select_active(list, &self.fallback, &self.last_resort, crate::clock::synced())
     }
 
-    /// 主要上游都失敗時改問的：備援 + 最後手段
+    /// 主要上游都失敗時改問的：備援 + 最後手段（沒對時只用其中的明文上游）
     pub fn backup(&self) -> Vec<Arc<Up>> {
-        self.fallback.iter().chain(&self.last_resort).cloned().collect()
+        let synced = crate::clock::synced();
+        self.fallback
+            .iter()
+            .chain(&self.last_resort)
+            .filter(|u| synced || is_plain(u.up.kind))
+            .cloned()
+            .collect()
     }
 
     pub fn list_json(&self) -> Value {
@@ -329,6 +354,30 @@ mod tests {
         }
         assert_eq!(m.active()[0].up.id, "udp://10.0.0.1:53");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unsynced_clock_uses_plain_only() {
+        let ups = |specs: &[&str], role| build(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>(), role);
+        let ids = |v: Vec<Arc<Up>>| v.iter().map(|u| u.up.id.clone()).collect::<Vec<_>>();
+        let list = ups(
+            &["https://dns.example.net/dns-query", "udp://192.0.2.1", "tls://dns.example.com"],
+            Role::Auto,
+        );
+        let fb = ups(&["https://dns.example.org/dns-query", "udp://198.51.100.1"], Role::Fallback);
+        let lr = ups(&["tcp://203.0.113.1"], Role::LastResort);
+        // 已對時：原本的行為
+        assert_eq!(select_active(list.clone(), &fb, &lr, true).len(), 3);
+        assert_eq!(ids(select_active(vec![], &fb, &lr, true)).len(), 2);
+        // 沒對時：只留明文的
+        assert_eq!(ids(select_active(list.clone(), &fb, &lr, false)), vec!["udp://192.0.2.1:53"]);
+        // 主要上游全是加密的：改用備援裡的明文上游，再沒有就用最後手段
+        let enc = ups(&["https://dns.example.net/dns-query", "quic://dns.example.com"], Role::Pinned);
+        assert_eq!(ids(select_active(enc.clone(), &fb, &lr, false)), vec!["udp://198.51.100.1:53"]);
+        let fb_enc = ups(&["https://dns.example.org/dns-query"], Role::Fallback);
+        assert_eq!(ids(select_active(enc.clone(), &fb_enc, &lr, false)), vec!["tcp://203.0.113.1:53"]);
+        // 全都是加密的：不問（問了也只會憑證錯誤、把上游記成失敗）
+        assert!(select_active(enc, &fb_enc, &[], false).is_empty());
     }
 
     #[test]

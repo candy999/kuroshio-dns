@@ -2,6 +2,7 @@
 //! 核心（`kuroshio`）、CDN 與背景工作都用這一層。
 //! `probe`：指定 IP + Host / SNI 的 HTTP(S) 探測與下載測速（CDN 節點與網站驗證用）。
 
+pub mod clock;
 pub mod fetch;
 pub mod iprank;
 pub mod probe;

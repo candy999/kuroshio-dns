@@ -121,8 +121,15 @@ const LOGIN_FAIL_DELAY: Duration = Duration::from_millis(500);
 /// 那樣就能清快取、改 CDN 策略、加好友。POST 一定帶 Origin，跨站的會被 `same_origin` 擋下。
 pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
     match path {
-        "/api/cache/flush" | "/api/jobs/run" | "/api/acme/issue" | "/api/ddns/update" | "/api/filter/update" | "/api/cdn/verify"
-        | "/api/cdn/policy" | "/api/cdn/ecs" => true,
+        "/api/cache/flush"
+        | "/api/jobs/run"
+        | "/api/acme/issue"
+        | "/api/ddns/update"
+        | "/api/filter/update"
+        | "/api/cdn/verify"
+        | "/api/cdn/policy"
+        | "/api/cdn/ecs"
+        | "/api/notify/wan-changed" => true,
         p => match p.strip_prefix("/api/community/") {
             Some("status" | "peers" | "events" | "scores" | "invite") => false,
             // 不帶 channel 是查詢，帶了是指定管道
@@ -574,8 +581,17 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 (c.len(), c.approx_bytes())
             };
             let filter = r.filter.read().unwrap().as_ref().map(|f| f.stats()).unwrap_or(Value::Null);
+            let data = crate::manifest::check(&crate::app::share_dir(&st.cfg));
+            let synced = crate::clock::synced();
+            let warnings = crate::integration::warnings(&data, synced, crate::app::pressure(), &filter);
             ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
+                // 執行方式：service（Windows 服務）/ cmd（前景）；uci = 設定來自 OpenWrt UCI
+                "mode": st.webui.run_mode.get().copied().unwrap_or("cmd"),
+                "uci": st.webui.config_file.get().is_none(),
+                "clock": { "synced": synced, "buildEpoch": crate::clock::BUILD_EPOCH },
+                "data": data.json(),
+                "warnings": warnings,
                 "stats": r.stats.summary(),
                 "cacheEntries": cache_entries,
                 "cacheBytes": cache_bytes,
@@ -655,6 +671,23 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             None => bad("DDNS 未啟用", 400),
             Some(d) => ok(d.update(true).await),
         },
+        // `kuroshio notify wan-changed`：WAN 變了（重新撥號、換 IP）。DDNS 立即檢查、重新偵測 ECS 用的對外 IP；
+        // 都在背景做，立刻回應（熱插拔腳本不用等）
+        "/api/notify/wan-changed" => {
+            info!("收到通知：WAN 變動，立即檢查 DDNS、重新偵測對外 IP");
+            let ddns = match &st.ddns {
+                Some(d) => {
+                    let d = d.clone();
+                    tokio::spawn(async move {
+                        d.update(true).await;
+                    });
+                    "started"
+                }
+                None => "disabled",
+            };
+            crate::app::spawn_wan_subnet(r.clone(), 0);
+            ok(json!({ "ok": true, "ddns": ddns, "ecs": "started", "clockSynced": crate::clock::synced() }))
+        }
         "/api/filter/update" => match &st.filter {
             None => bad("過濾未啟用", 400),
             Some(f) => {
@@ -892,6 +925,7 @@ mod tests {
             "/api/cdn/verify",
             "/api/cdn/policy",
             "/api/cdn/ecs",
+            "/api/notify/wan-changed",
             "/api/community/add",
             "/api/community/accept",
             "/api/community/delete",

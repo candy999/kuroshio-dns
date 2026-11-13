@@ -171,8 +171,12 @@ impl Cdn {
         }
     }
 
-    /// 驗證（同 2.x `Verifier.verify`）：回傳 ok / fail / unknown，沒有候選 IP 回 None
+    /// 驗證（同 2.x `Verifier.verify`）：回傳 ok / fail / unknown，沒有候選 IP 回 None。
+    /// 系統時間還沒對時（憑證驗不過）：不驗證、不記任何結果，回 `deferred`
     pub async fn verify(self: &Arc<Self>, name: &str, provider: &str, family: u8, orig: Option<IpAddr>) -> Option<&'static str> {
+        if !kuroshio_net::clock::synced() {
+            return Some("deferred");
+        }
         let mut hinted: Vec<Hinted> = Vec::new();
         let r = self.verify_inner(name, provider, family, orig, &mut hinted).await;
         // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗（沒輪到試的不算）
