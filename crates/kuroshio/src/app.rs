@@ -825,10 +825,16 @@ pub fn community_section(cfg: &Value, base: &std::path::Path) -> Option<Value> {
         eps.insert("doh".into(), json!(format!("https://{domain}{p}/.well-known/kuroshio")));
     }
     if on("dot") {
-        eps.insert("dot".into(), json!(format!("dot://{domain}:{}", cfg_port(cfg, "listen.dot.port").unwrap_or(853))));
+        eps.insert(
+            "dot".into(),
+            json!(format!("dot://{domain}:{}", cfg_port(cfg, "listen.dot.port").unwrap_or(853))),
+        );
     }
     if on("doq") {
-        eps.insert("doq".into(), json!(format!("doq://{domain}:{}", cfg_port(cfg, "listen.doq.port").unwrap_or(853))));
+        eps.insert(
+            "doq".into(),
+            json!(format!("doq://{domain}:{}", cfg_port(cfg, "listen.doq.port").unwrap_or(853))),
+        );
     }
     if let Some(o) = c.as_object_mut() {
         o.insert("endpoints".into(), Value::Object(eps));
@@ -1688,7 +1694,10 @@ mod tests {
             "listen": { "dot": { "enabled": true } },
             "community": { "endpoints": { "dot": "dot://other.example.net:853" } }
         }));
-        assert_eq!(community_section(&c, base).unwrap()["endpoints"]["dot"], json!("dot://other.example.net:853"));
+        assert_eq!(
+            community_section(&c, base).unwrap()["endpoints"]["dot"],
+            json!("dot://other.example.net:853")
+        );
         let c = kuroshio_config::build(&json!({ "listen": { "dot": { "enabled": true } } }));
         let e = &community_section(&c, base).unwrap()["endpoints"];
         assert!(e.get("dot").map(Value::is_null).unwrap_or(true));
