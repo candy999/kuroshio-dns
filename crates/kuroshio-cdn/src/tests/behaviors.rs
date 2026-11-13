@@ -364,6 +364,24 @@ async fn health_check_marks_and_sorts() {
 }
 
 #[tokio::test]
+async fn small_healthy_pool_does_not_request_rebuild() {
+    // 節點池本來就只有 2 個（少於 minPool 3）但都正常：重建也找不到更多，不要一直重排節點池工作
+    let (c, net) = setup(json!({ "minPool": 3 }));
+    let low = Arc::new(Mutex::new(Vec::<String>::new()));
+    let l2 = low.clone();
+    c.set_on_low_pool(move |p| l2.lock().unwrap().push(p.to_string()));
+    c.with_state(|st| {
+        st.pools.p.get_mut("cloudflare").unwrap().pool4 = vec![PoolNode::new(ip("104.16.161.36")), PoolNode::new(ip("104.18.20.216"))];
+        st.pools.p.get_mut("fastly").unwrap().pool4 = vec![];
+    });
+    net.on_http(|_, _| cf_ok("TPE"));
+    net.on_ping(|_| lat(2.5));
+    c.health_check().await;
+    c.health_check().await;
+    assert!(low.lock().unwrap().is_empty(), "節點都正常：不通知重建");
+}
+
+#[tokio::test]
 async fn try_v6_discovers_taiwan_node() {
     let (c, net) = setup(json!({}));
     net.on_http(|_, _| resp(200, &[], "fl=1\ncolo=TPE\n"));

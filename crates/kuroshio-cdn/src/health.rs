@@ -112,6 +112,8 @@ impl Cdn {
                 changed |= self.with_state(|st| {
                     let st = &mut *st;
                     let mut changed = false;
+                    // 這一輪有沒有把節點移出池（POP 移出台灣、永久失效）
+                    let mut shrunk = false;
                     let Some(d) = st.pools.p.get_mut(name) else { return false };
                     for r in &results {
                         let Some(x) = d.pool_mut(family).iter_mut().find(|x| x.ip == r.ip) else {
@@ -171,6 +173,7 @@ impl Cdn {
                         if !drop.is_empty() {
                             d.pool6.retain(|x| !drop.contains(&x.ip));
                             changed = true;
+                            shrunk = true;
                         }
                     }
                     // 最近節點型（Fastly）依品質分數排序；一般 CDN 依延遲（有尖峰時段量測時加權）
@@ -181,8 +184,11 @@ impl Cdn {
                             .cmp(&(bad.contains_key(&b.ip) as u8))
                             .then(key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal))
                     });
+                    let total = d.pool(family).len();
                     let alive = d.pool(family).iter().filter(|x| !bad.contains_key(&x.ip)).count();
-                    if alive < min_pool && (family == 4 || v6_ok) {
+                    // 只有「有節點壞掉或被移出」才重建：節點本來就少（例如 Azure 在台灣只有 2 個 IPv6 節點）而且全部正常時，
+                    // 重建也變不出更多節點，只會每輪重排一次節點池工作、白白耗 CPU（每天 05:30 的例行重建照常會找新節點）
+                    if alive < min_pool && (alive < total || shrunk) && (family == 4 || v6_ok) {
                         warn!("{} IPv{family} 可用台灣節點只剩 {alive} 個，排入節點池重建", prov.label);
                         st.pools.request_rebuild(name);
                     }

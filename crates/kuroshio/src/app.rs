@@ -11,11 +11,12 @@ use crate::upstreams::Manager;
 use anyhow::{bail, Result};
 use kuroshio_config::get;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 fn strings(v: Option<&Value>) -> Vec<String> {
@@ -795,13 +796,38 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
             Ok(())
         }
     });
-    // 某一家的節點不夠：提早跑節點池（至少隔 60 分鐘）
+    // 某一家的節點不夠：提早跑節點池。同一家一直不夠（重建也補不起來，例如沒有 IPv6 對外連線）時退避：
+    // 距上次執行至少 1 小時 → 6 小時 → 24 小時；超過 26 小時沒再發生就回到 1 小時
     let weak = Arc::downgrade(sched);
+    let backoff: Arc<Mutex<HashMap<String, (usize, Instant)>>> = Default::default();
     cdn.set_on_low_pool(move |provider| {
-        if let Some(s) = weak.upgrade() {
-            s.request_with_gap("cdn-pool", &format!("{provider} 節點不足"), 60.0);
+        let Some(s) = weak.upgrade() else { return };
+        let gap = {
+            let mut b = backoff.lock().unwrap();
+            low_pool_gap_min(b.entry(provider.to_string()).or_insert((0, Instant::now())), Instant::now())
+        };
+        let r = s.request_with_gap("cdn-pool", &format!("{provider} 節點不足"), gap);
+        if r.get("ok").and_then(Value::as_bool) != Some(true) {
+            // 沒有排進去（剛執行過、執行中、已在佇列）不算一次
+            let mut b = backoff.lock().unwrap();
+            if let Some(e) = b.get_mut(provider) {
+                e.0 = e.0.saturating_sub(1);
+            }
         }
     });
+}
+
+/// 節點不足時重建節點池的最短間隔（分鐘）。`entry` = (連續次數, 上次時間)，呼叫一次算一次：
+/// 1 小時 → 6 小時 → 24 小時；距上次超過 26 小時就重新從 1 小時開始
+fn low_pool_gap_min(entry: &mut (usize, Instant), now: Instant) -> f64 {
+    const STEPS: [f64; 3] = [60.0, 360.0, 1440.0];
+    if entry.0 > 0 && now.saturating_duration_since(entry.1) > Duration::from_secs(26 * 3600) {
+        entry.0 = 0;
+    }
+    let gap = STEPS[entry.0.min(STEPS.len() - 1)];
+    entry.0 += 1;
+    entry.1 = now;
+    gap
 }
 
 /// 社群的對外端點（好友連過來的網址）。OpenWrt 的 UCI 轉換會依 LuCI 的設定填好；
@@ -1686,6 +1712,18 @@ pub async fn start(cfg: &Value) -> Result<Started> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn low_pool_backoff_steps() {
+        let t0 = Instant::now();
+        let mut e = (0usize, t0);
+        assert_eq!(low_pool_gap_min(&mut e, t0), 60.0);
+        assert_eq!(low_pool_gap_min(&mut e, t0 + Duration::from_secs(3600)), 360.0);
+        assert_eq!(low_pool_gap_min(&mut e, t0 + Duration::from_secs(7200)), 1440.0);
+        assert_eq!(low_pool_gap_min(&mut e, t0 + Duration::from_secs(9000)), 1440.0);
+        // 超過 26 小時沒再發生：回到 1 小時
+        assert_eq!(low_pool_gap_min(&mut e, t0 + Duration::from_secs(9000 + 27 * 3600)), 60.0);
+    }
+
     #[test]
     fn community_endpoints_from_listeners() {
         let base = std::path::Path::new("/tmp/k");
