@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "kuroshio"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "kuroshio-cdn"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "kuroshio-community"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "kuroshio-config"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1050,14 +1050,14 @@ dependencies = [
 
 [[package]]
 name = "kuroshio-filter"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "kuroshio-jobs"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "kuroshio",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "kuroshio-net"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "kuroshio-proto"
-version = "3.0.2"
+version = "3.1.0"
 
 [[package]]
 name = "lazy_static"
