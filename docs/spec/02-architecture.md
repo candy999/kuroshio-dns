@@ -149,7 +149,7 @@ kuroshio check-config <file>                     檢查設定檔
 
 **備份檔（`.kuroshio`）**：zstd 壓縮的 JSON `{ format: "kuroshio-backup", version: 1, kind: "full"|"share", exportedAt, core, files: { 相對路徑: {json}|{text}|{b64} } }`。
 `full` 有狀態目錄的學習資料（CDN 網域、節點池、IPv6 節點、候選 IP、網段分類、評測結果、汙染黑名單、統計、常用網域）、自訂規則（`custom-rules.txt`）、社群狀態與金鑰（`community/`、金鑰目錄不同時 `community-keys/`）；
-`share` 只有 CDN 網域（去掉 `hits`、`firstSeen`、`lastSeen`、`policy`）、節點池、IPv6 節點、評測結果、汙染黑名單。
+`share` 只有 CDN 網域（去掉 `hits`、`firstSeen`、`lastSeen`、`policy`，也去掉自己網域底下的名稱：`domain`、`site.hostname`、`community.domain`、`ddns.records`、`ddns.zone`、`acme.domains` 三段以上去掉第一段、兩段照用，等於或在它底下的都不放；好友同步的網站 / 跨 CDN 記錄同樣排除）、節點池、IPv6 節點、評測結果、汙染黑名單。
 匯入時拒絕：format 不對、version 大於 1、解壓後超過 64 MB、不認識的路徑、含 `..` / 絕對路徑 / 反斜線的路徑（分享檔只能有上面五個檔案）。
 匯入一律合併：網域以名稱比對，匯入的驗證時間比較新才用，但次數、手動設定、最早 / 最晚出現時間以本機為準；節點池與 IPv6 節點依 IP 聯集（本機優先）；評測結果比較新才用；黑名單依每行第一欄聯集；候選 IP、網段分類、統計、常用網域本機沒有才用；自訂規則本機還是預設內容就換掉，否則只把沒有的規則加在最後；社群身分在本機還沒有好友時換成備份的身分（本機自己產生的金鑰另存 key.pem.before-import），已經有好友就不覆蓋。
 

@@ -23,6 +23,19 @@ const SINCE_MS: u64 = 30 * 86400 * 1000;
 pub struct CdnData {
     pub cdn: Option<Arc<Cdn>>,
     pub upstreams: Option<Arc<crate::upstreams::Manager>>,
+    /// 自己網域的上層網域（[`kuroshio_config::own_base_domains`]）：這底下的網站、跨 CDN 結果不分享給好友
+    pub own_bases: Vec<String>,
+}
+
+/// 拿掉自己網域底下的網站與跨 CDN 記錄（即使只分享雜湊，也不讓好友能比對出自己的子網域）
+fn drop_own(out: &mut Vec<LocalRecord>, own_bases: &[String]) {
+    if own_bases.is_empty() {
+        return;
+    }
+    out.retain(|r| match r {
+        LocalRecord::Site { name, .. } | LocalRecord::Cross { name, .. } => !kuroshio_config::is_own_domain(name, own_bases),
+        _ => true,
+    });
 }
 
 fn now_ms() -> u64 {
@@ -62,6 +75,9 @@ impl DataProvider for CdnData {
                 let (mut sites, mut cross) = (0, 0);
                 for e in st.db.domains.values() {
                     let Some(p) = e.provider.val() else { continue };
+                    if kuroshio_config::is_own_domain(&e.name, &self.own_bases) {
+                        continue;
+                    }
                     for (fam, v) in [(4u8, &e.v4), (6u8, &e.v6)] {
                         let Some(v) = v else { continue };
                         let at = v.at.unwrap_or(0);
@@ -118,6 +134,7 @@ impl DataProvider for CdnData {
                 });
             }
         }
+        drop_own(&mut out, &self.own_bases);
         out
     }
 
@@ -223,6 +240,66 @@ pub fn spawn_friend_ips(node: Weak<Community>, access: Arc<crate::ipfilter::Acce
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod own_domain_tests {
+    use super::*;
+
+    #[test]
+    fn own_domains_are_not_shared() {
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let site = |name: &str| LocalRecord::Site {
+            name: name.into(),
+            p: "cloudflare".into(),
+            fam: 4,
+            ips: vec![ip],
+            pop: "TPE".into(),
+            obs: 1,
+        };
+        let cross = |name: &str| LocalRecord::Cross {
+            name: name.into(),
+            from: "cloudflare".into(),
+            to: "akamai".into(),
+            ips: vec![ip],
+            obs: 1,
+        };
+        let mut out = vec![
+            site("time.example.net"),
+            site("next.example.net"),
+            site("example.net"),
+            site("www.example.com"),
+            cross("cdn.example.net"),
+            cross("img.example.com"),
+            LocalRecord::Node {
+                p: "cloudflare".into(),
+                ip,
+                pop: "TPE".into(),
+                ms: Some(3),
+                obs: 1,
+                permanent: false,
+            },
+        ];
+        let cfg = kuroshio_config::build(&serde_json::json!({ "domain": "dns.example.net" }));
+        let bases = kuroshio_config::own_base_domains(&cfg);
+        drop_own(&mut out, &bases);
+        let names: Vec<&str> = out
+            .iter()
+            .filter_map(|r| match r {
+                LocalRecord::Site { name, .. } | LocalRecord::Cross { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["www.example.com", "img.example.com"], "自己網域底下的不分享");
+        assert_eq!(out.len(), 3, "節點照樣分享");
+        // 沒有綁定網域：全部照舊
+        let mut all = vec![site("time.example.net")];
+        drop_own(
+            &mut all,
+            &kuroshio_config::own_base_domains(&kuroshio_config::build(&serde_json::json!({}))),
+        );
+        assert_eq!(all.len(), 1);
+    }
 }
 
 #[cfg(test)]

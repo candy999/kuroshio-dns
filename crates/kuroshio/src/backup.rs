@@ -195,6 +195,8 @@ pub struct Locations {
     pub custom_rules: Option<PathBuf>,
     /// 程式附帶資料的根目錄（底下的 `cdn/ranges/` 是各家 CDN 的官方範圍；狀態目錄沒有時用）
     pub data: PathBuf,
+    /// 自己網域的上層網域（[`kuroshio_config::own_base_domains`]）：分享檔不放這底下的名稱
+    pub own_bases: Vec<String>,
 }
 
 fn rel(base: &Path, p: &str) -> PathBuf {
@@ -227,6 +229,7 @@ impl Locations {
                 .filter(|p| !p.is_empty())
                 .map(|p| rel(&base, p)),
             data: crate::app::share_dir(cfg),
+            own_bases: kuroshio_config::own_base_domains(cfg),
             state,
         }
     }
@@ -239,6 +242,7 @@ impl Locations {
             key_dir: state.join("community"),
             custom_rules: Some(state.join(CUSTOM)),
             data: state.join("data"),
+            own_bases: Vec::new(),
         }
     }
 
@@ -317,9 +321,14 @@ pub fn allowed(kind: Kind, key: &str) -> bool {
     }
 }
 
-/// 分享用：拿掉每個網域的次數、時間、手動設定
-fn strip_domains(v: &mut Value) {
+/// 分享用：拿掉每個網域的次數、時間、手動設定，以及自己網域（`own_bases` 底下）的名稱
+fn strip_domains(v: &mut Value, own_bases: &[String]) {
     if let Some(list) = v.get_mut("domains").and_then(Value::as_array_mut) {
+        list.retain(|d| {
+            !d.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| kuroshio_config::is_own_domain(n, own_bases))
+        });
         for d in list.iter_mut().filter_map(Value::as_object_mut) {
             for k in PRIVATE_DOMAIN_FIELDS {
                 d.remove(k);
@@ -346,7 +355,7 @@ pub fn export(loc: &Locations, kind: Kind) -> Bundle {
         let Some(mut d) = d else { continue };
         if kind == Kind::Share && *key == DOMAINS {
             if let Data::Json(v) = &mut d {
-                strip_domains(v);
+                strip_domains(v, &loc.own_bases);
             }
         }
         files.insert(key.to_string(), d);
@@ -1389,6 +1398,44 @@ mod tests {
         assert!(!st.join(kuroshio_cdn::db::SHARD_DIR).exists(), "分片作廢");
         let after = read_domains(&st).unwrap();
         assert_eq!(after["domains"].as_array().unwrap().len(), 5, "原本的 4 個 + 新的 1 個");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn share_leaves_out_own_domains() {
+        let d = tmp("own");
+        let mut loc = fill(&d);
+        wj(
+            &d.join(DOMAINS),
+            json!({ "domains": [
+                domain("time.example.net", 100, 1),
+                domain("next.example.net", 100, 1),
+                domain("example.net", 100, 1),
+                domain("a.example", 100, 1),
+                domain("www.notexample.net", 100, 1)
+            ] }),
+        );
+        let cfg = kuroshio_config::build(&json!({ "domain": "dns.example.net" }));
+        loc.own_bases = Locations::from_cfg(&cfg).own_bases;
+        assert_eq!(loc.own_bases, vec!["example.net"]);
+        let names = |b: &Bundle| -> Vec<String> {
+            b.files[DOMAINS].json().unwrap()["domains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["name"].as_str().unwrap().to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let share = Bundle::decode(&export(&loc, Kind::Share).encode()).unwrap();
+        assert_eq!(
+            names(&share),
+            vec!["a.example", "www.notexample.net"],
+            "分享檔不含自己網域底下的名稱"
+        );
+        let full = Bundle::decode(&export(&loc, Kind::Full).encode()).unwrap();
+        assert_eq!(names(&full).len(), 5, "完整備份全部保留");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

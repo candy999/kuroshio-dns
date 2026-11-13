@@ -869,6 +869,7 @@ fn start_community(
     opts.provider = Arc::new(crate::community_bridge::CdnData {
         cdn: cdn.clone(),
         upstreams: Some(resolver.upstreams.clone()),
+        own_bases: kuroshio_config::own_base_domains(cfg),
     });
     let node = match Community::open(c, opts) {
         Ok(n) => n,

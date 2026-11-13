@@ -129,6 +129,53 @@ pub fn bound_domain(cfg: &Value) -> String {
         .to_ascii_lowercase()
 }
 
+/// 自己網域的上層網域（分享檔、好友同步不送出這底下的名稱，避免洩漏自己的子網域）。
+///
+/// 從綁定網域 `domain`，以及 `site.hostname`、`community.domain`、`ddns.records`、`ddns.zone`、
+/// `acme.domains` 取名稱：三段以上去掉第一段（`dns.example.net` → `example.net`、
+/// `dns.example.com.tw` → `example.com.tw`），剛好兩段就是它本身；一段、IP 位址不算。
+/// 回傳不重複的清單（沒設定任何網域時是空的）
+pub fn own_base_domains(cfg: &Value) -> Vec<String> {
+    let mut names = vec![bound_domain(cfg)];
+    for k in ["site.hostname", "community.domain", "ddns.zone"] {
+        if let Some(s) = get(cfg, k).and_then(Value::as_str) {
+            names.push(s.to_string());
+        }
+    }
+    for k in ["ddns.records", "acme.domains"] {
+        for v in get(cfg, k).and_then(Value::as_array).into_iter().flatten() {
+            if let Some(s) = v.as_str() {
+                names.push(s.to_string());
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for n in names {
+        let n = n.trim().trim_end_matches('.').to_ascii_lowercase();
+        let n = n.strip_prefix("*.").unwrap_or(&n);
+        if n.parse::<std::net::IpAddr>().is_ok() || n.starts_with('[') {
+            continue;
+        }
+        let labels: Vec<&str> = n.split('.').collect();
+        if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+            continue;
+        }
+        let base = if labels.len() >= 3 { labels[1..].join(".") } else { n.to_string() };
+        if !out.contains(&base) {
+            out.push(base);
+        }
+    }
+    out
+}
+
+/// `name` 是不是自己的網域（等於某個上層網域，或在它底下）；`bases` 來自 [`own_base_domains`]
+pub fn is_own_domain(name: &str, bases: &[String]) -> bool {
+    let n = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    bases
+        .iter()
+        .any(|b| n == *b || (n.len() > b.len() && n.ends_with(b.as_str()) && n.as_bytes()[n.len() - b.len() - 1] == b'.'))
+}
+
 /// 合併後的整理：只填了綁定網域 `domain`（固定網域或 DDNS 名稱）時，需要網域的地方自動帶入。
 ///
 /// - `site.hostname`、`community.domain` 空白 → `domain`
@@ -340,6 +387,33 @@ mod tests {
         let c = build(&user);
         assert_eq!(get(&c, "resolver.cacheMax"), Some(&json!(9999)), "使用者設定優先");
         assert!(get(&c, "jobs.cdn-scan.at").is_some());
+    }
+
+    #[test]
+    fn own_base_domains_from_config() {
+        let b = |user: Value| own_base_domains(&build_for(&Host { cores: 1 }, &user));
+        assert!(b(json!({})).is_empty(), "沒設定網域：沒有");
+        assert_eq!(b(json!({ "domain": "dns.example.net" })), vec!["example.net"]);
+        assert_eq!(b(json!({ "domain": "DNS.Example.com.tw." })), vec!["example.com.tw"]);
+        assert_eq!(b(json!({ "domain": "example.net" })), vec!["example.net"], "兩段的網域就是它本身");
+        assert_eq!(
+            b(json!({
+                "domain": "dns.example.net",
+                "site": { "hostname": "www.example.net" },
+                "ddns": { "enabled": true, "records": ["home.example.com", "192.0.2.1"] },
+                "acme": { "domains": ["*.example.org", "localhost"] }
+            })),
+            vec!["example.net", "example.com", "example.org"],
+            "不重複；IP、單段名稱不算"
+        );
+        let bases = vec!["example.net".to_string()];
+        for n in ["example.net", "time.example.net", "a.b.example.net.", "NEXT.Example.NET"] {
+            assert!(is_own_domain(n, &bases), "{n}");
+        }
+        for n in ["notexample.net", "example.network", "example.com", "net"] {
+            assert!(!is_own_domain(n, &bases), "{n}");
+        }
+        assert!(!is_own_domain("example.net", &[]));
     }
 
     #[test]
