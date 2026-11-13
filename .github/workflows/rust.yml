@@ -16,10 +16,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # MIPS 在 Rust 是 tier 3，只能用 nightly 的 -Zbuild-std 自己編標準函式庫。nightly 每天都在變、偶爾會壞，
-  # 所以固定在已知能編、QEMU 實際執行也通過的那一天（v3.0.2 Release 用的 rustc 1.102.0-nightly 8eb778d04 2026-11-12）。
-  # 要更新：改這個日期推一次，兩個 MIPS 執行檔的編譯與 QEMU 測試都通過就好（說明：docs/building.md）
-  MIPS_NIGHTLY: nightly-2026-11-13
+  # MIPS 在 Rust 是 tier 3，只能用 nightly 的 -Zbuild-std 自己編標準函式庫。平常跟著最新的 nightly 編；
+  # 最新的 nightly 偶爾會壞，編不過時自動改用這個已知能編、QEMU 實際執行也通過的日期（v3.0.2 Release 用的
+  # rustc 1.102.0-nightly 8eb778d04 2026-11-12），日誌會出現警告。說明：docs/building.md
+  MIPS_NIGHTLY_FALLBACK: nightly-2026-11-13
   # 容器映像檔（說明：docs/docker.md）
   IMAGE: ghcr.io/candy999/kuroshio-dns
 
@@ -105,11 +105,13 @@ jobs:
         if: ${{ !matrix.nightly }}
         with:
           targets: ${{ matrix.target }}
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@nightly
         if: ${{ matrix.nightly }}
         with:
-          toolchain: ${{ env.MIPS_NIGHTLY }}
           components: rust-src
+      - name: 備用的 nightly（最新的編不過時用）
+        if: ${{ matrix.nightly }}
+        run: rustup toolchain install "$MIPS_NIGHTLY_FALLBACK" --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -120,7 +122,10 @@ jobs:
           if [ "${{ matrix.nightly }}" = "true" ]; then
             # MIPS 的 static-pie 執行檔一啟動就 segfault：改成非 PIE 的靜態執行檔
             export RUSTFLAGS="-C relocation-model=static"
-            cargo zigbuild --release -p kuroshio --target ${{ matrix.target }} -Zbuild-std=std,panic_abort
+            if ! cargo +nightly zigbuild --release -p kuroshio --target ${{ matrix.target }} -Zbuild-std=std,panic_abort; then
+              echo "::warning::最新的 nightly 編不過，改用 $MIPS_NIGHTLY_FALLBACK"
+              cargo "+$MIPS_NIGHTLY_FALLBACK" zigbuild --release -p kuroshio --target ${{ matrix.target }} -Zbuild-std=std,panic_abort
+            fi
           else
             cargo zigbuild --release -p kuroshio --target ${{ matrix.target }}
           fi

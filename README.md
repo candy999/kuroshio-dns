@@ -317,7 +317,7 @@ cargo run -- query example.com -s 8.8.8.8
 ```sh
 pip install ziglang cargo-zigbuild
 cargo zigbuild --release -p kuroshio --target aarch64-unknown-linux-musl
-# MIPS（nightly 固定日期，同 CI 的 MIPS_NIGHTLY）
+# MIPS（nightly；這裡用 CI 的備用日期 MIPS_NIGHTLY_FALLBACK，用最新的 nightly 也可以）
 RUSTFLAGS="-C relocation-model=static" \
   cargo +nightly-2026-11-13 zigbuild --release -p kuroshio --target mipsel-unknown-linux-musl -Zbuild-std=std,panic_abort
 ```

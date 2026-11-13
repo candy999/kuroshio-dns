@@ -7,10 +7,10 @@
 | 用途 | 工具鏈 |
 |---|---|
 | 測試、x86_64 / aarch64 / armv7、Windows | Rust stable（最低 1.80） |
-| MIPS（`mipsel` / `mips`） | **固定日期的 nightly**＋`rust-src`，用 `-Zbuild-std` 自己編標準函式庫 |
+| MIPS（`mipsel` / `mips`） | **最新的 nightly**＋`rust-src`，用 `-Zbuild-std` 自己編標準函式庫；編不過時自動改用備用日期 |
 | Linux 各 CPU 的連結 | [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)（用 zig 當 C 編譯器與連結器，不必裝各 CPU 的 GCC） |
 
-為什麼 MIPS 要 nightly：MIPS 在 Rust 是 **tier 3**，官方不提供編好的標準函式庫（`rustup target add` 裝不到），只能用 nightly 才有的 `-Zbuild-std` 從原始碼編。nightly 每天都在變、偶爾會壞，所以 CI 固定在一個已知可以編、QEMU 測試也通過的日期，寫在 workflow 開頭的 `MIPS_NIGHTLY`（目前 `nightly-2026-11-13`）。
+為什麼 MIPS 要 nightly：MIPS 在 Rust 是 **tier 3**，官方不提供編好的標準函式庫（`rustup target add` 裝不到），只能用 nightly 才有的 `-Zbuild-std` 從原始碼編。CI 平常跟著最新的 nightly 編；nightly 偶爾會壞，最新的編不過時會自動改用 workflow 開頭 `MIPS_NIGHTLY_FALLBACK` 指定的、已知能編也通過 QEMU 測試的日期（目前 `nightly-2026-11-13`），日誌會出現警告。
 
 ## CI 怎麼編
 
@@ -19,7 +19,7 @@
 | 測試 | 主機（x86_64 Linux） | `cargo fmt --check`、`cargo clippy`、`cargo test`、shellcheck、設定頁 / 公開頁的 Playwright 測試 |
 | 執行檔 | `x86_64-unknown-linux-musl` | `cargo zigbuild --release -p kuroshio --target …`，直接執行測試 |
 | 執行檔 | `aarch64-unknown-linux-musl`、`armv7-unknown-linux-musleabihf` | 同上，用 QEMU user-mode 實際執行 |
-| 執行檔 | `mipsel-unknown-linux-musl`、`mips-unknown-linux-musl` | `MIPS_NIGHTLY` 的 nightly，`RUSTFLAGS="-C relocation-model=static"`（MIPS 的 static-pie 一啟動就 segfault），`-Zbuild-std=std,panic_abort`，用 QEMU 實際執行 |
+| 執行檔 | `mipsel-unknown-linux-musl`、`mips-unknown-linux-musl` | 最新的 nightly（編不過時用 `MIPS_NIGHTLY_FALLBACK`），`RUSTFLAGS="-C relocation-model=static"`（MIPS 的 static-pie 一啟動就 segfault），`-Zbuild-std=std,panic_abort`，用 QEMU 實際執行 |
 | Windows | `x86_64-pc-windows-msvc` | windows-latest 上 `cargo build --release -p kuroshio --features acme`（C 執行階段靜態連結，見 `.cargo/config.toml`），測服務、防火牆、IIS / HTTP.sys |
 | OpenWrt | 各套件架構 × 24.10 / 25.12 | 把上面的靜態執行檔交給 OpenWrt SDK 打包（不在 SDK 裡編 Rust），再在 OpenWrt 容器裡安裝測試、跑 LuCI |
 | 容器映像檔 | amd64（每次推送）；amd64 / arm64 / armv7（標籤） | 用上面的靜態執行檔 `docker build`，[`docker/test.sh`](../docker/test.sh) 測試；見 [Docker 使用說明](docker.md) |
@@ -68,7 +68,7 @@ qemu-mips-static    target/mips-unknown-linux-musl/release/kuroshio run -c /tmp/
 
 （`armv7` 用 `qemu-arm-static`。）裝了 `binfmt-support` 的話也可以直接 `./kuroshio` 執行。CI 的「用 QEMU 實際執行」那一步就是這樣測的，可以照著跑一遍。
 
-## 更新 MIPS 的 nightly
+## 更新備用的 nightly 日期
 
 1. 挑一個日期，先在自己電腦上試：
 
@@ -79,8 +79,8 @@ qemu-mips-static    target/mips-unknown-linux-musl/release/kuroshio run -c /tmp/
    qemu-mips-static target/mips-unknown-linux-musl/release/kuroshio query example.com -s 8.8.8.8
    ```
 
-2. 改 `.github/workflows/rust.yml` 開頭的 `MIPS_NIGHTLY`（只有這一個地方），連同註解裡的 rustc 版本，推送。
-3. 確認「執行檔 mipsel-unknown-linux-musl」「執行檔 mips-unknown-linux-musl」兩個工作都通過（編譯、QEMU 實際執行），日誌裡的 `rustc … -nightly` 是新的日期。
+2. 改 `.github/workflows/rust.yml` 開頭的 `MIPS_NIGHTLY_FALLBACK`（只有這一個地方），連同註解裡的 rustc 版本，推送。平常不用動它；最新的 nightly 編不過（日誌出現「改用 nightly-…」的警告）而且備用日期太舊時再更新。
+3. 確認「執行檔 mipsel-unknown-linux-musl」「執行檔 mips-unknown-linux-musl」兩個工作都通過（編譯、QEMU 實際執行）。
 4. 再跑一次完整的 OpenWrt 打包與實機測試（手動執行 workflow，`full` 打勾）比較保險。
 
 `nightly-YYYY-MM-DD` 是 rustup 發布的日期，裡面的 rustc 版本字串通常是前一天的 commit 日期（例如 `nightly-2026-11-13` 是 `rustc 1.102.0-nightly (8eb778d04 2026-11-12)`）。
