@@ -74,6 +74,8 @@
 @@||cbu-search-app.cn-shanghai.log.aliyuncs.com^
 @@||ali-ctf.cn-hangzhou.dualstack.log.aliyuncs.com^
 @@||ali-ctf-req.cn-hangzhou.dualstack.log.aliyuncs.com^
+# [解鎖原因] 蝦皮 App 的服務（HaGeZi Light 會擋）。
+@@||msdk.shopee.tw^
 # ==============================================================
 # 🗺️ 【地圖圖資、路況與 Google 時間軸】
 # ==============================================================
@@ -143,6 +145,9 @@
 @@||cxcs.microsoft.net^
 @@||gateway.bingviz.microsoftapp.net^
 @@||config.edge.skype.com^
+# [解鎖原因] crl 為 Windows 憑證撤銷清單（anti-AD 會擋，擋了可能讓 Windows 連線變慢）；presence 為 Microsoft Teams 上線狀態。
+@@||crl.microsoft.com^
+@@||presence.teams.live.com^
 # ==============================================================
 # 🔗 【動態連結、短網址與行銷跳轉 (防網頁空白)】
 # ==============================================================

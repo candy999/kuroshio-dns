@@ -4300,7 +4300,7 @@
 ["xv6hosts.example",65,"none"],
 ["例子.台灣",1,"none"],
 ["例子.台灣",65,"none"]]},
-{"name":"default-custom-rules","relaxedModifiers":false,"custom":[],"customFiles":["rules/default-custom-rules.txt"],"lists":[{"name":"selftest","category":"ads","enabled":true,"text":"! comment\n[Adblock Plus 2.0]\n||gs-loc.apple.com^\n||ads.example.com^\n||tracker.example.net^$important\n@@||good.ads.example.com^\n0.0.0.0 hosts-blocked.example.org\n||thirdparty.example.com^$third-party\n||example.org/ads/banner.js\nexample.com##.ad-banner\n||onlyaaaa.example.com^$dnstype=AAAA\n||bad.example.com^\n||bad.example.com^$badfilter\n|exact.example.com^\nplain-domain.example.com\n/^ad[0-9]+\\.regex\\.test$/\n||mmstat.com^"}],"stats":{"custom":210,"lists":10,"byCategory":{"ads":10},"skipped":2},
+{"name":"default-custom-rules","relaxedModifiers":false,"custom":[],"customFiles":["rules/default-custom-rules.txt"],"lists":[{"name":"selftest","category":"ads","enabled":true,"text":"! comment\n[Adblock Plus 2.0]\n||gs-loc.apple.com^\n||ads.example.com^\n||tracker.example.net^$important\n@@||good.ads.example.com^\n0.0.0.0 hosts-blocked.example.org\n||thirdparty.example.com^$third-party\n||example.org/ads/banner.js\nexample.com##.ad-banner\n||onlyaaaa.example.com^$dnstype=AAAA\n||bad.example.com^\n||bad.example.com^$badfilter\n|exact.example.com^\nplain-domain.example.com\n/^ad[0-9]+\\.regex\\.test$/\n||mmstat.com^"}],"stats":{"custom":213,"lists":10,"byCategory":{"ads":10},"skipped":2},
 "chains":[
 ["clean.example",["mal-cname.example"],1,null,null],
 ["clean.example",["ok.example","tele-cname.example","mal-cname.example"],1,null,null],
