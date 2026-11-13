@@ -156,7 +156,8 @@ jobs:
           $RUN query example.com -s https://cloudflare-dns.com/dns-query
           $RUN query example.com -s https://dns.google/dns-query
           # QUIC：DoQ / DoH3
-          $RUN query example.com -s quic://dns.adguard-dns.com
+          # 外部伺服器偶爾逾時：換一台再試（只要有一台通就代表 DoQ 在這種 CPU 上能用）
+          $RUN query example.com -s quic://dns.adguard-dns.com || $RUN query example.com -s quic://unfiltered.adguard-dns.com || $RUN query example.com -s quic://dns.nextdns.io
           $RUN query example.com -s h3://cloudflare-dns.com/dns-query || $RUN query example.com -s h3://dns.google/dns-query
           # 啟動伺服器，再用同一個執行檔查詢自己
           echo '{"listen":{"plain":{"binds":["127.0.0.1"],"port":5336}},"upstream":{"pinned":["udp://8.8.8.8","udp://1.1.1.1"]}}' > /tmp/k.json
@@ -229,7 +230,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           ./target/release/kuroshio.exe query example.com -s https://dns.google/dns-query
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          ./target/release/kuroshio.exe query example.com -s quic://dns.adguard-dns.com
+          ./target/release/kuroshio.exe query example.com -s quic://dns.adguard-dns.com || ./target/release/kuroshio.exe query example.com -s quic://unfiltered.adguard-dns.com || ./target/release/kuroshio.exe query example.com -s quic://dns.nextdns.io
           if ($LASTEXITCODE -ne 0) { exit 1 }
           '{"listen":{"plain":{"binds":["127.0.0.1"],"port":5336}},"upstream":{"pinned":["udp://8.8.8.8","udp://1.1.1.1"]}}' | Set-Content -Encoding utf8 k.json
           $p = Start-Process -PassThru -NoNewWindow ./target/release/kuroshio.exe -ArgumentList 'run','-c','k.json'
