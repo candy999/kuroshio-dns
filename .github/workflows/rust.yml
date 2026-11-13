@@ -28,7 +28,7 @@ jobs:
     name: 測試
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -47,9 +47,9 @@ jobs:
           shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/access.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/guard.sh openwrt/kuroshio/files/kuroshio.uci-defaults openwrt/install.sh
           shellcheck -s sh -e SC3043,SC2015,SC2086,SC1091 openwrt/tools/ci-smoke-kuroshio.sh openwrt/tools/ci-luci-setup.sh
           shellcheck docker/test.sh
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
       - name: LuCI 語法
         run: node openwrt/tools/check-luci.js luci-app-kuroshio
       # Windows 本機設定頁（data/admin）：debug 執行檔 + Playwright，腳本自己用暫存設定檔啟動 kuroshio
@@ -66,7 +66,7 @@ jobs:
         env:
           KUROSHIO_BIN: target/debug/kuroshio
           SHOTS: screenshots-admin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: admin-ui-screenshots
@@ -78,7 +78,7 @@ jobs:
         env:
           KUROSHIO_BIN: target/debug/kuroshio
           SHOTS: screenshots-site
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: site-screenshots
@@ -100,7 +100,7 @@ jobs:
           - { target: mipsel-unknown-linux-musl,      qemu: qemu-mipsel, nightly: true }
           - { target: mips-unknown-linux-musl,        qemu: qemu-mips,   nightly: true }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ !matrix.nightly }}
         with:
@@ -180,7 +180,7 @@ jobs:
           $RUN sysinfo -c /tmp/tiny.json | tee /tmp/sysinfo.txt
           grep -q '記憶體保留量' /tmp/sysinfo.txt
           grep -q '依 CPU 核心數換算的設定' /tmp/sysinfo.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/kuroshio
@@ -195,7 +195,7 @@ jobs:
           cp linux/README.txt dist/kuroshio/README-linux.txt
           tar -C dist --owner=0 --group=0 --numeric-owner -czf dist/kuroshio-linux-${{ matrix.target }}.tar.gz kuroshio
           tar -tvzf dist/kuroshio-linux-${{ matrix.target }}.tar.gz | sed -n "1,5p"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kuroshio-linux-${{ matrix.target }}
           path: dist/kuroshio-linux-${{ matrix.target }}.tar.gz
@@ -205,7 +205,7 @@ jobs:
     needs: test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 測試
@@ -432,7 +432,7 @@ jobs:
           Copy-Item -Recurse data dist/kuroshio/data
           Copy-Item rules/default-custom-rules.txt dist/kuroshio/data/
           Compress-Archive dist/kuroshio dist/kuroshio-windows-x86_64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kuroshio-windows-x86_64
           path: dist/kuroshio-windows-x86_64.zip
@@ -443,8 +443,8 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: bin-x86_64-unknown-linux-musl
           path: docker/bin/amd64
@@ -493,8 +493,8 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: bin-${{ matrix.target }}
           path: prebuilt/${{ matrix.arch }}
@@ -518,7 +518,7 @@ jobs:
           cp openwrt/install.sh openwrt/README-install.txt dist/
           printf 'ARCH=%s\nOPENWRT=%s\n' "${{ matrix.sdk }}" "${{ matrix.release }}" > dist/PACKAGE_INFO
           ls -la dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kuroshio-openwrt-${{ matrix.release }}-${{ matrix.sdk }}
           path: dist/*
@@ -532,8 +532,8 @@ jobs:
       matrix:
         release: [ '24.10', '25.12' ]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: kuroshio-openwrt-${{ matrix.release }}-x86_64
           path: pkgs
@@ -551,8 +551,8 @@ jobs:
       matrix:
         release: [ '24.10', '25.12' ]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: kuroshio-openwrt-${{ matrix.release }}-x86_64
           path: pkgs
@@ -560,9 +560,9 @@ jobs:
         run: |
           docker run -d --name owrt -p 8080:80 -v "$PWD:/src" -v "$PWD/pkgs:/pkgs" openwrt/rootfs:x86_64-openwrt-${{ matrix.release }} /bin/sh -c 'sleep infinity'
           docker exec owrt /bin/sh /src/openwrt/tools/ci-luci-setup.sh kuroshio
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
       - name: Playwright
         run: |
           npm i --no-save playwright@1.48.2
@@ -576,7 +576,7 @@ jobs:
       - name: uhttpd 紀錄
         if: always()
         run: docker exec owrt cat /tmp/uhttpd.log || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: luci-kuroshio-screenshots-${{ matrix.release }}
@@ -593,8 +593,8 @@ jobs:
       id-token: write      # 建置來源證明（attestation）
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: art
       - name: 整理
@@ -609,7 +609,7 @@ jobs:
           ( cd dist && sha256sum * > SHA256SUMS )
           ls -la dist
       # 驗證：gh attestation verify <檔案> --repo candy999/kuroshio-dns
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
       # 容器映像檔（三種 CPU）：用同一批靜態執行檔，映像檔裡不編譯
@@ -627,14 +627,14 @@ jobs:
           cp art/bin-x86_64-unknown-linux-musl/kuroshio docker/bin/amd64/
           cp art/bin-aarch64-unknown-linux-musl/kuroshio docker/bin/arm64/
           cp art/bin-armv7-unknown-linux-musleabihf/kuroshio docker/bin/armv7/
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
@@ -643,12 +643,12 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           push: true
       # 驗證：gh attestation verify oci://ghcr.io/candy999/kuroshio-dns:<版本> --repo candy999/kuroshio-dns
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: dist/*
