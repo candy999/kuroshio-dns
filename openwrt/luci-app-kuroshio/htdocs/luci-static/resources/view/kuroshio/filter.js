@@ -226,13 +226,27 @@ return view.extend({
 			var box = E('div', { 'id': 'kuroshio-restore-summary' });
 			var plan = null;
 			var okBtn = E('button', { 'class': 'btn cbi-button-negative', 'id': 'kuroshio-restore-confirm', 'click': ui.createHandlerFn(this, function() {
+				if (!plan) return;
 				ui.hideModal();
 				return applyRestore(m, cur, plan);
 			}) }, _('恢復預設清單'));
 			var draw = function() {
-				plan = common.restorePlan(cur, defs, own.checked);
-				dom.content(box, common.restoreSummary(plan.changes));
-				okBtn.disabled = !plan.changes.count;
+				// 瀏覽器還在用升級前快取的 common.js（沒有這兩個函式）：說清楚原因，不要讓按鈕按了沒反應
+				if (typeof common.restorePlan !== 'function' || typeof common.restoreSummary !== 'function') {
+					plan = null;
+					okBtn.disabled = true;
+					dom.content(box, E('p', { 'class': 'alert-message warning' }, _('瀏覽器還在用升級前的介面檔案（快取）。請按 Ctrl+F5（Mac 是 Cmd+Shift+R）強制重新整理這一頁再試一次。')));
+					return;
+				}
+				try {
+					plan = common.restorePlan(cur, defs, own.checked);
+					dom.content(box, common.restoreSummary(plan.changes));
+					okBtn.disabled = !plan.changes.count;
+				} catch (e) {
+					plan = null;
+					okBtn.disabled = true;
+					dom.content(box, E('p', { 'class': 'alert-message error' }, _('無法比對目前的清單：%s').format(e && e.message || e)));
+				}
 			};
 			own.addEventListener('change', draw);
 			ui.showModal(_('恢復預設清單'), [
