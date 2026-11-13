@@ -33,22 +33,35 @@ fn bind_socket(addr: SocketAddr, ty: Type, proto: Protocol) -> Result<Socket> {
 impl Server {
     /// `open` = 不檢查來源（綁在 ULA 上：外網連不進來，劫持來的查詢常用公網位址當來源）
     pub async fn listen(self: &Arc<Self>, addr: SocketAddr, open: bool) -> Result<Vec<SocketAddr>> {
-        // port 0（測試）：TCP 用 UDP 實際拿到的埠；那個 TCP 埠剛好被占用時換一個再試
-        let mut tries = if addr.port() == 0 { 8 } else { 1 };
+        // port 0（測試）：UDP 與 TCP 要同一個埠號。先讓其中一邊拿系統配的埠，再用同一個號碼綁另一邊；
+        // 剛好被占用就換一個再試。兩種順序輪流：Windows 常把整段 TCP 埠號保留給 Hyper-V 等元件
+        // （netsh int ipv4 show excludedportrange protocol=tcp），只用「UDP 先」可能連續好幾次都落在保留範圍裡
+        let mut tries = if addr.port() == 0 { 32 } else { 1 };
+        let mut udp_first = true;
         let (udp, ts) = loop {
-            let udp = UdpSocket::from_std(
-                bind_socket(addr, Type::DGRAM, Protocol::UDP)
-                    .with_context(|| format!("UDP 綁定 {addr} 失敗"))?
-                    .into(),
-            )?;
-            let tcp_addr = SocketAddr::new(addr.ip(), udp.local_addr()?.port());
-            match bind_socket(tcp_addr, Type::STREAM, Protocol::TCP) {
-                Ok(ts) => break (udp, ts),
+            let attempt = if udp_first {
+                let us = bind_socket(addr, Type::DGRAM, Protocol::UDP).with_context(|| format!("UDP 綁定 {addr} 失敗"))?;
+                let port = us.local_addr()?.as_socket().map(|a| a.port()).unwrap_or(0);
+                let tcp_addr = SocketAddr::new(addr.ip(), port);
+                bind_socket(tcp_addr, Type::STREAM, Protocol::TCP)
+                    .map(|ts| (us, ts))
+                    .with_context(|| format!("TCP 綁定 {tcp_addr} 失敗"))
+            } else {
+                let ts = bind_socket(addr, Type::STREAM, Protocol::TCP).with_context(|| format!("TCP 綁定 {addr} 失敗"))?;
+                let port = ts.local_addr()?.as_socket().map(|a| a.port()).unwrap_or(0);
+                let udp_addr = SocketAddr::new(addr.ip(), port);
+                bind_socket(udp_addr, Type::DGRAM, Protocol::UDP)
+                    .map(|us| (us, ts))
+                    .with_context(|| format!("UDP 綁定 {udp_addr} 失敗"))
+            };
+            match attempt {
+                Ok((us, ts)) => break (UdpSocket::from_std(us.into())?, ts),
                 Err(e) => {
                     tries -= 1;
                     if tries == 0 {
-                        return Err(e.context(format!("TCP 綁定 {tcp_addr} 失敗")));
+                        return Err(e);
                     }
+                    udp_first = !udp_first;
                 }
             }
         };
