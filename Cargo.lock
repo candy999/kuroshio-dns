@@ -1044,7 +1044,6 @@ name = "kuroshio-config"
 version = "3.1.0"
 dependencies = [
  "anyhow",
- "serde",
  "serde_json",
 ]
 

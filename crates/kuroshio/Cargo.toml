@@ -52,8 +52,10 @@ ring = "0.17"
 # 備份檔（.kuroshio）：zstd 壓縮的 JSON，二進位檔用 base64
 zstd = { version = "0.13", default-features = false }
 base64 = "0.22"
-# 列出本機網卡與位址（多網卡 / 多出口的 DDNS）：Unix 用 getifaddrs、Windows 用 GetAdaptersAddresses；
-# 只依賴 libc / windows-sys（本來就在相依樹裡）
+
+[target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
+# 列出本機網卡與位址（多網卡 / 多出口的 DDNS）：Windows 用 GetAdaptersAddresses、BSD / macOS 用 getifaddrs；
+# 只依賴 libc / windows-sys（本來就在相依樹裡）。Linux / Android 不用它（netif.rs 改讀 ioctl 與 /proc，見那裡的說明）
 if-addrs = "0.15"
 
 [target.'cfg(unix)'.dependencies]
