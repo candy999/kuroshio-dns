@@ -71,8 +71,32 @@ config filter 'filter'
 
 config filter_list
 	option enabled '1'
-	option name 'EasyList China'
-	option url 'https://easylist-downloads.adblockplus.org/easylistchina.txt'
+	option name 'FutaGuard TW165（台灣 165 反詐騙）'
+	option url 'https://filter.futa.gg/TW165_abp.txt'
+	option category 'malware'
+
+config filter_list
+	option enabled '1'
+	option name 'FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）'
+	option url 'https://filter.futa.gg/TWNIC-RPZ_abp.txt'
+	option category 'malware'
+
+config filter_list
+	option enabled '1'
+	option name 'HaGeZi TIF 精簡版（威脅情資）'
+	option url 'https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.mini.txt'
+	option category 'malware'
+
+config filter_list
+	option enabled '0'
+	option name 'FutaGuard 新註冊網域（7 天，誤擋風險高）'
+	option url 'https://filter.futa.gg/nrd/past-07day_abp.txt'
+	option category 'malware'
+
+config filter_list
+	option enabled '1'
+	option name 'FutaGuard LowTechHost（台灣廣告）'
+	option url 'https://filter.futa.gg/hosts_abp.txt'
 	option category 'ads'
 
 config filter_list
@@ -83,14 +107,20 @@ config filter_list
 
 config filter_list
 	option enabled '1'
-	option name 'FutaGuard LowTechHost（台灣廣告）'
-	option url 'https://filter.futa.gg/hosts_abp.txt'
+	option name 'EasyList China'
+	option url 'https://easylist-downloads.adblockplus.org/easylistchina.txt'
 	option category 'ads'
 
 config filter_list
-	option enabled '0'
-	option name 'blocklistproject tracking'
-	option url 'https://raw.githubusercontent.com/blocklistproject/Lists/master/tracking.txt'
+	option enabled '1'
+	option name 'OISD small'
+	option url 'https://small.oisd.nl/'
+	option category 'ads'
+
+config filter_list
+	option enabled '1'
+	option name 'HaGeZi Light'
+	option url 'https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/light.txt'
 	option category 'ads'
 
 config filter_list
@@ -102,13 +132,7 @@ config filter_list
 config filter_list
 	option enabled '1'
 	option name 'a-dove-is-dumb（Adobe 遙測）'
-	option url 'https://raw.githubusercontent.com/ignaciocastro/a-dove-is-dumb/main/list.txt'
-	option category 'telemetry'
-
-config filter_list
-	option enabled '1'
-	option name 'Ruddernation（Adobe 驗證）'
-	option url 'https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts'
+	option url 'https://a.dove.isdumb.one/cdn'
 	option category 'telemetry'
 
 config filter_list
@@ -119,27 +143,9 @@ config filter_list
 
 config filter_list
 	option enabled '0'
-	option name 'blocklistproject adobe（會擋 Adobe 登入）'
-	option url 'https://raw.githubusercontent.com/blocklistproject/Lists/master/adobe.txt'
+	option name 'Ruddernation（Adobe 驗證，會擋 Adobe 正版啟用）'
+	option url 'https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts'
 	option category 'telemetry'
-
-config filter_list
-	option enabled '1'
-	option name 'FutaGuard TW165（台灣 165 反詐騙）'
-	option url 'https://filter.futa.gg/TW165_abp.txt'
-	option category 'malware'
-
-config filter_list
-	option enabled '0'
-	option name 'HaGeZi'\''s Threat Intelligence Feeds'
-	option url 'https://adguardteam.github.io/HostlistsRegistry/assets/filter_44.txt'
-	option category 'malware'
-
-config filter_list
-	option enabled '0'
-	option name 'FutaGuard 新註冊網域（7 天，誤擋風險高）'
-	option url 'https://filter.futa.gg/nrd/past-07day_abp.txt'
-	option category 'malware'
 
 config cdn 'cdn'
 	option enabled '1'

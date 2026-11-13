@@ -37,6 +37,133 @@ done
 uci -q get kuroshio.system.profile >/dev/null || uci set kuroshio.system.profile='auto'
 uci commit kuroshio
 
+# 3.2：預設過濾清單更新。/etc/config/kuroshio 升級時會保留舊的，所以在這裡搬：
+# 只動「跟 3.1.x 預設值完全相同」（啟用、分類、網址、名稱都沒改，也沒有其他選項）的項目，使用者改過的一律不動。
+# 做完記在 main.lists_version，之後不再重做（使用者之後刪掉的清單不會被加回來）
+L_EASYLIST='https://easylist-downloads.adblockplus.org/easylistchina.txt'
+L_ANTIAD='https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt'
+L_LOWTECH='https://filter.futa.gg/hosts_abp.txt'
+L_TRACKING='https://raw.githubusercontent.com/blocklistproject/Lists/master/tracking.txt'
+L_FARM='https://danny0838.github.io/content-farm-terminator/files/blocklist/content-farms.txt'
+L_DOVE_OLD='https://raw.githubusercontent.com/ignaciocastro/a-dove-is-dumb/main/list.txt'
+L_DOVE='https://a.dove.isdumb.one/cdn'
+L_RUDDER='https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts'
+L_SMARTTV='https://raw.githubusercontent.com/blocklistproject/Lists/master/smart-tv.txt'
+L_ADOBE='https://raw.githubusercontent.com/blocklistproject/Lists/master/adobe.txt'
+L_TW165='https://filter.futa.gg/TW165_abp.txt'
+L_TIF_FULL='https://adguardteam.github.io/HostlistsRegistry/assets/filter_44.txt'
+L_TIF='https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.mini.txt'
+L_NRD='https://filter.futa.gg/nrd/past-07day_abp.txt'
+L_TWNIC='https://filter.futa.gg/TWNIC-RPZ_abp.txt'
+L_OISD='https://small.oisd.nl/'
+L_LIGHT='https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/light.txt'
+
+# 3.1.x 預設清單的順序（第幾份）；不是舊預設的網址印空字串
+old_list_pos() {
+	case "$1" in
+	"$L_EASYLIST") echo 1 ;; "$L_ANTIAD") echo 2 ;; "$L_LOWTECH") echo 3 ;; "$L_TRACKING") echo 4 ;;
+	"$L_FARM") echo 5 ;; "$L_DOVE_OLD") echo 6 ;; "$L_RUDDER") echo 7 ;; "$L_SMARTTV") echo 8 ;;
+	"$L_ADOBE") echo 9 ;; "$L_TW165") echo 10 ;; "$L_TIF_FULL") echo 11 ;; "$L_NRD") echo 12 ;;
+	esac
+}
+
+# 全部 filter_list 區段（依設定檔裡的順序）
+filter_list_sections() {
+	uci -X show kuroshio 2>/dev/null | sed -n 's/^kuroshio\.\([^.=]*\)=filter_list$/\1/p'
+}
+
+# 第一個網址等於 $1 的 filter_list 區段
+filter_list_by_url() {
+	for _s in $(filter_list_sections); do
+		[ "$(uci -q get "kuroshio.$_s.url")" = "$1" ] && echo "$_s" && return 0
+	done
+	return 1
+}
+
+add_filter_list() { # add_filter_list <啟用> <名稱> <網址> <分類>
+	filter_list_by_url "$3" >/dev/null && return 0
+	_s=$(uci add kuroshio filter_list) || return 0
+	uci set "kuroshio.$_s.enabled=$1"
+	uci set "kuroshio.$_s.name=$2"
+	uci set "kuroshio.$_s.url=$3"
+	uci set "kuroshio.$_s.category=$4"
+	lists_log="$lists_log；新增「$2」"
+}
+
+if [ "$(uci -q get kuroshio.main.lists_version)" != '3.2' ]; then
+	lists_log=''
+	# 順序沒被調整過（LuCI 可以拖曳排序）才重新排序：舊預設清單維持原本的先後，
+	# 自己加的清單都在它們後面（新增的清單本來就加在最後）
+	lists_sorted=1
+	last=0
+	other=0
+	for s in $(filter_list_sections); do
+		p=$(old_list_pos "$(uci -q get "kuroshio.$s.url")")
+		if [ -z "$p" ]; then
+			other=1
+		elif [ "$other" = 1 ] || [ "$p" -le "$last" ]; then
+			lists_sorted=0
+			break
+		else
+			last=$p
+		fi
+	done
+	for s in $(filter_list_sections); do
+		# 有啟用、名稱、網址、分類以外的選項（例如 protect）就算改過
+		uci -X show "kuroshio.$s" | grep -qvE "^kuroshio\.$s(=|\.(enabled|name|url|category)=)" && continue
+		en=$(uci -q get "kuroshio.$s.enabled")
+		key="${en:-1}|$(uci -q get "kuroshio.$s.category")|$(uci -q get "kuroshio.$s.url")|$(uci -q get "kuroshio.$s.name")"
+		case "$key" in
+		"1|telemetry|$L_RUDDER|Ruddernation（Adobe 驗證）")
+			uci set "kuroshio.$s.enabled=0"
+			uci set "kuroshio.$s.name=Ruddernation（Adobe 驗證，會擋 Adobe 正版啟用）"
+			lists_log="$lists_log；Ruddernation 改成預設停用（會擋 Adobe 正版啟用）"
+			;;
+		"1|telemetry|$L_DOVE_OLD|a-dove-is-dumb（Adobe 遙測）")
+			uci set "kuroshio.$s.url=$L_DOVE"
+			lists_log="$lists_log；a-dove-is-dumb 改用官方 CDN 網址"
+			;;
+		"0|malware|$L_TIF_FULL|HaGeZi's Threat Intelligence Feeds")
+			uci set "kuroshio.$s.enabled=1"
+			uci set "kuroshio.$s.name=HaGeZi TIF 精簡版（威脅情資）"
+			uci set "kuroshio.$s.url=$L_TIF"
+			lists_log="$lists_log；HaGeZi TIF 完整版換成精簡版並啟用"
+			;;
+		"0|ads|$L_TRACKING|blocklistproject tracking")
+			uci delete "kuroshio.$s"
+			lists_log="$lists_log；移除 blocklistproject tracking"
+			;;
+		"0|telemetry|$L_ADOBE|blocklistproject adobe（會擋 Adobe 登入）")
+			uci delete "kuroshio.$s"
+			lists_log="$lists_log；移除 blocklistproject adobe"
+			;;
+		esac
+	done
+	add_filter_list 1 'FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）' "$L_TWNIC" malware
+	add_filter_list 1 'OISD small' "$L_OISD" ads
+	add_filter_list 1 'HaGeZi Light' "$L_LIGHT" ads
+	uci commit kuroshio
+	# 依新的預設順序排列（排在原本第一份清單的位置；不是預設網址的清單照原本的相對順序接在後面）
+	if [ "$lists_sorted" = 1 ]; then
+		pos=0
+		for s in $(uci -X show kuroshio 2>/dev/null | sed -n 's/^kuroshio\.\([^.=]*\)=\(.*\)$/\1=\2/p'); do
+			[ "${s#*=}" = filter_list ] && break
+			pos=$((pos + 1))
+		done
+		for u in "$L_TW165" "$L_TWNIC" "$L_TIF" "$L_NRD" "$L_LOWTECH" "$L_ANTIAD" "$L_EASYLIST" "$L_OISD" "$L_LIGHT" \
+			"$L_FARM" "$L_DOVE" "$L_SMARTTV" "$L_RUDDER"; do
+			s=$(filter_list_by_url "$u") || continue
+			uci reorder "kuroshio.$s=$pos"
+			pos=$((pos + 1))
+		done
+	else
+		lists_log="$lists_log；清單順序是自己調整過的，不重新排序"
+	fi
+	uci set kuroshio.main.lists_version='3.2'
+	uci commit kuroshio
+	[ -n "$lists_log" ] && logger -t kuroshio "預設過濾清單已更新（只改沒動過的預設項目）：${lists_log#；}"
+fi
+
 # 使用者自己加的評測名單（程式附帶的預設名單會自動一起使用，不複製，升級時才會更新）
 mkdir -p /etc/kuroshio/benchmark
 for f in iplist.txt dohlist.txt dotlist.txt doqlist.txt web.txt blacklist.txt; do

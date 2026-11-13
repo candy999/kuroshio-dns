@@ -94,7 +94,10 @@ fn custom_values_exchange_mode() {
         lists.last().unwrap(),
         &json!({ "url": "https://example.com/my.txt", "category": "malware", "name": "My" })
     );
-    assert!(!lists.iter().any(|l| l["name"] == "EasyList China"), "停用的清單不載入");
+    assert!(
+        !lists.iter().any(|l| l["url"] == "https://filter.futa.gg/TW165_abp.txt"),
+        "停用的清單不載入"
+    );
     assert_eq!(g(&c, "jobs.cdn-scan.enabled"), &json!(false));
     assert_eq!(g(&c, "jobs.cdn-scan.at"), &json!(["02:00", "14:00"]));
     assert_eq!(g(&c, "jobs.cdn-scan.weekdays"), &json!([3, 6]));

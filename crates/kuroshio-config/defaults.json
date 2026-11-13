@@ -182,14 +182,25 @@
     ],
     "lists": [
       {
-        "url": "https://easylist-downloads.adblockplus.org/easylistchina.txt",
-        "category": "ads",
-        "name": "EasyList China"
+        "url": "https://filter.futa.gg/TW165_abp.txt",
+        "category": "malware",
+        "name": "FutaGuard TW165（台灣 165 反詐騙）"
       },
       {
-        "url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt",
-        "category": "ads",
-        "name": "CHN: anti-AD"
+        "url": "https://filter.futa.gg/TWNIC-RPZ_abp.txt",
+        "category": "malware",
+        "name": "FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）"
+      },
+      {
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.mini.txt",
+        "category": "malware",
+        "name": "HaGeZi TIF 精簡版（威脅情資）"
+      },
+      {
+        "url": "https://filter.futa.gg/nrd/past-07day_abp.txt",
+        "category": "malware",
+        "name": "FutaGuard 新註冊網域（7 天，誤擋風險高）",
+        "enabled": false
       },
       {
         "url": "https://filter.futa.gg/hosts_abp.txt",
@@ -197,10 +208,24 @@
         "name": "FutaGuard LowTechHost（台灣廣告）"
       },
       {
-        "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/tracking.txt",
+        "url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt",
         "category": "ads",
-        "name": "blocklistproject tracking",
-        "enabled": false
+        "name": "CHN: anti-AD"
+      },
+      {
+        "url": "https://easylist-downloads.adblockplus.org/easylistchina.txt",
+        "category": "ads",
+        "name": "EasyList China"
+      },
+      {
+        "url": "https://small.oisd.nl/",
+        "category": "ads",
+        "name": "OISD small"
+      },
+      {
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/light.txt",
+        "category": "ads",
+        "name": "HaGeZi Light"
       },
       {
         "url": "https://danny0838.github.io/content-farm-terminator/files/blocklist/content-farms.txt",
@@ -209,14 +234,9 @@
         "enabled": false
       },
       {
-        "url": "https://raw.githubusercontent.com/ignaciocastro/a-dove-is-dumb/main/list.txt",
+        "url": "https://a.dove.isdumb.one/cdn",
         "category": "telemetry",
         "name": "a-dove-is-dumb（Adobe 遙測）"
-      },
-      {
-        "url": "https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts",
-        "category": "telemetry",
-        "name": "Ruddernation（Adobe 驗證）"
       },
       {
         "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/smart-tv.txt",
@@ -224,26 +244,9 @@
         "name": "blocklistproject smart-tv（電視遙測）"
       },
       {
-        "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/adobe.txt",
+        "url": "https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts",
         "category": "telemetry",
-        "name": "blocklistproject adobe（會擋 Adobe 登入）",
-        "enabled": false
-      },
-      {
-        "url": "https://filter.futa.gg/TW165_abp.txt",
-        "category": "malware",
-        "name": "FutaGuard TW165（台灣 165 反詐騙）"
-      },
-      {
-        "url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_44.txt",
-        "category": "malware",
-        "name": "HaGeZi's Threat Intelligence Feeds",
-        "enabled": false
-      },
-      {
-        "url": "https://filter.futa.gg/nrd/past-07day_abp.txt",
-        "category": "malware",
-        "name": "FutaGuard 新註冊網域（7 天，誤擋風險高）",
+        "name": "Ruddernation（Adobe 驗證，會擋 Adobe 正版啟用）",
         "enabled": false
       }
     ],

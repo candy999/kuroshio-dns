@@ -105,6 +105,44 @@ pub fn legacy_keys(user: &Value) -> Vec<String> {
     v
 }
 
+/// 3.1.x 的預設過濾清單（`filter.lists`）。設定頁存檔時可能把整份清單寫進使用者設定；
+/// 跟這份完全相同（同樣的項目、同樣的順序）就是使用者沒動過，載入時換成新的預設清單（[`old_default_lists`]）
+pub const OLD_DEFAULT_LISTS_3_1: &str = r#"[
+    {"url": "https://easylist-downloads.adblockplus.org/easylistchina.txt", "category": "ads", "name": "EasyList China"},
+    {"url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt", "category": "ads", "name": "CHN: anti-AD"},
+    {"url": "https://filter.futa.gg/hosts_abp.txt", "category": "ads", "name": "FutaGuard LowTechHost（台灣廣告）"},
+    {"url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/tracking.txt", "category": "ads", "name": "blocklistproject tracking", "enabled": false},
+    {"url": "https://danny0838.github.io/content-farm-terminator/files/blocklist/content-farms.txt", "category": "ads", "name": "內容農場終結者", "enabled": false},
+    {"url": "https://raw.githubusercontent.com/ignaciocastro/a-dove-is-dumb/main/list.txt", "category": "telemetry", "name": "a-dove-is-dumb（Adobe 遙測）"},
+    {"url": "https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts", "category": "telemetry", "name": "Ruddernation（Adobe 驗證）"},
+    {"url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/smart-tv.txt", "category": "telemetry", "name": "blocklistproject smart-tv（電視遙測）"},
+    {"url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/adobe.txt", "category": "telemetry", "name": "blocklistproject adobe（會擋 Adobe 登入）", "enabled": false},
+    {"url": "https://filter.futa.gg/TW165_abp.txt", "category": "malware", "name": "FutaGuard TW165（台灣 165 反詐騙）"},
+    {"url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_44.txt", "category": "malware", "name": "HaGeZi's Threat Intelligence Feeds", "enabled": false},
+    {"url": "https://filter.futa.gg/nrd/past-07day_abp.txt", "category": "malware", "name": "FutaGuard 新註冊網域（7 天，誤擋風險高）", "enabled": false}
+]"#;
+
+/// 比對用：`enabled` 沒寫等於 `true`（拿掉 `"enabled": true`）；欄位順序本來就不影響比較
+fn list_entry_key(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(m) = v.as_object_mut() {
+        if m.get("enabled") == Some(&Value::Bool(true)) {
+            m.remove("enabled");
+        }
+    }
+    v
+}
+
+/// 使用者設定裡的 `filter.lists` 是不是 3.1.x 的預設清單原封不動（[`OLD_DEFAULT_LISTS_3_1`]）。
+/// 是的話 [`build`] 會換成新的預設清單；啟動時用這個判斷要不要記一行說明
+pub fn old_default_lists(user: &Value) -> bool {
+    let Some(Value::Array(lists)) = get(user, "filter.lists") else {
+        return false;
+    };
+    let old: Vec<Value> = serde_json::from_str(OLD_DEFAULT_LISTS_3_1).expect("OLD_DEFAULT_LISTS_3_1 格式錯誤");
+    lists.len() == old.len() && lists.iter().zip(&old).all(|(a, b)| list_entry_key(a) == list_entry_key(b))
+}
+
 /// 內建預設值 → 使用者設定 → 綁定網域補齊（`normalize`）→ `"auto"` 換算（這台機器的核心數）
 pub fn build(user: &Value) -> Value {
     build_for(&Host::detect(), user)
@@ -114,6 +152,15 @@ pub fn build(user: &Value) -> Value {
 pub fn build_for(host: &Host, user: &Value) -> Value {
     let mut cfg = defaults();
     merge(&mut cfg, user);
+    if old_default_lists(user) {
+        // 舊版預設清單沒動過：用新的預設清單（設定檔本身不改寫）
+        if let (Some(slot), Some(new)) = (
+            cfg.get_mut("filter").and_then(|f| f.get_mut("lists")),
+            get(&defaults(), "filter.lists").cloned(),
+        ) {
+            *slot = new;
+        }
+    }
     normalize(&mut cfg);
     derive_auto(&mut cfg, host);
     cfg
@@ -474,5 +521,72 @@ mod tests {
     fn load_missing_file_gives_defaults() {
         let v = load_file(Path::new("/nonexistent/kuroshio.json")).unwrap();
         assert_eq!(v, build(&json!({})));
+    }
+
+    fn old_lists() -> Vec<Value> {
+        serde_json::from_str(OLD_DEFAULT_LISTS_3_1).unwrap()
+    }
+
+    #[test]
+    fn old_default_lists_are_replaced() {
+        let new = get(&defaults(), "filter.lists").unwrap().clone();
+        assert_ne!(Value::Array(old_lists()), new);
+        // 原封不動的舊預設清單 → 新的預設清單；其他過濾設定照樣保留
+        let user = json!({ "filter": { "lists": old_lists(), "updateIntervalHours": 12 } });
+        assert!(old_default_lists(&user));
+        let c = build(&user);
+        assert_eq!(get(&c, "filter.lists"), Some(&new));
+        assert_eq!(get(&c, "filter.updateIntervalHours"), Some(&json!(12)));
+        // 設定頁存檔的寫法：明確寫 "enabled": true、欄位順序不同，一樣算沒動過
+        let saved: Vec<Value> = old_lists()
+            .into_iter()
+            .map(|l| {
+                let mut m = serde_json::Map::new();
+                m.insert("enabled".into(), l.get("enabled").cloned().unwrap_or(json!(true)));
+                for k in ["name", "category", "url"] {
+                    m.insert(k.into(), l[k].clone());
+                }
+                Value::Object(m)
+            })
+            .collect();
+        let user = json!({ "filter": { "lists": saved } });
+        assert!(old_default_lists(&user));
+        assert_eq!(get(&build(&user), "filter.lists"), Some(&new));
+    }
+
+    #[test]
+    fn modified_lists_are_kept() {
+        let keep = |lists: Vec<Value>| {
+            let user = json!({ "filter": { "lists": lists.clone() } });
+            assert!(!old_default_lists(&user));
+            assert_eq!(get(&build(&user), "filter.lists"), Some(&Value::Array(lists)));
+        };
+        // 改了一個網址
+        let mut a = old_lists();
+        a[0]["url"] = json!("https://example.com/my-easylist.txt");
+        keep(a);
+        // 切換了一個啟用狀態（打開本來關閉的、關掉本來打開的）
+        let mut b = old_lists();
+        b[3]["enabled"] = json!(true);
+        keep(b);
+        let mut c = old_lists();
+        c[6]["enabled"] = json!(false);
+        keep(c);
+        // 加了保護旗標、少一份、多一份、換順序
+        let mut d = old_lists();
+        d[9]["protect"] = json!(true);
+        keep(d);
+        let mut e = old_lists();
+        e.pop();
+        keep(e);
+        let mut f = old_lists();
+        f.push(json!({ "url": "https://example.com/a.txt", "category": "ads", "name": "A" }));
+        keep(f);
+        let mut g = old_lists();
+        g.swap(0, 1);
+        keep(g);
+        // 沒寫 filter.lists：直接用新的預設清單
+        assert!(!old_default_lists(&json!({})));
+        assert_eq!(get(&build(&json!({})), "filter.lists"), get(&defaults(), "filter.lists"));
     }
 }

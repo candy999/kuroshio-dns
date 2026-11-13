@@ -131,9 +131,24 @@
     "enabled": true,
     "lists": [
       {
+        "category": "malware",
+        "name": "FutaGuard TW165（台灣 165 反詐騙）",
+        "url": "https://filter.futa.gg/TW165_abp.txt"
+      },
+      {
+        "category": "malware",
+        "name": "FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）",
+        "url": "https://filter.futa.gg/TWNIC-RPZ_abp.txt"
+      },
+      {
+        "category": "malware",
+        "name": "HaGeZi TIF 精簡版（威脅情資）",
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.mini.txt"
+      },
+      {
         "category": "ads",
-        "name": "EasyList China",
-        "url": "https://easylist-downloads.adblockplus.org/easylistchina.txt"
+        "name": "FutaGuard LowTechHost（台灣廣告）",
+        "url": "https://filter.futa.gg/hosts_abp.txt"
       },
       {
         "category": "ads",
@@ -142,28 +157,28 @@
       },
       {
         "category": "ads",
-        "name": "FutaGuard LowTechHost（台灣廣告）",
-        "url": "https://filter.futa.gg/hosts_abp.txt"
+        "name": "EasyList China",
+        "url": "https://easylist-downloads.adblockplus.org/easylistchina.txt"
+      },
+      {
+        "category": "ads",
+        "name": "OISD small",
+        "url": "https://small.oisd.nl/"
+      },
+      {
+        "category": "ads",
+        "name": "HaGeZi Light",
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/light.txt"
       },
       {
         "category": "telemetry",
         "name": "a-dove-is-dumb（Adobe 遙測）",
-        "url": "https://raw.githubusercontent.com/ignaciocastro/a-dove-is-dumb/main/list.txt"
-      },
-      {
-        "category": "telemetry",
-        "name": "Ruddernation（Adobe 驗證）",
-        "url": "https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts"
+        "url": "https://a.dove.isdumb.one/cdn"
       },
       {
         "category": "telemetry",
         "name": "blocklistproject smart-tv（電視遙測）",
         "url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/smart-tv.txt"
-      },
-      {
-        "category": "malware",
-        "name": "FutaGuard TW165（台灣 165 反詐騙）",
-        "url": "https://filter.futa.gg/TW165_abp.txt"
       }
     ]
   },

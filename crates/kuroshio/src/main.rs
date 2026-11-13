@@ -445,6 +445,10 @@ pub async fn serve(
                     legacy.join("、")
                 );
             }
+            // 設定檔裡的過濾清單是 3.1.x 的預設值原封不動：載入時已經換成新的預設清單（設定檔不改寫）
+            if user_config(&config, uci).is_ok_and(|u| kuroshio_config::old_default_lists(&u)) {
+                info!("過濾清單是舊版預設值，已更新成新的預設清單");
+            }
         }
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<bool>>();

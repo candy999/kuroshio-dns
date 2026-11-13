@@ -4,8 +4,8 @@
 //! KUROSHIO_BENCH_LISTS=<放預設清單的資料夾> cargo test -p kuroshio --test memgov_bench -- --ignored --nocapture
 //! ```
 //!
-//! 資料夾裡放內建預設清單（啟用的那幾份）下載下來的原檔，檔名：easylistchina.txt、filter_21.txt、hosts_abp.txt、
-//! adove.txt、ruddernation.txt、smarttv.txt、tw165.txt。用本機的 HTTP 伺服器餵給程式（不連外網）。
+//! 資料夾裡放內建預設清單（啟用的那幾份）下載下來的原檔，檔名：tw165.txt、twnic.txt、tif.txt、hosts_abp.txt、
+//! filter_21.txt、easylistchina.txt、oisd.txt、light.txt、adove.txt、smarttv.txt。用本機的 HTTP 伺服器餵給程式（不連外網）。
 //! 情境：small 等級、預設清單、種子 CDN 資料庫（九成設成一小時以上沒出現）、快取填滿（15,000 筆）。
 //! 印出每一步釋出的記憶體：配置器實際少了多少（live heap）、結構估計值、RSS 差。
 
@@ -40,14 +40,17 @@ unsafe impl GlobalAlloc for Live {
 #[global_allocator]
 static A: Live = Live;
 
-const LISTS: [(&str, &str, &str); 7] = [
-    ("easylistchina.txt", "EasyList China", "ads"),
-    ("filter_21.txt", "CHN: anti-AD", "ads"),
-    ("hosts_abp.txt", "FutaGuard LowTechHost（台灣廣告）", "ads"),
-    ("adove.txt", "a-dove-is-dumb（Adobe 遙測）", "telemetry"),
-    ("ruddernation.txt", "Ruddernation（Adobe 驗證）", "telemetry"),
-    ("smarttv.txt", "blocklistproject smart-tv（電視遙測）", "telemetry"),
+const LISTS: [(&str, &str, &str); 10] = [
     ("tw165.txt", "FutaGuard TW165（台灣 165 反詐騙）", "malware"),
+    ("twnic.txt", "FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）", "malware"),
+    ("tif.txt", "HaGeZi TIF 精簡版（威脅情資）", "malware"),
+    ("hosts_abp.txt", "FutaGuard LowTechHost（台灣廣告）", "ads"),
+    ("filter_21.txt", "CHN: anti-AD", "ads"),
+    ("easylistchina.txt", "EasyList China", "ads"),
+    ("oisd.txt", "OISD small", "ads"),
+    ("light.txt", "HaGeZi Light", "ads"),
+    ("adove.txt", "a-dove-is-dumb（Adobe 遙測）", "telemetry"),
+    ("smarttv.txt", "blocklistproject smart-tv（電視遙測）", "telemetry"),
 ];
 
 async fn serve(dir: std::path::PathBuf) -> SocketAddr {
