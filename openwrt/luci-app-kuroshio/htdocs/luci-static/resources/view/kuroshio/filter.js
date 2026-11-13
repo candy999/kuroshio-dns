@@ -3,9 +3,29 @@
 'require form';
 'require fs';
 'require ui';
+'require uci';
+'require dom';
 'require kuroshio.common as common';
 
 var RULES = '/etc/kuroshio/custom-rules.txt';
+// 這個版本的預設自訂規則（套件附帶，升級時更新）
+var DEFAULT_RULES = '/usr/share/kuroshio/default-custom-rules.txt';
+var CONF = 'kuroshio';
+
+/** 換行統一、去掉結尾空白再比較（記事本存成 CRLF 也算一樣） */
+function sameText(a, b) {
+	var n = function(t) { return String(t || '').replace(/\r\n/g, '\n').replace(/\s+$/, ''); };
+	return n(a) === n(b);
+}
+
+/** UCI 的 filter_list 區段 → restorePlan 用的格式 */
+function currentLists() {
+	return uci.sections(CONF, 'filter_list').map(function(x) {
+		var p = x.protect;
+		return { ref: x['.name'], name: x.name, url: x.url, category: x.category, enabled: x.enabled !== '0',
+			protect: (p == null || p === '') ? undefined : p === '1' };
+	});
+}
 
 return view.extend({
 	load: function() {
@@ -16,6 +36,7 @@ return view.extend({
 	},
 
 	render: function(data) {
+		var self = this;
 		var rules = data[1] || '';
 		var pro = common.isPro();
 		var m, s, o;
@@ -38,6 +59,18 @@ return view.extend({
 		s.addremove = true;
 		s.sortable = true;
 		s.nodescriptions = true;
+
+		// 「新增」按鈕旁邊加「恢復預設清單」
+		var addButtons = s.renderSectionAdd;
+		s.renderSectionAdd = function() {
+			var node = addButtons.apply(this, arguments);
+			node.appendChild(E('button', {
+				'class': 'cbi-button cbi-button-neutral', 'id': 'kuroshio-restore-lists', 'style': 'margin-left:.5em',
+				'title': _('把訂閱清單改回這個版本的預設；自己加的清單會保留'),
+				'click': ui.createHandlerFn(self, 'restoreLists', m)
+			}, _('恢復預設清單')));
+			return node;
+		};
 
 		o = s.option(form.Flag, 'enabled', _('啟用'));
 		o.default = '1';
@@ -86,6 +119,63 @@ return view.extend({
 			return fs.write(RULES, value.replace(/\n*$/, '\n'));
 		};
 		o.remove = function() { return this.write(null, ''); };
+		var rulesOpt = o;
+
+		o = s.option(form.Button, '_reset_rules', ' ');
+		o.inputtitle = _('恢復預設自訂規則');
+		o.inputstyle = 'reset';
+		o.cfgvalue = function() { return null; };
+		o.write = o.remove = function() {};
+		o.onclick = function() {
+			ui.showModal(_('恢復預設自訂規則'), [
+				E('p', {}, _('把自訂規則換成這個版本的預設規則。編輯框裡還沒儲存的修改也會被取代。')),
+				E('p', {}, _('目前的內容會先備份成 %s（只保留最近一次）。').format(RULES + '.bak')),
+				E('div', { 'class': 'right' }, [
+					E('button', { 'class': 'btn', 'click': ui.hideModal }, _('取消')), ' ',
+					E('button', { 'class': 'btn cbi-button-negative', 'id': 'kuroshio-rules-confirm', 'click': ui.createHandlerFn(self, function() {
+						ui.hideModal();
+						return resetRules();
+					}) }, _('恢復預設'))
+				])
+			]);
+		};
+
+		/** 編輯框與比較用的內容換成 text（已經寫進檔案了，存檔時不會再寫一次） */
+		var showRules = function(text) {
+			rules = String(text || '').replace(/\r\n/g, '\n');
+			var w = rulesOpt.getUIElement('filter');
+			if (w) w.setValue(rules);
+		};
+		// 預設規則從套件附帶的檔案讀；讀不到時改請服務處理（服務會用執行檔內建的預設規則）
+		var resetRules = function() {
+			return L.resolveDefault(fs.read(DEFAULT_RULES), null).then(function(def) {
+				if (def == null || !def.trim()) {
+					return common.action('/api/filter/reset-rules').then(function(r) {
+						var x = common.result(r);
+						if (!x) return common.notify(r);
+						return L.resolveDefault(fs.read(RULES), '').then(function(t) {
+							showRules(t);
+							common.notify(r, x.changed === false ? _('自訂規則已經是這個版本的預設，不需要變更。')
+								: _('已恢復預設自訂規則，3 秒內生效。原本的內容備份在 %s').format(x.backup || RULES + '.bak'));
+						});
+					});
+				}
+				return L.resolveDefault(fs.read(RULES), null).then(function(cur) {
+					if (cur != null && sameText(cur, def)) {
+						showRules(def);
+						return common.notify({}, _('自訂規則已經是這個版本的預設，不需要變更。'));
+					}
+					var backup = (cur == null) ? Promise.resolve() : fs.write(RULES + '.bak', cur);
+					return backup.then(function() { return fs.write(RULES, def); }).then(function() {
+						showRules(def);
+						common.notify({}, cur == null ? _('已恢復預設自訂規則，3 秒內生效。')
+							: _('已恢復預設自訂規則，3 秒內生效。原本的內容備份在 %s').format(RULES + '.bak'));
+					});
+				});
+			}).catch(function(e) {
+				common.notify({ ok: false, error: _('恢復預設自訂規則失敗：%s').format(e.message || e) });
+			});
+		};
 
 		// ---------------- 檢查工具 ----------------
 		var out = E('div');
@@ -120,5 +210,77 @@ return view.extend({
 		]);
 
 		return m.render().then(function(node) { return E([], [common.modeBar(), node, tools, common.footer()]); });
+	},
+
+	/**
+	 * 恢復預設清單：預設值來自 rpcd 的 defaults（kuroshio defaults --json），不寫死在介面裡。
+	 * 先把表單裡還沒存的修改暫存，列出會改什麼，確認後改 UCI（暫存），再按「儲存並套用」生效
+	 */
+	restoreLists: function(m) {
+		var defs = ((common.defaults || {}).filter || {}).lists;
+		if (!Array.isArray(defs) || !defs.length)
+			return common.notify({ ok: false, error: _('讀不到這個版本的預設清單（kuroshio defaults --json 沒有回應），沒有變更。') });
+		return m.save(null, true).then(function() {
+			var cur = currentLists();
+			var own = E('input', { 'type': 'checkbox', 'id': 'kuroshio-restore-own' });
+			var box = E('div', { 'id': 'kuroshio-restore-summary' });
+			var plan = null;
+			var okBtn = E('button', { 'class': 'btn cbi-button-negative', 'id': 'kuroshio-restore-confirm', 'click': ui.createHandlerFn(this, function() {
+				ui.hideModal();
+				return applyRestore(m, cur, plan);
+			}) }, _('恢復預設清單'));
+			var draw = function() {
+				plan = common.restorePlan(cur, defs, own.checked);
+				dom.content(box, common.restoreSummary(plan.changes));
+				okBtn.disabled = !plan.changes.count;
+			};
+			own.addEventListener('change', draw);
+			ui.showModal(_('恢復預設清單'), [
+				E('p', {}, _('把訂閱清單改回這個版本的預設：名稱、網址、分類、啟用狀態與順序。網址不在預設裡的清單是你自己加的，會保留並排在預設清單後面（啟用狀態不變）。')),
+				box,
+				E('p', {}, E('label', {}, [own, ' ', _('一併移除我自己加的清單')])),
+				E('p', { 'class': 'cbi-value-description' }, _('按下「恢復預設清單」後，還要按頁面下方的「儲存並套用」才會生效。')),
+				E('div', { 'class': 'right' }, [E('button', { 'class': 'btn', 'click': ui.hideModal }, _('取消')), ' ', okBtn])
+			]);
+			draw();
+		}, function(e) {
+			common.notify({ ok: false, error: _('表單裡有格式不正確的欄位，請先修正：%s').format(e && e.message || e) });
+		});
 	}
 });
+
+/**
+ * 依 restorePlan 改 UCI（暫存，還沒套用）。分兩次存：
+ * 第一次新增、改值、排順序；第二次才刪除區段與選項（LuCI 同一次存檔裡有刪除時不會送出順序）
+ */
+function applyRestore(m, cur, plan) {
+	var order = [], unset = [], keep = {};
+	plan.result.forEach(function(r) {
+		var sid;
+		if (r.own) {
+			sid = r.own.ref;
+		} else {
+			var d = r.def, old = r.from >= 0 ? cur[r.from] : null;
+			sid = old ? old.ref : uci.add(CONF, 'filter_list');
+			uci.set(CONF, sid, 'name', d.name);
+			uci.set(CONF, sid, 'url', d.url);
+			uci.set(CONF, sid, 'category', d.category);
+			uci.set(CONF, sid, 'enabled', d.enabled ? '1' : '0');
+			if (d.protect !== undefined) uci.set(CONF, sid, 'protect', d.protect ? '1' : '0');
+			else if (old && old.protect !== undefined) unset.push(sid);
+		}
+		if (r.from >= 0) keep[r.from] = true;
+		order.push(sid);
+	});
+	order.forEach(function(sid) { uci.move(CONF, sid, null); });
+	return uci.save().then(function() {
+		cur.forEach(function(c, j) { if (!keep[j]) uci.remove(CONF, c.ref); });
+		unset.forEach(function(sid) { uci.unset(CONF, sid, 'protect'); });
+		return uci.save();
+	}).then(function() { return m.load(); }).then(function() { return m.reset(); }).then(function() {
+		var ch = plan.changes;
+		common.notify({}, _('已改成這個版本的預設清單（%d 項變更），按下方「儲存並套用」後生效。').format(ch.count));
+	}).catch(function(e) {
+		common.notify({ ok: false, error: _('恢復預設清單失敗：%s').format(e && e.message || e) });
+	});
+}

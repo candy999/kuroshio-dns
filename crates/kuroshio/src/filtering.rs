@@ -28,6 +28,62 @@ use tracing::{info, warn};
 /// 安裝時附帶的預設自訂規則（設定的自訂規則檔不存在時寫出這份）
 pub const DEFAULT_CUSTOM_RULES: &str = include_str!("../../../rules/default-custom-rules.txt");
 
+/// 這個版本的預設自訂規則：唯讀資料目錄（OpenWrt 是 `/usr/share/kuroshio`）有 `default-custom-rules.txt` 就用它，
+/// 沒有（或讀不出來、是空的）就用執行檔內建的 [`DEFAULT_CUSTOM_RULES`]。回傳（內容, 來源檔案；內建 = None）
+pub fn default_custom_rules(share_dir: &Path) -> (String, Option<PathBuf>) {
+    let p = share_dir.join("default-custom-rules.txt");
+    match std::fs::read(&p).ok().and_then(|b| String::from_utf8(b).ok()) {
+        Some(t) if !t.trim().is_empty() => (t, Some(p)),
+        _ => (DEFAULT_CUSTOM_RULES.to_string(), None),
+    }
+}
+
+/// 把自訂規則檔換回預設規則（設定頁的「恢復預設自訂規則」）：原本的內容先複製到同一個資料夾的 `<檔名>.bak`
+/// （已經跟預設一樣時不動檔案、也不覆蓋上一次的備份）。回傳 JSON：`{ok, changed, file, backup, source, bytes}`
+pub fn reset_custom_rules(file: &Path, share_dir: &Path) -> std::io::Result<Value> {
+    let (text, src) = default_custom_rules(share_dir);
+    let source = src.map(|p| p.display().to_string()).unwrap_or_else(|| "builtin".into());
+    let old = match std::fs::read(file) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    // 換行不同（記事本存成 CRLF）也算一樣
+    let same = old
+        .as_deref()
+        .is_some_and(|b| String::from_utf8_lossy(b).replace("\r\n", "\n").trim_end() == text.replace("\r\n", "\n").trim_end());
+    if same {
+        return Ok(json!({ "ok": true, "changed": false, "file": file, "backup": null, "source": source, "bytes": text.len() }));
+    }
+    let mut bak_name = file
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "custom-rules.txt".into());
+    bak_name.push(".bak");
+    let backup = match &old {
+        Some(b) => {
+            let bak = file.with_file_name(bak_name);
+            crate::persist::write_atomic(&bak, b)?;
+            Some(bak)
+        }
+        None => {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            None
+        }
+    };
+    crate::persist::write_atomic(file, text.as_bytes())?;
+    info!(
+        "自訂規則已恢復成預設（{source}）{}",
+        backup
+            .as_ref()
+            .map(|b| format!("，原本的內容備份在 {}", b.display()))
+            .unwrap_or_default()
+    );
+    Ok(json!({ "ok": true, "changed": true, "file": file, "backup": backup, "source": source, "bytes": text.len() }))
+}
+
 /// 各清單命中次數的快照檔
 pub const HITS_FILE: &str = "filter-hits.json";
 

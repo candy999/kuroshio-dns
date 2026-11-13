@@ -8,6 +8,7 @@
 			},
 			"file": {
 				"/etc/kuroshio/custom-rules.txt": [ "read" ],
+				"/usr/share/kuroshio/default-custom-rules.txt": [ "read" ],
 				"/etc/kuroshio/benchmark/iplist.txt": [ "read" ],
 				"/etc/kuroshio/benchmark/dohlist.txt": [ "read" ],
 				"/etc/kuroshio/benchmark/web.txt": [ "read" ],
@@ -24,6 +25,7 @@
 			},
 			"file": {
 				"/etc/kuroshio/custom-rules.txt": [ "write" ],
+				"/etc/kuroshio/custom-rules.txt.bak": [ "write" ],
 				"/etc/kuroshio/benchmark/iplist.txt": [ "write" ],
 				"/etc/kuroshio/benchmark/dohlist.txt": [ "write" ],
 				"/etc/kuroshio/benchmark/web.txt": [ "write" ],

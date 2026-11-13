@@ -525,11 +525,16 @@ impl Persister {
 
     /// 定時呼叫：到了間隔、而且今天的寫入量還沒超過節奏目標的才寫；到了最久未存上限的一定寫
     pub fn flush(&mut self, now: u64) -> std::io::Result<usize> {
-        self.flush_inner(now, false)
+        self.flush_inner(now, false).map(|x| x.0)
     }
 
     /// 關機時：有變動的全部寫出
     pub fn flush_all(&mut self, now: u64) -> std::io::Result<usize> {
+        self.flush_inner(now, true).map(|x| x.0)
+    }
+
+    /// 有變動的全部寫出，回傳（寫了幾份, 磁碟上一共幾 bytes）：管理介面的「立即儲存學習資料」
+    pub fn flush_all_counted(&mut self, now: u64) -> std::io::Result<(usize, u64)> {
         self.flush_inner(now, true)
     }
 
@@ -689,7 +694,7 @@ impl Persister {
         false
     }
 
-    fn flush_inner(&mut self, now: u64, force: bool) -> std::io::Result<usize> {
+    fn flush_inner(&mut self, now: u64, force: bool) -> std::io::Result<(usize, u64)> {
         self.roll_day(now);
         let interval = effective_interval(&self.policy, self.mem);
         let critical = self.mem.pressure() == Pressure::Critical;
@@ -700,7 +705,7 @@ impl Persister {
             .collect();
         // 有先後順序的（分片清單）放最後
         names.sort();
-        let mut n = 0;
+        let (mut n, mut bytes) = (0, 0u64);
         for (_, name) in names {
             let (why, size, age) = {
                 let e = &self.entries[&name];
@@ -779,8 +784,9 @@ impl Persister {
             self.stats.bytes_today += disk;
             self.stats.writes_today += 1;
             n += 1;
+            bytes += disk;
         }
-        Ok(n)
+        Ok((n, bytes))
     }
 
     /// 最久的未存變動（秒）

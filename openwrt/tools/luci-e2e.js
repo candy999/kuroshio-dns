@@ -211,6 +211,19 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
                 ? ok('連線來源頁：模式、名單與說明') : bad(`連線來源頁內容不對\n     ${text.slice(0, 300)}`);
             if (MOCK) /\d{4}-\d{2}-\d{2} 的資料/.test(text) && /57 次/.test(text) && /45\.135\.232\.0\/24/.test(text) ? ok('連線來源頁：資料日期、拒絕次數、被拒絕最多的網段') : bad('連線來源頁沒有目前狀態');
         }
+        if (NAME === 'kuroshio' && p === 'status') {
+            /立即儲存學習資料/.test(text) && /更新韌體或要斷電前先按一下，學到的資料會馬上寫進儲存空間/.test(text)
+                ? ok('狀態頁：操作區有「立即儲存學習資料」與說明') : bad('狀態頁沒有「立即儲存學習資料」');
+            if (MOCK) {
+                const n = JSON.parse(await mockGet('/__mock/calls')).length;
+                await page.click('#kuroshio-persist-flush');
+                await page.waitForFunction(() => /已儲存學習資料/.test(document.body.innerText), null, { timeout: 5000 }).catch(() => {});
+                const calls = JSON.parse(await mockGet('/__mock/calls?since=' + n));
+                const note = (await page.locator('body').innerText()).match(/已儲存學習資料[^\n]*/);
+                calls.length === 1 && calls[0].path === '/api/persist/flush' && note && /（\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}）：寫了 7 份快照，共 338 KB/.test(note[0])
+                    ? ok(`狀態頁：立即儲存學習資料 → /api/persist/flush，顯示「${note[0]}」`) : bad(`狀態頁：立即儲存學習資料結果不對（呼叫 ${JSON.stringify(calls)}，訊息 ${note && note[0]}）`);
+            }
+        }
         if (NAME === 'kuroshio' && p === 'status' && MOCK) {
             /連線來源/.test(text) && /只開放台灣/.test(text) && /已拒絕 57 次/.test(text) ? ok('狀態頁：連線來源摘要') : bad('狀態頁沒有連線來源摘要');
             /最久未存/.test(text) && /1\.5 小時/.test(text) && /上限 24 小時/.test(text) ? ok('狀態頁：最久未存') : bad('狀態頁沒有「最久未存」');
@@ -521,6 +534,109 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
             await page.locator('.modal button:has-text("Dismiss"), .modal .cbi-button:not(.cbi-button-positive)').first().click().catch(() => {});
         } catch (e) { bad(`自動規則操作中斷：${e.message.split('\n')[0]}`); }
         if (errors.length) bad(`自動規則：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+    }
+
+    // 黑潮：恢復預設清單（UCI 的 filter_list 改回 kuroshio defaults --json 的清單；自己加的保留在後面）與恢復預設自訂規則
+    if (NAME === 'kuroshio') {
+        errors = [];
+        const filterPage = async () => {
+            await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/filter`);
+            await page.waitForLoadState('networkidle');
+            await page.waitForSelector('#kuroshio-restore-lists', { timeout: 20000 });
+        };
+        const saveApply = async () => {
+            await page.locator('.cbi-page-actions .cbi-button-apply, .cbi-page-actions button:has-text("Save & Apply")').first().click();
+            await page.waitForTimeout(MOCK ? 1500 : 6000);
+        };
+        /** 打開「恢復預設清單」，own = 勾「一併移除我自己加的清單」；回傳視窗裡的變更清單文字（沒有確認） */
+        const openRestore = async own => {
+            await page.click('#kuroshio-restore-lists');
+            await page.waitForSelector('#kuroshio-restore-summary', { timeout: 10000 });
+            if (own) await page.check('#kuroshio-restore-own');
+            return (await page.locator('#kuroshio-restore-summary').innerText()).replace(/\s+/g, ' ');
+        };
+        const lists = async n => {
+            const out = [];
+            for (let i = 0; i < n + 1; i++) {
+                let url = null, en = null;
+                try { url = await uciGet(`${NAME}.@filter_list[${i}].url`); } catch (e) { break; }
+                try { en = await uciGet(`${NAME}.@filter_list[${i}].enabled`); } catch (e) { en = '1'; }
+                if (!url) break;
+                out.push({ url, enabled: en !== '0' });
+            }
+            return out;
+        };
+        const same = (got, want) => got.length === want.length && got.every((g, i) => g.url === want[i].url && g.enabled === (want[i].enabled !== false));
+        const OWN = 'https://lists.example.com/mine.txt';
+        try {
+            await filterPage();
+            // 預設清單從頁面讀（rpcd defaults = kuroshio defaults --json），不寫死在測試裡
+            const defs = await page.evaluate(() => L.require('kuroshio.common').then(c => (c.defaults.filter || {}).lists || []));
+            defs.length >= 3 ? ok(`恢復預設清單：讀到 ${defs.length} 份預設清單`) : bad(`恢復預設清單：預設清單太少（${defs.length}）`);
+            // 1. 先整理成預設（連自己加的也移除）
+            await openRestore(true);
+            if (await page.locator('#kuroshio-restore-confirm').isDisabled()) await page.locator('.modal button:has-text("取消")').click();
+            else { await page.click('#kuroshio-restore-confirm'); await page.waitForTimeout(1000); await saveApply(); }
+            same(await lists(defs.length), defs) ? ok('恢復預設清單：UCI 跟預設清單一樣（名稱、網址、啟用、順序）') : bad(`恢復預設清單：UCI 跟預設不同\n     ${JSON.stringify(await lists(defs.length))}`);
+            // 2. 改網址、改啟用、刪一份、加一份自己的放最前面
+            const a = 0, b = defs.findIndex((d, i) => i > 0 && d.enabled !== false), c = [1, 2, 3].find(i => i !== b);
+            await filterPage();
+            await page.evaluate(([a, b, c, own]) => L.require('uci').then(uci => {
+                const ls = uci.sections('kuroshio', 'filter_list');
+                uci.set('kuroshio', ls[a]['.name'], 'url', 'https://old.example.net/list.txt');
+                uci.set('kuroshio', ls[b]['.name'], 'enabled', '0');
+                uci.remove('kuroshio', ls[c]['.name']);
+                return uci.save().then(() => {
+                    const sid = uci.add('kuroshio', 'filter_list');
+                    uci.set('kuroshio', sid, 'name', '我的清單');
+                    uci.set('kuroshio', sid, 'url', own);
+                    uci.set('kuroshio', sid, 'enabled', '0');
+                    uci.move('kuroshio', sid, uci.sections('kuroshio', 'filter_list')[0]['.name']);
+                    return uci.save();
+                });
+            }), [a, b, c, OWN]);
+            await filterPage();
+            const sum = await openRestore(false);
+            await page.screenshot({ path: `${SHOTS}/filter-restore-confirm.png`, fullPage: true });
+            const want = [`會新增（1） ${defs[c].name}`, `網址改回預設（1） ${defs[a].name}：https://old.example.net/list.txt → ${defs[a].url}`,
+                `啟用狀態改回預設（1） ${defs[b].name}：停用 → 啟用`, '順序 改回預設的順序', '保留你自己加的清單（1，排在預設清單後面） 我的清單'];
+            const miss = want.filter(w => !sum.includes(w));
+            !miss.length && !/會移除/.test(sum) ? ok('恢復預設清單：確認視窗列出新增、網址、啟用、順序、保留') : bad(`恢復預設清單：確認視窗內容不對（缺 ${miss.join('、')}）\n     ${sum}`);
+            await page.check('#kuroshio-restore-own');
+            /會移除（1） 我的清單（自己加的）/.test((await page.locator('#kuroshio-restore-summary').innerText()).replace(/\s+/g, ' '))
+                ? ok('恢復預設清單：勾「一併移除我自己加的清單」→ 列在會移除') : bad('恢復預設清單：勾選後沒有列出要移除自己的清單');
+            await page.uncheck('#kuroshio-restore-own');
+            await page.click('#kuroshio-restore-confirm');
+            await page.waitForFunction(() => /已改成這個版本的預設清單/.test(document.body.innerText), null, { timeout: 10000 }).catch(() => {});
+            await saveApply();
+            same(await lists(defs.length + 1), defs.concat([{ url: OWN, enabled: false }]))
+                ? ok('恢復預設清單：預設清單復原，自己加的排在最後、維持停用') : bad(`恢復預設清單：結果不對\n     ${JSON.stringify(await lists(defs.length + 1))}`);
+            // 3. 一併移除自己加的
+            await filterPage();
+            await openRestore(true);
+            await page.click('#kuroshio-restore-confirm');
+            await page.waitForTimeout(1000);
+            await saveApply();
+            same(await lists(defs.length), defs) ? ok('恢復預設清單：一併移除自己加的清單') : bad(`恢復預設清單：自己加的沒有移除\n     ${JSON.stringify(await lists(defs.length))}`);
+
+            // 恢復預設自訂規則：目前內容備份成 .bak，編輯框與檔案換成套件附帶的預設規則
+            await filterPage();
+            const ta0 = page.locator('textarea').first();
+            await ta0.fill('||e2e-before-reset.example^\n');
+            await page.locator('.cbi-page-actions .cbi-button-save, .cbi-page-actions button:has-text("Save")').first().click();
+            await page.waitForTimeout(2000);
+            await filterPage();
+            await page.click('button:has-text("恢復預設自訂規則")');
+            /custom-rules\.txt\.bak/.test(await page.locator('.modal').innerText()) ? ok('恢復預設自訂規則：先確認，說明備份位置') : bad('恢復預設自訂規則：確認視窗沒有說明備份');
+            await page.click('#kuroshio-rules-confirm');
+            await page.waitForFunction(() => /已恢復預設自訂規則/.test(document.body.innerText), null, { timeout: 10000 }).catch(() => {});
+            const def = await readFile('/usr/share/kuroshio/default-custom-rules.txt');
+            const now = await readFile(`/etc/${NAME}/custom-rules.txt`), bak = await readFile(`/etc/${NAME}/custom-rules.txt.bak`).catch(() => '');
+            now === def && (await page.locator('textarea').first().inputValue()).trim() === def.trim() ? ok('恢復預設自訂規則：檔案與編輯框都是預設規則') : bad(`恢復預設自訂規則：內容不對\n     ${now.slice(0, 120)}`);
+            /e2e-before-reset\.example/.test(bak) ? ok('恢復預設自訂規則：原本的內容備份在 custom-rules.txt.bak') : bad(`恢復預設自訂規則：沒有備份（${bak.slice(0, 120)}）`);
+            await page.screenshot({ path: `${SHOTS}/filter-rules-reset.png`, fullPage: true });
+        } catch (e) { bad(`恢復預設操作中斷：${e.message.split('\n')[0]}`); }
+        if (errors.length) bad(`恢復預設：JavaScript 錯誤\n     ${errors.join('\n     ')}`);
     }
 
     // 自訂規則：編輯後存檔應寫進 /etc/<名稱>/custom-rules.txt

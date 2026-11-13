@@ -185,6 +185,86 @@ function fmtTime(t, mode) {
 	return mode === 'date' ? date : mode === 'time' ? hm : mode === 'timesec' ? hm + sec : date + ' ' + hm + (mode === 'sec' ? sec : '');
 }
 
+/**
+ * 「恢復預設清單」要怎麼改（跟 Windows 設定頁 data/admin/app.js 的 restorePlan 同一份規則）。
+ * cur / defs：{ name, url, category, enabled(布林), protect(布林或 undefined) }；cur 可以多帶 ref（UCI 區段 ID）。
+ * 對應方式：先用網址找，找不到再用名稱找（所以只改了網址的預設清單會被改回預設網址）。
+ * 網址不在預設裡的是使用者自己加的：保留、排在預設清單後面（removeOwn = true 時移除）。
+ * 回傳 { result: [{ def | own, from }], changes: { add, remove, url, enabled, other, keep, reorder, count } }
+ */
+function restorePlan(cur, defs, removeOwn) {
+	var norm = function(x) {
+		var p = x.protect;
+		return { name: String(x.name || ''), url: String(x.url || '').trim(), category: x.category || 'ads', enabled: x.enabled !== false,
+			protect: (p === undefined || p === null || p === '') ? undefined : !!p, ref: x.ref };
+	};
+	cur = (cur || []).map(norm);
+	defs = (defs || []).map(norm);
+	var used = cur.map(function() { return false; }), match = defs.map(function() { return -1; });
+	var find = function(test) {
+		for (var j = 0; j < cur.length; j++) if (!used[j] && test(cur[j])) { used[j] = true; return j; }
+		return -1;
+	};
+	defs.forEach(function(d, i) { match[i] = find(function(c) { return c.url === d.url; }); });
+	defs.forEach(function(d, i) { if (match[i] < 0) match[i] = find(function(c) { return c.name !== '' && c.name === d.name; }); });
+	var defUrl = {};
+	defs.forEach(function(d) { defUrl[d.url] = true; });
+	var ch = { add: [], remove: [], url: [], enabled: [], other: [], keep: [], reorder: false, count: 0 };
+	var result = [];
+	defs.forEach(function(d, i) {
+		var j = match[i];
+		result.push({ def: d, from: j });
+		if (j < 0) { ch.add.push(d); return; }
+		var c = cur[j], o = [];
+		if (c.url !== d.url) ch.url.push({ name: d.name, from: c.url, to: d.url });
+		if (c.enabled !== d.enabled) ch.enabled.push({ name: d.name, from: c.enabled, to: d.enabled });
+		if (c.name !== d.name) o.push({ what: 'name', from: c.name, to: d.name });
+		if (c.category !== d.category) o.push({ what: 'category', from: c.category, to: d.category });
+		if (c.protect !== d.protect) o.push({ what: 'protect', from: c.protect, to: d.protect });
+		if (o.length) ch.other.push({ name: d.name, diffs: o });
+	});
+	cur.forEach(function(c, j) {
+		if (used[j]) return;
+		var own = !defUrl[c.url];
+		if (own && !removeOwn) { result.push({ own: c, from: j }); ch.keep.push(c); }
+		else ch.remove.push({ name: c.name, url: c.url, own: own });
+	});
+	var order = result.filter(function(r) { return r.from >= 0; }).map(function(r) { return r.from; });
+	ch.reorder = order.some(function(v, i) { return i > 0 && v < order[i - 1]; });
+	ch.count = ch.add.length + ch.remove.length + ch.url.length + ch.enabled.length + ch.other.length + (ch.reorder ? 1 : 0);
+	return { result: result, changes: ch };
+}
+
+var CAT = { ads: _('廣告 / 追蹤'), telemetry: _('遙測 / 驗證'), malware: _('惡意 / 詐騙') };
+var onOff = function(v) { return v ? _('啟用') : _('停用'); };
+var protName = function(v) { return v === undefined ? _('自動') : v ? _('保護') : _('不保護'); };
+
+/** 「恢復預設清單」確認視窗裡的變更清單（節點） */
+function restoreSummary(ch) {
+	if (!ch.count) return E('p', { 'class': 'kuroshio-restore-none' }, _('目前的訂閱清單已經跟這個版本的預設一樣，不需要變更。'));
+	var block = function(cls, title, items) {
+		if (!items.length) return '';
+		return E('div', { 'class': 'kuroshio-restore-' + cls }, [T('strong', {}, title),
+			E('ul', { 'style': 'margin:.2em 0 .6em 1.2em' }, items.map(function(x) { return T('li', {}, x); }))]);
+	};
+	var otherText = function(o) {
+		return o.name + '：' + o.diffs.map(function(x) {
+			if (x.what === 'name') return _('名稱「%s」→「%s」').format(x.from, x.to);
+			if (x.what === 'category') return _('分類「%s」→「%s」').format(CAT[x.from] || x.from, CAT[x.to] || x.to);
+			return _('保護「%s」→「%s」').format(protName(x.from), protName(x.to));
+		}).join('、');
+	};
+	return E('div', { 'class': 'kuroshio-restore-list' }, [
+		block('add', _('會新增（%d）').format(ch.add.length), ch.add.map(function(d) { return d.name + '（' + onOff(d.enabled) + '）'; })),
+		block('remove', _('會移除（%d）').format(ch.remove.length), ch.remove.map(function(d) { return (d.name || d.url) + (d.own ? _('（自己加的）') : _('（重複的預設清單）')); })),
+		block('url', _('網址改回預設（%d）').format(ch.url.length), ch.url.map(function(d) { return d.name + '：' + d.from + ' → ' + d.to; })),
+		block('enabled', _('啟用狀態改回預設（%d）').format(ch.enabled.length), ch.enabled.map(function(d) { return d.name + '：' + onOff(d.from) + ' → ' + onOff(d.to); })),
+		block('other', _('名稱 / 分類 / 保護改回預設（%d）').format(ch.other.length), ch.other.map(otherText)),
+		ch.reorder ? block('reorder', _('順序'), [_('改回預設的順序（自己加的清單排在預設清單後面）')]) : '',
+		block('keep', _('保留你自己加的清單（%d，排在預設清單後面）').format(ch.keep.length), ch.keep.map(function(d) { return d.name || d.url; }))
+	]);
+}
+
 var SCOPE = { 'public': _('公網'), 'private': _('私有'), 'cgnat': _('電信商 CGNAT'), 'linklocal': _('鏈路本地'), 'ula': _('區網 IPv6'), 'loopback': _('本機') };
 var BADGE = { ok: '#19733a', warn: '#8a5a00', err: '#b42318', off: '#6b7785' };
 
@@ -195,6 +275,10 @@ return baseclass.extend({
 
 	/** 日期時間（固定格式，見上方 fmtTime） */
 	time: fmtTime,
+
+	/** 恢復預設清單：比對與變更清單（見上方 restorePlan） */
+	restorePlan: restorePlan,
+	restoreSummary: restoreSummary,
 
 	/** 小標籤（狀態用）：kind = ok / warn / err / off */
 	badge: function(text, kind) {

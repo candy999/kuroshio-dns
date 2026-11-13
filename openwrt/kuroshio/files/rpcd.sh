@@ -4,7 +4,8 @@
 #  轉送到本機管理 API（127.0.0.1:admin_port），只開放白名單內的路徑。
 #    status        執行狀態＋/api/status
 #    api           查看類 API（追蹤、規則檢查、上游、節點池、儀表板統計…）
-#    action        會改變狀態的 API（清快取、更新清單、執行工作、驗證…）     ← ACL 寫入權限
+#    action        會改變狀態的 API（清快取、更新清單、執行工作、驗證、恢復預設自訂規則、
+#                  立即儲存學習資料…）                                    ← ACL 寫入權限
 #    defaults      內建預設值（kuroshio defaults --json，LuCI 顯示成提示文字）
 #    acme_status   憑證資訊與申請紀錄
 #    acme_issue    背景申請憑證                                          ← ACL 寫入權限
@@ -87,6 +88,7 @@ call)
 		read_input
 		case "$P_PATH" in
 		/api/cache/flush|/api/filter/update|/api/jobs/run|/api/cdn/verify|/api/cdn/policy|/api/cdn/ecs|/api/ddns/update) ;;
+		/api/filter/reset-rules|/api/persist/flush) ;;
 		/api/community/check|/api/community/add|/api/community/accept|/api/community/reject|/api/community/block|/api/community/unblock|/api/community/delete|/api/community/sync) ;;
 		/api/community/invite/refresh|/api/community/invite/use) ;;
 		/api/community/rotate|/api/community/accept-key|/api/community/channel) ;;

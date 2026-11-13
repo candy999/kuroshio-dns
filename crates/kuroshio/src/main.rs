@@ -260,6 +260,13 @@ enum NotifyEvent {
         #[arg(long)]
         uci: bool,
     },
+    /// 立刻把學到的資料（快照）寫進儲存空間，不結束（同 SIGUSR1；Windows 沒有訊號，用這個）
+    Save {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1535,7 +1542,11 @@ async fn status_cmd(config: &std::path::Path, uci: bool, json: bool) -> i32 {
 
 /// `kuroshio notify <事件>`：結束碼 0 = 已送達，1 = 服務沒有回應，2 = 設定讀不到
 async fn notify_cmd(event: NotifyEvent) -> i32 {
-    let NotifyEvent::WanChanged { config, uci } = event;
+    let (config, uci, path, timeout) = match event {
+        NotifyEvent::WanChanged { config, uci } => (config, uci, "/api/notify/wan-changed", 10),
+        // 快照可能有好幾 MB（CDN 網域庫），慢的儲存裝置要多等一下
+        NotifyEvent::Save { config, uci } => (config, uci, "/api/persist/flush", 120),
+    };
     let cfg = match config_for_cli(&config, uci) {
         Ok(c) => c,
         Err(e) => {
@@ -1547,14 +1558,7 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
         eprintln!("管理 API 沒有開啟（admin.enabled = false），無法通知服務");
         return 1;
     };
-    let r = admin_call(
-        &ep,
-        "POST",
-        "/api/notify/wan-changed",
-        Some(b"{}"),
-        std::time::Duration::from_secs(10),
-    )
-    .await;
+    let r = admin_call(&ep, "POST", path, Some(b"{}"), std::time::Duration::from_secs(timeout)).await;
     match r {
         Err(e) => {
             eprintln!("服務沒有回應（{}）：{e:#}", ep.0);
@@ -1562,6 +1566,10 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
         }
         Ok((200, body)) => {
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            if path == "/api/persist/flush" {
+                println!("{}", kuroshio::integration::save_text(&v));
+                return 0;
+            }
             println!(
                 "已通知服務：WAN 變動。{}；重新偵測對外 IP（ECS）{}",
                 if v["ddns"] == "disabled" {

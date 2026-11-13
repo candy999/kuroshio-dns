@@ -1193,9 +1193,14 @@ pub struct Started {
 impl AppState {
     /// 把有變動的快照全部寫出，回傳寫了幾份（關機、SIGUSR1）
     pub fn flush_now(&self) -> std::io::Result<usize> {
+        self.flush_counted().map(|x| x.0)
+    }
+
+    /// 同 [`AppState::flush_now`]，另外回傳寫入的 bytes（管理 API 的 `POST /api/persist/flush`）
+    pub fn flush_counted(&self) -> std::io::Result<(usize, u64)> {
         stage_hot_names(&self.resolver, &self.persister, self.warm_names);
         stage_sources(&self.persister, &self.snap_sources);
-        self.persister.lock().unwrap().flush_all(crate::persist::now_secs())
+        self.persister.lock().unwrap().flush_all_counted(crate::persist::now_secs())
     }
 }
 

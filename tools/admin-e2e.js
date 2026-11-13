@@ -1,7 +1,8 @@
 'use strict';
 // CI：Windows 本機設定頁（data/admin）端對端測試。自己啟動 kuroshio（暫存設定檔、空著的埠號），用 Playwright 實際操作：
 // 登入、狀態、簡易 / 專業模式、改設定並儲存（伺服器在程式內重新啟動）、原始 JSON、網域與憑證 / 多網卡 / 多位址監聽 / 存放位置、連線來源、
-// 社群（邀請碼、我的身分、新增好友、好友清單與動作〔模擬資料〕、事件紀錄、自動規則）、工具、備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
+// 恢復預設清單 / 自訂規則、社群（邀請碼、我的身分、新增好友、好友清單與動作〔模擬資料〕、事件紀錄、自動規則）、工具（含立即儲存學習資料）、
+// 備份匯出 / 匯入、日誌、手機寬度、深色模式、登出。
 //
 //   cargo build -p kuroshio && node tools/admin-e2e.js
 //   KUROSHIO_BIN=path/to/kuroshio SHOTS=screenshots-admin node tools/admin-e2e.js
@@ -118,6 +119,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         check((await raw(adminPort, 'GET', '/api/backup/export?kind=full')).status === 401, '沒登入時不能下載備份（401）');
         const xi = await raw(adminPort, 'POST', '/api/backup/import', { Origin: 'http://evil.example', Authorization: `Bearer ${token}` }, 'x');
         check(xi.status === 403, '跨站匯入備份（Origin 不是本機）回 403');
+        // 會改東西的動作只接受 POST（GET 會被 <img src> 之類的偷偷觸發）
+        for (const p of ['/api/persist/flush', '/api/filter/reset-rules']) {
+            check((await raw(adminPort, 'GET', p, { Authorization: `Bearer ${token}` })).status === 405, `GET ${p} 回 405（只接受 POST）`);
+            check((await raw(adminPort, 'POST', p, { Origin: 'http://evil.example', Authorization: `Bearer ${token}` }, '{}')).status === 403, `跨站 POST ${p} 回 403`);
+        }
         check(!/candy\.moe/.test(js.body + fj.body), '沒有寫死真實網域');
 
         // ---------------- 瀏覽器
@@ -234,6 +240,80 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.click('#cfg-groups button[data-group=upstream]');
         check(await page.inputValue('[data-key="resolver.timeoutMs"] input') === '1777', '重新讀取後表單顯示新值');
         await shot('05-settings-saved');
+
+        console.log('設定：恢復預設清單、恢復預設自訂規則');
+        {
+            // 預設清單從伺服器讀（GET /api/config 的 defaults），不寫死在測試裡
+            const defs = (await page.evaluate(() => fetch('/api/config').then(r => r.json()))).defaults.filter.lists;
+            const OWN = 'https://lists.example.com/mine.txt';
+            const saveWait = async () => {
+                await page.click('#btn-save');
+                await page.waitForFunction(() => /已儲存並套用|失敗|沒有在 30 秒/.test(document.getElementById('save-msg').textContent), null, { timeout: 40000 });
+                return JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+            };
+            const sameLists = (got, want) => Array.isArray(got) && got.length === want.length
+                && got.every((g, i) => g.url === want[i].url && (g.enabled !== false) === (want[i].enabled !== false) && g.name === want[i].name);
+            check(defs.length >= 3, `恢復預設清單：讀到 ${defs.length} 份預設清單`);
+            await page.click('#cfg-groups button[data-group=filter]');
+            const tbl = '[data-key="filter.lists"]';
+            // 改網址、停用一份預設啟用的、刪一份、加一份自己的（停用）
+            const b = defs.findIndex((d, i) => i > 0 && d.enabled !== false), c = [1, 2, 3].find(i => i !== b);
+            await page.fill(`${tbl} tbody tr:nth-child(1) input[aria-label="網址"]`, 'https://old.example.net/list.txt');
+            await page.uncheck(`${tbl} tbody tr:nth-child(${b + 1}) input[aria-label="啟用"]`);
+            await page.click(`${tbl} tbody tr:nth-child(${c + 1}) button.danger`);
+            await page.click(`${tbl} button:has-text("新增一列")`);
+            await page.fill(`${tbl} tbody tr:last-child input[aria-label="名稱"]`, '我的清單');
+            await page.fill(`${tbl} tbody tr:last-child input[aria-label="網址"]`, OWN);
+            await page.uncheck(`${tbl} tbody tr:last-child input[aria-label="啟用"]`);
+            await page.click('#restore-lists');
+            await page.waitForSelector('#restore-box:not([hidden]) #restore-summary');
+            const sum = (await page.textContent('#restore-summary')).replace(/\s+/g, ' ');
+            const want = [`會新增（1）${defs[c].name}`, `網址改回預設（1）${defs[0].name}：https://old.example.net/list.txt → ${defs[0].url}`,
+                `啟用狀態改回預設（1）${defs[b].name}：停用 → 啟用`, `${defs[0].name}：保護「保護」→「自動」`, '保留你自己加的清單（1，排在預設清單後面）我的清單'];
+            const miss = want.filter(w => !sum.includes(w));
+            check(!miss.length && !/會移除/.test(sum), '恢復預設清單：確認區塊列出新增、網址、啟用、保護、保留', `缺 ${miss.join('、')}\n     ${sum}`);
+            await page.check('#restore-own');
+            check(/會移除（1）我的清單（自己加的）/.test((await page.textContent('#restore-summary')).replace(/\s+/g, ' ')), '恢復預設清單：勾「一併移除我自己加的清單」→ 列在會移除');
+            await page.uncheck('#restore-own');
+            await shot('05b-restore-lists');
+            await page.click('#restore-confirm');
+            check(await page.isHidden('#restore-box') && /項未儲存的變更/.test(await page.textContent('#save-msg')), '恢復預設清單：確定後是未儲存的變更（還要按儲存並套用）');
+            let saved2 = await saveWait();
+            check(sameLists(saved2.filter.lists, defs.concat([{ name: '我的清單', url: OWN, enabled: false }])), '恢復預設清單：存檔後預設清單復原，自己加的排在最後、維持停用',
+                JSON.stringify(saved2.filter.lists));
+            await page.click('#cfg-groups button[data-group=filter]');
+            await page.click('#restore-lists');
+            await page.check('#restore-own');
+            await page.click('#restore-confirm');
+            saved2 = await saveWait();
+            check(!('lists' in (saved2.filter || {})), '恢復預設清單：一併移除自己加的 → 跟預設一樣，設定檔不寫 filter.lists', JSON.stringify(saved2.filter));
+            await page.click('#cfg-groups button[data-group=filter]');
+            await page.click('#restore-lists');
+            check(await page.isDisabled('#restore-confirm') && /已經跟這個版本的預設一樣/.test(await page.textContent('#restore-summary')), '恢復預設清單：已經是預設時不能按確定');
+            await page.click('#restore-cancel');
+
+            // 恢復預設自訂規則：先備份成 custom-rules.txt.bak，換成這個版本的預設規則
+            const rulesFile = path.join(dir, 'custom-rules.txt');
+            fs.writeFileSync(rulesFile, '||e2e-before-reset.example^\n');
+            await page.waitForFunction(() => /custom-rules\.txt/.test(document.getElementById('rules-file').textContent), null, { timeout: 5000 }).catch(() => {});
+            check(await page.textContent('#rules-file') === rulesFile, '自訂規則：顯示檔案位置', await page.textContent('#rules-file'));
+            page.once('dialog', dl => dl.dismiss());
+            await page.click('#custom-rules button:has-text("恢復預設自訂規則")');
+            await sleep(500);
+            check(fs.readFileSync(rulesFile, 'utf-8') === '||e2e-before-reset.example^\n', '恢復預設自訂規則：確認視窗按取消不變');
+            page.once('dialog', dl => dl.accept());
+            await page.click('#custom-rules button:has-text("恢復預設自訂規則")');
+            await page.waitForSelector('#rules-reset-msg:not([hidden])', { timeout: 10000 });
+            const rmsg = await page.textContent('#rules-reset-msg');
+            check(/已恢復預設自訂規則/.test(rmsg) && rmsg.includes(rulesFile + '.bak'), '恢復預設自訂規則：顯示備份位置', rmsg);
+            check(fs.readFileSync(rulesFile + '.bak', 'utf-8') === '||e2e-before-reset.example^\n', '恢復預設自訂規則：原本的內容備份在 custom-rules.txt.bak');
+            check(fs.readFileSync(rulesFile, 'utf-8') === fs.readFileSync(path.join(ROOT, 'rules', 'default-custom-rules.txt'), 'utf-8'), '恢復預設自訂規則：檔案換成預設規則');
+            page.once('dialog', dl => dl.accept());
+            await page.click('#custom-rules button:has-text("恢復預設自訂規則")');
+            await page.waitForFunction(() => /不需要變更/.test(document.getElementById('rules-reset-msg').textContent), null, { timeout: 10000 }).catch(() => {});
+            check(/不需要變更/.test(await page.textContent('#rules-reset-msg')) && fs.readFileSync(rulesFile + '.bak', 'utf-8') === '||e2e-before-reset.example^\n', '恢復預設自訂規則：已經是預設時不動檔案、不蓋掉備份');
+            await shot('05c-custom-rules-reset');
+        }
 
         console.log('設定：原始 JSON');
         await page.click('#cfg-groups button[data-group=raw]');
@@ -713,6 +793,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.click('#tool-cache button');
         await page.waitForSelector('#tool-cache .verdict:not([hidden])');
         check(/快取已清除/.test(await page.textContent('#tool-cache .verdict')), '清除快取');
+        check(/更新韌體或要斷電前先按一下，學到的資料會馬上寫進儲存空間/.test(await page.textContent('#tool-persist')), '立即儲存學習資料：說明');
+        await page.click('#tool-persist button');
+        await page.waitForFunction(() => /已儲存學習資料|失敗/.test(document.querySelector('#tool-persist .verdict').textContent), null, { timeout: 15000 }).catch(() => {});
+        check(/^已儲存學習資料（\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}）：(寫了 \d+ 份快照，共 \d|沒有新的變動)/.test(await page.textContent('#tool-persist .verdict')), '立即儲存學習資料：顯示時間與寫了幾份',
+            await page.textContent('#tool-persist .verdict'));
+        check(/手動儲存學習資料/.test(out), '立即儲存學習資料：伺服器記了一行日誌');
         await page.fill('#tool-filter input[type=text]', 'ads.example.com');
         await page.click('#tool-filter button.primary');
         await page.waitForSelector('#tool-filter .verdict:not([hidden])');

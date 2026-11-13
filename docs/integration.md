@@ -130,6 +130,7 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 
 ```
 kuroshio notify wan-changed [-c 設定檔] [--uci]
+kuroshio notify save [-c 設定檔] [--uci]
 ```
 
 通知執行中的服務發生了某件事。目前的事件：
@@ -137,16 +138,20 @@ kuroshio notify wan-changed [-c 設定檔] [--uci]
 | 事件 | 服務會做什麼 |
 |---|---|
 | `wan-changed` | WAN 變了（重新撥號、換 IP、換線路）：DDNS 立即檢查並更新（等同設定頁的「立即更新」）、重新偵測對外 IP（問上游時帶的 ECS 子網路）。都在背景進行，指令立刻回來 |
+| `save` | 立刻把所有還沒寫出的學習資料（快照）寫進快照目錄，不結束；寫完才回來（同 `SIGUSR1`、LuCI 狀態頁與設定頁的「立即儲存學習資料」）。**Windows 沒有訊號，要強制存檔就用這個**（例如關機、更新程式、UPS 通知之前） |
 
 適合放在 WAN 撥號成功後會執行的腳本，例如 Padavan 的 `/etc/storage/post_wan_script.sh`、Asuswrt-Merlin 的 `/jffs/scripts/wan-event`、OpenWrt 的 hotplug（`/etc/hotplug.d/iface/`）、`ppp` 的 `ip-up`。
 
 | 結束碼 | 意思 |
 |---|---|
-| `0` | 已送達（DDNS 沒有啟用也是 0，輸出會寫「DDNS 沒有啟用」） |
+| `0` | 已送達（DDNS 沒有啟用也是 0，輸出會寫「DDNS 沒有啟用」；`save` 沒有新的變動也是 0） |
 | `1` | 服務沒有回應、管理 API 被關掉，或服務拒絕 |
 | `2` | 設定讀不到 |
 
-管理 API 的對應路徑是 `POST /api/notify/wan-changed`（只接受 POST），回應 `{"ok":true,"ddns":"started"|"disabled","ecs":"started","clockSynced":bool}`。
+管理 API 的對應路徑（只接受 POST）：
+
+- `wan-changed`：`POST /api/notify/wan-changed`，回應 `{"ok":true,"ddns":"started"|"disabled","ecs":"started","clockSynced":bool}`。
+- `save`：`POST /api/persist/flush`，回應 `{"ok":true,"files":寫了幾份,"bytes":磁碟上一共幾 bytes,"at":完成時間（Unix 毫秒）,"dir":"快照目錄"}`；沒有新的變動時 `files` 是 `0`。寫入失敗回 HTTP 500 與 `{"error":"..."}`。
 
 ### 其他常用指令
 
@@ -164,7 +169,7 @@ kuroshio notify wan-changed [-c 設定檔] [--uci]
 |---|---|
 | `SIGTERM`、`SIGINT` | 把還沒寫出的快照寫出後結束（結束碼 0）。Flash 上快照可能要幾秒，請給至少 15 秒再強制結束 |
 | `SIGHUP` | 重新載入設定：效果跟設定頁按儲存、主控台輸入 `reload` 一樣（在同一個行程裡重新啟動所有監聽與工作，快照先寫出）。用 `--uci` 時重新讀 UCI（`KUROSHIO_UCI_JSON` 有設定就讀那個檔，所以要先更新它） |
-| `SIGUSR1` | 立刻把所有還沒寫出的快照寫進快照目錄，不結束（例如路由器要斷電、要備份之前） |
+| `SIGUSR1` | 立刻把所有還沒寫出的快照寫進快照目錄，不結束（例如路由器要斷電、要備份之前）。效果同 `kuroshio notify save`（Windows 用那個） |
 
 每收到一個訊號都會在日誌記一行（`收到 SIGHUP…`、`收到 SIGUSR1…`）。用 JSON 設定檔時，重新載入後的新設定啟動失敗，會把設定檔改回上一份可以用的內容繼續執行，不會停掉。
 
@@ -223,7 +228,7 @@ kuroshio notify wan-changed [-c 設定檔] [--uci]
 
 - **健康檢查**用 `kuroshio health`（不需要管理 API、不需要 token，成本很低，可以每幾秒跑一次）；要細節才用 `kuroshio status --json`。
 - **停止**送 `SIGTERM`，等至少 15 秒。不要直接 `SIGKILL`：還沒寫出的學習資料（快照）會遺失。
-- **斷電前**（例如 UPS 通知）送 `SIGUSR1` 先把快照寫出。
+- **斷電前**（例如 UPS 通知）送 `SIGUSR1`，或執行 `kuroshio notify save`（Windows 只能用這個），先把快照寫出。
 - **WAN 變動**時執行 `kuroshio notify wan-changed`。
 - **容器**：把設定檔與快照目錄放在掛載的磁碟區（例如 `/config/config.json`、`system.persistDir: "/config/state"`），用 `KUROSHIO_INIT_CONFIG` 提供第一次啟動的預設設定，`KUROSHIO_SHARE` 指向映像裡的 data/。
 - 管理 API 只聽本機（`127.0.0.1`）、只接受本機的 `Host`；要從別的地方管理請經過反向代理並開啟登入（`admin.auth`）。

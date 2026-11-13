@@ -126,6 +126,8 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         | "/api/acme/issue"
         | "/api/ddns/update"
         | "/api/filter/update"
+        | "/api/filter/reset-rules"
+        | "/api/persist/flush"
         | "/api/cdn/verify"
         | "/api/cdn/policy"
         | "/api/cdn/ecs"
@@ -698,6 +700,38 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 }
             }
         },
+        // 恢復預設自訂規則：原本的內容先備份成 <檔名>.bak，寫入這個版本的預設規則，立刻重新載入
+        "/api/filter/reset-rules" => {
+            let Some(file) = crate::backup::Locations::from_cfg(&st.cfg).custom_rules else {
+                return bad("設定裡沒有自訂規則檔（filter.customRules）", 400);
+            };
+            let share = crate::app::share_dir(&st.cfg);
+            match tokio::task::spawn_blocking(move || crate::filtering::reset_custom_rules(&file, &share)).await {
+                Ok(Ok(mut v)) => {
+                    let reloaded = st.filter.as_ref().map(|f| f.reload_custom(true));
+                    v["reloaded"] = json!(reloaded.unwrap_or(false));
+                    ok(v)
+                }
+                Ok(Err(e)) => bad(&format!("恢復預設自訂規則失敗：{e}"), 500),
+                Err(e) => bad(&format!("恢復預設自訂規則失敗：{e}"), 500),
+            }
+        }
+        // 立即儲存學習資料：有變動的快照全部寫進快照目錄（Windows 沒有 SIGUSR1，就靠這個或 `kuroshio notify save`）
+        "/api/persist/flush" => {
+            let s2 = st.clone();
+            match tokio::task::spawn_blocking(move || s2.flush_counted()).await {
+                Ok(Ok((files, bytes))) => {
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    info!("手動儲存學習資料：寫了 {files} 份快照（{bytes} bytes）");
+                    ok(json!({ "ok": true, "files": files, "bytes": bytes, "at": at, "dir": st.persist_dir }))
+                }
+                Ok(Err(e)) => bad(&format!("寫入快照失敗：{e}"), 500),
+                Err(e) => bad(&format!("寫入快照失敗：{e}"), 500),
+            }
+        }
         "/api/filter/check" => {
             let Some(name) = q.get("name").filter(|n| !n.is_empty()) else {
                 return bad("需要 name", 400);
@@ -922,6 +956,8 @@ mod tests {
             "/api/acme/issue",
             "/api/ddns/update",
             "/api/filter/update",
+            "/api/filter/reset-rules",
+            "/api/persist/flush",
             "/api/cdn/verify",
             "/api/cdn/policy",
             "/api/cdn/ecs",

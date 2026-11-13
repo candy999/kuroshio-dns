@@ -144,6 +144,8 @@ kuroshio check-config <file>                     檢查設定檔
 | `/api/backup/export?kind=full\|share`（GET） | 先把記憶體裡的狀態寫出，再下載 `.kuroshio` 備份檔（`application/octet-stream`、`content-disposition: attachment; filename="kuroshio-<種類>-YYYYMMDD.kuroshio"`） |
 | `/api/backup/import`（POST，內容 = 檔案本身，最多 64 MB） | 檢查後存成 `<state>/import-pending.kuroshio`，在程式內重新啟動；回 `{ok, reloading:true, preview}`。新的一輪在讀取任何狀態之前合併（舊的一輪先把記憶體寫出，不會蓋掉合併結果） |
 | `/api/backup/last-import` | 上一次匯入的合併結果（`<state>/import-last.json`；沒有時 `{none:true}`） |
+| `/api/persist/flush`（POST） | 立即儲存學習資料：有變動的快照全部寫進快照目錄（同 SIGUSR1、`kuroshio notify save`）；回 `{ok, files, bytes, at（Unix 毫秒）, dir}` |
+| `/api/filter/reset-rules`（POST） | 恢復預設自訂規則：`filter.customRules` 的第一個檔案先複製成 `<檔名>.bak`，再寫入這個版本的預設規則（`<shareDir>/default-custom-rules.txt`，沒有就用執行檔內建的），立刻重新載入；已經是預設時不動檔案。回 `{ok, changed, file, backup, source（檔案路徑或 builtin）, bytes, reloaded}` |
 
 `rpcd.sh` 的允許清單同步加入新路徑。備份不走 `api` / `action`：rpcd 另有 `backup_export {kind}`（執行 `kuroshio export --uci`，檔案放在 `/tmp/kuroshio-backup.kuroshio` 讓 LuCI 下載）與 `backup_import {}`（匯入 LuCI 上傳的 `/tmp/kuroshio-import.kuroshio`），兩個都需要 ACL 寫入權限。
 

@@ -1,5 +1,5 @@
 //! 給其他平台（Docker、第三方路由器韌體、一般 Linux 的服務管理）用的穩定介面：
-//! `kuroshio health`、`kuroshio status --json`、`kuroshio notify wan-changed`、`KUROSHIO_INIT_CONFIG`。
+//! `kuroshio health`、`kuroshio status --json`、`kuroshio notify wan-changed | save`、`KUROSHIO_INIT_CONFIG`。
 //! 完整說明見 `docs/integration.md`（那份是對外的約定，這裡改了要一起改）。
 //!
 //! # `kuroshio status --json` 的欄位
@@ -91,6 +91,18 @@ pub fn health_json(server: SocketAddr, ms: Option<u64>, rcode: Option<u8>, error
 fn upstream_ok(u: &Value) -> bool {
     let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
     u.get("paused") != Some(&Value::Bool(true)) && !(n("fail") > 0 && n("ok") == 0)
+}
+
+/// `kuroshio notify save` 的輸出（`POST /api/persist/flush` 的回應 → 一行給人看的文字）
+pub fn save_text(v: &Value) -> String {
+    let files = v["files"].as_u64().unwrap_or(0);
+    let dir = v["dir"].as_str().map(|d| format!("（{d}）")).unwrap_or_default();
+    if files == 0 {
+        format!("已儲存學習資料：沒有新的變動，不需要寫入{dir}")
+    } else {
+        let kb = v["bytes"].as_u64().unwrap_or(0).div_ceil(1024);
+        format!("已儲存學習資料：寫了 {files} 份快照，共 {kb} KB{dir}")
+    }
 }
 
 /// `/api/status` → `kuroshio status --json` 的穩定格式（欄位見本模組說明）

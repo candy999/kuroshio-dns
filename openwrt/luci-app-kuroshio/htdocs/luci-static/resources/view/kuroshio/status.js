@@ -21,6 +21,12 @@ var JOBS = { 'dns-benchmark': _('DNS 評測'), 'cdn-ranges': _('CDN IP 範圍'),
 function fmtNum(n) { return (n == null) ? '-' : Number(n).toLocaleString(); }
 function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
 function fmtTime(t, mode) { return common.time(t, mode); }
+function fmtBytes(b) {
+	if (b == null) return '-';
+	if (b < 1024) return b + ' B';
+	if (b < 1048576) return (b / 1024).toFixed(0) + ' KB';
+	return (b / 1048576).toFixed(1) + ' MB';
+}
 /* 還沒存的時間：0 = 都存了 */
 function fmtAge(s) {
 	if (s == null) return '-';
@@ -56,6 +62,17 @@ var tile = function(label, value, sub) { return common.tile(label, value, sub); 
 return view.extend({
 	load: function() {
 		return Promise.all([uci.load('kuroshio'), L.resolveDefault(callStatus(), {}), L.resolveDefault(callAcmeStatus(), null)]);
+	},
+
+	/** 立即儲存學習資料（POST /api/persist/flush）：顯示時間、寫了幾份、多大 */
+	flushNow: function() {
+		return common.action('/api/persist/flush').then(function(r) {
+			var x = common.result(r);
+			if (!x || x.ok === false) return common.notify({ ok: false, error: (x && x.error) || (r && r.error) || _('儲存失敗') });
+			var at = fmtTime(x.at, 'sec');
+			common.notify(r, x.files ? _('已儲存學習資料（%s）：寫了 %d 份快照，共 %s').format(at, x.files, fmtBytes(x.bytes))
+				: _('已儲存學習資料（%s）：沒有新的變動，不需要寫入').format(at));
+		});
 	},
 
 	runJob: function(name) {
@@ -190,6 +207,10 @@ return view.extend({
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/cache/flush').then(function(r) { common.notify(r, _('快取已清除')); }); }) }, _('清除快取')),
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/filter/update').then(function(r) { common.notify(r, _('已重新下載過濾清單')); }); }) }, _('更新過濾清單')),
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/ddns/update').then(function(r) { common.notify(r, _('DDNS 已更新')); }); }) }, _('立即更新 DDNS'))
+			]),
+			E('div', { 'class': 'kuroshio-row', 'style': 'margin-top:.6em' }, [
+				E('button', { 'class': 'btn cbi-button cbi-button-action', 'id': 'kuroshio-persist-flush', 'click': ui.createHandlerFn(self, 'flushNow') }, _('立即儲存學習資料')),
+				E('span', { 'class': 'cbi-value-description', 'style': 'margin:0' }, _('更新韌體或要斷電前先按一下，學到的資料會馬上寫進儲存空間'))
 			])
 		]);
 

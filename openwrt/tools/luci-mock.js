@@ -59,7 +59,9 @@ if (process.env.UCI_SET) {
         if (uci.kuroshio[sec]) uci.kuroshio[sec][opt] = /,/.test(v) ? v.split(',') : v;
     }
 }
-const files = { '/etc/kuroshio/custom-rules.txt': '! 自訂規則\n' };
+const files = { '/etc/kuroshio/custom-rules.txt': '! 自訂規則\n',
+    // 套件附帶的預設自訂規則（恢復預設自訂規則用）：跟真正的套件一樣用 rules/default-custom-rules.txt
+    '/usr/share/kuroshio/default-custom-rules.txt': fs.readFileSync(path.join(ROOT, 'rules', 'default-custom-rules.txt'), 'utf-8') };
 
 // ---------------- kuroshio 的範例資料 ----------------
 const IFACES = { interfaces: [
@@ -278,6 +280,7 @@ function kuroshio(method, args) {
         if (args.path === '/api/ddns/update') return wrap('/api/ddns');
         if (args.path === '/api/community/invite/refresh') { inviteN++; return wrap('/api/community/invite'); }
         if (args.path === '/api/community/invite/use') return { ok: true, result: INVITE_USE(args.query) };
+        if (args.path === '/api/persist/flush') return DOWN ? wrap(args.path) : { ok: true, result: { ok: true, files: 7, bytes: 345678, at: Date.now(), dir: '/etc/kuroshio/state' } };
         return { ok: true, result: { ok: true } };
     case 'defaults': return { result: defaults };
     case 'about': return { core: { name: '黑潮 DNS', version: '3.1.1', language: 'Rust', target: 'mock', features: ['doh', 'dot'], license: 'GPL-3.0-or-later', licenseUrl: 'https://www.gnu.org/licenses/gpl-3.0.html', source: 'https://github.com/candy999/kuroshio-dns', qrSource: QR_SOURCE }, ui: '3.1.1-r1' };
@@ -310,9 +313,15 @@ function ubus(obj, method, a) {
             return [0];
         case 'add': {
             const name = a.name || 'cfg' + Math.random().toString(16).slice(2, 8);
-            cfg[name] = Object.assign({ '.type': a.type, '.name': name, '.anonymous': !a.name, '.index': Object.keys(cfg).length }, a.values || {});
+            cfg[name] = Object.assign({ '.type': a.type, '.name': name, '.anonymous': !a.name, '.index': Math.max(-1, ...Object.values(cfg).map(x => x['.index'])) + 1 }, a.values || {});
             return [0, { section: name }];
         }
+        case 'order':
+            if (!cfg) return [4];
+            // 跟 rpcd 一樣：列出的區段依序排在最前面，其他的維持原本的先後
+            [].concat(a.sections || []).concat(Object.values(cfg).sort((x, y) => x['.index'] - y['.index']).map(x => x['.name']))
+                .filter((n, i, all) => cfg[n] && all.indexOf(n) === i).forEach((n, i) => { cfg[n]['.index'] = i; });
+            return [0];
         case 'changes': return [0, { changes: {} }];
         case 'configs': return [0, { configs: Object.keys(uci) }];
         default: return [0];   // apply / confirm / rollback / order / commit

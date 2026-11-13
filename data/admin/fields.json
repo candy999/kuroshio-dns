@@ -280,6 +280,11 @@
               ] }
             ] }
           ]
+        },
+        {
+          "title": "自訂規則",
+          "desc": "最高原則：自訂規則永遠優先於所有訂閱清單。例：||ads.example.com^ 封鎖、@@||good.example.com^ 白名單、! 或 # 開頭是註解。",
+          "widget": "customRules"
         }
       ]
     },

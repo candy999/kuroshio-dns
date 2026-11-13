@@ -118,6 +118,11 @@ async fn health_status_notify_exit_codes() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("DDNS 沒有啟用"), "{out}");
 
+    // notify save：立刻寫出快照（Windows 沒有 SIGUSR1，用這個）
+    let (code, out) = run_async(a(&["notify", "save", "-c", &c])).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("已儲存學習資料"), "{out}");
+
     // token 錯了：服務在，但讀不到狀態
     let token = kuroshio::webui::token_file(&cfg, &dir).unwrap();
     let real = std::fs::read(&token).unwrap();
@@ -165,6 +170,75 @@ async fn health_status_notify_exit_codes() {
     assert!(v["error"].is_string());
     let (code, _) = run_async(a(&["notify", "wan-changed", "-c", &g])).await;
     assert_eq!(code, 1);
+    let (code, _) = run_async(a(&["notify", "save", "-c", &g])).await;
+    assert_eq!(code, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `POST /api/persist/flush`（立即儲存學習資料）與 `POST /api/filter/reset-rules`（恢復預設自訂規則）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persist_flush_and_reset_custom_rules() {
+    let dir = tmp("flush");
+    // 唯讀資料目錄放一份「這個版本的預設自訂規則」：優先用它，不用執行檔內建的
+    let share = dir.join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::write(share.join("default-custom-rules.txt"), "! 預設\n||default.example.com^\n").unwrap();
+    let rules = dir.join("custom-rules.txt");
+    std::fs::write(&rules, "||mine.example.com^\n").unwrap();
+    let mut u = user_cfg(&dir, 0, 0, false);
+    u["system"]["dataDir"] = json!(share);
+    u["filter"] = json!({ "enabled": true, "customRules": ["./custom-rules.txt"], "lists": [] });
+    let cfg = kuroshio_config::with_overrides(&u);
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let st = &started.state;
+    let none = Default::default();
+    let check = |name: &'static str| {
+        let q = [("name".to_string(), name.to_string())].into_iter().collect();
+        async move { kuroshio::admin::route(st, "/api/filter/check", &q).await.body["action"].clone() }
+    };
+    assert_eq!(check("mine.example.com").await, "block");
+
+    // 立即儲存學習資料：回寫了幾份、幾 bytes、時間（毫秒）
+    let r = kuroshio::admin::route(st, "/api/persist/flush", &none).await;
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert_eq!(r.body["ok"], true);
+    assert!(r.body["files"].is_u64() && r.body["bytes"].is_u64(), "{}", r.body);
+    assert!(r.body["at"].as_u64().unwrap() > 1_700_000_000_000);
+    assert_eq!(r.body["dir"], json!(dir.join("state")));
+    // 馬上再按一次：沒有新的變動
+    let r = kuroshio::admin::route(st, "/api/persist/flush", &none).await;
+    assert_eq!(r.body["files"], 0, "{}", r.body);
+    assert_eq!(r.body["bytes"], 0);
+
+    // 恢復預設自訂規則：原本的內容備份成 custom-rules.txt.bak，立刻生效
+    let r = kuroshio::admin::route(st, "/api/filter/reset-rules", &none).await;
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert_eq!(r.body["changed"], true);
+    assert_eq!(r.body["reloaded"], true);
+    assert_eq!(
+        r.body["source"],
+        json!(share.join("default-custom-rules.txt").display().to_string())
+    );
+    let bak = dir.join("custom-rules.txt.bak");
+    assert_eq!(r.body["backup"], json!(bak));
+    assert_eq!(std::fs::read_to_string(&bak).unwrap(), "||mine.example.com^\n");
+    assert_eq!(std::fs::read_to_string(&rules).unwrap(), "! 預設\n||default.example.com^\n");
+    assert_eq!(check("mine.example.com").await, "none");
+    assert_eq!(check("default.example.com").await, "block");
+    // 已經是預設：不動檔案，也不蓋掉上一次的備份
+    let r = kuroshio::admin::route(st, "/api/filter/reset-rules", &none).await;
+    assert_eq!(r.body["changed"], false, "{}", r.body);
+    assert_eq!(std::fs::read_to_string(&bak).unwrap(), "||mine.example.com^\n");
+    started.shutdown();
+    drop(started);
+
+    // 唯讀資料目錄沒有預設規則檔：用執行檔內建的；自訂規則檔不存在時沒有備份
+    std::fs::remove_file(share.join("default-custom-rules.txt")).unwrap();
+    std::fs::remove_file(&rules).unwrap();
+    let v = kuroshio::filtering::reset_custom_rules(&rules, &share).unwrap();
+    assert_eq!(v["source"], "builtin");
+    assert_eq!(v["backup"], Value::Null);
+    assert_eq!(std::fs::read_to_string(&rules).unwrap(), kuroshio::filtering::DEFAULT_CUSTOM_RULES);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

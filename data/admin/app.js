@@ -1446,6 +1446,29 @@
 		access: function () { return panel('access', loadAccess, accessPanel); },
 		accessTest: accessTest,
 
+		// 自訂規則檔：位置、恢復預設自訂規則（先備份成 .bak；設定頁不編輯規則內容，用記事本編輯）
+		customRules: function () {
+			var file = el('span', { class: 'mono', id: 'rules-file', text: '…' });
+			var msg = el('p', { class: 'msg', id: 'rules-reset-msg', hidden: true });
+			api('/api/paths').then(function (r) { file.textContent = (r.ok && r.data && r.data.customRules) || '（設定裡沒有自訂規則檔）'; });
+			var say = function (text, kind) { msg.textContent = text; msg.className = 'msg ' + kind; msg.hidden = false; };
+			return el('div', { id: 'custom-rules' }, [
+				el('p', {}, ['自訂規則檔：', file]),
+				el('p', { class: 'muted', text: '用記事本編輯，存檔後 3 秒內生效。想從頭來過時，可以換回這個版本附帶的預設規則。' }),
+				el('div', { class: 'tbl-actions' }, [actBtn('恢復預設自訂規則', 'small danger', function () {
+					if (!window.confirm('把自訂規則檔換成這個版本的預設規則？\n目前的內容會先備份成同一個資料夾的 custom-rules.txt.bak（只保留最近一次）。')) return;
+					return api('/api/filter/reset-rules', { method: 'POST' }).then(function (r) {
+						if (!r.ok) { say('失敗：' + errText(r), 'err'); return; }
+						var x = r.data || {};
+						if (x.changed === false) { say('自訂規則已經是這個版本的預設，不需要變更。', 'info'); return; }
+						say('已恢復預設自訂規則' + (x.reloaded ? '，已經生效' : '（過濾沒有啟用，啟用後才會套用）') + '。'
+							+ (x.backup ? '原本的內容備份在 ' + x.backup : '原本沒有自訂規則檔，不需要備份。'), 'ok');
+					});
+				})]),
+				msg
+			]);
+		},
+
 		// 存放位置（/api/paths）：只有路徑，沒有密鑰內容
 		paths: function () {
 			return panel('paths', function () { return api('/api/paths'); }, function (box, p) {
@@ -1496,6 +1519,81 @@
 			changed(f, null);
 		}
 	};
+
+	/**
+	 * 「恢復預設清單」要怎麼改（跟 LuCI kuroshio/common.js 的 restorePlan 同一份規則）。
+	 * 對應方式：先用網址找，找不到再用名稱找（所以只改了網址的預設清單會被改回預設網址）。
+	 * 網址不在預設裡的是使用者自己加的：保留原樣、排在預設清單後面（removeOwn = true 時移除）。
+	 * 回傳 { result: [{ def | own（原本的物件）, from }], changes: { add, remove, url, enabled, other, keep, reorder, count } }
+	 */
+	function restorePlan(curRaw, defsRaw, removeOwn) {
+		var norm = function (x) {
+			var p = x.protect;
+			return { name: String(x.name || ''), url: String(x.url || '').trim(), category: x.category || 'ads', enabled: x.enabled !== false,
+				protect: p === undefined || p === null || p === '' ? undefined : !!p, raw: x };
+		};
+		var cur = (curRaw || []).map(norm), defs = (defsRaw || []).map(norm);
+		var used = cur.map(function () { return false; }), match = defs.map(function () { return -1; });
+		var find = function (test) {
+			for (var j = 0; j < cur.length; j++) if (!used[j] && test(cur[j])) { used[j] = true; return j; }
+			return -1;
+		};
+		defs.forEach(function (d, i) { match[i] = find(function (c) { return c.url === d.url; }); });
+		defs.forEach(function (d, i) { if (match[i] < 0) match[i] = find(function (c) { return c.name !== '' && c.name === d.name; }); });
+		var defUrl = {};
+		defs.forEach(function (d) { defUrl[d.url] = true; });
+		var ch = { add: [], remove: [], url: [], enabled: [], other: [], keep: [], reorder: false, count: 0 };
+		var result = [];
+		defs.forEach(function (d, i) {
+			var j = match[i];
+			result.push({ def: d.raw, from: j });
+			if (j < 0) { ch.add.push(d); return; }
+			var c = cur[j], o = [];
+			if (c.url !== d.url) ch.url.push({ name: d.name, from: c.url, to: d.url });
+			if (c.enabled !== d.enabled) ch.enabled.push({ name: d.name, from: c.enabled, to: d.enabled });
+			if (c.name !== d.name) o.push({ what: 'name', from: c.name, to: d.name });
+			if (c.category !== d.category) o.push({ what: 'category', from: c.category, to: d.category });
+			if (c.protect !== d.protect) o.push({ what: 'protect', from: c.protect, to: d.protect });
+			if (o.length) ch.other.push({ name: d.name, diffs: o });
+		});
+		cur.forEach(function (c, j) {
+			if (used[j]) return;
+			var own = !defUrl[c.url];
+			if (own && !removeOwn) { result.push({ own: c.raw, from: j }); ch.keep.push(c); }
+			else ch.remove.push({ name: c.name, url: c.url, own: own });
+		});
+		var order = result.filter(function (r) { return r.from >= 0; }).map(function (r) { return r.from; });
+		ch.reorder = order.some(function (v, i) { return i > 0 && v < order[i - 1]; });
+		ch.count = ch.add.length + ch.remove.length + ch.url.length + ch.enabled.length + ch.other.length + (ch.reorder ? 1 : 0);
+		return { result: result, changes: ch };
+	}
+	var CAT_LABEL = { ads: '廣告 / 追蹤', telemetry: '遙測 / 驗證', malware: '惡意 / 詐騙' };
+	/** 「恢復預設清單」確認區塊裡的變更清單 */
+	function restoreSummary(ch) {
+		if (!ch.count) return el('p', { class: 'msg info', text: '目前的訂閱清單已經跟這個版本的預設一樣，不需要變更。' });
+		var onOff = function (v) { return v ? '啟用' : '停用'; };
+		var prot = function (v) { return v === undefined ? '自動' : v ? '保護' : '不保護'; };
+		var block = function (cls, title, items) {
+			if (!items.length) return null;
+			return el('div', { class: 'restore-' + cls }, [el('strong', { text: title }), el('ul', {}, items.map(function (x) { return el('li', { text: x }); }))]);
+		};
+		var otherText = function (o) {
+			return o.name + '：' + o.diffs.map(function (x) {
+				if (x.what === 'name') return '名稱「' + x.from + '」→「' + x.to + '」';
+				if (x.what === 'category') return '分類「' + (CAT_LABEL[x.from] || x.from) + '」→「' + (CAT_LABEL[x.to] || x.to) + '」';
+				return '保護「' + prot(x.from) + '」→「' + prot(x.to) + '」';
+			}).join('、');
+		};
+		return el('div', { class: 'restore-list' }, [
+			block('add', '會新增（' + ch.add.length + '）', ch.add.map(function (d) { return d.name + '（' + onOff(d.enabled) + '）'; })),
+			block('remove', '會移除（' + ch.remove.length + '）', ch.remove.map(function (d) { return (d.name || d.url) + (d.own ? '（自己加的）' : '（重複的預設清單）'); })),
+			block('url', '網址改回預設（' + ch.url.length + '）', ch.url.map(function (d) { return d.name + '：' + d.from + ' → ' + d.to; })),
+			block('enabled', '啟用狀態改回預設（' + ch.enabled.length + '）', ch.enabled.map(function (d) { return d.name + '：' + onOff(d.from) + ' → ' + onOff(d.to); })),
+			block('other', '名稱 / 分類 / 保護改回預設（' + ch.other.length + '）', ch.other.map(otherText)),
+			ch.reorder ? block('reorder', '順序', ['改回預設的順序（自己加的清單排在預設清單後面）']) : null,
+			block('keep', '保留你自己加的清單（' + ch.keep.length + '，排在預設清單後面）', ch.keep.map(function (d) { return d.name || d.url; }))
+		]);
+	}
 
 	/** 物件陣列（訂閱清單）：每一列的欄位依 columns；不認識的屬性保留 */
 	function renderTable(f, row) {
@@ -1579,10 +1677,47 @@
 				}
 			}),
 			el('button', {
-				type: 'button', class: 'btn small', text: '還原預設清單',
-				onclick: function () { rows = clone(d || []); draw(); commit(); }
+				type: 'button', class: 'btn small', id: 'restore-lists', text: '恢復預設清單',
+				title: '把訂閱清單改回這個版本的預設；自己加的清單會保留',
+				onclick: function () { showRestore(); }
 			})
 		]));
+		// 恢復預設清單：先列出會改什麼，確認後改編輯中的設定（還要按「儲存並套用」）
+		var restoreBox = el('div', { class: 'card restore', id: 'restore-box', hidden: true });
+		var showRestore = function () {
+			var own = el('input', { type: 'checkbox', id: 'restore-own' });
+			var sum = el('div', { id: 'restore-summary' });
+			var plan = null;
+			var okb = el('button', { type: 'button', class: 'btn primary', id: 'restore-confirm', text: '恢復預設清單' });
+			var draw2 = function () {
+				plan = restorePlan(rows, d || [], own.checked);
+				clear(sum);
+				sum.appendChild(restoreSummary(plan.changes));
+				okb.disabled = !plan.changes.count;
+			};
+			own.addEventListener('change', draw2);
+			okb.addEventListener('click', function () {
+				// 預設清單照預設值原樣放（跟預設完全一樣時設定檔就不寫這一欄）；自己加的保留原本的物件（含不認識的屬性）
+				rows = plan.result.map(function (r) { return r.def ? clone(r.def) : r.own; });
+				restoreBox.hidden = true;
+				draw();
+				commit();
+				toast('已改成這個版本的預設清單（' + plan.changes.count + ' 項變更），按「儲存並套用」後生效');
+			});
+			clear(restoreBox);
+			append(restoreBox, [
+				el('h4', { text: '恢復預設清單' }),
+				el('p', { text: '把訂閱清單改回這個版本的預設：名稱、網址、分類、啟用狀態與順序。網址不在預設裡的清單是你自己加的，會保留並排在預設清單後面（啟用狀態不變）。' }),
+				sum,
+				el('label', { class: 'chk' }, [own, el('span', { text: '一併移除我自己加的清單' })]),
+				el('p', { class: 'muted', text: '確定後還要按下方的「儲存並套用」才會生效。' }),
+				el('div', { class: 'tbl-actions' }, [okb, el('button', { type: 'button', class: 'btn', id: 'restore-cancel', text: '取消', onclick: function () { restoreBox.hidden = true; } })])
+			]);
+			draw2();
+			restoreBox.hidden = false;
+			restoreBox.scrollIntoView({ block: 'nearest' });
+		};
+		wrap.appendChild(restoreBox);
 		return wrap;
 	}
 
@@ -1864,6 +1999,19 @@
 			});
 		}));
 		box.appendChild(cache);
+
+		// 立即儲存學習資料（Windows 沒有 SIGUSR1：這個按鈕或 kuroshio notify save）
+		var pc = toolCard('persist', '立即儲存學習資料', '更新韌體或要斷電前先按一下，學到的資料會馬上寫進儲存空間');
+		pc.body.appendChild(actBtn('立即儲存學習資料', 'primary', function () {
+			pc.show('儲存中…', '');
+			return api('/api/persist/flush', { method: 'POST' }).then(function (r) {
+				if (!r.ok) return pc.show('失敗：' + errText(r), 'err');
+				var x = r.data || {}, at = fmtTime(x.at, 'sec');
+				pc.show(x.files ? '已儲存學習資料（' + at + '）：寫了 ' + fmtNum(x.files) + ' 份快照，共 ' + fmtBytes(x.bytes)
+					: '已儲存學習資料（' + at + '）：沒有新的變動，不需要寫入', 'ok');
+			});
+		}));
+		box.appendChild(pc);
 
 		// 規則檢查
 		var fc = toolCard('filter', '過濾規則檢查', '看一個網域會不會被擋、是哪一條規則。');
