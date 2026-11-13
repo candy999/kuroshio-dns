@@ -260,6 +260,17 @@ kuroshio.exe service install    長期執行：裝成 Windows 服務
 
 **[Windows 使用說明](docs/windows.md)**：設定檔放哪裡、`config.json` 怎麼寫（只給本機、給區網、對外提供加密 DNS、跟 IIS 共用 443、IIS 反向代理）、憑證（內建申請或沿用 win-acme）、cmd 自動重啟腳本、服務、測試與常見問題。
 
+**Docker**（amd64、arm64、armv7；NAS 也適用）：
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/candy999/kuroshio-dns/main/docker/compose.yml
+docker compose up -d     # 第一次啟動建立 ./config/config.json，改完 docker restart kuroshio
+```
+
+**[Docker 使用說明](docs/docker.md)**：為什麼要用 host 網路、Ubuntu 的 53 埠、設定頁登入、備份與升級、Synology / QNAP / Unraid、放在 Caddy / Nginx / Apache 後面。
+
+**其他 Linux**：下載 `kuroshio-linux-<target>.tar.gz`（例如 x86_64 用 `kuroshio-linux-x86_64-unknown-linux-musl.tar.gz`），解開後 `kuroshio` 與 `data/` 放在一起，`./kuroshio run -c config.json`，說明在裡面的 `README-linux.txt`。
+
 ## 指令
 
 ```
@@ -306,10 +317,12 @@ cargo run -- query example.com -s 8.8.8.8
 ```sh
 pip install ziglang cargo-zigbuild
 cargo zigbuild --release -p kuroshio --target aarch64-unknown-linux-musl
-# MIPS
+# MIPS（nightly 固定日期，同 CI 的 MIPS_NIGHTLY）
 RUSTFLAGS="-C relocation-model=static" \
-  cargo +nightly zigbuild --release -p kuroshio --target mipsel-unknown-linux-musl -Zbuild-std=std,panic_abort
+  cargo +nightly-2026-11-13 zigbuild --release -p kuroshio --target mipsel-unknown-linux-musl -Zbuild-std=std,panic_abort
 ```
+
+各平台怎麼編、怎麼用 QEMU 在電腦上跑其他 CPU 的執行檔、怎麼更新 MIPS 的 nightly：見 [建置說明](docs/building.md)。
 
 | 資料夾 | 內容 |
 |---|---|
@@ -323,6 +336,8 @@ RUSTFLAGS="-C relocation-model=static" \
 | `crates/kuroshio-community` | 社群共享 |
 | `openwrt/` | OpenWrt 套件與 LuCI |
 | `windows/` | Windows 版說明 |
+| `linux/` | Linux 通用版說明 |
+| `docker/` | 容器映像檔、Compose 範例、映像檔測試 |
 | `data/` | 設定頁、公開頁、共用儀表板、種子資料、評測名單、CDN 官方範圍、台灣 IP 公版 |
 | `rules/` | 預設自訂過濾規則 |
 | `docs/spec/` | 規格 |
