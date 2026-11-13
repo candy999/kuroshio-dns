@@ -227,7 +227,8 @@ endlocal
 - 用系統管理員執行，是為了讓憑證續期後能自動重新匯入、綁定 HTTP.sys / IIS。只跑一般 DNS 的話不需要。
 - 正常結束（`quit`、Ctrl+C）就停下；異常結束才重開。
 - ConEmu、Windows Terminal、cmd 都可以用，日誌有顏色。不要顏色可以在 `setlocal` 下面加 `set "NO_COLOR=1"`。
-- 傳統 cmd 視窗如果開著「快速編輯模式」，在視窗裡點一下滑鼠會讓輸出暫停、DNS 也可能跟著卡住（按 Esc 恢復）。建議在視窗標題列按右鍵 →「內容」→ 取消「快速編輯模式」，或改用服務。
+- 傳統 cmd 視窗的「快速編輯模式」會讓你在視窗裡點一下滑鼠時暫停輸出、DNS 也跟著卡住（按 Esc 恢復）。3.1.0 起 `kuroshio run` 啟動時會自動把它關掉（日誌會有一行「已關閉主控台的「快速編輯模式」」），不用自己設定。
+  - 3.1.0 以前的版本：在視窗標題列按右鍵 →「內容」→ 取消「快速編輯模式」，或改用服務。
 
 ### 方式二：Windows 服務（長期 24 小時運作，建議）
 
@@ -268,6 +269,7 @@ kuroshio.exe query www.google.com -s quic://dns.example.net
 | DoQ 外面連不到 | 路由器沒有轉 UDP 853 |
 | 憑證續期了但 HTTPS 還是舊的 | HTTP.sys / IIS 的綁定要系統管理員權限才能更新：cmd 用系統管理員執行，或改用服務。`kuroshio.exe httpsys cert` 立即同步 |
 | 53 埠被占用（日誌說監聽失敗） | Hyper-V 的預設交換器、網路連線共用（ICS）、其他 DNS 軟體會佔 53 埠：`netstat -ano \| findstr :53` 找出程式（最後一欄是 PID），或改 `listen.plain.port` |
+| cmd 視窗點一下之後畫面不動、DNS 也沒回應，按 Esc 才恢復 | 傳統主控台的「快速編輯模式」。3.1.0 起啟動時會自動關掉；以前的版本在標題列右鍵 →「內容」取消，或改用服務 |
 | 啟動失敗、不知道設定哪裡錯 | `kuroshio.exe check-config config.json`；設定頁存了一份啟動不了的設定時，程式會自動退回上一份能用的 |
 
 更多細節：[規格 07 · Windows 版](spec/07-windows.md)。

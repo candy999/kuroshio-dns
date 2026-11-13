@@ -328,6 +328,35 @@ pub fn enable_ansi() -> bool {
     }
 }
 
+/// 關閉 Windows 主控台的「快速編輯模式」（cmd / conhost）：開著時在視窗裡點一下就會進入選取狀態，
+/// 程式寫到畫面的動作會卡住直到按 Esc，日誌是同步寫的，DNS 也跟著停。
+/// 只拿掉快速編輯，插入模式等其他設定不動；不是主控台（ConEmu、輸入被導向…）就什麼都不做。
+/// 回傳有沒有真的關掉（其他平台一律 false）
+pub fn disable_quick_edit() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, STD_INPUT_HANDLE,
+        };
+        // SAFETY: GetStdHandle 回傳的是行程的標準輸入代碼，不用關閉；mode 由我們配置
+        unsafe {
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(h, &mut mode) == 0 {
+                return false;
+            }
+            if mode & ENABLE_QUICK_EDIT_MODE == 0 {
+                return false;
+            }
+            SetConsoleMode(h, (mode | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// 標準輸入是終端機時，開一條執行緒逐行讀取（讀到結尾就結束）
 pub fn spawn_reader() -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
     use std::io::{BufRead, IsTerminal};

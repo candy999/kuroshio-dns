@@ -424,6 +424,10 @@ pub async fn serve(
     // cmd 執行：可以在視窗裡輸入 help、url、site…（標準輸入是終端機時才讀）
     let console: ConsoleSlot = Default::default();
     let mut console_rx = if mode == "cmd" { kuroshio::console::spawn_reader() } else { None };
+    // cmd 視窗的「快速編輯模式」：點一下視窗就會卡住畫面輸出（連帶卡住 DNS），啟動時先關掉
+    if mode == "cmd" && kuroshio::console::disable_quick_edit() {
+        info!("已關閉主控台的「快速編輯模式」（避免在視窗裡點一下就讓程式暫停）");
+    }
     let mut first = true;
     // SIGHUP：重新載入設定；SIGUSR1：立刻寫出快照（只有 Unix）
     let mut signals = Signals::new();
