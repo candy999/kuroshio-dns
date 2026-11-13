@@ -300,12 +300,16 @@ pub(crate) fn parse_rule(line: &str, relaxed: bool) -> Parsed {
         (false, false)
     };
 
-    // 含路徑的網址規則在 DNS 層無法套用（允許結尾單一 "/"）
+    // 含路徑的網址規則在 DNS 層無法套用。空路徑（`||example.com/`、`||example.com/^`）等於整個網域：
+    // 去掉 "/"、保留後面的 `^` / `|`（FutaGuard TW165 有大量詐騙網域是這樣寫的）
+    let joined: String;
     if let Some(slash) = s.find('/') {
-        if slash != s.len() - 1 {
+        let path = &s[slash + 1..];
+        if !matches!(path, "" | "^" | "^|" | "|") {
             return Parsed::Unsupported { regex_feature: false };
         }
-        s = &s[..slash];
+        joined = format!("{}{path}", &s[..slash]);
+        s = &joined;
     }
     let s = js::lower(s);
     if s.is_empty() || s == "*" || s == "^" {
@@ -419,6 +423,22 @@ mod tests {
         assert_eq!(kind("/a**/"), "skip");
         assert_eq!(kind("||cl*.apple.com^"), "pattern:.apple.com");
         assert!(matches!(parse_rule("||x.com^$third-party", true), Parsed::Rule(_)));
+    }
+
+    #[test]
+    fn empty_path_is_domain_rule() {
+        // 空路徑：等於 `||網域^`
+        assert_eq!(kind("||scam.example/^"), "suffix:scam.example");
+        assert_eq!(kind("||scam.example/"), "suffix:scam.example");
+        assert_eq!(kind("||scam.example/|"), "suffix:scam.example");
+        assert_eq!(kind("||scam.example/^$important"), "suffix:scam.example!");
+        assert_eq!(kind("@@||ok.example/^"), "@@suffix:ok.example");
+        assert_eq!(kind("|exact.example/^"), "exact:exact.example");
+        // 真的有路徑：照樣略過
+        assert_eq!(kind("||scam.example/some/path"), "unsupported");
+        assert_eq!(kind("||scam.example/^x"), "unsupported");
+        assert_eq!(kind("||scam.example//^"), "unsupported");
+        assert_eq!(kind("||scam.example/ads^$important"), "unsupported");
     }
 
     #[test]

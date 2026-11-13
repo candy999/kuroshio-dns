@@ -271,6 +271,27 @@ fn unsupported_regex_is_counted() {
 }
 
 #[test]
+fn empty_path_rule_blocks_domain() {
+    // FutaGuard TW165 的寫法：`||網域/^`（空路徑）等於 `||網域^`；真的有路徑的照樣略過
+    let mut b = FilterBuilder::new(BuildOptions::default());
+    let st = b
+        .add_list(
+            ListSpec::new("tw165", Category::Malware),
+            b"||scam.example/^\n||imp.example/^$important\n||path.example/some/path\n",
+        )
+        .unwrap()
+        .clone();
+    assert_eq!((st.domain_rules, st.unsupported), (2, 1));
+    let f = b.finish();
+    for n in ["scam.example", "www.scam.example", "a.b.scam.example"] {
+        assert_eq!(f.check(n, A).unwrap().action, Action::Block, "{n}");
+    }
+    assert!(f.check("imp.example", A).unwrap().important);
+    assert!(f.check("path.example", A).is_none());
+    assert!(f.check("notscam.example", A).is_none());
+}
+
+#[test]
 fn badfilter_across_lists() {
     let f = build(
         BuildOptions::default(),
