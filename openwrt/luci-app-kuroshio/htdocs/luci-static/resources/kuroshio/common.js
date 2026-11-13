@@ -268,7 +268,12 @@ function restoreSummary(ch) {
 var SCOPE = { 'public': _('公網'), 'private': _('私有'), 'cgnat': _('電信商 CGNAT'), 'linklocal': _('鏈路本地'), 'ula': _('區網 IPv6'), 'loopback': _('本機') };
 var BADGE = { ok: '#19733a', warn: '#8a5a00', err: '#b42318', off: '#6b7785' };
 
+/** 介面檔案的版本（跟 Cargo.toml 的版本一致，CI 的 check-luci.js 會檢查）。每個頁面拿它比對自己的版本，不一樣代表瀏覽器還在用快取的舊檔案 */
+var BUILD = '3.2.0';
+
 return baseclass.extend({
+	build: BUILD,
+
 	defaults: {},
 
 	T: T,

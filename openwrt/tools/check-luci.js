@@ -14,4 +14,16 @@ for (const f of walk(root)) {
         console.log(`  ✔ ${path.relative(root, f)}`);
     } catch (e) { fail++; console.log(`  ✘ ${path.relative(root, f)}：${e.message}`); }
 }
+// 介面檔案的版本標記（common.js 的 BUILD 與每個頁面的 BUILD）要跟 Cargo.toml 的版本一致：
+// 頁面用它判斷瀏覽器是不是還在用快取的舊檔案，改版時忘了改就會一直誤判
+const cargo = path.join(__dirname, '..', '..', 'Cargo.toml');
+if (fs.existsSync(cargo)) {
+    const want = (fs.readFileSync(cargo, 'utf-8').match(/^version = "([^"]+)"/m) || [])[1];
+    for (const f of walk(root).filter(f => f.endsWith('.js'))) {
+        const m = fs.readFileSync(f, 'utf-8').match(/^var BUILD = '([^']*)';/m);
+        if (!m) continue;
+        if (m[1] === want) console.log(`  ✔ ${path.relative(root, f)}：BUILD ${m[1]}`);
+        else { fail++; console.log(`  ✘ ${path.relative(root, f)}：BUILD ${m[1]}，Cargo.toml 是 ${want}`); }
+    }
+}
 process.exit(fail ? 1 : 0);
