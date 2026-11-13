@@ -867,7 +867,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.goto(`${BASE}/#about`);
         await page.waitForFunction(() => /GPL/.test(document.getElementById('about-kv').textContent));
         const ak = await page.textContent('#tab-about');
-        check(ak.includes(about.version) && /設定頁版本/.test(ak) && /3\.2\.0/.test(ak), '關於：核心版本與設定頁版本');
+        check(ak.includes(about.version) && /設定頁版本/.test(ak) && /3\.2\.1/.test(ak), '關於：核心版本與設定頁版本');
         check(ak.includes(about.source) && ak.includes(about.target) && /GPL-3\.0-or-later/.test(ak) && /散布/.test(ak), '關於：授權、原始碼網址、編譯平台、GPL 說明');
         check(await page.evaluate(() => { const i = document.getElementById('about-qr'); return i.complete && i.naturalWidth > 0; }), '關於：QR 碼圖片載入');
         check(await page.isVisible('#foot'), '主畫面也有頁尾');

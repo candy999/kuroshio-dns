@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-kuroshio
-PKG_VERSION:=3.2.0
+PKG_VERSION:=3.2.1
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Kuroshio DNS contributors
 PKG_LICENSE:=GPL-3.0-or-later

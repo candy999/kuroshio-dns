@@ -45,7 +45,7 @@ function quality(p) {
 
 // 瀏覽器快取：LuCI 用固定的 ?v=（LuCI 本身的版本）載入外掛的檔案，升級黑潮之後瀏覽器可能還拿到舊的 common.js，
 // 新功能就會按了沒反應。版本對不上時重新下載本外掛的所有檔案（更新瀏覽器快取）再重新整理一次；還是對不上就提示
-var BUILD = '3.2.0';
+var BUILD = '3.2.1';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
