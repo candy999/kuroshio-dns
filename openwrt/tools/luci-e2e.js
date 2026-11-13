@@ -211,10 +211,11 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
                 ? ok('連線來源頁：模式、名單與說明') : bad(`連線來源頁內容不對\n     ${text.slice(0, 300)}`);
             if (MOCK) /\d{4}-\d{2}-\d{2} 的資料/.test(text) && /57 次/.test(text) && /45\.135\.232\.0\/24/.test(text) ? ok('連線來源頁：資料日期、拒絕次數、被拒絕最多的網段') : bad('連線來源頁沒有目前狀態');
         }
-        if (NAME === 'kuroshio' && p === 'status') {
+        // 操作區只有服務在執行時才顯示（實機測試的容器裡服務沒有啟動），所以只在模擬環境檢查
+        if (NAME === 'kuroshio' && p === 'status' && MOCK) {
             /立即儲存學習資料/.test(text) && /更新韌體或要斷電前先按一下，學到的資料會馬上寫進儲存空間/.test(text)
                 ? ok('狀態頁：操作區有「立即儲存學習資料」與說明') : bad('狀態頁沒有「立即儲存學習資料」');
-            if (MOCK) {
+            {
                 const n = JSON.parse(await mockGet('/__mock/calls')).length;
                 await page.click('#kuroshio-persist-flush');
                 await page.waitForFunction(() => /已儲存學習資料/.test(document.body.innerText), null, { timeout: 5000 }).catch(() => {});
