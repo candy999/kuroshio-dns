@@ -59,7 +59,64 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
             private_ptr: lf.get("privatePtr").and_then(Value::as_bool).unwrap_or(true),
         })
     });
-    Ok(Resolver::new(Params::from_cfg(cfg), ups, cache_max, iprank, local))
+    let r = Resolver::new(Params::from_cfg(cfg), ups, cache_max, iprank, local);
+    adopt_cache(cfg, &r);
+    Ok(r)
+}
+
+/// 重新載入設定時交給下一輪的 DNS 快取：（答案相關設定的指紋, 過濾設定的指紋, 交出的時間, 快取）
+type CacheHandoff = (String, String, Instant, crate::cache::Cache);
+static CACHE_HANDOFF: Mutex<Option<CacheHandoff>> = Mutex::new(None);
+
+/// 會改變快取裡答案的設定（上游、解析、CDN、本機網域、快照位置）：都沒變才沿用上一輪的快取
+fn answer_fingerprint(cfg: &Value) -> String {
+    let mut res = get(cfg, "resolver").cloned().unwrap_or_default();
+    if let Some(m) = res.as_object_mut() {
+        // 只影響快取大小、開機預熱的不算
+        for k in ["cacheMax", "warmNames", "warmRate"] {
+            m.remove(k);
+        }
+    }
+    let pick = |k: &str| get(cfg, k).cloned().unwrap_or_default();
+    json!([
+        pick("upstream"),
+        res,
+        pick("cdn"),
+        pick("pool"),
+        pick("domain"),
+        pick("system.persistDir")
+    ])
+    .to_string()
+}
+
+fn filter_fingerprint(cfg: &Value) -> String {
+    get(cfg, "filter").cloned().unwrap_or_default().to_string()
+}
+
+/// 結束這一輪：把快取留給下一輪（重新載入時用；1 分鐘內沒人接手就丟掉）
+fn hand_over_cache(cfg: &Value, r: &Resolver) {
+    let c = r.cache.lock().unwrap().take();
+    if c.is_empty() {
+        return;
+    }
+    *CACHE_HANDOFF.lock().unwrap() = Some((answer_fingerprint(cfg), filter_fingerprint(cfg), Instant::now(), c));
+}
+
+/// 新的一輪：上一輪留下的快取設定相符就接手（不用重新問上游）。
+/// 上游、解析、CDN 這類設定變了就不接；只改了過濾設定時丟掉有 CNAME 的項目
+fn adopt_cache(cfg: &Value, r: &Resolver) {
+    let Some((fp, ffp, at, c)) = CACHE_HANDOFF.lock().unwrap().take() else {
+        return;
+    };
+    if at.elapsed() > Duration::from_secs(60) {
+        return;
+    }
+    if fp != answer_fingerprint(cfg) {
+        info!("重新載入：上游或解析設定有變，DNS 快取重新開始");
+        return;
+    }
+    let n = r.cache.lock().unwrap().adopt(c, ffp != filter_fingerprint(cfg), Instant::now());
+    info!("重新載入：沿用上一輪的 DNS 快取（{n} 筆）");
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1287,6 +1344,8 @@ impl Started {
         if let Some(h) = &self.encrypted.httpsys {
             h.stop();
         }
+        // 快照寫完之後才交出快取（常用網域的快照要從快取裡取）
+        let _hand = HandOver(&self.state.cfg, &self.state.resolver);
         // 記下寫了幾份、多少、花多久：整合方可以依這個決定停止服務時要等多久
         let t0 = Instant::now();
         match self.state.flush_counted() {
@@ -1297,6 +1356,15 @@ impl Started {
             ),
             Err(e) => warn!("關機前寫出快照有失敗的：{e}（{} ms）", t0.elapsed().as_millis()),
         }
+    }
+}
+
+/// `shutdown` 結束時把快取交給下一輪
+struct HandOver<'a>(&'a Value, &'a Arc<Resolver>);
+
+impl Drop for HandOver<'_> {
+    fn drop(&mut self) {
+        hand_over_cache(self.0, self.1);
     }
 }
 

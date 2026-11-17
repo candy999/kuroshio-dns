@@ -1739,10 +1739,14 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
             (kuroshio_config::build(&serde_json::json!({})), 2)
         }
     };
-    let Some(ep) = admin_endpoint(&cfg) else {
+    let Some(mut ep) = admin_endpoint(&cfg) else {
         eprintln!("管理 API 沒有開啟（admin.enabled = false），無法通知服務");
         return 1;
     };
+    // 備援時明確不帶 token（Windows 預設要登入，admin_endpoint 會去讀預設位置的 token 檔；那不一定是這個服務的）
+    if fail_code == 2 {
+        ep.1 = None;
+    }
     let r = admin_call(&ep, "POST", path, Some(b"{}"), std::time::Duration::from_secs(timeout)).await;
     match r {
         Err(e) => {

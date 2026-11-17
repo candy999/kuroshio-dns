@@ -183,6 +183,29 @@ impl Cache {
         self.map.clear();
     }
 
+    /// 重新載入設定時把整份快取交給下一輪（不複製）：取出後這裡變成空的
+    pub fn take(&mut self) -> Cache {
+        std::mem::replace(self, Cache::new(self.max))
+    }
+
+    /// 接手上一輪的快取。`recheck_cname` = 過濾規則可能變了：答案裡有 CNAME 的項目丟掉
+    /// （「CNAME 指到被封鎖的網域」是寫入時判斷、存在項目裡的；查詢網域本身的封鎖每次查詢前都用新的過濾器判斷）。
+    /// 上限變小時立刻縮到新上限。回傳接手了幾筆
+    pub fn adopt(&mut self, old: Cache, recheck_cname: bool, now: Instant) -> usize {
+        let max = self.max;
+        *self = old;
+        self.max = max;
+        if recheck_cname {
+            self.map
+                .retain(|_, e| e.blocked.is_none() && !e.answers.iter().any(|r| r.rtype == kuroshio_proto::message::rtype::CNAME));
+        }
+        if self.map.len() > self.max {
+            // 只依上限縮（過期的照 serve-stale 規則由定時清掃處理）
+            self.sweep(now, 365 * 86400);
+        }
+        self.map.len()
+    }
+
     /// 清掃：過期超過 stale 秒的刪掉；超過上限刪掉最久沒用的，降到 90%
     pub fn sweep(&mut self, now: Instant, stale_sec: u64) {
         let stale = Duration::from_secs(stale_sec);
@@ -262,6 +285,49 @@ mod tests {
             fast,
             None,
         )
+    }
+
+    #[test]
+    fn handover_keeps_entries_and_drops_cname_when_filter_changed() {
+        let now = Instant::now();
+        let mut old = Cache::new(100);
+        old.insert("1|a.test".into(), entry(300, false), now);
+        let mut c = entry(300, false);
+        c.answers.insert(
+            0,
+            Record {
+                name: "cdn.test".into(),
+                rtype: kuroshio_proto::message::rtype::CNAME,
+                class: 1,
+                ttl: 300,
+                data: kuroshio_proto::message::RData::Name("edge.example".into()),
+            },
+        );
+        old.insert("1|cdn.test".into(), c, now);
+        let mut blocked = entry(300, false);
+        blocked.blocked = Some("ads");
+        old.insert("1|b.test".into(), blocked, now);
+        // 設定沒變：全部接手，使用紀錄也在
+        let mut src = old;
+        let moved = src.take();
+        assert!(src.is_empty());
+        let mut n = Cache::new(100);
+        let hits_before = moved.peek("1|a.test").unwrap().hits.load(Ordering::Relaxed);
+        assert_eq!(n.adopt(moved, false, now), 3);
+        assert_eq!(n.peek("1|a.test").unwrap().hits.load(Ordering::Relaxed), hits_before);
+        // 過濾設定變了：有 CNAME（或 CNAME 被封鎖）的丟掉
+        let moved = n.take();
+        let mut m = Cache::new(100);
+        assert_eq!(m.adopt(moved, true, now), 1);
+        assert!(m.peek("1|a.test").is_some() && m.peek("1|cdn.test").is_none());
+        // 新的上限比較小：立刻縮
+        let mut big = Cache::new(100);
+        for i in 0..100 {
+            big.insert(format!("1|n{i}.test"), entry(300, false), now);
+        }
+        let mut small = Cache::new(20);
+        assert!(small.adopt(big.take(), false, now) <= 20);
+        assert_eq!(small.max, 20);
     }
 
     #[test]

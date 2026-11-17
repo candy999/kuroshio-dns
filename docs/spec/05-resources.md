@@ -258,6 +258,7 @@ c = CPU 核心數（`available_parallelism`）：
 | `pool.latencyConcurrency` | clamp(32c, 32, 200) | 32 | 64 | 128 | 200 |
 | `pool.probeConcurrency` | clamp(8c, 8, 32) | 8 | 16 | 32 | 32 |
 | `system.maxTlsConnections`（每條約 30–60 KB，記憶體另由 09 收緊） | clamp(128c, 128, 2048) | 128 | 256 | 512 | 1,024（16 核 2,048） |
+| `system.maxTlsConnectionsPerIp`（3.3.2 起；IPv6 以 /64 算一個來源，本機不算；0 = 不限） | 總上限 ÷ 8，限制在 8–64 | 16 | 32 | 64 | 64 |
 | `system.maxQuicConnections`（0 = 不開 QUIC） | clamp(32c, 32, 512) | 32 | 64 | 128 | 256 |
 | `filter.maxUnindexed`（每次查詢都要跑的規則；每 2,000 條約 +0.5 ms/查詢，慢的 CPU 更多） | clamp(250c, 200, 2000) | 250 | 500 | 1,000 | 2,000 |
 

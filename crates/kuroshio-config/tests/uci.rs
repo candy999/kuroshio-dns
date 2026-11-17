@@ -547,3 +547,21 @@ fn max_bundle_mb_maps_to_config_field() {
     assert_eq!(g(&c, "jobs.tw-ip.maxMemKB"), &json!(4096));
     assert!(get(&c, "jobs.tw-ip.maxMemKb").is_none());
 }
+
+/// 自備憑證只填一半（只有 cert 或只有 key）：不跟 acme 位置的另一半配在一起，兩個都用 acme 的位置並警告
+#[test]
+fn manual_cert_needs_both_halves() {
+    let text = default_text().replace(
+        "option cert_mode 'acme'",
+        "option cert_mode 'manual'\n\toption cert '/mnt/certs/fullchain.pem'",
+    );
+    let (c, warns) = load_warn(&text);
+    assert_eq!(g(&c, "listen.dot.cert"), &json!("/etc/kuroshio/cert.pem"));
+    assert_eq!(g(&c, "listen.dot.key"), &json!("/etc/kuroshio/key.pem"));
+    assert!(warns.iter().any(|w| w.contains("只填了一個")), "{warns:?}");
+    // 兩個都填：照用
+    let (c, warns) = load_warn(&existing_text());
+    assert_eq!(g(&c, "listen.dot.cert"), &json!("/mnt/certs/fullchain.pem"));
+    assert_eq!(g(&c, "listen.dot.key"), &json!("/mnt/certs/privkey.pem"));
+    assert!(!warns.iter().any(|w| w.contains("只填了一個")));
+}

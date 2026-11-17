@@ -796,7 +796,7 @@ impl FilterService {
         // 依上次的規則數先預留：建置中的 Vec 不必倍增（倍增時尖峰最多多一倍）
         let expect: u64 = (0..self.sources.len()).filter(|&i| !ex[i]).map(|i| prev_sizes[i].1).sum();
         if expect > 0 {
-            b.reserve((expect + expect / 20).min(max_domains as u64) as usize);
+            b.reserve((expect + expect / 20).min(max_domains) as usize);
         }
         let mut errors = Vec::new();
         let mut validators = Vec::new();

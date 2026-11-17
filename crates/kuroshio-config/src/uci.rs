@@ -319,16 +319,17 @@ fn convert(uci: &Value, env: &Env, w: &Warns) -> Value {
     // ---------------- 監聽 ----------------
     let domain = s("tls", "domain");
     let manual = s("tls", "cert_mode") == "manual";
-    let cert = if manual && !s("tls", "cert").is_empty() {
-        s("tls", "cert")
-    } else {
-        format!("{etc}/cert.pem")
-    };
-    let key = if manual && !s("tls", "key").is_empty() {
-        s("tls", "key")
-    } else {
-        format!("{etc}/key.pem")
-    };
+    // 自備憑證要兩個都填才用：只填一半時不能跟 acme 位置的另一半配在一起（憑證跟私鑰對不上）
+    let (own_cert, own_key) = (s("tls", "cert"), s("tls", "key"));
+    let own = manual && !own_cert.is_empty() && !own_key.is_empty();
+    if manual && own_cert.is_empty() != own_key.is_empty() {
+        warn(
+            w,
+            format!("UCI 選項 tls.cert / tls.key 只填了一個：自備憑證要兩個都填，先用 {etc}/cert.pem 與 {etc}/key.pem"),
+        );
+    }
+    let cert = if own { own_cert } else { format!("{etc}/cert.pem") };
+    let key = if own { own_key } else { format!("{etc}/key.pem") };
     let port_of = |n: &str, k: &str, dflt: u64| port(&s(n, k), &format!("{n}.{k}"), dflt, w);
     let doh_on = flag("doh", "enabled", false);
     let dot_on = flag("dot", "enabled", false);

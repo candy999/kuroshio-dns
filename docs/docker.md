@@ -6,7 +6,7 @@
 |---|---|
 | `latest` | 最新的正式版（預覽版不會更新它） |
 | `3.3` | 3.3.x 的最新一版 |
-| `3.3.1` | 固定版本 |
+| `3.3.2` | 固定版本 |
 
 映像檔裡只有一個靜態執行檔與唯讀資料（`FROM scratch`，沒有 shell），跟 Releases 的 `kuroshio-<target>` 是同一批 CI 編好、測過的執行檔。
 
@@ -86,7 +86,7 @@ Ubuntu（以及其他用 systemd-resolved 的發行版）在 `127.0.0.53:53` 有
 docker exec kuroshio kuroshio url -c /config/config.json
 ```
 
-會印出含 token 的登入網址 `http://127.0.0.1:8054/login?token=…`。在別台電腦開的話把 `127.0.0.1` 換成這台主機的 IP。token 存在 `./config/admin.token`，刪掉後重新啟動會產生新的。
+會印出含一次性登入碼的網址 `http://127.0.0.1:8054/login?code=…`（10 分鐘內有效、只能用一次，要再拿一個就再執行一次）。在別台電腦開的話把 `127.0.0.1` 換成這台主機的 IP。長期的登入 token 存在 `./config/admin.token`，也可以在登入頁貼上它；刪掉後重新啟動會產生新的。
 
 ### /config 裡有什麼
 

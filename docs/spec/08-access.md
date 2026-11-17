@@ -50,7 +50,7 @@ config access 'access'
 
 IPv4 對應的 IPv6（`::ffff:a.b.c.d`）一律當成 IPv4 判斷。
 
-**台灣 IP 資料讀不到或格式錯誤時不擋（fail open）**：記錄警告，`/api/status` 的 `access.failOpen = true`、`access.warning` 寫原因；`deny` 照樣有效。
+**台灣 IP 資料讀不到或格式錯誤時，公網來源一律擋下（fail closed，3.3.2 起；以前是不擋）**：迴路、私有 / 區網、本機網段、社群好友、`allow` 照常允許，`deny` 照樣有效；記錄警告，`/api/status` 的 `access.failClosed = true`、`access.warning` 寫原因，`warnings` 也有一筆。`access.failOpen` 保留給舊的整合，永遠是 `false`。`mode = open` 不受影響。
 
 ## 3. 在哪裡擋
 
@@ -91,7 +91,7 @@ accept 時只有在「這個埠上的每個服務都有套用而且都不允許�
 }
 ```
 
-讀取時檢查：每組有 id（英數、`-`、`_`，不能是 `*`、不能重複），每個 CIDR 都要有效，IPv4 總量不能是 0；不符合就整份不用（fail open）。
+讀取時檢查：每組有 id（英數、`-`、`_`，不能是 `*`、不能重複），每個 CIDR 都要有效，IPv4 總量不能是 0；不符合就整份不用（等同讀不到：公網來源擋下）。
 
 ### 產生方式（`cargo run -p kuroshio-jobs --bin tw-ip -- data/geo/tw-ip.json 報表.md`）
 
@@ -203,7 +203,7 @@ ASN 與持有者名稱對照 RIPE NCC 的 ASN 名稱表（`ftp.ripe.net/ripe/asn
 
 ## 6. 管理 API 與指令
 
-- `/api/status` 多一個 `access`：`mode`、`applyTo`、`active`、`dataOk`、`failOpen`、`warning`、`generatedAt`、`ranges`、`memoryBytes`、`dataBytes`、
+- `/api/status` 多一個 `access`：`mode`、`applyTo`、`active`、`dataOk`、`failOpen`（永遠 false）、`failClosed`、`warning`、`generatedAt`、`ranges`、`memoryBytes`、`dataBytes`、
   `denied: { total, byListener: { dot, doh, doq, doh3, site, community, plain } }`、`topDenied: [{ net: "a.b.c.0/24" | "x:y:z::/48", count }]`（前 10）
 - `GET /api/access`：上面全部，加上 `groups: [{ id, name, note, asns, size: { v4, v6_48 }, cidrs: { v4, v6 }, enabled, checked }]`、
   `selected`（設定的 `groups`）、`allow`、`deny`、`log`、`localUpdate`、`dataSource`、`dataOrigin`、`update`（第 5.7 節）、`total`、`topDenied`（前 50）

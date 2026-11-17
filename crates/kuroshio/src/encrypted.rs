@@ -161,19 +161,22 @@ fn source_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// 每個來源目前幾條連線
+type BySource = Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>;
+
 /// 連線數上限（總數與每個來源）與記憶體壓力檢查
 #[derive(Clone)]
 pub struct Limits {
     pub conns: Arc<Semaphore>,
     max: usize,
     per_ip: usize,
-    by_ip: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+    by_ip: BySource,
 }
 
 /// 一條連線佔的名額：結束（drop）時歸還總數與這個來源的計數
 pub struct Permit {
     _conn: tokio::sync::OwnedSemaphorePermit,
-    src: Option<(IpAddr, Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>)>,
+    src: Option<(IpAddr, BySource)>,
 }
 
 impl Drop for Permit {

@@ -1216,7 +1216,8 @@ impl Benchmark {
     }
 }
 
-/// 收集到的原始答案大約佔多少記憶體（每筆：結果本身 + 幾個 IP；估計值，給 `memory.sizes`）
+/// 收集到的原始答案大約佔多少記憶體（每筆：結果本身 + 幾個 IP；估計值，誤差約 ±30%）。
+/// 只算原始答案，不含每台上游的歷史、ASN 快取、連線緩衝。放在 `/api/status` 的 `memory.jobs.rawBytes`
 fn raw_bytes(entries: usize) -> usize {
     entries * (std::mem::size_of::<Option<QueryResult>>() + 16)
 }
