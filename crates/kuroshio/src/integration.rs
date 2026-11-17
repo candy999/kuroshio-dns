@@ -41,8 +41,31 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 /// `/api/status.warnings`：需要使用者注意的事
+/// 上一次重新載入設定失敗的原因（時間 Unix 毫秒）：失敗時服務繼續用上一份可以用的設定跑，
+/// 下一次重新載入成功就清掉。`/api/status` 的 `reload` 與 `warnings` 看得到
+static RELOAD_ERROR: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+
+pub fn set_reload_error(e: Option<String>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    *RELOAD_ERROR.lock().unwrap() = e.map(|e| (e, now));
+}
+
+/// `/api/status` 的 `reload`：`{ "error": 原因 | null, "at": 時間 | null, "usingPrevious": bool }`
+pub fn reload_json() -> Value {
+    match &*RELOAD_ERROR.lock().unwrap() {
+        Some((e, at)) => json!({ "error": e, "at": at, "usingPrevious": true }),
+        None => json!({ "error": null, "at": null, "usingPrevious": false }),
+    }
+}
+
 pub fn warnings(data: &crate::manifest::DataCheck, synced: bool, pressure: Pressure, filter: &Value) -> Vec<String> {
     let mut w = Vec::new();
+    if let Some((e, _)) = &*RELOAD_ERROR.lock().unwrap() {
+        w.push(format!("新設定無法套用，繼續用上一份設定：{e}"));
+    }
     if let Some(d) = &data.warning {
         w.push(d.clone());
     }

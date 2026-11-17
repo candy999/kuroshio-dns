@@ -159,6 +159,15 @@ async fn health_status_notify_exit_codes() {
     }
     let (code, _) = run_async(a(&["notify", "wan-changed", "-c", bad.to_str().unwrap()])).await;
     assert_eq!(code, 2);
+    // --uci 卻沒有 /etc/config/kuroshio（第三方韌體直接執行）：提示設定 KUROSHIO_UCI_FILE
+    if !Path::new("/etc/config/kuroshio").exists() && std::env::var_os("KUROSHIO_UCI_FILE").is_none() {
+        let (code, out) = run(&["status", "--json", "--uci"]);
+        assert_eq!(code, 2, "{out}");
+        assert!(
+            one_line_json(&out)["error"].as_str().unwrap_or("").contains("KUROSHIO_UCI_FILE"),
+            "{out}"
+        );
+    }
 
     // 服務停了：都是 1
     started.shutdown();
@@ -319,6 +328,130 @@ fn run_signals_and_init_config() {
     healthy();
     assert_eq!(run(&["status", "--json", "-c", &c]).0, 0);
     kill(libc::SIGTERM);
+    let t0 = Instant::now();
+    let st = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "SIGTERM 後要結束");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(st.success(), "{st:?}\n{}", log.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UCI 模式（第三方韌體）：SIGHUP 時新設定讀不進來 → 照舊用上一份設定跑，`/api/status` 看得到原因；
+/// 設定目錄在快照目錄以外（Padavan 的 KUROSHIO_ETC）時，恢復預設自訂規則照樣觸發 KUROSHIO_ON_CONFIG_WRITE
+#[cfg(unix)]
+#[test]
+fn uci_reload_failure_keeps_running_and_config_hook_fires() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let dir = tmp("uci-reload");
+    let etc = dir.join("etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    let (dns, admin) = (free_port(), free_port());
+    let uci = dir.join("tmp/kuroshio.uci");
+    std::fs::create_dir_all(uci.parent().unwrap()).unwrap();
+    let text = format!(
+        "config kuroshio 'main'\n\toption enabled '1'\n\toption dns_port '{dns}'\n\toption admin_port '{admin}'\n\toption data_dir '{}'\n\toption listen_ipv6 '0'\n\nconfig filter 'filter'\n\toption enabled '1'\n\nconfig job 'dns_benchmark'\n\toption enabled '0'\n",
+        dir.join("media/kuroshio/state").display()
+    );
+    std::fs::write(&uci, &text).unwrap();
+    let marker = dir.join("hook.log");
+    let cmd = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_kuroshio"))
+            .args(args)
+            .env("KUROSHIO_UCI_FILE", &uci)
+            .env("KUROSHIO_ETC", &etc)
+            .env("KUROSHIO_SHARE", root().join("data"))
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string())
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kuroshio"))
+        .args(["run", "--uci"])
+        .env("KUROSHIO_UCI_FILE", &uci)
+        .env("KUROSHIO_ETC", &etc)
+        .env("KUROSHIO_SHARE", root().join("data"))
+        .env(
+            "KUROSHIO_ON_CONFIG_WRITE",
+            format!("echo \"$KUROSHIO_CONFIG_FILES\" >> '{}'", marker.display()),
+        )
+        .env("NO_COLOR", "1")
+        .env("KUROSHIO_LOG", "info")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let log = Arc::new(Mutex::new(String::new()));
+    for pipe in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            for l in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let mut g = log.lock().unwrap();
+                g.push_str(&l);
+                g.push('\n');
+            }
+        });
+    }
+    let until = |what: &str, f: &dyn Fn() -> bool| {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(30) {
+            if f() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        panic!("等不到 {what}：\n{}", log.lock().unwrap());
+    };
+    until("服務回答", &|| cmd(&["health", "--uci", "--timeout", "500"]).0 == 0);
+    let status = || one_line_json(&cmd(&["status", "--json", "--uci"]).1);
+    until("管理 API", &|| status()["running"] == true);
+    let st0 = status();
+    assert_eq!(st0["warnings"], json!([]), "{st0}\n{}", log.lock().unwrap());
+
+    // 恢復預設自訂規則：custom-rules.txt 在 KUROSHIO_ETC（不在快照目錄的上一層）
+    std::fs::write(etc.join("custom-rules.txt"), "||mine.example^\n").unwrap();
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", admin)).unwrap();
+    write!(
+        s,
+        "POST /api/filter/reset-rules HTTP/1.1\r\nHost: 127.0.0.1:{admin}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    )
+    .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    until("寫入設定後的外部指令", &|| {
+        std::fs::read_to_string(&marker).is_ok_and(|t| t.contains("custom-rules.txt"))
+    });
+    let hook = std::fs::read_to_string(&marker).unwrap();
+    assert!(hook.contains("custom-rules.txt.bak"), "合併成一次：{hook}");
+    assert_eq!(hook.lines().filter(|l| !l.is_empty()).count(), 2, "一次執行，兩個檔案：{hook}");
+
+    // 新設定讀不進來（檔案不見了）：不結束，繼續用上一份設定
+    std::fs::rename(&uci, uci.with_extension("gone")).unwrap();
+    let pid = child.id() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    until("重新載入失敗的紀錄", &|| log.lock().unwrap().contains("繼續用上一份設定"));
+    assert!(child.try_wait().unwrap().is_none(), "不能結束：\n{}", log.lock().unwrap());
+    std::fs::rename(uci.with_extension("gone"), &uci).unwrap();
+    until("用上一份設定回答", &|| cmd(&["health", "--uci", "--timeout", "500"]).0 == 0);
+    until("狀態裡的重新載入錯誤", &|| {
+        status()["warnings"].to_string().contains("繼續用上一份設定")
+    });
+
+    // 設定恢復正常後再 SIGHUP：成功，警告清掉
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    until("重新載入成功", &|| status()["warnings"] == json!([]));
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     let t0 = Instant::now();
     let st = loop {
         if let Some(st) = child.try_wait().unwrap() {

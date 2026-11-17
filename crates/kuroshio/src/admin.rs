@@ -597,6 +597,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "clock": { "synced": synced, "buildEpoch": crate::clock::BUILD_EPOCH },
                 "data": data.json(),
                 "warnings": warnings,
+                // 重新載入設定失敗時：原因，以及正在用上一份設定
+                "reload": crate::integration::reload_json(),
                 "stats": r.stats.summary(),
                 "cacheEntries": cache_entries,
                 "cacheBytes": cache_bytes,

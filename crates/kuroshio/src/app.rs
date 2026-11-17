@@ -1171,6 +1171,17 @@ impl AppState {
     /// 快照目錄在 tmpfs 時多一個 `stateInRam`：那些檔案也佔記憶體（不算在本程式的 RSS 裡）
     pub fn memory_json(&self) -> Value {
         let mut v = self.memory_json_inner();
+        // 背景工作：執行中的是哪一個；每日評測另外有手上的原始答案與開著的連線（結束後就沒有）
+        if let Some(s) = &self.scheduler {
+            let st = s.status();
+            let name = st["running"]["name"].as_str().map(str::to_string);
+            let d = name.as_ref().map(|n| st["detail"][n].clone()).unwrap_or(Value::Null);
+            v["jobs"] = json!({
+                "running": name,
+                "rawBytes": d.get("rawBytes").cloned().unwrap_or(json!(0)),
+                "openConnections": d.get("openConnections").cloned().unwrap_or(json!(0)),
+            });
+        }
         // 不鎖 persister：system_json 拿著它的鎖時會呼叫這裡（std 的 Mutex 不能重複鎖）
         if storage_class(&self.cfg) == StorageClass::Ram {
             v["stateInRam"] = json!({ "dir": self.persist_dir, "bytes": state_dir_bytes(&self.persist_dir) });

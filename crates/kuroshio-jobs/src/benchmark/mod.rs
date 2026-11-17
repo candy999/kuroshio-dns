@@ -703,8 +703,10 @@ impl Benchmark {
                 break;
             }
             info!("[{}/{}] {domain}（倖存 {}）", di + 1, domains.len(), survivors.len());
+            let kept: usize = raw.iter().map(|v| v.iter().filter(|x| x.is_some()).count()).sum();
             self.set_progress(json!({
                 "phase": "judge", "domain": di + 1, "domains": domains.len(), "survivors": survivors.len(), "openConnections": 0,
+                "rawBytes": raw_bytes(kept),
                 "text": format!("執行中：判斷第 {} / {} 個網域（倖存 {}）", di + 1, domains.len(), survivors.len()),
             }));
             // 收集時因為逾時太多而提早停下的候選，在這之前就已經依同樣的規則淘汰了
@@ -1077,8 +1079,10 @@ impl Benchmark {
         for i in it.by_ref().take(conc) {
             spawn(&mut set, i);
         }
+        let mut kept = 0usize;
         while let Some(r) = set.join_next().await {
             if let Ok((i, v)) = r {
+                kept += v.len();
                 out[i] = v;
             }
             done += 1;
@@ -1088,7 +1092,7 @@ impl Benchmark {
             let open = set.len().saturating_sub(pause.paused.load(Ordering::Relaxed));
             self.set_progress(json!({
                 "phase": "collect", "done": done, "total": total, "domains": domains.len(),
-                "concurrency": conc, "openConnections": open,
+                "concurrency": conc, "openConnections": open, "rawBytes": raw_bytes(kept),
                 "text": format!("執行中：測完 {done} / {total} 個候選（開著 {open} 條連線）"),
             }));
             if last_log.elapsed() >= Duration::from_secs(60) {
@@ -1175,6 +1179,11 @@ impl Benchmark {
             })
             .collect()
     }
+}
+
+/// 收集到的原始答案大約佔多少記憶體（每筆：結果本身 + 幾個 IP；估計值，給 `memory.sizes`）
+fn raw_bytes(entries: usize) -> usize {
+    entries * (std::mem::size_of::<Option<QueryResult>>() + 16)
 }
 
 /// 收集時的暫停狀態（很多個候選各自暫停，只記一次日誌）

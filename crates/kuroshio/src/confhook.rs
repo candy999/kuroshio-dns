@@ -4,7 +4,8 @@
 //! （`KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save"`）。
 //!
 //! - **只能用環境變數設定**：不開放在設定頁或管理 API 設定，管理介面不能被拿來執行任意指令。
-//! - **只看設定目錄**：設定檔所在的資料夾與 `base_dir`（自訂規則、`.bak`、設定頁 token 等）；
+//! - **只看設定目錄**：設定檔所在的資料夾、`base_dir`，以及設定裡指到的檔案所在的資料夾（[`config_dirs`]：
+//!   自訂規則與它的 `.bak`、憑證與金鑰、社群金鑰、設定頁 token；UCI 模式另加 `KUROSHIO_ETC`）。
 //!   快照目錄（學習資料）與執行期目錄不算，所以平常的學習資料寫入不會觸發。
 //! - **合併**：最後一次寫入後等 [`DELAY`] 才執行一次（恢復預設規則會連寫兩個檔，只存一次 Flash）。
 //! - **逾時**：指令最多跑 [`TIMEOUT`]，超過就結束它；失敗與輸出記在日誌。
@@ -67,11 +68,64 @@ fn abs(p: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(p).ok()
 }
 
+/// 黑潮 DNS 會寫入的設定類檔案在哪些資料夾：`base`（快照目錄的上一層），加上設定裡指到的
+/// 自訂規則（`filter.customRules`）、憑證與金鑰（`tls.*`、`listen.*.cert / key`、`acme.certFile / keyFile`）、
+/// 設定頁 token（`admin.tokenFile`）所在的資料夾，與社群金鑰目錄（`community.dir`）。相對路徑以 `base` 為準，重複的只留一個
+pub fn config_dirs(cfg: &serde_json::Value, base: &Path) -> Vec<PathBuf> {
+    use kuroshio_config::get;
+    let rel = |p: &str| {
+        let pp = Path::new(p);
+        if pp.is_absolute() {
+            pp.to_path_buf()
+        } else {
+            base.join(pp.strip_prefix("./").unwrap_or(pp))
+        }
+    };
+    let mut out = vec![base.to_path_buf()];
+    let mut files: Vec<String> = Vec::new();
+    if let Some(a) = get(cfg, "filter.customRules").and_then(|v| v.as_array()) {
+        files.extend(a.iter().filter_map(|v| v.as_str()).map(str::to_string));
+    }
+    for k in [
+        "tls.cert",
+        "tls.key",
+        "listen.doh.cert",
+        "listen.doh.key",
+        "listen.dot.cert",
+        "listen.dot.key",
+        "listen.doq.cert",
+        "listen.doq.key",
+        "acme.certFile",
+        "acme.keyFile",
+        "admin.tokenFile",
+    ] {
+        if let Some(v) = get(cfg, k).and_then(|v| v.as_str()) {
+            files.push(v.to_string());
+        }
+    }
+    for f in files.iter().filter(|f| !f.trim().is_empty()) {
+        if let Some(d) = rel(f).parent() {
+            out.push(d.to_path_buf());
+        }
+    }
+    if let Some(d) = get(cfg, "community.dir").and_then(|v| v.as_str()).filter(|d| !d.trim().is_empty()) {
+        out.push(rel(d));
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    out
+}
+
 /// 設定要監看的資料夾（設定檔所在的資料夾、`base_dir`）與排除的資料夾（快照、執行期目錄）。
 /// 不存在的資料夾略過。沒有設定外部指令時什麼都不做
 pub fn configure(watch: &[&Path], exclude: &[&Path]) {
     let Some(h) = hook() else { return };
-    let w: Vec<PathBuf> = watch.iter().filter_map(|p| abs(p)).collect();
+    let mut w: Vec<PathBuf> = Vec::new();
+    for p in watch.iter().filter_map(|p| abs(p)) {
+        if !w.contains(&p) {
+            w.push(p);
+        }
+    }
     let x: Vec<PathBuf> = exclude.iter().filter_map(|p| abs(p)).collect();
     let first = h.dirs.lock().unwrap().0.is_empty();
     if first {
@@ -264,6 +318,33 @@ impl Hook {
             }
             st = self.cv.wait_timeout(st, deadline - now).unwrap().0;
         }
+    }
+}
+
+#[cfg(test)]
+mod dir_tests {
+    use super::*;
+
+    #[test]
+    fn config_dirs_follow_configured_files() {
+        // Padavan：快照在 jffs2，自訂規則與憑證在 KUROSHIO_ETC（/etc/storage/kuroshio）
+        let cfg = serde_json::json!({
+            "filter": { "customRules": ["/etc/storage/kuroshio/custom-rules.txt", "./extra/rules.txt"] },
+            "tls": { "cert": "/etc/storage/kuroshio/cert.pem", "key": "/etc/storage/kuroshio/key.pem" },
+            "admin": { "tokenFile": "" },
+            "community": { "dir": "/etc/storage/kuroshio/community" },
+        });
+        let base = Path::new("/media/kuroshio/kuroshio");
+        let d = config_dirs(&cfg, base);
+        assert_eq!(
+            d,
+            vec![
+                PathBuf::from("/media/kuroshio/kuroshio"),
+                PathBuf::from("/etc/storage/kuroshio"),
+                PathBuf::from("/media/kuroshio/kuroshio/extra"),
+                PathBuf::from("/etc/storage/kuroshio/community"),
+            ]
+        );
     }
 }
 

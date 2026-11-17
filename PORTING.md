@@ -49,7 +49,7 @@ kuroshio/
 兩種格式，功能相同：
 
 - **JSON**：`kuroshio run -c config.json`。只寫跟預設值不同的欄位；完整預設值用 `kuroshio defaults`，`kuroshio check-config config.json` 檢查並印出合併後的結果。
-- **UCI 文字檔**（OpenWrt 格式）：`kuroshio run --uci`，用 `KUROSHIO_UCI_FILE` 指定檔案。沒有 `uci` 指令的韌體也能用：把韌體自己的設定（例如 nvram）寫成 UCI 文字檔再啟動。Padavan 就是這樣做的。
+- **UCI 文字檔**（OpenWrt 格式）：`kuroshio run --uci`，用 `KUROSHIO_UCI_FILE` 指定檔案（`status`、`notify` 等指令也要設同一個環境變數）。沒有 `uci` 指令的韌體也能用：把韌體自己的設定（例如 nvram）寫成 UCI 文字檔再啟動。Padavan 就是這樣做的。升級黑潮 DNS 時執行一次 `kuroshio uci-migrate <UCI 檔>`，把新版本的預設過濾清單補進去（使用者改過的不動，規則跟 OpenWrt 套件一樣）。
 
 設定欄位只會新增；改名或淘汰時舊名稱照樣讀得進來，並在啟動日誌說明（例如已經不用的 `system.profile`）。
 

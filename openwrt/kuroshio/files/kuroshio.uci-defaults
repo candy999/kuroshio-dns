@@ -37,6 +37,8 @@ done
 uci -q get kuroshio.system.profile >/dev/null || uci set kuroshio.system.profile='auto'
 uci commit kuroshio
 
+# 過濾清單的遷移規則跟 `kuroshio uci-migrate`（crates/kuroshio-config/src/uci_migrate.rs，給沒有 uci 指令的第三方韌體用）
+# 是同一套，改這裡要一起改那邊（測試：crates/kuroshio-config/tests/uci_migrate.rs 比對遷移結果跟這一版的預設設定）。
 # 3.2：預設過濾清單更新。/etc/config/kuroshio 升級時會保留舊的，所以在這裡搬：
 # 只動「跟 3.1.x 預設值完全相同」（啟用、分類、網址、名稱都沒改，也沒有其他選項）的項目，使用者改過的一律不動。
 # 做完記在 main.lists_version，之後不再重做（使用者之後刪掉的清單不會被加回來）

@@ -10,6 +10,7 @@
 //! - 舊版的 `system.profile` / `system.tier`（硬體等級）、`system.memoryBudgetMB` 照樣接受、不使用（[`legacy_keys`]）。
 
 pub mod uci;
+pub mod uci_migrate;
 
 use anyhow::{Context, Result};
 use serde_json::Value;

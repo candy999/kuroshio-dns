@@ -179,6 +179,18 @@ enum Cmd {
         #[arg(long)]
         uci: bool,
     },
+    /// UCI 設定檔的升級遷移（不需要 uci 指令；規則同 OpenWrt 套件升級時做的）：
+    /// 依 main.lists_version 更新沒動過的預設過濾清單、加上新的預設清單，使用者改過的不動
+    UciMigrate {
+        /// UCI 設定檔；沒寫就用 KUROSHIO_UCI_FILE，再沒有就是 /etc/config/kuroshio
+        file: Option<PathBuf>,
+        /// 寫到另一個檔案（沒寫就直接改原檔）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// 只顯示會做什麼，不寫檔
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// 顯示偵測到的硬體、記憶體 / 儲存保留量、依 CPU 核心數換算的值
     Sysinfo {
         #[arg(short, long, default_value_os_t = default_config_path())]
@@ -436,7 +448,7 @@ pub async fn serve(
     let (cfg, ..) = effective(&config, uci)?;
     init_log_to(Some(&cfg), log_file.as_deref());
     let src = if uci {
-        "/etc/config/kuroshio（UCI）".to_string()
+        format!("{}（UCI）", kuroshio_config::uci::file_path())
     } else {
         config.display().to_string()
     };
@@ -459,10 +471,40 @@ pub async fn serve(
     let mut signals = Signals::new();
     // 上一份成功啟動的設定檔內容：設定頁存了一份啟動不了的設定時改回來（不讓服務整個停掉）
     let mut last_good: Option<Vec<u8>> = None;
+    // 上一份成功啟動的設定（合併後的內容）：重新載入時新設定讀不進來或啟動不了，就用它繼續跑
+    // （UCI 沒有檔案可以改回去，JSON 設定檔改回去失敗時也靠這個；不讓服務整個停掉）
+    let mut good_cfg: Option<serde_json::Value> = None;
+    let mut use_good = false;
+    // 剛把 JSON 設定檔改回上一份：下一輪讀到的是舊內容，失敗原因要留著
+    let mut restored = false;
     loop {
         let current = if uci { None } else { std::fs::read(&config).ok() };
         // 每一輪（設定頁存檔後重新載入）都在自己的執行環境裡跑：結束時所有工作與監聽一起關掉
-        let (cfg, info, legacy) = effective(&config, uci)?;
+        let loaded = if use_good {
+            Err(anyhow::anyhow!("（用上一份設定）"))
+        } else {
+            effective(&config, uci)
+        };
+        let mut fallback = false;
+        let (cfg, info, legacy) = match (loaded, &good_cfg) {
+            (Ok(t), _) => t,
+            (Err(e), Some(good)) => {
+                if !use_good {
+                    tracing::error!("新設定讀不進來：{e:#}；繼續用上一份設定");
+                    kuroshio::integration::set_reload_error(Some(format!("{e:#}")));
+                }
+                use_good = false;
+                fallback = true;
+                (good.clone(), SysInfo::detect(), Vec::new())
+            }
+            (Err(e), None) => return Err(e),
+        };
+        let this_cfg = cfg.clone();
+        // 從設定檔正常讀進來：先清掉上一次的失敗紀錄（這一輪啟動失敗會再記上；用上一份設定頂著跑的那一輪不清）
+        if !fallback && !restored {
+            kuroshio::integration::set_reload_error(None);
+        }
+        restored = false;
         if first {
             info!("{}，{} 條工作執行緒", describe(&info), threads);
             if !legacy.is_empty() {
@@ -557,12 +599,23 @@ pub async fn serve(
         let reload = match result {
             Ok(r) => {
                 last_good = current;
+                good_cfg = Some(this_cfg);
                 r
             }
-            Err(e) => match (&last_good, &current) {
-                (Some(good), cur) if cur.as_ref() != Some(good) => {
+            Err(e) => match (&last_good, &current, &good_cfg) {
+                // JSON 設定檔：改回上一份可以用的內容（設定頁看到的也是舊的）
+                (Some(good), cur, _) if cur.as_ref() != Some(good) => {
                     tracing::error!("新設定無法啟動：{e:#}；改回上一份可以用的設定");
+                    kuroshio::integration::set_reload_error(Some(format!("{e:#}")));
                     kuroshio::persist::write_atomic(&config, good)?;
+                    restored = true;
+                    true
+                }
+                // UCI（沒有檔案可以改回去）：用記在記憶體裡的上一份設定重新啟動
+                (_, _, Some(good)) if *good != this_cfg => {
+                    tracing::error!("新設定無法啟動：{e:#}；繼續用上一份設定");
+                    kuroshio::integration::set_reload_error(Some(format!("{e:#}")));
+                    use_good = true;
                     true
                 }
                 _ => return Err(e),
@@ -682,8 +735,13 @@ async fn generation(
         let conf_dir = conf_file
             .parent()
             .map(|p| if p.as_os_str().is_empty() { std::path::Path::new(".") } else { p });
-        let mut watch: Vec<&std::path::Path> = vec![&base];
-        watch.extend(conf_dir);
+        // 自訂規則、憑證、社群金鑰、token 可能放在別的地方（例如 Padavan 的 KUROSHIO_ETC = /etc/storage/kuroshio）
+        let mut dirs = kuroshio::confhook::config_dirs(&cfg, &base);
+        dirs.extend(conf_dir.map(std::path::Path::to_path_buf));
+        if uci {
+            dirs.push(PathBuf::from(kuroshio_config::uci::Env::from_process().etc));
+        }
+        let watch: Vec<&std::path::Path> = dirs.iter().map(PathBuf::as_path).collect();
         let runtime = kuroshio::app::runtime_dir(&cfg);
         kuroshio::confhook::configure(&watch, &[&state, &runtime]);
     }
@@ -889,6 +947,25 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
         }
         Cmd::Defaults { .. } => {
             println!("{}", serde_json::to_string_pretty(&kuroshio_config::defaults())?);
+        }
+        Cmd::UciMigrate { file, output, dry_run } => {
+            let file = file.unwrap_or_else(|| PathBuf::from(kuroshio_config::uci::file_path()));
+            let text = std::fs::read_to_string(&file).with_context(|| format!("讀不到 {}", file.display()))?;
+            let m = kuroshio_config::uci_migrate::migrate(&text)?;
+            if m.log.is_empty() {
+                println!("{}：已經是最新的，不需要遷移", file.display());
+            } else {
+                for l in &m.log {
+                    println!("- {l}");
+                }
+                if dry_run {
+                    println!("（--dry-run：沒有寫檔）");
+                } else {
+                    let out = output.unwrap_or(file);
+                    kuroshio::persist::write_atomic(&out, m.text.as_bytes())?;
+                    println!("已寫入 {}", out.display());
+                }
+            }
         }
         Cmd::CheckConfig { file, uci } => {
             let (cfg, ..) = effective(&file.unwrap_or_else(default_config_path), uci)?;
@@ -1484,9 +1561,14 @@ async fn import_cmd(file: &std::path::Path, config: &std::path::Path, uci: bool,
 
 /// 設定讀不到時：結束碼 2
 fn config_for_cli(config: &std::path::Path, uci: bool) -> std::result::Result<serde_json::Value, String> {
-    user_config(config, uci)
-        .map(|u| kuroshio_config::build(&u))
-        .map_err(|e| format!("{e:#}"))
+    user_config(config, uci).map(|u| kuroshio_config::build(&u)).map_err(|e| {
+        let mut m = format!("{e:#}");
+        // 第三方韌體直接執行 `--uci`：預設找 /etc/config/kuroshio（OpenWrt 的位置）
+        if uci && std::env::var_os("KUROSHIO_UCI_FILE").is_none() && std::env::var_os("KUROSHIO_UCI_JSON").is_none() {
+            m.push_str("。不是 OpenWrt 的話，請用環境變數 KUROSHIO_UCI_FILE 指定 UCI 設定檔的位置（跟啟動服務時一樣）");
+        }
+        m
+    })
 }
 
 /// `kuroshio health`：結束碼 0 = 有回答，1 = 沒有回答，2 = 設定讀不到
@@ -1588,11 +1670,13 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
         NotifyEvent::Trim { hold, config, uci } => (config, uci, format!("/api/memory/trim?holdSec={hold}"), 60),
     };
     let path = path.as_str();
-    let cfg = match config_for_cli(&config, uci) {
-        Ok(c) => c,
+    // 讀不到設定也試一次預設的管理埠（127.0.0.1:8054，不帶 token）：通知送得到就好，不必知道其他設定。
+    // 送不到時結束碼照樣是 2（設定讀不到）
+    let (cfg, fail_code) = match config_for_cli(&config, uci) {
+        Ok(c) => (c, 1),
         Err(e) => {
-            eprintln!("錯誤：{e}");
-            return 2;
+            eprintln!("注意：設定讀不到（{e}）；改用預設的管理埠 8054 送出");
+            (kuroshio_config::build(&serde_json::json!({})), 2)
         }
     };
     let Some(ep) = admin_endpoint(&cfg) else {
@@ -1603,7 +1687,7 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
     match r {
         Err(e) => {
             eprintln!("服務沒有回應（{}）：{e:#}", ep.0);
-            1
+            fail_code
         }
         Ok((200, body)) => {
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -1632,7 +1716,7 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
         }
         Ok((code, body)) => {
             eprintln!("服務拒絕通知：{}", api_error(code, &body));
-            1
+            fail_code
         }
     }
 }
