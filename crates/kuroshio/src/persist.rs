@@ -548,11 +548,12 @@ impl Persister {
 
     /// 儲存空間的保留量（依設定、檔案系統大小、最大一份待寫內容）
     pub fn reserve(&self) -> StorageReserve {
+        // 可省略的檔（清單副本）不算：寫不下就算了，不該為了它把保留量撐大
         let largest = self
             .entries
-            .values()
-            .filter(|e| e.pending.is_some())
-            .map(Self::size_of)
+            .iter()
+            .filter(|(k, e)| e.pending.is_some() && space::tier_of(k) != Tier::Optional)
+            .map(|(_, e)| Self::size_of(e))
             .max()
             .unwrap_or(0);
         let p = &self.policy;
@@ -561,6 +562,7 @@ impl Persister {
 
     /// 可省略 / 可重建的資料現在能不能多寫 `size` bytes（寫完還在保留 + 遲滯以上）。
     /// 例如過濾清單的本機副本：空間大方時才留
+    /// 可省略的檔（清單副本）現在放得下嗎：不刪別的檔，寫完還要在保留 + 遲滯以上
     pub fn has_room_for_optional(&self, size: u64) -> bool {
         match (self.free_probe)(&self.dir) {
             Some(free) => free >= size + 64 * 1024 + self.reserve().keep_line(),
@@ -631,9 +633,14 @@ impl Persister {
 
     /// 刪日誌、可重建的檔，直到多出 `need` bytes（`keep` = 正要寫的那一份，不刪）；回傳釋出多少
     fn make_room(&mut self, need: u64, keep: Option<&Path>) -> u64 {
+        self.make_room_below(need, keep, Tier::Core)
+    }
+
+    /// 同 [`Persister::make_room`]，只刪比 `below` 低一級以下的檔
+    fn make_room_below(&mut self, need: u64, keep: Option<&Path>, below: Tier) -> u64 {
         let list: Vec<_> = space::candidates(&self.dir, &self.extra_files)
             .into_iter()
-            .filter(|c| keep.map_or(true, |k| c.path != k))
+            .filter(|c| keep.map_or(true, |k| c.path != k) && c.tier < below)
             .collect();
         let sizes: HashMap<String, u64> = list.iter().map(|c| (c.rel.clone(), c.size)).collect();
         let (gone, freed) = space::free_up(list, |f| f >= need);
@@ -674,6 +681,24 @@ impl Persister {
         if free >= required {
             self.stats.free_bytes = Some(free);
             return true;
+        }
+        // 可省略的檔（清單副本）：只刪日誌讓位，不刪別的副本（不然小 Flash 上每天寫一份刪一份）
+        if tier == Tier::Optional {
+            let freed = self.make_room_below(required - free, Some(&stored), Tier::Optional);
+            let free = (self.free_probe)(&self.dir).unwrap_or(free + freed);
+            self.stats.free_bytes = Some(free);
+            if free >= required {
+                return true;
+            }
+            // 放不下就不留在記憶體：丟掉這份待寫內容（只是少了本機副本）
+            self.entries.remove(name);
+            self.stats.skipped += 1;
+            info!(
+                "儲存空間不夠留清單副本（剩 {} KB、需要 {} KB）：{name} 不存，之後照常下載",
+                free / 1024,
+                required.div_ceil(1024)
+            );
+            return false;
         }
         // 只刪到夠用為止（核心資料只要放得下）
         let freed = self.make_room(required - free, Some(&stored));

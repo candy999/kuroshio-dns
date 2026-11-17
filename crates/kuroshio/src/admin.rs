@@ -770,7 +770,7 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(crate::memgov::TRIM_HOLD_DEFAULT);
             match &st.memgov {
-                Some(g) => ok(g.trim(hold, crate::persist::now_secs()).await),
+                Some(g) => ok(g.trim(hold, crate::memgov::steady_secs()).await),
                 None => {
                     crate::sysinfo::trim_heap();
                     ok(json!({ "ok": true, "enabled": false, "steps": [], "freedBytes": 0, "holdSec": 0 }))

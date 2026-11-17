@@ -109,6 +109,19 @@ pub fn parse_psi(text: &str) -> Option<Psi> {
     })
 }
 
+/// 記憶體控制用的時鐘（秒）：單調遞增，不受系統時間調整影響（Padavan 開機時是 1970，對時後跳到現在，
+/// 用牆上時間的話 hold、恢復間隔都會亂掉）。從一個很大的數開始，0 可以當「沒有」
+pub fn steady_secs() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1_000_000_000
+}
+
+/// [`steady_secs`] 的時間換成牆上時間（Unix 毫秒），狀態頁顯示用
+pub fn steady_to_wall_ms(t: u64) -> u64 {
+    let back = steady_secs().saturating_sub(t);
+    crate::persist::now_secs().saturating_sub(back) * 1000
+}
+
 /// 一次量測（bytes；量不到是 None）。測試直接造這個，不碰主機真正的記憶體
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Reading {
@@ -834,7 +847,7 @@ impl Governor {
             "enabled": true,
             "state": i.hyst.state.as_str(),
             "stateLabel": i.hyst.state.label(),
-            "since": i.hyst.changed_at * 1000,
+            "since": steady_to_wall_ms(i.hyst.changed_at),
             "rssKB": kb(r.rss),
             "availKB": kb(r.avail),
             "totalKB": kb(r.total),
@@ -846,20 +859,20 @@ impl Governor {
             "psi": r.psi.map(|p| json!({ "someAvg10": p.some_avg10, "fullAvg10": p.full_avg10 })),
             "pollSec": poll_interval(&r, &self.reserve),
             "growth": i.growth,
-            "holdUntil": (i.hold_until > crate::persist::now_secs()).then_some(i.hold_until * 1000),
+            "holdUntil": (i.hold_until > steady_secs()).then(|| steady_to_wall_ms(i.hold_until)),
             "floor": floor,
             "protectedSuspended": protected,
             "sizes": Value::Object(sizes),
             "shed": i.shed.iter().map(|s| json!({
                 "step": s.key, "label": s.label, "detail": s.detail, "freedBytes": s.bytes,
-                "availDeltaKB": s.avail_delta.map(|d| d / 1024), "at": s.at * 1000,
+                "availDeltaKB": s.avail_delta.map(|d| d / 1024), "at": steady_to_wall_ms(s.at),
             })).collect::<Vec<_>>(),
             "freedBytes": i.shed.iter().map(|s| s.bytes).sum::<u64>(),
             "freedTotalBytes": i.freed_total,
-            "lastChange": i.last_change.map(|(at, from, to)| json!({ "at": at * 1000, "from": from.as_str(), "to": to.as_str() })),
+            "lastChange": i.last_change.map(|(at, from, to)| json!({ "at": steady_to_wall_ms(at), "from": from.as_str(), "to": to.as_str() })),
             "waiting": i.waiting,
-            "nextRestoreAt": (i.next_restore_at > 0 && !i.shed.is_empty()).then_some(i.next_restore_at * 1000),
-            "events": i.events.iter().rev().map(|e| json!({ "at": e.at * 1000, "msg": e.msg })).collect::<Vec<_>>(),
+            "nextRestoreAt": (i.next_restore_at > 0 && !i.shed.is_empty()).then(|| steady_to_wall_ms(i.next_restore_at)),
+            "events": i.events.iter().rev().map(|e| json!({ "at": steady_to_wall_ms(e.at), "msg": e.msg })).collect::<Vec<_>>(),
         })
     }
 }

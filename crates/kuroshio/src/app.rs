@@ -1424,6 +1424,19 @@ pub fn new_persister(cfg: &Value) -> Persister {
 /// 離保留量近（兩倍以內）或 PSI 看得到等待時每 2–3 秒量一次，遠的時候 30 秒
 fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov::Governor>>) {
     use crate::memgov::{poll_interval, pressure_of, Reading};
+    // 記憶體控制另外一個工作：它可能要等清單重建（幾十秒），壓力訊號不能跟著停住。
+    // 量測只留最新一筆，控制跑完一輪再拿最新的
+    let (tx, mut rx) = tokio::sync::watch::channel::<Option<Reading>>(None);
+    if let Some(g) = gov.clone() {
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let r = *rx.borrow_and_update();
+                if let Some(r) = r {
+                    g.tick(r, crate::memgov::steady_secs()).await;
+                }
+            }
+        });
+    }
     tokio::spawn(async move {
         let mut last = Pressure::Normal;
         loop {
@@ -1445,8 +1458,8 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                 }
                 last = p;
             }
-            if let Some(g) = &gov {
-                g.tick(r, crate::persist::now_secs()).await;
+            if gov.is_some() {
+                tx.send_replace(Some(r));
             }
             tokio::time::sleep(Duration::from_secs(poll_interval(&r, &reserve))).await;
         }
@@ -1573,6 +1586,12 @@ fn start_governor(
             let f = w.upgrade()?;
             let r = gw.upgrade().map(|g| g.read()).unwrap_or_else(memgov::Reading::now);
             memgov::list_allowance(&r, &res, f.lists_bytes())
+        }));
+        // 重建時新舊兩份同時存在：建置中的那份要放得進保留量以上的空間
+        let (gw, res) = (Arc::downgrade(&g), reserve.clone());
+        f.set_build_room(Arc::new(move || {
+            let r = gw.upgrade().map(|g| g.read()).unwrap_or_else(memgov::Reading::now);
+            memgov::headroom(&r, &res)
         }));
     }
     info!(

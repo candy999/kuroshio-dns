@@ -121,6 +121,29 @@ pub type AllowanceFn = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 /// 本機副本的索引檔
 pub const COPY_INDEX: &str = "filter-lists/index.json";
 
+/// 重建時清單從哪裡來
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// 下載（`reuse[i]` = 剛問過沒變、而且有本機副本的直接讀副本；下載失敗拿副本頂著）
+    Download,
+    /// 有本機副本就用副本，沒有才下載（記憶體控制停用 / 恢復清單）
+    PreferCopy,
+    /// 只用本機副本：沒有副本的這次不載入（開機時：不必等對時、等下載）
+    CopiesOnly,
+}
+
+/// 建置中每條網域規則約佔多少記憶體（建好後壓縮成約 9 bytes）：重建的尖峰要算進去
+pub const BUILD_BYTES_PER_RULE: u64 = 16;
+/// 規則數掉到上次的一半以下、而且上次至少這麼多條：當成下載被截斷，不換上
+const DROP_CHECK_MIN_RULES: u64 = 1000;
+/// 第一次載入（或更新）有清單下載失敗時的重試間隔：1、2、5 分鐘，之後每 30 分鐘
+const RETRY_BACKOFF: [u64; 4] = [60, 120, 300, 1800];
+
+/// 新下載的規則數比上次少一大半：多半是連線中途斷掉、沒有長度資訊的回應被當成完整（回傳說明）
+fn suspicious_drop(prev: u64, now: u64) -> Option<String> {
+    (prev >= DROP_CHECK_MIN_RULES && now.saturating_mul(2) < prev).then(|| format!("規則數從 {prev} 條掉到 {now} 條，可能下載不完整"))
+}
+
 /// 一份副本的紀錄
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyMeta {
@@ -134,6 +157,8 @@ pub struct CopyMeta {
     pub bytes: u64,
     /// 存的時間（Unix 秒）
     pub at: u64,
+    /// 這份清單的規則數（開機時估記憶體、檢查新下載的有沒有少一大半；舊版的索引沒有是 0）
+    pub rules: u64,
 }
 
 /// 過濾清單的本機副本（可省略的資料：空間大方時才留）
@@ -205,6 +230,7 @@ impl ListCopies {
                             last_modified: s("lastModified"),
                             bytes: n("bytes"),
                             at: n("at"),
+                            rules: n("rules"),
                         },
                     );
                 }
@@ -258,13 +284,17 @@ impl ListCopies {
         h.finish() == m.hash
     }
 
-    /// 下載完成：內容有變（雜湊不同）才登記寫出新的副本；驗證資訊有變就更新索引。回傳有沒有登記新的副本
-    pub fn offer(&self, url: &str, hash: u64, compressed: Option<Vec<u8>>, v: &Validators, now: u64) -> bool {
+    /// 下載完成：內容有變（雜湊不同）才登記寫出新的副本；驗證資訊有變就更新索引。回傳有沒有登記新的副本。
+    /// 實際壓縮後的大小現在放不下（不刪別的副本）就不登記：小 Flash 上不會每天寫一份、刪一份
+    pub fn offer(&self, url: &str, hash: u64, compressed: Option<Vec<u8>>, v: &Validators, now: u64, rules: u64) -> bool {
         let mut idx = self.index.lock().unwrap();
         let same = idx.get(url).is_some_and(|m| m.hash == hash);
         let mut staged = false;
         if !same {
             let Some(z) = compressed else { return false };
+            if !self.persister.lock().unwrap().has_room_for_optional(z.len() as u64) {
+                return false;
+            }
             let file = url_id(url);
             idx.insert(
                 url.to_string(),
@@ -275,6 +305,7 @@ impl ListCopies {
                     last_modified: v.last_modified.clone(),
                     bytes: z.len() as u64,
                     at: now,
+                    rules,
                 },
             );
             self.persister.lock().unwrap().stage(&file, z);
@@ -282,6 +313,7 @@ impl ListCopies {
         } else if let Some(m) = idx.get_mut(url) {
             m.etag = v.etag.clone();
             m.last_modified = v.last_modified.clone();
+            m.rules = rules;
         }
         let body = Self::index_json(&idx);
         drop(idx);
@@ -299,7 +331,7 @@ impl ListCopies {
                 let c = &idx[k];
                 (
                     k.clone(),
-                    json!({ "hash": format!("{:016x}", c.hash), "etag": c.etag, "lastModified": c.last_modified, "bytes": c.bytes, "at": c.at }),
+                    json!({ "hash": format!("{:016x}", c.hash), "etag": c.etag, "lastModified": c.last_modified, "bytes": c.bytes, "at": c.at, "rules": c.rules }),
                 )
             })
             .collect();
@@ -334,12 +366,16 @@ pub struct FilterService {
     /// 同一時間只有一個重建（定時更新、記憶體控制的停用 / 恢復）
     rebuild_lock: tokio::sync::Mutex<()>,
     allowance: OnceLock<AllowanceFn>,
+    /// 重建時可以用的記憶體（保留量以上還有多少；記憶體控制提供）
+    build_room: OnceLock<AllowanceFn>,
     /// 記憶體控制到了最低限度、連保護清單都暫停了（只剩自訂規則）
     suspended: AtomicBool,
     /// 暫停前清單層佔的記憶體（恢復時要有這麼多空間的 1.3 倍）
     suspended_bytes: Mutex<u64>,
     /// 本機副本（快照寫入器設定好才有）
     copies: OnceLock<ListCopies>,
+    /// 只用副本建的時候，因為沒有副本而這次沒載入的清單（下一次更新一定下載）
+    missing: Mutex<Vec<usize>>,
     /// 手動「立即更新」（`POST /api/filter/update`）：背景執行，進度與結果在狀態的 `filter.update`
     update_run: Mutex<UpdateRun>,
     /// 每次更新結束時送出那一次的 runId（`?wait=1` 等結果用）
@@ -430,9 +466,11 @@ impl FilterService {
             unloaded: Mutex::new(Vec::new()),
             rebuild_lock: tokio::sync::Mutex::new(()),
             allowance: OnceLock::new(),
+            build_room: OnceLock::new(),
             suspended: AtomicBool::new(false),
             suspended_bytes: Mutex::new(0),
             copies: OnceLock::new(),
+            missing: Mutex::new(Vec::new()),
             update_run: Mutex::new(UpdateRun::default()),
             update_done: tokio::sync::watch::channel(0).0,
         }))
@@ -506,25 +544,36 @@ impl FilterService {
     /// 本機副本存在快照目錄的 `filter-lists/`（只能設定一次）
     pub fn set_copies(&self, p: Arc<Mutex<crate::persist::Persister>>) {
         let _ = self.copies.set(ListCopies::new(p));
+        // 副本記著上次的規則數：開機那次就能估記憶體（沒量過的清單本來只受 maxDomains 限制）
+        if let Some(c) = self.copies.get() {
+            let mut sizes = self.sizes.lock().unwrap();
+            for (i, s) in self.sources.iter().enumerate() {
+                if sizes[i] == (0, 0) {
+                    if let Some(m) = c.meta(&s.url).filter(|m| m.rules > 0) {
+                        sizes[i] = (m.rules * 9, m.rules);
+                    }
+                }
+            }
+        }
     }
 
     pub fn copies(&self) -> Option<&ListCopies> {
         self.copies.get()
     }
 
-    /// 開機時：每份啟用的清單都有本機副本 → 先用副本建好過濾器（不必等下載），驗證資訊也接上
-    /// （下一次更新只問「有沒有變」）。回傳有沒有建
+    /// 開機時：有本機副本的清單先用副本建好過濾器（不必等下載、也不必等對時），驗證資訊也接上
+    /// （下一次更新只問「有沒有變」）；沒有副本的清單等之後下載。回傳有沒有建
     pub async fn build_from_copies(&self) -> bool {
         let Some(c) = self.copies.get() else { return false };
         let _g = self.rebuild_lock.lock().await;
         let ex = self.excluded();
-        let all = (0..self.sources.len())
+        let any = (0..self.sources.len())
             .filter(|&i| !ex[i])
-            .all(|i| c.available(&self.sources[i].url));
-        if self.sources.is_empty() || !all || self.all_suspended() {
+            .any(|i| c.available(&self.sources[i].url));
+        if self.sources.is_empty() || !any || self.all_suspended() {
             return false;
         }
-        match self.rebuild_with(true).await {
+        match self.rebuild_mode(Source::CopiesOnly, &[]).await {
             Ok(_) => {
                 let mut v = self.validators.lock().unwrap();
                 for (i, s) in self.sources.iter().enumerate() {
@@ -535,7 +584,12 @@ impl FilterService {
                         };
                     }
                 }
-                info!("過濾清單：用本機副本建好（不必等下載），稍後檢查有沒有更新");
+                let missing = self.missing.lock().unwrap().len();
+                if missing > 0 {
+                    info!("過濾清單：用本機副本先建好，{missing} 份沒有副本的稍後下載");
+                } else {
+                    info!("過濾清單：用本機副本建好（不必等下載），稍後檢查有沒有更新");
+                }
                 true
             }
             Err(e) => {
@@ -548,6 +602,11 @@ impl FilterService {
     /// 記憶體控制提供的預算（只能設定一次）
     pub fn set_allowance(&self, f: AllowanceFn) {
         let _ = self.allowance.set(f);
+    }
+
+    /// 重建時可以用的記憶體（只能設定一次）
+    pub fn set_build_room(&self, f: AllowanceFn) {
+        let _ = self.build_room.set(f);
     }
 
     /// 自訂規則檔有變就重建（第一次呼叫一定建）；設定的檔案不存在時寫出預設規則
@@ -621,15 +680,23 @@ impl FilterService {
         // 1. 都有驗證資訊時先問「有沒有變」：全部 304 就不重建（停用中的清單不問）
         let prev = self.validators.lock().unwrap().clone();
         let active: Vec<usize> = (0..self.sources.len()).filter(|&i| !ex[i]).collect();
-        if !force && have && active.iter().all(|&i| prev[i].etag.is_some() || prev[i].last_modified.is_some()) {
-            let mut changed = false;
+        // 有變的那份不在這裡下載（收到第一段就停），重建時才下載一次；沒變而且有本機副本的，重建時直接讀副本
+        let mut reuse = vec![false; self.sources.len()];
+        let missing = !self.missing.lock().unwrap().is_empty();
+        if !force && have && active.iter().any(|&i| prev[i].etag.is_some() || prev[i].last_modified.is_some()) {
+            let mut changed = missing;
             for &i in &active {
-                match fetch::get(&self.sources[i].url, &prev[i], self.max_bytes, timeout, |_| Ok(())).await {
-                    Ok(Outcome::NotModified) => {}
-                    _ => {
-                        changed = true;
-                        break;
-                    }
+                if prev[i].etag.is_none() && prev[i].last_modified.is_none() {
+                    changed = true;
+                    continue;
+                }
+                let r = fetch::get(&self.sources[i].url, &prev[i], self.max_bytes, timeout, |_| {
+                    Err(anyhow::anyhow!("有更新（重建時再下載）"))
+                })
+                .await;
+                match r {
+                    Ok(Outcome::NotModified) => reuse[i] = true,
+                    _ => changed = true,
                 }
             }
             if !changed {
@@ -639,36 +706,48 @@ impl FilterService {
         }
         // 2. 載入前先看記憶體預算：量過大小的清單估計會超過，就依停用順序先不載入（看得到原因）
         self.fit_allowance();
-        self.rebuild().await.map(|_| true)
+        self.rebuild_mode(Source::Download, &reuse).await.map(|_| true)
     }
 
     /// 依記憶體預算（記憶體控制提供）先排除會放不下的清單：只用量過的大小估，依停用順序（保護清單絕不排除；
     /// 只剩保護清單還是超過時照樣載入、記警告）。沒量過的清單（第一次載入）只受 `max_domains` 限制
+    ///
+    /// 重建時新的一份在建置中每條規則約 [`BUILD_BYTES_PER_RULE`]，建好前舊的一份也還在：
+    /// 「建好的大小 + 建置中的大小」也要放得進保留量以上的空間（128 MB 的機器載大清單時才會碰到）
     fn fit_allowance(&self) {
-        let Some(limit) = self.allowance.get().and_then(|f| f()) else {
+        let Some(steady) = self.allowance.get().and_then(|f| f()) else {
             return;
         };
+        let room = self.build_room.get().and_then(|f| f());
         let ex = self.excluded();
-        let sizes: Vec<u64> = self.sizes.lock().unwrap().iter().map(|s| s.0).collect();
+        let sz: Vec<(u64, u64)> = self.sizes.lock().unwrap().clone();
+        let sizes: Vec<u64> = sz.iter().map(|s| s.0).collect();
+        // 建置尖峰換算成「建好的大小」的上限：bytes + rules × 16 ≤ room
+        let need = |i: usize| sz[i].0 + sz[i].1 * BUILD_BYTES_PER_RULE;
         let mut total: u64 = (0..self.sources.len()).filter(|&i| !ex[i]).map(|i| sizes[i]).sum();
-        if total <= limit {
+        let mut peak: u64 = (0..self.sources.len()).filter(|&i| !ex[i]).map(need).sum();
+        let fits = |total: u64, peak: u64| total <= steady && room.map_or(true, |r| peak <= r);
+        let limit = steady;
+        if fits(total, peak) {
             return;
         }
         let loaded: Vec<bool> = ex.iter().map(|e| !e).collect();
         for i in shed_order(&self.sources, &self.hits_vec(), &sizes, &loaded) {
-            if total <= limit {
+            if fits(total, peak) {
                 break;
             }
-            let (bytes, rules) = self.sizes.lock().unwrap()[i];
+            let (bytes, rules) = sz[i];
             if bytes == 0 {
                 continue;
             }
             total -= bytes;
+            peak -= need(i);
             warn!(
-                "記憶體預算不足：這次不載入清單「{}」（約 {} KB、{rules} 條規則；預算 {} KB）",
+                "記憶體預算不足：這次不載入清單「{}」（約 {} KB、{rules} 條規則；預算 {} KB{}）",
                 self.sources[i].name,
                 bytes / 1024,
-                limit / 1024
+                limit / 1024,
+                room.map(|r| format!("，重建時可用 {} KB", r / 1024)).unwrap_or_default()
             );
             self.unloaded.lock().unwrap().push(Unloaded {
                 idx: i,
@@ -689,15 +768,17 @@ impl FilterService {
     }
 
     /// 依目前的停用名單重新下載、建一份清單層（下載失敗而且原本有清單時保留舊的）。回傳（重建前，重建後）的大小
-    async fn rebuild(&self) -> anyhow::Result<(u64, u64)> {
-        self.rebuild_with(false).await
-    }
-
-    /// `prefer_copy` = 有本機副本就用副本（記憶體控制停用 / 恢復清單、開機）；否則下載，下載失敗時拿副本頂著
-    async fn rebuild_with(&self, prefer_copy: bool) -> anyhow::Result<(u64, u64)> {
+    /// 重建清單層。`mode` 見 [`Source`]；`reuse[i]` = 剛問過沒變（有副本就讀副本，不重新下載）
+    async fn rebuild_mode(&self, mode: Source, reuse: &[bool]) -> anyhow::Result<(u64, u64)> {
         let timeout = Duration::from_secs(30);
-        let have = self.lists.read().unwrap().stats().lists > 0;
+        let current = self.lists.read().unwrap().clone();
+        let have = current.stats().lists > 0;
         let ex = self.excluded();
+        // 這次沒有副本、所以沒載入的清單（只用副本建的時候）
+        let mut no_copy: Vec<usize> = Vec::new();
+        // 下載失敗的清單編號（跟 errors 同順序）
+        let mut failed: Vec<usize> = Vec::new();
+        let prev_sizes = self.sizes.lock().unwrap().clone();
         // 自訂規則的網域數也算在預算裡
         let (custom_n, custom_unindexed) = {
             let c = self.custom.read().unwrap();
@@ -712,6 +793,11 @@ impl FilterService {
             max_unindexed: self.opts.max_unindexed.saturating_sub(custom_unindexed),
             ..self.opts
         });
+        // 依上次的規則數先預留：建置中的 Vec 不必倍增（倍增時尖峰最多多一倍）
+        let expect: u64 = (0..self.sources.len()).filter(|&i| !ex[i]).map(|i| prev_sizes[i].1).sum();
+        if expect > 0 {
+            b.reserve((expect + expect / 20).min(max_domains as u64) as usize);
+        }
         let mut errors = Vec::new();
         let mut validators = Vec::new();
         for (i, s) in self.sources.iter().enumerate() {
@@ -727,7 +813,11 @@ impl FilterService {
                 continue;
             }
             let copies = self.copies.get();
-            if prefer_copy {
+            let use_copy = match mode {
+                Source::Download => reuse.get(i).copied().unwrap_or(false),
+                Source::PreferCopy | Source::CopiesOnly => true,
+            };
+            if use_copy {
                 if let Some(c) = copies.filter(|c| c.available(&s.url)) {
                     if c.read(&s.url, &mut |b| w.feed(b)) {
                         w.end();
@@ -742,6 +832,13 @@ impl FilterService {
                     w.reset();
                 }
             }
+            if mode == Source::CopiesOnly {
+                // 只用副本：沒有副本的這次不載入，不在這時候下載
+                w.end();
+                validators.push(Validators::default());
+                no_copy.push(i);
+                continue;
+            }
             let estimate = copies.and_then(|c| c.meta(&s.url)).map_or(1 << 20, |m| m.bytes);
             let mut sink = CopySink::new(copies.is_some_and(|c| c.wanted(estimate)));
             let r = fetch::get(&s.url, &Validators::default(), self.max_bytes, timeout, |c| {
@@ -750,12 +847,25 @@ impl FilterService {
                 Ok(())
             })
             .await;
+            // 下載完成但規則數比上次少一大半：當成下載不完整（不換上、不存副本）
+            let prev_rules = match prev_sizes[i].1 {
+                0 => copies.and_then(|c| c.meta(&s.url)).map_or(0, |m| m.rules),
+                n => n,
+            };
+            let r = match r {
+                Ok(Outcome::Done { .. }) => match suspicious_drop(prev_rules, w.rules()) {
+                    Some(why) => Err(anyhow::anyhow!(why)),
+                    None => r,
+                },
+                r => r,
+            };
             match r {
                 Ok(Outcome::Done { validators: v, .. }) => {
+                    let rules = w.rules();
                     w.end();
                     if let Some(c) = copies {
                         let (h, z) = sink.finish();
-                        c.offer(&s.url, h, z, &v, crate::persist::now_secs());
+                        c.offer(&s.url, h, z, &v, crate::persist::now_secs(), rules);
                     }
                     validators.push(v)
                 }
@@ -775,6 +885,7 @@ impl FilterService {
                     } else {
                         warn!("下載清單「{}」失敗：{e}", s.name);
                         errors.push(json!({ "name": s.name, "url": s.url, "error": e.to_string() }));
+                        failed.push(i);
                     }
                     validators.push(Validators::default());
                 }
@@ -793,8 +904,12 @@ impl FilterService {
                 s.name, s.complex_dropped, st.max_complex, s.unindexed_dropped, st.max_unindexed
             );
         }
-        if !errors.is_empty() && have {
-            // 有清單下載失敗：保留舊的，避免少掉一整份清單
+        // 有清單下載失敗、而且它在目前的過濾器裡是載入的：保留舊的，避免少掉一整份清單。
+        // 失敗的清單目前本來就沒有（例如開機時就沒下載到）：換上新的不會更少，其他恢復的清單也能用上
+        let lost = failed
+            .iter()
+            .any(|&i| current.stats().sources.get(i).is_some_and(|x| x.status == SourceStatus::Loaded));
+        if lost && have {
             self.status.lock().unwrap()["errors"] = json!(errors);
             anyhow::bail!("{} 份清單下載失敗，保留舊的過濾器", errors.len());
         }
@@ -826,6 +941,7 @@ impl FilterService {
         }
         *self.lists.write().unwrap() = Arc::new(f);
         *self.validators.lock().unwrap() = validators;
+        *self.missing.lock().unwrap() = no_copy;
         let mut status = self.status.lock().unwrap();
         status["updatedAt"] = json!(crate::persist::now_secs() * 1000);
         status["errors"] = json!(errors);
@@ -892,7 +1008,7 @@ impl FilterService {
     pub async fn resume_all(&self) -> anyhow::Result<()> {
         let _g = self.rebuild_lock.lock().await;
         self.suspended.store(false, Ordering::Relaxed);
-        match self.rebuild_with(true).await {
+        match self.rebuild_mode(Source::PreferCopy, &[]).await {
             Ok(_) => {
                 info!("記憶體恢復：重新載入全部過濾清單");
                 self.status.lock().unwrap()["suspended"] = json!(false);
@@ -916,6 +1032,7 @@ impl FilterService {
     }
 
     /// 記憶體控制：停用下一份清單（重建一份不含它的過濾器；重建期間舊的照常使用）。
+    /// 有本機副本的清單讀副本，沒有的才下載（記憶體控制在自己的工作裡跑，下載期間記憶體監看照常更新）。
     /// 沒有可以停用的回傳 Ok(None)；下載失敗時保留舊的、清單不算停用
     pub async fn unload_one(&self) -> anyhow::Result<Option<Unloaded>> {
         let _g = self.rebuild_lock.lock().await;
@@ -932,7 +1049,7 @@ impl FilterService {
             at: crate::persist::now_secs() * 1000,
         };
         self.unloaded.lock().unwrap().push(u.clone());
-        match self.rebuild_with(true).await {
+        match self.rebuild_mode(Source::PreferCopy, &[]).await {
             Ok((before, after)) => {
                 let bytes = before.saturating_sub(after).max(self.sizes.lock().unwrap()[i].0);
                 let mut list = self.unloaded.lock().unwrap();
@@ -962,7 +1079,7 @@ impl FilterService {
         let Some(u) = self.unloaded.lock().unwrap().pop() else {
             return Ok(None);
         };
-        match self.rebuild_with(true).await {
+        match self.rebuild_mode(Source::PreferCopy, &[]).await {
             Ok(_) => {
                 let loaded = self.lists.read().unwrap().stats().sources.get(u.idx).map(|s| s.status) == Some(SourceStatus::Loaded);
                 if !loaded {
@@ -1025,17 +1142,38 @@ impl FilterService {
             if me.build_from_copies().await {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
+            // 下載要 TLS：系統時間還沒對時（路由器開機時常是 1970）先等，最多 10 分鐘
+            let t0 = std::time::Instant::now();
+            if !crate::clock::synced() {
+                info!("系統時間還沒對時：過濾清單等對時後再下載");
+                while !crate::clock::synced() && t0.elapsed() < Duration::from_secs(600) {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+            // 有清單下載失敗（或還有沒載入的）時短間隔重試：1、2、5 分鐘，之後每 30 分鐘；全部成功就回到正常間隔
+            let mut tries = 0usize;
             loop {
                 // 記憶體吃緊時延後（重建時新舊兩份會同時存在）
                 let wait = if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
                     warn!("記憶體不足，延後更新過濾清單");
                     Duration::from_secs(1800)
                 } else {
-                    match me.update_lists(false).await {
-                        Ok(_) => me.interval,
-                        Err(e) => {
-                            warn!("{e:#}；30 分鐘後重試");
-                            Duration::from_secs(1800)
+                    let r = me.update_lists(false).await;
+                    let partial = me.status.lock().unwrap()["errors"].as_array().is_some_and(|a| !a.is_empty())
+                        || !me.missing.lock().unwrap().is_empty();
+                    match r {
+                        Ok(_) if !partial => {
+                            tries = 0;
+                            me.interval
+                        }
+                        r => {
+                            let w = Duration::from_secs(RETRY_BACKOFF[tries.min(RETRY_BACKOFF.len() - 1)]);
+                            tries += 1;
+                            match r {
+                                Err(e) => warn!("{e:#}；{} 秒後重試", w.as_secs()),
+                                Ok(_) => warn!("有清單還沒載入（下載失敗）：{} 秒後重試", w.as_secs()),
+                            }
+                            w
                         }
                     }
                 };
@@ -1193,7 +1331,7 @@ mod copy_tests {
             s.finish()
         };
         let (h, z) = sink(&body);
-        assert!(c.offer(url, h, z, &v, 100), "第一次：登記寫出");
+        assert!(c.offer(url, h, z, &v, 100, 10), "第一次：登記寫出");
         let now = crate::persist::now_secs();
         assert_eq!(p.lock().unwrap().flush(now).unwrap(), 2, "副本 + 索引");
         let file = c.meta(url).unwrap().file;
@@ -1209,14 +1347,14 @@ mod copy_tests {
             etag: Some("\"v2\"".into()),
             last_modified: None,
         };
-        assert!(!c.offer(url, h2, z2, &v2, 200));
+        assert!(!c.offer(url, h2, z2, &v2, 200, 10));
         assert!(!p.lock().unwrap().is_pending(&file), "副本沒有重新登記");
         assert_eq!(c.meta(url).unwrap().etag.as_deref(), Some("\"v2\""));
         // 內容變了：重寫
         let mut body2 = body.clone();
         body2.extend_from_slice(b"||new.example.org^\n");
         let (h3, z3) = sink(&body2);
-        assert!(c.offer(url, h3, z3, &v2, 300));
+        assert!(c.offer(url, h3, z3, &v2, 300, 10));
         assert!(p.lock().unwrap().is_pending(&file));
         // 重開機：索引讀得回來
         p.lock().unwrap().flush_all(now).unwrap();

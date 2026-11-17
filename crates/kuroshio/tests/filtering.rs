@@ -454,3 +454,122 @@ async fn deepest_shed_state_still_forwards_plain_dns() {
     assert_eq!(api["memory"]["protectedSuspended"], true);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 有 ETag 的清單伺服器：`If-None-Match` 對得上回 304；記每份清單回了幾次 200；`down` 裡的路徑回 503
+#[derive(Default)]
+struct EtagLists {
+    lists: std::collections::HashMap<String, (String, String)>,
+    down: std::collections::HashSet<String>,
+    full: std::collections::HashMap<String, usize>,
+}
+
+async fn etag_server(st: std::sync::Arc<std::sync::Mutex<EtagLists>>) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
+                let inm = req.lines().find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .starts_with("if-none-match:")
+                        .then(|| l[14..].trim().to_string())
+                });
+                let resp = {
+                    let mut g = st.lock().unwrap();
+                    match g.lists.get(&path).cloned() {
+                        Some(_) if g.down.contains(&path) => "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n".to_string(),
+                        Some((etag, _)) if inm.as_deref() == Some(etag.as_str()) => {
+                            format!("HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nContent-Length: 0\r\n\r\n")
+                        }
+                        Some((etag, body)) => {
+                            *g.full.entry(path.clone()).or_default() += 1;
+                            format!("HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
+                    }
+                };
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+/// 3.3.2：第一次載入有清單失敗時先用其他的、之後補上；沒變的清單讀本機副本不重新下載；
+/// 規則數掉一大半的下載當成不完整（用副本頂著）；開機時有副本的先用副本建
+#[tokio::test]
+async fn partial_loads_copies_and_truncated_lists() {
+    use kuroshio::resolver::FilterCheck;
+    use std::sync::{Arc, Mutex};
+    let st = Arc::new(Mutex::new(EtagLists::default()));
+    {
+        let mut g = st.lock().unwrap();
+        g.lists.insert("a.txt".into(), ("\"a1\"".into(), many("aa", 2000)));
+        g.lists.insert("b.txt".into(), ("\"b1\"".into(), many("bb", 100)));
+        g.lists.insert("c.txt".into(), ("\"c1\"".into(), many("cc", 100)));
+        g.down.insert("b.txt".into());
+    }
+    let srv = etag_server(st.clone()).await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "A", "url": format!("http://{srv}/a.txt"), "category": "ads" },
+        { "name": "B", "url": format!("http://{srv}/b.txt"), "category": "ads" },
+        { "name": "C", "url": format!("http://{srv}/c.txt"), "category": "ads" },
+    ] } }));
+    let persister = || {
+        let mut p = kuroshio::persist::Persister::new(
+            dir.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        p.set_free_probe(|_| Some(10 << 30));
+        Arc::new(Mutex::new(p))
+    };
+    let p = persister();
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(p.clone());
+    // 1. 第一次載入：B 失敗 → A、C 先用上，B 記在錯誤裡
+    assert!(f.update_lists(false).await.unwrap());
+    assert!(f.check("aa1.example", 1).unwrap().block && f.check("cc1.example", 1).unwrap().block);
+    assert!(f.check("bb1.example", 1).is_none());
+    assert_eq!(f.stats()["errors"][0]["name"], "B");
+    p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+
+    // 2. B 恢復、A 有新版：A、B 下載，C 沒變 → 讀副本（C 只下載過第一次那 1 次）
+    {
+        let mut g = st.lock().unwrap();
+        g.down.clear();
+        g.lists.insert("a.txt".into(), ("\"a2\"".into(), many("aa", 2100)));
+    }
+    assert!(f.update_lists(false).await.unwrap());
+    assert!(f.check("bb1.example", 1).unwrap().block, "B 補上了");
+    assert!(f.check("aa2050.example", 1).unwrap().block, "A 是新版");
+    assert_eq!(f.stats()["errors"], json!([]));
+    assert_eq!(st.lock().unwrap().full.get("c.txt"), Some(&1), "C 沒變：讀本機副本");
+    p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+
+    // 3. A 的新版只剩 100 條（下載被截斷）：不換上，用本機副本頂著，副本也不被蓋掉
+    st.lock().unwrap().lists.insert("a.txt".into(), ("\"a3\"".into(), many("aa", 100)));
+    f.update_lists(false).await.unwrap();
+    assert!(f.check("aa2050.example", 1).unwrap().block, "規則數掉一大半：用副本頂著");
+    let meta = f.copies().unwrap().meta(&format!("http://{srv}/a.txt")).unwrap();
+    assert_eq!(meta.rules, 2100, "副本還是完整的那份");
+    p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+
+    // 4. 重新啟動、而且清單伺服器全部連不上：有副本的先用副本建好（不用等下載）
+    st.lock()
+        .unwrap()
+        .down
+        .extend(["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()]);
+    let f2 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f2.set_copies(persister());
+    assert!(f2.build_from_copies().await);
+    assert!(f2.check("aa2050.example", 1).unwrap().block && f2.check("bb1.example", 1).unwrap().block);
+    let _ = std::fs::remove_dir_all(&dir);
+}
