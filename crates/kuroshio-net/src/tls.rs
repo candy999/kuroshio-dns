@@ -16,10 +16,28 @@ use tracing::debug;
 // ---------------- bootstrap：加密上游的主機名稱 → IP ----------------
 
 static BOOTSTRAP: RwLock<Vec<IpAddr>> = RwLock::new(Vec::new());
-type BootCache = Mutex<HashMap<String, (Vec<IpAddr>, Instant)>>;
+type BootMap = HashMap<String, (Vec<IpAddr>, Instant)>;
+type BootCache = Mutex<BootMap>;
 fn boot_cache() -> &'static BootCache {
     static C: OnceLock<BootCache> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 快取最多幾筆（每日評測一次就會解析幾百個主機名稱，不設上限會一直長）
+const BOOT_CACHE_MAX: usize = 512;
+/// 過期多久以內還留著（bootstrap 查不到時先用過期的）；超過就在下次寫入時清掉
+const BOOT_STALE_KEEP: Duration = Duration::from_secs(3600);
+
+/// 寫入一筆：順便清掉過期太久的；超過上限時刪掉最早到期的
+fn boot_cache_insert(c: &mut BootMap, key: String, v: (Vec<IpAddr>, Instant), now: Instant) {
+    c.retain(|_, (_, exp)| *exp + BOOT_STALE_KEEP > now);
+    c.insert(key, v);
+    while c.len() > BOOT_CACHE_MAX {
+        let Some(k) = c.iter().min_by_key(|(_, (_, exp))| *exp).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        c.remove(&k);
+    }
 }
 
 pub fn set_bootstrap(list: &[String]) {
@@ -82,8 +100,9 @@ pub async fn resolve_host(host: &str) -> Result<Vec<IpAddr>> {
             }
         }
         if !ips.is_empty() {
-            let exp = Instant::now() + Duration::from_secs(ttl.max(300) as u64);
-            boot_cache().lock().unwrap().insert(key, (ips.clone(), exp));
+            let now = Instant::now();
+            let exp = now + Duration::from_secs(ttl.max(300) as u64);
+            boot_cache_insert(&mut boot_cache().lock().unwrap(), key, (ips.clone(), exp), now);
             return Ok(ips);
         }
     }
@@ -153,6 +172,10 @@ pub fn add_root(cert: CertificateDer<'static>) {
 }
 
 pub(crate) fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
+    Arc::new(build_client_config(alpn))
+}
+
+fn build_client_config(alpn: &[&[u8]]) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -167,6 +190,13 @@ pub(crate) fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
         .with_no_client_auth();
     cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     // 同一個設定共用 session 快取：重新連線時用 TLS session resumption，少一次完整握手
+    cfg
+}
+
+/// 探測用（節點探測、網站驗證、測速）：每次連的都是不同的 IP / 網域，session 快取幾乎用不到，
+/// 只會留著幾百台伺服器的 session 不放，所以關掉 resumption
+fn without_resumption(mut cfg: rustls::ClientConfig) -> Arc<rustls::ClientConfig> {
+    cfg.resumption = rustls::client::Resumption::disabled();
     Arc::new(cfg)
 }
 
@@ -289,10 +319,17 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+/// 探測用的設定（`connect_ip`）：不跟一般 HTTPS 下載（`cached_config_h1`）共用，關掉 resumption
 fn cached_config_probe(verify: bool) -> Arc<rustls::ClientConfig> {
+    static VERIFY: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     static NOVERIFY: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     if verify {
-        return cached_config_h1();
+        if !EXTRA_ROOTS.read().unwrap().is_empty() {
+            return without_resumption(build_client_config(&[b"http/1.1"]));
+        }
+        return VERIFY
+            .get_or_init(|| without_resumption(build_client_config(&[b"http/1.1"])))
+            .clone();
     }
     NOVERIFY
         .get_or_init(|| {
@@ -304,7 +341,7 @@ fn cached_config_probe(verify: bool) -> Arc<rustls::ClientConfig> {
                 .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
                 .with_no_client_auth();
             cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-            Arc::new(cfg)
+            without_resumption(cfg)
         })
         .clone()
 }
@@ -684,4 +721,47 @@ async fn h1_post(s: &mut TlsStream<TcpStream>, host: &str, path: &str, body: &[u
         bail!("DoH HTTP {status}");
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_cache_prunes_and_caps() {
+        let t0 = Instant::now();
+        let ip = vec![IpAddr::from([1, 1, 1, 1])];
+        let mut c = BootMap::new();
+        // 過期太久的：下次寫入時清掉；剛過期的：留著（bootstrap 查不到時先用）
+        c.insert("old.example".into(), (ip.clone(), t0));
+        c.insert("stale.example".into(), (ip.clone(), t0 + Duration::from_secs(2 * 3600)));
+        let now = t0 + BOOT_STALE_KEEP + Duration::from_secs(2 * 3600 - 60);
+        boot_cache_insert(&mut c, "new.example".into(), (ip.clone(), now + Duration::from_secs(300)), now);
+        assert!(!c.contains_key("old.example"));
+        assert!(c.contains_key("stale.example"));
+        assert!(c.contains_key("new.example"));
+        // 上限：刪掉最早到期的
+        let mut c = BootMap::new();
+        for i in 0..BOOT_CACHE_MAX + 200 {
+            let exp = t0 + Duration::from_secs(300 + i as u64);
+            boot_cache_insert(&mut c, format!("h{i}.example"), (ip.clone(), exp), t0);
+        }
+        assert_eq!(c.len(), BOOT_CACHE_MAX);
+        assert!(!c.contains_key("h0.example"));
+        assert!(!c.contains_key("h199.example"));
+        assert!(c.contains_key("h200.example"));
+        assert!(c.contains_key(&format!("h{}.example", BOOT_CACHE_MAX + 199)));
+    }
+
+    #[test]
+    fn probe_configs_disable_resumption() {
+        let probe = format!("{:?}", rustls::client::Resumption::disabled());
+        for v in [true, false] {
+            assert_eq!(format!("{:?}", cached_config_probe(v).resumption), probe, "verify = {v}");
+        }
+        // 一般上游、HTTPS 下載照樣用 resumption
+        assert_ne!(format!("{:?}", cached_config_h1().resumption), probe);
+        assert_ne!(format!("{:?}", cached_config(true).resumption), probe);
+        assert_ne!(format!("{:?}", cached_config(false).resumption), probe);
+    }
 }
