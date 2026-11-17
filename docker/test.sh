@@ -85,7 +85,9 @@ TOKEN=$(cat_file "$P-1" /config/admin.token | tr -d '[:space:]')
 [ "${#TOKEN}" -ge 16 ] || fail "設定頁 token 沒有建立（/config/admin.token）"
 URL=$(docker exec "$P-1" /usr/bin/kuroshio url -c /config/config.json)
 echo "$URL"
-grep -q "login?token=$TOKEN" <<<"$URL" || fail "kuroshio url 沒有顯示 token 登入網址"
+# 3.3.2 起：印一次性登入碼（向執行中的服務換來的），不印長期的 token。登入碼的 HTTP 流程在 Rust 的 admin_security 測試
+grep -qE 'login\?code=[0-9a-f]{32}' <<<"$URL" || fail "kuroshio url 沒有顯示一次性登入網址"
+if grep -q "$TOKEN" <<<"$URL"; then fail "kuroshio url 印出了長期的 token"; fi
 
 echo "== 2. 從主機查詢（127.0.0.1:$DNS_PORT → 容器的 53）"
 expect_rcode0 -s "127.0.0.1:$DNS_PORT"
