@@ -1112,6 +1112,30 @@ fn spawn_maintenance(r: Arc<Resolver>, legacy: bool) {
     });
 }
 
+/// 目錄（含子目錄）裡檔案的總大小；狀態頁每幾秒問一次，結果留 60 秒
+fn state_dir_bytes(dir: &std::path::Path) -> u64 {
+    fn walk(d: &std::path::Path, depth: u32) -> u64 {
+        let Ok(rd) = std::fs::read_dir(d) else { return 0 };
+        rd.flatten()
+            .map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() && depth < 8 => walk(&e.path(), depth + 1),
+                Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => 0,
+            })
+            .sum()
+    }
+    static CACHE: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    if let Some((t, b)) = *c {
+        if t.elapsed() < Duration::from_secs(60) {
+            return b;
+        }
+    }
+    let b = walk(dir, 0);
+    *c = Some((std::time::Instant::now(), b));
+    b
+}
+
 /// 管理 API 需要的整體狀態
 pub struct AppState {
     pub resolver: Arc<Resolver>,
@@ -1143,8 +1167,18 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// `/api/status.memory`：記憶體控制的狀態（沒啟用時只有 RSS）
+    /// `/api/status.memory`：記憶體控制的狀態（沒啟用時只有 RSS）。
+    /// 快照目錄在 tmpfs 時多一個 `stateInRam`：那些檔案也佔記憶體（不算在本程式的 RSS 裡）
     pub fn memory_json(&self) -> Value {
+        let mut v = self.memory_json_inner();
+        // 不鎖 persister：system_json 拿著它的鎖時會呼叫這裡（std 的 Mutex 不能重複鎖）
+        if storage_class(&self.cfg) == StorageClass::Ram {
+            v["stateInRam"] = json!({ "dir": self.persist_dir, "bytes": state_dir_bytes(&self.persist_dir) });
+        }
+        v
+    }
+
+    fn memory_json_inner(&self) -> Value {
         match &self.memgov {
             Some(g) => g.status_json(),
             None => {

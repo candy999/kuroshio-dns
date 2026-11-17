@@ -128,6 +128,7 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         | "/api/filter/update"
         | "/api/filter/reset-rules"
         | "/api/persist/flush"
+        | "/api/memory/trim"
         | "/api/cdn/verify"
         | "/api/cdn/policy"
         | "/api/cdn/ecs"
@@ -588,6 +589,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             let warnings = crate::integration::warnings(&data, synced, crate::app::pressure(), &filter);
             ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
+                // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
+                "api": crate::integration::API_VERSION,
                 // 執行方式：service（Windows 服務）/ cmd（前景）；uci = 設定來自 OpenWrt UCI
                 "mode": st.webui.run_mode.get().copied().unwrap_or("cmd"),
                 "uci": st.webui.config_file.get().is_none(),
@@ -690,14 +693,27 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             crate::app::spawn_wan_subnet(r.clone(), 0);
             ok(json!({ "ok": true, "ddns": ddns, "ecs": "started", "clockSynced": crate::clock::synced() }))
         }
+        // 立即更新過濾清單（API 2：背景執行）：立刻回 `{started, running, runId, startedAt}`，
+        // 進度與結果看 `/api/status` 的 `filter.update`。正在跑時再呼叫一次，回 `started: false` 與同一個 runId。
+        // `?wait=1`：等到這一次結束才回，多了 `changed`（舊的行為，給腳本用）
         "/api/filter/update" => match &st.filter {
             None => bad("過濾未啟用", 400),
             Some(f) => {
-                f.reload_custom(true);
-                match f.update_lists(true).await {
-                    Ok(changed) => ok(json!({ "changed": changed })),
-                    Err(e) => bad(&format!("{e:#}"), 500),
+                let (started, run) = f.start_update();
+                if matches!(q.get("wait").map(String::as_str), Some("1" | "true")) {
+                    let done = f.wait_update(run.run_id).await;
+                    return match &done.error {
+                        Some(e) if done.run_id == run.run_id => bad(e, 500),
+                        _ => ok(json!({
+                            "changed": done.changed.unwrap_or(false), "runId": run.run_id, "started": started,
+                            "update": done.json(),
+                        })),
+                    };
                 }
+                ok(json!({
+                    "started": started, "running": true, "runId": run.run_id, "startedAt": run.started_at,
+                    "update": run.json(),
+                }))
             }
         },
         // 恢復預設自訂規則：原本的內容先備份成 <檔名>.bak，寫入這個版本的預設規則，立刻重新載入
@@ -714,6 +730,20 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 }
                 Ok(Err(e)) => bad(&format!("恢復預設自訂規則失敗：{e}"), 500),
                 Err(e) => bad(&format!("恢復預設自訂規則失敗：{e}"), 500),
+            }
+        }
+        // 先讓出記憶體（`kuroshio notify trim`）：韌體要做很佔記憶體的事之前呼叫；`holdSec` 秒內不長大、不恢復
+        "/api/memory/trim" => {
+            let hold = q
+                .get("holdSec")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(crate::memgov::TRIM_HOLD_DEFAULT);
+            match &st.memgov {
+                Some(g) => ok(g.trim(hold, crate::persist::now_secs()).await),
+                None => {
+                    crate::sysinfo::trim_heap();
+                    ok(json!({ "ok": true, "enabled": false, "steps": [], "freedBytes": 0, "holdSec": 0 }))
+                }
             }
         }
         // 立即儲存學習資料：有變動的快照全部寫進快照目錄（Windows 沒有 SIGUSR1，就靠這個或 `kuroshio notify save`）
@@ -958,6 +988,7 @@ mod tests {
             "/api/filter/update",
             "/api/filter/reset-rules",
             "/api/persist/flush",
+            "/api/memory/trim",
             "/api/cdn/verify",
             "/api/cdn/policy",
             "/api/cdn/ecs",

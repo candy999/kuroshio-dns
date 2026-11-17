@@ -123,6 +123,12 @@ async fn health_status_notify_exit_codes() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("已儲存學習資料"), "{out}");
 
+    // notify trim：先讓出記憶體，指定時間內不長大、不恢復
+    let (code, out) = run_async(a(&["notify", "trim", "--hold", "60", "-c", &c])).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("已先讓出記憶體") || out.contains("記憶體控制沒有啟用"), "{out}");
+    assert!(out.contains("60 秒") || out.contains("沒有啟用"), "{out}");
+
     // token 錯了：服務在，但讀不到狀態
     let token = kuroshio::webui::token_file(&cfg, &dir).unwrap();
     let real = std::fs::read(&token).unwrap();

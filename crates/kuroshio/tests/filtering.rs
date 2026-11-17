@@ -136,10 +136,38 @@ async fn lists_custom_priority_and_reload() {
     let c = kuroshio::admin::route(&started.state, "/api/filter/check", &q).await.body;
     assert_eq!(c["action"], "block");
     assert_eq!(c["rule"], "||malware.example^");
+    // API 2：立刻回「已開始」，結果在狀態的 filter.update；?wait=1 等結果（舊的行為）
     let u = kuroshio::admin::route(&started.state, "/api/filter/update", &Default::default())
         .await
         .body;
-    assert_eq!(u["changed"], true);
+    assert_eq!(u["started"], true, "{u}");
+    let id = u["runId"].as_u64().unwrap();
+    assert!(u["changed"].is_null(), "背景執行：還沒有結果");
+    let again = kuroshio::admin::route(&started.state, "/api/filter/update", &Default::default())
+        .await
+        .body;
+    if again["started"] == false {
+        assert_eq!(again["runId"], id, "正在跑：回同一個 runId");
+    }
+    let mut done = serde_json::Value::Null;
+    for _ in 0..100 {
+        let st = kuroshio::admin::route(&started.state, "/api/status", &Default::default())
+            .await
+            .body;
+        if st["filter"]["update"]["state"] == "idle" {
+            done = st["filter"]["update"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(done["runId"].as_u64().unwrap() >= id, "{done}");
+    assert!(done["finishedAt"].is_u64(), "{done}");
+    assert!(done["error"].is_null(), "{done}");
+    let w = [("wait".to_string(), "1".to_string())].into_iter().collect();
+    let u = kuroshio::admin::route(&started.state, "/api/filter/update", &w).await.body;
+    assert_eq!(u["started"], true, "{u}");
+    assert_eq!(u["changed"], true, "強制更新：重新建好（{u}）");
+    assert_eq!(u["update"]["state"], "idle");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

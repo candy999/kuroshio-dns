@@ -906,6 +906,8 @@ fn write_file(path: &Path, compress: bool, gen: &mut dyn FnMut(&mut dyn Write) -
     match r {
         Ok(out) => {
             std::fs::rename(&tmp, path)?;
+            // 設定目錄裡的檔案：排一次 KUROSHIO_ON_CONFIG_WRITE（沒設定時立刻回來）
+            crate::confhook::touched(path);
             Ok(out)
         }
         Err(e) => {

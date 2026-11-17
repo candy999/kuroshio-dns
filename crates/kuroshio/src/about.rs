@@ -38,6 +38,7 @@ pub fn json(cfg: &Value) -> Value {
     json!({
         "name": NAME,
         "version": VERSION,
+        "api": crate::integration::API_VERSION,
         "license": LICENSE,
         "licenseUrl": LICENSE_URL,
         "source": source_url(cfg),

@@ -12,6 +12,7 @@ pub mod clock;
 pub mod cloudflare;
 pub mod community_bridge;
 pub mod compare;
+pub mod confhook;
 pub mod console;
 pub mod ddns;
 pub mod dnr;

@@ -105,6 +105,40 @@ pub fn save_text(v: &Value) -> String {
     }
 }
 
+/// 管理 API 的版本（`/api/status`、`about` 的 `api`）。行為有不相容的改變才加 1；3.2.x 以前沒有這個欄位，視為 1。
+/// - 2（3.3.0）：`POST /api/filter/update` 改成背景執行（立刻回 `runId`；`?wait=1` 是舊的行為）
+pub const API_VERSION: u32 = 2;
+
+/// `POST /api/memory/trim` 的回應 → `kuroshio notify trim` 印出的一行
+pub fn trim_text(v: &Value) -> String {
+    if v["enabled"] == false {
+        return "記憶體控制沒有啟用（system.memoryGovernor = false），只把配置器空著的記憶體還給系統".into();
+    }
+    let kb = v["freedBytes"].as_u64().unwrap_or(0) / 1024;
+    let done: Vec<&str> = v["steps"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|s| s.get("skipped").is_none())
+                .filter_map(|s| s["label"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let what = if done.is_empty() {
+        "沒有可以再讓出的項目".to_string()
+    } else {
+        done.join("、")
+    };
+    let avail = match (v["availBeforeKB"].as_u64(), v["availKB"].as_u64()) {
+        (Some(b), Some(a)) => format!("；系統可用 {} → {} MB", b / 1024, a / 1024),
+        _ => String::new(),
+    };
+    format!(
+        "已先讓出記憶體：約 {kb} KB（{what}）{avail}；{} 秒內不長大、不恢復",
+        v["holdSec"].as_u64().unwrap_or(0)
+    )
+}
+
 /// `/api/status` → `kuroshio status --json` 的穩定格式（欄位見本模組說明）
 pub fn summarize_status(api: &Value) -> Value {
     let today = &api["stats"]["today"];
@@ -137,6 +171,7 @@ pub fn summarize_status(api: &Value) -> Value {
     json!({
         "running": true,
         "version": api["version"],
+        "api": api.get("api").cloned().unwrap_or(json!(1)),
         "uptimeSec": api["stats"]["uptimeSec"],
         "mode": api.get("mode").cloned().unwrap_or(json!("cmd")),
         "config": if api["uci"] == true { "uci" } else { "json" },

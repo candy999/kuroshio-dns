@@ -867,6 +867,11 @@ impl Cdn {
         self.state().db.domains.len()
     }
 
+    /// 記憶體裡的網域資料庫大約多大（bytes；狀態頁分項用量用，不必精確）
+    pub fn approx_ram_bytes(&self) -> usize {
+        self.state().db.domains.values().map(|d| d.approx_bytes()).sum()
+    }
+
     /// `/api/status` 的 cdn 區塊
     pub fn status_lite(&self) -> Value {
         let st = self.state();

@@ -340,6 +340,42 @@ pub struct FilterService {
     suspended_bytes: Mutex<u64>,
     /// 本機副本（快照寫入器設定好才有）
     copies: OnceLock<ListCopies>,
+    /// 手動「立即更新」（`POST /api/filter/update`）：背景執行，進度與結果在狀態的 `filter.update`
+    update_run: Mutex<UpdateRun>,
+    /// 每次更新結束時送出那一次的 runId（`?wait=1` 等結果用）
+    update_done: tokio::sync::watch::Sender<u64>,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 一次手動更新的狀態（`/api/status` 的 `filter.update`）
+#[derive(Debug, Clone, Default)]
+pub struct UpdateRun {
+    pub running: bool,
+    /// 這次的編號：開始時間（Unix 毫秒），同一個程式裡不會重複
+    pub run_id: u64,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub changed: Option<bool>,
+    pub error: Option<String>,
+}
+
+impl UpdateRun {
+    pub fn json(&self) -> Value {
+        json!({
+            "state": if self.running { "running" } else { "idle" },
+            "runId": (self.run_id > 0).then_some(self.run_id),
+            "startedAt": (self.started_at > 0).then_some(self.started_at),
+            "finishedAt": self.finished_at,
+            "changed": self.changed,
+            "error": self.error,
+        })
+    }
 }
 
 /// 清單的停用順序（純函式，方便測試）：保護清單、已經停用的不算；
@@ -397,11 +433,74 @@ impl FilterService {
             suspended: AtomicBool::new(false),
             suspended_bytes: Mutex::new(0),
             copies: OnceLock::new(),
+            update_run: Mutex::new(UpdateRun::default()),
+            update_done: tokio::sync::watch::channel(0).0,
         }))
     }
 
     pub fn sources(&self) -> &[ListSource] {
         &self.sources
+    }
+
+    /// 開始一次手動更新（重新讀自訂規則、強制檢查每份清單），在背景執行。
+    /// 回傳（這次是不是新開始的, 這一次的狀態）：已經有一次在跑就不再開，回傳正在跑的那一次
+    pub fn start_update(self: &Arc<Self>) -> (bool, UpdateRun) {
+        let run = {
+            let mut u = self.update_run.lock().unwrap();
+            if u.running {
+                return (false, u.clone());
+            }
+            // 開始時間（毫秒）當編號；時鐘倒退也不會跟上一次重複
+            let now = unix_ms().max(u.run_id + 1);
+            *u = UpdateRun {
+                running: true,
+                run_id: now,
+                started_at: now,
+                ..Default::default()
+            };
+            u.clone()
+        };
+        let me = self.clone();
+        let id = run.run_id;
+        tokio::spawn(async move {
+            me.reload_custom(true);
+            let r = me.update_lists(true).await;
+            let fin = unix_ms();
+            {
+                let mut u = me.update_run.lock().unwrap();
+                u.running = false;
+                u.finished_at = Some(fin);
+                match r {
+                    Ok(c) => u.changed = Some(c),
+                    Err(e) => {
+                        warn!("立即更新過濾清單失敗：{e:#}");
+                        u.error = Some(format!("{e:#}"));
+                    }
+                }
+            }
+            me.update_done.send_replace(id);
+        });
+        (true, run)
+    }
+
+    /// 等 `run_id` 那一次更新結束，回傳結果（`?wait=1`）
+    pub async fn wait_update(&self, run_id: u64) -> UpdateRun {
+        let mut rx = self.update_done.subscribe();
+        loop {
+            {
+                let u = self.update_run.lock().unwrap();
+                if u.run_id != run_id || !u.running {
+                    return u.clone();
+                }
+            }
+            if rx.changed().await.is_err() {
+                return self.update_run.lock().unwrap().clone();
+            }
+        }
+    }
+
+    pub fn update_status(&self) -> UpdateRun {
+        self.update_run.lock().unwrap().clone()
     }
 
     /// 本機副本存在快照目錄的 `filter-lists/`（只能設定一次）
@@ -1061,6 +1160,8 @@ impl FilterCheck for FilterService {
             })).collect::<Vec<_>>(),
             "notice": notice,
             "updatedAt": status["updatedAt"], "errors": status["errors"],
+            // 手動「立即更新」：背景執行的狀態（API 2）
+            "update": self.update_status().json(),
         })
     }
 }

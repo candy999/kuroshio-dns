@@ -267,6 +267,17 @@ enum NotifyEvent {
         #[arg(long)]
         uci: bool,
     },
+    /// 先讓出記憶體：韌體要做很佔記憶體的事（例如把韌體映像檔寫進 tmpfs）之前呼叫。
+    /// 立刻縮小快取、把 CDN 冷資料移出記憶體（不停用過濾清單），並在 --hold 秒內不長大、不恢復
+    Trim {
+        /// 多久之內不長大、不恢復（秒，最多 3600）
+        #[arg(long, default_value_t = 300)]
+        hold: u64,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -341,6 +352,11 @@ fn default_config_path() -> PathBuf {
     }
 }
 
+/// 預設的日誌過濾：設定的等級，加上 QUIC 函式庫只記錯誤
+fn default_log_directives(level: &str) -> String {
+    format!("{level},quinn_proto=error,quinn=warn")
+}
+
 /// 記錄到檔案（Windows 服務用）：超過 5 MB 時改名成 .old 再重新開始
 fn init_log_to(cfg: Option<&serde_json::Value>, file: Option<&std::path::Path>) {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -350,7 +366,10 @@ fn init_log_to(cfg: Option<&serde_json::Value>, file: Option<&std::path::Path>) 
         .and_then(|v| v.as_str())
         .unwrap_or("info")
         .to_string();
-    let filter = tracing_subscriber::EnvFilter::try_from_env("KUROSHIO_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    // QUIC 函式庫（quinn-proto）的警告跟查詢結果無關，而且某些伺服器會讓它每十幾秒一行（例如 duplicate reset token），
+    // 路由器的 syslog 很小，會把其他日誌洗掉：預設只記它的錯誤。KUROSHIO_LOG 可以整個覆寫
+    let filter = tracing_subscriber::EnvFilter::try_from_env("KUROSHIO_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_directives(&level)));
     if let Some(path) = file {
         // 儲存空間不足時日誌最先刪（規格 05 第 5.6 節）
         kuroshio::space::register(path.with_extension("log.old"), kuroshio::space::Tier::Log);
@@ -555,6 +574,8 @@ pub async fn serve(
         info!("重新載入（設定變更或匯入備份）");
         first = false;
     }
+    // 還在等待合併的「寫入設定後的外部指令」：結束前先跑完（例如 Padavan 存進 Flash）
+    kuroshio::confhook::flush();
     info!("結束");
     Ok(())
 }
@@ -649,6 +670,23 @@ async fn generation(
     console: ConsoleSlot,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<bool> {
+    // KUROSHIO_ON_CONFIG_WRITE：監看設定檔所在的資料夾與設定目錄（快照目錄的上一層），不含快照與執行期目錄
+    {
+        let state = kuroshio::app::persist_dir(&cfg);
+        let base = state.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state.clone());
+        let conf_file = if uci {
+            PathBuf::from(kuroshio_config::uci::file_path())
+        } else {
+            config.clone()
+        };
+        let conf_dir = conf_file
+            .parent()
+            .map(|p| if p.as_os_str().is_empty() { std::path::Path::new(".") } else { p });
+        let mut watch: Vec<&std::path::Path> = vec![&base];
+        watch.extend(conf_dir);
+        let runtime = kuroshio::app::runtime_dir(&cfg);
+        kuroshio::confhook::configure(&watch, &[&state, &runtime]);
+    }
     let started = kuroshio::app::start(&cfg).await?;
     let ui = &started.state.webui;
     if !uci {
@@ -1543,10 +1581,13 @@ async fn status_cmd(config: &std::path::Path, uci: bool, json: bool) -> i32 {
 /// `kuroshio notify <事件>`：結束碼 0 = 已送達，1 = 服務沒有回應，2 = 設定讀不到
 async fn notify_cmd(event: NotifyEvent) -> i32 {
     let (config, uci, path, timeout) = match event {
-        NotifyEvent::WanChanged { config, uci } => (config, uci, "/api/notify/wan-changed", 10),
+        NotifyEvent::WanChanged { config, uci } => (config, uci, "/api/notify/wan-changed".to_string(), 10),
         // 快照可能有好幾 MB（CDN 網域庫），慢的儲存裝置要多等一下
-        NotifyEvent::Save { config, uci } => (config, uci, "/api/persist/flush", 120),
+        NotifyEvent::Save { config, uci } => (config, uci, "/api/persist/flush".to_string(), 120),
+        // CDN 冷資料移出前要先寫出快照
+        NotifyEvent::Trim { hold, config, uci } => (config, uci, format!("/api/memory/trim?holdSec={hold}"), 60),
     };
+    let path = path.as_str();
     let cfg = match config_for_cli(&config, uci) {
         Ok(c) => c,
         Err(e) => {
@@ -1568,6 +1609,10 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             if path == "/api/persist/flush" {
                 println!("{}", kuroshio::integration::save_text(&v));
+                return 0;
+            }
+            if path.starts_with("/api/memory/trim") {
+                println!("{}", kuroshio::integration::trim_text(&v));
                 return 0;
             }
             println!(

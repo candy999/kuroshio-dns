@@ -8,6 +8,10 @@
 //!   兩個都填取大的；0 = 自動。不看自己用了多少（沒有「預算」），只看整台機器還剩多少。
 //! - **反應快**：可用記憶體在保留量兩倍以內時每 2–3 秒量一次，離得遠時 30 秒（[`poll_interval`]）；
 //!   Linux 有 PSI（`/proc/pressure/memory`）時當作提早的訊號：別的程式已經在等記憶體了，就先讓。
+//!   沒有 PSI（舊核心，例如 Padavan 的 4.4）只能靠輪詢：比保留量多不到 [`NO_PSI_NEAR`] 時每 3 秒、其他 10 秒。
+//! - **先讓出來**（[`Governor::trim`]，`kuroshio notify trim`）：韌體要做一件很佔記憶體的事（例如把韌體映像檔寫進 tmpfs）
+//!   之前先呼叫，立刻做「吃緊」時會做的釋出（診斷緩衝、快取、CDN 冷資料；不停用過濾清單），
+//!   並在一段時間內不長大、不恢復。
 //! - **狀態**：寬裕 / 吃緊 / 不足，有遲滯與最短停留時間，不會來回跳。變嚴重立刻反應；放鬆要條件持續 `dwell` 秒。
 //! - **釋出階梯**（離保留量遠時一輪做好幾步，直到估計釋出的量補足差額）：
 //!   1. 診斷用的緩衝（設定頁日誌、熱門排行）縮小
@@ -258,10 +262,23 @@ pub fn poll_interval(r: &Reading, res: &Reserve) -> u64 {
         2
     } else if a < res.bytes.saturating_mul(2) || r.psi.is_some_and(|p| !p.calm()) {
         3
+    } else if r.psi.is_none() && a < res.bytes.saturating_add(NO_PSI_NEAR) {
+        // 沒有 PSI：別的程式突然要一大塊（幾秒內寫進 tmpfs 十幾 MB）時沒有提早的訊號，量勤一點
+        3
+    } else if r.psi.is_none() {
+        10
     } else {
         30
     }
 }
+
+/// 沒有 PSI 時「離保留量很近」的距離：比保留量多不到這麼多就每 3 秒量一次
+pub const NO_PSI_NEAR: u64 = 64 * MB;
+
+/// `kuroshio notify trim` 預設不長大、不恢復的時間（秒）
+pub const TRIM_HOLD_DEFAULT: u64 = 300;
+/// 最長可以要求多久
+pub const TRIM_HOLD_MAX: u64 = 3600;
 
 /// 立即的判斷（沒有遲滯）
 pub fn classify(r: &Reading, res: &Reserve) -> State {
@@ -479,6 +496,8 @@ struct Inner {
     last_change: Option<(u64, State, State)>,
     waiting: Option<String>,
     growth: bool,
+    /// `trim` 要求的「先不長大、不恢復」到這個時間（秒）
+    hold_until: u64,
 }
 
 type Reader = Box<dyn Fn() -> Reading + Send + Sync>;
@@ -519,6 +538,7 @@ impl Governor {
                 last_change: None,
                 waiting: None,
                 growth: true,
+                hold_until: 0,
             }),
             gap: 5,
             dwell: 180,
@@ -600,8 +620,9 @@ impl Governor {
                 Self::event(i, now, msg);
             }
             let state = i.hyst.state;
-            // 長大：寬裕而且離保留量 + 遲滯還有空間
-            let growth = state == State::Comfortable && pressure_of(&r, &self.reserve) == Pressure::Normal;
+            // 長大：寬裕而且離保留量 + 遲滯還有空間（`trim` 要求暫停的期間不長大）
+            let held = now < i.hold_until;
+            let growth = !held && state == State::Comfortable && pressure_of(&r, &self.reserve) == Pressure::Normal;
             GROWTH.store(growth, Ordering::Relaxed);
             let growth_change = (growth != i.growth).then_some(growth);
             i.growth = growth;
@@ -613,6 +634,9 @@ impl Governor {
                     let far = state == State::Critical || r.avail.is_some_and(|a| a < self.reserve.bytes / 4 * 3);
                     Plan::Shed { far, deficit }
                 })
+            } else if held {
+                i.waiting = Some(format!("應要求先讓出記憶體，{} 秒內不恢復", i.hold_until - now));
+                None
             } else if now.saturating_sub(i.hyst.changed_at) >= self.dwell && now >= i.next_restore_at {
                 match self.steps.iter().rposition(|s| s.is_shed()) {
                     Some(k) => {
@@ -725,6 +749,76 @@ impl Governor {
         }
     }
 
+    /// 應要求先讓出記憶體（`kuroshio notify trim`、`POST /api/memory/trim`）：不管目前寬不寬裕，
+    /// 立刻做「吃緊」時會做的每一步（[`Step::min_state`] 是吃緊的：診斷緩衝、快取、CDN 冷資料；
+    /// 過濾清單與純轉送只在系統真的不足時才做，這裡不碰），然後 `hold` 秒內不長大、不恢復。
+    /// 回傳 `{ steps: [...], freedBytes, holdSec, availKB }`
+    pub async fn trim(&self, hold: u64, now: u64) -> Value {
+        let hold = hold.clamp(1, TRIM_HOLD_MAX);
+        {
+            let mut i = self.inner.lock().unwrap();
+            i.hold_until = i.hold_until.max(now + hold);
+            i.growth = false;
+        }
+        GROWTH.store(false, Ordering::Relaxed);
+        for s in &self.steps {
+            s.set_growth(false);
+        }
+        let before = self.read();
+        let mut done = Vec::new();
+        let mut freed = 0u64;
+        for s in self.steps.iter().filter(|s| s.min_state() <= State::Tight) {
+            if !s.can_shed() {
+                continue;
+            }
+            match s.shed(&before).await {
+                Ok(o) => {
+                    info!("記憶體控制（應要求先讓出）：{}（約 {} KB）{}", s.label(), o.bytes / 1024, o.detail);
+                    freed += o.bytes;
+                    let mut g = self.inner.lock().unwrap();
+                    let i = &mut *g;
+                    i.freed_total += o.bytes;
+                    Self::event(
+                        i,
+                        now,
+                        format!("應要求釋出：{} {}（約 {} KB）", s.label(), o.detail, o.bytes / 1024),
+                    );
+                    i.shed.push(ShedRec {
+                        key: s.key(),
+                        label: s.label(),
+                        detail: o.detail.clone(),
+                        bytes: o.bytes,
+                        avail_before: before.avail,
+                        avail_delta: None,
+                        at: now,
+                    });
+                    done.push(json!({ "step": s.key(), "label": s.label(), "freedBytes": o.bytes, "detail": o.detail }));
+                }
+                Err(e) => done.push(json!({ "step": s.key(), "label": s.label(), "skipped": format!("{e:#}") })),
+            }
+        }
+        sysinfo::trim_heap();
+        let after = self.read();
+        {
+            let mut g = self.inner.lock().unwrap();
+            let i = &mut *g;
+            i.last = after;
+            Self::event(
+                i,
+                now,
+                format!("應要求先讓出記憶體：約 {} KB，{hold} 秒內不長大、不恢復", freed / 1024),
+            );
+        }
+        json!({
+            "ok": true,
+            "steps": done,
+            "freedBytes": freed,
+            "holdSec": hold,
+            "availKB": after.avail.map(|b| b / 1024),
+            "availBeforeKB": before.avail.map(|b| b / 1024),
+        })
+    }
+
     /// `/api/status.memory`
     pub fn status_json(&self) -> Value {
         let mut sizes = serde_json::Map::new();
@@ -752,6 +846,7 @@ impl Governor {
             "psi": r.psi.map(|p| json!({ "someAvg10": p.some_avg10, "fullAvg10": p.full_avg10 })),
             "pollSec": poll_interval(&r, &self.reserve),
             "growth": i.growth,
+            "holdUntil": (i.hold_until > crate::persist::now_secs()).then_some(i.hold_until * 1000),
             "floor": floor,
             "protectedSuspended": protected,
             "sizes": Value::Object(sizes),
@@ -912,11 +1007,12 @@ impl Step for CacheStep {
         self.resolver.cache.lock().unwrap().max = cap.effective().max(16);
     }
     fn sizes(&self, out: &mut serde_json::Map<String, Value>) {
-        let (len, max) = {
+        let (len, max, bytes) = {
             let c = self.resolver.cache.lock().unwrap();
-            (c.len(), c.max)
+            (c.len(), c.max, c.approx_bytes())
         };
         out.insert("cacheEntries".into(), json!(len));
+        out.insert("cacheBytes".into(), json!(bytes));
         out.insert("cacheMax".into(), json!(max));
         out.insert("cacheConfiguredMax".into(), json!(self.cap.lock().unwrap().configured));
     }
@@ -1013,6 +1109,7 @@ impl Step for CdnStep {
     }
     fn sizes(&self, out: &mut serde_json::Map<String, Value>) {
         out.insert("cdnInRam".into(), json!(self.cdn.domains_in_ram()));
+        out.insert("cdnBytes".into(), json!(self.cdn.approx_ram_bytes()));
         out.insert("cdnOnDiskOnly".into(), json!(self.cdn.evicted_count()));
     }
     fn shed<'a>(&'a self, _r: &'a Reading) -> BoxFut<'a, anyhow::Result<Outcome>> {
@@ -1331,7 +1428,14 @@ mod tests {
         assert_eq!(poll_interval(&rd(50), &res), 2, "低於保留量");
         assert_eq!(poll_interval(&rd(150), &res), 3, "保留量兩倍以內");
         assert_eq!(poll_interval(&rd(199), &res), 3);
-        assert_eq!(poll_interval(&rd(500), &res), 30, "離得遠");
+        assert_eq!(poll_interval(&rd(150), &res), 3, "保留量兩倍以內");
+        assert_eq!(poll_interval(&rd(160), &res), 3, "沒有 PSI、比保留量多不到 64 MB");
+        assert_eq!(poll_interval(&rd(500), &res), 10, "沒有 PSI：離得遠也 10 秒量一次");
+        let calm = Reading {
+            psi: Some(Psi::default()),
+            ..rd(500)
+        };
+        assert_eq!(poll_interval(&calm, &res), 30, "有 PSI 而且平靜：離得遠時 30 秒");
         let mut r = rd(500);
         r.psi = Some(Psi {
             some_avg10: 12.0,
@@ -1569,6 +1673,37 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), ["restore:cdn", "restore:cache", "restore:diagnostics"]);
         assert_eq!(g.status_json()["shed"].as_array().unwrap().len(), 0);
         assert_eq!(g.state(), State::Comfortable);
+    }
+
+    #[tokio::test]
+    async fn trim_sheds_tight_steps_now_and_holds_restore() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let g = Governor::new(res100(), ladder(&log, 2 * MB), 0);
+        g.set_reader(|| rd(600));
+        let mut now = 1000;
+        // 寬裕時也照做：只做「吃緊」層級的（過濾清單、最低限度不碰）
+        let v = g.trim(120, now).await;
+        assert_eq!(*log.lock().unwrap(), ["shed:diagnostics", "shed:cache", "shed:cdn"]);
+        assert_eq!(v["freedBytes"], 3000);
+        assert_eq!(v["holdSec"], 120);
+        assert_eq!(g.status_json()["growth"], false, "暫停期間不長大");
+        log.lock().unwrap().clear();
+        // 暫停期間：寬裕也不恢復、不長大
+        while now < 1000 + 115 {
+            g.tick(rd(600), now).await;
+            now += 5;
+        }
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        assert!(g.status_json()["waiting"].as_str().unwrap().contains("不恢復"));
+        // 時間到了：照一般規則依相反順序恢復
+        for _ in 0..200 {
+            g.tick(rd(600), now).await;
+            now += 5;
+        }
+        assert_eq!(*log.lock().unwrap(), ["restore:cdn", "restore:cache", "restore:diagnostics"]);
+        assert_eq!(g.status_json()["growth"], true);
+        // 上限 3600 秒
+        assert_eq!(g.trim(99_999, now).await["holdSec"], TRIM_HOLD_MAX);
     }
 
     #[tokio::test]
