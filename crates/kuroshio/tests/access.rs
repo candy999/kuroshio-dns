@@ -202,12 +202,16 @@ async fn listeners_reject_denied_sources() {
     s.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 
-    // 5. 台灣 IP 資料讀不到：不擋（fail open），狀態顯示警告
+    // 5. 台灣 IP 資料讀不到：公網來源擋下（fail closed），狀態顯示警告
     let (s, dir) = start("nodata", up, json!({ "dataFile": "/nonexistent/tw-ip.json" }), true).await;
     let u = Upstream::parse(&format!("tls://{}", s.encrypted.dot.unwrap())).unwrap();
-    assert!(u.exchange(&q(6, "f.test"), Duration::from_secs(3)).await.is_ok(), "資料讀不到不擋");
+    assert!(
+        u.exchange(&q(6, "f.test"), Duration::from_secs(3)).await.is_err(),
+        "資料讀不到：公網來源擋下"
+    );
     let st = s.resolver.access.get().unwrap().status_json();
-    assert_eq!(st["failOpen"], json!(true));
+    assert_eq!(st["failClosed"], json!(true));
+    assert_eq!(st["failOpen"], json!(false));
     assert!(st["warning"].as_str().unwrap().contains("讀不到"));
     assert!(s.resolver.access.get().unwrap().applies(Kind::Dot));
     s.shutdown();

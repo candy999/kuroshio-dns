@@ -1,8 +1,10 @@
 //! Windows 本機設定頁（規格 02 第 6、7.2 節、規格 07）
 //!
 //! - 只聽 127.0.0.1（管理 API 同一個埠）；Host 必須是本機名稱（防 DNS rebinding）
-//! - 登入：一次性 token（`admin.token`，第一次啟動時產生，只有系統管理員可讀的資料夾）→
+//! - 登入：token（`admin.token`，第一次啟動時產生，只有系統管理員可讀的資料夾；長期有效）→
 //!   HttpOnly、SameSite=Strict 的 cookie；腳本也可以用 `Authorization: Bearer <token>`
+//! - 印給人點的網址用一次性登入碼（`/login?code=`，10 分鐘內、只能用一次），長期的 token 不會留在瀏覽器歷史；
+//!   舊的 `/login?token=` 照樣接受
 //! - 會改東西的請求（POST / PUT）檢查 Origin 必須是本機
 //! - `admin.auth`：`auto`（預設：Windows 開、OpenWrt 關——OpenWrt 由 rpcd 代理，只聽本機）/ true / false
 //! - 靜態檔：`<share>/admin/`（index.html、app.js、style.css、fields.json）
@@ -20,6 +22,17 @@ pub const COOKIE: &str = "kuroshio_session";
 const MAX_SESSIONS: usize = 32;
 /// 登入後多久要重新登入
 const SESSION_TTL: Duration = Duration::from_secs(30 * 86400);
+/// 一次性登入碼的有效時間
+pub const LOGIN_CODE_TTL: Duration = Duration::from_secs(600);
+/// 同時有效的登入碼最多幾個（多的擠掉最舊的）
+const MAX_LOGIN_CODES: usize = 16;
+
+/// 一次性登入碼 → 建立時間（整個程式共用：設定重新載入後還能用）
+fn login_codes() -> &'static Mutex<HashMap<String, Instant>> {
+    static C: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
 /// 密碼類欄位送到瀏覽器時的遮罩；存檔時收到這個值 = 沒改
 pub const SECRET_MASK: &str = "********";
 
@@ -280,16 +293,47 @@ impl WebUi {
         self.token.is_some()
     }
 
-    /// 登入用網址（指令列 `kuroshio admin-url`、cmd 啟動時顯示）
+    /// 登入用網址（cmd 啟動時顯示、主控台的 url / open）：每次產生新的一次性登入碼
     pub fn login_url(&self, port: u16) -> String {
-        match &self.token {
-            Some(t) => format!("http://127.0.0.1:{port}/login?token={t}"),
+        match self.new_login_code() {
+            Some(c) => format!("http://127.0.0.1:{port}/login?code={c}"),
             None => format!("http://127.0.0.1:{port}/"),
         }
     }
 
     pub fn check_token(&self, t: &str) -> bool {
         self.token.as_deref().is_some_and(|tok| ct_eq(tok, t.trim()))
+    }
+
+    /// 產生一次性登入碼（不需要登入時 None）
+    pub fn new_login_code(&self) -> Option<String> {
+        self.token.as_ref()?;
+        let code = random_hex(16);
+        let now = Instant::now();
+        let mut m = login_codes().lock().unwrap();
+        m.retain(|_, at| now.duration_since(*at) < LOGIN_CODE_TTL);
+        while m.len() >= MAX_LOGIN_CODES {
+            let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            m.remove(&oldest);
+        }
+        m.insert(code.clone(), now);
+        Some(code)
+    }
+
+    /// 用掉一次性登入碼（對了就作廢，不能再用第二次）
+    pub fn take_login_code(&self, c: &str) -> bool {
+        if self.token.is_none() {
+            return false;
+        }
+        let c = c.trim();
+        let mut m = login_codes().lock().unwrap();
+        let hit = m.keys().find(|k| ct_eq(k, c)).cloned();
+        match hit.and_then(|k| m.remove(&k)) {
+            Some(at) => at.elapsed() < LOGIN_CODE_TTL,
+            None => false,
+        }
     }
 
     /// 登入成功：發一個 session
@@ -464,11 +508,18 @@ mod tests {
         assert!(w.authorized(&req(&[("Cookie", &format!("a=1; {COOKIE}={sid}"))])));
         w.logout(&sid);
         assert!(!w.authorized(&req(&[("Cookie", &format!("{COOKIE}={sid}"))])));
-        assert!(w.login_url(8054).contains(&tok));
+        // 印給人點的網址：一次性登入碼，不含 token；用過一次就失效
+        let u = w.login_url(8054);
+        assert!(u.starts_with("http://127.0.0.1:8054/login?code=") && !u.contains(&tok), "{u}");
+        let code = u.rsplit_once('=').unwrap().1.to_string();
+        assert!(w2.take_login_code(&code), "設定重新載入後還能用");
+        assert!(!w.take_login_code(&code), "只能用一次");
+        assert!(!w.take_login_code("nope"));
         let _ = std::fs::remove_dir_all(&dir);
         // 關閉登入
         let w = WebUi::new(&json!({ "admin": { "auth": false } }), &dir, &dir);
         assert!(!w.auth_enabled() && w.authorized(&req(&[])));
+        assert_eq!(w.login_url(8054), "http://127.0.0.1:8054/");
     }
 
     #[test]

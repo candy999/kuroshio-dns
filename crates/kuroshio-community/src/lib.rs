@@ -26,6 +26,21 @@ pub mod share;
 pub mod transport;
 pub mod util;
 
+/// 寫完設定類檔案（金鑰、身分、邀請）後要通知的對象：主程式在啟動時設成「排一次寫入設定後的外部指令」
+/// （KUROSHIO_ON_CONFIG_WRITE），第三方韌體才會把金鑰存進 Flash
+static ON_WRITE: std::sync::OnceLock<fn(&std::path::Path)> = std::sync::OnceLock::new();
+
+/// 設定寫檔後的通知（只能設一次）
+pub fn set_on_write(f: fn(&std::path::Path)) {
+    let _ = ON_WRITE.set(f);
+}
+
+pub(crate) fn notify_written(path: &std::path::Path) {
+    if let Some(f) = ON_WRITE.get() {
+        f(path);
+    }
+}
+
 pub use client::Hint;
 pub use config::{Config, Tuning};
 pub use envelope::{ALPN, BASE_PATH};

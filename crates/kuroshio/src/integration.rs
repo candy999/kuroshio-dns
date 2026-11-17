@@ -61,7 +61,7 @@ pub fn reload_json() -> Value {
     }
 }
 
-pub fn warnings(data: &crate::manifest::DataCheck, synced: bool, pressure: Pressure, filter: &Value) -> Vec<String> {
+pub fn warnings(data: &crate::manifest::DataCheck, synced: bool, pressure: Pressure, filter: &Value, access: &Value) -> Vec<String> {
     let mut w = Vec::new();
     if let Some((e, _)) = &*RELOAD_ERROR.lock().unwrap() {
         w.push(format!("新設定無法套用，繼續用上一份設定：{e}"));
@@ -79,6 +79,27 @@ pub fn warnings(data: &crate::manifest::DataCheck, synced: bool, pressure: Press
     }
     if let Some(n) = filter.get("notice").and_then(Value::as_str) {
         w.push(n.to_string());
+    }
+    // 過濾清單下載失敗（第一次載入時缺的清單會短間隔重試）
+    let failed: Vec<&str> = filter
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("name").and_then(Value::as_str))
+        .collect();
+    if !failed.is_empty() {
+        w.push(format!("過濾清單下載失敗：{}（之後會自動重試）", failed.join("、")));
+    }
+    if access.get("failClosed") == Some(&Value::Bool(true)) {
+        w.push(format!(
+            "存取控制的台灣 IP 資料讀不到{}：公網來源暫時一律擋下（區網、好友、自訂允許照常）",
+            access
+                .get("warning")
+                .and_then(Value::as_str)
+                .map(|x| format!("（{x}）"))
+                .unwrap_or_default()
+        ));
     }
     w
 }
@@ -390,12 +411,20 @@ mod tests {
     #[test]
     fn warning_list() {
         let ok = crate::manifest::evaluate(Path::new("d"), Some(r#"{"dataFormat":1,"version":"x"}"#), 1, "x");
-        assert!(warnings(&ok, true, Pressure::Normal, &Value::Null).is_empty());
+        assert!(warnings(&ok, true, Pressure::Normal, &Value::Null, &Value::Null).is_empty());
         let bad = crate::manifest::evaluate(Path::new("d"), None, 1, "x");
-        let w = warnings(&bad, false, Pressure::Low, &json!({ "notice": "記憶體不足，暫時停用：ads 清單" }));
-        assert_eq!(w.len(), 4);
+        let w = warnings(
+            &bad,
+            false,
+            Pressure::Low,
+            &json!({ "notice": "記憶體不足，暫時停用：ads 清單", "errors": [{ "name": "OISD", "error": "timeout" }] }),
+            &json!({ "failClosed": true, "warning": "讀不到 geo/tw-ip.json" }),
+        );
+        assert_eq!(w.len(), 6, "{w:?}");
         assert!(w[0].contains("沒有版本標記"));
         assert!(w[1].contains("對時"));
+        assert!(w[4].contains("OISD"));
+        assert!(w[5].contains("擋下") && w[5].contains("tw-ip.json"));
     }
 
     #[test]

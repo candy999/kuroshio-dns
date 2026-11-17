@@ -165,10 +165,10 @@ return view.extend({
 			}), [2]) : ''
 		], { 'id': 'kuroshio-memory' }) : '';
 
-		// 連線來源限制（規格 08）：模式、拒絕次數、資料日期；資料讀不到時不擋，要明顯提醒
+		// 連線來源限制（規格 08）：模式、拒絕次數、資料日期；資料讀不到時公網來源一律擋下，要明顯提醒
 		var ac = api.access;
 		var accSec = ac ? common.section(_('連線來源'), [
-			ac.failOpen ? E('div', { 'class': 'alert-message danger' }, _('台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）') + (ac.warning ? '：' + ac.warning : ''))
+			ac.failClosed ? E('div', { 'class': 'alert-message danger' }, _('台灣 IP 資料讀不到：公網來源暫時一律擋下（區網、好友、自訂允許照常）') + (ac.warning ? '：' + ac.warning : ''))
 				: (ac.warning ? E('div', { 'class': 'alert-message warning' }, ac.warning) : ''),
 			E('p', {}, [
 				E('strong', {}, { taiwan: _('只開放台灣'), custom: _('自訂 ISP'), open: _('全開放') }[ac.mode] || ac.mode || '-'),

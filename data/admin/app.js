@@ -612,7 +612,7 @@
 			tile('快取筆數', fmtNum(st.cacheEntries), '約 ' + fmtBytes(st.cacheBytes)),
 			tile('過濾規則', f ? fmtNum((f.lists || 0) + (f.custom || 0)) : '未啟用', f ? '自訂 ' + fmtNum(f.custom) + (f.domains != null ? ' · ' + fmtNum(f.domains) + ' 個網域' : '') : ''),
 			st.access ? tile('連線來源', ACCESS_MODE[st.access.mode] || st.access.mode || '-',
-				st.access.failOpen ? '資料讀不到，暫時不擋' : '已拒絕 ' + fmtNum((st.access.denied || {}).total) + ' 次' + (st.access.generatedAt ? ' · 資料 ' + st.access.generatedAt : '')) : null,
+				st.access.failClosed ? '資料讀不到，公網來源暫時一律擋下' : '已拒絕 ' + fmtNum((st.access.denied || {}).total) + ' 次' + (st.access.generatedAt ? ' · 資料 ' + st.access.generatedAt : '')) : null,
 			tile('磁碟寫入（今天）', per.bytesToday != null ? fmtBytes(per.bytesToday) : '-', (per.storage || '') + (per.effectiveIntervalMin != null ? ' · 間隔 ' + per.effectiveIntervalMin + ' 分' : '') + (per.estimatedDailyBytes != null ? ' · 預估每天 ' + fmtBytes(per.estimatedDailyBytes) : '')),
 			tile('最久未存', fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? '上限 ' + per.maxAgeHours + ' 小時' : '') + (per.forcedByAge ? ' · 到期強制寫入 ' + fmtNum(per.forcedByAge) + ' 次' : '') +
 				(per.lowSpace ? ' · 儲存空間不足（只寫核心資料）' : '')),
@@ -670,10 +670,10 @@
 		// 憑證、最近的錯誤
 		var ex = clear($('st-extra'));
 		var ac = st.access;
-		if (ac && (ac.failOpen || ac.warning)) {
+		if (ac && (ac.failClosed || ac.warning)) {
 			ex.appendChild(el('h3', { text: '連線來源' }));
-			ex.appendChild(el('p', { class: ac.failOpen ? 'msg err' : 'msg warn', id: 'st-access-warn',
-				text: (ac.failOpen ? '台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）' : '') + (ac.warning ? (ac.failOpen ? '：' : '') + ac.warning : '') }));
+			ex.appendChild(el('p', { class: ac.failClosed ? 'msg err' : 'msg warn', id: 'st-access-warn',
+				text: (ac.failClosed ? '台灣 IP 資料讀不到：公網來源暫時一律擋下（區網、好友、自訂允許照常）' : '') + (ac.warning ? (ac.failClosed ? '：' : '') + ac.warning : '') }));
 		}
 		if (acme && acme.enabled) {
 			var c = acme.certInfo;
@@ -1229,7 +1229,7 @@
 	/** 「目前狀態」：模式、資料日期、資料讀不到時不擋的警告、拒絕次數、被拒絕最多的網段 */
 	function accessPanel(box, a) {
 		var dn = a.denied || {}, by = dn.byListener || {};
-		if (a.failOpen) box.appendChild(el('p', { class: 'msg err', id: 'access-failopen', text: '台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）' + (a.warning ? '：' + a.warning : '。') }));
+		if (a.failClosed) box.appendChild(el('p', { class: 'msg err', id: 'access-failopen', text: '台灣 IP 資料讀不到：公網來源暫時一律擋下（區網、好友、自訂允許照常）' + (a.warning ? '：' + a.warning : '。') }));
 		else if (a.warning) box.appendChild(el('p', { class: 'msg warn', text: a.warning }));
 		var groups = [].concat(a.groups || []);
 		var on = groups.filter(function (g) { return g.enabled; });

@@ -26,6 +26,8 @@ pub const ENV: &str = "KUROSHIO_ON_CONFIG_WRITE";
 pub const DELAY: Duration = Duration::from_secs(3);
 /// 指令最多跑多久
 pub const TIMEOUT: Duration = Duration::from_secs(30);
+/// 指令結束後，最多再等多久讀完它的輸出
+const OUTPUT_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct St {
@@ -247,15 +249,18 @@ impl Hook {
             }
         };
         // 輸出另外讀（不讀的話輸出多時管線塞住，指令卡著不結束）
+        // 讀完的結果用 channel 送回來：指令結束後只等一下，不 join（背景程式拿著管線時永遠讀不到結尾）
         let read = |r: Option<Box<dyn std::io::Read + Send>>| {
+            let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let mut s = String::new();
                 if let Some(mut r) = r {
                     let _ = std::io::Read::read_to_string(&mut std::io::Read::take(&mut r, 4096), &mut s);
                     let _ = std::io::copy(&mut r, &mut std::io::sink());
                 }
-                s
-            })
+                let _ = tx.send(s);
+            });
+            rx
         };
         let out = read(child.stdout.take().map(|x| Box::new(x) as Box<dyn std::io::Read + Send>));
         let err = read(child.stderr.take().map(|x| Box::new(x) as Box<dyn std::io::Read + Send>));
@@ -279,9 +284,16 @@ impl Hook {
                 }
             }
         };
-        // 逾時結束的：輸出不等了（還有孫程式拿著管線的話會一直讀不完）
+        // 指令結束後輸出最多再等 1 秒：指令留了背景程式（例如 `save.sh &`）還拿著輸出管線時，不能一直等下去，
+        // 不然之後的寫入都不會再觸發。逾時結束的不等
         let (out, err) = match status {
-            Some(_) => (out.join().unwrap_or_default(), err.join().unwrap_or_default()),
+            Some(_) => {
+                let until = Instant::now() + OUTPUT_WAIT;
+                let get = |rx: std::sync::mpsc::Receiver<String>| {
+                    rx.recv_timeout(until.saturating_duration_since(Instant::now())).unwrap_or_default()
+                };
+                (get(out), get(err))
+            }
             None => (String::new(), String::new()),
         };
         let tail = |s: &str| s.trim().lines().last().unwrap_or("").to_string();
@@ -302,11 +314,13 @@ impl Hook {
     }
 
     fn flush(&self) {
-        let deadline = Instant::now() + self.timeout + Duration::from_secs(1);
         let mut st = self.st.lock().unwrap();
         if st.files.is_empty() && !st.running {
             return;
         }
+        // 指令正在跑、又有新的寫入在等：要等它跑完再跑一次，期限給兩次
+        let runs = if st.running && !st.files.is_empty() { 2 } else { 1 };
+        let deadline = Instant::now() + (self.timeout + OUTPUT_WAIT) * runs + Duration::from_secs(1);
         info!("結束前先執行寫入設定後的外部指令（{}）", self.cmd);
         st.now = true;
         self.cv.notify_all();
@@ -440,6 +454,30 @@ mod tests {
         h.flush();
         assert!(t.elapsed() < Duration::from_secs(5), "逾時就結束指令");
         assert_eq!(h.st.lock().unwrap().runs, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn background_child_holding_output_does_not_block() {
+        // 指令自己馬上結束，但留了一個拿著輸出管線的背景程式：1 秒左右就算跑完，之後的寫入照樣觸發
+        let d = tmp("bg");
+        let h = Arc::new(Hook::new(
+            "sleep 20 & echo ok".into(),
+            Duration::from_millis(10),
+            Duration::from_secs(10),
+        ));
+        *h.dirs.lock().unwrap() = (vec![abs(&d.join("conf")).unwrap()], vec![]);
+        std::fs::write(d.join("conf/x"), "x").unwrap();
+        h.touch(&d.join("conf/x"));
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        h.flush();
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        assert_eq!(h.st.lock().unwrap().runs, 1);
+        h.touch(&d.join("conf/x"));
+        std::thread::sleep(Duration::from_millis(50));
+        h.flush();
+        assert_eq!(h.st.lock().unwrap().runs, 2);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

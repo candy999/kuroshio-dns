@@ -170,6 +170,17 @@ async fn dot_and_doh_serve_queries() {
     let u = Upstream::parse(&format!("tls://{dot}")).unwrap();
     let resp = u.exchange(&pq.encode(), Duration::from_secs(3)).await.unwrap();
     assert_eq!(resp.len() % 468, 0, "回應長度 {}", resp.len());
+
+    // DoT：送了長度、內容一直不送 → 10 秒後關掉連線（不會一直佔著連線名額）
+    let mut slow = kuroshio::tls::connect_addrs("127.0.0.1", &[dot], &[b"dot"], Duration::from_secs(3))
+        .await
+        .unwrap();
+    slow.write_all(&[0, 40, 0, 1]).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let mut buf = [0u8; 16];
+    let r = tokio::time::timeout(Duration::from_secs(20), slow.read(&mut buf)).await;
+    assert!(matches!(r, Ok(Ok(0)) | Ok(Err(_))), "伺服器關閉連線：{r:?}");
+    assert!(t0.elapsed() >= Duration::from_secs(8), "{:?}", t0.elapsed());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -195,7 +206,9 @@ async fn plain_http_doh_behind_proxy() {
         "admin": { "port": 0, "auth": false }, "filter": { "enabled": false },
         "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 }, "doh": { "enabled": true, "host": "127.0.0.1", "port": 0, "cert": "", "key": "", "trustProxy": true } },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false }
+        "resolver": { "lastResort": [], "rankIps": false },
+        // 測試環境沒有台灣 IP 資料：資料讀不到時公網來源（X-Forwarded-For 203.0.113.9）會被擋，這裡測的是轉發
+        "access": { "mode": "open" }
     }));
     let started = kuroshio::app::start(&cfg).await.unwrap();
     let doh = started.encrypted.doh.unwrap();
@@ -211,7 +224,7 @@ async fn plain_http_doh_behind_proxy() {
     let mut out = Vec::new();
     s.read_to_end(&mut out).await.unwrap();
     let p = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-    assert!(out.starts_with(b"HTTP/1.1 200"));
+    assert!(out.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&out[..p]));
     assert_eq!(Message::parse(&out[p..]).unwrap().id, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -565,10 +565,14 @@ fn read_domains(state: &Path) -> Option<Value> {
     kuroshio_cdn::db::read_store_json(state).and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-/// 匯入合併後的網域資料庫寫成單一檔案（服務啟動時再搬進分片）：先拿掉分片清單、寫好再刪分片
+/// 匯入合併後的網域資料庫寫成單一檔案（服務啟動時再搬進分片）：先拿掉分片清單、寫好再刪分片。
+/// 壓縮後再寫（這份可能有好幾 MB，Flash 上省空間也省寫入量）
 fn write_domains(state: &Path, v: &Value) -> Result<()> {
+    let p = state.join(DOMAINS);
+    let z = statefile::compress(&serde_json::to_vec(v)?);
     kuroshio_cdn::db::retire_shards(state);
-    write_json(&state.join(DOMAINS), v)?;
+    write_atomic(&statefile::zst_path(&p), &z).with_context(|| format!("寫入 {} 失敗", p.display()))?;
+    let _ = std::fs::remove_file(&p);
     kuroshio_cdn::db::remove_shards(state);
     Ok(())
 }
@@ -1123,7 +1127,8 @@ pub fn merge(loc: &Locations, b: &Bundle) -> Value {
             let Some(d) = b.files.get(key) else { continue };
             let mut it = Item::new(key);
             let p = path(key);
-            if p.exists() {
+            // 本機的檔可能是壓縮過的（.zst）：用 statefile::exists 兩種都看
+            if statefile::exists(&p) {
                 it.kept = 1;
                 it.note = Some("本機已經有，沒有覆蓋".into());
             } else {
@@ -1252,15 +1257,35 @@ pub fn preview_text(p: &Value) -> String {
     out.join("\n")
 }
 
-/// 管理 API 收到的檔案：檢查後放到 `import-pending.kuroshio`，等服務重新啟動時合併；回傳預覽
+/// 管理 API 收到的檔案：檢查後放到 `import-pending.kuroshio`，等服務重新啟動時合併；回傳預覽。
+/// 會解壓縮與寫檔：從 async 的處理函式呼叫時要放在 `spawn_blocking` 裡
 pub fn stage_pending(loc: &Locations, bytes: &[u8]) -> Result<Value> {
     let b = Bundle::decode(bytes)?;
     let p = loc.pending_file();
+    // 狀態目錄放得下嗎（暫存檔 + 合併時的單一網域檔，抓兩倍）
+    if let Some(free) = crate::space::free_bytes(&loc.state) {
+        let need = bytes.len() as u64 * 2 + 256 * 1024;
+        if free < need {
+            anyhow::bail!(
+                "狀態目錄空間不足：剩 {} KB，匯入這個檔案大約需要 {} KB",
+                free / 1024,
+                need.div_ceil(1024)
+            );
+        }
+    }
     write_atomic(&p, bytes).with_context(|| format!("寫入 {} 失敗", p.display()))?;
     Ok(b.preview())
 }
 
-/// 啟動最前面：有等著合併的備份就合併（不管成功與否都刪掉，免得每次啟動都重來）
+/// 合併失敗時留下的備份檔（下次啟動不會再自動合併，使用者可以拿去重新匯入）
+pub fn failed_file(loc: &Locations) -> PathBuf {
+    let mut s = loc.pending_file().into_os_string();
+    s.push(".failed");
+    PathBuf::from(s)
+}
+
+/// 啟動最前面：有等著合併的備份就合併。合併完就刪掉（免得每次啟動都重來）；
+/// 有項目寫入失敗或檔案壞掉時改名成 `.failed` 留著，這次匯入的內容才不會整個不見
 pub fn apply_pending(loc: &Locations) -> Option<Value> {
     let p = loc.pending_file();
     let bytes = std::fs::read(&p).ok()?;
@@ -1278,7 +1303,13 @@ pub fn apply_pending(loc: &Locations) -> Option<Value> {
     if let Err(e) = write_json(&loc.last_file(), &report) {
         warn!("{e:#}");
     }
-    if let Err(e) = std::fs::remove_file(&p) {
+    if report["ok"] == false {
+        let f = failed_file(loc);
+        match std::fs::rename(&p, &f) {
+            Ok(()) => warn!("匯入有項目失敗：備份檔留在 {}，可以修正後重新匯入", f.display()),
+            Err(e) => warn!("無法保留匯入失敗的備份檔 {}：{e}", p.display()),
+        }
+    } else if let Err(e) = std::fs::remove_file(&p) {
         warn!("無法刪除 {}：{e}", p.display());
     }
     Some(report)
@@ -1761,7 +1792,11 @@ mod tests {
 
         // CDN 讀進來之後：這個網域是「還沒驗證」，不是「通過」
         let mut db = kuroshio_cdn::db::Db::new(1000);
-        db.load_domains(&std::fs::read(dst.join(DOMAINS)).unwrap(), false).unwrap();
+        db.load_domains(&statefile::read(&dst.join(DOMAINS)).unwrap(), false).unwrap();
+        assert!(
+            statefile::zst_path(&dst.join(DOMAINS)).exists() && !dst.join(DOMAINS).exists(),
+            "合併後的網域資料庫壓縮後寫入"
+        );
         let e = db.get("bank.example").unwrap();
         let v = e.verdict(4).unwrap();
         assert!(v.is("ok") && !v.valid(now_ms()) && v.ip.is_none() && v.ips.is_none());

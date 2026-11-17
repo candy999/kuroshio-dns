@@ -188,7 +188,12 @@ pub struct Identity {
 /// 寫私鑰與身分資料：暫存檔一建立就是 0600（先寫再 chmod 會有別人讀得到的空檔），不跟著別人放的符號連結走
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
+    // 暫存檔：主檔名加 .tmp（key.pem → key.pem.tmp），不同副檔名的檔案不會共用同一個暫存檔
+    let tmp = {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".tmp");
+        std::path::PathBuf::from(s)
+    };
     let _ = std::fs::remove_file(&tmp);
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -199,6 +204,11 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let _ = f.sync_all();
     drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("改名 {}", path.display()))?;
+    #[cfg(unix)]
+    if let Some(d) = path.parent().and_then(|d| std::fs::File::open(d).ok()) {
+        let _ = d.sync_all();
+    }
+    crate::notify_written(path);
     Ok(())
 }
 
@@ -395,7 +405,7 @@ mod tests {
         // 暫存檔的位置先被放了符號連結：不跟著寫出去
         let victim = dir.join("victim");
         std::fs::write(&victim, "v").unwrap();
-        std::os::unix::fs::symlink(&victim, dir.join("x.tmp")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("x.pem.tmp")).unwrap();
         write_atomic(&dir.join("x.pem"), b"secret").unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "v");
         assert_eq!(mode("x.pem"), 0o600);

@@ -259,7 +259,9 @@ pub fn doh_uses_tls(cfg: &Value, base: &std::path::Path) -> bool {
 async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path::Path) -> Encrypted {
     use crate::encrypted::{listen_doh, listen_doh3, listen_doq, listen_dot, CertStore, DohOptions, Limits};
     let mut out = Encrypted::default();
-    let limits = Limits::new(get(cfg, "system.maxTlsConnections").and_then(Value::as_u64).unwrap_or(2048) as usize);
+    // 每個來源的連線上限：auto（沒填）= 總上限的 1/8（8–64 條）；0 = 不限
+    let per_ip = kuroshio_config::num_or_auto(get(cfg, "system.maxTlsConnectionsPerIp")).map(|n| n as usize);
+    let limits = Limits::new(get(cfg, "system.maxTlsConnections").and_then(Value::as_u64).unwrap_or(2048) as usize).with_per_ip(per_ip);
     let mut stores: std::collections::HashMap<(PathBuf, PathBuf), Arc<CertStore>> = std::collections::HashMap::new();
     let mut store_for = |key: (PathBuf, PathBuf)| -> Arc<CertStore> {
         stores
@@ -362,7 +364,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             Some(pair) => {
                 let certs = store_for(pair);
                 for (i, a) in targets(&mut out, "doq", &hosts, port, true) {
-                    let r = listen_doq(a, certs.clone(), resolver.clone(), Limits::new(quic_max)).await;
+                    let r = listen_doq(a, certs.clone(), resolver.clone(), Limits::new(quic_max).with_per_ip(per_ip)).await;
                     if let Some(b) = done(&mut out, i, r) {
                         out.doq.get_or_insert(b);
                     }
@@ -430,7 +432,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
                             trust_proxy: false,
                             alt_svc: None,
                         };
-                        let r = listen_doh3(a, certs.clone(), resolver.clone(), o3, Limits::new(quic_max)).await;
+                        let r = listen_doh3(a, certs.clone(), resolver.clone(), o3, Limits::new(quic_max).with_per_ip(per_ip)).await;
                         if let Some(b) = done(&mut out, i, r) {
                             out.doh3.get_or_insert(b);
                         }
@@ -1259,10 +1261,15 @@ impl Started {
         if let Some(h) = &self.encrypted.httpsys {
             h.stop();
         }
-        match self.state.flush_now() {
-            Ok(n) if n > 0 => info!("關機前寫出 {n} 份快照"),
-            Ok(_) => {}
-            Err(e) => warn!("關機前寫出快照失敗：{e}"),
+        // 記下寫了幾份、多少、花多久：整合方可以依這個決定停止服務時要等多久
+        let t0 = Instant::now();
+        match self.state.flush_counted() {
+            Ok((n, bytes)) => info!(
+                "關機前寫出 {n} 份快照，{} KB，{} ms",
+                bytes.div_ceil(1024),
+                t0.elapsed().as_millis()
+            ),
+            Err(e) => warn!("關機前寫出快照有失敗的：{e}（{} ms）", t0.elapsed().as_millis()),
         }
     }
 }

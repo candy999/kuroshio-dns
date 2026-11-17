@@ -9,7 +9,8 @@
 //! 6. `access.mode`：`open` → 允許；`taiwan` → 全部台灣網段；`custom` → `access.groups` 勾選的群組
 //! 7. 其他 → 拒絕
 //!
-//! 台灣 IP 資料（`tw-ip.json`）讀不到或格式錯誤時「不擋」（fail open），在狀態裡顯示警告。
+//! 台灣 IP 資料（`tw-ip.json`）讀不到或格式錯誤時（3.3.2 起）：公網來源一律擋下（fail closed），
+//! 上面 1–5 照常允許（迴路、區網、好友、自訂允許），狀態與警告裡看得到。不讓資料檔壞掉時對外服務變成全球開放
 //!
 //! 查詢：建立時把所有網段合併成排序、不重疊的區間（IPv4 `u32`、IPv6 `u128`），每次連線二分搜尋。
 //! IPv4 對應的 IPv6（`::ffff:a.b.c.d`）當成 IPv4。
@@ -189,7 +190,7 @@ pub enum Reason {
     Friend,
     CustomAllow(String),
     Open,
-    /// 台灣 IP 資料讀不到：不擋
+    /// 台灣 IP 資料讀不到：公網來源擋下（fail closed）
     NoData,
     Group(String),
     NotAllowed,
@@ -205,7 +206,7 @@ impl Reason {
             Reason::Friend => "社群好友目前的 IP".into(),
             Reason::CustomAllow(c) => format!("自訂允許 {c}"),
             Reason::Open => "全開放模式".into(),
-            Reason::NoData => "台灣 IP 資料讀不到，暫時不擋".into(),
+            Reason::NoData => "台灣 IP 資料讀不到：公網來源暫時一律擋下".into(),
             Reason::Group(g) => format!("台灣網段：{g}"),
             Reason::NotAllowed => "不在允許的網段".into(),
         }
@@ -310,8 +311,8 @@ impl Rules {
             return true;
         }
         match &self.geo {
-            None => true, // open 模式，或資料讀不到（fail open）
             Some(g) => g.contains(ip),
+            None => self.mode == Mode::Open, // 資料讀不到：公網來源擋下（fail closed）
         }
     }
 
@@ -339,7 +340,7 @@ impl Rules {
         }
         match (&self.geo, self.mode) {
             (None, Mode::Open) => (true, Reason::Open),
-            (None, _) => (true, Reason::NoData),
+            (None, _) => (false, Reason::NoData),
             (Some(g), _) => {
                 // 屬於哪一組（不管有沒有勾選，方便說明）
                 let grp = self
@@ -655,7 +656,9 @@ impl Access {
             "active": self.settings.mode != Mode::Open || !self.settings.deny.is_empty(),
             "dataOk": self.data.read().unwrap().0.is_some(),
             "warning": self.data_error.read().unwrap().clone(),
-            "failOpen": self.settings.mode != Mode::Open && self.data.read().unwrap().0.is_none(),
+            // 資料讀不到時的處理：3.3.2 起擋下公網來源（failClosed）；failOpen 保留給舊的整合，永遠是 false
+            "failOpen": false,
+            "failClosed": self.settings.mode != Mode::Open && self.data.read().unwrap().0.is_none(),
             "generatedAt": self.data.read().unwrap().0.as_ref().map(|d| d.generated_at.clone()),
             "ranges": ranges,
             "memoryBytes": bytes,
@@ -1105,22 +1108,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_data_fails_open() {
-        let r = Rules::build(&st(json!({ "deny": ["9.9.9.9"] })), None, Dual::default(), Dual::default());
-        assert!(r.allows(ip("8.8.8.8")), "資料讀不到不擋");
+    fn missing_data_fails_closed() {
+        let r = Rules::build(
+            &st(json!({ "deny": ["9.9.9.9"], "allow": ["198.51.100.0/24"] })),
+            None,
+            Dual::default(),
+            Dual::default(),
+        );
+        assert!(!r.allows(ip("8.8.8.8")), "資料讀不到：公網來源擋下");
         assert!(!r.allows(ip("9.9.9.9")), "自訂封鎖照樣有效");
-        assert_eq!(r.explain(ip("8.8.8.8")), (true, Reason::NoData));
+        assert!(r.allows(ip("198.51.100.7")), "自訂允許照常");
+        assert!(r.allows(ip("192.168.1.5")), "區網照常");
+        assert_eq!(r.explain(ip("8.8.8.8")), (false, Reason::NoData));
+        // open 模式不受影響
+        let o = Rules::build(&st(json!({ "mode": "open" })), None, Dual::default(), Dual::default());
+        assert!(o.allows(ip("8.8.8.8")));
         let dir = std::env::temp_dir().join(format!("kuroshio-access-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("geo")).unwrap();
         let a = Access::from_cfg(&json!({}), &dir, None);
-        assert!(a.allow(Kind::Dot, ip("8.8.8.8")));
+        assert!(!a.allow(Kind::Dot, ip("8.8.8.8")));
         let s = a.status_json();
-        assert_eq!(s["failOpen"], json!(true));
+        assert_eq!(s["failClosed"], json!(true));
+        assert_eq!(s["failOpen"], json!(false));
         assert!(s["warning"].as_str().unwrap().contains("讀不到"));
         std::fs::write(dir.join("geo/tw-ip.json"), b"{broken").unwrap();
         let a = Access::from_cfg(&json!({}), &dir, None);
         assert!(a.status_json()["warning"].as_str().unwrap().contains("格式錯誤"));
-        assert!(a.allow(Kind::Dot, ip("8.8.8.8")));
+        assert!(!a.allow(Kind::Dot, ip("8.8.8.8")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

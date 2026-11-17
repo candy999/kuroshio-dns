@@ -116,12 +116,12 @@ const ACCESS = query => {
     }
     const groups = TWIP.groups.map(g => ({ id: g.id, name: g.name, note: g.note, asns: g.asns, size: g.size, cidrs: { v4: g.v4.length, v6: g.v6.length },
         enabled: mode !== 'open' && (mode === 'taiwan' || sel.includes('*') || sel.includes(g.id)), checked: sel.includes('*') || sel.includes(g.id) }));
-    return { mode, applyTo, active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt, ranges: 1003, memoryBytes: 16048, dataBytes: 21312,
+    return { mode, applyTo, active: true, dataOk: true, failOpen: false, failClosed: false, warning: null, generatedAt: TWIP.generatedAt, ranges: 1003, memoryBytes: 16048, dataBytes: 21312,
         denied: { total: 57, byListener: { dot: 40, doh: 17, doq: 0, doh3: 0, site: 0, community: 0, plain: 0 } },
         topDenied: [{ net: '45.135.232.0/24', count: 31 }, { net: '2a06:4880:1000::/48', count: 26 }],
         groups, selected: sel, allow: list(a.allow), deny: list(a.deny), log: a.log !== '0', localUpdate: a.local_update !== '0', dataSource: '/usr/share/kuroshio/geo/tw-ip.json', total: TWIP.total };
 };
-STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, warning: null, generatedAt: TWIP.generatedAt,
+STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, failClosed: false, warning: null, generatedAt: TWIP.generatedAt,
     ranges: 1003, memoryBytes: 16048, dataBytes: 21312, denied: { total: 57, byListener: { dot: 40, doh: 17 } }, topDenied: [] };
 // 好友邀請碼（假的）：重新產生換一個；貼上時 KRS1.MOCKGOOD 開頭當成成功，其他當成檢查碼不符
 // QR 碼：有 kuroshio 執行檔時借用 `kuroshio about --qr` 的真 QR 碼（內容是原始碼網址，只是讓畫面像實機），沒有就畫一個方塊

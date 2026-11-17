@@ -201,8 +201,8 @@ return view.extend({
 					'click': function(ev) { ev.preventDefault(); addTo(opt, net); } }, text);
 			};
 			return E('div', { 'id': 'kuroshio-access-status' }, [
-				acc.failOpen ? T('div', { 'class': 'alert-message danger', 'id': 'kuroshio-access-failopen' },
-					_('台灣 IP 資料讀不到，現在不擋任何來源（封鎖名單照樣有效）') + (acc.warning ? '：' + acc.warning : '')) :
+				acc.failClosed ? T('div', { 'class': 'alert-message danger', 'id': 'kuroshio-access-failopen' },
+					_('台灣 IP 資料讀不到：公網來源暫時一律擋下（區網、好友、自訂允許照常）') + (acc.warning ? '：' + acc.warning : '')) :
 					(acc.warning ? T('div', { 'class': 'alert-message warning' }, acc.warning) : ''),
 				kv(rows),
 				T('h4', { 'style': 'margin:.8em 0 .3em' }, _('被拒絕最多的網段')),

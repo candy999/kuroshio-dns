@@ -17,6 +17,7 @@
     "storageReservePercent": 0,
     "workerThreads": 0,
     "maxTlsConnections": "auto",
+    "maxTlsConnectionsPerIp": "auto",
     "maxQuicConnections": "auto",
     "queryLogRing": 20000,
     "memoryWatchdog": true,

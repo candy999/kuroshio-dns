@@ -706,6 +706,8 @@ impl Persister {
         // 有先後順序的（分片清單）放最後
         names.sort();
         let (mut n, mut bytes) = (0, 0u64);
+        // 一份寫失敗：放回待寫、繼續寫下一份（不讓後面的檔整輪都寫不到），最後回報第一個錯誤
+        let mut first_err: Option<std::io::Error> = None;
         for (_, name) in names {
             let (why, size, age) = {
                 let e = &self.entries[&name];
@@ -718,7 +720,7 @@ impl Persister {
                 if !deps_ok {
                     continue;
                 }
-                let size = Self::size_of(e);
+                let size = self.size_estimate(&name, e);
                 let age = now.saturating_sub(p.since);
                 let aged = age >= self.policy.max_age;
                 let due = e.written_at == 0 || now.saturating_sub(e.written_at) >= interval;
@@ -754,8 +756,10 @@ impl Persister {
             let (h, disk) = match r {
                 Ok(x) => x,
                 Err(e) => {
+                    warn!("寫入 {name} 失敗：{e}（留在記憶體，下次再試）");
                     self.entries.get_mut(&name).unwrap().pending = Some(pending);
-                    return Err(e);
+                    first_err.get_or_insert(e);
+                    continue;
                 }
             };
             // 另一種格式的舊檔（例如壓縮前的一般 JSON）：只遷移一次
@@ -786,7 +790,27 @@ impl Persister {
             n += 1;
             bytes += disk;
         }
-        Ok((n, bytes))
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok((n, bytes)),
+        }
+    }
+
+    /// 寫入前估計磁碟上的大小：串流內容第一次寫時還不知道大小，用同一個資料夾裡已寫過的檔
+    /// （例如其他網域分片）最大的那份估，都沒有就估 256 KB（不然空間檢查擋不住大檔）
+    fn size_estimate(&self, name: &str, e: &Entry) -> u64 {
+        let known = Self::size_of(e);
+        if known > 0 || !matches!(e.pending.as_ref().map(|p| &p.data), Some(Data::Stream(_))) {
+            return known;
+        }
+        let dir = name.rsplit_once('/').map_or("", |x| x.0);
+        self.entries
+            .iter()
+            .filter(|(k, _)| k.rsplit_once('/').map_or("", |x| x.0) == dir)
+            .map(|(_, x)| x.written_size)
+            .max()
+            .filter(|&x| x > 0)
+            .unwrap_or(256 * 1024)
     }
 
     /// 最久的未存變動（秒）
@@ -872,7 +896,8 @@ fn write_file(path: &Path, compress: bool, gen: &mut dyn FnMut(&mut dyn Write) -
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    // 暫存檔：主檔名後面加 .tmp（a.json → a.json.tmp）。不用 with_extension：a.json 和 a.txt 會共用同一個暫存檔
+    let tmp = tmp_path(path);
     let r = (|| {
         let mut o = std::fs::OpenOptions::new();
         o.write(true).create(true).truncate(true);
@@ -906,6 +931,8 @@ fn write_file(path: &Path, compress: bool, gen: &mut dyn FnMut(&mut dyn Write) -
     match r {
         Ok(out) => {
             std::fs::rename(&tmp, path)?;
+            // 改名要寫進資料夾才算數：斷電時才不會回到舊檔（或兩個都沒有）
+            sync_dir(path);
             // 設定目錄裡的檔案：排一次 KUROSHIO_ON_CONFIG_WRITE（沒設定時立刻回來）
             crate::confhook::touched(path);
             Ok(out)
@@ -915,6 +942,26 @@ fn write_file(path: &Path, compress: bool, gen: &mut dyn FnMut(&mut dyn Write) -
             Err(e)
         }
     }
+}
+
+/// 寫入用的暫存檔名
+pub fn tmp_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// 改名之後 fsync 所在資料夾（Unix；Windows 不支援開資料夾來 sync，改名本身已經寫進日誌）
+pub fn sync_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[cfg(test)]
@@ -936,14 +983,14 @@ mod tests {
         // 舊版留下、所有人可讀的檔案與暫存檔：重寫之後都收緊成 0600
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&f, b"old").unwrap();
-        std::fs::write(f.with_extension("tmp"), b"junk").unwrap();
-        for p in [&f, &f.with_extension("tmp")] {
+        std::fs::write(tmp_path(&f), b"junk").unwrap();
+        for p in [&f, &tmp_path(&f)] {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         write_atomic(&f, b"secret").unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"secret");
         assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(!f.with_extension("tmp").exists());
+        assert!(!tmp_path(&f).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -170,6 +170,21 @@ async fn login_secrets_and_upload_limits() {
     assert_eq!(code, 303);
     assert!(head.contains("httponly") && head.contains("samesite=strict"), "{head}");
 
+    // 一次性登入碼：要登入才拿得到；用過一次就失效
+    assert_eq!(http(admin, "POST", "/api/login-code", &[], b"").await.0, 401);
+    let (code, _, b) = http(admin, "POST", "/api/login-code", &auth, b"").await;
+    assert_eq!(code, 200);
+    let path = js(&b)["path"].as_str().unwrap().to_string();
+    assert!(path.starts_with("/login?code=") && !path.contains(&token));
+    let (code, head, _) = http(admin, "GET", &path, &[], b"").await;
+    assert_eq!(code, 303);
+    assert!(head.contains("set-cookie") && !head.contains("login=failed"), "{head}");
+    let (_, head, _) = http(admin, "GET", &path, &[], b"").await;
+    assert!(
+        head.contains("login=failed") && !head.contains("set-cookie"),
+        "登入碼只能用一次：{head}"
+    );
+
     // 讀設定：Token 換成遮罩，哪裡都看不到原本的值
     let (code, _, b) = http(admin, "GET", "/api/config", &auth, b"").await;
     assert_eq!(code, 200);

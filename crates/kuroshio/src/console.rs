@@ -11,8 +11,10 @@ use std::sync::Arc;
 /// 這一輪執行的網址與位置（設定重新載入後會換新的）
 #[derive(Debug, Clone, Default)]
 pub struct Info {
-    /// 設定頁（含登入 token 的網址；沒開管理 API 時 None）
+    /// 設定頁（要登入時是含一次性登入碼的網址；沒開管理 API 時 None）
     pub admin_url: Option<String>,
+    /// 拿不到登入碼時的說明（`kuroshio url` 而服務沒在執行）
+    pub login_note: Option<String>,
     /// 登入 token 檔的位置
     pub token_file: Option<String>,
     /// 公開頁網址（對外的網域優先，再來是本機）
@@ -154,6 +156,18 @@ impl Info {
     }
 }
 
+/// 設定頁網址：服務在這個程式裡跑、而且要登入時，每次產生新的一次性登入碼（舊的可能已經用掉或過期）
+pub fn fresh_admin_url(ctx: &Ctx) -> Option<String> {
+    let u = ctx.info.admin_url.as_ref()?;
+    match (&ctx.state, u.split_once("/login?code=")) {
+        (Some(st), Some((base, _))) => Some(match st.webui.new_login_code() {
+            Some(c) => format!("{base}/login?code={c}"),
+            None => format!("{base}/"),
+        }),
+        _ => Some(u.clone()),
+    }
+}
+
 /// 處理一行輸入，回傳要印出來的文字與要做的事
 pub fn handle(line: &str, ctx: Option<&Ctx>) -> (String, Action) {
     let cmd = line.trim().trim_start_matches('/').to_lowercase();
@@ -169,11 +183,25 @@ pub fn handle(line: &str, ctx: Option<&Ctx>) -> (String, Action) {
     let i = &ctx.info;
     let out = match cmd.as_str() {
         "help" | "?" | "h" | "說明" => HELP.to_string(),
-        "url" | "admin" | "設定" | "設定頁" => match &i.admin_url {
-            Some(u) => format!(
-                "設定頁：{u}\n（只有這台電腦能開；網址裡的 token 就是登入密碼，不要給別人{}）",
-                i.token_file.as_ref().map(|f| format!("。token 存在 {f}")).unwrap_or_default()
+        "url" | "admin" | "設定" | "設定頁" => match fresh_admin_url(ctx) {
+            Some(u) if u.contains("/login?code=") => format!(
+                "設定頁：{u}\n（只有這台電腦能開；網址裡是一次性登入碼，{} 分鐘內有效、只能用一次。要再拿一個就再輸入 url{}）",
+                crate::webui::LOGIN_CODE_TTL.as_secs() / 60,
+                i.token_file
+                    .as_ref()
+                    .map(|f| format!("。長期的登入 token 存在 {f}"))
+                    .unwrap_or_default()
             ),
+            Some(u) => {
+                let mut t = format!("設定頁：{u}");
+                if let Some(n) = &i.login_note {
+                    t.push_str(&format!(
+                        "\n（{n}{}）",
+                        i.token_file.as_ref().map(|f| format!("；token 存在 {f}")).unwrap_or_default()
+                    ));
+                }
+                t
+            }
             None => "管理 API 沒有開（admin.enabled = false）".into(),
         },
         "open" => match &i.admin_url {
@@ -448,7 +476,7 @@ mod tests {
     #[test]
     fn commands() {
         let c = ctx(Info {
-            admin_url: Some("http://127.0.0.1:8054/login?token=abc".into()),
+            admin_url: Some("http://127.0.0.1:8054/login?code=abc".into()),
             token_file: Some("C:\\ProgramData\\kuroshio\\admin.token".into()),
             site_urls: vec!["https://dns.example.net/".into()],
             detail_url: Some("https://dns.example.net/detail/".into()),
@@ -461,7 +489,7 @@ mod tests {
         assert!(out.contains("url") && out.contains("site") && act == Action::None);
         assert_eq!(handle(" ? ", Some(&c)).0, HELP);
         let (out, _) = handle("URL", Some(&c));
-        assert!(out.contains("http://127.0.0.1:8054/login?token=abc") && out.contains("admin.token"));
+        assert!(out.contains("http://127.0.0.1:8054/login?code=abc") && out.contains("admin.token") && out.contains("一次性"));
         let (out, _) = handle("site", Some(&c));
         assert!(out.contains("公開頁：https://dns.example.net/") && out.contains("詳細數據頁") && out.contains("DoT"));
         assert_eq!(handle("open", Some(&c)).1, Action::Open);

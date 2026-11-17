@@ -134,11 +134,60 @@ impl ResolvesServerCert for CertStore {
 /// 記憶體接近保留量時，加密連線最多幾條（每條約 30–60 KB）
 pub const LOW_MEMORY_CONNS: usize = 32;
 
-/// 連線數上限與記憶體壓力檢查
+/// DoT 一條連線同時處理中的查詢上限（滿了先不讀下一筆；對方只送不收時查詢不會無限堆積）
+pub const DOT_MAX_INFLIGHT: usize = 64;
+/// DoH（HTTP/2）一條連線同時幾個請求
+pub const DOH_MAX_STREAMS: u32 = 64;
+/// 讀一筆查詢的內容、HTTP 標頭最多等多久（送了開頭就不送完的連線不會一直佔著）
+pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 每個來源的連線上限（`system.maxTlsConnectionsPerIp` 是 auto 時）：總上限的 1/8，8–64 條
+pub fn per_ip_default(max: usize) -> usize {
+    (max / 8).clamp(8, 64)
+}
+
+/// 每個來源算一份的鍵：IPv4 用位址；IPv6 用前 64 位元（同一個用戶通常拿到整段 /64）
+fn source_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut o = v6.octets();
+                o[8..].fill(0);
+                IpAddr::V6(o.into())
+            }
+        },
+        v4 => v4,
+    }
+}
+
+/// 連線數上限（總數與每個來源）與記憶體壓力檢查
 #[derive(Clone)]
 pub struct Limits {
     pub conns: Arc<Semaphore>,
     max: usize,
+    per_ip: usize,
+    by_ip: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+}
+
+/// 一條連線佔的名額：結束（drop）時歸還總數與這個來源的計數
+pub struct Permit {
+    _conn: tokio::sync::OwnedSemaphorePermit,
+    src: Option<(IpAddr, Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>)>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if let Some((ip, m)) = self.src.take() {
+            let mut m = m.lock().unwrap();
+            if let Some(n) = m.get_mut(&ip) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&ip);
+                }
+            }
+        }
+    }
 }
 
 impl Limits {
@@ -146,8 +195,40 @@ impl Limits {
         Limits {
             conns: Arc::new(Semaphore::new(max.max(1))),
             max: max.max(1),
+            per_ip: per_ip_default(max.max(1)),
+            by_ip: Default::default(),
         }
     }
+
+    /// 每個來源最多幾條（0 = 不限）
+    pub fn with_per_ip(mut self, n: Option<usize>) -> Limits {
+        if let Some(n) = n {
+            self.per_ip = n;
+        }
+        self
+    }
+
+    /// 新連線：總數、記憶體、這個來源的連線數都還有空間才收。本機（反向代理）不算每個來源的上限
+    pub(crate) fn admit_from(&self, ip: IpAddr) -> Option<Permit> {
+        let conn = self.admit()?;
+        if self.per_ip == 0 || ip.is_loopback() {
+            return Some(Permit { _conn: conn, src: None });
+        }
+        let key = source_key(ip);
+        {
+            let mut m = self.by_ip.lock().unwrap();
+            let n = m.entry(key).or_insert(0);
+            if *n >= self.per_ip {
+                return None;
+            }
+            *n += 1;
+        }
+        Some(Permit {
+            _conn: conn,
+            src: Some((key, self.by_ip.clone())),
+        })
+    }
+
     pub(crate) fn admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         use crate::sysinfo::Pressure;
         match crate::app::pressure() {
@@ -179,8 +260,8 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
             if !crate::ipfilter::accept_dot(&resolver, peer.ip()) {
                 continue; // 存取控制：直接關閉，不做 TLS 握手
             }
-            let Some(permit) = limits.admit() else {
-                debug!("DoT 連線數已滿或記憶體不足，拒絕 {peer}");
+            let Some(permit) = limits.admit_from(peer.ip()) else {
+                debug!("DoT 連線數已滿（總數或這個來源）或記憶體不足，拒絕 {peer}");
                 continue;
             };
             if !certs.ready() {
@@ -213,28 +294,43 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
 async fn dot_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(s: S, client: IpAddr, r: Arc<Resolver>) {
     let (mut rd, mut wr) = tokio::io::split(s);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-    // 寫出端：回應完成一筆寫一筆（不必照查詢順序）
+    // 寫出端：回應完成一筆寫一筆（不必照查詢順序）。對方 30 秒都不收就關掉連線
     let writer = tokio::spawn(async move {
         while let Some(resp) = rx.recv().await {
             let mut frame = (resp.len() as u16).to_be_bytes().to_vec();
             frame.extend_from_slice(&resp);
-            if wr.write_all(&frame).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(30), wr.write_all(&frame)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
-        let _ = wr.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), wr.shutdown()).await;
     });
+    let inflight = Arc::new(Semaphore::new(DOT_MAX_INFLIGHT));
     loop {
-        let len = match tokio::time::timeout(Duration::from_secs(30), rd.read_u16()).await {
+        // 處理中的查詢滿了：等回應送出再讀下一筆（30 秒都沒空出來 = 對方不收回應，關掉）
+        let Ok(Ok(slot)) = tokio::time::timeout(Duration::from_secs(30), inflight.clone().acquire_owned()).await else {
+            break;
+        };
+        // 閒置多久關閉：記憶體吃緊時縮短，把閒著的連線還回來
+        let idle = if crate::app::pressure() == crate::sysinfo::Pressure::Normal {
+            30
+        } else {
+            5
+        };
+        let len = match tokio::time::timeout(Duration::from_secs(idle), rd.read_u16()).await {
             Ok(Ok(l)) if l >= 12 => l as usize,
             _ => break,
         };
         let mut q = vec![0u8; len];
-        if rd.read_exact(&mut q).await.is_err() {
+        if !matches!(tokio::time::timeout(READ_TIMEOUT, rd.read_exact(&mut q)).await, Ok(Ok(_))) {
             break;
         }
         let (r, tx) = (r.clone(), tx.clone());
         tokio::spawn(async move {
+            let _slot = slot;
             let ctx = Ctx { proto: "dot", client };
             if let Some(resp) = r.handle(&q, &ctx).await {
                 let _ = tx.send(resp).await;
@@ -475,7 +571,7 @@ pub async fn listen_doh(
             if !crate::ipfilter::accept_doh(&resolver, peer.ip()) {
                 continue; // 存取控制：直接關閉，不做 TLS 握手
             }
-            let Some(permit) = limits.admit() else { continue };
+            let Some(permit) = limits.admit_from(peer.ip()) else { continue };
             if certs.as_ref().map(|c| !c.ready()).unwrap_or(false) {
                 continue;
             }
@@ -487,7 +583,18 @@ pub async fn listen_doh(
                     let (r, o) = (r.clone(), o.clone());
                     async move { Ok::<_, std::convert::Infallible>(handle_doh(req, peer.ip(), r, o).await) }
                 });
-                let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                // 標頭要在 10 秒內送完；HTTP/2 每條連線最多 64 個同時進行的請求，定時 ping 清掉斷線的
+                builder
+                    .http1()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(READ_TIMEOUT);
+                builder
+                    .http2()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .max_concurrent_streams(DOH_MAX_STREAMS)
+                    .keep_alive_interval(Duration::from_secs(30))
+                    .keep_alive_timeout(Duration::from_secs(10));
                 let res = match acc {
                     Some(acc) => match tokio::time::timeout(Duration::from_secs(10), acc.accept(tcp)).await {
                         Ok(Ok(s)) => builder.serve_connection(hyper_util::rt::TokioIo::new(s), svc).await,
@@ -554,7 +661,7 @@ pub async fn listen_doq(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
                 incoming.ignore(); // 存取控制：不回任何封包
                 continue;
             }
-            let Some(permit) = limits.admit() else {
+            let Some(permit) = limits.admit_from(incoming.remote_address().ip()) else {
                 incoming.refuse();
                 continue;
             };
@@ -620,7 +727,7 @@ pub async fn listen_doh3(
                 incoming.ignore(); // 存取控制：不回任何封包
                 continue;
             }
-            let Some(permit) = limits.admit() else {
+            let Some(permit) = limits.admit_from(incoming.remote_address().ip()) else {
                 incoming.refuse();
                 continue;
             };
@@ -686,6 +793,38 @@ pub fn parse_forwarded_ip(v: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_source_connection_limit() {
+        let l = Limits::new(64).with_per_ip(Some(2));
+        let a: IpAddr = "203.0.113.5".parse().unwrap();
+        let p1 = l.admit_from(a).unwrap();
+        let _p2 = l.admit_from(a).unwrap();
+        assert!(l.admit_from(a).is_none(), "同一個來源超過上限");
+        assert!(l.admit_from("203.0.113.6".parse().unwrap()).is_some(), "別的來源不受影響");
+        // 同一段 /64 的 IPv6 算同一個來源；IPv4-mapped 跟 IPv4 一樣
+        let v6a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let v6b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let _q1 = l.admit_from(v6a).unwrap();
+        let _q2 = l.admit_from(v6b).unwrap();
+        assert!(l.admit_from("2001:db8:1:2::77".parse().unwrap()).is_none());
+        assert!(l.admit_from("2001:db8:1:3::1".parse().unwrap()).is_some());
+        assert!(l.admit_from("::ffff:203.0.113.5".parse().unwrap()).is_none());
+        // 本機（反向代理）不算
+        for _ in 0..5 {
+            std::mem::forget(l.admit_from("127.0.0.1".parse().unwrap()).unwrap());
+        }
+        // 連線結束就還回來
+        drop(p1);
+        assert!(l.admit_from(a).is_some());
+        assert_eq!(per_ip_default(128), 16);
+        assert_eq!(per_ip_default(2048), 64);
+        assert_eq!(per_ip_default(32), 8);
+        // 0 = 不限
+        let u = Limits::new(64).with_per_ip(Some(0));
+        let held: Vec<_> = (0..10).map(|_| u.admit_from(a).unwrap()).collect();
+        assert_eq!(held.len(), 10);
+    }
 
     #[test]
     fn b64url() {

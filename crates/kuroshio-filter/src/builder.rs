@@ -390,6 +390,12 @@ impl<'b> SourceWriter<'b> {
         st.badfilter = 0;
     }
 
+    /// 目前為止收進來的規則數（網域 + 複雜規則；最後一段沒有換行結尾的還沒算）
+    pub fn rules(&self) -> u64 {
+        let st = &self.b.sources[self.source];
+        st.domain_rules + st.complex_rules
+    }
+
     /// 結束這個來源，回傳它在 [`FilterStats::sources`] 的索引
     pub fn end(mut self) -> usize {
         self.finish_source();

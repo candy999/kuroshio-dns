@@ -477,7 +477,11 @@ pub async fn serve(
     let mut use_good = false;
     // 剛把 JSON 設定檔改回上一份：下一輪讀到的是舊內容，失敗原因要留著
     let mut restored = false;
-    loop {
+    // 收到停止（SIGTERM、Ctrl+C、quit）：這一輪結束後不再重新啟動。`stop` 只能等一次（完成後不能再 poll）
+    let mut stopping = false;
+    // 服務還在啟動時收到的 SIGHUP / reload：啟動完成後補做一次
+    let mut pending_reload = false;
+    let outcome: Result<()> = 'run: loop {
         let current = if uci { None } else { std::fs::read(&config).ok() };
         // 每一輪（設定頁存檔後重新載入）都在自己的執行環境裡跑：結束時所有工作與監聽一起關掉
         let loaded = if use_good {
@@ -497,7 +501,7 @@ pub async fn serve(
                 fallback = true;
                 (good.clone(), SysInfo::detect(), Vec::new())
             }
-            (Err(e), None) => return Err(e),
+            (Err(e), None) => break 'run Err(e),
         };
         let this_cfg = cfg.clone();
         // 從設定檔正常讀進來：先清掉上一次的失敗紀錄（這一輪啟動失敗會再記上；用上一份設定頂著跑的那一輪不清）
@@ -536,17 +540,31 @@ pub async fn serve(
         let mut stop_tx = Some(stop_tx);
         let result = loop {
             tokio::select! {
-                _ = &mut stop => {
+                _ = &mut stop, if !stopping => {
+                    stopping = true;
                     if let Some(t) = stop_tx.take() {
                         let _ = t.send(());
                     }
                     break (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false);
                 }
                 r = &mut done_rx => break r.unwrap_or(Ok(false)),
+                // 啟動中收到的重新載入：每半秒看一次啟動完成了沒
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)), if pending_reload => {
+                    let state = console.lock().unwrap().as_ref().and_then(|c| c.state.clone());
+                    if let Some(st) = state {
+                        info!("啟動完成：補做啟動期間收到的重新載入");
+                        pending_reload = false;
+                        st.reload.notify_one();
+                    }
+                }
                 sig = signals.next() => {
                     let state = console.lock().unwrap().as_ref().and_then(|c| c.state.clone());
                     match (sig, state) {
-                        (_, None) => info!("收到 {}：服務還在啟動，略過", sig.name()),
+                        (Sig::Reload, None) => {
+                            info!("收到 SIGHUP：服務還在啟動，啟動完成後重新載入");
+                            pending_reload = true;
+                        }
+                        (Sig::Flush, None) => info!("收到 SIGUSR1：服務還在啟動，還沒有快照可以寫"),
                         (Sig::Reload, Some(st)) => {
                             info!("收到 SIGHUP：重新載入設定");
                             st.reload.notify_one();
@@ -565,7 +583,7 @@ pub async fn serve(
                         (
                             out,
                             act,
-                            g.as_ref().and_then(|c| c.info.admin_url.clone()),
+                            g.as_ref().and_then(kuroshio::console::fresh_admin_url),
                             g.as_ref().and_then(|c| c.state.as_ref().map(|s| s.reload.clone())),
                         )
                     };
@@ -574,16 +592,16 @@ pub async fn serve(
                     }
                     match act {
                         Action::Quit => {
+                            stopping = true;
                             if let Some(t) = stop_tx.take() {
                                 let _ = t.send(());
                             }
                             break (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false);
                         }
-                        Action::Reload => {
-                            if let Some(r) = reload {
-                                r.notify_one();
-                            }
-                        }
+                        Action::Reload => match reload {
+                            Some(r) => r.notify_one(),
+                            None => pending_reload = true,
+                        },
                         Action::Open => {
                             if let Some(u) = url {
                                 if !kuroshio::console::open_browser(&u) {
@@ -598,17 +616,34 @@ pub async fn serve(
         };
         let reload = match result {
             Ok(r) => {
-                last_good = current;
+                // 用上一份設定頂著跑的那一輪：設定檔還是讀不進來的那份，不能記成「可以用」
+                if !fallback {
+                    last_good = current;
+                }
                 good_cfg = Some(this_cfg);
                 r
+            }
+            // 已經要停止：這一輪的錯誤記下來就結束，不再用舊設定重開
+            Err(e) if stopping => {
+                tracing::error!("停止時發生錯誤：{e:#}");
+                false
             }
             Err(e) => match (&last_good, &current, &good_cfg) {
                 // JSON 設定檔：改回上一份可以用的內容（設定頁看到的也是舊的）
                 (Some(good), cur, _) if cur.as_ref() != Some(good) => {
                     tracing::error!("新設定無法啟動：{e:#}；改回上一份可以用的設定");
                     kuroshio::integration::set_reload_error(Some(format!("{e:#}")));
-                    kuroshio::persist::write_atomic(&config, good)?;
-                    restored = true;
+                    match kuroshio::persist::write_atomic(&config, good) {
+                        Ok(()) => restored = true,
+                        // 改不回去（例如 Flash 唯讀）：不結束，用記在記憶體裡的上一份設定繼續跑
+                        Err(w) => {
+                            tracing::error!("設定檔改不回上一份：{w:#}；用記在記憶體裡的上一份設定繼續跑");
+                            match &good_cfg {
+                                Some(_) => use_good = true,
+                                None => break 'run Err(e),
+                            }
+                        }
+                    }
                     true
                 }
                 // UCI（沒有檔案可以改回去）：用記在記憶體裡的上一份設定重新啟動
@@ -618,19 +653,21 @@ pub async fn serve(
                     use_good = true;
                     true
                 }
-                _ => return Err(e),
+                _ => break 'run Err(e),
             },
         };
-        if !reload {
-            break;
+        if !reload || stopping {
+            break 'run Ok(());
         }
         info!("重新載入（設定變更或匯入備份）");
         first = false;
-    }
-    // 還在等待合併的「寫入設定後的外部指令」：結束前先跑完（例如 Padavan 存進 Flash）
+    };
+    // 還在等待合併的「寫入設定後的外部指令」：結束前先跑完（例如 Padavan 存進 Flash）；啟動失敗也一樣
     kuroshio::confhook::flush();
-    info!("結束");
-    Ok(())
+    if outcome.is_ok() {
+        info!("結束");
+    }
+    outcome
 }
 
 /// 把黑潮 DNS 的憑證匯入 Windows 憑證存放區並綁到 IIS 站台。`soft`：憑證還沒準備好時只提示，不當成錯誤
@@ -692,8 +729,9 @@ fn console_info(
             let ui = kuroshio::webui::WebUi::peek(cfg, &base);
             let admin = get(cfg, "admin.enabled").and_then(|v| v.as_bool()).unwrap_or(true);
             (
+                // 要登入：網址不放長期的 token，`kuroshio url` 會再向執行中的服務換一次性登入碼
                 admin.then(|| match (&ui.0, &ui.1) {
-                    (Some(t), _) => format!("http://127.0.0.1:{}/login?token={t}", n("admin.port", 8054)),
+                    (Some(_), _) => format!("http://127.0.0.1:{}/", n("admin.port", 8054)),
                     // 要登入但 token 還沒產生：服務還沒啟動過
                     (None, Some(_)) => format!("http://127.0.0.1:{}/（登入 token 會在服務第一次啟動時產生）", n("admin.port", 8054)),
                     (None, None) => format!("http://127.0.0.1:{}/", n("admin.port", 8054)),
@@ -744,6 +782,8 @@ async fn generation(
         let watch: Vec<&std::path::Path> = dirs.iter().map(PathBuf::as_path).collect();
         let runtime = kuroshio::app::runtime_dir(&cfg);
         kuroshio::confhook::configure(&watch, &[&state, &runtime]);
+        // 社群模組自己寫金鑰、身分、邀請：寫完也要排一次外部指令
+        kuroshio_community::set_on_write(kuroshio::confhook::touched);
     }
     let started = kuroshio::app::start(&cfg).await?;
     let ui = &started.state.webui;
@@ -1029,8 +1069,9 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
                 if v["ok"] != true {
                     std::process::exit(1);
                 }
-            } else {
-                r?;
+            } else if r?["ok"] == false {
+                // 部分項目寫入失敗：結束碼非 0（整合方的腳本才知道要重試）
+                std::process::exit(1);
             }
         }
         Cmd::Dnr { lan, config, uci } => {
@@ -1040,7 +1081,26 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
         }
         Cmd::Url { config, uci, open } => {
             let (cfg, ..) = effective(&config, uci)?;
-            let info = console_info(&cfg, (!uci).then_some(config.as_path()), None);
+            let mut info = console_info(&cfg, (!uci).then_some(config.as_path()), None);
+            // 要登入：向執行中的服務換一次性登入碼（用 token 檔驗證），網址裡不放 token
+            let base = kuroshio::app::persist_dir(&cfg).parent().map(PathBuf::from).unwrap_or_default();
+            if kuroshio::webui::WebUi::peek(&cfg, &base).0.is_some() {
+                if let (Some(ep), Some(u)) = (admin_endpoint(&cfg), info.admin_url.clone()) {
+                    let r = admin_call(&ep, "POST", "/api/login-code", Some(b""), std::time::Duration::from_secs(3)).await;
+                    match r {
+                        Ok((200, b)) => {
+                            let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+                            if let Some(p) = v["path"].as_str() {
+                                info.admin_url = Some(format!("{}{p}", u.trim_end_matches('/')));
+                            }
+                        }
+                        _ => {
+                            info.login_note =
+                                Some("服務沒有在執行：啟動後再執行 kuroshio url 拿登入網址，或打開設定頁後貼上 token 檔裡的內容".into())
+                        }
+                    }
+                }
+            }
             let ctx = kuroshio::console::Ctx { info, state: None };
             println!("{}", kuroshio::console::handle("url", Some(&ctx)).0);
             println!("{}", kuroshio::console::handle("site", Some(&ctx)).0);
@@ -1728,15 +1788,6 @@ enum Sig {
     Reload,
     /// SIGUSR1：立刻寫出快照（不結束）
     Flush,
-}
-
-impl Sig {
-    fn name(self) -> &'static str {
-        match self {
-            Sig::Reload => "SIGHUP",
-            Sig::Flush => "SIGUSR1",
-        }
-    }
 }
 
 struct Signals {

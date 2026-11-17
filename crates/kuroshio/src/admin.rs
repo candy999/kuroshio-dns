@@ -199,7 +199,16 @@ async fn read_chunked(s: &mut TcpStream, mut raw: Vec<u8>, max: usize, deadline:
     }
 }
 
-/// 讀一個 HTTP/1.1 請求（標頭最多 16 KB、內容最多 1 MB；已登入的匯入備份最多 64 MB）
+/// 大檔匯入同時只收一個（沒有登入機制的平台上，本機任何程式都能送；不讓幾個 64 MB 同時進記憶體）
+static IMPORT_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// 這次匯入最多收多大：64 MB，但不超過目前可用記憶體的 1/4（解壓縮與合併還要再用到記憶體）
+fn import_limit() -> usize {
+    let avail = crate::sysinfo::mem_bytes().1.map_or(usize::MAX, |a| (a / 4) as usize);
+    crate::backup::MAX_BYTES.min(avail.max(1 << 20))
+}
+
+/// 讀一個 HTTP/1.1 請求（標頭最多 16 KB、內容最多 1 MB；已登入的匯入備份最多 64 MB，同時只收一個）
 async fn read_req(s: &mut TcpStream, ui: &crate::webui::WebUi) -> anyhow::Result<Option<Req>> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 16384];
@@ -234,9 +243,15 @@ async fn read_req(s: &mut TcpStream, ui: &crate::webui::WebUi) -> anyhow::Result
     (req.path, req.query) = (path.to_string(), query.to_string());
     let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
     // 大檔案只收「會被處理的」：已登入、本機來源的匯入。沒登入的人不能讓服務先收下 64 MB 再回 401
+    let mut _slot = None;
     let max = if req.path == IMPORT_PATH && req.method == "POST" && req.same_origin() && ui.authorized(&req) {
         deadline += Duration::from_secs(50);
-        crate::backup::MAX_BYTES
+        _slot = Some(IMPORT_SLOT.try_acquire().map_err(|_| anyhow::anyhow!("已經有一個匯入正在上傳"))?);
+        let lim = import_limit();
+        if len > lim {
+            anyhow::bail!("檔案太大：目前可用記憶體只夠收 {} MB", lim >> 20);
+        }
+        lim
     } else {
         1 << 20
     };
@@ -381,8 +396,10 @@ async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
             if !ui.auth_enabled() {
                 return Out::redirect("/", None);
             }
-            match q.get("token") {
-                Some(t) if ui.check_token(t) => {
+            // 一次性登入碼（印給人點的網址）或 token（登入頁貼上、舊的網址）
+            let good = q.get("code").is_some_and(|c| ui.take_login_code(c)) || q.get("token").is_some_and(|t| ui.check_token(t));
+            match good {
+                true => {
                     let sid = ui.new_session();
                     Out::redirect(
                         "/",
@@ -422,6 +439,14 @@ async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
             }
             match (m, p) {
                 ("GET", "/api/config") | ("PUT", "/api/config") => Out::from_response(config_api(st, req)),
+                // 一次性登入碼（`kuroshio url` 用 token 換一個，印出不含 token 的網址）
+                ("POST", "/api/login-code") => match ui.new_login_code() {
+                    Some(c) => Out::json(
+                        200,
+                        &json!({ "code": c, "path": format!("/login?code={c}"), "expiresIn": crate::webui::LOGIN_CODE_TTL.as_secs() }),
+                    ),
+                    None => Out::from_response(bad("這個平台不需要登入（admin.auth 關閉）", 404)),
+                },
                 ("GET", "/api/backup/export") => backup_export(st, req).await,
                 ("POST", IMPORT_PATH) => Out::from_response(backup_import(st, req).await),
                 ("GET", "/api/log") => {
@@ -544,9 +569,12 @@ async fn backup_import(st: &Arc<AppState>, req: &Req) -> Response {
     if req.body.is_empty() {
         return bad("沒有收到檔案", 400);
     }
-    let preview = match crate::backup::stage_pending(&st.backup, &req.body) {
-        Ok(p) => p,
-        Err(e) => return bad(&format!("{e:#}"), 400),
+    // 解壓縮檢查與寫檔是同步的工作：放到 blocking 執行緒，不卡住其他請求
+    let (loc, body) = (st.backup.clone(), req.body.clone());
+    let preview = match tokio::task::spawn_blocking(move || crate::backup::stage_pending(&loc, &body)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return bad(&format!("{e:#}"), 400),
+        Err(e) => return bad(&format!("{e}"), 500),
     };
     info!("收到{}，重新載入後合併", preview["kindLabel"].as_str().unwrap_or("備份"));
     let r = st.reload.clone();
@@ -586,7 +614,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             let filter = r.filter.read().unwrap().as_ref().map(|f| f.stats()).unwrap_or(Value::Null);
             let data = crate::manifest::check(&crate::app::share_dir(&st.cfg));
             let synced = crate::clock::synced();
-            let warnings = crate::integration::warnings(&data, synced, crate::app::pressure(), &filter);
+            let access = r.access.get().map(|a| a.status_json()).unwrap_or(Value::Null);
+            let warnings = crate::integration::warnings(&data, synced, crate::app::pressure(), &filter, &access);
             ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
@@ -620,7 +649,7 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "listenersDetail": st.encrypted.detail_json(),
                 "dohMode": st.encrypted.doh_mode,
                 "doh3Provider": st.encrypted.doh3_provider,
-                "access": r.access.get().map(|a| a.status_json()),
+                "access": access,
             }))
         }
         // 來源 IP 存取控制（規格 08）；?ip= 說明這個 IP 的判斷結果
