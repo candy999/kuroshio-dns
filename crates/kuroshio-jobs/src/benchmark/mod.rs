@@ -170,16 +170,41 @@ impl Benchmark {
 
     /// 跑一次評測；成功時回傳寫進 upstreams.json 的內容
     pub async fn run(&self, ctx: &JobCtx) -> Result<Value> {
-        let mut cache = AsnCache::load(&self.paths);
-        let r = self.run_inner(ctx, &mut cache).await;
-        *self.progress.lock().unwrap() = None;
+        let mut g = RunGuard {
+            progress: self.progress.clone(),
+            cache: AsnCache::load(&self.paths),
+            cache_file: self.paths.out_root.as_ref().map(|r| r.join("cidr_cache.json")),
+            finished: false,
+        };
+        let r = self.run_inner(ctx, &mut g.cache).await;
+        g.finished = true;
+        r
+    }
+}
+
+/// 一次評測的收尾：正常結束、出錯、被排程逾時強制結束（future 被丟掉）都會經過這裡的 `Drop`。
+/// 清掉進度（`/api/jobs` 才不會一直顯示執行中）、存 ASN 快取（同步寫檔）
+struct RunGuard {
+    progress: Arc<Mutex<Option<Value>>>,
+    cache: AsnCache,
+    cache_file: Option<PathBuf>,
+    /// `run_inner` 有跑完（沒有被丟掉）
+    finished: bool,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        // 工作 panic 時鎖可能中毒：照樣清掉（在 Drop 裡再 panic 會直接中止整個行程）
+        *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if !self.finished {
+            warn!("[{JOB_NAME}] 評測被強制結束：已清掉進度，已經查到的 ASN 快取與可疑 DNS 紀錄照樣存檔");
+        }
         // 2.x 每查到新的就寫一次（一天可能寫上百次 340 KB）；這裡只在結束時寫一次
-        if let (Some(root), true) = (&self.paths.out_root, cache.dirty) {
-            if let Err(e) = cache.save(&root.join("cidr_cache.json")) {
+        if let (Some(f), true) = (&self.cache_file, self.cache.dirty) {
+            if let Err(e) = self.cache.save(f) {
                 warn!("ASN 快取寫入失敗：{e}");
             }
         }
-        r
     }
 }
 
@@ -586,12 +611,22 @@ impl Strikes {
         }
         days.len()
     }
-    fn save(&self) {
+    /// 有變動才寫（同步寫檔）；寫過（不論成敗）就不再重寫，`Drop` 不會重複記錄失敗
+    fn save(&mut self) {
         if self.dirty {
+            self.dirty = false;
             if let Err(e) = write_json(&self.file, &json!(self.map)) {
                 warn!("可疑 DNS 紀錄寫入失敗（{}）：{e}", self.file.display());
             }
         }
+    }
+}
+
+/// 評測中途出錯或被強制結束（future 被丟掉）時也存：已經記下的天數不能丟
+/// （永久黑名單是當下就附加寫入的，這份紀錄要跟它一致）
+impl Drop for Strikes {
+    fn drop(&mut self) {
+        self.save();
     }
 }
 

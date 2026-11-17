@@ -557,3 +557,91 @@ async fn collect_bounds_concurrent_candidates() {
     assert_eq!(state["counts"]["survivors"], 9, "{state:#}");
     assert!(b.detail().is_none(), "結束後不再顯示進度");
 }
+
+/// 只在某個網域的網站驗證卡住（模擬評測做到一半），其他照 `LocalOnly`
+struct HangOn {
+    domain: &'static str,
+    reached: Arc<tokio::sync::Notify>,
+}
+
+impl Prober for HangOn {
+    fn supports(&self, up: &Upstream) -> bool {
+        LocalOnly.supports(up)
+    }
+    fn exchange(&self, up: Upstream, q: Vec<u8>, t: Duration) -> BoxFuture<anyhow::Result<Vec<u8>>> {
+        LocalOnly.exchange(up, q, t)
+    }
+    fn resolve_v4(&self, host: String) -> BoxFuture<Option<Ipv4Addr>> {
+        LocalOnly.resolve_v4(host)
+    }
+    fn verify_site(&self, ip: std::net::IpAddr, domain: String, t: Duration) -> BoxFuture<(SiteCheck, String)> {
+        if domain == self.domain {
+            self.reached.notify_one();
+            return Box::pin(std::future::pending());
+        }
+        LocalOnly.verify_site(ip, domain, t)
+    }
+}
+
+/// 評測被強制結束（排程逾時把 future 丟掉）：進度清掉、ASN 快取與可疑 DNS 紀錄照樣存檔
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_run_clears_progress_and_saves() {
+    // 第二個網域（www.alpha.net）也是 Alpha Networks 的網站
+    let site = |n: &str, k: u8| match n {
+        "www.alpha.net" => Reply::A(vec![Ipv4Addr::new(93, 1, 1, k)]),
+        _ => honest(n, k),
+    };
+    let a = mock("127.1.0.31:0", 0, move |n| site(n, 1)).await;
+    let b = mock("127.2.0.31:0", 0, move |n| site(n, 2)).await;
+    let c = mock("127.3.0.31:0", 0, move |n| site(n, 3)).await;
+    // 第一個網域回別家業者、網站無法驗證 → 記一天
+    let quiet = mock("127.6.0.31:0", 0, move |n| match n {
+        "www.alpha.com" => Reply::A(vec![ip("98.6.0.9")]),
+        _ => site(n, 1),
+    })
+    .await;
+    // 第二個網域回別家業者 → 網站驗證卡住
+    let stuck = mock("127.7.0.31:0", 0, move |n| match n {
+        "www.alpha.net" => Reply::A(vec![ip("98.6.0.10")]),
+        _ => site(n, 1),
+    })
+    .await;
+    let root = tmp("dropped");
+    let p = paths(&root);
+    std::fs::create_dir_all(&p.list_dir).unwrap();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    let ids: Vec<String> = [a, b, c, quiet, stuck].iter().map(|x| x.to_string()).collect();
+    std::fs::write(p.list_dir.join("iplist.txt"), ids.join("\n")).unwrap();
+    std::fs::write(p.list_dir.join("web.txt"), "www.alpha.com\nwww.alpha.net\n").unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "upstream": { "pinned": [], "autoTypes": ["udp"], "autoMax": 6 },
+        "benchmark": { "timeoutMs": 300, "concurrency": 4, "maxTimeouts": 1, "minAuto": 1, "paceMs": 0 },
+    }));
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12)));
+    let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(cfg)).with_clock(clock);
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let prober = HangOn {
+        domain: "www.alpha.net",
+        reached: reached.clone(),
+    };
+    let bench = Benchmark::with(p.clone(), Arc::new(prober), asn());
+    let b2 = bench.clone();
+    let mut h = tokio::spawn(async move { b2.run(&ctx).await });
+    tokio::select! {
+        _ = reached.notified() => {}
+        r = &mut h => panic!("評測應該卡在第二個網域的網站驗證，卻結束了：{r:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(30)) => panic!("評測沒有做到第二個網域的網站驗證"),
+    }
+    let d = kuroshio_jobs::Job::detail(&bench).expect("執行中有進度");
+    assert_eq!(d["phase"], "judge", "{d}");
+    // 強制結束：abort 會把 future 丟掉
+    h.abort();
+    assert!(h.await.unwrap_err().is_cancelled());
+    assert_eq!(kuroshio_jobs::Job::detail(&bench), None, "進度要清掉");
+    let out_root = p.out_root.clone().unwrap();
+    let cache = read(&out_root.join("cidr_cache.json"));
+    assert!(cache.get("98.6").is_some(), "ASN 快取要存：{cache}");
+    let suspects = read(&root.join("state/blacklist-suspects.json"));
+    assert_eq!(suspects[quiet.to_string()], json!(["2026-11-10"]), "{suspects}");
+    let _ = std::fs::remove_dir_all(&root);
+}
