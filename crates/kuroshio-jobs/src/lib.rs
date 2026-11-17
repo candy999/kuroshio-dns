@@ -34,7 +34,7 @@ pub mod twip;
 pub mod util;
 
 pub use benchmark::{BenchPaths, Benchmark};
-pub use scheduler::{resolve_path, Job, JobCtx, Options, Scheduler, JOBS_STATE_FILE};
+pub use scheduler::{resolve_path, state_file_exists, Job, JobCtx, Options, Scheduler, JOBS_STATE_FILE};
 pub use seed::{apply_seeds, apply_seeds_with, SeedSpec, SEEDS};
 pub use time::{Clock, ManualClock, SystemClock};
 pub use twip::TwIpJob;

@@ -524,3 +524,18 @@ fn jitter_seed_is_created_once_and_saved() {
     assert_eq!(s2.next_run("m"), s.next_run("m"));
     assert_eq!(s.status()["nextRun"]["m"].as_u64(), s.next_run("m"));
 }
+
+#[test]
+fn run_if_missing_accepts_compressed_state_file() {
+    let dir = std::env::temp_dir().join(format!("kuroshio-rim-{}", std::process::id()));
+    let state = dir.join("state");
+    std::fs::create_dir_all(state.join("cdn")).unwrap();
+    let o = kuroshio_jobs::Options::new(&state, &dir);
+    assert!(!(o.file_exists)("state/cdn/pools.json"), "沒有檔案：缺檔");
+    std::fs::write(state.join("cdn/pools.json.zst"), b"x").unwrap();
+    assert!((o.file_exists)("state/cdn/pools.json"), "只有壓縮檔（pools.json.zst）也算有");
+    std::fs::remove_file(state.join("cdn/pools.json.zst")).unwrap();
+    std::fs::write(state.join("cdn/pools.json"), b"{}").unwrap();
+    assert!((o.file_exists)("state/cdn/pools.json"), "一般檔也算有");
+    let _ = std::fs::remove_dir_all(&dir);
+}

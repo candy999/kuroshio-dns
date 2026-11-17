@@ -152,6 +152,17 @@ pub fn resolve_path(state_dir: &Path, base_dir: &Path, rel: &str) -> PathBuf {
     }
 }
 
+/// 狀態檔在不在：大檔寫成 zstd 壓縮（`名稱.zst`，例如 `cdn/pools.json.zst`），兩種都算。
+/// 只看原檔名的話，壓縮存檔之後 `runIfMissing` 永遠判定缺檔，每次重新啟動都會補跑（例如節點池每次開機都重建）
+pub fn state_file_exists(p: &Path) -> bool {
+    if p.exists() {
+        return true;
+    }
+    let mut z = p.as_os_str().to_os_string();
+    z.push(".zst");
+    Path::new(&z).exists()
+}
+
 pub type ExistsFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub struct Options {
@@ -178,7 +189,7 @@ impl Options {
         Options {
             clock: Arc::new(SystemClock),
             should_defer: None,
-            file_exists: Arc::new(move |rel: &str| resolve_path(&state_dir, &base_dir, rel).exists()),
+            file_exists: Arc::new(move |rel: &str| state_file_exists(&resolve_path(&state_dir, &base_dir, rel))),
             lock_dir: None,
             on_state_change: None,
             tick_interval: Duration::from_secs(30),
