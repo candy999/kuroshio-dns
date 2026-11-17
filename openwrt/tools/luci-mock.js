@@ -397,12 +397,12 @@ function page(view, theme, dark) {
         media, resource: '/luci-static/resources', scriptname: '/cgi-bin/luci', pathinfo: `/admin/services/kuroshio/${view}`,
         documentroot: '/www', requestpath: ['admin', 'services', 'kuroshio', view], dispatchpath: ['admin', 'services', 'kuroshio', view],
         pollinterval: 5, ubuspath: '/ubus/', sessionid: '0123456789abcdef0123456789abcdef', token: 'mocktoken',
-        nodespec: { action: { type: 'view', path: `kuroshio/${view}` }, satisfied: true, readonly: false, title: '黑潮 DNS' },
+        nodespec: { action: { type: 'view', path: `kuroshio_ui/${view}` }, satisfied: true, readonly: false, title: '黑潮 DNS' },
         apply_rollback: 90, apply_holdoff: 1, apply_timeout: 1, apply_display: 1
     };
     const sk = (SKELETON[theme] || SKELETON.bootstrap)(dark, `<div id="tabmenu" style="display:none"></div>
 <script src="/luci-static/resources/luci.js"></script><script>L = new LuCI(${JSON.stringify(env)});</script>
-<div id="view"><div class="spinning">Loading view…</div><script>L.require('ui').then(function(ui) { ui.instantiateView('kuroshio/${view}'); });</script></div>`);
+<div id="view"><div class="spinning">Loading view…</div><script>L.require('ui').then(function(ui) { ui.instantiateView('kuroshio_ui/${view}'); });</script></div>`);
     // bootstrap / vantage 的「自動」：跟著系統的深淺色設 data-darkmode（跟主題自己的 header 一樣）
     const auto = sk.autoDark ? `<script>(function(){ var m = window.matchMedia('(prefers-color-scheme: dark)'), r = document.documentElement; var set = function(x) { r.setAttribute('data-darkmode', x.matches); }; set(m); m.addListener(set); })();</script>` : '';
     return `<!DOCTYPE html><html lang="zh-tw"${sk.html || ''}><head><meta charset="utf-8"><title>OpenWrt - 黑潮 DNS - LuCI（mock）</title>

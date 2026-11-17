@@ -32,8 +32,8 @@ define Build/Compile
 endef
 
 define Package/luci-app-kuroshio/install
-	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/kuroshio $(1)/www/luci-static/resources/kuroshio
-	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/kuroshio/*.js $(1)/www/luci-static/resources/view/kuroshio/
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/kuroshio_ui $(1)/www/luci-static/resources/kuroshio
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/kuroshio_ui/*.js $(1)/www/luci-static/resources/view/kuroshio_ui/
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/kuroshio/*.js $(1)/www/luci-static/resources/kuroshio/
 	$(INSTALL_DATA) $(REPO_ROOT)/data/dashboard/dashboard.js $(REPO_ROOT)/data/dashboard/dashboard.css $(1)/www/luci-static/resources/kuroshio/
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d

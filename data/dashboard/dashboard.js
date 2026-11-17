@@ -30,7 +30,7 @@
   /**
    * 日期時間一律用台灣習慣的固定格式，不跟瀏覽器語系（英文瀏覽器原本會顯示 11/12/2026, 10:22:03 AM）：
    * fmtTime(t) = 2026-11-12 10:22（24 小時制）；mode 'sec' 加秒、'date' 只有日期、'time' = 10:22、'timesec' = 10:22:03。
-   * t 可以是毫秒、毫秒字串或 ISO 字串；空的回 '-'，看不懂的原樣回傳。LuCI 的 kuroshio/common.js 有一份相同的實作。
+   * t 可以是毫秒、毫秒字串或 ISO 字串；空的回 '-'，看不懂的原樣回傳。LuCI 的 kuroshio/ui.js 有一份相同的實作。
    */
   const p2 = n => String(n).padStart(2, '0');
   const fmtTime = (t, mode) => {

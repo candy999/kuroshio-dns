@@ -4,7 +4,7 @@
 'require poll';
 'require ui';
 'require uci';
-'require kuroshio.common as common';
+'require kuroshio.ui as common';
 
 // 功能、用語跟 Windows 設定頁（data/admin/community.js）一樣（規格 03 第 10 節）
 var REL = { friend: _('好友'), out: _('等待對方同意'), 'in': _('待我審核'), none: '-' };
@@ -49,7 +49,7 @@ var BUILD = '3.2.1';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
-	var files = ['kuroshio/common', 'view/kuroshio/access', 'view/kuroshio/advanced', 'view/kuroshio/cdn', 'view/kuroshio/community', 'view/kuroshio/dashboard', 'view/kuroshio/filter', 'view/kuroshio/log', 'view/kuroshio/settings', 'view/kuroshio/status'];
+	var files = ['kuroshio/ui', 'view/kuroshio_ui/access', 'view/kuroshio_ui/advanced', 'view/kuroshio_ui/cdn', 'view/kuroshio_ui/community', 'view/kuroshio_ui/dashboard', 'view/kuroshio_ui/filter', 'view/kuroshio_ui/log', 'view/kuroshio_ui/settings', 'view/kuroshio_ui/status'];
 	var tried = false;
 	try { tried = !!window.sessionStorage.getItem(key); window.sessionStorage.setItem(key, '1'); } catch (e) {}
 	if (!tried && window.fetch)

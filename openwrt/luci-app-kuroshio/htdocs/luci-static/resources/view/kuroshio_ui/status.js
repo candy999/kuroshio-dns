@@ -4,7 +4,7 @@
 'require rpc';
 'require uci';
 'require ui';
-'require kuroshio.common as common';
+'require kuroshio.ui as common';
 
 var callStatus = rpc.declare({ object: 'kuroshio', method: 'status' });
 var callAcmeStatus = rpc.declare({ object: 'kuroshio', method: 'acme_status' });
@@ -65,7 +65,7 @@ var BUILD = '3.2.1';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
-	var files = ['kuroshio/common', 'view/kuroshio/access', 'view/kuroshio/advanced', 'view/kuroshio/cdn', 'view/kuroshio/community', 'view/kuroshio/dashboard', 'view/kuroshio/filter', 'view/kuroshio/log', 'view/kuroshio/settings', 'view/kuroshio/status'];
+	var files = ['kuroshio/ui', 'view/kuroshio_ui/access', 'view/kuroshio_ui/advanced', 'view/kuroshio_ui/cdn', 'view/kuroshio_ui/community', 'view/kuroshio_ui/dashboard', 'view/kuroshio_ui/filter', 'view/kuroshio_ui/log', 'view/kuroshio_ui/settings', 'view/kuroshio_ui/status'];
 	var tried = false;
 	try { tried = !!window.sessionStorage.getItem(key); window.sessionStorage.setItem(key, '1'); } catch (e) {}
 	if (!tried && window.fetch)

@@ -4,7 +4,7 @@
 'require fs';
 'require rpc';
 'require ui';
-'require kuroshio.common as common';
+'require kuroshio.ui as common';
 
 var BENCH = '/etc/kuroshio/benchmark/';
 // 這些檔案只放「自己加的」：程式附帶的預設名單（/usr/share/kuroshio/benchmark）每次評測都會自動一起測，升級套件就更新
@@ -136,7 +136,7 @@ var BUILD = '3.2.1';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
-	var files = ['kuroshio/common', 'view/kuroshio/access', 'view/kuroshio/advanced', 'view/kuroshio/cdn', 'view/kuroshio/community', 'view/kuroshio/dashboard', 'view/kuroshio/filter', 'view/kuroshio/log', 'view/kuroshio/settings', 'view/kuroshio/status'];
+	var files = ['kuroshio/ui', 'view/kuroshio_ui/access', 'view/kuroshio_ui/advanced', 'view/kuroshio_ui/cdn', 'view/kuroshio_ui/community', 'view/kuroshio_ui/dashboard', 'view/kuroshio_ui/filter', 'view/kuroshio_ui/log', 'view/kuroshio_ui/settings', 'view/kuroshio_ui/status'];
 	var tried = false;
 	try { tried = !!window.sessionStorage.getItem(key); window.sessionStorage.setItem(key, '1'); } catch (e) {}
 	if (!tried && window.fetch)

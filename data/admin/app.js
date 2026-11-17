@@ -1521,7 +1521,7 @@
 	};
 
 	/**
-	 * 「恢復預設清單」要怎麼改（跟 LuCI kuroshio/common.js 的 restorePlan 同一份規則）。
+	 * 「恢復預設清單」要怎麼改（跟 LuCI kuroshio/ui.js 的 restorePlan 同一份規則）。
 	 * 對應方式：先用網址找，找不到再用名稱找（所以只改了網址的預設清單會被改回預設網址）。
 	 * 網址不在預設裡的是使用者自己加的：保留原樣、排在預設清單後面（removeOwn = true 時移除）。
 	 * 回傳 { result: [{ def | own（原本的物件）, from }], changes: { add, remove, url, enabled, other, keep, reorder, count } }

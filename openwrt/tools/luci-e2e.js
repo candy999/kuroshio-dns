@@ -572,7 +572,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         try {
             await filterPage();
             // 預設清單從頁面讀（rpcd defaults = kuroshio defaults --json），不寫死在測試裡
-            const defs = await page.evaluate(() => L.require('kuroshio.common').then(c => (c.defaults.filter || {}).lists || []));
+            const defs = await page.evaluate(() => L.require('kuroshio.ui').then(c => (c.defaults.filter || {}).lists || []));
             defs.length >= 3 ? ok(`恢復預設清單：讀到 ${defs.length} 份預設清單`) : bad(`恢復預設清單：預設清單太少（${defs.length}）`);
             // 1. 先整理成預設（連自己加的也移除）
             await openRestore(true);

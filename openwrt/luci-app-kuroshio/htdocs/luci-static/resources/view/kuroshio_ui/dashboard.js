@@ -1,7 +1,7 @@
 'use strict';
 'require view';
 'require ui';
-'require kuroshio.common as common';
+'require kuroshio.ui as common';
 
 // 儀表板：跟公開頁、Windows 設定頁共用同一份 kuroshio/dashboard.js（套件從 data/dashboard/ 安裝進來）。
 // 資料經 rpcd（kuroshio.api）轉送到本機管理 API，是完整資料（排行不受公開頁的人數門檻限制）；
@@ -85,7 +85,7 @@ var BUILD = '3.2.1';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
-	var files = ['kuroshio/common', 'view/kuroshio/access', 'view/kuroshio/advanced', 'view/kuroshio/cdn', 'view/kuroshio/community', 'view/kuroshio/dashboard', 'view/kuroshio/filter', 'view/kuroshio/log', 'view/kuroshio/settings', 'view/kuroshio/status'];
+	var files = ['kuroshio/ui', 'view/kuroshio_ui/access', 'view/kuroshio_ui/advanced', 'view/kuroshio_ui/cdn', 'view/kuroshio_ui/community', 'view/kuroshio_ui/dashboard', 'view/kuroshio_ui/filter', 'view/kuroshio_ui/log', 'view/kuroshio_ui/settings', 'view/kuroshio_ui/status'];
 	var tried = false;
 	try { tried = !!window.sessionStorage.getItem(key); window.sessionStorage.setItem(key, '1'); } catch (e) {}
 	if (!tried && window.fetch)
