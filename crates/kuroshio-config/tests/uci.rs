@@ -416,3 +416,134 @@ fn access_section() {
     assert_eq!(g(&c, "access.mode"), &json!("open"));
     assert_eq!(g(&c, "access.groups"), &json!([]));
 }
+
+fn load_warn(text: &str) -> (Value, Vec<String>) {
+    let (over, warns) = kuroshio_config::uci::overrides_with_warnings(&parse_text(text).unwrap(), &env());
+    (build(&over), warns)
+}
+
+/// 同名區段跟 libuci 一樣合併：後面的 option 蓋掉同名的、list 接在後面，前一段的其他選項不會不見
+#[test]
+fn duplicate_sections_are_merged() {
+    let text = default_text()
+        + "\nconfig candydns 'main'\n\toption dns_port '5400'\n\tlist local_domain 'home.arpa'\n"
+        + "\nconfig resolver 'resolver'\n\toption timeout_ms '2000'\n"
+        + "\nconfig resolver 'resolver'\n\toption fast_path '0'\n\toption timeout_ms '3000'\n";
+    let c = load(&text, &env());
+    // 第二段 main 只有 dns_port：第一段的 admin_port、redirect 還在
+    assert_eq!(g(&c, "listen.plain.port"), &json!(5400));
+    assert_eq!(g(&c, "admin.port"), &json!(8054));
+    assert_eq!(g(&c, "listen.plain.binds"), &json!(["127.0.0.1", "::1"]), "redirect 沿用第一段");
+    let raw = parse_text(&text).unwrap();
+    assert_eq!(raw["values"]["main"]["local_domain"], json!(["lan", "home.arpa"]), "list 接在後面");
+    assert_eq!(raw["values"]["main"][".index"], json!(0), "位置以第一次出現的為準");
+    assert_eq!(g(&c, "resolver.timeoutMs"), &json!(3000), "同一個 option 取最後一個");
+    assert_eq!(g(&c, "resolver.fastPath"), &json!(false));
+    // 同名但類型不同：照樣是錯誤
+    assert!(parse_text("config doh 'x'\nconfig dot 'x'\n").is_err());
+}
+
+/// 埠號超出範圍（0、> 65535）或不是數字：用預設值並警告，不會被截斷成 4464 / 0
+#[test]
+fn out_of_range_ports_use_defaults() {
+    let text = default_text()
+        .replace("\toption port '8443'", "\toption port '70000'")
+        .replace("option dns_port '5335'", "option dns_port '65536'")
+        .replace("option admin_port '8054'", "option admin_port '0'")
+        .replace("option exchange_port '5354'", "option exchange_port 'abc'");
+    assert!(text.contains("'70000'"), "測試資料要真的改到 doh.port");
+    let (c, warns) = load_warn(&text);
+    assert_eq!(g(&c, "listen.doh.port"), &json!(8443));
+    assert_eq!(g(&c, "listen.plain.port"), &json!(5335));
+    assert_eq!(g(&c, "admin.port"), &json!(8054));
+    for w in [
+        "UCI 選項 doh.port = '70000' 不是有效的埠號（1–65535），改用預設值 8443",
+        "UCI 選項 main.dns_port = '65536' 不是有效的埠號（1–65535），改用預設值 5335",
+        "UCI 選項 main.admin_port = '0' 不是有效的埠號（1–65535），改用預設值 8054",
+    ] {
+        assert!(warns.iter().any(|x| x == w), "少了「{w}」：{warns:?}");
+    }
+    // 同一個選項讀好幾次也只警告一次
+    assert_eq!(warns.iter().filter(|x| x.starts_with("UCI 選項 doh.port")).count(), 1, "{warns:?}");
+    // exchange_port 只有 exchange 模式才讀
+    let (c, warns) = load_warn(&text.replace("option redirect 'dnsmasq-upstream'", "option redirect 'exchange'"));
+    assert_eq!(g(&c, "resolver.localForward.server"), &json!("udp://127.0.0.1:5354"));
+    assert!(warns.iter().any(|x| x.contains("main.exchange_port = 'abc'")), "{warns:?}");
+    // 正常的設定沒有任何警告
+    let (_, warns) = load_warn(&default_text());
+    assert!(warns.is_empty(), "{warns:?}");
+}
+
+/// 數字填錯（5k、-1、1e5）：用預設值並警告（以前靜默改用預設值）
+#[test]
+fn bad_numbers_warn() {
+    let d = defaults();
+    for bad in ["5k", "-1x", "1e5", "inf", "0x10"] {
+        let text = default_text().replace(
+            "config resolver 'resolver'",
+            &format!("config resolver 'resolver'\n\toption cache_max '{bad}'"),
+        );
+        let (c, warns) = load_warn(&text);
+        assert_eq!(g(&c, "resolver.cacheMax"), g(&d, "resolver.cacheMax"), "{bad}");
+        let want = format!(
+            "UCI 選項 resolver.cache_max = '{bad}' 不是有效的數字，改用預設值 {}",
+            g(&d, "resolver.cacheMax")
+        );
+        assert!(warns.contains(&want), "{bad}：{warns:?}");
+    }
+    // 小數照樣是數字
+    let text = default_text().replace(
+        "config resolver 'resolver'",
+        "config resolver 'resolver'\n\toption timeout_ms '1500.5'",
+    );
+    let (c, warns) = load_warn(&text);
+    assert_eq!(g(&c, "resolver.timeoutMs"), &json!(1500.5));
+    assert!(warns.is_empty(), "{warns:?}");
+    // DDNS 的數字（非負整數）
+    let text = default_text().replace(
+        "\toption ttl '1'\n\toption interval '5'",
+        "\toption ttl '-1'\n\toption interval '5k'\n\toption force_hours '1e5'",
+    );
+    let (c, warns) = load_warn(&text);
+    assert_eq!(
+        (g(&c, "ddns.ttl"), g(&c, "ddns.intervalMin"), g(&c, "ddns.forceHours")),
+        (&json!(1), &json!(5), &json!(24))
+    );
+    for w in [
+        "UCI 選項 ddns.ttl = '-1' 不是有效的數字，改用預設值 1",
+        "UCI 選項 ddns.interval = '5k' 不是有效的數字，改用預設值 5",
+        "UCI 選項 ddns.force_hours = '1e5' 不是有效的數字，改用預設值 24",
+    ] {
+        assert!(warns.iter().any(|x| x == w), "少了「{w}」：{warns:?}");
+    }
+    // 數字清單裡填錯的項目略過
+    let text = default_text().replace(
+        "\tlist at '03:20'\n\tlist weekday '0'",
+        "\tlist at '03:20'\n\tlist weekday '0'\n\tlist weekday 'x'",
+    );
+    let (c, warns) = load_warn(&text);
+    assert_eq!(g(&c, "jobs.cdn-scan.weekdays"), &json!([0]));
+    assert!(
+        warns
+            .iter()
+            .any(|x| x == "UCI 選項 cdn_scan.weekday 的 'x' 不是有效的數字，略過這一項"),
+        "{warns:?}"
+    );
+}
+
+/// `community.max_bundle_mb` → `maxBundleMB`（駝峰式會轉成 maxBundleMb，社群模組讀不到）
+#[test]
+fn max_bundle_mb_maps_to_config_field() {
+    let text = default_text().replace(
+        "config community 'community'\n\toption enabled '0'",
+        "config community 'community'\n\toption enabled '0'\n\toption max_bundle_mb '8'",
+    );
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "community.maxBundleMB"), &json!(8));
+    assert!(get(&c, "community.maxBundleMb").is_none());
+    // 其他縮寫結尾的選項也依預設值的欄位名稱對應（tw_ip 的 max_mem_kb → maxMemKB）
+    let text = default_text() + "\nconfig job 'tw_ip'\n\toption max_mem_kb '4096'\n";
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "jobs.tw-ip.maxMemKB"), &json!(4096));
+    assert!(get(&c, "jobs.tw-ip.maxMemKb").is_none());
+}
