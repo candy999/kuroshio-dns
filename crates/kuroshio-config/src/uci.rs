@@ -33,6 +33,8 @@ impl Env {
 
 /// 解析 UCI 設定檔文字，輸出跟 `ubus call uci get` 一樣的 `{ values: {...} }`
 pub fn parse_text(text: &str) -> Result<Value> {
+    // 記事本存的檔開頭可能有 BOM：不去掉的話第一個 config 行會認不得
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut values = Map::new();
     let mut cur: Option<String> = None;
     let (mut anon, mut index) = (0u32, 0u32);

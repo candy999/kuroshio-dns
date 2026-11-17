@@ -138,7 +138,8 @@ fn parse(text: &str) -> Result<(Vec<String>, Vec<Sec>)> {
     let mut secs: Vec<Sec> = Vec::new();
     for l in text.lines() {
         let t = l.trim();
-        if t.starts_with("config ") || t == "config" {
+        // 跟 parse_text 一樣：第一個詞是 config（後面接空白或 Tab 都算）
+        if t.split_whitespace().next() == Some("config") {
             let mut it = t.splitn(3, char::is_whitespace);
             let _ = it.next();
             let typ = it.next().unwrap_or("").to_string();
@@ -172,6 +173,10 @@ pub struct Migrated {
 
 /// 依 `main.lists_version` 套用還沒做過的遷移
 pub fn migrate(text: &str) -> Result<Migrated> {
+    // 記事本存的檔：去掉 BOM、CRLF 換成 LF（寫回去一律 LF）
+    let orig = text;
+    let norm = text.strip_prefix('\u{feff}').unwrap_or(text).replace("\r\n", "\n");
+    let text = norm.as_str();
     let (head, mut secs) = parse(text)?;
     let mut log = Vec::new();
     let main = secs
@@ -325,7 +330,7 @@ pub fn migrate(text: &str) -> Result<Migrated> {
     }
     if log.is_empty() && secs_unchanged(text, &text_out) {
         return Ok(Migrated {
-            text: text.to_string(),
+            text: orig.to_string(),
             log,
         });
     }
