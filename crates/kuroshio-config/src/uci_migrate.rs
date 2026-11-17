@@ -2,12 +2,14 @@
 //!
 //! 規則跟 OpenWrt 套件的 `openwrt/kuroshio/files/kuroshio.uci-defaults` 一樣（兩邊要一起改）：
 //!
-//! - **3.2**（`main.lists_version` 不是 3.2 / 3.3 時）：預設過濾清單更新。只動「跟 3.1.x 預設值完全相同」的
+//! - **3.2**（`main.lists_version` 比 3.2 舊、或沒有時）：預設過濾清單更新。只動「跟 3.1.x 預設值完全相同」的
 //!   `filter_list`（啟用、分類、網址、名稱都沒改，也沒有其他選項）；加上 TWNIC-RPZ、OISD small、HaGeZi Light（同網址不重複加）；
 //!   清單順序沒被調整過的話，依新的預設順序排列
-//! - **3.3**（`lists_version` 是 3.2 時）：最後加上四份預設不勾選的大清單（同網址不重複加）
+//! - **3.3**（`lists_version` 比 3.3 舊時）：最後加上四份預設不勾選的大清單（同網址不重複加）
 //!
-//! 做過的版本記在 `main.lists_version`，之後不再重做（使用者刪掉的清單不會被加回來）。
+//! 做過的版本記在 `main.lists_version`，之後不再重做（使用者刪掉的清單不會被加回來）。版本號拆成「主.次」比大小，
+//! 降版或之後的版本號（3.10、4.0）不會重做；看不懂的版本號（例如 `abc`）什麼都不動，只在 log 記一筆。
+//! 跟 uci 一樣：`config kuroshio 'main'` 寫了好幾段當成同一段、同一個選項寫了好幾次取最後一個。
 //! 檔案的其他內容（註解、其他區段、選項順序）原樣保留。
 
 use anyhow::{bail, Result};
@@ -95,33 +97,40 @@ impl Sec {
             .collect()
     }
 
+    /// 同一個選項寫了好幾次時跟 uci 一樣取最後一個
     fn get(&self, key: &str) -> Option<String> {
         self.entries()
             .into_iter()
-            .find(|(kw, k, _)| kw == "option" && k == key)
+            .rfind(|(kw, k, _)| kw == "option" && k == key)
             .map(|e| e.2)
     }
 
+    fn has(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// 改一個選項：寫了好幾次的每一行都改（不管 uci 取哪一個都是新的值），沒有就加在最後
     fn set(&mut self, key: &str, val: &str) {
         let line = format!("\toption {key} {}", quote(val));
-        let found = self.lines.iter().position(|l| {
+        let mut found = false;
+        for l in self.lines.iter_mut() {
             let mut it = l.split_whitespace();
-            it.next() == Some("option") && it.next() == Some(key)
-        });
-        match found {
-            Some(i) => self.lines[i] = line,
-            None => {
-                // 放在最後一個 option / list 後面（後面的空行、註解屬於下一段之前）
-                let last = self
-                    .lines
-                    .iter()
-                    .rposition(|l| {
-                        let t = l.trim_start();
-                        t.starts_with("option ") || t.starts_with("list ") || t.starts_with("config ")
-                    })
-                    .unwrap_or(0);
-                self.lines.insert(last + 1, line);
+            if it.next() == Some("option") && it.next() == Some(key) {
+                *l = line.clone();
+                found = true;
             }
+        }
+        if !found {
+            // 放在最後一個 option / list 後面（後面的空行、註解屬於下一段之前）
+            let last = self
+                .lines
+                .iter()
+                .rposition(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("option ") || t.starts_with("list ") || t.starts_with("config ")
+                })
+                .unwrap_or(0);
+            self.lines.insert(last + 1, line);
         }
     }
 
@@ -179,11 +188,20 @@ pub fn migrate(text: &str) -> Result<Migrated> {
     let text = norm.as_str();
     let (head, mut secs) = parse(text)?;
     let mut log = Vec::new();
-    let main = secs
-        .iter()
-        .position(|s| s.typ == "kuroshio" && s.name.as_deref() == Some("main"))
-        .ok_or_else(|| anyhow::anyhow!("找不到 `config kuroshio 'main'` 區段，這不是黑潮 DNS 的 UCI 設定檔"))?;
-    let lists_version = secs[main].get("lists_version").unwrap_or_default();
+    if !secs.iter().any(is_main) {
+        bail!("找不到 `config kuroshio 'main'` 區段，這不是黑潮 DNS 的 UCI 設定檔");
+    }
+    let lists_version = main_get(&secs, "lists_version").unwrap_or_default();
+    let Some(from) = parse_version(&lists_version) else {
+        // 看不懂的版本號：不知道做過哪些遷移，什麼都不動（避免把使用者刪掉的清單加回來）
+        log.push(format!(
+            "main.lists_version 是「{lists_version}」，看不懂這個版本號：過濾清單不做遷移"
+        ));
+        return Ok(Migrated {
+            text: orig.to_string(),
+            log,
+        });
+    };
     let by_url = |secs: &Vec<Sec>, url: &str| {
         secs.iter()
             .position(|s| s.typ == "filter_list" && s.get("url").as_deref() == Some(url))
@@ -195,7 +213,8 @@ pub fn migrate(text: &str) -> Result<Migrated> {
         }
     };
 
-    if lists_version != "3.2" && lists_version != "3.3" {
+    // 比版本號大小（不是比字串）：降版、或是之後的版本號（3.10、4.0）都不會重做
+    if from < (3, 2) {
         // 順序沒被調整過（舊預設清單維持原本的先後，自己加的都在它們後面）才重新排序
         let mut sorted = true;
         let (mut last, mut other) = (0u32, false);
@@ -216,9 +235,10 @@ pub fn migrate(text: &str) -> Result<Migrated> {
                 i += 1;
                 continue;
             }
+            // 跟 uci-defaults 的 `${en:-1}` 一樣：沒寫或空白都算 1
             let key = format!(
                 "{}|{}|{}|{}",
-                s.get("enabled").unwrap_or_else(|| "1".into()),
+                s.get("enabled").filter(|e| !e.is_empty()).unwrap_or_else(|| "1".into()),
                 s.get("category").unwrap_or_default(),
                 s.get("url").unwrap_or_default(),
                 s.get("name").unwrap_or_default()
@@ -274,18 +294,11 @@ pub fn migrate(text: &str) -> Result<Migrated> {
         } else {
             log.push("清單順序是自己調整過的，不重新排序".into());
         }
-        let m = secs
-            .iter()
-            .position(|s| s.typ == "kuroshio" && s.name.as_deref() == Some("main"))
-            .unwrap();
-        secs[m].set("lists_version", "3.2");
+        main_set(&mut secs, "lists_version", "3.2");
     }
 
-    let m = secs
-        .iter()
-        .position(|s| s.typ == "kuroshio" && s.name.as_deref() == Some("main"))
-        .unwrap();
-    if secs[m].get("lists_version").as_deref() == Some("3.2") {
+    let now = main_get(&secs, "lists_version").as_deref().and_then(parse_version).unwrap_or(from);
+    if now < (3, 3) {
         // 3.3：最後加上預設不勾選的大清單
         add(
             &mut secs,
@@ -312,7 +325,7 @@ pub fn migrate(text: &str) -> Result<Migrated> {
             L_BYPASS,
             "malware",
         );
-        secs[m].set("lists_version", "3.3");
+        main_set(&mut secs, "lists_version", "3.3");
     }
 
     let mut out: Vec<String> = head;
@@ -321,7 +334,7 @@ pub fn migrate(text: &str) -> Result<Migrated> {
     }
     let mut text_out = out.join("\n");
     text_out.push('\n');
-    let new_version = secs[m].get("lists_version").unwrap_or_default();
+    let new_version = main_get(&secs, "lists_version").unwrap_or_default();
     if new_version != lists_version {
         log.push(format!(
             "lists_version：{} → {new_version}",
@@ -339,4 +352,78 @@ pub fn migrate(text: &str) -> Result<Migrated> {
 
 fn secs_unchanged(a: &str, b: &str) -> bool {
     a.trim_end() == b.trim_end()
+}
+
+fn is_main(s: &Sec) -> bool {
+    s.typ == "kuroshio" && s.name.as_deref() == Some("main")
+}
+
+/// `main` 的選項：`config kuroshio 'main'` 寫了好幾段時跟 uci（以及 parse_text）一樣當成同一段，
+/// 同一個選項取最後寫的那個
+fn main_get(secs: &[Sec], key: &str) -> Option<String> {
+    secs.iter().rev().filter(|s| is_main(s)).find_map(|s| s.get(key))
+}
+
+/// 改 `main` 的選項：每一段 main 裡寫到這個選項的都改；都沒有就加在最後一段 main
+fn main_set(secs: &mut [Sec], key: &str, val: &str) {
+    let mut done = false;
+    for s in secs.iter_mut().filter(|s| is_main(s) && s.has(key)) {
+        s.set(key, val);
+        done = true;
+    }
+    if !done {
+        if let Some(s) = secs.iter_mut().rfind(|s| is_main(s)) {
+            s.set(key, val);
+        }
+    }
+}
+
+/// `lists_version` → （主版本, 次版本）：沒有或空字串 = (0, 0)（很舊，要遷移）；
+/// `3.2`、`3.10`、`4`、`3.2.1` 都看得懂（第三段以後不比）；其他（`abc`、`3.x`、`.3`、前後有空白）= None。
+/// 判斷方式跟 uci-defaults 的 `lists_version_older` 一樣
+fn parse_version(v: &str) -> Option<(u32, u32)> {
+    if v.is_empty() {
+        return Some((0, 0));
+    }
+    let mut parts = Vec::new();
+    for p in v.split('.') {
+        // 每一段 1～9 位數字（跟 uci-defaults 的 shell 一樣，不會溢位）
+        if p.is_empty() || p.len() > 9 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        parts.push(p.parse::<u32>().ok()?);
+    }
+    Some((parts[0], parts.get(1).copied().unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_version;
+
+    /// 版本號比大小而不是比字串：3.10 比 3.3 新
+    #[test]
+    fn version_compares_numerically() {
+        assert_eq!(parse_version(""), Some((0, 0)));
+        assert_eq!(parse_version("3.1"), Some((3, 1)));
+        assert_eq!(parse_version("3.10"), Some((3, 10)));
+        assert_eq!(parse_version("4"), Some((4, 0)));
+        assert_eq!(parse_version("3.2.1"), Some((3, 2)));
+        assert_eq!(parse_version("03.02"), Some((3, 2)));
+        assert!(parse_version("3.10").unwrap() > (3, 3));
+        for bad in [
+            "abc",
+            "3.x",
+            ".3",
+            "3.",
+            "3..2",
+            "v3.2",
+            "-1",
+            "3.2 beta",
+            " 3.2",
+            "  ",
+            "1234567890.1",
+        ] {
+            assert_eq!(parse_version(bad), None, "{bad}");
+        }
+    }
 }

@@ -130,3 +130,107 @@ fn user_changes_are_kept() {
 fn not_a_kuroshio_config() {
     assert!(migrate("config dnsmasq\n\toption x '1'\n").is_err());
 }
+
+/// `config kuroshio 'main'` 寫了兩段：跟 uci / parse_text 一樣當成同一段，lists_version 取最後寫的那個
+#[test]
+fn duplicate_main_sections_are_merged() {
+    let (v320, now) = (v320(), now());
+    // 第二段 main 寫了 3.3：已經是最新的，不動
+    let t = now.clone() + "\nconfig kuroshio 'main'\n\toption enabled '1'\n";
+    let m = migrate(&t).unwrap();
+    assert!(m.log.is_empty(), "第二段沒有 lists_version，沿用第一段的 3.3：{:?}", m.log);
+    let t = v320.clone() + "\nconfig kuroshio 'main'\n\toption lists_version '3.3'\n";
+    let m = migrate(&t).unwrap();
+    assert!(m.log.is_empty(), "{:?}", m.log);
+    assert_eq!(m.text, t);
+    // 第二段 main 沒有 lists_version：看第一段的 3.2，做 3.3 遷移、改第一段那一行
+    let t = v320.clone() + "\nconfig kuroshio 'main'\n\toption enabled '1'\n";
+    let m = migrate(&t).unwrap();
+    assert_eq!(lists(&m.text), lists(&now), "{:?}", m.log);
+    assert_eq!(m.text.matches("option lists_version").count(), 1, "不另外加一行");
+    assert_eq!(version(&m.text).as_deref(), Some("3.3"));
+}
+
+/// 同一個區段裡同一個選項寫了兩次：跟 uci 一樣取最後一個
+#[test]
+fn duplicate_option_last_wins() {
+    let (v320, now) = (v320(), now());
+    // 先 3.2 後 3.3 → 3.3：不動
+    let t = v320.replace(
+        "\toption lists_version '3.2'\n",
+        "\toption lists_version '3.2'\n\toption lists_version '3.3'\n",
+    );
+    assert_ne!(t, v320);
+    let m = migrate(&t).unwrap();
+    assert!(m.log.is_empty(), "{:?}", m.log);
+    // 先 3.3 後 3.2 → 3.2：做 3.3 遷移，兩行都改成 3.3
+    let t = v320.replace(
+        "\toption lists_version '3.2'\n",
+        "\toption lists_version '3.3'\n\toption lists_version '3.2'\n",
+    );
+    let m = migrate(&t).unwrap();
+    assert_eq!(lists(&m.text), lists(&now), "{:?}", m.log);
+    assert_eq!(m.text.matches("option lists_version '3.3'").count(), 2);
+    // 清單的選項重複：取最後一個（第一個是改過的名稱、最後一個是預設名稱 → 算沒改過，照樣遷移）
+    let t = v310().replace(
+        "\toption name 'Ruddernation（Adobe 驗證）'\n",
+        "\toption name '我的'\n\toption name 'Ruddernation（Adobe 驗證）'\n",
+    );
+    let m = migrate(&t).unwrap();
+    assert!(m.log.iter().any(|l| l.starts_with("Ruddernation 改成預設停用")), "{:?}", m.log);
+}
+
+/// `option enabled ''`：跟 uci-defaults 的 `${en:-1}` 一樣當成 1（啟用）
+#[test]
+fn empty_enabled_counts_as_enabled() {
+    let v310 = v310();
+    let t = v310.replace(
+        "config filter_list\n\toption enabled '1'\n\toption name 'Ruddernation（Adobe 驗證）'",
+        "config filter_list\n\toption enabled ''\n\toption name 'Ruddernation（Adobe 驗證）'",
+    );
+    assert_ne!(t, v310);
+    let m = migrate(&t).unwrap();
+    assert!(m.log.iter().any(|l| l.starts_with("Ruddernation 改成預設停用")), "{:?}", m.log);
+    assert_eq!(lists(&m.text), lists(&now()));
+}
+
+/// lists_version 比版本號大小：降版或之後的版本號（3.10、4.0）不重做；看不懂的不動、只記 log；空白 = 很舊
+#[test]
+fn lists_version_compared_numerically() {
+    let (v320, now) = (v320(), now());
+    for v in ["3.10", "4.0", "4", "3.3.1"] {
+        let t = now.replace("option lists_version '3.3'", &format!("option lists_version '{v}'"));
+        assert_ne!(t, now);
+        let m = migrate(&t).unwrap();
+        assert!(m.log.is_empty(), "{v}：{:?}", m.log);
+        assert_eq!(m.text, t, "{v}");
+    }
+    // 使用者刪掉 OISD small、lists_version 是之後的版本號：不加回來
+    let t = now
+        .replace(
+            "config filter_list\n\toption enabled '1'\n\toption name 'OISD small'\n\toption url 'https://small.oisd.nl/'\n\toption category 'ads'\n",
+            "",
+        )
+        .replace("option lists_version '3.3'", "option lists_version '3.10'");
+    assert!(!t.contains("small.oisd.nl"), "測試資料要真的刪掉 OISD");
+    assert!(migrate(&t).unwrap().log.is_empty());
+    // 看不懂的版本號：什麼都不動，log 記一筆
+    for v in ["abc", "3.x", " 3.2"] {
+        let t = v320.replace("option lists_version '3.2'", &format!("option lists_version '{v}'"));
+        let m = migrate(&t).unwrap();
+        assert_eq!(m.text, t, "{v}");
+        assert_eq!(
+            m.log,
+            vec![format!("main.lists_version 是「{v}」，看不懂這個版本號：過濾清單不做遷移")],
+            "{v}"
+        );
+    }
+    // 空白 = 很舊：從 3.1 開始遷移；3.2.x 只做 3.3
+    let t = v310().replace("config kuroshio 'main'", "config kuroshio 'main'\n\toption lists_version ''");
+    let m = migrate(&t).unwrap();
+    assert_eq!(lists(&m.text), lists(&now), "{:?}", m.log);
+    let t = v320.replace("option lists_version '3.2'", "option lists_version '3.2.1'");
+    let m = migrate(&t).unwrap();
+    assert_eq!(lists(&m.text), lists(&now), "{:?}", m.log);
+    assert_eq!(version(&m.text).as_deref(), Some("3.3"));
+}
