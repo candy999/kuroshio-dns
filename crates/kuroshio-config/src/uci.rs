@@ -3,10 +3,12 @@
 //! - 沒設定的選項沿用預設值（預設值只定義在一個地方）
 //! - 數字 / 開關 / 清單依預設值的型別自動轉換；空白 = 用預設值
 //! - 輸出的是「使用者設定」，之後照樣經過 內建預設 → 使用者設定 → "auto" 換算 的合併
+//! - 填錯的數字、超出範圍的埠號改用預設值，並記一筆警告（[`overrides_with_warnings`]；[`overrides`] 用 tracing 記 warn）
 
 use crate::{defaults, get};
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
+use std::cell::RefCell;
 
 /// 執行環境（init 腳本傳入）
 #[derive(Debug, Clone, Default)]
@@ -64,16 +66,19 @@ pub fn parse_text(text: &str) -> Result<Value> {
                         n
                     }
                 };
+                // 同名區段跟 libuci 一樣當成同一段：後面的 option 蓋掉同名 option、list 接在後面
+                // （不是整段換掉，否則第一段的選項會全部不見）；位置以第一次出現的為準
                 if let Some(old) = values.get(&sec) {
                     if old[".type"] != name {
                         bail!("UCI 解析錯誤：區段 '{sec}' 同時是 {} 與 {name}", old[".type"]);
                     }
+                } else {
+                    values.insert(
+                        sec.clone(),
+                        json!({ ".anonymous": rest.map(|r| r.is_empty()).unwrap_or(true), ".type": name, ".name": sec, ".index": index }),
+                    );
+                    index += 1;
                 }
-                values.insert(
-                    sec.clone(),
-                    json!({ ".anonymous": rest.map(|r| r.is_empty()).unwrap_or(true), ".type": name, ".name": sec, ".index": index }),
-                );
-                index += 1;
                 cur = Some(sec);
             }
             "option" | "list" => {
@@ -136,35 +141,67 @@ fn list(v: Option<&Value>) -> Vec<String> {
     }
 }
 
+/// 十進位數字（可以有負號、小數點）；`1e5`、`inf`、`0x10`、`+3` 這類寫法不算
 fn num(s: &str) -> Option<Value> {
-    if let Ok(i) = s.trim().parse::<i64>() {
+    let s = s.trim();
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let (int, frac) = match body.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (body, None),
+    };
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int) || !frac.map(digits).unwrap_or(true) {
+        return None;
+    }
+    if let Ok(i) = s.parse::<i64>() {
         return Some(json!(i));
     }
-    s.trim().parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| json!(f))
+    s.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| json!(f))
 }
 
-/// 依預設值的型別轉換 UCI 字串
-fn coerce(v: &Value, like: Option<&Value>) -> Value {
+/// 轉換時發現的問題（填錯的選項改用預設值等）：[`overrides_with_warnings`] 回傳、[`overrides`] 用 tracing 記 warn
+type Warns = RefCell<Vec<String>>;
+
+fn warn(w: &Warns, msg: String) {
+    let mut w = w.borrow_mut();
+    if !w.contains(&msg) {
+        w.push(msg);
+    }
+}
+
+/// 依預設值的型別轉換 UCI 字串；`what` 是警告裡顯示的選項名稱（例如 `resolver.cache_max`）
+fn coerce(v: &Value, like: Option<&Value>, what: &str, w: &Warns) -> Value {
     match like {
         Some(Value::Array(a)) => {
             let numeric = a.first().map(Value::is_number).unwrap_or(false);
             Value::Array(
                 list(Some(v))
                     .into_iter()
-                    .map(|x| {
-                        if numeric {
-                            num(&x).unwrap_or(Value::String(x))
-                        } else {
-                            Value::String(x)
+                    .filter_map(|x| {
+                        if !numeric {
+                            return Some(Value::String(x));
                         }
+                        let n = num(&x);
+                        if n.is_none() {
+                            warn(w, format!("UCI 選項 {what} 的 '{x}' 不是有效的數字，略過這一項"));
+                        }
+                        n
                     })
                     .collect(),
             )
         }
         _ if v.is_array() => v.clone(),
         Some(Value::Bool(_)) => Value::Bool(truthy(v)),
-        Some(Value::Number(_)) => v.as_str().and_then(num).unwrap_or_else(|| like.cloned().unwrap()),
+        Some(Value::Number(_)) => v.as_str().and_then(num).unwrap_or_else(|| {
+            let d = like.cloned().unwrap();
+            warn(
+                w,
+                format!("UCI 選項 {what} = '{}' 不是有效的數字，改用預設值 {d}", v.as_str().unwrap_or("")),
+            );
+            d
+        }),
         // 預設是 "auto"（依 CPU 核心數換算）：填數字就是數字，其他（auto）照原樣
+        // （有些預設 auto 的欄位本來就收文字，例如 system.storage_class 'flash'，所以這裡不發警告）
         Some(Value::String(a)) if a == "auto" => v.as_str().and_then(num).unwrap_or_else(|| v.clone()),
         None => match v.as_str().and_then(|s| {
             (!s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-'))
@@ -178,8 +215,16 @@ fn coerce(v: &Value, like: Option<&Value>) -> Value {
     }
 }
 
-/// 把一個 UCI 區段的選項套到 `out`（snake_case → camelCase），`rename` 可改名或忽略（None）
-fn apply(out: &mut Map<String, Value>, defaults: Option<&Value>, sec: Option<&Value>, rename: &[(&str, Option<&str>)]) {
+/// 把一個 UCI 區段的選項套到 `out`（snake_case → camelCase），`rename` 可改名或忽略（None）；
+/// `label` 是警告裡選項名稱的前綴（例如 `resolver.`、`cdn.cross_`）
+fn apply(
+    out: &mut Map<String, Value>,
+    defaults: Option<&Value>,
+    sec: Option<&Value>,
+    rename: &[(&str, Option<&str>)],
+    label: &str,
+    w: &Warns,
+) {
     let Some(Value::Object(sec)) = sec else { return };
     for (k, v) in sec {
         if k.starts_with('.') {
@@ -188,19 +233,71 @@ fn apply(out: &mut Map<String, Value>, defaults: Option<&Value>, sec: Option<&Va
         let key = match rename.iter().find(|(from, _)| *from == k) {
             Some((_, None)) => continue,
             Some((_, Some(to))) => to.to_string(),
-            None => camel(k),
+            None => {
+                let c = camel(k);
+                // 駝峰式轉不出縮寫（max_bundle_mb → maxBundleMb，設定欄位是 maxBundleMB）：
+                // 預設值裡有只差大小寫的欄位就用它的寫法
+                match defaults.and_then(Value::as_object) {
+                    Some(d) if !d.contains_key(&c) && !out.contains_key(&c) => {
+                        d.keys().find(|dk| dk.eq_ignore_ascii_case(&c)).cloned().unwrap_or(c)
+                    }
+                    _ => c,
+                }
+            }
         };
         let like = out.get(&key).or_else(|| defaults.and_then(|d| d.get(&key)));
         if v.as_str() == Some("") && !like.map(Value::is_array).unwrap_or(false) {
             continue; // 空白 = 用預設值
         }
-        let val = coerce(v, like);
+        let val = coerce(v, like, &format!("{label}{k}"), w);
         out.insert(key, val);
     }
 }
 
-/// UCI → 使用者設定
+/// UCI → 使用者設定；填錯的選項（數字格式錯、埠號超出範圍）改用預設值，每一筆用 tracing 記 warn
 pub fn overrides(uci: &Value, env: &Env) -> Value {
+    let (out, warns) = overrides_with_warnings(uci, env);
+    for m in &warns {
+        tracing::warn!("{m}");
+    }
+    out
+}
+
+/// 同 [`overrides`]，另外回傳轉換時的警告（填錯的選項改用了預設值；同樣的警告只列一次）
+pub fn overrides_with_warnings(uci: &Value, env: &Env) -> (Value, Vec<String>) {
+    let w: Warns = RefCell::new(Vec::new());
+    let out = convert(uci, env, &w);
+    (out, w.into_inner())
+}
+
+/// 埠號：1–65535；沒填 = 預設值，填錯或超出範圍 = 預設值並記警告（不能讓 70000 被截成 4464）
+fn port(v: &str, what: &str, dflt: u64, w: &Warns) -> u64 {
+    let v = v.trim();
+    if v.is_empty() {
+        return dflt;
+    }
+    match v.parse::<u64>() {
+        Ok(p) if (1..=65535).contains(&p) => p,
+        _ => {
+            warn(w, format!("UCI 選項 {what} = '{v}' 不是有效的埠號（1–65535），改用預設值 {dflt}"));
+            dflt
+        }
+    }
+}
+
+/// 非負整數：沒填 = 預設值，填錯（`5k`、`-1`、`1e5`）= 預設值並記警告
+fn uint(v: &str, what: &str, dflt: u64, w: &Warns) -> u64 {
+    let v = v.trim();
+    if v.is_empty() {
+        return dflt;
+    }
+    v.parse::<u64>().unwrap_or_else(|_| {
+        warn(w, format!("UCI 選項 {what} = '{v}' 不是有效的數字，改用預設值 {dflt}"));
+        dflt
+    })
+}
+
+fn convert(uci: &Value, env: &Env, w: &Warns) -> Value {
     let d = defaults();
     let vals = uci.get("values").unwrap_or(uci);
     let sec = |n: &str| vals.get(n);
@@ -232,7 +329,7 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     } else {
         format!("{etc}/key.pem")
     };
-    let port_of = |n: &str, k: &str, dflt: u64| s(n, k).parse::<u64>().unwrap_or(dflt);
+    let port_of = |n: &str, k: &str, dflt: u64| port(&s(n, k), &format!("{n}.{k}"), dflt, w);
     let doh_on = flag("doh", "enabled", false);
     let dot_on = flag("dot", "enabled", false);
     let doq_on = flag("doq", "enabled", false);
@@ -270,7 +367,7 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     // 公開頁、描述檔、Alt-Svc、HTTPS 記錄要用外面看到的埠號
     if flag("doh", "open_wan", false) {
         let wan = port_of("doh", "wan_port", 443);
-        if wan != port_of("doh", "port", 8443) && (1..=65535).contains(&wan) {
+        if wan != port_of("doh", "port", 8443) {
             listen["doh"]["publicPort"] = json!(wan);
         }
     }
@@ -389,7 +486,14 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     let mut site = Map::new();
     site.insert("enabled".into(), json!(flag("site", "enabled", false)));
     site.insert("hostname".into(), json!(domain));
-    apply(&mut site, d.get("site"), sec("site"), &[("enabled", None), ("hostname", None)]);
+    apply(
+        &mut site,
+        d.get("site"),
+        sec("site"),
+        &[("enabled", None), ("hostname", None)],
+        "site.",
+        w,
+    );
     let site_on = site["enabled"].clone();
     out.insert("site".into(), Value::Object(site));
     out.insert("check".into(), json!({ "enabled": site_on }));
@@ -401,6 +505,8 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
         d.get("upstream"),
         sec("upstream"),
         &[("auto_type", Some("autoTypes")), ("last_resort", None)],
+        "upstream.",
+        w,
     );
     // 固定上游沒填 = 不用（路由器本身當上游會變成迴圈）
     up.insert("pinned".into(), json!(list(sec("upstream").and_then(|u| u.get("pinned")))));
@@ -410,15 +516,15 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     }
 
     // ---------------- 解析 / 測速 ----------------
-    apply(&mut resolver, d.get("resolver"), sec("resolver"), &[]);
+    apply(&mut resolver, d.get("resolver"), sec("resolver"), &[], "resolver.", w);
     out.insert("resolver".into(), Value::Object(resolver));
     let mut iprank = Map::new();
-    apply(&mut iprank, d.get("iprank"), sec("iprank"), &[]);
+    apply(&mut iprank, d.get("iprank"), sec("iprank"), &[], "iprank.", w);
     out.insert("iprank".into(), Value::Object(iprank));
 
     // ---------------- 過濾 ----------------
     let mut filter = Map::new();
-    apply(&mut filter, d.get("filter"), sec("filter"), &[("custom_rules", None)]);
+    apply(&mut filter, d.get("filter"), sec("filter"), &[("custom_rules", None)], "filter.", w);
     let custom = s("filter", "custom_rules");
     filter.insert(
         "customRules".into(),
@@ -464,9 +570,16 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
         }
     }
     let dcdn = d.get("cdn");
-    apply(&mut cdn, dcdn, Some(&Value::Object(plain_src)), &[]);
+    apply(&mut cdn, dcdn, Some(&Value::Object(plain_src)), &[], "cdn.", w);
     let mut cross = Map::new();
-    apply(&mut cross, dcdn.and_then(|c| c.get("cross")), Some(&Value::Object(cross_src)), &[]);
+    apply(
+        &mut cross,
+        dcdn.and_then(|c| c.get("cross")),
+        Some(&Value::Object(cross_src)),
+        &[],
+        "cdn.cross_",
+        w,
+    );
     if !cross.is_empty() {
         cdn.insert("cross".into(), Value::Object(cross));
     }
@@ -479,7 +592,7 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
             .and_then(|ps| ps.get(&name))
             .cloned()
             .unwrap_or(json!({ "enabled": true }));
-        apply(&mut cur, Some(&dp), Some(p), &[("seed_v4", Some("seedV4"))]);
+        apply(&mut cur, Some(&dp), Some(p), &[("seed_v4", Some("seedV4"))], &format!("{name}."), w);
         providers.insert(name, Value::Object(cur));
     }
     if !providers.is_empty() {
@@ -491,6 +604,8 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
         dcdn.and_then(|c| c.get("ecs")),
         sec("ecs"),
         &[("resolver", Some("resolvers")), ("tw_subnet", Some("twSubnets"))],
+        "ecs.",
+        w,
     );
     if !ecs.is_empty() {
         cdn.insert("ecs".into(), Value::Object(ecs));
@@ -503,8 +618,8 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
         "enabled": flag("ddns", "enabled", false), "provider": "cloudflare", "apiToken": s("cf_account", "api_token"),
         "records": list(sec("ddns").and_then(|x| x.get("record"))), "zone": dd("zone"),
         "ipv4": flag("ddns", "ipv4", true), "ipv6": flag("ddns", "ipv6", false), "proxied": flag("ddns", "proxied", false),
-        "ttl": dd("ttl").parse::<u64>().unwrap_or(1), "intervalMin": dd("interval").parse::<u64>().unwrap_or(5),
-        "forceHours": dd("force_hours").parse::<u64>().unwrap_or(24),
+        "ttl": uint(&dd("ttl"), "ddns.ttl", 1, w), "intervalMin": uint(&dd("interval"), "ddns.interval", 5, w),
+        "forceHours": uint(&dd("force_hours"), "ddns.force_hours", 24, w),
         "ipSource": if dd("ip_source").is_empty() { "web".into() } else { dd("ip_source") }, "iface4": dd("iface4"), "iface6": dd("iface6"),
     });
     for k in ["url4", "url6"] {
@@ -572,7 +687,11 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
             ("domain", None),
             ("cert", None),
             ("sync_interval", Some("syncIntervalMin")),
+            // 駝峰式會轉成 maxBundleMb，社群模組讀的是 maxBundleMB
+            ("max_bundle_mb", Some("maxBundleMB")),
         ],
+        "community.",
+        w,
     );
     out.insert("community".into(), Value::Object(cm));
 
@@ -581,14 +700,22 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
     // 沒有這個區段 = 內建預設（只開放台灣）；`option groups ''` = 一組都不勾
     if sec("access").is_some() {
         let mut acc = Map::new();
-        apply(&mut acc, d.get("access"), sec("access"), &[("apply_to", Some("applyTo"))]);
+        apply(
+            &mut acc,
+            d.get("access"),
+            sec("access"),
+            &[("apply_to", Some("applyTo"))],
+            "access.",
+            w,
+        );
         out.insert("access".into(), Value::Object(acc));
     }
 
     // ---------------- 排程工作 ----------------
     let mut jobs = Map::new();
     for j in of_type("job") {
-        let name = j.get(".name").and_then(Value::as_str).unwrap_or("").replace('_', "-");
+        let uci_name = j.get(".name").and_then(Value::as_str).unwrap_or("");
+        let name = uci_name.replace('_', "-");
         let dj = get(&d, &format!("jobs.{name}")).cloned();
         let mut cur = Map::new();
         if let Some(e) = j.get("enabled") {
@@ -598,15 +725,27 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
             cur.insert("at".into(), json!(list(j.get("at"))));
         }
         if j.get("weekday").is_some() {
-            let w: Vec<Value> = list(j.get("weekday")).iter().filter_map(|x| num(x)).collect();
+            let days: Vec<Value> = list(j.get("weekday"))
+                .iter()
+                .filter_map(|x| {
+                    let n = num(x);
+                    if n.is_none() {
+                        warn(w, format!("UCI 選項 {uci_name}.weekday 的 '{x}' 不是有效的數字，略過這一項"));
+                    }
+                    n
+                })
+                .collect();
             // 清單是空的 = 每天
-            cur.insert("weekdays".into(), Value::Array(w));
+            cur.insert("weekdays".into(), Value::Array(days));
         }
+        // tw_ip 的 max_mem_kb → maxMemKB：apply 依預設值的欄位名稱對應大小寫
         apply(
             &mut cur,
             dj.as_ref(),
             Some(j),
             &[("enabled", None), ("at", None), ("weekday", None)],
+            &format!("{uci_name}."),
+            w,
         );
         jobs.insert(name, Value::Object(cur));
     }
@@ -617,6 +756,8 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
         d.get("benchmark"),
         sec("benchmark"),
         &[("dir", None), ("out_dir", None), ("q_exe", None)],
+        "benchmark.",
+        w,
     );
     bench.insert("dir".into(), json!(format!("{etc}/benchmark")));
     out.insert("benchmark".into(), Value::Object(bench));
@@ -637,6 +778,8 @@ pub fn overrides(uci: &Value, env: &Env) -> Value {
                 ("storage_reserve_mb", Some("storageReserveMB")),
                 ("flash_write_budget_kb", Some("flashWriteBudgetKB")),
             ],
+            &format!("{name}."),
+            w,
         );
         if !m.is_empty() {
             out.insert(name.into(), Value::Object(m));

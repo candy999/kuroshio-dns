@@ -96,8 +96,34 @@ add_filter_list() { # add_filter_list <啟用> <名稱> <網址> <分類>
 	lists_log="$lists_log；新增「$2」"
 }
 
-lists_version=$(uci -q get kuroshio.main.lists_version)
-if [ "$lists_version" != '3.2' ] && [ "$lists_version" != '3.3' ]; then
+# main.lists_version 比 <主>.<次> 舊（或沒有）：回傳 0；一樣或比較新：1；看不懂：2
+# 拆成「主.次」比整數，不是比字串：降版、或之後的版本號（3.10、4.0）都不會重做；
+# 每一段限 1～9 位數字（跟 uci_migrate.rs 一樣）。POSIX sh / busybox ash 都能跑
+lists_version_older() {
+	_v=$(uci -q get kuroshio.main.lists_version)
+	[ -z "$_v" ] && return 0
+	case "$_v" in
+	*[!0-9.]* | .* | *. | *..* | *[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 2 ;;
+	esac
+	_maj=${_v%%.*}
+	_rest=${_v#*.}
+	if [ "$_rest" = "$_v" ]; then
+		_min=0
+	else
+		_min=${_rest%%.*}
+	fi
+	[ "$_maj" -lt "$1" ] && return 0
+	[ "$_maj" -eq "$1" ] && [ "$_min" -lt "$2" ] && return 0
+	return 1
+}
+
+lists_version_older 3 2
+lists_version_cmp=$?
+if [ "$lists_version_cmp" = 2 ]; then
+	# 看不懂的版本號：不知道做過哪些遷移，什麼都不動（避免把使用者刪掉的清單加回來）
+	logger -t kuroshio "main.lists_version 是「$(uci -q get kuroshio.main.lists_version)」，看不懂這個版本號：過濾清單不做遷移"
+fi
+if [ "$lists_version_cmp" = 0 ]; then
 	lists_log=''
 	# 順序沒被調整過（LuCI 可以拖曳排序）才重新排序：舊預設清單維持原本的先後，
 	# 自己加的清單都在它們後面（新增的清單本來就加在最後）
@@ -173,7 +199,7 @@ fi
 
 # 3.3：清單最後加上幾份預設不勾選的大清單（已經有同一個網址的不重複加；做完記在 main.lists_version，
 # 之後使用者刪掉也不會被加回來）。不勾選，所以不影響記憶體與過濾結果，要用的人自己打開
-if [ "$(uci -q get kuroshio.main.lists_version)" = '3.2' ]; then
+if lists_version_older 3 3; then
 	lists_log=''
 	add_filter_list 0 'HaGeZi Pro++（廣告追蹤加強版，約 27 萬條）' "$L_PROPLUS" ads
 	add_filter_list 0 'AdGuard DNS filter（約 19 萬條）' "$L_ADGUARD" ads

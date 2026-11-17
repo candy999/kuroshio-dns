@@ -179,16 +179,26 @@ fn cfg_port(cfg: &Value, key: &str) -> Option<u16> {
         .map(|p| p as u16)
 }
 
+/// 監聽埠號 `listen.<sec>.port`：沒填或超出範圍（0、> 65535）時用這個欄位的內建預設值
+/// （defaults.json；UCI 的 8443 等預設在 UCI 轉換時就已經填好）。
+/// 監聽與公開頁、描述檔用同一個函式，兩邊的埠號才會一致（不會一邊截斷成 4464、一邊退回 443）
+fn listen_port(cfg: &Value, sec: &str, fallback: u16) -> u16 {
+    let key = format!("listen.{sec}.port");
+    cfg_port(cfg, &key)
+        .or_else(|| cfg_port(&kuroshio_config::defaults(), &key))
+        .unwrap_or(fallback)
+}
+
 /// 裝置從外面連 DoH 用的 TCP 埠號（公開頁、描述檔、QR 碼、Cloudflare HTTPS 記錄、Alt-Svc 都用這個）：
 /// 1. `listen.doh.publicPort`（> 0）：外面看到的埠號跟監聽的不同時（例如路由器把 WAN 443 轉到本機 8443）
-/// 2. DoH 自己做 TLS（`tls`）：`listen.doh.port`——DoH 可以用任何埠號，例如 443 被占用時改用 8443
+/// 2. DoH 自己做 TLS（`tls`）：`listen.doh.port`（超出範圍時跟監聽一樣用預設值）——DoH 可以用任何埠號，例如 443 被占用時改用 8443
 /// 3. 前面有反向代理（IIS、nginx…，DoH 本身是明文）：443
 pub fn public_doh_port(cfg: &Value, tls: bool) -> u16 {
     if let Some(p) = cfg_port(cfg, "listen.doh.publicPort") {
         return p;
     }
     if tls {
-        cfg_port(cfg, "listen.doh.port").unwrap_or(443)
+        listen_port(cfg, "doh", 8443)
     } else {
         443
     }
@@ -200,7 +210,7 @@ pub fn public_doh3_port(cfg: &Value, tls: bool) -> u16 {
     if let Some(p) = cfg_port(cfg, "listen.doh.altSvcPort") {
         return p;
     }
-    let listen = cfg_port(cfg, "listen.doh.port").unwrap_or(443);
+    let listen = listen_port(cfg, "doh", 8443);
     match cfg_port(cfg, "listen.doh.http3Port") {
         Some(h3) if h3 != listen => h3,
         _ => public_doh_port(cfg, tls),
@@ -273,7 +283,19 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             })
             .clone()
     };
-    let port_of = |sec: &str, dport: u64| get(cfg, &format!("listen.{sec}.port")).and_then(Value::as_u64).unwrap_or(dport) as u16;
+    // 0 = 讓系統挑一個空的埠（測試用）；超過 65535 不能用 `as u16` 截斷（70000 會變成 4464），改用預設值
+    let port_of = |sec: &str, dport: u16| {
+        let key = format!("listen.{sec}.port");
+        match get(cfg, &key) {
+            Some(v) if v.as_u64() == Some(0) => 0,
+            Some(v) if !v.is_null() && cfg_port(cfg, &key).is_none() => {
+                let p = listen_port(cfg, sec, dport);
+                warn!("設定 {key} = {v} 不是有效的埠號（1–65535），改用預設值 {p}");
+                p
+            }
+            _ => listen_port(cfg, sec, dport),
+        }
+    };
     let on = |sec: &str| get(cfg, &format!("listen.{sec}.enabled")).and_then(Value::as_bool).unwrap_or(false);
     // 記下每個位址的結果；回傳要監聽的位址（格式錯誤的直接記成失敗）
     fn targets(out: &mut Encrypted, proto: &'static str, hosts: &[String], port: u16, tls: bool) -> Vec<(usize, SocketAddr)> {
@@ -872,16 +894,10 @@ pub fn community_section(cfg: &Value, base: &std::path::Path) -> Option<Value> {
         eps.insert("doh".into(), json!(format!("https://{domain}{p}/.well-known/kuroshio")));
     }
     if on("dot") {
-        eps.insert(
-            "dot".into(),
-            json!(format!("dot://{domain}:{}", cfg_port(cfg, "listen.dot.port").unwrap_or(853))),
-        );
+        eps.insert("dot".into(), json!(format!("dot://{domain}:{}", listen_port(cfg, "dot", 853))));
     }
     if on("doq") {
-        eps.insert(
-            "doq".into(),
-            json!(format!("doq://{domain}:{}", cfg_port(cfg, "listen.doq.port").unwrap_or(853))),
-        );
+        eps.insert("doq".into(), json!(format!("doq://{domain}:{}", listen_port(cfg, "doq", 853))));
     }
     if let Some(o) = c.as_object_mut() {
         o.insert("endpoints".into(), Value::Object(eps));
@@ -1902,6 +1918,18 @@ mod tests {
         // 反向代理在前面（DoH 本身是明文）：外面是 443
         let cfg = c(json!({ "port": 8053 }));
         assert_eq!(public_doh_port(&cfg, false), 443);
+        // 埠號超出範圍（70000、65536）：跟監聽一樣用 listen.doh.port 的預設值，不是 443、也不是截斷後的 4464 / 0
+        let dflt = cfg_port(&kuroshio_config::defaults(), "listen.doh.port").unwrap();
+        for bad in [70000, 65536] {
+            let cfg = c(json!({ "port": bad }));
+            assert_eq!(listen_port(&cfg, "doh", 8443), dflt, "{bad}");
+            assert_eq!((public_doh_port(&cfg, true), public_doh3_port(&cfg, true)), (dflt, dflt), "{bad}");
+        }
+        // UCI 轉出來的設定：範圍外的 doh.port 已經換成 UCI 的預設 8443，公開的埠號也是 8443
+        let uci = json!({ "values": { "doh": { ".type": "doh", "port": "70000" } } });
+        let env = kuroshio_config::uci::Env::default();
+        let cfg = kuroshio_config::build(&kuroshio_config::uci::overrides(&uci, &env));
+        assert_eq!((listen_port(&cfg, "doh", 8443), public_doh_port(&cfg, true)), (8443, 8443));
     }
 
     #[test]
