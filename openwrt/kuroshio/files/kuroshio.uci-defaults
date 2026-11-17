@@ -57,6 +57,10 @@ L_NRD='https://filter.futa.gg/nrd/past-07day_abp.txt'
 L_TWNIC='https://filter.futa.gg/TWNIC-RPZ_abp.txt'
 L_OISD='https://small.oisd.nl/'
 L_LIGHT='https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/light.txt'
+L_PROPLUS='https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.plus.txt'
+L_ADGUARD='https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt'
+L_TIF_BIG='https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.txt'
+L_BYPASS='https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/doh-vpn-proxy-bypass.txt'
 
 # 3.1.x 預設清單的順序（第幾份）；不是舊預設的網址印空字串
 old_list_pos() {
@@ -90,7 +94,8 @@ add_filter_list() { # add_filter_list <啟用> <名稱> <網址> <分類>
 	lists_log="$lists_log；新增「$2」"
 }
 
-if [ "$(uci -q get kuroshio.main.lists_version)" != '3.2' ]; then
+lists_version=$(uci -q get kuroshio.main.lists_version)
+if [ "$lists_version" != '3.2' ] && [ "$lists_version" != '3.3' ]; then
 	lists_log=''
 	# 順序沒被調整過（LuCI 可以拖曳排序）才重新排序：舊預設清單維持原本的先後，
 	# 自己加的清單都在它們後面（新增的清單本來就加在最後）
@@ -162,6 +167,19 @@ if [ "$(uci -q get kuroshio.main.lists_version)" != '3.2' ]; then
 	uci set kuroshio.main.lists_version='3.2'
 	uci commit kuroshio
 	[ -n "$lists_log" ] && logger -t kuroshio "預設過濾清單已更新（只改沒動過的預設項目）：${lists_log#；}"
+fi
+
+# 3.3：清單最後加上幾份預設不勾選的大清單（已經有同一個網址的不重複加；做完記在 main.lists_version，
+# 之後使用者刪掉也不會被加回來）。不勾選，所以不影響記憶體與過濾結果，要用的人自己打開
+if [ "$(uci -q get kuroshio.main.lists_version)" = '3.2' ]; then
+	lists_log=''
+	add_filter_list 0 'HaGeZi Pro++（廣告追蹤加強版，約 27 萬條）' "$L_PROPLUS" ads
+	add_filter_list 0 'AdGuard DNS filter（約 19 萬條）' "$L_ADGUARD" ads
+	add_filter_list 0 'HaGeZi TIF 完整版（威脅情資，約 146 萬條、15 MB 記憶體）' "$L_TIF_BIG" malware
+	add_filter_list 0 'HaGeZi 加密 DNS／VPN／代理繞過（企業用：裝置無法自己改用其他 DNS）' "$L_BYPASS" malware
+	uci set kuroshio.main.lists_version='3.3'
+	uci commit kuroshio
+	[ -n "$lists_log" ] && logger -t kuroshio "過濾清單：加上預設不勾選的大清單（${lists_log#；}）"
 fi
 
 # 使用者自己加的評測名單（程式附帶的預設名單會自動一起使用，不複製，升級時才會更新）

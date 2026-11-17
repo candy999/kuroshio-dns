@@ -13,6 +13,8 @@ const http = require('http');
 const net = require('net');
 const os = require('os');
 const path = require('path');
+// 設定頁版本（data/admin/app.js 的 UI_VERSION）：改版時不用改這個測試
+const UI_VERSION = (fs.readFileSync(path.join(__dirname, '..', 'data', 'admin', 'app.js'), 'utf-8').match(/var UI_VERSION = '([^']+)'/) || [])[1] || '?';
 
 const ROOT = path.resolve(__dirname, '..');
 const BIN = process.env.KUROSHIO_BIN ? path.resolve(process.env.KUROSHIO_BIN) : path.join(ROOT, 'target', 'debug', process.platform === 'win32' ? 'kuroshio.exe' : 'kuroshio');
@@ -869,7 +871,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.goto(`${BASE}/#about`);
         await page.waitForFunction(() => /GPL/.test(document.getElementById('about-kv').textContent));
         const ak = await page.textContent('#tab-about');
-        check(ak.includes(about.version) && /設定頁版本/.test(ak) && /3\.2\.1/.test(ak), '關於：核心版本與設定頁版本');
+        check(ak.includes(about.version) && /設定頁版本/.test(ak) && ak.includes(UI_VERSION), '關於：核心版本與設定頁版本');
         check(ak.includes(about.source) && ak.includes(about.target) && /GPL-3\.0-or-later/.test(ak) && /散布/.test(ak), '關於：授權、原始碼網址、編譯平台、GPL 說明');
         check(await page.evaluate(() => { const i = document.getElementById('about-qr'); return i.complete && i.naturalWidth > 0; }), '關於：QR 碼圖片載入');
         check(await page.isVisible('#foot'), '主畫面也有頁尾');

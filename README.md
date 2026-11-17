@@ -76,7 +76,7 @@
 ### 過濾
 - **廣告、遙測、惡意 / 詐騙** 三種分類，一層一層往上疊；同一個網域出現在多份清單只算一次。
 - 支援 AdGuard 與 hosts 語法、檢查 CNAME 鏈；hosts 裡寫的 IP 一律不採用。
-- 內建台灣清單：165 反詐騙、TWNIC 停止解析名單、台灣廣告、內容農場等；國際清單補上威脅情資（HaGeZi TIF 精簡版）與 OISD small、HaGeZi Light。
+- 內建台灣清單：165 反詐騙、TWNIC 停止解析名單、台灣廣告、內容農場等；國際清單補上威脅情資（HaGeZi TIF 精簡版）與 OISD small、HaGeZi Light。記憶體多、要更完整防護（例如企業）的，清單最後還有幾份預設不勾選的大清單：HaGeZi Pro++、AdGuard DNS filter、HaGeZi TIF 完整版、加密 DNS／VPN／代理繞過。
 - **自訂規則永遠優先**，可以用 `! @begin 分類` / `! @end` 把規則分段歸類；存檔 3 秒內生效。
 - 緊湊結構，每個網域約 9 bytes（預設清單約 37 萬條 ≈ 3.5 MB；105 萬條的 HaGeZi TIF 完整版 ≈ 10 MB）；複雜規則用索引挑候選，不會每個查詢都掃過全部規則。
 - 被擋時回傳 Extended DNS Errors，裝置與日誌看得到原因。

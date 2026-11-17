@@ -248,6 +248,30 @@
         "category": "telemetry",
         "name": "Ruddernation（Adobe 驗證，會擋 Adobe 正版啟用）",
         "enabled": false
+      },
+      {
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.plus.txt",
+        "category": "ads",
+        "name": "HaGeZi Pro++（廣告追蹤加強版，約 27 萬條）",
+        "enabled": false
+      },
+      {
+        "url": "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
+        "category": "ads",
+        "name": "AdGuard DNS filter（約 19 萬條）",
+        "enabled": false
+      },
+      {
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.txt",
+        "category": "malware",
+        "name": "HaGeZi TIF 完整版（威脅情資，約 146 萬條、15 MB 記憶體）",
+        "enabled": false
+      },
+      {
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/doh-vpn-proxy-bypass.txt",
+        "category": "malware",
+        "name": "HaGeZi 加密 DNS／VPN／代理繞過（企業用：裝置無法自己改用其他 DNS）",
+        "enabled": false
       }
     ],
     "updateIntervalHours": 24,

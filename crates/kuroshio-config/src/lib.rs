@@ -122,6 +122,23 @@ pub const OLD_DEFAULT_LISTS_3_1: &str = r#"[
     {"url": "https://filter.futa.gg/nrd/past-07day_abp.txt", "category": "malware", "name": "FutaGuard 新註冊網域（7 天，誤擋風險高）", "enabled": false}
 ]"#;
 
+/// 3.2.x 的預設過濾清單：3.3 在後面加了幾份預設停用的大清單。設定頁存檔時整份寫進使用者設定、之後沒動過的，一樣換成新的預設清單
+pub const OLD_DEFAULT_LISTS_3_2: &str = r#"[
+    {"url": "https://filter.futa.gg/TW165_abp.txt", "category": "malware", "name": "FutaGuard TW165（台灣 165 反詐騙）"},
+    {"url": "https://filter.futa.gg/TWNIC-RPZ_abp.txt", "category": "malware", "name": "FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）"},
+    {"url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.mini.txt", "category": "malware", "name": "HaGeZi TIF 精簡版（威脅情資）"},
+    {"url": "https://filter.futa.gg/nrd/past-07day_abp.txt", "category": "malware", "name": "FutaGuard 新註冊網域（7 天，誤擋風險高）", "enabled": false},
+    {"url": "https://filter.futa.gg/hosts_abp.txt", "category": "ads", "name": "FutaGuard LowTechHost（台灣廣告）"},
+    {"url": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt", "category": "ads", "name": "CHN: anti-AD"},
+    {"url": "https://easylist-downloads.adblockplus.org/easylistchina.txt", "category": "ads", "name": "EasyList China"},
+    {"url": "https://small.oisd.nl/", "category": "ads", "name": "OISD small"},
+    {"url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/light.txt", "category": "ads", "name": "HaGeZi Light"},
+    {"url": "https://danny0838.github.io/content-farm-terminator/files/blocklist/content-farms.txt", "category": "ads", "name": "內容農場終結者", "enabled": false},
+    {"url": "https://a.dove.isdumb.one/cdn", "category": "telemetry", "name": "a-dove-is-dumb（Adobe 遙測）"},
+    {"url": "https://raw.githubusercontent.com/blocklistproject/Lists/master/smart-tv.txt", "category": "telemetry", "name": "blocklistproject smart-tv（電視遙測）"},
+    {"url": "https://raw.githubusercontent.com/Ruddernation-Designs/Adobe-URL-Block-List/master/hosts", "category": "telemetry", "name": "Ruddernation（Adobe 驗證，會擋 Adobe 正版啟用）", "enabled": false}
+]"#;
+
 /// 比對用：`enabled` 沒寫等於 `true`（拿掉 `"enabled": true`）；欄位順序本來就不影響比較
 fn list_entry_key(v: &Value) -> Value {
     let mut v = v.clone();
@@ -133,14 +150,16 @@ fn list_entry_key(v: &Value) -> Value {
     v
 }
 
-/// 使用者設定裡的 `filter.lists` 是不是 3.1.x 的預設清單原封不動（[`OLD_DEFAULT_LISTS_3_1`]）。
+/// 使用者設定裡的 `filter.lists` 是不是舊版的預設清單原封不動（[`OLD_DEFAULT_LISTS_3_1`]、[`OLD_DEFAULT_LISTS_3_2`]）。
 /// 是的話 [`build`] 會換成新的預設清單；啟動時用這個判斷要不要記一行說明
 pub fn old_default_lists(user: &Value) -> bool {
     let Some(Value::Array(lists)) = get(user, "filter.lists") else {
         return false;
     };
-    let old: Vec<Value> = serde_json::from_str(OLD_DEFAULT_LISTS_3_1).expect("OLD_DEFAULT_LISTS_3_1 格式錯誤");
-    lists.len() == old.len() && lists.iter().zip(&old).all(|(a, b)| list_entry_key(a) == list_entry_key(b))
+    [OLD_DEFAULT_LISTS_3_1, OLD_DEFAULT_LISTS_3_2].iter().any(|src| {
+        let old: Vec<Value> = serde_json::from_str(src).expect("舊版預設清單格式錯誤");
+        lists.len() == old.len() && lists.iter().zip(&old).all(|(a, b)| list_entry_key(a) == list_entry_key(b))
+    })
 }
 
 /// 內建預設值 → 使用者設定 → 綁定網域補齊（`normalize`）→ `"auto"` 換算（這台機器的核心數）
@@ -525,6 +544,25 @@ mod tests {
 
     fn old_lists() -> Vec<Value> {
         serde_json::from_str(OLD_DEFAULT_LISTS_3_1).unwrap()
+    }
+
+    #[test]
+    fn default_lists_of_3_2_are_replaced_and_big_lists_are_off() {
+        let new = get(&defaults(), "filter.lists").unwrap().as_array().unwrap().clone();
+        let old: Vec<Value> = serde_json::from_str(OLD_DEFAULT_LISTS_3_2).unwrap();
+        // 3.3：舊的清單原封不動排在前面，後面加的大清單一律預設停用
+        assert_eq!(&new[..old.len()], &old[..]);
+        assert!(new.len() > old.len());
+        assert!(new[old.len()..].iter().all(|l| l["enabled"] == false), "新加的大清單預設不勾選");
+        let user = json!({ "filter": { "lists": old } });
+        assert!(old_default_lists(&user));
+        assert_eq!(get(&build(&user), "filter.lists"), Some(&Value::Array(new.clone())));
+        // 改過一點（停用一份）就不動
+        let mut changed: Vec<Value> = serde_json::from_str(OLD_DEFAULT_LISTS_3_2).unwrap();
+        changed[0]["enabled"] = json!(false);
+        assert!(!old_default_lists(&json!({ "filter": { "lists": changed } })));
+        // 新的預設清單本身不算舊版
+        assert!(!old_default_lists(&json!({ "filter": { "lists": new } })));
     }
 
     #[test]
