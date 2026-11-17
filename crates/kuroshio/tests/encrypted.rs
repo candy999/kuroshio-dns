@@ -229,6 +229,34 @@ async fn plain_http_doh_behind_proxy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// DoQ：未驗證的握手太多時先回 Retry（這裡設成一律 Retry），正常的用戶端照樣查得到
+#[tokio::test]
+async fn doq_retry_when_many_unvalidated_handshakes() {
+    let dir = std::env::temp_dir().join(format!("kuroshio-enc-retry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let der = write_cert(&dir);
+    kuroshio::tls::add_root(der);
+    let up = upstream().await;
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "system": { "persistDir": dir.join("state").to_string_lossy() },
+        "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
+        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false }
+    }));
+    let r = kuroshio::app::build_resolver(&cfg).unwrap();
+    let certs = kuroshio::encrypted::CertStore::new(dir.join("cert.pem"), dir.join("key.pem"));
+    let limits = kuroshio::encrypted::Limits::new(32).with_retry_threshold(0);
+    let doq = kuroshio::encrypted::listen_doq("127.0.0.1:0".parse().unwrap(), certs, r, limits)
+        .await
+        .unwrap();
+    for i in 0..3u16 {
+        let u = Upstream::parse(&format!("quic://{doq}")).unwrap();
+        let m = Message::parse(&u.exchange(&q(300 + i, "retry.test"), Duration::from_secs(5)).await.unwrap()).unwrap();
+        assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn cert_hot_reload() {
     let dir = std::env::temp_dir().join(format!("kuroshio-cert-{}", std::process::id()));

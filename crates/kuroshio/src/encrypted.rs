@@ -171,25 +171,66 @@ pub struct Limits {
     max: usize,
     per_ip: usize,
     by_ip: BySource,
+    /// QUIC：還沒完成握手（來源位址還沒驗證）的連線數
+    handshaking: Arc<std::sync::atomic::AtomicUsize>,
+    /// 未驗證的握手到幾個就先要求 Retry（None = 總上限的 1/4，至少 8）
+    retry_after: Option<usize>,
 }
 
-/// 一條連線佔的名額：結束（drop）時歸還總數與這個來源的計數
-pub struct Permit {
-    _conn: tokio::sync::OwnedSemaphorePermit,
-    src: Option<(IpAddr, BySource)>,
+/// 一個來源佔的一個名額：結束（drop）時歸還
+pub struct SourceSlot {
+    key: IpAddr,
+    m: BySource,
 }
 
-impl Drop for Permit {
+impl Drop for SourceSlot {
     fn drop(&mut self) {
-        if let Some((ip, m)) = self.src.take() {
-            let mut m = m.lock().unwrap();
-            if let Some(n) = m.get_mut(&ip) {
-                *n -= 1;
-                if *n == 0 {
-                    m.remove(&ip);
-                }
+        let mut m = self.m.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.key);
             }
         }
+    }
+}
+
+/// 一條連線佔的名額：總數 + 這個來源（本機或不限時沒有）
+pub struct Permit {
+    _conn: tokio::sync::OwnedSemaphorePermit,
+    _src: Option<SourceSlot>,
+}
+
+/// QUIC 新連線佔的名額：握手期間只佔總數；握手完成（對方收得到封包 = 來源位址是真的）才計入這個來源
+pub struct QuicPermit {
+    _conn: tokio::sync::OwnedSemaphorePermit,
+    handshaking: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    _src: Option<SourceSlot>,
+}
+
+impl QuicPermit {
+    /// 握手完成：計入這個來源的名額。這個來源已經滿了回傳 false（呼叫端關閉連線）
+    pub fn established(&mut self, limits: &Limits, ip: IpAddr) -> bool {
+        self.end_handshake();
+        match limits.claim_source(ip) {
+            Ok(s) => {
+                self._src = s;
+                true
+            }
+            Err(()) => false,
+        }
+    }
+
+    fn end_handshake(&mut self) {
+        if let Some(h) = self.handshaking.take() {
+            h.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for QuicPermit {
+    fn drop(&mut self) {
+        self.end_handshake();
     }
 }
 
@@ -200,7 +241,15 @@ impl Limits {
             max: max.max(1),
             per_ip: per_ip_default(max.max(1)),
             by_ip: Default::default(),
+            handshaking: Default::default(),
+            retry_after: None,
         }
+    }
+
+    /// 未驗證的握手到幾個就先要求 Retry（0 = 一律 Retry；測試用）
+    pub fn with_retry_threshold(mut self, n: usize) -> Limits {
+        self.retry_after = Some(n);
+        self
     }
 
     /// 每個來源最多幾條（0 = 不限）
@@ -211,25 +260,64 @@ impl Limits {
         self
     }
 
-    /// 新連線：總數、記憶體、這個來源的連線數都還有空間才收。本機（反向代理）不算每個來源的上限
-    pub(crate) fn admit_from(&self, ip: IpAddr) -> Option<Permit> {
-        let conn = self.admit()?;
+    /// 這個來源再佔一個名額：Ok(None) = 不算（本機、不限），Err = 滿了
+    pub(crate) fn claim_source(&self, ip: IpAddr) -> Result<Option<SourceSlot>, ()> {
         if self.per_ip == 0 || ip.is_loopback() {
-            return Some(Permit { _conn: conn, src: None });
+            return Ok(None);
         }
         let key = source_key(ip);
-        {
-            let mut m = self.by_ip.lock().unwrap();
-            let n = m.entry(key).or_insert(0);
-            if *n >= self.per_ip {
-                return None;
-            }
-            *n += 1;
+        let mut m = self.by_ip.lock().unwrap();
+        let n = m.entry(key).or_insert(0);
+        if *n >= self.per_ip {
+            return Err(());
         }
-        Some(Permit {
-            _conn: conn,
-            src: Some((key, self.by_ip.clone())),
-        })
+        *n += 1;
+        Ok(Some(SourceSlot {
+            key,
+            m: self.by_ip.clone(),
+        }))
+    }
+
+    /// 新連線（TCP：三向交握已經證明來源位址是真的）：總數、記憶體、這個來源的連線數都還有空間才收。
+    /// 本機（反向代理）不算每個來源的上限
+    pub(crate) fn admit_from(&self, ip: IpAddr) -> Option<Permit> {
+        let src = self.claim_source(ip).ok()?;
+        let conn = self.admit()?;
+        Some(Permit { _conn: conn, _src: src })
+    }
+
+    /// 未驗證的握手超過這個數就先要求 Retry（總上限的 1/4，至少 8）
+    pub fn retry_threshold(&self) -> usize {
+        self.retry_after.unwrap_or((self.max / 4).max(8))
+    }
+
+    /// QUIC 新連線（UDP 的來源位址可以偽造）：
+    /// - 進行中、來源還沒驗證的握手太多時，先回 Retry 要求對方證明收得到封包（平常不多一次往返）；
+    /// - 握手期間只佔總數，不佔「每個來源」的名額：偽造來源的 Initial 握手永遠完成不了，佔不到真實使用者的名額。
+    ///
+    /// 回傳 None = 已經處理掉（Retry 或拒絕），呼叫端不必再管這個 Incoming
+    pub(crate) fn admit_quic(&self, incoming: quinn::Incoming) -> Option<(quinn::Incoming, QuicPermit)> {
+        use std::sync::atomic::Ordering;
+        if !incoming.remote_address_validated() && self.handshaking.load(Ordering::Relaxed) >= self.retry_threshold() {
+            // 沒驗證過的一定可以 Retry（quinn 保證）；萬一不行就拒絕
+            if let Err(e) = incoming.retry() {
+                e.into_incoming().refuse();
+            }
+            return None;
+        }
+        let Some(conn) = self.admit() else {
+            incoming.refuse();
+            return None;
+        };
+        self.handshaking.fetch_add(1, Ordering::Relaxed);
+        Some((
+            incoming,
+            QuicPermit {
+                _conn: conn,
+                handshaking: Some(self.handshaking.clone()),
+                _src: None,
+            },
+        ))
     }
 
     pub(crate) fn admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -664,15 +752,19 @@ pub async fn listen_doq(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
                 incoming.ignore(); // 存取控制：不回任何封包
                 continue;
             }
-            let Some(permit) = limits.admit_from(incoming.remote_address().ip()) else {
-                incoming.refuse();
+            let Some((incoming, mut permit)) = limits.admit_quic(incoming) else {
                 continue;
             };
-            let r = resolver.clone();
+            let (r, limits) = (resolver.clone(), limits.clone());
             tokio::spawn(async move {
-                let _permit = permit;
                 let Ok(conn) = incoming.await else { return };
                 let client = conn.remote_address().ip();
+                // 握手完成才計入這個來源的名額；滿了用 DOQ_EXCESSIVE_LOAD（0x4）關閉
+                if !permit.established(&limits, client) {
+                    conn.close(0x4u32.into(), b"");
+                    return;
+                }
+                let _permit = permit;
                 let proto = conn
                     .handshake_data()
                     .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -730,15 +822,19 @@ pub async fn listen_doh3(
                 incoming.ignore(); // 存取控制：不回任何封包
                 continue;
             }
-            let Some(permit) = limits.admit_from(incoming.remote_address().ip()) else {
-                incoming.refuse();
+            let Some((incoming, mut permit)) = limits.admit_quic(incoming) else {
                 continue;
             };
-            let (r, o) = (resolver.clone(), opts.clone());
+            let (r, o, limits) = (resolver.clone(), opts.clone(), limits.clone());
             tokio::spawn(async move {
-                let _permit = permit;
                 let Ok(conn) = incoming.await else { return };
                 let peer = conn.remote_address().ip();
+                // 握手完成才計入這個來源的名額；滿了用 H3_EXCESSIVE_LOAD（0x107）關閉
+                if !permit.established(&limits, peer) {
+                    conn.close(0x107u32.into(), b"");
+                    return;
+                }
+                let _permit = permit;
                 let Ok(mut h3c) = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn)).await else {
                     return;
                 };
@@ -823,6 +919,27 @@ mod tests {
         assert_eq!(per_ip_default(128), 16);
         assert_eq!(per_ip_default(2048), 64);
         assert_eq!(per_ip_default(32), 8);
+        // QUIC：握手期間只佔總數，握手完成才計入這個來源；滿了 established 回 false
+        let q = Limits::new(64).with_per_ip(Some(1));
+        let ip_a: IpAddr = "198.51.100.9".parse().unwrap();
+        let mk = |l: &Limits| {
+            l.handshaking.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            QuicPermit {
+                _conn: l.admit().unwrap(),
+                handshaking: Some(l.handshaking.clone()),
+                _src: None,
+            }
+        };
+        let (mut h1, mut h2, h3) = (mk(&q), mk(&q), mk(&q));
+        assert_eq!(q.handshaking.load(std::sync::atomic::Ordering::Relaxed), 3, "握手中的不佔來源名額");
+        assert!(h1.established(&q, ip_a));
+        assert!(!h2.established(&q, ip_a), "這個來源滿了");
+        drop(h3);
+        assert_eq!(q.handshaking.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop((h1, h2));
+        assert!(q.claim_source(ip_a).unwrap().is_some(), "連線結束就還回來");
+        assert_eq!(Limits::new(64).retry_threshold(), 16);
+        assert_eq!(Limits::new(16).retry_threshold(), 8);
         // 0 = 不限
         let u = Limits::new(64).with_per_ip(Some(0));
         let held: Vec<_> = (0..10).map(|_| u.admit_from(a).unwrap()).collect();
