@@ -23,7 +23,7 @@
 - **系統功能**：`/proc/meminfo`、`/proc/mounts`、`/proc/self/status`、`/proc/net/if_inet6`；`/proc/pressure/memory` 有就用、沒有就略過；`/dev/urandom`（舊核心沒有 `getrandom` 系統呼叫時使用）；epoll。
 - **權限**：監聽 53 埠需要 root（或 `CAP_NET_BIND_SERVICE`）；程式會把自己的 `oom_score_adj` 設成 -500（需要 root，做不到只記警告）。其他都不需要 root。
 - **檔案描述元**：背景工作會同時開很多連線，建議 `ulimit -n 65535`。
-- **記憶體與 Flash**：見 [選硬體、選套件](docs/hardware.md)；128 MB 記憶體可以用，64 MB 以下不支援。
+- **記憶體與 Flash**：見 [選硬體](docs/hardware.md)；128 MB 記憶體可以用，64 MB 以下不支援。
 
 ## 2. 通用 Linux 包
 

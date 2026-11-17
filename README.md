@@ -193,7 +193,7 @@
 | Flash | 16 MB（安裝後剩 4 MB 以上） | 32 MB 以上或 NAND | 128 MB 以上，或外接儲存 |
 | CPU | MIPS 24Kc 單核 ~575 MHz | 雙核（MT7621、Cortex-A53） | ARMv8 四核、x86 |
 
-各平台常見機種的規格與建議見 [選硬體、選套件](docs/hardware.md)。
+該買哪一台、手邊的機器能不能用，見 [選硬體](docs/hardware.md)（依預算推薦；舊機的刷機資料在 [各機種刷機資料](docs/hardware-details.md)）。
 
 ## 支援平台
 
@@ -205,7 +205,7 @@
 | **x86**（64 位元） | 軟路由小主機（N100、J4125…）、虛擬機 | `x86_64` |
 
 - OpenWrt 24.10 用 `.ipk`、25.12 以後用 `.apk`；Windows 10 / 11（x86_64）有 Windows 版，其他 Linux 用上面各 CPU 的靜態執行檔。
-- **不知道該選哪個、想知道各晶片的規格夠不夠用：見 [選硬體、選套件](docs/hardware.md)**（常見機種的 CPU、記憶體、儲存，以及跑黑潮 DNS 的建議）。
+- **不知道該買哪一台：見 [選硬體](docs/hardware.md)**（依預算推薦的機種、N100 軟路由 + AP、低階機改用 padavan-tw）。
 
 ## 開發進度
 
@@ -236,7 +236,7 @@
 
 到 GitHub **[Releases](https://github.com/candy999/kuroshio-dns/releases)** 下載。
 
-**OpenWrt**：先在路由器執行 `cat /etc/openwrt_release`，看 `DISTRIB_RELEASE`（OpenWrt 版本）和 `DISTRIB_ARCH`（套件架構），下載 `kuroshio-openwrt-<版本>-<架構>.zip`，例如 OpenWrt 24.10 的 NanoPi R2S 下載 `kuroshio-openwrt-24.10-aarch64_generic.zip`。不知道選哪個見 [選硬體、選套件](docs/hardware.md)。
+**OpenWrt**：先在路由器執行 `cat /etc/openwrt_release`，看 `DISTRIB_RELEASE`（OpenWrt 版本）和 `DISTRIB_ARCH`（套件架構），下載 `kuroshio-openwrt-<版本>-<架構>.zip`，例如 OpenWrt 24.10 的 NanoPi R2S 下載 `kuroshio-openwrt-24.10-aarch64_generic.zip`。不知道選哪個見 [選硬體](docs/hardware.md)。
 
 壓縮檔裡有 `kuroshio`、`luci-app-kuroshio` 兩個套件與一鍵安裝腳本：
 
