@@ -21,12 +21,7 @@ var JOBS = { 'dns-benchmark': _('DNS 評測'), 'cdn-ranges': _('CDN IP 範圍'),
 function fmtNum(n) { return (n == null) ? '-' : Number(n).toLocaleString(); }
 function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
 function fmtTime(t, mode) { return common.time(t, mode); }
-function fmtBytes(b) {
-	if (b == null) return '-';
-	if (b < 1024) return b + ' B';
-	if (b < 1048576) return (b / 1024).toFixed(0) + ' KB';
-	return (b / 1048576).toFixed(1) + ' MB';
-}
+function fmtBytes(b) { return common.bytes(b); }
 /* 還沒存的時間：0 = 都存了 */
 function fmtAge(s) {
 	if (s == null) return '-';
@@ -69,7 +64,9 @@ if (common.build !== BUILD) (function() {
 	var tried = false;
 	try { tried = !!window.sessionStorage.getItem(key); window.sessionStorage.setItem(key, '1'); } catch (e) {}
 	if (!tried && window.fetch)
-		Promise.all(files.map(function(f) { return fetch(L.env.base_url + '/' + f + '.js' + v, { cache: 'reload' }).catch(function() {}); }))
+		// kuroshio/ui-core.js（共用邏輯）由 kuroshio/ui.js 用 ?v=BUILD 載入，一起更新
+		Promise.all(files.map(function(f) { return L.env.base_url + '/' + f + '.js' + v; }).concat([L.env.base_url + '/kuroshio/ui-core.js?v=' + BUILD])
+			.map(function(u) { return fetch(u, { cache: 'reload' }).catch(function() {}); }))
 			.then(function() { window.location.reload(); });
 	else
 		ui.addNotification(null, E('p', {}, _('瀏覽器還在用舊版黑潮 DNS 的介面檔案（快取），部分功能可能沒有反應。請清除這個網站的瀏覽資料，或改用無痕視窗開啟。')), 'warning');
@@ -77,7 +74,7 @@ if (common.build !== BUILD) (function() {
 
 return view.extend({
 	load: function() {
-		return Promise.all([uci.load('kuroshio'), L.resolveDefault(callStatus(), {}), L.resolveDefault(callAcmeStatus(), null)]);
+		return Promise.all([uci.load('kuroshio'), L.resolveDefault(callStatus(), {}), L.resolveDefault(callAcmeStatus(), null), common.ready]);
 	},
 
 	/** 立即儲存學習資料（POST /api/persist/flush）：顯示時間、寫了幾份、多大 */
@@ -221,7 +218,7 @@ return view.extend({
 		var actions = common.section(_('操作'), [
 			E('div', { 'class': 'kuroshio-row' }, [
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/cache/flush').then(function(r) { common.notify(r, _('快取已清除')); }); }) }, _('清除快取')),
-				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/filter/update').then(function(r) { common.notify(r, _('已重新下載過濾清單')); }); }) }, _('更新過濾清單')),
+				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.filterUpdate().then(function(r) { common.notify(r, r && r.changed === false ? _('過濾清單沒有變化') : _('已重新下載過濾清單')); }); }) }, _('更新過濾清單')),
 				E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(self, function() { return common.action('/api/ddns/update').then(function(r) { common.notify(r, _('DDNS 已更新')); }); }) }, _('立即更新 DDNS'))
 			]),
 			E('div', { 'class': 'kuroshio-row', 'style': 'margin-top:.6em' }, [

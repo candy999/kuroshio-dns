@@ -140,7 +140,9 @@ if (common.build !== BUILD) (function() {
 	var tried = false;
 	try { tried = !!window.sessionStorage.getItem(key); window.sessionStorage.setItem(key, '1'); } catch (e) {}
 	if (!tried && window.fetch)
-		Promise.all(files.map(function(f) { return fetch(L.env.base_url + '/' + f + '.js' + v, { cache: 'reload' }).catch(function() {}); }))
+		// kuroshio/ui-core.js（共用邏輯）由 kuroshio/ui.js 用 ?v=BUILD 載入，一起更新
+		Promise.all(files.map(function(f) { return L.env.base_url + '/' + f + '.js' + v; }).concat([L.env.base_url + '/kuroshio/ui-core.js?v=' + BUILD])
+			.map(function(u) { return fetch(u, { cache: 'reload' }).catch(function() {}); }))
 			.then(function() { window.location.reload(); });
 	else
 		ui.addNotification(null, E('p', {}, _('瀏覽器還在用舊版黑潮 DNS 的介面檔案（快取），部分功能可能沒有反應。請清除這個網站的瀏覽資料，或改用無痕視窗開啟。')), 'warning');
@@ -148,9 +150,10 @@ if (common.build !== BUILD) (function() {
 
 return view.extend({
 	load: function() {
+		// 最後一個是 common.ready（共用邏輯 ui-core.js 載入完成），render 前拿掉
 		return Promise.all([common.loadDefaults()].concat(FILES.map(function(f) {
 			return L.resolveDefault(fs.read(path(f[0])), '');
-		})));
+		}), [common.ready])).then(function(r) { return r.slice(0, -1); });
 	},
 
 	render: function(data) {

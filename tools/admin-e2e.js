@@ -112,6 +112,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         const js = await raw(adminPort, 'GET', '/app.js');
         check(js.status === 200 && /javascript/.test(js.headers['content-type']), '靜態檔 app.js');
         check(!/innerHTML|insertAdjacentHTML|document\.write|outerHTML/.test(js.body), 'app.js 不用 innerHTML（伺服器字串一律 textContent）');
+        const uc = await raw(adminPort, 'GET', '/shared/ui-core.js');
+        check(uc.status === 200 && /javascript/.test(uc.headers['content-type']) && /KuroshioUiCore/.test(uc.body), '介面共用邏輯 /shared/ui-core.js（data/shared/）');
         const fj = await raw(adminPort, 'GET', '/fields.json');
         let fields = null;
         try { fields = JSON.parse(fj.body); } catch (e) { /* 下面報錯 */ }

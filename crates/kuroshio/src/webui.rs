@@ -35,6 +35,8 @@ pub struct WebUi {
     pub static_dir: PathBuf,
     /// 共用儀表板（dashboard.js、dashboard.css）：設定頁用 `/dashboard/<檔名>` 載入
     pub dashboard_dir: PathBuf,
+    /// 介面共用邏輯（ui-core.js）：設定頁用 `/shared/<檔名>` 載入
+    pub shared_dir: PathBuf,
     /// 用 JSON 設定檔執行時的路徑（UCI 時沒有：設定走 LuCI）
     pub config_file: OnceLock<PathBuf>,
     /// 執行方式（cmd / 服務），給設定頁顯示
@@ -231,18 +233,23 @@ impl WebUi {
             .map(PathBuf::from)
             .unwrap_or_else(|| share_dir.join("admin"));
         let sessions = token.as_deref().map(session_store).unwrap_or_default();
-        // 設定頁資料夾旁邊的 dashboard/（開發時 admin.webDir 指到原始碼的 data/admin），沒有再用 share/dashboard
-        let dashboard_dir = static_dir
-            .parent()
-            .map(|p| p.join("dashboard"))
-            .filter(|d| d.is_dir())
-            .unwrap_or_else(|| share_dir.join("dashboard"));
+        // 設定頁資料夾旁邊的 dashboard/、shared/（開發時 admin.webDir 指到原始碼的 data/admin），沒有再用 share/ 底下的
+        let sibling = |name: &str| {
+            static_dir
+                .parent()
+                .map(|p| p.join(name))
+                .filter(|d| d.is_dir())
+                .unwrap_or_else(|| share_dir.join(name))
+        };
+        let dashboard_dir = sibling("dashboard");
+        let shared_dir = sibling("shared");
         WebUi {
             token,
             token_file,
             sessions,
             static_dir,
             dashboard_dir,
+            shared_dir,
             config_file: OnceLock::new(),
             run_mode: OnceLock::new(),
             about: crate::about::json(cfg),
@@ -320,13 +327,14 @@ impl WebUi {
             .is_some_and(|c| self.sessions.lock().unwrap().get(c).is_some_and(|at| at.elapsed() < SESSION_TTL))
     }
 
-    /// 讀靜態檔（只允許 static_dir 底下的一層檔名；`dashboard/<檔名>` 是共用儀表板）
+    /// 讀靜態檔（只允許 static_dir 底下的一層檔名；`dashboard/<檔名>` 是共用儀表板、`shared/<檔名>` 是介面共用邏輯）
     pub fn static_file(&self, path: &str) -> Option<(&'static str, Vec<u8>)> {
         let (dir, name) = match path.trim_start_matches('/') {
             "" => (&self.static_dir, "index.html"),
-            p => match p.strip_prefix("dashboard/") {
-                Some(n) => (&self.dashboard_dir, n),
-                None => (&self.static_dir, p),
+            p => match (p.strip_prefix("dashboard/"), p.strip_prefix("shared/")) {
+                (Some(n), _) => (&self.dashboard_dir, n),
+                (_, Some(n)) => (&self.shared_dir, n),
+                _ => (&self.static_dir, p),
             },
         };
         if name.contains('/') || name.contains('\\') || name.starts_with('.') {
@@ -494,6 +502,8 @@ mod tests {
         std::fs::create_dir_all(base.join("admin")).unwrap();
         std::fs::create_dir_all(base.join("dashboard")).unwrap();
         std::fs::write(base.join("dashboard/dashboard.js"), "x").unwrap();
+        std::fs::create_dir_all(base.join("shared")).unwrap();
+        std::fs::write(base.join("shared/ui-core.js"), "y").unwrap();
         std::fs::write(base.join("admin/index.html"), "<p>").unwrap();
         let w = WebUi::new(
             &json!({ "admin": { "auth": false, "webDir": base.join("admin").to_string_lossy() } }),
@@ -506,6 +516,11 @@ mod tests {
         );
         assert!(w.static_file("/dashboard/../admin/index.html").is_none());
         assert!(w.static_file("/dashboard/nope.js").is_none());
+        assert_eq!(
+            w.static_file("/shared/ui-core.js").unwrap(),
+            ("text/javascript; charset=utf-8", b"y".to_vec())
+        );
+        assert!(w.static_file("/shared/../admin/index.html").is_none());
         assert!(w.static_file("/").is_some());
         std::fs::remove_dir_all(&base).unwrap();
     }

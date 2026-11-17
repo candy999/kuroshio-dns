@@ -52,6 +52,11 @@ jobs:
           node-version: 22
       - name: LuCI 語法
         run: node openwrt/tools/check-luci.js luci-app-kuroshio
+      # data/ 的 .js / .css 不能有 Padavan httpd 會解析的模板標記；介面共用邏輯（data/shared/ui-core.js）的測試向量
+      - name: 共用網頁檔（Padavan 相容、ui-core 測試向量）
+        run: |
+          node tools/check-data-assets.js
+          node tools/ui-core-test.js
       # Windows 本機設定頁（data/admin）：debug 執行檔 + Playwright，腳本自己用暫存設定檔啟動 kuroshio
       - name: 編譯（設定頁測試用，debug）
         run: cargo build -p kuroshio

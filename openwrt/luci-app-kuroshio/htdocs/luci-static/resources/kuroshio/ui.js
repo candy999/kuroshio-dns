@@ -170,99 +170,61 @@ function keepNumbers(text) {
 	return out;
 }
 
-/**
- * 日期時間一律用台灣習慣的固定格式，不跟瀏覽器語系（英文瀏覽器原本會顯示 11/12/2026, 10:22:03 AM）：
- * fmtTime(t) = 2026-11-12 10:22（24 小時制）；mode 'sec' 加秒、'date' 只有日期、'time' = 10:22、'timesec' = 10:22:03。
- * 跟共用儀表板 data/dashboard/dashboard.js 的 KuroshioDashboard.fmtTime 同一份規則（LuCI 其他頁沒有載入儀表板，所以放一份在這裡）。
+/*
+ * 跟介面框架無關的共用邏輯（日期時間格式、恢復預設清單的比對、憑證涵蓋…）在 kuroshio/ui-core.js
+ * （repo 的 data/shared/ui-core.js，跟 Windows 設定頁、第三方韌體同一份），用 <script> 載入成全域的 KuroshioUiCore。
+ * 網址帶 ?v=BUILD：升級後一定拿到新的檔案，不會被瀏覽器快取的舊版擋住。
+ * 每個頁面的 load() 都要等 common.ready（載入完成）之後才用 time() / restorePlan() 這些函式。
  */
-function p2(n) { return (n < 10 ? '0' : '') + n; }
+var CORE_NAME = 'kuroshio/ui-core.js';
+var coreReady = null;
+function core() { return window.KuroshioUiCore || null; }
+function loadCore(build) {
+	if (coreReady) return coreReady;
+	if (core()) return (coreReady = Promise.resolve(true));
+	coreReady = new Promise(function(resolve) {
+		var n = document.createElement('script');
+		n.src = L.env.base_url + '/' + CORE_NAME + '?v=' + encodeURIComponent(build);
+		n.onload = function() { resolve(!!core()); };
+		n.onerror = function() { resolve(false); };
+		document.head.appendChild(n);
+	}).then(function(ok) {
+		if (!ok)
+			ui.addNotification(null, E('p', {}, _('讀不到 /luci-static/resources/kuroshio/ui-core.js（luci-app-kuroshio 安裝不完整？請重新安裝）')), 'danger');
+		return ok;
+	});
+	return coreReady;
+}
+/** ui-core.js 沒載入成功時：明確的錯誤（呼叫的地方會顯示原因），不要變成看不懂的 TypeError */
+function needCore() {
+	var c = core();
+	if (!c) throw new Error(_('讀不到 kuroshio/ui-core.js（luci-app-kuroshio 安裝不完整？請重新安裝）'));
+	return c;
+}
+
+/** 日期時間：2026-11-12 10:22（固定格式，規則見 ui-core.js 的 fmtTime）；ui-core.js 沒載入時原樣顯示 */
 function fmtTime(t, mode) {
-	if (t == null || t === '' || t === 0) return '-';
-	var d = new Date(typeof t === 'number' || /^\d+$/.test(t) ? Number(t) : t);
-	if (isNaN(d)) return String(t);
-	var date = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
-	var hm = p2(d.getHours()) + ':' + p2(d.getMinutes()), sec = ':' + p2(d.getSeconds());
-	return mode === 'date' ? date : mode === 'time' ? hm : mode === 'timesec' ? hm + sec : date + ' ' + hm + (mode === 'sec' ? sec : '');
+	var c = core();
+	if (c) return c.fmtTime(t, mode);
+	return (t == null || t === '' || t === 0) ? '-' : String(t);
 }
 
 /**
- * 「恢復預設清單」要怎麼改（跟 Windows 設定頁 data/admin/app.js 的 restorePlan 同一份規則）。
- * cur / defs：{ name, url, category, enabled(布林), protect(布林或 undefined) }；cur 可以多帶 ref（UCI 區段 ID）。
- * 對應方式：先用網址找，找不到再用名稱找（所以只改了網址的預設清單會被改回預設網址）。
- * 網址不在預設裡的是使用者自己加的：保留、排在預設清單後面（removeOwn = true 時移除）。
- * 回傳 { result: [{ def | own, from }], changes: { add, remove, url, enabled, other, keep, reorder, count } }
+ * 「恢復預設清單」要怎麼改（規則見 ui-core.js 的 restorePlan，跟 Windows 設定頁同一份）。
+ * cur 可以多帶 ref（UCI 區段 ID）；回傳 { result: [{ def | own, raw, from }], changes }
  */
 function restorePlan(cur, defs, removeOwn) {
-	var norm = function(x) {
-		var p = x.protect;
-		return { name: String(x.name || ''), url: String(x.url || '').trim(), category: x.category || 'ads', enabled: x.enabled !== false,
-			protect: (p === undefined || p === null || p === '') ? undefined : !!p, ref: x.ref };
-	};
-	cur = (cur || []).map(norm);
-	defs = (defs || []).map(norm);
-	var used = cur.map(function() { return false; }), match = defs.map(function() { return -1; });
-	var find = function(test) {
-		for (var j = 0; j < cur.length; j++) if (!used[j] && test(cur[j])) { used[j] = true; return j; }
-		return -1;
-	};
-	defs.forEach(function(d, i) { match[i] = find(function(c) { return c.url === d.url; }); });
-	defs.forEach(function(d, i) { if (match[i] < 0) match[i] = find(function(c) { return c.name !== '' && c.name === d.name; }); });
-	var defUrl = {};
-	defs.forEach(function(d) { defUrl[d.url] = true; });
-	var ch = { add: [], remove: [], url: [], enabled: [], other: [], keep: [], reorder: false, count: 0 };
-	var result = [];
-	defs.forEach(function(d, i) {
-		var j = match[i];
-		result.push({ def: d, from: j });
-		if (j < 0) { ch.add.push(d); return; }
-		var c = cur[j], o = [];
-		if (c.url !== d.url) ch.url.push({ name: d.name, from: c.url, to: d.url });
-		if (c.enabled !== d.enabled) ch.enabled.push({ name: d.name, from: c.enabled, to: d.enabled });
-		if (c.name !== d.name) o.push({ what: 'name', from: c.name, to: d.name });
-		if (c.category !== d.category) o.push({ what: 'category', from: c.category, to: d.category });
-		if (c.protect !== d.protect) o.push({ what: 'protect', from: c.protect, to: d.protect });
-		if (o.length) ch.other.push({ name: d.name, diffs: o });
-	});
-	cur.forEach(function(c, j) {
-		if (used[j]) return;
-		var own = !defUrl[c.url];
-		if (own && !removeOwn) { result.push({ own: c, from: j }); ch.keep.push(c); }
-		else ch.remove.push({ name: c.name, url: c.url, own: own });
-	});
-	var order = result.filter(function(r) { return r.from >= 0; }).map(function(r) { return r.from; });
-	ch.reorder = order.some(function(v, i) { return i > 0 && v < order[i - 1]; });
-	ch.count = ch.add.length + ch.remove.length + ch.url.length + ch.enabled.length + ch.other.length + (ch.reorder ? 1 : 0);
-	return { result: result, changes: ch };
+	return needCore().restorePlan(cur, defs, removeOwn);
 }
 
-var CAT = { ads: _('廣告 / 追蹤'), telemetry: _('遙測 / 驗證'), malware: _('惡意 / 詐騙') };
-var onOff = function(v) { return v ? _('啟用') : _('停用'); };
-var protName = function(v) { return v === undefined ? _('自動') : v ? _('保護') : _('不保護'); };
-
-/** 「恢復預設清單」確認視窗裡的變更清單（節點） */
+/** 「恢復預設清單」確認視窗裡的變更清單（節點；文字由 ui-core.js 的 restoreSummary 產生） */
 function restoreSummary(ch) {
-	if (!ch.count) return E('p', { 'class': 'kuroshio-restore-none' }, _('目前的訂閱清單已經跟這個版本的預設一樣，不需要變更。'));
-	var block = function(cls, title, items) {
-		if (!items.length) return '';
-		return E('div', { 'class': 'kuroshio-restore-' + cls }, [T('strong', {}, title),
-			E('ul', { 'style': 'margin:.2em 0 .6em 1.2em' }, items.map(function(x) { return T('li', {}, x); }))]);
-	};
-	var otherText = function(o) {
-		return o.name + '：' + o.diffs.map(function(x) {
-			if (x.what === 'name') return _('名稱「%s」→「%s」').format(x.from, x.to);
-			if (x.what === 'category') return _('分類「%s」→「%s」').format(CAT[x.from] || x.from, CAT[x.to] || x.to);
-			return _('保護「%s」→「%s」').format(protName(x.from), protName(x.to));
-		}).join('、');
-	};
-	return E('div', { 'class': 'kuroshio-restore-list' }, [
-		block('add', _('會新增（%d）').format(ch.add.length), ch.add.map(function(d) { return d.name + '（' + onOff(d.enabled) + '）'; })),
-		block('remove', _('會移除（%d）').format(ch.remove.length), ch.remove.map(function(d) { return (d.name || d.url) + (d.own ? _('（自己加的）') : _('（重複的預設清單）')); })),
-		block('url', _('網址改回預設（%d）').format(ch.url.length), ch.url.map(function(d) { return d.name + '：' + d.from + ' → ' + d.to; })),
-		block('enabled', _('啟用狀態改回預設（%d）').format(ch.enabled.length), ch.enabled.map(function(d) { return d.name + '：' + onOff(d.from) + ' → ' + onOff(d.to); })),
-		block('other', _('名稱 / 分類 / 保護改回預設（%d）').format(ch.other.length), ch.other.map(otherText)),
-		ch.reorder ? block('reorder', _('順序'), [_('改回預設的順序（自己加的清單排在預設清單後面）')]) : '',
-		block('keep', _('保留你自己加的清單（%d，排在預設清單後面）').format(ch.keep.length), ch.keep.map(function(d) { return d.name || d.url; }))
-	]);
+	var sum = needCore().restoreSummary(ch, function(s) { return _(s); });
+	if (sum.empty) return E('p', { 'class': 'kuroshio-restore-none' }, sum.empty);
+	return E('div', { 'class': 'kuroshio-restore-list' }, sum.blocks.map(function(b) {
+		return E('div', { 'class': 'kuroshio-restore-' + b.cls }, [T('strong', {}, b.title),
+			E('ul', { 'style': 'margin:.2em 0 .6em 1.2em' }, b.items.map(function(x) { return T('li', {}, x); }))]);
+	}));
 }
 
 var SCOPE = { 'public': _('公網'), 'private': _('私有'), 'cgnat': _('電信商 CGNAT'), 'linklocal': _('鏈路本地'), 'ula': _('區網 IPv6'), 'loopback': _('本機') };
@@ -274,12 +236,18 @@ var BUILD = '3.2.1';
 return baseclass.extend({
 	build: BUILD,
 
+	/** ui-core.js 載入完成（true）或失敗（false）；每個頁面的 load() 要等它 */
+	ready: loadCore(BUILD),
+
 	defaults: {},
 
 	T: T,
 
 	/** 日期時間（固定格式，見上方 fmtTime） */
 	time: fmtTime,
+
+	/** 位元組 → 1023 B / 12 KB / 1.5 MB（ui-core.js 的 fmtBytes） */
+	bytes: function(b) { return needCore().fmtBytes(b); },
 
 	/** 恢復預設清單：比對與變更清單（見上方 restorePlan） */
 	restorePlan: restorePlan,
@@ -374,17 +342,8 @@ return baseclass.extend({
 		return E('span', {}, [T('code', { 'style': 'word-break:break-all' }, p), this.copyButton(String(p))]);
 	},
 
-	/** 憑證（/api/paths 的 tls.info）有沒有涵蓋這個網域（含萬用字元） */
-	certCovers: function(info, domain) {
-		var d = String(domain || '').replace(/\.$/, '').toLowerCase();
-		return String((info && info.san) || '').split(', ').some(function(n) {
-			if (n.slice(0, 4) !== 'DNS:') return false;
-			n = n.slice(4).toLowerCase();
-			if (n === d) return true;
-			var i = d.indexOf('.');
-			return n.slice(0, 2) === '*.' && i > 0 && d.slice(i + 1) === n.slice(2);
-		});
-	},
+	/** 憑證（/api/paths 的 tls.info）有沒有涵蓋這個網域（含萬用字元；ui-core.js 的 certCovers） */
+	certCovers: function(info, domain) { return needCore().certCovers(info, domain); },
 
 	scopeName: function(s) { return SCOPE[s] || s || ''; },
 
@@ -451,6 +410,31 @@ return baseclass.extend({
 	api: function(path, params) { return rpcCall(callApi, path, this.query(params), 2); },
 	// 動作（加好友、同步…）不自動重試：可能已經送到、只是回應被斷掉，重送會重複執行
 	action: function(path, params) { return rpcCall(callAction, path, this.query(params), 0); },
+
+	/**
+	 * 立即更新過濾清單。核心 API 2 起是背景執行：開始後每 2 秒看一次狀態，等到這一次（runId）結束，
+	 * 回 { ok, changed } 或 { ok: false, error }（最多等 5 分鐘）。舊版核心會直接回結果
+	 */
+	filterUpdate: function() {
+		var self = this;
+		return this.action('/api/filter/update').then(function(r) {
+			if (!r || r.ok === false || r.runId == null) return r;
+			var id = r.runId, deadline = Date.now() + 300000;
+			var poll = function() {
+				return new Promise(function(done) { window.setTimeout(done, 2000); }).then(function() {
+					return self.api('/api/status');
+				}).then(function(st) {
+					var u = st && st.filter && st.filter.update;
+					if (u && u.runId >= id && u.state === 'idle')
+						return u.error ? { ok: false, error: u.error } : { ok: true, changed: u.changed };
+					if (Date.now() > deadline)
+						return { ok: false, error: _('更新還在背景進行，請稍後到狀態頁查看') };
+					return poll();
+				});
+			};
+			return poll();
+		});
+	},
 
 	query: function(params) {
 		return Object.keys(params || {}).map(function(k) {

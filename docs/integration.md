@@ -224,6 +224,31 @@ kuroshio notify save [-c 設定檔] [--uci]
 
 打包時請把執行檔與**同一版的 data/ 整個**一起放（OpenWrt 套件放在 `/usr/share/kuroshio/`，含 `manifest.json`；Windows 壓縮檔放在執行檔旁的 `data\`）。發行新版時 `manifest.json` 的 `version` 要跟著改（有單元測試檢查）。
 
+## 網頁共用檔（自己的管理頁面要嵌入時）
+
+第三方韌體（Padavan 等）可以把 data/ 底下的網頁檔直接放進自己的網頁目錄，用一般的 `<script>` 載入，不需要編譯、也不依賴任何框架：
+
+| 檔案 | 全域名稱 | 內容 |
+|---|---|---|
+| `data/dashboard/dashboard.js`、`dashboard.css` | `KuroshioDashboard` | 共用儀表板（圖表、表格），資料從轉接器拿，見 [規格 02 第 7.3 節](spec/02-architecture.md) |
+| `data/shared/ui-core.js` | `KuroshioUiCore` | 跟介面框架無關的純函式（不碰 DOM、不發請求），LuCI 與 Windows 設定頁用的是同一份 |
+
+`KuroshioUiCore` 的函式：
+
+| 函式 | 說明 |
+|---|---|
+| `fmtTime(t, mode, tzOffsetMin)` | 日期時間固定格式：`2026-11-12 10:22`；`mode` = `'sec'`（加秒）、`'date'`、`'time'`、`'timesec'`。`t` 是毫秒、毫秒字串或 ISO 字串，空的回 `-`。`tzOffsetMin` 指定時區（UTC 往東幾分鐘，台灣 = 480），不給 = 瀏覽器的本地時區 |
+| `fmtBytes(b)` | `1023 B`、`12 KB`、`1.5 MB` |
+| `certCovers(info, domain)` | 憑證（`san` = `DNS:a.example.com, DNS:*.example.net`）有沒有涵蓋這個網域，含萬用字元 |
+| `restorePlan(cur, defs, removeOwn)` | 「恢復預設清單」：比對目前的過濾清單與預設清單（先比網址、再比名稱），回傳新的順序 `result` 與變更 `changes`（新增、移除、網址、啟用、其他、保留、順序、`count`） |
+| `restoreSummary(changes, tr)` | 把 `changes` 變成要顯示的文字：`{ empty, blocks: [{ cls, title, items }] }`，畫面自己組；`tr` 是翻譯函式（可省略） |
+| `format(template, args)` | `%s` / `%d` 代換 |
+
+- 也可以在 Node 用 `require('data/shared/ui-core.js')`（有 `module.exports`）。語法是 ES5，舊瀏覽器也能用。
+- 每個函式的輸入與預期輸出在 `data/shared/ui-core.tests.json`，自己移植或改寫時可以拿來對照；CI 用 `node tools/ui-core-test.js` 逐一檢查（`dashboard.js` 的 `fmtTime` 也用同一組向量檢查）。
+- **Padavan httpd 的限制**：它會解析 `.js` 檔裡的模板標記，所以 data/ 底下所有 `.js`、`.css` 都不會出現 `<%`、`%>`、`<#`、`#>` 這四種組合（註解、字串、正規表示式都算）。CI 用 `node tools/check-data-assets.js` 檢查，出現時列出檔名與行號並失敗。
+- 版本跟執行檔一起走：請用跟執行檔同一版的 data/。LuCI 載入時網址帶 `?v=版本`，升級後瀏覽器不會拿到快取的舊檔；自己嵌入時建議也這樣做。
+
 ## 給整合者的建議
 
 - **健康檢查**用 `kuroshio health`（不需要管理 API、不需要 token，成本很低，可以每幾秒跑一次）；要細節才用 `kuroshio status --json`。

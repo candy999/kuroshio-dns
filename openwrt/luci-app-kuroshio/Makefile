@@ -10,7 +10,7 @@ PKG_LICENSE:=GPL-3.0-or-later
 
 include $(INCLUDE_DIR)/package.mk
 
-# 共用儀表板（data/dashboard：公開頁、Windows 設定頁、LuCI 同一份）在 repo 的 data/ 底下
+# 共用儀表板（data/dashboard：公開頁、Windows 設定頁、LuCI 同一份）與介面共用邏輯（data/shared/ui-core.js）在 repo 的 data/ 底下
 REPO_ROOT:=$(CURDIR)/../..
 
 define Package/luci-app-kuroshio
@@ -36,6 +36,7 @@ define Package/luci-app-kuroshio/install
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/kuroshio_ui/*.js $(1)/www/luci-static/resources/view/kuroshio_ui/
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/kuroshio/*.js $(1)/www/luci-static/resources/kuroshio/
 	$(INSTALL_DATA) $(REPO_ROOT)/data/dashboard/dashboard.js $(REPO_ROOT)/data/dashboard/dashboard.css $(1)/www/luci-static/resources/kuroshio/
+	$(INSTALL_DATA) $(REPO_ROOT)/data/shared/ui-core.js $(1)/www/luci-static/resources/kuroshio/ui-core.js
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-kuroshio.json $(1)/usr/share/luci/menu.d/
 	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-kuroshio.json $(1)/usr/share/rpcd/acl.d/

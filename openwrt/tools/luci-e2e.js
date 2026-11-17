@@ -167,6 +167,12 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
 
     for (const p of PAGES) {
         const text = await visit(p, 'simple');
+        // 黑潮：共用邏輯 kuroshio/ui-core.js（data/shared/ui-core.js）用 ?v=BUILD 載入成全域的 KuroshioUiCore
+        if (NAME === 'kuroshio' && p === 'status') {
+            const core = await page.evaluate(() => ({ ok: !!(window.KuroshioUiCore && window.KuroshioUiCore.restorePlan),
+                src: [].map.call(document.querySelectorAll('script[src*="ui-core.js"]'), s => s.getAttribute('src')) }));
+            core.ok && core.src.length === 1 && /\?v=\d/.test(core.src[0]) ? ok(`共用邏輯 ui-core.js 已載入（${core.src[0]}）`) : bad(`共用邏輯 ui-core.js 沒有載入：${JSON.stringify(core)}`);
+        }
         // 黑潮：基本設定頁要有網域與憑證、固定網域 / DDNS、DNR、存放位置
         if (NAME === 'kuroshio' && p === 'settings') {
             /網域與憑證/.test(text) && /綁定網域/.test(text) && /目前憑證/.test(text) ? ok('設定頁：網域與憑證') : bad('設定頁沒有「網域與憑證」');

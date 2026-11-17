@@ -473,6 +473,8 @@ http.createServer((req, res) => {
     }
     if ((m = /^\/luci-static\/resources\/([\w./-]+)$/.exec(url.pathname)) && !m[1].includes('..')) {
         if (/^kuroshio\/dashboard\.(js|css)$/.test(m[1])) return send(200, MIME[path.extname(m[1])], fs.readFileSync(path.join(ROOT, 'data', 'dashboard', m[1].slice(9))));
+        // 介面共用邏輯：套件從 data/shared/ui-core.js 安裝成 kuroshio/ui-core.js（kuroshio/ui.js 帶 ?v= 載入）
+        if (m[1] === 'kuroshio/ui-core.js') return send(200, MIME['.js'], fs.readFileSync(path.join(ROOT, 'data', 'shared', 'ui-core.js')));
         for (const base of [APP, path.join(LUCI, 'res')]) {
             const f = path.join(base, m[1]);
             if (fs.existsSync(f) && fs.statSync(f).isFile()) return send(200, MIME[path.extname(f)] || 'application/octet-stream', fs.readFileSync(f));
