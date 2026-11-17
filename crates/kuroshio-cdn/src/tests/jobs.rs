@@ -1,9 +1,10 @@
 //! 背景工作（範圍下載、網段分類、節點池）用假的網路測
 
 use super::*;
-use crate::jobs::{pool, ranges, scan, JobCtx};
+use crate::jobs::{pool, ranges, scan, Checkpoint, JobCtx};
 use crate::util::Num;
 use kuroshio_net::iprank::{Latency, Quality};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn ctx_for(providers: Value, extra: Value) -> (JobCtx, Arc<MockNet>, Paths) {
     let net = MockNet::new();
@@ -209,4 +210,88 @@ async fn pool_job_nearest_fastly() {
     assert_eq!(d.prefixes["HKG"].len(), 2);
     assert_eq!(st.pools.active_pops("fastly"), ["HKG", "NRT"]);
     assert_eq!(st.pools.best_pop("fastly").as_deref(), Some("HKG"));
+}
+
+/// 計數用的檢查點掛勾
+fn counting_hook() -> (Checkpoint, Arc<AtomicUsize>) {
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    let f: Checkpoint = Arc::new(move || {
+        n2.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {})
+    });
+    (f, n)
+}
+
+#[tokio::test]
+async fn jobs_call_checkpoint_hook() {
+    // 範圍下載：每家下載之前各一次
+    let (ctx, net, paths) = ctx_for(
+        json!({ "cloudflare": {"enabled": true}, "fastly": {"enabled": true} }),
+        json!({ "scan": { "samplesPerSubnet": 1, "concurrency": 2 } }),
+    );
+    net.fetch
+        .lock()
+        .unwrap()
+        .insert("https://www.cloudflare.com/ips-v4".into(), "104.16.0.0/22\n".into());
+    net.fetch
+        .lock()
+        .unwrap()
+        .insert("https://www.cloudflare.com/ips-v6".into(), "2606:4700::/32\n".into());
+    let (hook, n) = counting_hook();
+    let ctx = ctx.with_checkpoint(hook);
+    ranges::run(&ctx).await.unwrap();
+    assert_eq!(n.load(Ordering::SeqCst), 2, "cloudflare、fastly 各一次");
+    // 網段分類：4 個 /24、並行 2 → 每批 8 個，一批一次
+    write(&paths, "ranges/cloudflare-ipv4.txt", "104.16.0.0/22\n");
+    net.on_http(|_, _| resp(200, &[], "colo=TPE"));
+    n.store(0, Ordering::SeqCst);
+    scan::run(&ctx).await.unwrap();
+    assert!(n.load(Ordering::SeqCst) >= 1);
+    // 節點池：每家、每個階段之間
+    n.store(0, Ordering::SeqCst);
+    pool::run(&ctx).await.unwrap();
+    assert!(n.load(Ordering::SeqCst) >= 4, "節點池的檢查點 {}", n.load(Ordering::SeqCst));
+    // 沒有掛勾：照常執行
+    let (ctx2, _, _) = ctx_for(json!({ "cloudflare": {"enabled": true} }), json!({}));
+    assert!(ctx2.checkpoint.is_none());
+}
+
+#[tokio::test]
+async fn scan_pauses_between_batches_without_probes_in_flight() {
+    let (ctx, net, paths) = ctx_for(
+        json!({ "cloudflare": {"enabled": true} }),
+        json!({ "scan": { "samplesPerSubnet": 1, "concurrency": 1 } }),
+    );
+    // 32 個 /24、並行 1 → 每批 4 個，共 8 批
+    write(&paths, "ranges/cloudflare-ipv4.txt", "104.16.0.0/19\n");
+    net.on_http(|_, _| resp(200, &[], "colo=TPE"));
+    // 第二次檢查點（第一批做完）暫停，直到測試放行
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let (c2, g2, p2) = (calls.clone(), gate.clone(), paused.clone());
+    let hook: Checkpoint = Arc::new(move || {
+        let (c, g, p) = (c2.clone(), g2.clone(), p2.clone());
+        Box::pin(async move {
+            if c.fetch_add(1, Ordering::SeqCst) == 1 {
+                p.notify_one();
+                g.acquire().await.unwrap().forget();
+            }
+        })
+    });
+    let ctx = ctx.with_checkpoint(hook);
+    let h = tokio::spawn(async move { scan::run(&ctx).await });
+    paused.notified().await;
+    let at_pause = net.calls("http").len();
+    assert_eq!(at_pause, 4, "暫停時第一批已全部探測完");
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(net.calls("http").len(), at_pause, "暫停期間沒有新的探測");
+    gate.add_permits(1);
+    let r = h.await.unwrap().unwrap();
+    assert_eq!(r.providers[0].tw, 32);
+    assert_eq!(net.calls("http").len(), 32);
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
 }

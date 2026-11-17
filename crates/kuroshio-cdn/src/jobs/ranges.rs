@@ -247,6 +247,8 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         if !ctx.wants(name) {
             continue;
         }
+        // 每家下載之前：系統吃緊時在這裡暫停
+        ctx.checkpoint().await;
         info!("[{name}] 抓取中…");
         let r = async {
             let (v4, v6) = fetch(ctx, name).await?;

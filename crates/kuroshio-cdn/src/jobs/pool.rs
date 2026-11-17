@@ -179,6 +179,7 @@ async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: 
     info!("{} 官方沒有台灣 POP：掃描 {} 個 /24，找品質最好的鄰近節點", prov.label, cand.len());
 
     // 2. 粗篩延遲（3 次）
+    ctx.checkpoint().await;
     let c2 = cdn.clone();
     let lat = map_limit(cand.values().copied().collect(), jc.latency_concurrency, move |ip| {
         let c = c2.clone();
@@ -195,6 +196,7 @@ async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: 
     info!("粗篩：{} 個 /24 可連線且 ≤ {max_lat}ms", ok.len());
 
     // 3. 判定 POP：先用 HTTP 80 埠＋Host；80 埠被擋就改用 HTTPS，IP 換成探測網站自己的最後一段
+    ctx.checkpoint().await;
     let (host, path) = prov.probe.unwrap_or(("", "/"));
     let last_of = |ips: Vec<IpAddr>| ips.into_iter().find(|i| i.is_ipv4()).and_then(util::last_octet);
     let octet = last_of(cdn.net().resolve_host(host).await);
@@ -246,6 +248,7 @@ async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: 
     pops.truncate(jc.nearest_pops);
     let mut scored: Vec<Scored> = Vec::new();
     for (pop, list) in &pops {
+        ctx.checkpoint().await;
         for (ip, _) in list {
             let q = cdn
                 .net()
@@ -293,6 +296,7 @@ async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: 
             });
             top.truncate(5);
             for pop in top {
+                ctx.checkpoint().await;
                 let mut idx: Vec<usize> = (0..scored.len()).filter(|&i| scored[i].pop == pop).collect();
                 idx.sort_by(|&a, &b| qs(&scored[a]).partial_cmp(&qs(&scored[b])).unwrap_or(std::cmp::Ordering::Equal));
                 for i in idx.into_iter().take(2) {
@@ -426,6 +430,8 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         if !ctx.wants(name) || !prov.alias {
             continue;
         }
+        // 每家開始之前、每個驗證階段之間：系統吃緊時在這裡暫停
+        ctx.checkpoint().await;
         let pc = cdn.cfg.provider(name).cloned().unwrap();
         let max_lat = pc.max_latency_ms.unwrap_or(prov.max_latency_ms);
         let prev = prev_of(&cdn, name);
@@ -514,6 +520,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         );
 
         // ---------- 階段 A：延遲 / 丟包 ----------
+        ctx.checkpoint().await;
         let c = cdn.clone();
         let lat = map_limit(cand.into_iter().collect(), jc.latency_concurrency, move |ip| {
             let c = c.clone();
@@ -530,6 +537,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         info!("階段 A 延遲：{} 個 0% 丟包且 ≤ {max_lat}ms", good.len());
 
         // ---------- 階段 B：確認是台灣 POP ----------
+        ctx.checkpoint().await;
         let (host, path) = prov.probe.unwrap_or(("", "/"));
         good.truncate(120);
         let c = cdn.clone();
@@ -569,6 +577,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         // ---------- 階段 C：下載測速 ----------
         if let Some(url) = prov.speed_url {
             for x in good.iter_mut().take(jc.speed_top) {
+                ctx.checkpoint().await;
                 x.speed = Some(cdn.net().download_speed(x.ip, url, jc.speed_seconds * 1000).await);
                 info!(
                     "  測速 {:<16} {}  {:.1}ms  {} MB/s",
@@ -580,6 +589,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             }
         }
         // 階段 A 同時測很多個，本機會塞車、延遲偏高：決選名單用低並行重新量一次
+        ctx.checkpoint().await;
         let finalists: Vec<IpAddr> = good.iter().take(pool_size * 2).map(|x| x.ip).collect();
         let c = cdn.clone();
         let rq = map_limit(finalists, 4, move |ip| {
@@ -645,6 +655,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             .unwrap_or_default();
         let permanent = cdn.state().v6.list(name);
         if v6ok {
+            ctx.checkpoint().await;
             let mut c6: IndexSet<IpAddr> = cdn.state().db.harvest_of(name, true).into_iter().collect();
             c6.extend(prev.v6.iter().map(|x| x.ip));
             c6.extend(pc.seed_v6.iter().filter_map(|s| util::parse_ip(s)));
@@ -674,6 +685,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                 permanent.len(),
                 per48.len()
             );
+            ctx.checkpoint().await;
             let c = cdn.clone();
             let r6 = map_limit(list.into_iter().collect(), jc.probe_concurrency, move |ip| {
                 let c = c.clone();
@@ -803,6 +815,9 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
 
 /// 方便外層用：節點池工作的 `Arc<Cdn>` 版本
 pub async fn run_for(cfg: Value, cdn: Arc<Cdn>, only: Option<String>) -> Result<Report> {
-    let ctx = JobCtx { cfg, cdn, only };
+    let ctx = JobCtx {
+        only,
+        ..JobCtx::new(cfg, cdn)
+    };
     run(&ctx).await
 }

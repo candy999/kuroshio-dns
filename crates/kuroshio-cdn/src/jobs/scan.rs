@@ -2,10 +2,12 @@
 //! 分成 TW / Global / Dead 三類 → `state/cdn/scan/<cdn>-ipv4-TW.txt` 等。
 //!
 //! 同時數 `scan.concurrency`（預設依 CPU 核心數），用固定數量的工作者輪流取網段（不會一次開幾萬個 task）。
+//! 網段分批跑，批與批之間過檢查點（系統吃緊時暫停，暫停時沒有進行中的探測）。
 //! 結果依網段排序後寫檔（2.x 是完成順序），內容沒變就不寫。
 
 use super::{v4_lines, JobCtx};
-use crate::providers::{self, is_tw_pop};
+use crate::net::Net;
+use crate::providers::{self, is_tw_pop, Provider};
 use crate::util::{self, write_if_changed};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -66,6 +68,79 @@ const TW: u8 = 1;
 const GLOBAL: u8 = 2;
 const DEAD: u8 = 3;
 
+/// 每批的網段數 = 並行數 × 這個倍數（批次夠大，批尾工作者閒置的時間才少；
+/// 批與批之間過檢查點，暫停時最多只有這一批還在跑完）
+const BATCH_PER_WORKER: usize = 4;
+
+/// 一批網段的探測（`range` 是 `tasks` 的索引範圍）
+struct ScanBatch {
+    name: &'static str,
+    prov: &'static Provider,
+    host: &'static str,
+    path: &'static str,
+    n: usize,
+    timeout: Duration,
+    workers: usize,
+    range: (usize, usize),
+    tasks: Arc<Vec<u32>>,
+    cls: Arc<Mutex<Vec<u8>>>,
+    pops: Arc<Mutex<HashMap<String, u32>>>,
+    done: Arc<AtomicUsize>,
+    last_pct: Arc<Mutex<i64>>,
+    net: Arc<dyn Net>,
+}
+
+/// 用固定數量的工作者輪流取這一批的網段，全部探測完才回來
+async fn scan_batch(b: ScanBatch) {
+    let b = Arc::new(b);
+    let idx = Arc::new(AtomicUsize::new(b.range.0));
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..b.workers {
+        let (b, idx) = (b.clone(), idx.clone());
+        set.spawn(async move {
+            let (name, prov, tasks) = (b.name, b.prov, &b.tasks);
+            loop {
+                let i = idx.fetch_add(1, Ordering::Relaxed);
+                if i >= b.range.1 {
+                    return;
+                }
+                let (mut live, mut tw) = (false, false);
+                for ip in samples(tasks[i], b.n) {
+                    let r = b.net.http_probe(ip, b.host, b.path, b.timeout).await;
+                    if !r.ok {
+                        continue;
+                    }
+                    live = true; // 有任何回應就算活著（同原本 Step2）
+                    let pop = prov.pop(&r.headers, &r.body);
+                    if pop.is_empty() {
+                        continue; // 沒抓到 POP，繼續抽樣看看
+                    }
+                    *b.pops.lock().unwrap().entry(pop.clone()).or_default() += 1;
+                    tw = is_tw_pop(&pop);
+                    break; // 已確認 POP，不必再測
+                }
+                b.cls.lock().unwrap()[i] = if tw {
+                    TW
+                } else if live {
+                    GLOBAL
+                } else {
+                    DEAD
+                };
+                let d = b.done.fetch_add(1, Ordering::Relaxed) + 1;
+                let pct = (d * 20 / tasks.len()) as i64 * 5;
+                let mut lp = b.last_pct.lock().unwrap();
+                if pct != *lp {
+                    *lp = pct;
+                    let c = b.cls.lock().unwrap();
+                    let count = |k: u8| c.iter().filter(|x| **x == k).count();
+                    info!("[{name}] {pct}%  TW:{} Global:{} Dead:{}", count(TW), count(GLOBAL), count(DEAD));
+                }
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+}
+
 pub async fn run(ctx: &JobCtx) -> Result<Report> {
     let jc = ctx.jobs_cfg();
     let n = jc.scan_samples;
@@ -89,61 +164,33 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         info!("[{name}] 展開 {} 個 /24，每段抽樣 {n} 個 IP，並行 {conc}", tasks.len());
         let cls: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0; tasks.len()]));
         let pops: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-        let idx = Arc::new(AtomicUsize::new(0));
         let done = Arc::new(AtomicUsize::new(0));
         let last_pct = Arc::new(Mutex::new(-1i64));
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..conc.min(tasks.len()) {
-            let (tasks, cls, pops, idx, done, last_pct) = (
-                tasks.clone(),
-                cls.clone(),
-                pops.clone(),
-                idx.clone(),
-                done.clone(),
-                last_pct.clone(),
-            );
-            let net = ctx.cdn.net().clone();
-            set.spawn(async move {
-                loop {
-                    let i = idx.fetch_add(1, Ordering::Relaxed);
-                    if i >= tasks.len() {
-                        return;
-                    }
-                    let (mut live, mut tw) = (false, false);
-                    for ip in samples(tasks[i], n) {
-                        let r = net.http_probe(ip, host, path, timeout).await;
-                        if !r.ok {
-                            continue;
-                        }
-                        live = true; // 有任何回應就算活著（同原本 Step2）
-                        let pop = prov.pop(&r.headers, &r.body);
-                        if pop.is_empty() {
-                            continue; // 沒抓到 POP，繼續抽樣看看
-                        }
-                        *pops.lock().unwrap().entry(pop.clone()).or_default() += 1;
-                        tw = is_tw_pop(&pop);
-                        break; // 已確認 POP，不必再測
-                    }
-                    cls.lock().unwrap()[i] = if tw {
-                        TW
-                    } else if live {
-                        GLOBAL
-                    } else {
-                        DEAD
-                    };
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    let pct = (d * 20 / tasks.len()) as i64 * 5;
-                    let mut lp = last_pct.lock().unwrap();
-                    if pct != *lp {
-                        *lp = pct;
-                        let c = cls.lock().unwrap();
-                        let count = |k: u8| c.iter().filter(|x| **x == k).count();
-                        info!("[{name}] {pct}%  TW:{} Global:{} Dead:{}", count(TW), count(GLOBAL), count(DEAD));
-                    }
-                }
-            });
+        // 分批跑：每批結束（手上沒有進行中的探測）才過檢查點，系統吃緊時在批與批之間暫停
+        let batch = (conc * BATCH_PER_WORKER).max(1);
+        let mut start = 0;
+        while start < tasks.len() {
+            ctx.checkpoint().await;
+            let end = (start + batch).min(tasks.len());
+            scan_batch(ScanBatch {
+                name,
+                prov,
+                host,
+                path,
+                n,
+                timeout,
+                workers: conc.min(end - start),
+                range: (start, end),
+                tasks: tasks.clone(),
+                cls: cls.clone(),
+                pops: pops.clone(),
+                done: done.clone(),
+                last_pct: last_pct.clone(),
+                net: ctx.cdn.net().clone(),
+            })
+            .await;
+            start = end;
         }
-        while set.join_next().await.is_some() {}
         let cls = cls.lock().unwrap().clone();
         let pops = pops.lock().unwrap().clone();
         let mut lists: [Vec<u32>; 3] = [vec![], vec![], vec![]];

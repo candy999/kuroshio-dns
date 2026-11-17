@@ -751,14 +751,24 @@ fn register_twip_job(
     sched.register("tw-ip", job);
 }
 
+/// CDN 工作的執行環境：接上排程器的檢查點（讓出 CPU、記憶體吃緊時暫停）
+fn cdn_job_ctx(ctx: kuroshio_jobs::JobCtx, cdn: Arc<kuroshio_cdn::Cdn>) -> kuroshio_cdn::jobs::JobCtx {
+    let cfg = (*ctx.cfg).clone();
+    let hook: kuroshio_cdn::jobs::Checkpoint = Arc::new(move || {
+        let ctx = ctx.clone();
+        Box::pin(async move { ctx.checkpoint().await })
+    });
+    kuroshio_cdn::jobs::JobCtx::new(cfg, cdn).with_checkpoint(hook)
+}
+
 /// CDN 的三個背景工作（同 2.x `jobs/cdn-*.js`，但在同一個行程裡跑，直接更新記憶體裡的狀態）
 fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_cdn::Cdn>) {
-    use kuroshio_cdn::jobs::{pool, ranges, scan, JobCtx as CdnCtx};
+    use kuroshio_cdn::jobs::{pool, ranges, scan};
     let c = cdn.clone();
     sched.register("cdn-ranges", move |ctx: kuroshio_jobs::JobCtx| {
         let c = c.clone();
         async move {
-            let r = ranges::run(&CdnCtx::new((*ctx.cfg).clone(), c)).await?;
+            let r = ranges::run(&cdn_job_ctx(ctx, c)).await?;
             info!(
                 "CDN 官方範圍：{} 家，{}",
                 r.providers.len(),
@@ -771,7 +781,7 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
     sched.register("cdn-scan", move |ctx: kuroshio_jobs::JobCtx| {
         let c = c.clone();
         async move {
-            let r = scan::run(&CdnCtx::new((*ctx.cfg).clone(), c)).await?;
+            let r = scan::run(&cdn_job_ctx(ctx, c)).await?;
             info!(
                 "CDN 網段分類：{} 家，{}",
                 r.providers.len(),
@@ -784,7 +794,7 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
     sched.register("cdn-pool", move |ctx: kuroshio_jobs::JobCtx| {
         let c = c.clone();
         async move {
-            let r = pool::run(&CdnCtx::new((*ctx.cfg).clone(), c.clone())).await?;
+            let r = pool::run(&cdn_job_ctx(ctx, c.clone())).await?;
             info!(
                 "台灣節點池更新：{} 家（IPv6 {}）",
                 r.providers.len(),

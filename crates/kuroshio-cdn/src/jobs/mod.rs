@@ -15,7 +15,13 @@ pub mod scan;
 use crate::cdn::Cdn;
 use crate::config::JobsConfig;
 use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// 檢查點掛勾：工作每做完一小段就呼叫並等它結束。外層（排程器）在這裡讓出 CPU，
+/// 系統吃緊（例如記憶體不足）時一直等到恢復才回來；沒有掛勾就直接繼續
+pub type Checkpoint = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// 工作的執行環境
 pub struct JobCtx {
@@ -25,11 +31,31 @@ pub struct JobCtx {
     pub cdn: Arc<Cdn>,
     /// 只跑某一家（2.x 的命令列參數）
     pub only: Option<String>,
+    /// 檢查點掛勾（由排程器接進來；單元測試、命令列沒有）
+    pub checkpoint: Option<Checkpoint>,
 }
 
 impl JobCtx {
     pub fn new(cfg: Value, cdn: Arc<Cdn>) -> JobCtx {
-        JobCtx { cfg, cdn, only: None }
+        JobCtx {
+            cfg,
+            cdn,
+            only: None,
+            checkpoint: None,
+        }
+    }
+
+    /// 接上檢查點掛勾
+    pub fn with_checkpoint(mut self, f: Checkpoint) -> JobCtx {
+        self.checkpoint = Some(f);
+        self
+    }
+
+    /// 做完一小段：有掛勾就交給它（系統吃緊時在這裡暫停），沒有就直接繼續
+    pub(crate) async fn checkpoint(&self) {
+        if let Some(f) = &self.checkpoint {
+            f().await;
+        }
     }
 
     pub fn jobs_cfg(&self) -> JobsConfig {
