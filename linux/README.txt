@@ -1,4 +1,4 @@
-黑潮 DNS（Kuroshio DNS）Linux 通用版 3.0
+黑潮 DNS（Kuroshio DNS）Linux 通用版
 
 這是什麼：單一靜態執行檔（musl，不需要另外安裝任何函式庫），一般 Linux 主機、NAS、虛擬機、
 沒有 OpenWrt 套件的設備都能直接執行。OpenWrt 請改用 kuroshio-openwrt-*.zip（含 LuCI 介面與 DNS 接管）；
@@ -8,8 +8,14 @@
   kuroshio 與 data/ 要放在同一個資料夾。執行檔會自動使用自己旁邊的 data/
   （台灣 IP 清單、種子資料、評測名單、設定頁、公開頁，不要刪）。
 
+附的設定範例：
+  config.example.json       最小的 JSON 設定（複製成 config.json 再改）
+  data/kuroshio.config      預設的 UCI 文字設定（kuroshio run --uci，KUROSHIO_UCI_FILE 指定檔案；
+                            沒有 uci 指令的韌體照它產生自己的設定）
+
 快速開始：
-  1. 在旁邊放一份 config.json，只寫跟預設值不同的欄位（完整預設值：./kuroshio defaults），例如：
+  1. 在旁邊放一份 config.json，只寫跟預設值不同的欄位（完整預設值：./kuroshio defaults），例如
+     cp config.example.json config.json，內容：
        {
          "system": { "persistDir": "/var/lib/kuroshio/state" },
          "listen": { "plain": { "binds": ["127.0.0.1"], "port": 5336 } }

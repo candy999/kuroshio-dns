@@ -1,0 +1,4 @@
+{
+  "system": { "persistDir": "/var/lib/kuroshio/state" },
+  "listen": { "plain": { "binds": ["127.0.0.1"], "port": 5336 } }
+}

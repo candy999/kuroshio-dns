@@ -31,11 +31,15 @@ Releases 的 `kuroshio-linux-<CPU>.tar.gz`（例如 `kuroshio-linux-mipsel-unkno
 
 ```
 kuroshio/
-  kuroshio          執行檔
-  data/             唯讀資料：種子、評測名單、CDN 範圍、台灣 IP 清單、設定頁、公開頁、儀表板
+  kuroshio              執行檔
+  data/                 唯讀資料：種子、評測名單、CDN 範圍、台灣 IP 清單、設定頁、公開頁、儀表板、介面共用邏輯
+  data/kuroshio.config  預設的 UCI 文字設定（跟 OpenWrt 套件的 /etc/config/kuroshio 同一份）
+  config.example.json   最小的 JSON 設定範例
   LICENSE
   README-linux.txt
 ```
+
+升級時只要換這一個 tar.gz（版本號與一個 SHA256），預設設定已經在裡面，不必另外下載。
 
 - **`data/` 一定要用同一版**，而且要讓程式找得到：放在執行檔旁邊（自動使用），或用 `KUROSHIO_SHARE` / `system.dataDir` 指定。少了 `data/`，DNS 仍然能用，但「只開放台灣」會因為讀不到台灣 IP 清單而放行所有來源、設定頁與公開頁也打不開。版本不一致時，啟動日誌與 `kuroshio status --json` 會有警告。
 - 只要單一執行檔（例如韌體自己打包資料）的話，Releases 也有 `kuroshio-<target>` 執行檔，檔名與 `SHA256SUMS` 格式維持不變。
@@ -81,6 +85,8 @@ kuroshio/
 | 其他（硬碟、SSD、USB） | disk | 10 分鐘一次 |
 
 內容沒變不寫；收到 SIGTERM 時全部寫出；SIGUSR1 立即寫出。
+
+**設定放在記憶體的韌體**（例如 Padavan 的 `/etc/storage`，要執行 `mtd_storage.sh save` 才寫進 Flash）：設定環境變數 `KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save"`。黑潮寫入設定目錄（自訂規則、`.bak`、token……；不含快照目錄）之後，合併 3 秒執行一次，結束前也會先跑完。細節見 [整合介面](docs/integration.md#寫入設定後的外部指令kuroshio_on_config_write)。
 
 **沒有持久空間時**：狀態目錄放 tmpfs，必須保留的小檔（設定、自訂規則、社群金鑰）用絕對路徑放到持久的地方，再定時匯出、開機匯入：
 
@@ -165,6 +171,8 @@ WantedBy=multi-user.target
 - **WAN 斷線**：上游查不到時，快取裡有的會回過期答案頂著；過濾清單下載失敗保留舊的，30 分鐘後重試。
 - **時間還沒對時**（沒有 RTC 的路由器開機是 1970 年）：黑潮偵測到系統時間不合理時，暫時只用明文上游（加密上游的憑證檢查會失敗），也暫停需要 TLS 的背景工作，不會因此把節點或上游記成失敗；對時後自動恢復。這段期間 DNS 照常可用，NTP 也查得到。
 - **WAN 換 IP**：整合腳本在 WAN 上線時執行 `kuroshio notify wan-changed`，立即檢查 DDNS。
+- **要做很佔記憶體的事之前**（韌體更新把映像檔寫進 tmpfs 等）：先執行 `kuroshio notify trim`，黑潮立刻讓出快取等記憶體、幾分鐘內不再長大。沒有 PSI 的舊核心特別需要（見 [整合介面](docs/integration.md#小記憶體的機器128-mb-以下)）。
+- **耗時的管理 API**：「立即更新過濾清單」（`POST /api/filter/update`）是背景執行，立刻回 `runId`，結果看 `/api/status` 的 `filter.update`；判斷服務支不支援用 `api`（≥ 2）。
 
 ## 8. 檢查清單
 
@@ -194,4 +202,4 @@ WantedBy=multi-user.target
 
 ## 授權
 
-GPL-3.0-or-later。把黑潮放進韌體或映像散布時，請附上授權全文，並提供對應版本的完整原始碼（每個 Release 的原始碼壓縮檔即可；修改過的話要公開修改後的原始碼）。
+GPL-3.0-or-later。把黑潮放進韌體或映像散布時，請附上授權全文，並提供對應版本的完整原始碼。3.3.0 起每個 Release 附 `kuroshio-dns-<版本>-source.tar.xz`：這個版本的原始碼加上全部依賴套件（`cargo vendor`），可以完全離線編譯，雜湊值列在 `SHA256SUMS`（GitHub 自動產生的原始碼壓縮檔不保證每次的位元組相同，不適合核對雜湊）。修改過的話要公開修改後的原始碼。

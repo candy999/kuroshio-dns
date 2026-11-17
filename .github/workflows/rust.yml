@@ -47,6 +47,10 @@ jobs:
           shellcheck -s sh -e SC3043,SC1091 openwrt/kuroshio/files/takeover.sh openwrt/kuroshio/files/acme.sh openwrt/kuroshio/files/access.sh openwrt/kuroshio/files/rpcd.sh openwrt/kuroshio/files/lan.sh openwrt/kuroshio/files/guard.sh openwrt/kuroshio/files/kuroshio.uci-defaults openwrt/install.sh
           shellcheck -s sh -e SC3043,SC2015,SC2086,SC1091 openwrt/tools/ci-smoke-kuroshio.sh openwrt/tools/ci-luci-setup.sh
           shellcheck docker/test.sh
+          shellcheck -s sh tools/source-package.sh
+      # 發布時附的原始碼包（含全部依賴套件）：平常也做一次，確認只用 vendor/ 解析得了依賴（發布 job 只在打標籤時跑）
+      - name: 原始碼包
+        run: sh tools/source-package.sh ci /tmp/srcpkg
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -197,6 +201,9 @@ jobs:
           install -m 755 target/${{ matrix.target }}/release/kuroshio dist/kuroshio/kuroshio
           cp -r data dist/kuroshio/data
           cp rules/default-custom-rules.txt dist/kuroshio/data/
+          # 預設設定：UCI 文字檔（第三方韌體照它產生自己的設定）與最小的 JSON 範例；升級時只要核對這一個 tar.gz
+          cp openwrt/kuroshio/files/kuroshio.config dist/kuroshio/data/kuroshio.config
+          cp linux/config.example.json dist/kuroshio/config.example.json
           cp LICENSE dist/kuroshio/
           cp linux/README.txt dist/kuroshio/README-linux.txt
           tar -C dist --owner=0 --group=0 --numeric-owner -czf dist/kuroshio-linux-${{ matrix.target }}.tar.gz kuroshio
@@ -612,6 +619,9 @@ jobs:
           cp art/kuroshio-linux-*/*.tar.gz dist/
           # 單獨的執行檔 kuroshio-<target>：檔名不能改（下游韌體固定了檔名與雜湊）
           for d in art/bin-*; do t=${d#art/bin-}; cp "$d/kuroshio" "dist/kuroshio-$t"; done
+          # 原始碼包（GPL-3.0 的對應原始碼）：這個標籤的原始碼 + 全部依賴套件（cargo vendor），可以完全離線編譯。
+          # 由這次的 CI 產生、列進 SHA256SUMS；上傳後雜湊值就固定（GitHub 自動產生的壓縮檔不保證每次一樣）
+          sh tools/source-package.sh "${GITHUB_REF_NAME#v}" dist
           ( cd dist && sha256sum * > SHA256SUMS )
           ls -la dist
       # 驗證：gh attestation verify <檔案> --repo candy999/kuroshio-dns

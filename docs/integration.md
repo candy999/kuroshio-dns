@@ -7,6 +7,7 @@
 - 這裡列的指令、參數、結束碼、訊號、環境變數不會在小版本更動；要改會先在發行說明預告。
 - JSON 輸出**只會加欄位，不會改名、刪除或改型別**。整合程式請忽略不認識的欄位。
 - 給人看的文字（沒有 `--json` 的輸出、日誌）不是約定的一部分，隨時可能調整，請不要拿來比對。
+- 管理 API 的**行為**有不相容的改變時，`/api/status`、`kuroshio about --json`、`kuroshio status --json` 的 `api` 會加 1（見下面「管理 API 版本」）。第三方介面用它判斷，不要比對版本字串。
 
 > **原則：黑潮 DNS 不會格式化或抹除任何儲存裝置，只使用設定給它的目錄。**
 > 它只讀寫設定檔、快照目錄（`system.persistDir`）、執行期目錄（`system.runtimeDir`）、唯讀資料目錄（data/），以及設定裡明確指定的檔案（憑證、自訂規則、社群金鑰）。用 `kuroshio paths` 可以列出全部位置。不需要也不會要求掛載、分割或清除任何磁碟。
@@ -101,6 +102,7 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 | `running` | bool | 執行中是 `true` |
 | `error` | string | 只有讀不到狀態時才有 |
 | `version` | string | 執行中服務的版本 |
+| `api` | number | 管理 API 版本（3.3.0 起是 `2`；舊版服務沒有這個欄位時輸出 `1`） |
 | `uptimeSec` | number | 這一輪啟動以來的秒數（重新載入設定會從 0 開始） |
 | `mode` | string | `service`（Windows 服務）或 `cmd`（前景執行；procd、systemd、Docker 都是這個） |
 | `config` | string | 設定來源：`uci` 或 `json` |
@@ -131,6 +133,7 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 ```
 kuroshio notify wan-changed [-c 設定檔] [--uci]
 kuroshio notify save [-c 設定檔] [--uci]
+kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 ```
 
 通知執行中的服務發生了某件事。目前的事件：
@@ -139,6 +142,7 @@ kuroshio notify save [-c 設定檔] [--uci]
 |---|---|
 | `wan-changed` | WAN 變了（重新撥號、換 IP、換線路）：DDNS 立即檢查並更新（等同設定頁的「立即更新」）、重新偵測對外 IP（問上游時帶的 ECS 子網路）。都在背景進行，指令立刻回來 |
 | `save` | 立刻把所有還沒寫出的學習資料（快照）寫進快照目錄，不結束；寫完才回來（同 `SIGUSR1`、LuCI 狀態頁與設定頁的「立即儲存學習資料」）。**Windows 沒有訊號，要強制存檔就用這個**（例如關機、更新程式、UPS 通知之前） |
+| `trim` | 先讓出記憶體：立刻做記憶體「吃緊」時會做的釋出（診斷緩衝縮小、DNS 快取縮到 1/4、CDN 冷資料移出記憶體；**不停用過濾清單**），並在 `--hold` 秒內（預設 300，最多 3600）不讓記憶體結構長大、也不恢復。韌體要做很佔記憶體的事之前呼叫，例如把韌體映像檔寫進 tmpfs、解壓縮大檔案。做完才回來（CDN 冷資料移出前要先寫出快照，最多幾秒） |
 
 適合放在 WAN 撥號成功後會執行的腳本，例如 Padavan 的 `/etc/storage/post_wan_script.sh`、Asuswrt-Merlin 的 `/jffs/scripts/wan-event`、OpenWrt 的 hotplug（`/etc/hotplug.d/iface/`）、`ppp` 的 `ip-up`。
 
@@ -152,6 +156,27 @@ kuroshio notify save [-c 設定檔] [--uci]
 
 - `wan-changed`：`POST /api/notify/wan-changed`，回應 `{"ok":true,"ddns":"started"|"disabled","ecs":"started","clockSynced":bool}`。
 - `save`：`POST /api/persist/flush`，回應 `{"ok":true,"files":寫了幾份,"bytes":磁碟上一共幾 bytes,"at":完成時間（Unix 毫秒）,"dir":"快照目錄"}`；沒有新的變動時 `files` 是 `0`。寫入失敗回 HTTP 500 與 `{"error":"..."}`。
+- `trim`：`POST /api/memory/trim?holdSec=秒`，回應 `{"ok":true,"steps":[{"step","label","freedBytes","detail"} 或 {"step","label","skipped"}],"freedBytes":估計釋出的 bytes,"holdSec":實際的秒數,"availBeforeKB","availKB"}`。記憶體控制關掉（`system.memoryGovernor: false`）時回 `{"ok":true,"enabled":false,...}`。暫停期間 `/api/status` 的 `memory.holdUntil` 是結束時間（Unix 毫秒）。
+
+### 管理 API 版本
+
+`/api/status`、`kuroshio about --json` 有 `api`（數字）。3.2.x 以前沒有這個欄位，視為 `1`。
+
+| `api` | 版本 | 不相容的改變 |
+|---|---|---|
+| 1 | 3.0 – 3.2 | — |
+| 2 | 3.3.0 | `POST /api/filter/update`（立即更新過濾清單）改成背景執行，見下面 |
+
+### 立即更新過濾清單（`POST /api/filter/update`）
+
+下載清單在慢的路由器上可能超過一分鐘，所以 API 2 起改成**背景執行**：
+
+- 立刻回 `{"started":true,"running":true,"runId":編號,"startedAt":開始時間（Unix 毫秒）,"update":{...}}`。
+- 已經有一次在跑時再呼叫，回 `{"started":false,...}` 和**同一個** `runId`（不會重複下載）。
+- 進度與結果在 `/api/status` 的 `filter.update`：`{"state":"running"|"idle","runId","startedAt","finishedAt","changed":true|false|null,"error":string|null}`。`state` 是 `idle`、而且 `runId` 大於等於你拿到的那一個，就是那一次（或之後的一次）已經結束。
+- 腳本要等結果：加 `?wait=1`，結束才回，多了 `changed`（舊的行為；失敗回 HTTP 500 與 `{"error":"..."}`）。
+
+`runId` 是開始時間（毫秒），同一次執行的程式裡只會變大；服務重新啟動後 `filter.update` 從 `idle`、`runId: null` 開始。
 
 ### 其他常用指令
 
@@ -185,7 +210,25 @@ kuroshio notify save [-c 設定檔] [--uci]
 | `KUROSHIO_LAN_IP4`、`KUROSHIO_LAN_ULA` | `--uci`：區網 IPv4 與 ULA（積極劫持、取代 dnsmasq 模式下綁定用；OpenWrt 的 init 腳本會給） |
 | `KUROSHIO_LOG` | 日誌等級，優先於設定的 `log.level`；寫法同 `tracing` 的 EnvFilter（例如 `info`、`debug`、`warn,kuroshio=debug`） |
 | `KUROSHIO_ACCESS_HOOK` | 每月的台灣 IP 清單更新換上之後執行這個程式，參數是 `apply`（OpenWrt 用它重新產生 nftables 規則） |
+| `KUROSHIO_ON_CONFIG_WRITE` | 黑潮 DNS 寫入**設定目錄**之後執行的指令（`sh -c`；Windows 是 `cmd /C`），見下面「寫入設定後的外部指令」 |
 | `NO_COLOR` | 有設定（任何值）就不輸出 ANSI 色碼（日誌交給 syslog、檔案時用） |
+
+`KUROSHIO_LOG` 沒設定時，QUIC 函式庫（`quinn_proto`）只記錯誤：它的警告（例如某些伺服器造成的 `duplicate reset token`，每十幾秒一行）跟查詢結果無關，會洗掉路由器很小的 syslog。要看的話設定 `KUROSHIO_LOG=info,quinn_proto=warn`。
+
+### 寫入設定後的外部指令（`KUROSHIO_ON_CONFIG_WRITE`）
+
+給把設定放在記憶體、要另外執行指令才會寫進 Flash 的韌體，例如 Padavan 的 `/etc/storage`：
+
+```sh
+KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
+```
+
+- **只能用環境變數設定**，設定頁與管理 API 改不了（管理介面不能被拿來執行任意指令）。
+- **哪些寫入會觸發**：設定檔（或 UCI 檔）所在的資料夾，以及設定目錄（快照目錄的上一層，`custom-rules.txt`、它的 `.bak`、`admin.token` 等在這裡）。**快照目錄（學習資料）與執行期目錄不會觸發**。黑潮 DNS 只在使用者操作（設定頁存檔、恢復預設自訂規則、匯入備份）或版本升級遷移時寫設定目錄，所以很少執行。
+- **合併**：最後一次寫入後等 3 秒才執行一次（恢復預設自訂規則會寫兩個檔，只執行一次）。
+- **逾時**：最多 30 秒，超過就結束它（連同它啟動的子程式）；失敗會記在日誌。
+- **結束前跑完**：收到 `SIGTERM` / `SIGINT` 時，還在等待合併的那一次立刻執行（同樣受逾時限制），之後才結束。所以停止服務時請至少等 15 秒再強制結束。
+- 指令的環境變數 `KUROSHIO_CONFIG_FILES` 是這次寫入的檔案（完整路徑，換行分隔）。
 
 日誌一律寫到標準輸出（Windows 服務例外：寫到設定檔旁邊的 `kuroshio.log`），由服務管理程式收集（procd → logread、systemd → journald、Docker → `docker logs`）。
 
@@ -249,11 +292,34 @@ kuroshio notify save [-c 設定檔] [--uci]
 - **Padavan httpd 的限制**：它會解析 `.js` 檔裡的模板標記，所以 data/ 底下所有 `.js`、`.css` 都不會出現 `<%`、`%>`、`<#`、`#>` 這四種組合（註解、字串、正規表示式都算）。CI 用 `node tools/check-data-assets.js` 檢查，出現時列出檔名與行號並失敗。
 - 版本跟執行檔一起走：請用跟執行檔同一版的 data/。LuCI 載入時網址帶 `?v=版本`，升級後瀏覽器不會拿到快取的舊檔；自己嵌入時建議也這樣做。
 
+## 小記憶體的機器（128 MB 以下）
+
+黑潮 DNS 不依記憶體分等級，**不需要手動設定大小**：
+
+- 記憶體控制只看整台機器還剩多少（不是「自己最多用多少」）。保留量自動決定：Linux 是 max(16 MB, 實體記憶體 5%, `min_free_kbytes` × 3)，例如 128 MB 的機器約 16 MB、`MemTotal` 437 MB / `min_free_kbytes` 12288 的機器是 36 MB。`kuroshio sysinfo` 會印出實際的值。
+- 可用記憶體接近保留量，依「重建成本由低到高」讓出：診斷緩衝 → DNS 快取縮到 1/4 → CDN 冷資料移到磁碟 → （真的不足時）停用優先順序最低的過濾清單 → 只剩轉送。DNS 轉送本身永遠不讓出。
+- 快照目錄在 tmpfs 時，「CDN 冷資料移到磁碟」一樣有效：移出的只有已經寫進快照、之後沒變過的資料，快照檔本來就在那裡（而且是壓縮的），這一步放掉的是記憶體裡展開的那一份。快照檔佔的記憶體在 `/api/status` 的 `memory.stateInRam`。
+- 背景工作在記憶體吃緊時延後、執行中的會暫停。每日評測（dns-benchmark）同時只測 `benchmark.concurrency` 個候選（`auto` = 每核心 8 個，8–50），也不超過「可用記憶體扣掉保留量的 1/4 ÷ 128 KB」；每個候選測完就關閉連線，暫停時先關閉手上的連線。
+- 各結構目前的用量在 `/api/status` 的 `memory.sizes`（`cacheBytes`、`cdnBytes`、`filterListsBytes` 等，都是估計值）。
+
+真的要限制時可以調的設定：
+
+| 設定 | 作用 |
+|---|---|
+| `system.memoryReserveMB` / `system.memoryReservePercent` | 加大保留量：黑潮 DNS 更早讓出（兩個都填取大的） |
+| `resolver.cacheMax` | DNS 快取筆數上限（預設 100,000；記憶體控制另外會依可用記憶體收緊） |
+| `benchmark.concurrency` | 每日評測同時測幾個候選 |
+| `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
+| `system.oomScoreAdj` | 預設 -500；設 0 就跟一般程式一樣讓核心挑 |
+| `filter.lists` | 少開幾份訂閱清單（每份的大小在 `filter.sources`） |
+
 ## 給整合者的建議
 
 - **健康檢查**用 `kuroshio health`（不需要管理 API、不需要 token，成本很低，可以每幾秒跑一次）；要細節才用 `kuroshio status --json`。
 - **停止**送 `SIGTERM`，等至少 15 秒。不要直接 `SIGKILL`：還沒寫出的學習資料（快照）會遺失。
 - **斷電前**（例如 UPS 通知）送 `SIGUSR1`，或執行 `kuroshio notify save`（Windows 只能用這個），先把快照寫出。
 - **WAN 變動**時執行 `kuroshio notify wan-changed`。
+- **要做很佔記憶體的事之前**（韌體更新把映像檔寫進 tmpfs、解壓縮大檔案）執行 `kuroshio notify trim`。沒有 PSI 的舊核心（例如 Linux 4.4）只能輪詢可用記憶體，突然的大量配置可能來不及讓出；黑潮 DNS 的 `oom_score_adj` 是 -500，來不及時被核心結束的會是別的程式。
+- **設定放在記憶體**（要另外存進 Flash）的韌體：設定 `KUROSHIO_ON_CONFIG_WRITE`。
 - **容器**：把設定檔與快照目錄放在掛載的磁碟區（例如 `/config/config.json`、`system.persistDir: "/config/state"`），用 `KUROSHIO_INIT_CONFIG` 提供第一次啟動的預設設定，`KUROSHIO_SHARE` 指向映像裡的 data/。
 - 管理 API 只聽本機（`127.0.0.1`）、只接受本機的 `Host`；要從別的地方管理請經過反向代理並開啟登入（`admin.auth`）。
