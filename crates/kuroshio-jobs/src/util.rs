@@ -43,7 +43,16 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // 改名要寫進資料夾才算數（Unix）：斷電時不會回到舊檔
+        #[cfg(unix)]
+        if let Some(d) = path
+            .parent()
+            .and_then(|d| std::fs::File::open(if d.as_os_str().is_empty() { Path::new(".") } else { d }).ok())
+        {
+            let _ = d.sync_all();
+        }
+        Ok(())
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
