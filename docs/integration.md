@@ -178,6 +178,8 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 
 `runId` 是開始時間（毫秒），同一次執行的程式裡只會變大；服務重新啟動後 `filter.update` 從 `idle`、`runId: null` 開始。
 
+其他會等一下的動作：`POST /api/jobs/run`（排進佇列就回）、`POST /api/acme/issue`（背景申請）、`kuroshio notify wan-changed` 立刻回來；`POST /api/ddns/update`（每個請求逾時 8 秒，記錄很多時會久一點）、`POST /api/cdn/verify`、`POST /api/cdn/ecs`（一個網域的幾次連線）會等到完成才回。進度都可以從 `/api/status`、`/api/ddns`、`/api/jobs` 查。
+
 ### 其他常用指令
 
 | 指令 | 用途 |
