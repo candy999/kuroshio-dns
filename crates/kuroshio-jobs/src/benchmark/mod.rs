@@ -14,6 +14,14 @@
 //!   數量記在結果的 `skippedTypes`。之後加上傳輸層，這裡不用改。
 //! - 名單多了 `dotlist.txt`（DoT 主機）與 `stamps.txt`（sdns:// stamp）；`dohlist.txt` 的每一筆另外產生一個 h3:// 候選。
 //! - 每測完一個網域就呼叫 `checkpoint()`：讓出 CPU，系統吃緊時暫停（規格 05）。
+//!
+//! 3.3 的差異（記憶體）：Phase 1 分成兩段。
+//! - 收集：每個候選用自己的連線依序測完全部網域（每筆之間至少隔 `benchmark.paceMs`），測完就關閉連線；
+//!   同時只測 `benchmark.concurrency` 個候選（也看可用記憶體）。以前是「每個網域問一輪全部候選」，
+//!   整個評測期間幾百條加密連線一直開著（QUIC 還有 keep-alive），小記憶體的機器會吃不消。
+//!   系統吃緊時先關閉手上的連線再暫停，恢復後重新連線。
+//! - 判斷：照原本的順序逐網域重跑同樣的規則（封殺、汙染、逾時淘汰），結果跟以前的流程相同。
+//!   原始答案只留到判斷完那個網域，被淘汰的候選隨即釋放。
 //! - 選擇與報表的計算放到 blocking 執行緒，不卡住 DNS。
 
 pub mod probe;
@@ -35,8 +43,9 @@ use std::future::Future;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
@@ -116,7 +125,14 @@ pub struct Benchmark {
     pub asn: Arc<dyn AsnSource>,
     /// 資格賽用的網域與預期 IP
     pub preflight: (String, Vec<Ipv4Addr>),
+    /// 系統還有多少可用記憶體可以用（bytes，扣掉保留量之後）；決定同時測幾個候選。None = 只看設定
+    pub headroom: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
+    /// 執行中的進度（`/api/jobs` 的 `detail.dns-benchmark`）
+    progress: Arc<Mutex<Option<Value>>>,
 }
+
+/// 每個測試中的候選估計要多少記憶體（一條 TLS / QUIC 連線加上緩衝）
+const PER_CANDIDATE_BYTES: u64 = 128 * 1024;
 
 impl Benchmark {
     /// 正式環境：kuroshio-net 傳輸 + ip-api.com
@@ -130,13 +146,33 @@ impl Benchmark {
             prober,
             asn,
             preflight: (PREFLIGHT_DOMAIN.into(), PREFLIGHT_EXPECTED.to_vec()),
+            headroom: None,
+            progress: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 用可用記憶體決定同時測幾個候選（`headroom` 回傳扣掉保留量後還剩多少）
+    pub fn with_headroom(mut self, f: Arc<dyn Fn() -> Option<u64> + Send + Sync>) -> Benchmark {
+        self.headroom = Some(f);
+        self
+    }
+
+    fn set_progress(&self, v: Value) {
+        *self.progress.lock().unwrap() = Some(v);
+    }
+
+    /// 同時測幾個候選：設定值，再用可用記憶體的 1/4 限制（最少 4 個）
+    fn effective_conc(&self, cfg: &BenchCfg) -> (usize, Option<u64>) {
+        let room = self.headroom.as_ref().and_then(|f| f());
+        let by_mem = room.map(|r| ((r / 4) / PER_CANDIDATE_BYTES).max(4) as usize);
+        (cfg.conc.min(by_mem.unwrap_or(usize::MAX)).max(1), room)
     }
 
     /// 跑一次評測；成功時回傳寫進 upstreams.json 的內容
     pub async fn run(&self, ctx: &JobCtx) -> Result<Value> {
         let mut cache = AsnCache::load(&self.paths);
         let r = self.run_inner(ctx, &mut cache).await;
+        *self.progress.lock().unwrap() = None;
         // 2.x 每查到新的就寫一次（一天可能寫上百次 340 KB）；這裡只在結束時寫一次
         if let (Some(root), true) = (&self.paths.out_root, cache.dirty) {
             if let Err(e) = cache.save(&root.join("cidr_cache.json")) {
@@ -152,6 +188,10 @@ impl Job for Benchmark {
         let me = self.clone();
         Box::pin(async move { Benchmark::run(&me, &ctx).await.map(|_| ()) })
     }
+
+    fn detail(&self) -> Option<Value> {
+        self.progress.lock().unwrap().clone()
+    }
 }
 
 // ---------------- 設定 ----------------
@@ -159,6 +199,8 @@ impl Job for Benchmark {
 struct BenchCfg {
     timeout: Duration,
     conc: usize,
+    /// 同一個候選兩筆查詢之間至少隔多久（收集時一個候選連續測全部網域，不要打太快）
+    pace: Duration,
     max_timeouts: u32,
     keep_days: u64,
     pinned: Vec<String>,
@@ -174,6 +216,7 @@ impl BenchCfg {
         BenchCfg {
             timeout: Duration::from_millis(pos_f64(cfg, "benchmark.timeoutMs").unwrap_or(1500.0) as u64),
             conc: pos_f64(cfg, "benchmark.concurrency").unwrap_or(50.0) as usize,
+            pace: Duration::from_millis(get(cfg, "benchmark.paceMs").and_then(Value::as_u64).unwrap_or(250)),
             // 2.x 是 `?? 2`：0 也算數
             max_timeouts: get(cfg, "benchmark.maxTimeouts").and_then(Value::as_u64).unwrap_or(2) as u32,
             keep_days: pos_f64(cfg, "benchmark.keepDays").unwrap_or(14.0) as u64,
@@ -638,8 +681,9 @@ impl Benchmark {
         }
         ctx.checkpoint().await;
 
-        // Phase 1：逐一測網域
+        // Phase 1：逐一測網域。先收集（每個候選用自己的連線測完全部網域），再照原本的順序逐網域判斷
         let domains = self.paths.read_lists("web.txt");
+        let mut raw = self.collect(ctx, &all, &verified, &domains, &cfg).await;
         // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
         let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
         let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
@@ -648,12 +692,26 @@ impl Benchmark {
         let mut scored = 0usize;
         for (di, domain) in domains.iter().enumerate() {
             ctx.checkpoint().await;
+            // 已經淘汰的候選：剩下的原始答案用不到了
+            for &i in &verified {
+                if !all[i].alive && !raw[i].is_empty() {
+                    raw[i] = Vec::new();
+                }
+            }
             let survivors: Vec<usize> = verified.iter().copied().filter(|i| all[*i].alive).collect();
             if survivors.is_empty() {
                 break;
             }
             info!("[{}/{}] {domain}（倖存 {}）", di + 1, domains.len(), survivors.len());
-            let results = self.query_all(&all, survivors, domain, &cfg).await;
+            self.set_progress(json!({
+                "phase": "judge", "domain": di + 1, "domains": domains.len(), "survivors": survivors.len(), "openConnections": 0,
+                "text": format!("執行中：判斷第 {} / {} 個網域（倖存 {}）", di + 1, domains.len(), survivors.len()),
+            }));
+            // 收集時因為逾時太多而提早停下的候選，在這之前就已經依同樣的規則淘汰了
+            let results: Vec<(usize, QueryResult)> = survivors
+                .iter()
+                .filter_map(|&i| raw[i].get_mut(di).and_then(Option::take).map(|r| (i, r)))
+                .collect();
             let mut ok: Vec<(usize, Vec<Ipv4Addr>, f64)> = Vec::new();
             let mut blocked: Vec<(usize, String)> = Vec::new();
             let mut errors = 0usize;
@@ -830,6 +888,7 @@ impl Benchmark {
             );
         }
 
+        drop(raw);
         strikes.save();
         let finals: Vec<usize> = verified.iter().copied().filter(|i| all[*i].alive).collect();
         if !finals.iter().any(|i| !all[*i].pinned) {
@@ -967,6 +1026,80 @@ impl Benchmark {
         Ok(state)
     }
 
+    /// Phase 1 的收集：`verified` 裡的每個候選用自己的連線依序測完 `domains`，測完就關閉連線；
+    /// 同時只測 [`effective_conc`](Self::effective_conc) 個。回傳以 `all` 的位置為索引，每個網域一格
+    /// （因為逾時太多提早停下的，後面的格子就沒有）
+    async fn collect(
+        &self,
+        ctx: &JobCtx,
+        all: &[Srv],
+        verified: &[usize],
+        domains: &[String],
+        cfg: &BenchCfg,
+    ) -> Vec<Vec<Option<QueryResult>>> {
+        let (conc, room) = self.effective_conc(cfg);
+        info!(
+            "[Phase 1] {} 個網域 × {} 個候選，同時測 {conc} 個{}（每個候選測完就關閉連線）",
+            domains.len(),
+            verified.len(),
+            match room {
+                Some(r) if conc < cfg.conc => format!("（可用記憶體 {} MB，設定是 {}）", r >> 20, cfg.conc),
+                _ => String::new(),
+            }
+        );
+        let mut out: Vec<Vec<Option<QueryResult>>> = (0..all.len()).map(|_| Vec::new()).collect();
+        let domains: Arc<Vec<String>> = Arc::new(domains.to_vec());
+        let pause = Arc::new(PauseState::default());
+        let total = verified.len();
+        let mut done = 0usize;
+        let mut last_log = Instant::now();
+        self.set_progress(json!({
+            "phase": "collect", "done": 0, "total": total, "domains": domains.len(), "concurrency": conc, "openConnections": 0,
+            "text": format!("執行中：開始測 {total} 個候選"),
+        }));
+        let mut it = verified.iter().copied();
+        let mut set = JoinSet::new();
+        let spawn = |set: &mut JoinSet<(usize, Vec<Option<QueryResult>>)>, i: usize| {
+            let s = &all[i];
+            let job = CollectJob {
+                prober: self.prober.clone(),
+                up: s.up.fresh(),
+                domains: domains.clone(),
+                ctx: ctx.clone(),
+                timeout: cfg.timeout,
+                pace: cfg.pace,
+                // 固定上游永遠不淘汰，要測完全部網域
+                stop_after: if s.pinned { None } else { Some(cfg.max_timeouts) },
+                pause: pause.clone(),
+            };
+            set.spawn(async move { (i, job.run().await) });
+        };
+        for i in it.by_ref().take(conc) {
+            spawn(&mut set, i);
+        }
+        while let Some(r) = set.join_next().await {
+            if let Ok((i, v)) = r {
+                out[i] = v;
+            }
+            done += 1;
+            if let Some(i) = it.next() {
+                spawn(&mut set, i);
+            }
+            let open = set.len().saturating_sub(pause.paused.load(Ordering::Relaxed));
+            self.set_progress(json!({
+                "phase": "collect", "done": done, "total": total, "domains": domains.len(),
+                "concurrency": conc, "openConnections": open,
+                "text": format!("執行中：測完 {done} / {total} 個候選（開著 {open} 條連線）"),
+            }));
+            if last_log.elapsed() >= Duration::from_secs(60) {
+                last_log = Instant::now();
+                info!("   收集中：{done} / {total} 個候選測完（同時 {} 個）", set.len());
+            }
+        }
+        info!("   收集完成：{total} 個候選，開始逐網域判斷");
+        out
+    }
+
     /// 對 `idx` 這些候選並行查同一個網域；回傳（候選位置, 結果），依輸入順序
     /// 每個可疑回答驗證最多 `VERIFY_IPS` 個 IP：任一個憑證有效 → 有效；否則任一個憑證不符 → 劫持；都連不上 → 無法驗證
     async fn verify_answers(
@@ -1018,11 +1151,12 @@ impl Benchmark {
     }
 
     async fn query_all(&self, all: &[Srv], idx: Vec<usize>, domain: &str, cfg: &BenchCfg) -> Vec<(usize, QueryResult)> {
-        let jobs: Vec<(usize, Upstream)> = idx.iter().map(|&i| (i, all[i].up.clone())).collect();
+        // 不共用連線的複本：查完就關閉（不然資格賽的幾百條連線會一直開著）
+        let jobs: Vec<(usize, Upstream)> = idx.iter().map(|&i| (i, all[i].up.fresh())).collect();
         let prober = self.prober.clone();
         let timeout = cfg.timeout;
         let domain = domain.to_string();
-        let res = map_limit(jobs, cfg.conc, |(i, up)| {
+        let res = map_limit(jobs, self.effective_conc(cfg).0, |(i, up)| {
             let prober = prober.clone();
             let domain = domain.clone();
             async move { (i, query(&*prober, &up, &domain, timeout, 1).await) }
@@ -1040,6 +1174,80 @@ impl Benchmark {
                 ))
             })
             .collect()
+    }
+}
+
+/// 收集時的暫停狀態（很多個候選各自暫停，只記一次日誌）
+#[derive(Default)]
+struct PauseState {
+    paused: AtomicUsize,
+    announced: AtomicBool,
+}
+
+/// 一個候選的收集工作
+struct CollectJob {
+    prober: Arc<dyn Prober>,
+    up: Upstream,
+    domains: Arc<Vec<String>>,
+    ctx: JobCtx,
+    timeout: Duration,
+    pace: Duration,
+    /// 失敗超過幾次就不用再測（跟判斷時的淘汰規則一樣）；None = 測完全部
+    stop_after: Option<u32>,
+    pause: Arc<PauseState>,
+}
+
+impl CollectJob {
+    async fn run(self) -> Vec<Option<QueryResult>> {
+        let CollectJob {
+            prober,
+            mut up,
+            domains,
+            ctx,
+            timeout,
+            pace,
+            stop_after,
+            pause,
+        } = self;
+        let mut out = Vec::with_capacity(domains.len());
+        let mut errors = 0u32;
+        let mut last: Option<Instant> = None;
+        for d in domains.iter() {
+            if ctx.should_defer() {
+                // 先關閉連線再等：暫停期間不佔記憶體
+                up = up.fresh();
+                pause.paused.fetch_add(1, Ordering::Relaxed);
+                if !pause.announced.swap(true, Ordering::Relaxed) {
+                    info!("[{JOB_NAME}] 系統資源吃緊：關閉評測連線並暫停");
+                }
+                ctx.wait_while_deferred().await;
+                pause.paused.fetch_sub(1, Ordering::Relaxed);
+                if pause.announced.swap(false, Ordering::Relaxed) {
+                    info!("[{JOB_NAME}] 恢復評測");
+                }
+                last = None;
+            }
+            if let Some(t) = last {
+                let wait = pace.saturating_sub(t.elapsed());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+            last = Some(Instant::now());
+            let mut r = query(&*prober, &up, d, timeout, 1).await;
+            let failed = matches!(r.outcome, Outcome::Error(_));
+            if let Outcome::Ok(ips) = &mut r.outcome {
+                ips.shrink_to_fit();
+            }
+            out.push(Some(r));
+            if failed {
+                errors += 1;
+                if stop_after.is_some_and(|m| errors > m) {
+                    break;
+                }
+            }
+        }
+        out
     }
 }
 

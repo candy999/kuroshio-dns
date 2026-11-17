@@ -138,6 +138,15 @@ pub struct Doq {
     conn: tokio::sync::Mutex<Option<quinn::Connection>>,
 }
 
+/// 最後一個持有者丟掉時就關閉連線（不等閒置逾時：keep-alive 會讓閒置逾時永遠不到）
+impl Drop for Doq {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.get_mut().take() {
+            c.close(0u32.into(), b"");
+        }
+    }
+}
+
 impl Doq {
     async fn get(&self, host: &str, port: u16, timeout: Duration, fresh: bool) -> Result<quinn::Connection> {
         let mut slot = self.conn.lock().await;
@@ -200,6 +209,14 @@ type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 #[derive(Default)]
 pub struct Doh3 {
     send: tokio::sync::Mutex<Option<(H3Send, quinn::Connection)>>,
+}
+
+impl Drop for Doh3 {
+    fn drop(&mut self) {
+        if let Some((_, c)) = self.send.get_mut().take() {
+            c.close(0u32.into(), b"");
+        }
+    }
 }
 
 impl Doh3 {

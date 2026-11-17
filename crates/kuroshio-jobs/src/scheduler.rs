@@ -125,6 +125,16 @@ impl JobCtx {
         self.defer.as_ref().map(|f| f()).unwrap_or(false)
     }
 
+    /// 系統吃緊時等到恢復（不記日誌；很多個並行的小段落各自等，由呼叫者統一記錄）。有等待就回 true
+    pub async fn wait_while_deferred(&self) -> bool {
+        let mut waited = false;
+        while self.should_defer() {
+            waited = true;
+            tokio::time::sleep(self.defer_poll).await;
+        }
+        waited
+    }
+
     /// 每做完一小段就呼叫：讓出 CPU 給 DNS；系統吃緊時在這裡等到恢復
     pub async fn checkpoint(&self) {
         tokio::task::yield_now().await;

@@ -486,3 +486,74 @@ async fn pollution_requires_site_verification() {
         "{picked}"
     );
 }
+
+/// 記錄同時有幾個不同的候選在查詢（每個候選一條連線）
+#[derive(Default)]
+struct Counting {
+    active: std::sync::Mutex<HashMap<String, usize>>,
+    max: std::sync::atomic::AtomicUsize,
+}
+
+struct Forward(&'static Counting);
+
+impl Prober for Forward {
+    fn supports(&self, up: &Upstream) -> bool {
+        LocalOnly.supports(up)
+    }
+    fn exchange(&self, up: Upstream, q: Vec<u8>, t: Duration) -> BoxFuture<anyhow::Result<Vec<u8>>> {
+        let c = self.0;
+        {
+            let mut a = c.active.lock().unwrap();
+            *a.entry(up.id.clone()).or_default() += 1;
+            c.max.fetch_max(a.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Box::pin(async move {
+            let r = NetProber.exchange(up.clone(), q, t).await;
+            let mut a = c.active.lock().unwrap();
+            if let Some(n) = a.get_mut(&up.id) {
+                *n -= 1;
+                if *n == 0 {
+                    a.remove(&up.id);
+                }
+            }
+            r
+        })
+    }
+    fn resolve_v4(&self, h: String) -> BoxFuture<Option<Ipv4Addr>> {
+        LocalOnly.resolve_v4(h)
+    }
+    fn verify_site(&self, ip: std::net::IpAddr, d: String, t: Duration) -> BoxFuture<(SiteCheck, String)> {
+        LocalOnly.verify_site(ip, d, t)
+    }
+}
+
+/// 收集階段：同時測的候選不超過設定，也不超過「可用記憶體的 1/4」換算的數量（最少 4 個）；結果照樣正確
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_bounds_concurrent_candidates() {
+    use kuroshio_jobs::scheduler::Job;
+    let mut ids = Vec::new();
+    for k in 1..=9u8 {
+        let a = mock(&format!("127.{k}.0.31:0"), 20, move |n| honest(n, k)).await;
+        ids.push(a.to_string());
+    }
+    let root = tmp("conc");
+    let p = paths(&root);
+    std::fs::create_dir_all(&p.list_dir).unwrap();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::write(p.list_dir.join("iplist.txt"), ids.join("\n")).unwrap();
+    std::fs::write(p.list_dir.join("web.txt"), "www.alpha.com\ncdn.beta.com\nvideo.gamma.net\n").unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "upstream": { "pinned": [], "autoTypes": ["udp"], "autoMax": 6 },
+        "benchmark": { "timeoutMs": 500, "concurrency": 50, "paceMs": 0, "maxTimeouts": 1, "minAuto": 1 },
+    }));
+    let counting: &'static Counting = Box::leak(Box::default());
+    // 可用記憶體 0：只能同時測 4 個
+    let b = Benchmark::with(p.clone(), Arc::new(Forward(counting)), asn()).with_headroom(Arc::new(|| Some(0)));
+    let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(cfg));
+    let state = b.run(&ctx).await.unwrap();
+    let max = counting.max.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(max <= 4, "同時測了 {max} 個候選");
+    assert!(max >= 2, "應該有並行（{max}）");
+    assert_eq!(state["counts"]["survivors"], 9, "{state:#}");
+    assert!(b.detail().is_none(), "結束後不再顯示進度");
+}

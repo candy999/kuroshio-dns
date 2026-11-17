@@ -57,6 +57,14 @@ impl PartialEq for Upstream {
 }
 
 impl Upstream {
+    /// 同一個上游、但不共用連線的複本（評測用：這份丟掉，連線就跟著關閉）
+    pub fn fresh(&self) -> Upstream {
+        Upstream {
+            client: Arc::new(Client::default()),
+            ..self.clone()
+        }
+    }
+
     pub fn parse(spec: &str) -> Result<Upstream> {
         let s = spec.trim();
         // 純 IP 或 ip:port、[v6]:port → udp

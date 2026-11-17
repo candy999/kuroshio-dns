@@ -696,7 +696,10 @@ fn start_scheduler(
     if storage_class(cfg) != StorageClass::Disk {
         paths.out_root = Some(runtime_dir(cfg).join("benchmark"));
     }
-    sched.register("dns-benchmark", Benchmark::new(paths));
+    // 同時測幾個候選也看可用記憶體（扣掉保留量之後的 1/4）
+    let reserve = crate::memgov::reserve_from_cfg(cfg);
+    let bench = Benchmark::new(paths).with_headroom(Arc::new(move || crate::memgov::headroom(&crate::memgov::Reading::now(), &reserve)));
+    sched.register("dns-benchmark", bench);
     if let Some(cdn) = cdn {
         register_cdn_jobs(&sched, cdn);
     }
