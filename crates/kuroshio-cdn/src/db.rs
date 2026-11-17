@@ -874,6 +874,8 @@ impl Db {
         }
         out.shards_on_disk = n;
         let Some(n) = n else { return out };
+        // 不見的分片只記一行（第一次啟動、資料庫還是空的時候可能一片都還沒寫，不要洗版）
+        let mut missing: Vec<usize> = Vec::new();
         for i in 0..n {
             let rel = shard_file(n, i);
             match read(&rel).map(|b| serde_json::from_slice::<FileFmt>(&b)) {
@@ -891,10 +893,17 @@ impl Db {
                     out.bad_shards.push(i);
                 }
                 None => {
-                    tracing::warn!("CDN 網域分片 {rel} 不見了，略過（其他分片照常載入）");
+                    missing.push(i);
                     out.bad_shards.push(i);
                 }
             }
+        }
+        if !missing.is_empty() {
+            tracing::warn!(
+                "CDN 網域分片有 {} / {n} 片不見了（例如 {}），略過（其他分片照常載入）",
+                missing.len(),
+                shard_file(n, missing[0])
+            );
         }
         if self.domains.len() > self.max_entries {
             self.prune();

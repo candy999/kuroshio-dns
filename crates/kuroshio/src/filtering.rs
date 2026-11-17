@@ -161,6 +161,25 @@ pub struct CopyMeta {
     pub rules: u64,
 }
 
+/// [`ListCopies::stream`] 送回來的一段
+pub enum CopyChunk {
+    Data(Vec<u8>),
+    /// 讀完了：內容雜湊對不對（false = 副本壞了）
+    End(bool),
+}
+
+/// 把副本邊收邊交給清單的寫入端（每一段之間讓出執行緒）。回傳有沒有完整讀到
+async fn feed_copy(c: &ListCopies, url: &str, w: &mut kuroshio_filter::SourceWriter<'_>) -> bool {
+    let Some(mut rx) = c.stream(url) else { return false };
+    while let Some(m) = rx.recv().await {
+        match m {
+            CopyChunk::Data(d) => w.feed(&d),
+            CopyChunk::End(ok) => return ok,
+        }
+    }
+    false
+}
+
 /// 過濾清單的本機副本（可省略的資料：空間大方時才留）
 pub struct ListCopies {
     pub persister: Arc<Mutex<crate::persist::Persister>>,
@@ -256,6 +275,41 @@ impl ListCopies {
         let Some(m) = self.meta(url) else { return false };
         let p = self.persister.lock().unwrap();
         p.is_pending(&m.file) || p.file_path(&m.file).exists()
+    }
+
+    /// 讀副本，但解壓縮在 blocking 執行緒做，內容一段一段（64 KB）從 channel 送回來：
+    /// 呼叫端在 async 裡邊收邊解析，每一段之間會讓出執行緒，重建大清單時 DNS 照常回答。沒有副本回傳 None
+    pub fn stream(&self, url: &str) -> Option<tokio::sync::mpsc::Receiver<CopyChunk>> {
+        let m = self.meta(url)?;
+        let path = self.persister.lock().unwrap().file_path(&m.file);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::task::spawn_blocking(move || {
+            let ok = (|| {
+                let f = std::fs::File::open(&path).ok()?;
+                let mut dec = zstd::stream::read::Decoder::new(f).ok()?;
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let mut n = 0u64;
+                loop {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    match dec.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(k) => {
+                            buf.truncate(k);
+                            h.write(&buf);
+                            n += k as u64;
+                            // 收的那一端不要了（重建取消）：停下來
+                            tx.blocking_send(CopyChunk::Data(buf)).ok()?;
+                        }
+                        Err(_) => return None,
+                    }
+                }
+                h.write_u64(n);
+                Some(h.finish() == m.hash)
+            })()
+            .unwrap_or(false);
+            let _ = tx.blocking_send(CopyChunk::End(ok));
+        });
+        Some(rx)
     }
 
     /// 讀副本（解壓後一段一段交給 `feed`）。回傳有沒有讀到
@@ -819,7 +873,7 @@ impl FilterService {
             };
             if use_copy {
                 if let Some(c) = copies.filter(|c| c.available(&s.url)) {
-                    if c.read(&s.url, &mut |b| w.feed(b)) {
+                    if feed_copy(c, &s.url, &mut w).await {
                         w.end();
                         let m = c.meta(&s.url).unwrap_or_else(|| unreachable!());
                         validators.push(Validators {
@@ -875,10 +929,13 @@ impl FilterService {
                 }
                 Err(e) => {
                     // 下載失敗：有本機副本就拿副本頂著（這份清單不會整份不見）
-                    let fallback = copies.filter(|c| c.available(&s.url)).is_some_and(|c| {
-                        w.reset();
-                        c.read(&s.url, &mut |b| w.feed(b))
-                    });
+                    let fallback = match copies.filter(|c| c.available(&s.url)) {
+                        Some(c) => {
+                            w.reset();
+                            feed_copy(c, &s.url, &mut w).await
+                        }
+                        None => false,
+                    };
                     w.end();
                     if fallback {
                         warn!("下載清單「{}」失敗：{e}；先用本機副本", s.name);
@@ -891,7 +948,8 @@ impl FilterService {
                 }
             }
         }
-        let f = b.finish();
+        // 建索引（排序、壓縮）也是大量計算：放到 blocking 執行緒，不佔住回答查詢的執行緒
+        let f = tokio::task::spawn_blocking(move || b.finish()).await?;
         let st = f.stats();
         for s in st.over_budget() {
             if let SourceStatus::OverBudget { rules, remaining } = s.status {
