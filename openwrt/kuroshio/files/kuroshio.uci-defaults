@@ -1,6 +1,17 @@
 #!/bin/sh
 # 安裝 / 升級：補上新版本才有的設定區段、從 2.x（candydns）搬設定、放好可編輯的檔案
 
+# 升級：套件管理員把舊版套件附的設定檔當成舊檔刪掉時，放回升級前的備份（preinst 備份的）
+if [ ! -f /etc/config/kuroshio ] && [ -s /tmp/kuroshio.config.preinst ]; then
+	cp -p /tmp/kuroshio.config.preinst /etc/config/kuroshio
+	logger -t kuroshio "升級：已放回升級前的設定"
+fi
+[ -f /tmp/kuroshio.config.preinst ] && rm /tmp/kuroshio.config.preinst
+# 舊版升級時 opkg / apk 另外放的「新版預設設定」：用不到（新版預設值的變動由下面的遷移規則補上）
+for f in /etc/config/kuroshio-opkg /etc/config/kuroshio.apk-new; do
+	[ -f "$f" ] && rm "$f"
+done
+
 # 第一次安裝、而且有 2.x 的設定：整份搬過來（欄位相同），先不啟用，避免跟 2.x 搶 53 埠
 if [ ! -f /etc/kuroshio/.migrated ] && [ -s /etc/config/candydns ] && ! uci -q get kuroshio.main.migrated >/dev/null; then
 	sed -e 's/^config candydns /config kuroshio /' /etc/config/candydns > /etc/config/kuroshio
@@ -24,6 +35,9 @@ if [ ! -f /etc/kuroshio/.migrated ] && [ -s /etc/config/candydns ] && ! uci -q g
 	touch /etc/kuroshio/.migrated
 	logger -t kuroshio "已從 2.x（candydns）搬移設定，請在 LuCI 停用 candydns 後再啟用黑潮 DNS"
 fi
+
+# 第一次安裝：放預設設定（3.3.4 起預設值不放在套件的 /etc/config 裡，升級時才不會每次產生 kuroshio-opkg）
+[ -f /etc/config/kuroshio ] || cp /usr/share/kuroshio/kuroshio.config /etc/config/kuroshio
 
 # 升級後補上新版本才有的設定區段（LuCI 的設定頁需要這些區段存在才能儲存）
 touch /etc/config/kuroshio

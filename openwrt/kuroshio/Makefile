@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=kuroshio
-PKG_VERSION:=3.3.3
+PKG_VERSION:=3.3.4
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Kuroshio DNS contributors
 PKG_LICENSE:=GPL-3.0-or-later
@@ -32,6 +32,9 @@ define Package/kuroshio/description
   Rust 單一執行檔，依硬體自動調整（128 MB 記憶體的路由器也能用）。
 endef
 
+# /etc/config/kuroshio 不放在套件裡（預設值在 /usr/share/kuroshio/kuroshio.config，第一次安裝時由 uci-defaults 複製）：
+# 放在套件裡時，使用者改過設定後每次升級 opkg 都會另外產生 kuroshio-opkg 並列在「錯誤」裡（apk 是 .apk-new）。
+# 留在 conffiles 裡是為了系統升級（sysupgrade）時照樣保留
 define Package/kuroshio/conffiles
 /etc/config/kuroshio
 /etc/kuroshio/custom-rules.txt
@@ -52,7 +55,6 @@ endef
 define Package/kuroshio/install
 	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/config $(1)/etc/init.d $(1)/etc/uci-defaults $(1)/usr/libexec/kuroshio $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/kuroshio $(1)/usr/bin/kuroshio
-	$(INSTALL_CONF) ./files/kuroshio.config $(1)/etc/config/kuroshio
 	$(INSTALL_BIN) ./files/kuroshio.init $(1)/etc/init.d/kuroshio
 	$(INSTALL_BIN) ./files/kuroshio.uci-defaults $(1)/etc/uci-defaults/90-kuroshio
 	$(INSTALL_BIN) ./files/takeover.sh $(1)/usr/libexec/kuroshio/takeover.sh
@@ -63,6 +65,7 @@ define Package/kuroshio/install
 	$(INSTALL_BIN) ./files/rpcd.sh $(1)/usr/libexec/rpcd/kuroshio
 	# 唯讀資料：種子、評測名單、CDN 官方範圍、公開網頁、共用儀表板、預設自訂規則
 	$(INSTALL_DIR) $(1)/usr/share/kuroshio
+	$(INSTALL_DATA) ./files/kuroshio.config $(1)/usr/share/kuroshio/kuroshio.config
 	$(CP) $(REPO_ROOT)/data/seed $(1)/usr/share/kuroshio/seed
 	$(CP) $(REPO_ROOT)/data/benchmark $(1)/usr/share/kuroshio/benchmark
 	$(CP) $(REPO_ROOT)/data/cdn $(1)/usr/share/kuroshio/cdn
@@ -72,6 +75,14 @@ define Package/kuroshio/install
 	# data/ 的版本標記（跟執行檔同一版；啟動時檢查，見 docs/integration.md）
 	$(INSTALL_DATA) $(REPO_ROOT)/data/manifest.json $(1)/usr/share/kuroshio/manifest.json
 	$(INSTALL_DATA) $(REPO_ROOT)/rules/default-custom-rules.txt $(1)/usr/share/kuroshio/default-custom-rules.txt
+endef
+
+# 升級前先備份設定：舊版的套件裡有 /etc/config/kuroshio，新版沒有，套件管理員升級時可能把它當成舊檔刪掉；
+# uci-defaults 發現不見了就從這裡放回去
+define Package/kuroshio/preinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || { [ -f /etc/config/kuroshio ] && cp -p /etc/config/kuroshio /tmp/kuroshio.config.preinst; }
+exit 0
 endef
 
 define Package/kuroshio/postinst

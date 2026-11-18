@@ -39,6 +39,22 @@ check "版本" /usr/bin/kuroshio --version
 check "沒有 node 也能裝" sh -c '! command -v node'
 check "依賴 acme.sh 已自動安裝" test -x /usr/lib/acme/client/acme.sh
 check "預設設定檔" test -f /etc/config/kuroshio
+check "預設設定也放在 /usr/share（套件不帶 /etc/config/kuroshio）" test -f /usr/share/kuroshio/kuroshio.config
+
+echo "== 改過設定後再裝一次（升級）：不另外產生 kuroshio-opkg / .apk-new，使用者的設定保留"
+uci set kuroshio.main.ci_marker='kept'
+uci commit kuroshio
+if command -v apk >/dev/null 2>&1; then
+	apk add --allow-untrusted --force-overwrite /pkgs/kuroshio-[0-9]*.apk >/tmp/reinstall.log 2>&1 || true
+else
+	opkg install --force-reinstall /pkgs/kuroshio_*.ipk >/tmp/reinstall.log 2>&1 || true
+fi
+eq "使用者改過的設定還在" "$(uci -q get kuroshio.main.ci_marker)" "kept"
+check "沒有 kuroshio-opkg" sh -c '! test -e /etc/config/kuroshio-opkg'
+check "沒有 kuroshio.apk-new" sh -c '! test -e /etc/config/kuroshio.apk-new'
+check "安裝訊息沒有 conffile 錯誤" sh -c '! grep -q resolve_conffiles /tmp/reinstall.log'
+uci -q delete kuroshio.main.ci_marker
+uci commit kuroshio
 check "種子資料已打包" test -f /usr/share/kuroshio/seed/meta.json
 check "CDN 官方範圍已打包" test -d /usr/share/kuroshio/cdn
 sh /etc/uci-defaults/90-kuroshio 2>/dev/null || true
