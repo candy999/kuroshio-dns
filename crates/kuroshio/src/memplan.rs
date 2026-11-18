@@ -6,10 +6,10 @@
 //! - 背景工作（每日評測、CDN）只在「正常」時啟動，執行中變成偏低就在檢查點暫停
 //! - 過濾清單：建好每條約 [`crate::filtering::BYTES_PER_DOMAIN`] bytes；重建時建置中每條另外約
 //!   [`crate::filtering::BUILD_BYTES_PER_RULE`]，要放得進保留量以上的空間；放不下就依停用順序不載入，保護清單一定載入
-//! - 每日評測（3.3.3 起在子程序裡跑）：同時測 min(設定, max(4, 保留量以上可用的 1/4 ÷ 128 KB)) 個候選
+//! - 每日評測（3.3.3 起在子程序裡跑）：同時測 min(設定, max(4, 保留量以上可用的 1/4 ÷ 512 KB)) 個候選
 //!
 //! 常數（[`Assumptions`]）是實測推算的，不是程式的判斷規則：基本用量、CDN 資料庫、評測子程序的基本用量與原始答案。
-//! 32 位元的數字來自 Padavan（Newifi D3，mipsel）3.3.2 的實測，64 位元還沒有實測。
+//! 32 位元的數字來自 Padavan（Newifi D3，mipsel）3.3.3 的實測，64 位元還沒有實測。
 
 use crate::memgov::{auto_reserve, margin, Platform};
 use serde_json::{json, Value};
@@ -89,21 +89,22 @@ impl Assumptions {
     pub fn for_bits(bits: u32) -> Assumptions {
         let wide = bits == 64;
         Assumptions {
-            // D3：評測前 RSS 19.9 MB − 清單 3.4 MB − CDN 1.7 MB ≈ 14.8 MB
-            base_rss: if wide { 20 * MB } else { 15 * MB },
+            // D3（3.3.3）：評測前 RSS 21.8 MB − 清單 3.4 MB − CDN 1.7 MB ≈ 16.7 MB
+            base_rss: if wide { 22 * MB } else { 16 * MB + 512 * KB },
             cdn: 2 * MB,
             cache_entry: if wide { 360 } else { 260 },
-            // D3（3.3.2，同一個程式裡跑）：評測期間比評測前多約 25 MB，其中原始答案最多 6.1 MB、32 條連線
-            bench_base: if wide { 12 * MB } else { 8 * MB },
+            // D3（3.3.3，評測子程序）：剛開始 11.9 MB；收集階段同時 32 個、原始答案 6 MB 時到 34.5 MB；
+            // 判斷階段最高 37 MB（多出的約 2.5 MB 算進基本用量）
+            bench_base: if wide { 18 * MB } else { 14 * MB + 512 * KB },
             bench_raw: 6 * MB,
-            bench_per_candidate: 128 * KB,
+            bench_per_candidate: 512 * KB,
             os_fixed: 24 * MB,
             os_pct: 8,
         }
     }
 
     pub fn bits(&self) -> u32 {
-        if self.base_rss > 15 * MB {
+        if self.base_rss > 20 * MB {
             64
         } else {
             32
@@ -118,7 +119,7 @@ impl Assumptions {
             "benchPerCandidateKB": self.bench_per_candidate / KB,
             "osFixedMB": mb(self.os_fixed), "osPercent": self.os_pct,
             "bits": self.bits(),
-            "source": if self.bits() == 64 { "64 位元：還沒有實測，先用 32 位元的數字放大" } else { "32 位元：Padavan（Newifi D3，mipsel）3.3.2 實測推算" },
+            "source": if self.bits() == 64 { "64 位元：還沒有實測，先用 32 位元的數字放大" } else { "32 位元：Padavan（Newifi D3，mipsel）3.3.3 實測" },
         })
     }
 }
@@ -279,7 +280,7 @@ pub fn text(rows: &[Value], a: &Assumptions) -> String {
     }
     out.push(String::new());
     out.push(format!(
-        "常數：程式本身約 {:.0} MB、CDN 資料庫約 {:.0} MB、評測子程序基本 {:.0} MB + 原始答案 {:.0} MB + 每個候選 {} KB；{}",
+        "常數：程式本身約 {:.1} MB、CDN 資料庫約 {:.1} MB、評測子程序基本 {:.1} MB + 原始答案 {:.1} MB + 每個候選 {} KB；{}",
         a.base_rss as f64 / MB as f64,
         a.cdn as f64 / MB as f64,
         a.bench_base as f64 / MB as f64,
@@ -315,16 +316,7 @@ mod tests {
 
     #[test]
     fn small_machines_degrade_in_order() {
-        let a = Assumptions {
-            base_rss: 15 * MB,
-            cdn: 2 * MB,
-            cache_entry: 260,
-            bench_base: 8 * MB,
-            bench_raw: 6 * MB,
-            bench_per_candidate: 128 * KB,
-            os_fixed: 24 * MB,
-            os_pct: 8,
-        };
+        let a = Assumptions::for_bits(32);
         let p512 = plan(&input(512), &a);
         assert_eq!(p512["lists"], "all");
         assert_eq!(p512["pressure"], "normal");
@@ -332,7 +324,9 @@ mod tests {
         let p128 = plan(&input(128), &a);
         assert_eq!(p128["reserveMB"], 16.0, "128 MB：保留量 16 MB");
         assert_eq!(p128["lists"], "all");
-        assert_eq!(p128["benchmark"]["concurrency"], 32);
+        // 保留量以上可用約 56 MB：1/4 ÷ 512 KB = 28 個（設定是 32）
+        assert_eq!(p128["benchmark"]["concurrency"], 28);
+        assert_eq!(p128["benchmark"]["completes"], true);
         let p64 = plan(&input(64), &a);
         assert_ne!(p64["lists"], "all", "64 MB：清單放不下全部");
         assert!(p64["benchmark"].is_null(), "64 MB：每日評測延後");

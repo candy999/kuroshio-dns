@@ -1689,7 +1689,9 @@ async fn memory_plan_cmd(config: &std::path::Path, uci: bool, ram: Vec<u64>, bit
     let index: Value = kuroshio_cdn::statefile::read(&kuroshio::app::persist_dir(&cfg).join(kuroshio::filtering::COPY_INDEX))
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    let (mut rules, mut protected, mut unknown) = (0u64, 0u64, 0usize);
+    // 各清單的規則數（還沒扣掉不同清單之間重複的網域）：
+    // 本機副本記的實際值 → 內建清單 2026-11 實測的行數 → 其他每份估 5 萬條
+    let (mut sum, mut prot_sum, mut no_copy, mut no_rules) = (0u64, 0u64, 0usize, 0usize);
     for l in kuroshio_config::get(&cfg, "filter.lists")
         .and_then(Value::as_array)
         .into_iter()
@@ -1701,28 +1703,59 @@ async fn memory_plan_cmd(config: &std::path::Path, uci: bool, ram: Vec<u64>, bit
         let url = l.get("url").and_then(Value::as_str).unwrap_or("");
         let cat = l.get("category").and_then(Value::as_str).unwrap_or("ads");
         let prot = l.get("protect").and_then(Value::as_bool).unwrap_or(cat == "malware");
-        // 有本機副本：用實際載入的規則數；沒有：內建清單用實測的行數（扣掉重複），其他每份估 5 萬條
-        let r = match index.get(url).and_then(|m| m["rules"].as_u64()).filter(|&r| r > 0) {
-            Some(r) => r,
-            None => {
-                unknown += 1;
+        let r = match index.get(url) {
+            Some(m) if m["rules"].as_u64().unwrap_or(0) > 0 => m["rules"].as_u64().unwrap_or(0),
+            other => {
+                // 有副本但沒記規則數（3.3.2 以前寫的；3.3.3 起下次用副本載入時補記）／ 沒有副本
+                if other.is_some() {
+                    no_rules += 1;
+                } else {
+                    no_copy += 1;
+                }
                 kuroshio::memplan::KNOWN_RULES
                     .iter()
                     .find(|(u, _)| *u == url)
-                    .map_or(kuroshio::memplan::UNKNOWN_LIST_RULES, |(_, n)| {
-                        n * kuroshio::memplan::DEDUP_PCT / 100
-                    })
+                    .map_or(kuroshio::memplan::UNKNOWN_LIST_RULES, |(_, n)| *n)
             }
         };
-        rules += r;
+        sum += r;
         if prot {
-            protected += r;
+            prot_sum += r;
         }
     }
-    if unknown > 0 {
+    // 不同清單重複的網域只算一次（預設清單約少 25%）
+    let mut rules = sum * kuroshio::memplan::DEDUP_PCT / 100;
+    let mut protected = prot_sum * kuroshio::memplan::DEDUP_PCT / 100;
+    if no_copy > 0 {
+        notes.push(format!("{no_copy} 份清單還沒有本機副本：規則數用內建清單 2026-11 實測的行數估"));
+    }
+    if no_rules > 0 {
         notes.push(format!(
-            "{unknown} 份清單還沒有本機副本（不知道實際規則數）：內建清單用 2026-11 實測的行數（扣掉重複約 25%）估"
+            "{no_rules} 份清單的本機副本沒記規則數（3.3.2 以前寫的；服務下次用副本載入時會補記）：先用內建清單實測的行數估"
         ));
+    }
+    // 服務正在執行：直接用它實際載入的規則數（已經扣掉重複），比上面的估計準
+    let mut running: Option<Value> = None;
+    if let Some(ep) = admin_endpoint(&cfg) {
+        if let Ok((200, b)) = admin_call(&ep, "GET", "/api/status", None, std::time::Duration::from_secs(3)).await {
+            running = serde_json::from_slice::<Value>(&b).ok();
+        }
+    }
+    if let Some(f) = running
+        .as_ref()
+        .map(|v| &v["filter"])
+        .filter(|f| f["lists"].as_u64().unwrap_or(0) > 0)
+    {
+        rules = f["lists"].as_u64().unwrap_or(rules);
+        let p: u64 = f["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| s["protect"] == true && s["status"] == "loaded")
+            .filter_map(|s| s["rules"].as_u64())
+            .sum();
+        protected = (p * kuroshio::memplan::DEDUP_PCT / 100).min(rules);
+        notes.push(format!("清單規則數用執行中服務實際載入的 {rules} 條"));
     }
     let sys = kuroshio::sysinfo::SysInfo::detect();
     let conc = match n("benchmark.concurrency") {
@@ -1755,17 +1788,12 @@ async fn memory_plan_cmd(config: &std::path::Path, uci: bool, ram: Vec<u64>, bit
             let mut i = base(total);
             i.min_free_kb = kuroshio::memgov::read_min_free_kb();
             let mut own = 0u64;
-            if let Some(ep) = admin_endpoint(&cfg) {
-                if let Ok((200, b)) = admin_call(&ep, "GET", "/api/status", None, std::time::Duration::from_secs(3)).await {
-                    let v: Value = serde_json::from_slice(&b).unwrap_or_default();
-                    if let Some(kb) = v["memory"]["rssKB"].as_u64() {
-                        own = kb * 1024;
-                        notes.push(format!(
-                            "服務正在執行：目前實際用 {:.1} MB（RSS），推算時把它加回「啟動前可用」",
-                            own as f64 / 1048576.0
-                        ));
-                    }
-                }
+            if let Some(kb) = running.as_ref().and_then(|v| v["memory"]["rssKB"].as_u64()) {
+                own = kb * 1024;
+                notes.push(format!(
+                    "服務正在執行：目前實際用 {:.1} MB（RSS），推算時把它加回「啟動前可用」",
+                    own as f64 / 1048576.0
+                ));
             }
             i.avail_before = Some(avail + own);
             let mut r = plan(&i, &a);

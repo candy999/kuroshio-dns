@@ -311,8 +311,8 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 - 可用記憶體接近保留量，依「重建成本由低到高」讓出：診斷緩衝 → DNS 快取縮到 1/4 → CDN 冷資料移到磁碟 → （真的不足時）停用優先順序最低的過濾清單 → 只剩轉送。DNS 轉送本身永遠不讓出。
 - 快照目錄在 tmpfs 時，「CDN 冷資料移到磁碟」一樣有效：移出的只有已經寫進快照、之後沒變過的資料，快照檔本來就在那裡（而且是壓縮的），這一步放掉的是記憶體裡展開的那一份。快照檔佔的記憶體在 `/api/status` 的 `memory.stateInRam`。
 - 重新載入過濾清單時新舊兩份會同時存在：載入前先估「建好的大小 + 建置中每條約 16 bytes」，放不進保留量以上的空間就依停用順序先不載入（3.3.2 起；開機那次用本機副本記的規則數估）。
-- 背景工作在記憶體吃緊時延後、執行中的會暫停（每日評測、CDN 的範圍 / 網段分類 / 節點池都一樣）。每日評測（dns-benchmark）同時只測 `benchmark.concurrency` 個候選（`auto` = 每核心 8 個，8–50），也不超過「可用記憶體扣掉保留量的 1/4 ÷ 128 KB」；每個候選測完就關閉連線，暫停時先關閉手上的連線。
-- 各結構目前的用量在 `/api/status` 的 `memory.sizes`（`cacheBytes`、`cdnBytes`、`filterListsBytes` 等，都是估計值）。背景工作在 `memory.jobs`：`{"running":執行中的工作 | null,"rawBytes":每日評測手上的原始答案（估計）,"openConnections":每日評測開著的連線,"processRssBytes":評測子程序目前的實體記憶體,"processPeakRssBytes":評測子程序的最高值}`，工作結束後回到 `null` / `0`（資格賽階段也有連線數；3.3.3 起）。
+- 背景工作在記憶體吃緊時延後、執行中的會暫停（每日評測、CDN 的範圍 / 網段分類 / 節點池都一樣）。每日評測（dns-benchmark）同時只測 `benchmark.concurrency` 個候選（`auto` = 每核心 8 個，8–50），也不超過「可用記憶體扣掉保留量的 1/4 ÷ 512 KB（3.3.3 起；以前是 128 KB）」；每個候選測完就關閉連線，暫停時先關閉手上的連線。
+- 各結構目前的用量在 `/api/status` 的 `memory.sizes`（`cacheBytes`、`cdnBytes`、`filterListsBytes` 等，都是估計值）。背景工作在 `memory.jobs`：`{"running":執行中的工作 | null,"rawBytes":每日評測手上的原始答案（估計）,"openConnections":每日評測開著的連線,"processRssBytes":評測子程序目前的實體記憶體,"processPeakRssBytes":評測子程序的最高值,"lastBenchmark":{"finishedAt":Unix 毫秒,"ok":true,"durationSec":秒,"processPeakRssBytes":上一次評測子程序的最高值}}`（`lastBenchmark` 在評測結束後也查得到，服務重新啟動前一直留著），工作結束後回到 `null` / `0`（資格賽階段也有連線數；3.3.3 起）。
 - **每日評測在子程序裡跑**（3.3.3 起）：同一個執行檔的隱藏指令，結束時記憶體全部還給系統，主程式的 RSS 不會停在評測的高點（以前會因為記憶體碎片多留 20 MB 左右）。日誌照樣出現在主程式的日誌裡，結束時記一行「評測子程序結束，記憶體最高 X MB」。進行中 `ps` 會多看到一個 `kuroshio __job-dns-benchmark`；服務管理程式只要管主程式（主程式結束時子程序會跟著結束）。不想要子程序時設 `benchmark.subprocess: false`。
 - **`kuroshio memory-plan`**（3.3.3 起）：用跟執行時同一套規則推算這台機器（或 `--ram 64 128` 指定的大小、`--bits 32` 指定 32 位元）的保留量、常駐用量、會載入哪些清單、每日評測同時測幾個、會不會暫停；`--json` 給程式用。常數是實測推算的，輸出裡有列出來。
 

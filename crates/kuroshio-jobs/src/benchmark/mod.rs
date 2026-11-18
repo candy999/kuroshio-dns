@@ -131,8 +131,9 @@ pub struct Benchmark {
     progress: Arc<Mutex<Option<Value>>>,
 }
 
-/// 每個測試中的候選估計要多少記憶體（一條 TLS / QUIC 連線加上緩衝）
-const PER_CANDIDATE_BYTES: u64 = 128 * 1024;
+/// 每個測試中的候選估計要多少記憶體（一條 TLS / QUIC 連線加上緩衝）。
+/// Newifi D3（mipsel）3.3.3 實測：同時 32 個時，收集階段比子程序剛開始多約 16.6 MB（扣掉原始答案 6 MB），每個約 520 KB
+const PER_CANDIDATE_BYTES: u64 = 512 * 1024;
 
 impl Benchmark {
     /// 正式環境：kuroshio-net 傳輸 + ip-api.com

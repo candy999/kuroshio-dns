@@ -62,6 +62,9 @@ pub struct BenchJob {
     inner: Benchmark,
     child: Option<(PathBuf, PathBuf, PathBuf)>,
     progress: Arc<Mutex<Option<Value>>>,
+    /// 上一次在子程序跑的結果（`/api/jobs` 的 `detail.dns-benchmark.last`、`memory.jobs.lastBenchmark`）：
+    /// 結束後還查得到子程序用了多少記憶體
+    last: Arc<Mutex<Option<Value>>>,
 }
 
 impl BenchJob {
@@ -75,6 +78,7 @@ impl BenchJob {
             inner: make_benchmark(cfg, state_dir, base_dir),
             child,
             progress: Default::default(),
+            last: Default::default(),
         }
     }
 
@@ -88,8 +92,18 @@ impl Job for BenchJob {
     fn run(&self, ctx: JobCtx) -> BoxFuture<Result<()>> {
         match self.child.clone() {
             Some((exe, state, base)) => {
-                let progress = self.progress.clone();
-                Box::pin(async move { run_child(&exe, &state, &base, &ctx, progress).await })
+                let (progress, last) = (self.progress.clone(), self.last.clone());
+                Box::pin(async move {
+                    let t0 = std::time::Instant::now();
+                    let (r, peak) = run_child_peak(&exe, &state, &base, &ctx, progress).await;
+                    *last.lock().unwrap() = Some(json!({
+                        "finishedAt": crate::persist::now_secs() * 1000,
+                        "ok": r.is_ok(),
+                        "durationSec": t0.elapsed().as_secs(),
+                        "processPeakRssBytes": (peak > 0).then_some(peak),
+                    }));
+                    r
+                })
             }
             None => Job::run(&self.inner, ctx),
         }
@@ -97,7 +111,17 @@ impl Job for BenchJob {
 
     fn detail(&self) -> Option<Value> {
         match self.child {
-            Some(_) => self.progress.lock().unwrap().clone(),
+            Some(_) => {
+                let last = self.last.lock().unwrap().clone();
+                match (self.progress.lock().unwrap().clone(), last) {
+                    (Some(mut p), last) => {
+                        p["last"] = last.unwrap_or(Value::Null);
+                        Some(p)
+                    }
+                    (None, Some(l)) => Some(json!({ "last": l })),
+                    (None, None) => None,
+                }
+            }
             None => Job::detail(&self.inner),
         }
     }
@@ -183,7 +207,26 @@ fn relay(line: &str, last_error: &mut Option<String>) {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn run_child(exe: &Path, state: &Path, base: &Path, ctx: &JobCtx, progress: Arc<Mutex<Option<Value>>>) -> Result<()> {
+    run_child_peak(exe, state, base, ctx, progress).await.0
+}
+
+/// 同 [`run_child`]，另外回傳子程序的記憶體高點（bytes；量不到是 0）
+async fn run_child_peak(exe: &Path, state: &Path, base: &Path, ctx: &JobCtx, progress: Arc<Mutex<Option<Value>>>) -> (Result<()>, u64) {
+    let mut peak = 0u64;
+    let r = run_child_inner(exe, state, base, ctx, progress, &mut peak).await;
+    (r, peak)
+}
+
+async fn run_child_inner(
+    exe: &Path,
+    state: &Path,
+    base: &Path,
+    ctx: &JobCtx,
+    progress: Arc<Mutex<Option<Value>>>,
+    peak: &mut u64,
+) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg(CHILD_CMD)
@@ -211,8 +254,6 @@ pub(crate) async fn run_child(exe: &Path, state: &Path, base: &Path, ctx: &JobCt
     stdin.write_all(&first).await?;
     let (mut out_done, mut err_done, mut paused) = (false, false, false);
     let mut last_error: Option<String> = None;
-    // 子程序的記憶體高點（結束時記一行：整合方量最低需求用）
-    let mut peak: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     while !(out_done && err_done) {
         tokio::select! {
@@ -237,7 +278,7 @@ pub(crate) async fn run_child(exe: &Path, state: &Path, base: &Path, ctx: &JobCt
                     let mut g = progress.lock().unwrap();
                     add_process_rss(&mut g, pid);
                     if let Some(p) = g.as_ref().and_then(|v| v["processPeakRssBytes"].as_u64()) {
-                        peak = peak.max(p);
+                        *peak = (*peak).max(p);
                     }
                 }
                 // 記憶體吃緊、還沒對時：通知子程序在下一個檢查點暫停（恢復時再通知）
@@ -252,10 +293,10 @@ pub(crate) async fn run_child(exe: &Path, state: &Path, base: &Path, ctx: &JobCt
     let status = guard.child.as_mut().ok_or_else(|| anyhow!("子程序不見了"))?.wait().await?;
     guard.child = None;
     *progress.lock().unwrap() = None;
-    if peak > 0 {
+    if *peak > 0 {
         info!(
             "[dns-benchmark] 評測子程序結束，記憶體最高 {:.1} MB（已全部還給系統）",
-            peak as f64 / 1048576.0
+            *peak as f64 / 1048576.0
         );
     }
     if status.success() {

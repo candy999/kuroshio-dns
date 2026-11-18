@@ -1254,6 +1254,8 @@ impl AppState {
                 // 每日評測在子程序裡跑時：子程序目前與最高的實體記憶體（Linux；結束後回到 null）
                 "processRssBytes": d.get("processRssBytes").cloned().unwrap_or(Value::Null),
                 "processPeakRssBytes": d.get("processPeakRssBytes").cloned().unwrap_or(Value::Null),
+                // 上一次每日評測（子程序）：結束時間、成功與否、花多久、記憶體最高多少（結束後也查得到）
+                "lastBenchmark": st["detail"]["dns-benchmark"]["last"].clone(),
             });
         }
         // 不鎖 persister：system_json 拿著它的鎖時會呼叫這裡（std 的 Mutex 不能重複鎖）

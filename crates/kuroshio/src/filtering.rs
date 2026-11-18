@@ -376,6 +376,18 @@ impl ListCopies {
         staged
     }
 
+    /// 補記規則數（索引裡是 0 的時候）。索引內容沒變時快照寫入器不會重寫
+    pub fn note_rules(&self, url: &str, rules: u64) {
+        let mut idx = self.index.lock().unwrap();
+        let Some(m) = idx.get_mut(url).filter(|m| m.rules == 0 && rules > 0) else {
+            return;
+        };
+        m.rules = rules;
+        let body = Self::index_json(&idx);
+        drop(idx);
+        self.persister.lock().unwrap().stage(COPY_INDEX, body);
+    }
+
     fn index_json(idx: &HashMap<String, CopyMeta>) -> Vec<u8> {
         let mut keys: Vec<&String> = idx.keys().collect();
         keys.sort();
@@ -874,6 +886,8 @@ impl FilterService {
             if use_copy {
                 if let Some(c) = copies.filter(|c| c.available(&s.url)) {
                     if feed_copy(c, &s.url, &mut w).await {
+                        // 舊版（3.3.2 以前）寫的副本沒有記規則數：讀到時補記（記憶體規劃、截斷檢查要用）
+                        c.note_rules(&s.url, w.rules());
                         w.end();
                         let m = c.meta(&s.url).unwrap_or_else(|| unreachable!());
                         validators.push(Validators {
@@ -1367,6 +1381,27 @@ mod copy_tests {
     use super::*;
     use crate::persist::{Persister, Policy};
     use crate::sysinfo::StorageClass;
+
+    #[test]
+    fn rules_backfilled_for_old_copies() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-listcopy-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Arc::new(Mutex::new(Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096))));
+        p.lock().unwrap().set_free_probe(|_| Some(10 << 30));
+        let c = ListCopies::new(p.clone());
+        let url = "https://lists.example.com/old.txt";
+        let mut sink = CopySink::new(true);
+        sink.feed(b"||a.example^\n");
+        let (h, z) = sink.finish();
+        // 3.3.2 以前寫的副本：規則數是 0
+        assert!(c.offer(url, h, z, &Validators::default(), 1, 0));
+        assert_eq!(c.meta(url).unwrap().rules, 0);
+        c.note_rules(url, 1234);
+        assert_eq!(c.meta(url).unwrap().rules, 1234, "用副本載入時補記");
+        c.note_rules(url, 99);
+        assert_eq!(c.meta(url).unwrap().rules, 1234, "已經有的不蓋掉");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn list_copy_written_only_when_content_changes() {
