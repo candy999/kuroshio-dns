@@ -1190,15 +1190,42 @@ impl Benchmark {
     }
 
     async fn query_all(&self, all: &[Srv], idx: Vec<usize>, domain: &str, cfg: &BenchCfg) -> Vec<(usize, QueryResult)> {
-        // 不共用連線的複本：查完就關閉（不然資格賽的幾百條連線會一直開著）
-        let jobs: Vec<(usize, Upstream)> = idx.iter().map(|&i| (i, all[i].up.fresh())).collect();
+        // 不共用連線的複本：輪到才建立、查完就關閉（不然資格賽的幾百條連線會一直開著）
+        let jobs: Vec<(usize, Upstream)> = idx.iter().map(|&i| (i, all[i].up.clone())).collect();
         let prober = self.prober.clone();
         let timeout = cfg.timeout;
         let domain = domain.to_string();
-        let res = map_limit(jobs, self.effective_conc(cfg).0, |(i, up)| {
+        let conc = self.effective_conc(cfg).0;
+        // 進度：資格賽也看得到開著幾條連線（以前要到收集階段才有）
+        let total = jobs.len();
+        let (open, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let progress = self.progress.clone();
+        let show = {
+            let (open, done) = (open.clone(), done.clone());
+            move || {
+                let (o, d) = (open.load(Ordering::Relaxed), done.load(Ordering::Relaxed));
+                *progress.lock().unwrap() = Some(json!({
+                    "phase": "qualify", "done": d, "total": total, "concurrency": conc,
+                    "openConnections": o, "rawBytes": 0,
+                    "text": format!("執行中：資格賽 {d} / {total}（同時 {o} 個）"),
+                }));
+            }
+        };
+        show();
+        let res = map_limit(jobs, conc, |(i, up)| {
             let prober = prober.clone();
             let domain = domain.clone();
-            async move { (i, query(&*prober, &up, &domain, timeout, 1).await) }
+            let (open, done, show) = (open.clone(), done.clone(), show.clone());
+            async move {
+                let up = up.fresh();
+                open.fetch_add(1, Ordering::Relaxed);
+                let r = query(&*prober, &up, &domain, timeout, 1).await;
+                drop(up);
+                open.fetch_sub(1, Ordering::Relaxed);
+                done.fetch_add(1, Ordering::Relaxed);
+                show();
+                (i, r)
+            }
         })
         .await;
         idx.iter()

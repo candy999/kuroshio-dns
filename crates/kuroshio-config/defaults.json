@@ -494,7 +494,8 @@
     "coverageTarget": 0.97,
     "minAuto": 3,
     "maxAvgLatencyMs": 250,
-    "keepDays": 14
+    "keepDays": 14,
+    "subprocess": true
   },
   "scan": {
     "samplesPerSubnet": 6,

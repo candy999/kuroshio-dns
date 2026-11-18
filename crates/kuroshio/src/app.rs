@@ -741,7 +741,7 @@ fn start_scheduler(
     cdn: Option<&Arc<kuroshio_cdn::Cdn>>,
     access: Option<&Arc<crate::ipfilter::Access>>,
 ) -> Arc<kuroshio_jobs::Scheduler> {
-    use kuroshio_jobs::{BenchPaths, Benchmark, Options, Scheduler, JOBS_STATE_FILE};
+    use kuroshio_jobs::{Options, Scheduler, JOBS_STATE_FILE};
     let state_dir = persist_dir(cfg);
     let mut o = Options::new(&state_dir, base_dir);
     // 記憶體吃緊、或系統時間還沒對時（排程與 TLS 都靠正確的時間）：不啟動新工作，執行中的在 checkpoint 暫停
@@ -765,22 +765,8 @@ fn start_scheduler(
     }
     let sched = Arc::new(Scheduler::new(scfg, saved.as_deref(), o));
     let _ = slot.set(Arc::downgrade(&sched));
-    let mut paths = BenchPaths::from_config(cfg, &state_dir, base_dir);
-    let shipped = share_dir(cfg).join("benchmark");
-    if !paths.list_dir.is_dir() {
-        paths.list_dir = shipped.clone();
-    }
-    if shipped.is_dir() && shipped != paths.list_dir {
-        paths.default_list_dir = Some(shipped);
-    }
-    // 評測報表放記憶體：Flash 上不寫每天的報表
-    if storage_class(cfg) != StorageClass::Disk {
-        paths.out_root = Some(runtime_dir(cfg).join("benchmark"));
-    }
-    // 同時測幾個候選也看可用記憶體（扣掉保留量之後的 1/4）
-    let reserve = crate::memgov::reserve_from_cfg(cfg);
-    let bench = Benchmark::new(paths).with_headroom(Arc::new(move || crate::memgov::headroom(&crate::memgov::Reading::now(), &reserve)));
-    sched.register("dns-benchmark", bench);
+    // 每日評測：可以的話在子程序跑（結束後記憶體全部還給系統，見 benchjob.rs）
+    sched.register("dns-benchmark", crate::benchjob::BenchJob::new(cfg, &state_dir, base_dir));
     if let Some(cdn) = cdn {
         register_cdn_jobs(&sched, cdn);
     }
@@ -1265,6 +1251,9 @@ impl AppState {
                 "running": name,
                 "rawBytes": d.get("rawBytes").cloned().unwrap_or(json!(0)),
                 "openConnections": d.get("openConnections").cloned().unwrap_or(json!(0)),
+                // 每日評測在子程序裡跑時：子程序目前與最高的實體記憶體（Linux；結束後回到 null）
+                "processRssBytes": d.get("processRssBytes").cloned().unwrap_or(Value::Null),
+                "processPeakRssBytes": d.get("processPeakRssBytes").cloned().unwrap_or(Value::Null),
             });
         }
         // 不鎖 persister：system_json 拿著它的鎖時會呼叫這裡（std 的 Mutex 不能重複鎖）

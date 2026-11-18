@@ -179,6 +179,14 @@ enum Cmd {
         #[arg(long)]
         uci: bool,
     },
+    /// 每日評測的子程序（服務自己呼叫；設定從標準輸入傳進來）
+    #[command(name = "__job-dns-benchmark", hide = true)]
+    JobBenchmark {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        base: PathBuf,
+    },
     /// UCI 設定檔的升級遷移（不需要 uci 指令；規則同 OpenWrt 套件升級時做的）：
     /// 依 main.lists_version 更新沒動過的預設過濾清單、加上新的預設清單，使用者改過的不動
     UciMigrate {
@@ -843,6 +851,26 @@ fn main() {
             Err(e) => eprintln!("無法把 KUROSHIO_INIT_CONFIG 複製到 {}：{e}", config.display()),
         }
     }
+    // 每日評測的子程序：日誌寫到標準錯誤（不含時間，主程式逐行轉進自己的日誌）
+    if let Cmd::JobBenchmark { state, base } = &cli.cmd {
+        let filter = tracing_subscriber::EnvFilter::try_from_env("KUROSHIO_LOG")
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_directives("info")));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .init();
+        let code = match build_runtime(2) {
+            Ok(rt) => rt.block_on(kuroshio::benchjob::child_main(state.clone(), base.clone())),
+            Err(e) => {
+                eprintln!("ERROR 無法建立執行環境：{e}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
     // 執行緒數依硬體決定：單核心用單執行緒 runtime（規格 05 第 3.2 節）
     let threads = match &cli.cmd {
         Cmd::Run { config, uci } => thread_count(config, *uci),
@@ -985,6 +1013,8 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             }
             println!("{out}");
         }
+        // main() 一開始就處理掉了
+        Cmd::JobBenchmark { .. } => unreachable!(),
         Cmd::Defaults { .. } => {
             println!("{}", serde_json::to_string_pretty(&kuroshio_config::defaults())?);
         }
