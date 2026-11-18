@@ -1,0 +1,11 @@
+# 系統升級（sysupgrade，保留設定）時要留下的黑潮 DNS 檔案（裝到 /lib/upgrade/keep.d/kuroshio）
+# 設定、自訂規則、自己的評測名單、自備憑證、社群身分與好友。
+# 學習資料（/etc/kuroshio/state：CDN 驗證紀錄、節點池、清單副本等）不在這裡：可能有好幾 MB，
+# 系統升級時會佔用記憶體；要留著請先用「備份與分享」匯出，或把 main.data_dir 改到外接儲存
+/etc/config/kuroshio
+/etc/kuroshio/custom-rules.txt
+/etc/kuroshio/custom-rules.txt.bak
+/etc/kuroshio/benchmark/
+/etc/kuroshio/cert.pem
+/etc/kuroshio/key.pem
+/etc/kuroshio/community/

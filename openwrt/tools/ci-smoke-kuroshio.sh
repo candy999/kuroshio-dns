@@ -40,6 +40,14 @@ check "沒有 node 也能裝" sh -c '! command -v node'
 check "依賴 acme.sh 已自動安裝" test -x /usr/lib/acme/client/acme.sh
 check "預設設定檔" test -f /etc/config/kuroshio
 check "預設設定也放在 /usr/share（套件不帶 /etc/config/kuroshio）" test -f /usr/share/kuroshio/kuroshio.config
+check "系統升級的保留清單（keep.d）有設定檔" grep -qx /etc/config/kuroshio /lib/upgrade/keep.d/kuroshio
+check "系統升級的保留清單有自訂規則" grep -qx /etc/kuroshio/custom-rules.txt /lib/upgrade/keep.d/kuroshio
+# sysupgrade -l：實際會保留哪些檔案（容器裡能跑的話，用它確認）
+if command -v sysupgrade >/dev/null 2>&1 && sysupgrade -l >/tmp/keep.txt 2>/dev/null && [ -s /tmp/keep.txt ]; then
+	check "sysupgrade -l 會保留 /etc/config/kuroshio" grep -qx /etc/config/kuroshio /tmp/keep.txt
+else
+	echo "  （這個容器跑不了 sysupgrade -l，只檢查 keep.d）"
+fi
 
 echo "== 改過設定後再裝一次（升級）：不另外產生 kuroshio-opkg / .apk-new，使用者的設定保留"
 uci set kuroshio.main.ci_marker='kept'

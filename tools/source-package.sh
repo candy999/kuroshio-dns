@@ -11,7 +11,13 @@ git archive --format=tar --prefix="kuroshio-dns-$v/" HEAD | tar -x -C "$work"
 (
 	cd "$work/kuroshio-dns-$v"
 	mkdir -p .cargo
-	cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml
+	# 接在 repo 原本的 .cargo/config.toml 後面（Windows 的 +crt-static 等設定要留著），不是蓋掉
+	{
+		echo
+		echo "# cargo vendor：只用 vendor/ 裡的依賴套件（離線編譯）"
+		cargo vendor --locked --versioned-dirs vendor
+	} >> .cargo/config.toml
+	grep -q 'crt-static' .cargo/config.toml || { echo "原始碼包的 .cargo/config.toml 少了 +crt-static" >&2; exit 1; }
 	# 檢查：只用 vendor/ 也解析得了全部依賴
 	cargo metadata --offline --locked --format-version 1 > /dev/null
 )

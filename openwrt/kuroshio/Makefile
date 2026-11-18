@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=kuroshio
-PKG_VERSION:=3.3.4
+PKG_VERSION:=3.3.5
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Kuroshio DNS contributors
 PKG_LICENSE:=GPL-3.0-or-later
@@ -34,14 +34,8 @@ endef
 
 # /etc/config/kuroshio 不放在套件裡（預設值在 /usr/share/kuroshio/kuroshio.config，第一次安裝時由 uci-defaults 複製）：
 # 放在套件裡時，使用者改過設定後每次升級 opkg 都會另外產生 kuroshio-opkg 並列在「錯誤」裡（apk 是 .apk-new）。
-# 留在 conffiles 裡是為了系統升級（sysupgrade）時照樣保留
-define Package/kuroshio/conffiles
-/etc/config/kuroshio
-/etc/kuroshio/custom-rules.txt
-/etc/kuroshio/cert.pem
-/etc/kuroshio/key.pem
-/etc/kuroshio/community/key.pem
-endef
+# 也就不用 conffiles：SDK 會把套件裡沒有的路徑從 conffiles 拿掉（3.3.4 因此變成空的，系統升級時不保留設定）。
+# 系統升級（sysupgrade）要保留的檔案改列在 /lib/upgrade/keep.d/kuroshio（files/kuroshio.keep）
 
 define Build/Prepare
 	[ -f "$(PREBUILT)" ] || { echo "找不到 $(PREBUILT)：請先用 cargo zigbuild 編譯（見 .github/workflows/rust.yml）"; exit 1; }
@@ -57,6 +51,8 @@ define Package/kuroshio/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/kuroshio $(1)/usr/bin/kuroshio
 	$(INSTALL_BIN) ./files/kuroshio.init $(1)/etc/init.d/kuroshio
 	$(INSTALL_BIN) ./files/kuroshio.uci-defaults $(1)/etc/uci-defaults/90-kuroshio
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/kuroshio.keep $(1)/lib/upgrade/keep.d/kuroshio
 	$(INSTALL_BIN) ./files/takeover.sh $(1)/usr/libexec/kuroshio/takeover.sh
 	$(INSTALL_BIN) ./files/guard.sh $(1)/usr/libexec/kuroshio/guard.sh
 	$(INSTALL_DATA) ./files/lan.sh $(1)/usr/libexec/kuroshio/lan.sh
