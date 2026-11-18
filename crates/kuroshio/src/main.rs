@@ -199,6 +199,22 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// 記憶體規劃：用跟執行時同一套規則，推算這台機器（與 64 / 128 / 256 / 512 MB 的機器）會怎樣運作
+    MemoryPlan {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 要推算的實體記憶體大小（MB），可以給多個；沒給就是 64 128 256 512
+        #[arg(long, num_args = 1..)]
+        ram: Vec<u64>,
+        /// 依 32 或 64 位元的程式推算（沒給 = 這個執行檔；在電腦上推算路由器用 32）
+        #[arg(long)]
+        bits: Option<u32>,
+        /// 輸出 JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// 顯示偵測到的硬體、記憶體 / 儲存保留量、依 CPU 核心數換算的值
     Sysinfo {
         #[arg(short, long, default_value_os_t = default_config_path())]
@@ -1042,6 +1058,13 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
         Cmd::Sysinfo { config, uci } => sysinfo_report(&config, uci)?,
+        Cmd::MemoryPlan {
+            config,
+            uci,
+            ram,
+            bits,
+            json,
+        } => memory_plan_cmd(&config, uci, ram, bits, json).await?,
         Cmd::Access { cmd } => access_cmd(cmd)?,
         Cmd::Community { cmd } => community_cmd(cmd).await?,
         Cmd::Paths { config, uci } => {
@@ -1647,6 +1670,125 @@ async fn import_cmd(file: &std::path::Path, config: &std::path::Path, uci: bool,
     }
     report["preview"] = preview;
     Ok(report)
+}
+
+/// `kuroshio memory-plan`
+async fn memory_plan_cmd(config: &std::path::Path, uci: bool, ram: Vec<u64>, bits: Option<u32>, as_json: bool) -> Result<()> {
+    use kuroshio::memplan::{plan, text, Assumptions, Input};
+    use serde_json::{json, Value};
+    let mut notes: Vec<String> = Vec::new();
+    let cfg = match config_for_cli(config, uci) {
+        Ok(c) => c,
+        Err(e) => {
+            notes.push(format!("設定讀不到（{e}），用預設設定推算"));
+            kuroshio_config::build(&json!({}))
+        }
+    };
+    let n = |k: &str| kuroshio_config::num_or_auto(kuroshio_config::get(&cfg, k)).unwrap_or(0);
+    // 啟用的清單：規則數從本機副本的索引（3.3.2 起記錄）拿，沒有的用預設清單的實測值估
+    let index: Value = kuroshio_cdn::statefile::read(&kuroshio::app::persist_dir(&cfg).join(kuroshio::filtering::COPY_INDEX))
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let (mut rules, mut protected, mut unknown) = (0u64, 0u64, 0usize);
+    for l in kuroshio_config::get(&cfg, "filter.lists")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if l.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let url = l.get("url").and_then(Value::as_str).unwrap_or("");
+        let cat = l.get("category").and_then(Value::as_str).unwrap_or("ads");
+        let prot = l.get("protect").and_then(Value::as_bool).unwrap_or(cat == "malware");
+        // 有本機副本：用實際載入的規則數；沒有：內建清單用實測的行數（扣掉重複），其他每份估 5 萬條
+        let r = match index.get(url).and_then(|m| m["rules"].as_u64()).filter(|&r| r > 0) {
+            Some(r) => r,
+            None => {
+                unknown += 1;
+                kuroshio::memplan::KNOWN_RULES
+                    .iter()
+                    .find(|(u, _)| *u == url)
+                    .map_or(kuroshio::memplan::UNKNOWN_LIST_RULES, |(_, n)| {
+                        n * kuroshio::memplan::DEDUP_PCT / 100
+                    })
+            }
+        };
+        rules += r;
+        if prot {
+            protected += r;
+        }
+    }
+    if unknown > 0 {
+        notes.push(format!(
+            "{unknown} 份清單還沒有本機副本（不知道實際規則數）：內建清單用 2026-11 實測的行數（扣掉重複約 25%）估"
+        ));
+    }
+    let sys = kuroshio::sysinfo::SysInfo::detect();
+    let conc = match n("benchmark.concurrency") {
+        0 => (8 * sys.cores as u64).clamp(8, 50),
+        c => c,
+    };
+    let base = |total: u64| Input {
+        total,
+        avail_before: None,
+        min_free_kb: None,
+        reserve_mb: n("system.memoryReserveMB"),
+        reserve_pct: n("system.memoryReservePercent"),
+        rules,
+        protected_rules: protected,
+        cache_max: match n("resolver.cacheMax") {
+            0 => 100_000,
+            c => c,
+        },
+        bench_conc: conc,
+    };
+    let a = match bits {
+        Some(b @ (32 | 64)) => Assumptions::for_bits(b),
+        Some(b) => anyhow::bail!("--bits 只能是 32 或 64（收到 {b}）"),
+        None => Assumptions::for_this_build(),
+    };
+    let mut rows = Vec::new();
+    // 這台機器：實際的記憶體；服務正在跑時，把它目前的用量加回去當「啟動前可用」
+    if ram.is_empty() && bits.is_none() {
+        if let (Some(total), Some(avail)) = kuroshio::sysinfo::mem_bytes() {
+            let mut i = base(total);
+            i.min_free_kb = kuroshio::memgov::read_min_free_kb();
+            let mut own = 0u64;
+            if let Some(ep) = admin_endpoint(&cfg) {
+                if let Ok((200, b)) = admin_call(&ep, "GET", "/api/status", None, std::time::Duration::from_secs(3)).await {
+                    let v: Value = serde_json::from_slice(&b).unwrap_or_default();
+                    if let Some(kb) = v["memory"]["rssKB"].as_u64() {
+                        own = kb * 1024;
+                        notes.push(format!(
+                            "服務正在執行：目前實際用 {:.1} MB（RSS），推算時把它加回「啟動前可用」",
+                            own as f64 / 1048576.0
+                        ));
+                    }
+                }
+            }
+            i.avail_before = Some(avail + own);
+            let mut r = plan(&i, &a);
+            r["thisMachine"] = json!(true);
+            rows.push(r);
+        }
+    }
+    let sizes = if ram.is_empty() { vec![64, 128, 256, 512] } else { ram };
+    for mb in sizes {
+        rows.push(plan(&base(mb << 20), &a));
+    }
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "rows": rows, "assumptions": a.json(), "notes": notes }))?
+        );
+    } else {
+        println!("{}", text(&rows, &a));
+        for n in &notes {
+            println!("註：{n}");
+        }
+    }
+    Ok(())
 }
 
 /// 設定讀不到時：結束碼 2

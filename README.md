@@ -195,6 +195,23 @@
 
 該買哪一台、手邊的機器能不能用，見 [選硬體](docs/hardware.md)（依預算推薦；舊機的刷機資料在 [各機種刷機資料](docs/hardware-details.md)）。
 
+### 記憶體用量與小記憶體的機器
+
+黑潮 DNS 的用量分成兩段，都可以預先算出來（3.3.3 起）：
+
+- **常駐**：程式本身約 15 MB（32 位元）＋ 過濾清單每條約 9 bytes（預設清單約 37 萬條、3.2 MB）＋ CDN 網域資料庫約 2 MB ＋ DNS 快取（有餘裕才長大，接近保留量就縮小）。重新載入清單時新舊兩份同時存在，另外暫時多每條約 16 bytes。
+- **每日評測（暫時）**：在子程序裡跑，同時測幾個依可用記憶體決定（保留量以上可用的 1/4 ÷ 128 KB，最多 `benchmark.concurrency`）；結束後記憶體全部還給系統，常駐用量回到原本的值。
+
+下表是 `kuroshio memory-plan --bits 32` 的輸出：判斷規則跟程式執行時一樣，常數是 Padavan（Newifi D3，mipsel）3.3.2 的實測推算；「啟動前可用」是 OpenWrt 一般情況的推算值（實體記憶體 − 24 MB − 8%），每台機器不同。
+
+| 實體記憶體 | 啟動前可用（推算） | 保留量 | 黑潮 DNS 常駐 | 啟動後可用 | 結果 |
+|---|---|---|---|---|---|
+| 64 MB | 約 35 MB | 16 MB | 約 18 MB | 約 17 MB | **偏低**：只載入保護清單（反詐騙、威脅情資，約 16 萬條），每日評測與 CDN 背景工作延後、快取不長大；DNS 轉送照常。建議改用 [padavan-tw](https://github.com/candy999/padavan-tw) 這類更輕量的韌體 |
+| 128 MB | 約 94 MB | 16 MB | 約 20 MB | 約 74 MB | **完整功能**：預設清單全部載入，每日評測同時測 32 個、子程序最高約 18 MB |
+| 256 MB 以上 | 約 210 MB | 16 MB | 約 20 MB | 約 190 MB | 完整功能，還有空間開預設不勾選的大清單（例如 HaGeZi TIF 完整版約 146 萬條、多約 13 MB，重建時暫時再多約 23 MB） |
+
+在自己的機器上執行 `kuroshio memory-plan`（不加 `--ram`）會用這台實際的可用記憶體、目前的設定與已下載清單的實際規則數推算；服務正在執行時，`/api/status` 的 `memory.jobs.processPeakRssBytes` 是每日評測子程序實際用到的最高值。
+
 ## 支援平台
 
 | 平台 | 常見晶片 | 套件架構 |
@@ -282,6 +299,7 @@ kuroshio notify save                        立刻把學到的資料寫進儲存
 kuroshio defaults                           印出完整預設設定
 kuroshio check-config <檔案>                檢查設定檔並印出合併後的結果
 kuroshio sysinfo [-c 設定檔]                 偵測到的硬體、記憶體 / 儲存保留量、依 CPU 核心數換算的值
+kuroshio memory-plan [--ram MB…] [--bits 32]  推算這台（或 64 / 128 / 256 / 512 MB 的機器）會怎樣運作
 kuroshio paths                              設定、狀態、憑證、token 等檔案的位置
 kuroshio url [--open]                       設定頁、公開頁的網址與裝置要填的 DoH / DoT 位址
 kuroshio query <網域> [-t 類型] [-s 伺服器]    查詢（診斷用，類似 dig）
