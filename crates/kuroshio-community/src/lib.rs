@@ -11,6 +11,7 @@
 //! 把 [`Community::snapshots`] 寫回 state，並實作 [`DataProvider`] 接上 CDN 與評測模組。
 
 pub mod admin;
+pub mod chain;
 pub mod client;
 pub mod config;
 pub mod envelope;
