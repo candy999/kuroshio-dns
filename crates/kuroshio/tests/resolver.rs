@@ -587,3 +587,282 @@ async fn chain_upstream_answers_are_not_demoted() {
     assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 10)), "{:?}", m.answers);
     assert_eq!(r.upstreams.list_json()[0]["role"], "chain");
 }
+
+// ---------------------------------------------------------------- 3.4.0 背景補問（規格 10 第 5.2 節）
+
+/// 背景補問用的假上游：固定回一個位址（`None` = NXDOMAIN），記錄收到幾筆、同時處理中最多幾筆
+struct Bf {
+    addr: SocketAddr,
+    n: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+impl Bf {
+    fn n(&self) -> usize {
+        self.n.load(Ordering::SeqCst)
+    }
+}
+
+async fn bf_upstream(delay_ms: u64, ip: Option<[u8; 4]>) -> Bf {
+    let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = s.local_addr().unwrap();
+    let (n, peak, cur) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let (n2, peak2) = (n.clone(), peak.clone());
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (len, from) = s.recv_from(&mut buf).await.unwrap();
+            n2.fetch_add(1, Ordering::SeqCst);
+            let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+            peak2.fetch_max(now, Ordering::SeqCst);
+            let q = Message::parse(&buf[..len]).unwrap();
+            let mut r = Message::response_to(&q, if ip.is_some() { 0 } else { 3 });
+            r.opt = None;
+            if let Some(ip) = ip {
+                r.answers = vec![a(&q.questions[0].name, 300, ip)];
+            }
+            let (s, cur) = (s.clone(), cur.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let _ = s.send_to(&r.encode(), from).await;
+                cur.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    Bf { addr, n, peak }
+}
+
+/// 假的 CDN：`range` 裡的位址被認得（算 Fastly 的範圍：IP 置換型、但用最近節點，固定上游給的位址照樣當快速回應）；
+/// 背景工作只記錄、不執行
+fn fake_cdn(r: &kuroshio::resolver::Resolver, c: &serde_json::Value, tag: &str, range: &str, probe: [u8; 4]) {
+    let dir = std::env::temp_dir().join(format!("kuroshio-bf-{tag}-{}", std::process::id()));
+    let net: Arc<dyn kuroshio_cdn::Net> = Arc::new(kuroshio_cdn::RealNet::new(r.iprank.clone()));
+    let cdn = kuroshio_cdn::Cdn::load(c, kuroshio_cdn::Paths::new(dir.join("state"), dir.join("data")), net);
+    cdn.record_tasks();
+    cdn.with_state(|st| st.pools.p.get_mut("fastly").expect("fastly").range4 = kuroshio_cdn::pools::cidr(&[range]));
+    assert!(cdn.classify(IpAddr::from(probe)).is_some(), "假的 CDN 要認得 {probe:?}");
+    r.set_cdn(Some(cdn));
+}
+
+fn today(r: &kuroshio::resolver::Resolver, k: &str) -> u64 {
+    r.stats.summary()["today"][k].as_u64().unwrap()
+}
+
+/// 等到條件成立（最多 3 秒）
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    let t0 = std::time::Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(3), "等不到：{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn parallel_two_backfills_cdn_names() {
+    // 測速埠：所有 127.0.0.x 都連得上（合併後的位址都留著）
+    let l = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let _ = l.accept().await;
+        }
+    });
+    let f1 = bf_upstream(0, Some([127, 0, 0, 4])).await;
+    let f2 = bf_upstream(0, Some([127, 0, 0, 5])).await;
+    let b1 = bf_upstream(400, Some([127, 0, 0, 6])).await;
+    let b2 = bf_upstream(400, Some([127, 0, 0, 7])).await;
+    let c = cfg(
+        &[f1.addr, f2.addr, b1.addr, b2.addr],
+        json!({ "resolver": { "parallel": 2, "rankIps": true }, "iprank": { "port": port, "timeoutMs": 300 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    fake_cdn(&r, &c, "cdn", "127.0.0.0/24", [127, 0, 0, 4]);
+    let t0 = std::time::Instant::now();
+    let m = Message::parse(&r.handle(&q(1, "cdn-bf.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_millis(400),
+        "前 2 個回答就回用戶端，不等補問：{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(m.rcode, 0);
+    assert!(!m.answers.is_empty());
+    until("後段上游各收到 1 筆補問", || b1.n() == 1 && b2.n() == 1).await;
+    let has = |ip: [u8; 4]| {
+        r.cache
+            .lock()
+            .unwrap()
+            .peek("1|cdn-bf.example.com")
+            .is_some_and(|e| e.answers.iter().any(|x| x.data == RData::A(Ipv4Addr::from(ip))))
+    };
+    until("快取換成合併後的答案（含後段上游的位址）", || {
+        has([127, 0, 0, 6]) && has([127, 0, 0, 7])
+    })
+    .await;
+    assert!(has([127, 0, 0, 4]) && has([127, 0, 0, 5]), "前面的位址也還在");
+    assert_eq!((f1.n(), f2.n(), b1.n(), b2.n()), (1, 1, 1, 1));
+    assert_eq!(today(&r, "backfill"), 1);
+    assert_eq!(today(&r, "backfillMismatch"), 0);
+}
+
+#[tokio::test]
+async fn non_cdn_names_sampled() {
+    let f1 = bf_upstream(0, Some([198, 51, 100, 1])).await;
+    let f2 = bf_upstream(0, Some([198, 51, 100, 1])).await;
+    let b1 = bf_upstream(100, Some([198, 51, 100, 1])).await;
+    let b2 = bf_upstream(100, Some([198, 51, 100, 1])).await;
+    let c = cfg(
+        &[f1.addr, f2.addr, b1.addr, b2.addr],
+        json!({ "resolver": { "parallel": 2, "backfillSample": 4 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    // 先讓每個上游都有延遲紀錄（還沒有紀錄的上游會排到前面被問），之後固定先問快的兩個
+    for i in 0..2 {
+        r.handle(&q(i, &format!("warm{i}.example.com"), 1), &CTX).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (n1, n2) = (b1.n(), b2.n());
+    for i in 0..16 {
+        r.handle(&q(i, &format!("s{i}.example.com"), 1), &CTX).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(b1.n() - n1, 4, "16 個非 CDN 名稱，每 4 個抽 1 個補問");
+    assert_eq!(b2.n() - n2, 4);
+}
+
+#[tokio::test]
+async fn backfill_off_matches_3_3_7() {
+    let f1 = bf_upstream(0, Some([198, 51, 100, 1])).await;
+    let f2 = bf_upstream(0, Some([198, 51, 100, 2])).await;
+    let b1 = bf_upstream(0, Some([198, 51, 100, 3])).await;
+    let b2 = bf_upstream(0, Some([198, 51, 100, 4])).await;
+    let c = cfg(
+        &[f1.addr, f2.addr, b1.addr, b2.addr],
+        json!({ "resolver": { "parallel": 2, "backfill": "off", "backfillSample": 1 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    // CDN 相關、而且每次都抽樣：關掉時一樣不補問
+    fake_cdn(&r, &c, "off", "198.51.100.0/24", [198, 51, 100, 1]);
+    let m = Message::parse(&r.handle(&q(1, "off.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!((m.rcode, m.answers.len()), (0, 1));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!((f1.n(), f2.n()), (1, 1));
+    assert_eq!((b1.n(), b2.n()), (0, 0), "後段上游完全沒有收到查詢");
+    assert_eq!(today(&r, "backfill"), 0);
+}
+
+/// 抽樣比對：前面的上游給了位址，補問的上游多數說這個名稱不存在 → 記一筆不一致，
+/// 快取換成合併後 `decide()` 的結果（有正常回應就用正常回應，之後的查詢照樣拿到位址）。
+///
+/// 反方向（前面只有 NXDOMAIN、補問的多數有位址）在 `ask()` 裡實際上碰不到：第一輪收到不正常的回應
+/// 就會立刻加問下一個上游，所以第一輪沒有正常回應時通常已經問完所有上游、沒有可以補問的；
+/// 那個方向的判斷由 `resolver.rs` 的單元測試 `backfill_mismatch_rules` 驗證
+#[tokio::test]
+async fn backfill_mismatch_fixes_cache() {
+    let f1 = bf_upstream(0, Some([203, 0, 113, 9])).await;
+    let f2 = bf_upstream(0, Some([203, 0, 113, 9])).await;
+    let b1 = bf_upstream(0, None).await;
+    let b2 = bf_upstream(0, None).await;
+    let b3 = bf_upstream(0, None).await;
+    let c = cfg(
+        &[f1.addr, f2.addr, b1.addr, b2.addr, b3.addr],
+        json!({ "resolver": { "parallel": 2, "backfillSample": 1 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let m = Message::parse(&r.handle(&q(1, "mm.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(203, 0, 113, 9)));
+    until("記一筆不一致", || today(&r, "backfillMismatch") == 1).await;
+    assert_eq!((b1.n(), b2.n(), b3.n()), (1, 1, 1));
+    until("快取換成合併後的", || {
+        r.cache
+            .lock()
+            .unwrap()
+            .peek("1|mm.example.com")
+            .is_some_and(|e| !e.fast && e.class == kuroshio_proto::logic::Class::Ok)
+    })
+    .await;
+    let m = Message::parse(&r.handle(&q(2, "mm.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(203, 0, 113, 9)), "之後的查詢拿到位址");
+    assert_eq!(today(&r, "backfill"), 1, "快取命中不補問");
+}
+
+#[tokio::test]
+async fn backfill_respects_concurrency_cap() {
+    let f1 = bf_upstream(0, Some([198, 51, 100, 1])).await;
+    let f2 = bf_upstream(0, Some([198, 51, 100, 2])).await;
+    // 平均延遲在中間的上游：每 20 次的「探索」會換它到前面，後段兩個上游只會收到補問
+    let x = bf_upstream(100, Some([198, 51, 100, 3])).await;
+    let b1 = bf_upstream(500, Some([198, 51, 100, 4])).await;
+    let b2 = bf_upstream(500, Some([198, 51, 100, 5])).await;
+    let c = cfg(
+        &[f1.addr, f2.addr, x.addr, b1.addr, b2.addr],
+        json!({ "resolver": { "parallel": 2, "collectWindowMs": 1000 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    fake_cdn(&r, &c, "cap", "198.51.100.0/24", [198, 51, 100, 1]);
+    let max = r.params.backfill_max;
+    // 先讓每個上游都有延遲紀錄
+    r.handle(&q(1, "warm.example.com", 1), &CTX).await.unwrap();
+    until("暖身的補問問到後段", || b1.n() == 1 && b2.n() == 1).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let done = today(&r, "backfill");
+    b1.peak.store(0, Ordering::SeqCst);
+    b2.peak.store(0, Ordering::SeqCst);
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..20u16 {
+        let r = r.clone();
+        set.spawn(async move { r.handle(&q(i, &format!("cap{i}.example.com"), 1), &CTX).await.unwrap() });
+    }
+    while let Some(x) = set.join_next().await {
+        assert_eq!(Message::parse(&x.unwrap()).unwrap().rcode, 0);
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let (p1, p2) = (b1.peak.load(Ordering::SeqCst), b2.peak.load(Ordering::SeqCst));
+    assert!(p1 >= 1 && p1 <= max && p2 <= max, "同時進行的補問 {p1}/{p2}，上限 {max}");
+    let started = today(&r, "backfill") - done;
+    assert!((1..20).contains(&started), "拿不到名額就放棄、不排隊：{started}");
+    assert_eq!(b1.n() - 1, started as usize, "每個補問問後段上游一次");
+}
+
+#[tokio::test]
+async fn backfill_skips_verbatim() {
+    let f1 = bf_upstream(0, Some([198, 51, 100, 1])).await;
+    let f2 = bf_upstream(0, Some([198, 51, 100, 2])).await;
+    let b1 = bf_upstream(50, Some([198, 51, 100, 3])).await;
+    let b2 = bf_upstream(50, Some([198, 51, 100, 4])).await;
+    let c = cfg(
+        &[f1.addr, f2.addr, b1.addr, b2.addr],
+        json!({ "resolver": { "parallel": 2, "backfillSample": 1 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    // 對照：一般查詢每次都補問
+    r.handle(&q(1, "ctl.example.com", 1), &CTX).await.unwrap();
+    until("一般查詢補問", || b1.n() == 1 && b2.n() == 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 帶 DO：答案原樣轉交，不補問
+    let do_q = q_ext(2, "do.example.com", 1, kuroshio_proto::message::FLAG_RD, Some((1232, true)));
+    let m = Message::parse(&r.handle(&do_q, &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 0);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!((b1.n(), b2.n()), (1, 1), "帶 DO 的查詢不補問");
+    assert_eq!(today(&r, "backfill"), 1);
+}
+
+/// 串接中：只問上游黑潮（固定上游照舊排在後面），不在背景補問其他上游
+#[tokio::test]
+async fn backfill_skipped_while_chained() {
+    let pinned = bf_upstream(0, Some([198, 51, 100, 1])).await;
+    let chain = bf_upstream(0, Some([198, 51, 100, 10])).await;
+    let c = cfg(&[pinned.addr], json!({ "resolver": { "parallel": 1, "backfillSample": 1 } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let spec = format!("udp://{}", chain.addr);
+    r.upstreams.set_chain(Some(kuroshio::upstream::Upstream::parse(&spec).unwrap()));
+    let m = Message::parse(&r.handle(&q(1, "chained.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 10)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((chain.n(), pinned.n()), (1, 0));
+    assert_eq!(today(&r, "backfill"), 0);
+}

@@ -1047,7 +1047,8 @@ fn describe(info: &SysInfo) -> String {
         if info.aes {
             "有 AES 指令"
         } else {
-            "沒有 AES 指令（TLS 優先用 ChaCha20）"
+            // resolver.parallel 的 auto 在沒有 AES 時是 2（規格 10 第 5.1 節）
+            "沒有 AES 指令（TLS 優先用 ChaCha20；先問最快的 2 個上游，其他在背景補問）"
         }
     )
 }
@@ -1318,7 +1319,7 @@ fn sysinfo_report(config: &std::path::Path, uci: bool) -> Result<()> {
         sr.how
     );
     let user = user_config(config, uci)?;
-    println!("依 CPU 核心數換算的設定（你在設定檔寫了的以你的為準）：");
+    println!("依 CPU 核心數（resolver.parallel 另看 AES 指令）換算的設定（你在設定檔寫了的以你的為準）：");
     let keys = kuroshio_config::PER_CORE.iter().map(|x| x.0).chain(["resolver.parallel"]);
     for k in keys {
         let mine = kuroshio_config::num_or_auto(kuroshio_config::get(&user, k)).is_some();

@@ -96,6 +96,10 @@ struct Day {
     local: u64,
     stale: u64,
     prefetch: u64,
+    /// 背景補問次數（規格 10 第 5.2 節）
+    backfill: u64,
+    /// 背景補問的結果跟前面的不一致（一邊是正常回應、另一邊多數是 NXDOMAIN／NODATA）
+    backfill_mismatch: u64,
     lat_hit: Histogram,
     lat_miss: Histogram,
     cdn_served: u64,
@@ -344,6 +348,10 @@ pub enum Kind {
     Stale,
     /// 背景預取（自適應預取、開機預熱）
     Prefetch,
+    /// 背景補問（問這次沒問到的上游，規格 10 第 5.2 節）
+    Backfill,
+    /// 背景補問抽樣比對到不一致
+    BackfillMismatch,
 }
 
 impl Default for Stats {
@@ -445,6 +453,7 @@ impl Day {
             "cdn": d.cdn, "cross": d.cross,
             "route": d.route_json(),
             "stale": d.stale, "prefetch": d.prefetch,
+            "backfill": d.backfill, "backfillMismatch": d.backfill_mismatch,
             "hitRate": if d.hit + d.miss > 0 { json!((d.hit as f64 * 1000.0 / (d.hit + d.miss) as f64).round() / 10.0) } else { Value::Null },
             "latency": { "hit": d.lat_hit.json(), "miss": d.lat_miss.json() }
         })
@@ -525,6 +534,8 @@ impl Day {
             local: n("local"),
             stale: n("stale"),
             prefetch: n("prefetch"),
+            backfill: n("backfill"),
+            backfill_mismatch: n("backfillMismatch"),
             lat_hit: Histogram::from_json(v.get("latHit")),
             lat_miss: Histogram::from_json(v.get("latMiss")),
             cdn_served: n("cdnServed"),
@@ -553,6 +564,8 @@ impl Day {
         self.local += o.local;
         self.stale += o.stale;
         self.prefetch += o.prefetch;
+        self.backfill += o.backfill;
+        self.backfill_mismatch += o.backfill_mismatch;
         for i in 0..12 {
             self.lat_hit.counts[i] += o.lat_hit.counts[i];
             self.lat_miss.counts[i] += o.lat_miss.counts[i];
@@ -750,6 +763,8 @@ impl Stats {
                 Kind::Local => d.local += 1,
                 Kind::Stale => d.stale += 1,
                 Kind::Prefetch => d.prefetch += 1,
+                Kind::Backfill => d.backfill += 1,
+                Kind::BackfillMismatch => d.backfill_mismatch += 1,
             }
             if let Kind::Query = k {
                 i.minute(Self::now_min()).q += 1;
@@ -1050,6 +1065,12 @@ mod tests {
         assert_eq!(v["today"]["blocked"], 2);
         assert_eq!(v["today"]["blockedTelemetry"], 1);
         assert_eq!(v["today"]["blockedAds"], 1);
+        assert_eq!(v["today"]["backfill"], 0);
+        s.count(Kind::Backfill);
+        s.count(Kind::BackfillMismatch);
+        let v = s.summary();
+        assert_eq!(v["today"]["backfill"], 1);
+        assert_eq!(v["today"]["backfillMismatch"], 1);
         assert!(v["today"].get("sites").is_none(), "LuCI 讀的 today 不帶網站排行");
         let rt = s.realtime();
         assert_eq!(rt.as_array().unwrap().len(), 60);
