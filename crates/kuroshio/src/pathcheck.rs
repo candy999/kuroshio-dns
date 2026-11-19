@@ -14,6 +14,8 @@ use tracing::{info, warn};
 
 /// 定期檢查的間隔
 const INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// 有協定被判定整條被擋時，較快再檢查一次（被擋的那種上游在這段時間不用，恢復要快）
+const RECHECK_BLOCKED: Duration = Duration::from_secs(3600);
 /// 啟動後多久做第一次（讓監聽、bootstrap 先就緒）
 const FIRST_DELAY: Duration = Duration::from_secs(8);
 
@@ -101,9 +103,14 @@ pub fn spawn() {
         tokio::time::sleep(FIRST_DELAY).await;
         loop {
             crate::clock::wait_synced().await;
-            run_once().await;
+            let r = run_once().await;
+            let wait = if r.as_ref().is_some_and(|r| !r.blocked.is_empty()) {
+                RECHECK_BLOCKED
+            } else {
+                INTERVAL
+            };
             tokio::select! {
-                _ = tokio::time::sleep(INTERVAL) => {}
+                _ = tokio::time::sleep(wait) => {}
                 _ = wake().notified() => {
                     // WAN 剛變動：等幾秒讓路由與位址就緒
                     tokio::time::sleep(Duration::from_secs(5)).await;
