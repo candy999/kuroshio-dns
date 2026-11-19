@@ -328,3 +328,167 @@ async fn apply_sets_flags() {
     path::clear();
     assert!(!path::blocked(Proto::Dot) && !path::bootstrap_via_doh() && path::current().is_none());
 }
+
+/// 3.4.0：報告記下命中的保留位址（串接往這裡發挑戰）；`to_json()` 不輸出；沒有加密協定的目標時不算離線
+#[tokio::test]
+async fn report_records_hit_address() {
+    let dns = fake_dns(
+        Fake {
+            kuroshio: true,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    let r = path::check(&targets(vec![closed().await, dns])).await;
+    assert_eq!(r.hit, Some(dns));
+    assert!(!r.hit_tcp, "UDP 也被接走");
+    assert!(!r.offline && r.blocked.is_empty(), "沒有加密目標：沒測就不判斷");
+    let j = r.to_json();
+    assert!(j.get("hit").is_none() && j.get("hitTcp").is_none(), "{j}");
+    assert!(!path::summary(&r).contains("連不上"));
+
+    // 只有 TCP 被接走
+    let tcp_only = tcp_only_dns().await;
+    let r = path::check(&targets(vec![tcp_only])).await;
+    assert_eq!((r.hit, r.hit_tcp), (Some(tcp_only), true));
+
+    // 沒被接走
+    let r = path::check(&targets(vec![closed().await])).await;
+    assert_eq!((r.hit, r.hit_tcp), (None, false));
+    assert_eq!(path::Report::default().hit, None);
+}
+
+/// 只開 TCP 的假 DNS（UDP 的埠關著）
+async fn tcp_only_dns() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else { break };
+            tokio::spawn(async move {
+                let Ok(len) = s.read_u16().await else { return };
+                let mut q = vec![0u8; len as usize];
+                if s.read_exact(&mut q).await.is_err() {
+                    return;
+                }
+                if let Some(r) = answer(&q, Fake::default()) {
+                    let mut out = (r.len() as u16).to_be_bytes().to_vec();
+                    out.extend_from_slice(&r);
+                    let _ = s.write_all(&out).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// TXT RDATA：每段最多 255 bytes
+fn txt_rdata(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for seg in payload.chunks(255) {
+        out.push(seg.len() as u8);
+        out.extend_from_slice(seg);
+    }
+    out
+}
+
+type Seen = Arc<std::sync::Mutex<Vec<(u16, Vec<u8>)>>>;
+
+fn chaos_reply(q: &[u8], tc: bool, payload: &[u8], seen: &Seen) -> Vec<u8> {
+    let m = Message::parse(q).unwrap();
+    if let Some(o) = &m.opt {
+        seen.lock().unwrap().extend(o.options.iter().cloned());
+    }
+    let mut r = Message::response_to(&m, 0);
+    if tc {
+        r.flags |= 0x0200;
+    } else {
+        r.answers.push(Record {
+            name: m.questions[0].name.clone(),
+            rtype: 16,
+            class: 3,
+            ttl: 0,
+            data: RData::Raw(txt_rdata(payload)),
+        });
+    }
+    r.encode()
+}
+
+/// 假的串接上游：UDP 一律回 TC；TCP 回 `payload` 的 TXT（二進位）。`seen` 記下查詢裡的 EDNS 選項
+async fn chaos_server(payload: Vec<u8>, seen: Seen) -> SocketAddr {
+    // UDP 與 TCP 要同一個埠：TCP 那個埠剛好被占用就換一個
+    let (u, l) = loop {
+        let u = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(l) = TcpListener::bind(u.local_addr().unwrap()).await {
+            break (u, l);
+        }
+    };
+    let addr = u.local_addr().unwrap();
+    let payload = Arc::new(payload);
+    {
+        let (payload, seen) = (payload.clone(), seen.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, from)) = u.recv_from(&mut buf).await else { break };
+                let _ = u.send_to(&chaos_reply(&buf[..n], true, &payload, &seen), from).await;
+            }
+        });
+    }
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else { break };
+            let (payload, seen) = (payload.clone(), seen.clone());
+            tokio::spawn(async move {
+                // 同一條連線上可以連續問
+                loop {
+                    let Ok(len) = s.read_u16().await else { return };
+                    let mut q = vec![0u8; len as usize];
+                    if s.read_exact(&mut q).await.is_err() {
+                        return;
+                    }
+                    let r = chaos_reply(&q, false, &payload, &seen);
+                    let mut out = (r.len() as u16).to_be_bytes().to_vec();
+                    out.extend_from_slice(&r);
+                    if s.write_all(&out).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn chaos_txt_binary_and_tc_fallback() {
+    let payload: Vec<u8> = (0..2000u32).map(|i| (i * 7 % 256) as u8).collect();
+    let a = chaos_server(payload.clone(), Seen::default()).await;
+    let limit = Duration::from_secs(2);
+    // UDP 回 TC → 自動改 TCP，拿到完整的二進位內容
+    let r = path::chaos_txt(a, "0123.a.chain.kuroshio", false, None, limit).await.unwrap();
+    assert_eq!(r.rcode, 0);
+    assert_eq!(r.txt.as_deref(), Some(&payload[..]));
+    // 同一條 TCP 連線上連續問
+    let mut c = path::ChaosTcp::connect(a, limit).await.unwrap();
+    for _ in 0..3 {
+        let r = c.ask("m.s.chain.kuroshio", limit).await.unwrap();
+        assert_eq!(r.txt.as_deref(), Some(&payload[..]));
+    }
+    // 沒有人在聽：錯誤，不是空的成功
+    let none = path::chaos_txt(closed().await, "x.chain.kuroshio", false, None, Duration::from_millis(300)).await;
+    assert!(none.is_err());
+}
+
+#[tokio::test]
+async fn chaos_txt_carries_edns_option() {
+    let seen = Seen::default();
+    let a = chaos_server(b"ok".to_vec(), seen.clone()).await;
+    let opt = Some((65313, vec![1, 2, 3, 4]));
+    let r = path::chaos_txt(a, "r.chain.kuroshio", true, opt, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(r.txt.as_deref(), Some(&b"ok"[..]));
+    assert_eq!(seen.lock().unwrap().as_slice(), &[(65313u16, vec![1u8, 2, 3, 4])]);
+}

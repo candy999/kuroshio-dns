@@ -1,5 +1,9 @@
 //! 上游管理（對齊 2.x `lib/upstreams.js`）：固定上游永不淘汰、每日評測選出的自動上游、備援、最後手段。
 //! 自動上游連續失敗 5 次就暫停（1 → 2 → 4 … 分鐘，最長 30 分鐘），成功一次就歸零。
+//!
+//! 3.4.0 串接模式（規格 10 的 1.6）：串接上游（`Role::Chain`）由串接模組用 [`Manager::set_chain`] 設定，
+//! 不寫進設定檔。串接中只問串接上游＋固定上游；串接上游連續失敗 3 次暫停 30 秒，期間跟沒串接一樣。
+//! 沒有串接上游時，所有行為跟 3.3.7 完全一樣。
 
 use crate::upstream::{Kind, Upstream};
 use serde_json::{json, Value};
@@ -14,6 +18,8 @@ pub enum Role {
     Auto,
     Fallback,
     LastResort,
+    /// 串接模式（3.4.0）：驗證過的上游黑潮，第一順位
+    Chain,
 }
 
 impl Role {
@@ -23,7 +29,25 @@ impl Role {
             Role::Auto => "auto",
             Role::Fallback => "fallback",
             Role::LastResort => "lastResort",
+            Role::Chain => "chain",
         }
+    }
+}
+
+/// 串接上游連續失敗幾次就暫停
+pub const CHAIN_FAIL_LIMIT: u32 = 3;
+/// 串接上游暫停多久
+pub const CHAIN_PAUSE: Duration = Duration::from_secs(30);
+
+/// 串接上游連續失敗時的通知（串接模組立刻補一次心跳）
+pub type TroubleFn = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct Trouble(RwLock<Option<TroubleFn>>);
+
+impl std::fmt::Debug for Trouble {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Trouble")
     }
 }
 
@@ -44,6 +68,8 @@ pub struct Up {
     stats: Mutex<Stats>,
     /// 每日評測選上的原因（最快、覆蓋）
     reason: Mutex<Option<String>>,
+    /// 只有串接上游：連續失敗時通知誰
+    trouble: Option<Arc<Trouble>>,
 }
 
 impl Up {
@@ -53,6 +79,17 @@ impl Up {
             role,
             stats: Mutex::new(Stats::default()),
             reason: Mutex::new(None),
+            trouble: None,
+        })
+    }
+
+    fn new_chain(up: Upstream, trouble: Arc<Trouble>) -> Arc<Up> {
+        Arc::new(Up {
+            up,
+            role: Role::Chain,
+            stats: Mutex::new(Stats::default()),
+            reason: Mutex::new(None),
+            trouble: Some(trouble),
         })
     }
 
@@ -71,9 +108,11 @@ impl Up {
         matches!(self.up.host.parse::<std::net::IpAddr>(), Ok(ip) if !path::addr_usable(ip))
     }
 
-    /// 一般 DNS 而且路上有攔截者：實際回答的是攔截者，不是這台
+    /// 一般 DNS 而且路上有攔截者：實際回答的是攔截者，不是這台。
+    /// 串接上游不算（它就是我們要的那台，`decide()` 不能把它的答案排到後面）
     pub fn via_interceptor(&self) -> bool {
-        is_plain(self.up.kind)
+        self.role != Role::Chain
+            && is_plain(self.up.kind)
             && self
                 .up
                 .host
@@ -91,6 +130,15 @@ impl Up {
     }
 
     pub fn record(&self, ok: bool, ms: f64) {
+        let mut notify = None;
+        self.record_inner(ok, ms, &mut notify);
+        // 放掉 stats 的鎖之後才通知（回呼可能會讀這個上游的狀態）
+        if let Some(f) = notify {
+            f();
+        }
+    }
+
+    fn record_inner(&self, ok: bool, ms: f64, notify: &mut Option<TroubleFn>) {
         let mut s = self.stats.lock().unwrap();
         if ok {
             s.ok += 1;
@@ -111,6 +159,16 @@ impl Up {
                     self.up.id,
                     if s.ok > 0 { "" } else { "（上線以來從未成功）" }
                 );
+            }
+            if self.role == Role::Chain && s.consec_fail >= CHAIN_FAIL_LIMIT {
+                s.open_until = Some(now + CHAIN_PAUSE);
+                s.consec_fail = 0;
+                warn!(
+                    "串接：上游黑潮 {} 連續失敗 {CHAIN_FAIL_LIMIT} 次，暫停 {} 秒，先用自己的上游",
+                    self.up.id,
+                    CHAIN_PAUSE.as_secs()
+                );
+                *notify = self.trouble.as_ref().and_then(|t| t.0.read().unwrap().clone());
             }
         }
     }
@@ -145,6 +203,40 @@ pub fn kind_name(k: Kind) -> &'static str {
 /// 明文上游（UDP / TCP）：不需要 TLS，系統時間沒對時也能用
 pub fn is_plain(k: Kind) -> bool {
     matches!(k, Kind::Udp | Kind::Tcp)
+}
+
+/// 純函式（3.4.0 串接模式，規格 1.6）：(主要上游, 備援)。之後主要上游再過 [`select_active`]。
+///
+/// - 沒有串接上游：固定 + 自動；備援 = 備援 + 最後手段（3.3.7 的行為）
+/// - 串接中、沒暫停：[串接上游] + 固定上游（自動上游不問）；備援 = 自動 + 備援 + 最後手段
+/// - 串接上游暫停中：主要上游跟沒串接時一樣；備援 = 備援 + 最後手段
+///
+/// 串接時備援都去掉 `via_interceptor()` 為真的（一般 DNS 會回到同一台掛掉的上游）。
+/// `auto` 是已經去掉暫停中、路徑檢查判斷不能用的自動上游。
+pub fn select_chain(
+    chain: Option<&Arc<Up>>,
+    suspended: bool,
+    pinned: &[Arc<Up>],
+    auto: Vec<Arc<Up>>,
+    fallback: &[Arc<Up>],
+    last_resort: &[Arc<Up>],
+) -> (Vec<Arc<Up>>, Vec<Arc<Up>>) {
+    let rest = || fallback.iter().chain(last_resort).cloned();
+    let Some(chain) = chain else {
+        let mut active = pinned.to_vec();
+        active.extend(auto);
+        return (active, rest().collect());
+    };
+    let independent = |v: Vec<Arc<Up>>| -> Vec<Arc<Up>> { v.into_iter().filter(|u| !u.via_interceptor()).collect() };
+    if suspended {
+        let mut active = pinned.to_vec();
+        active.extend(auto);
+        return (active, independent(rest().collect()));
+    }
+    let mut active = vec![chain.clone()];
+    active.extend(pinned.iter().filter(|p| !Arc::ptr_eq(p, chain)).cloned());
+    let backup = independent(auto.into_iter().chain(rest()).collect());
+    (active, backup)
 }
 
 /// 純函式：這次查詢要用的上游。
@@ -190,6 +282,9 @@ pub struct Manager {
     state_file: PathBuf,
     auto_types: Vec<String>,
     auto_max: usize,
+    /// 串接上游（3.4.0）：由串接模組設定，不寫進設定檔
+    chain: RwLock<Option<Arc<Up>>>,
+    chain_trouble: Arc<Trouble>,
 }
 
 fn strings(v: Option<&Value>) -> Vec<String> {
@@ -213,6 +308,8 @@ impl Manager {
             state_file,
             auto_types: strings(g("upstream.autoTypes")),
             auto_max: g("upstream.autoMax").and_then(Value::as_u64).unwrap_or(6) as usize,
+            chain: RwLock::new(None),
+            chain_trouble: Arc::new(Trouble::default()),
         };
         m.reload_auto();
         m
@@ -275,39 +372,78 @@ impl Manager {
     }
 
     /// 這次查詢要用的上游：固定上游一律參與、暫停中的自動上游跳過；都沒有就用備援。
-    /// 系統時間還沒對時（見 `crate::clock`）：只用明文上游，見 [`select_active`]
+    /// 系統時間還沒對時（見 `crate::clock`）：只用明文上游，見 [`select_active`]。
+    /// 串接中（3.4.0）：串接上游 + 固定上游，見 [`select_chain`]
     pub fn active(&self) -> Vec<Arc<Up>> {
-        let now = Instant::now();
-        let mut list: Vec<Arc<Up>> = self.pinned.clone();
-        // 路徑檢查判斷不能用的（協定被擋、沒有 IPv6）先不用；路恢復了（下一次檢查）自動加回
-        list.extend(
-            self.auto
-                .read()
-                .unwrap()
-                .list
-                .iter()
-                .filter(|u| !u.paused(now) && !u.path_blocked())
-                .cloned(),
-        );
+        let (list, _) = self.select();
         select_active(list, &self.fallback, &self.last_resort, crate::clock::synced())
     }
 
-    /// 主要上游都失敗時改問的：備援 + 最後手段（沒對時只用其中的明文上游）
+    /// 主要上游都失敗時改問的：備援 + 最後手段（沒對時只用其中的明文上游）；
+    /// 串接中另外加上自己的自動上游（上游黑潮掛掉時退回自己的加密上游，固定行為）
     pub fn backup(&self) -> Vec<Arc<Up>> {
         let synced = crate::clock::synced();
-        self.fallback
+        let (_, backup) = self.select();
+        backup.into_iter().filter(|u| synced || is_plain(u.up.kind)).collect()
+    }
+
+    fn select(&self) -> (Vec<Arc<Up>>, Vec<Arc<Up>>) {
+        let now = Instant::now();
+        // 路徑檢查判斷不能用的（協定被擋、沒有 IPv6）先不用；路恢復了（下一次檢查）自動加回
+        let auto: Vec<Arc<Up>> = self
+            .auto
+            .read()
+            .unwrap()
+            .list
             .iter()
-            .chain(&self.last_resort)
-            .filter(|u| synced || is_plain(u.up.kind))
+            .filter(|u| !u.paused(now) && !u.path_blocked())
             .cloned()
-            .collect()
+            .collect();
+        let chain = self.chain();
+        let suspended = chain.as_ref().is_some_and(|c| c.role == Role::Chain && c.paused(now));
+        select_chain(chain.as_ref(), suspended, &self.pinned, auto, &self.fallback, &self.last_resort)
+    }
+
+    /// 設定／清除串接上游（串接模組在綁定、解除時呼叫）。跟某個固定上游的 `id` 相同時不新增：
+    /// 那個固定上游就當成串接上游（`chain()` 回它，角色維持 `Pinned`，不暫停）
+    pub fn set_chain(&self, up: Option<Upstream>) {
+        let mut c = self.chain.write().unwrap();
+        let Some(u) = up else {
+            *c = None;
+            return;
+        };
+        if c.as_ref().is_some_and(|x| x.up.id == u.id) {
+            return;
+        }
+        *c = Some(match self.pinned.iter().find(|p| p.up.id == u.id) {
+            Some(p) => p.clone(),
+            None => Up::new_chain(u, self.chain_trouble.clone()),
+        });
+    }
+
+    /// 目前的串接上游
+    pub fn chain(&self) -> Option<Arc<Up>> {
+        self.chain.read().unwrap().clone()
+    }
+
+    /// 串接上游連續失敗後的 30 秒暫停中
+    pub fn chain_suspended(&self) -> bool {
+        self.chain().is_some_and(|c| c.role == Role::Chain && c.paused(Instant::now()))
+    }
+
+    /// 串接上游連續失敗 3 次時呼叫（通知串接模組補心跳）
+    pub fn on_chain_trouble(&self, f: TroubleFn) {
+        *self.chain_trouble.0.write().unwrap() = Some(f);
     }
 
     pub fn list_json(&self) -> Value {
         let auto = self.auto.read().unwrap();
+        // 串接上游排第一個（跟固定上游相同的那種已經在固定上游裡，不重複列）
+        let chain = self.chain().filter(|c| c.role == Role::Chain);
         Value::Array(
-            self.pinned
+            chain
                 .iter()
+                .chain(&self.pinned)
                 .chain(&auto.list)
                 .chain(&self.fallback)
                 .map(|u| u.json())
@@ -429,5 +565,110 @@ mod tests {
         let c = kuroshio_config::with_overrides(&json!({ "upstream": { "pinned": [], "fallback": ["udp://1.0.0.2"] } }));
         let m = Manager::new(&c, PathBuf::from("/nonexistent/upstreams.json"));
         assert_eq!(m.active()[0].role, Role::Fallback);
+    }
+
+    fn ups(specs: &[&str], role: Role) -> Vec<Arc<Up>> {
+        build(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>(), role)
+    }
+
+    fn ids(v: &[Arc<Up>]) -> Vec<String> {
+        v.iter().map(|u| u.up.id.clone()).collect()
+    }
+
+    fn chain_up(spec: &str) -> Arc<Up> {
+        Up::new_chain(Upstream::parse(spec).unwrap(), Arc::new(Trouble::default()))
+    }
+
+    #[test]
+    fn chain_active_and_backup_rules() {
+        let pinned = ups(&["tls://dns.example.com"], Role::Pinned);
+        let auto = ups(&["https://dns.example.net/dns-query", "udp://203.0.113.53"], Role::Auto);
+        let fb = ups(&["udp://198.51.100.53"], Role::Fallback);
+        let lr = ups(&["tcp://192.0.2.53"], Role::LastResort);
+        let chain = chain_up("udp://192.168.1.1:53");
+
+        // 沒有串接上游：跟 3.3.7 一樣（固定 + 自動；備援 + 最後手段）
+        let (a, b) = select_chain(None, false, &pinned, auto.clone(), &fb, &lr);
+        assert_eq!(ids(&a), [ids(&pinned), ids(&auto)].concat());
+        assert_eq!(ids(&b), [ids(&fb), ids(&lr)].concat());
+
+        // 串接中、健康：只有串接上游 + 固定上游；自動上游移到備援
+        let (a, b) = select_chain(Some(&chain), false, &pinned, auto.clone(), &fb, &lr);
+        assert_eq!(
+            ids(&a),
+            vec!["udp://192.168.1.1:53".to_string(), "tls://dns.example.com:853".into()]
+        );
+        assert_eq!(a[0].role, Role::Chain);
+        assert!(ids(&b).contains(&"https://dns.example.net/dns-query".to_string()), "{:?}", ids(&b));
+        assert!(b.iter().all(|u| u.role != Role::Chain));
+
+        // 暫停中：主要上游跟沒串接時一樣
+        let (a, _) = select_chain(Some(&chain), true, &pinned, auto.clone(), &fb, &lr);
+        assert_eq!(ids(&a), [ids(&pinned), ids(&auto)].concat());
+
+        // 一般 DNS 被接走：備援去掉經由攔截者的明文上游，留下自己的加密上游
+        let mut r = kuroshio_net::path::Report::default();
+        r.plain_v4.udp = true;
+        kuroshio_net::path::apply(&r, false);
+        let (_, b) = select_chain(Some(&chain), false, &pinned, auto.clone(), &fb, &lr);
+        assert_eq!(ids(&b), vec!["https://dns.example.net/dns-query".to_string()]);
+        assert!(!chain.via_interceptor(), "串接上游不算經由攔截者");
+        let (_, b) = select_chain(None, false, &pinned, auto.clone(), &fb, &lr);
+        assert_eq!(b.len(), 2, "沒串接時備援照舊");
+        kuroshio_net::path::clear();
+    }
+
+    #[test]
+    fn chain_breaker_trips_after_three() {
+        let m = Manager::new(&cfg(), PathBuf::from("/nonexistent/upstreams.json"));
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        m.on_chain_trouble(Arc::new(move || {
+            n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        m.set_chain(Some(Upstream::parse("udp://192.168.1.1:53").unwrap()));
+        let c = m.chain().unwrap();
+        assert_eq!(m.active()[0].role, Role::Chain);
+        c.record(false, 0.0);
+        c.record(false, 0.0);
+        c.record(true, 5.0);
+        c.record(false, 0.0);
+        c.record(false, 0.0);
+        assert!(!m.chain_suspended(), "成功一次就歸零");
+        c.record(false, 0.0);
+        assert!(m.chain_suspended());
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1, "回呼被呼叫一次");
+        assert!(m.active().iter().all(|u| u.role != Role::Chain), "暫停中不問串接上游");
+        assert_eq!(c.json()["role"], "chain");
+        assert_eq!(m.list_json()[0]["role"], "chain");
+        m.set_chain(None);
+        assert!(m.chain().is_none() && !m.chain_suspended());
+    }
+
+    #[test]
+    fn chain_same_as_pinned_not_duplicated() {
+        let m = Manager::new(&cfg(), PathBuf::from("/nonexistent/upstreams.json"));
+        m.set_chain(Some(Upstream::parse("udp://10.0.0.1").unwrap()));
+        let a = m.active();
+        assert_eq!(ids(&a), vec!["udp://10.0.0.1:53"]);
+        assert_eq!(m.chain().unwrap().role, Role::Pinned, "角色維持固定上游");
+        assert_eq!(m.list_json().as_array().unwrap().len(), 2, "固定 + 備援，沒有重複");
+        // 固定上游永不暫停
+        for _ in 0..10 {
+            m.chain().unwrap().record(false, 0.0);
+        }
+        assert!(!m.chain_suspended());
+    }
+
+    #[test]
+    fn unsynced_clock_keeps_chain() {
+        let pinned = ups(&["https://dns.example.com/dns-query"], Role::Pinned);
+        let chain = chain_up("udp://192.168.1.1:53");
+        let (a, _) = select_chain(Some(&chain), false, &pinned, vec![], &[], &[]);
+        let a = select_active(a, &[], &[], false);
+        assert_eq!(ids(&a), vec!["udp://192.168.1.1:53"], "串接上游是明文，沒對時也能用");
+        let tcp = chain_up("tcp://192.168.1.1:53");
+        let (a, _) = select_chain(Some(&tcp), false, &pinned, vec![], &[], &[]);
+        assert_eq!(select_active(a, &[], &[], false)[0].role, Role::Chain);
     }
 }

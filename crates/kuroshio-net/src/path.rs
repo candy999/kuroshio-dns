@@ -451,6 +451,10 @@ pub struct Report {
     pub tls_intercept: Option<String>,
     /// 加密協定全部連不上（網路斷了）：這次不判斷協定被擋
     pub offline: bool,
+    /// 一般 DNS 被接走時命中的保留位址（IPv4 優先；3.4.0 串接模式往這裡發挑戰）。`to_json()` 不輸出
+    pub hit: Option<SocketAddr>,
+    /// 命中的那條路只有 TCP 被接走（UDP 沒有）
+    pub hit_tcp: bool,
 }
 
 /// 沒有任何狀況的結果（測試或手動建立用）
@@ -471,6 +475,8 @@ impl Default for Report {
             blocked: Vec::new(),
             tls_intercept: None,
             offline: false,
+            hit: None,
+            hit_tcp: false,
         }
     }
 }
@@ -663,6 +669,107 @@ async fn tcp_ask(addr: SocketAddr, q: &[u8], limit: Duration) -> Result<Vec<u8>>
     })
     .await
     .map_err(|_| anyhow!("逾時"))?
+}
+
+// ---------------- CH TXT（3.4.0 串接模式的通道） ----------------
+
+/// 一次 CH TXT 查詢的結果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChaosReply {
+    pub rcode: u16,
+    /// 第一筆 TXT 記錄的全部字串接起來（二進位，不是文字）；沒有 TXT 是 None
+    pub txt: Option<Vec<u8>>,
+}
+
+/// TXT 的 RDATA → 所有字串接起來；被截斷 → None
+fn txt_concat(rdata: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(rdata.len());
+    let mut i = 0;
+    while i < rdata.len() {
+        let n = rdata[i] as usize;
+        out.extend_from_slice(rdata.get(i + 1..i + 1 + n)?);
+        i += 1 + n;
+    }
+    Some(out)
+}
+
+fn chaos_reply(resp: &[u8]) -> Result<ChaosReply> {
+    let m = kuroshio_proto::Message::parse(resp).map_err(|e| anyhow!("回應格式錯誤：{e}"))?;
+    let txt = m.answers.iter().find(|r| r.rtype == 16).and_then(|r| match &r.data {
+        kuroshio_proto::message::RData::Raw(b) => txt_concat(b),
+        _ => None,
+    });
+    Ok(ChaosReply { rcode: m.rcode, txt })
+}
+
+/// CH TXT 查詢的封包；`opt` = 要帶的 EDNS 選項
+fn chaos_query(id: u16, name: &str, opt: Option<(u16, Vec<u8>)>) -> Vec<u8> {
+    match opt {
+        None => build_chaos_txt(id, name),
+        Some(o) => kuroshio_proto::Message {
+            id,
+            flags: kuroshio_proto::message::FLAG_RD,
+            questions: vec![kuroshio_proto::message::Question {
+                name: name.to_string(),
+                qtype: 16,
+                qclass: 3,
+            }],
+            opt: Some(kuroshio_proto::message::Opt {
+                udp_size: 1232,
+                options: vec![o],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode(),
+    }
+}
+
+/// 一次 CH TXT 查詢；`opt` = 要帶的 EDNS 選項；UDP 回 TC 時自動改 TCP
+pub async fn chaos_txt(addr: SocketAddr, name: &str, tcp: bool, opt: Option<(u16, Vec<u8>)>, limit: Duration) -> Result<ChaosReply> {
+    let q = chaos_query(rand16(), name, opt);
+    if !tcp {
+        let r = udp_ask(addr, &q, limit).await?;
+        if !kuroshio_proto::header(&r).is_ok_and(|h| h.tc) {
+            return chaos_reply(&r);
+        }
+    }
+    chaos_reply(&tcp_ask(addr, &q, limit).await?)
+}
+
+/// 同一條 TCP 連線上連續問 CH TXT（共用結果的分段）
+pub struct ChaosTcp {
+    s: TcpStream,
+}
+
+impl ChaosTcp {
+    pub async fn connect(addr: SocketAddr, limit: Duration) -> Result<ChaosTcp> {
+        let s = tokio::time::timeout(limit, TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow!("連線逾時"))??;
+        Ok(ChaosTcp { s })
+    }
+
+    pub async fn ask(&mut self, name: &str, limit: Duration) -> Result<ChaosReply> {
+        let q = build_chaos_txt(rand16(), name);
+        let s = &mut self.s;
+        let r = tokio::time::timeout(limit, async {
+            let mut msg = (q.len() as u16).to_be_bytes().to_vec();
+            msg.extend_from_slice(&q);
+            s.write_all(&msg).await?;
+            loop {
+                let len = s.read_u16().await? as usize;
+                let mut buf = vec![0u8; len];
+                s.read_exact(&mut buf).await?;
+                if kuroshio_proto::matches(&q, &buf) {
+                    return Ok::<_, anyhow::Error>(buf);
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("逾時"))??;
+        chaos_reply(&r)
+    }
 }
 
 /// TXT 回答的第一段文字
@@ -909,7 +1016,9 @@ pub async fn check(t: &Targets) -> Report {
     let get = |p: Proto| protocols.iter().find(|(x, _)| *x == p).map(|(_, r)| r.clone()).unwrap_or_default();
     let total_ok: usize = protocols.iter().map(|(_, r)| r.ok).sum();
     let total_cert: usize = protocols.iter().map(|(_, r)| r.cert_errors).sum();
-    let offline = total_ok == 0 && total_cert == 0;
+    // 沒有任何加密協定的目標（測試用的覆寫把它們清空）：沒測就不算離線
+    let tested = !(t.dot.is_empty() && t.doh.is_empty() && t.quic.is_empty());
+    let offline = tested && total_ok == 0 && total_cert == 0;
     let mut blocked = Vec::new();
     let tls_intercept = if total_cert >= 2 {
         protocols
@@ -942,6 +1051,8 @@ pub async fn check(t: &Targets) -> Report {
         blocked,
         tls_intercept,
         offline,
+        hit: hit.map(|(a, _)| a),
+        hit_tcp: hit.is_some_and(|(_, tcp)| tcp),
     };
     debug!("路徑檢查：{}", r.to_json());
     r
