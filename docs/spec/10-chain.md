@@ -593,7 +593,6 @@ RegBody：
     { "address": "192.168.1.2", "nodeId": "0f1e2d3c4b5a6978", "fingerprint": "9C01-…", "version": "3.4.0",
       "viaNat": false, "names": 6, "firstSeen": 1794990000000, "lastSeen": 1795000300000, "expiresAt": 1795001200000 }
   ],
-  "bypassListActive": false,
   "share": { "requests": 12, "lastAt": 1795000500000, "cacheBytes": 81234 },
   "probes": { "count24h": 0, "lastAt": null },
   "refused": { "rate": 0, "notPrivate": 0, "notAllowed": 0 }
@@ -604,7 +603,7 @@ RegBody：
   - 開、有下游：`提供資料給下游黑潮：目前 1 台`
   - 開、沒有下游：`提供資料給下游黑潮：目前沒有下游連上來`
   - 關：`不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）`；24 小時內有下游來探測過時接著寫「最近有下游黑潮來問過（…時間）」（`probes`：`allow_downstream` 關著時收到的 auth 挑戰數，只記次數與最後時間）。
-- `note`：開著時是 4.1 那段說明的一句話版；`bypassListActive`（有啟用任何標成 `bypass` 的清單）為真時，狀態頁要把 `note` 顯示得明顯一點。關著時是 `null`。
+- `note`：開著時是 4.1 那段說明的一句話版（一般樣式，不另外加醒目提醒：區網裡的裝置要繞過「繞過防護」清單沒有絕對擋得住的方法，使用者已決定接受）。關著時是 `null`。
 - 上游自己的指紋顯示在這裡：下游狀態頁的 `chain.upstream.fingerprint` 應該跟它相同，公鑰換過的警告出現時可以拿來對照。
 
 ---

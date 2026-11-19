@@ -281,7 +281,7 @@ impl Responder {
 
   要點：這一段**一定 return**，`chain.kuroshio` 的查詢不可以走到過濾、快取、上游。
 - `answer()`：`parse_name` → `Name::Auth(nonce)`：先過速率限制，再 `key.get()`、組 `AuthBody`、`seal(.., "auth", ..)`、放進一筆 TXT（class 3、TTL 0、`RData::Raw(txt_rdata(..))`）。`qtype` 不是 16 或 255 → 空答案。`Name::Reg`、`Name::Manifest`、`Name::Chunk` 在這個工作包先回 `REFUSED`（WP5、WP6 接上）。
-- `allow_downstream = false`：`allow: false`、`caps: []`，照樣簽章回答（「我是黑潮，但不提供資料」）；另外記數（`probes`：次數與最後時間，規格 4.5），讓上游的狀態頁看得出有下游來問過。`serving_json()` 一定回完整的物件，含規格 4.5 的 `text`、`note`、`bypassListActive`（後者由 `app.rs` 在過濾啟動後用 `set_bypass_list_active(bool)` 告訴它）。
+- `allow_downstream = false`：`allow: false`、`caps: []`，照樣簽章回答（「我是黑潮，但不提供資料」）；另外記數（`probes`：次數與最後時間，規格 4.5），讓上游的狀態頁看得出有下游來問過。`serving_json()` 一定回完整的物件，含規格 4.5 的 `text`、`note`（不做 `bypassListActive`）。
 - `peer`：`ctx.client.to_canonical().to_string()`。`tok`：`chain::token(&secret, &peer, now_ms / TOKEN_WINDOW_MS)`。
 - 速率限制：`Mutex<HashMap<IpAddr, (f64 /* 剩餘 */, Instant)>>`，每來源每秒補 4、上限 8；全域每秒補 32、上限 64。表滿 64 筆時刪掉最久沒更新的一筆。超過回 `REFUSED`，`serving_json` 的 `refused.rate` 加 1。
 - `NodeKey::get()` 失敗（金鑰目錄不能寫）：回 `SERVFAIL`（rcode 2），記一次警告（不要每個查詢都記）。
@@ -829,9 +829,9 @@ pub struct AsnInfo { pub raw: String, pub keywords: Vec<String>, pub cc: String 
 
 - 文字直接用 API 給的 `chain.text`（下游角色）與 `chain.serving.text`、`chain.serving.note`（上游角色），前端不自己拼句子。**沒有任何按鈕**（沒有同意、沒有核准）；兩個區塊都一定顯示，讓兩邊都看得出目前是哪一種情況與原因：
   - 下游角色：`text`；`chained` 時另外顯示上游指紋、`backupActive`、共用結果各種類的時間與略過的工作；`keyChangedAt` 在 24 小時內時顯示新舊指紋。`released`／`not-allowed` 與 `chain` 關著時，`text` 裡「會重複使用網路」那句要完整顯示，不可以截斷。
-  - 上游角色：`serving.text`、自己的指紋、「連上來的下游」清單（指紋、位址、版本、第一次與最後出現時間、「經 NAT」）。`allowDownstream` 關著時顯示「不提供資料…重複使用網路（含這台的頻寬）」那句；開著時顯示 `note`，`bypassListActive` 為真時用醒目的樣式。
+  - 上游角色：`serving.text`、自己的指紋、「連上來的下游」清單（指紋、位址、版本、第一次與最後出現時間、「經 NAT」）。`allowDownstream` 關著時顯示「不提供資料…重複使用網路（含這台的頻寬）」那句；開著時用一般樣式顯示 `note`。
 - `upstreams[]` 的 `role == "chain"` 顯示成「串接」；`region` 有值時顯示在原因旁邊。
-- `ui-core.js` 加一個把 `chain` 物件轉成顯示資料的純函式，`ui-core.tests.json` 加案例（五種狀態、每個 `reason`、`chain` 關著的兩種情況、`viaNat`、`backupActive`、公鑰換過、上游角色開／關／有下游／`bypassListActive`）。
+- `ui-core.js` 加一個把 `chain` 物件轉成顯示資料的純函式，`ui-core.tests.json` 加案例（五種狀態、每個 `reason`、`chain` 關著的兩種情況、`viaNat`、`backupActive`、公鑰換過、上游角色開／關／有下游）。
 
 **要寫的測試**：`ui-core.tests.json` 的案例（至少 16 筆，涵蓋上面列的）；`tools/admin-e2e.js` 加三個畫面案例（用假的 `/api/status` 回應）：「串接中」、「上游不提供資料（allow_downstream 關閉）…會重複使用網路」、「上游角色：allow_downstream 關閉的說明與開著時的下游清單」。
 
@@ -931,7 +931,7 @@ pub fn len() -> usize;
 | `e2e_reload_turns_chain_off` | 串接後把 D 的設定改成 `chain: false` 再 SIGHUP | D 回到 `none`、解析走替身；之後 U 的 `serving.downstreams` 在登記到期後清掉 D |
 | `e2e_share` | U 的快照目錄預先放 `upstreams.json`（有 `generatedAt`）與節點池 | D 的 `shared.objects` 有 `upstreams`、`cdn-pools` 而且 `fresh`；D 的 `upstreams.json` 有 `source.chain`；`POST /api/jobs/run?name=dns-benchmark` 之後工作狀態是「由上游黑潮提供，略過」 |
 | `e2e_share_falls_back` | U 沒有評測資料 | D 的 `shared.objects` 沒有 `upstreams`；`dns-benchmark` 沒有被略過 |
-| `e2e_bypass_exemption` | U：自訂一份標成 `bypass` 的清單（本機檔案，內容 `\|\|dns.example.net^`）；D 的固定上游裡有 `tls://dns.example.net`（指不到也沒關係） | D 登記成功後，D 的來源問 `dns.example.net` 不擋；另一個來源位址（`127.0.0.2`）照擋；U 的 `serving.bypassListActive == true`。U 改成 `allowDownstream: false` 重新載入後 D 也被擋 |
+| `e2e_bypass_exemption` | U：自訂一份標成 `bypass` 的清單（本機檔案，內容 `\|\|dns.example.net^`）；D 的固定上游裡有 `tls://dns.example.net`（指不到也沒關係） | D 登記成功後，D 的來源問 `dns.example.net` 不擋；另一個來源位址（`127.0.0.2`）照擋。U 改成 `allowDownstream: false` 重新載入後 D 也被擋 |
 | `e2e_3_3_downstream_unaffected` | 用假的「3.3 下游」行為：只發 `version.kuroshio` 與一般查詢 | U 的回答跟 3.3.7 的格式相同 |
 
 ### 執行
