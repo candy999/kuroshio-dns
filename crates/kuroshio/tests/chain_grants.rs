@@ -314,7 +314,16 @@ async fn register_roundtrip_and_listed() {
     c.attach(ChainSettings::from_cfg(&json!({})), &mgr, Some(&u.responder()));
     let st = c.status_json();
     println!("chain.serving = {}", serde_json::to_string_pretty(&st["serving"]).unwrap());
-    assert_eq!(st["serving"]["downstreams"], v["downstreams"]);
+    // 比對下游是誰（時間欄位可能在兩次讀取之間更新，不比）
+    let ids = |x: &serde_json::Value| -> Vec<(String, String)> {
+        x["downstreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| (d["address"].to_string(), d["fingerprint"].to_string()))
+            .collect()
+    };
+    assert_eq!(ids(&st["serving"]), ids(&v));
     assert_eq!(st["serving"]["text"], v["text"]);
 }
 
