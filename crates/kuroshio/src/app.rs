@@ -76,7 +76,8 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
 type CacheHandoff = (String, String, Instant, crate::cache::Cache);
 static CACHE_HANDOFF: Mutex<Option<CacheHandoff>> = Mutex::new(None);
 
-/// 會改變快取裡答案的設定（上游、解析、CDN、本機網域、快照位置）：都沒變才沿用上一輪的快取
+/// 會改變快取裡答案的設定（上游、解析、CDN、本機網域、快照位置）：都沒變才沿用上一輪的快取。
+/// `upstream` 整段都算進去，所以串接的開關 `upstream.chain`（3.4.0，規格第 10 節）改了也不沿用
 fn answer_fingerprint(cfg: &Value) -> String {
     let mut res = get(cfg, "resolver").cloned().unwrap_or_default();
     if let Some(m) = res.as_object_mut() {
@@ -97,8 +98,14 @@ fn answer_fingerprint(cfg: &Value) -> String {
     .to_string()
 }
 
+/// 過濾相關的設定：`filter` 整段（含清單的 `bypass` 標記），加上決定「繞過防護清單放不放行下游」的
+/// `upstream.allowDownstream`（3.4.0，規格第 10 節）
 fn filter_fingerprint(cfg: &Value) -> String {
-    get(cfg, "filter").cloned().unwrap_or_default().to_string()
+    json!([
+        get(cfg, "filter").cloned().unwrap_or_default(),
+        get(cfg, "upstream.allowDownstream").cloned().unwrap_or_default()
+    ])
+    .to_string()
 }
 
 /// 結束這一輪：把快取留給下一輪（重新載入時用；1 分鐘內沒人接手就丟掉）
@@ -1890,6 +1897,34 @@ pub async fn start(cfg: &Value) -> Result<Started> {
 
 #[cfg(test)]
 mod tests {
+    /// 串接的設定（3.4.0）：`upstream.chain` 改了不沿用快取；清單的 `bypass`、`upstream.allowDownstream` 改了算過濾設定變了
+    #[test]
+    fn fingerprints_change_with_chain_settings() {
+        let base = kuroshio_config::build(&json!({}));
+        let with = |user: Value| kuroshio_config::build(&user);
+        let (a0, f0) = (answer_fingerprint(&base), filter_fingerprint(&base));
+        assert_eq!(answer_fingerprint(&with(json!({}))), a0, "同樣的設定：指紋相同");
+        assert_eq!(filter_fingerprint(&with(json!({}))), f0);
+
+        let off = with(json!({ "upstream": { "chain": false } }));
+        assert_ne!(answer_fingerprint(&off), a0, "chain 改了：不沿用快取");
+
+        let no_down = with(json!({ "upstream": { "allowDownstream": false } }));
+        assert_ne!(filter_fingerprint(&no_down), f0, "allowDownstream 改了：過濾設定變了");
+
+        let mut lists = kuroshio_config::get(&base, "filter.lists").unwrap().clone();
+        let i = lists
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|l| l.get("bypass").is_some())
+            .expect("預設清單裡有一筆 bypass");
+        lists[i]["bypass"] = json!(false);
+        let unmarked = with(json!({ "filter": { "lists": lists } }));
+        assert_ne!(filter_fingerprint(&unmarked), f0, "清單的 bypass 改了：過濾設定變了");
+        assert_eq!(answer_fingerprint(&unmarked), a0, "只改過濾：答案的指紋不變");
+    }
+
     #[test]
     fn low_pool_backoff_steps() {
         let t0 = Instant::now();

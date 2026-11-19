@@ -23,7 +23,7 @@ function currentLists() {
 	return uci.sections(CONF, 'filter_list').map(function(x) {
 		var p = x.protect;
 		return { ref: x['.name'], name: x.name, url: x.url, category: x.category, enabled: x.enabled !== '0',
-			protect: (p == null || p === '') ? undefined : p === '1' };
+			protect: (p == null || p === '') ? undefined : p === '1', bypass: x.bypass === '1' };
 	});
 }
 
@@ -116,6 +116,11 @@ return view.extend({
 			o.value('1', _('保護'));
 			o.value('0', _('不保護'));
 			o.optional = true;
+			// 3.4.0：繞過防護類的清單（擋加密 DNS／VPN／代理）。沒勾 = 不寫這個選項
+			o = s.option(form.Flag, 'bypass', _('繞過防護'),
+				_('這份是繞過防護類的清單。上游的 allow_downstream 開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。'));
+			o.default = '0';
+			o.rmempty = true;
 		}
 
 		// ---------------- 自訂規則 ----------------
@@ -287,7 +292,7 @@ return view.extend({
  * 第一次新增、改值、排順序；第二次才刪除區段與選項（LuCI 同一次存檔裡有刪除時不會送出順序）
  */
 function applyRestore(m, cur, plan) {
-	var order = [], unset = [], keep = {};
+	var order = [], unset = [], unsetBypass = [], keep = {};
 	plan.result.forEach(function(r) {
 		var sid;
 		if (r.own) {
@@ -301,6 +306,9 @@ function applyRestore(m, cur, plan) {
 			uci.set(CONF, sid, 'enabled', d.enabled ? '1' : '0');
 			if (d.protect !== undefined) uci.set(CONF, sid, 'protect', d.protect ? '1' : '0');
 			else if (old && old.protect !== undefined) unset.push(sid);
+			// 繞過防護的標記照預設值（restorePlan 整理過的 def 沒有這一欄，看原始的預設 raw）
+			if (r.raw && r.raw.bypass === true) uci.set(CONF, sid, 'bypass', '1');
+			else if (old && old.bypass) unsetBypass.push(sid);
 		}
 		if (r.from >= 0) keep[r.from] = true;
 		order.push(sid);
@@ -309,6 +317,7 @@ function applyRestore(m, cur, plan) {
 	return uci.save().then(function() {
 		cur.forEach(function(c, j) { if (!keep[j]) uci.remove(CONF, c.ref); });
 		unset.forEach(function(sid) { uci.unset(CONF, sid, 'protect'); });
+		unsetBypass.forEach(function(sid) { uci.unset(CONF, sid, 'bypass'); });
 		return uci.save();
 	}).then(function() { return m.load(); }).then(function() { return m.reset(); }).then(function() {
 		var ch = plan.changes;

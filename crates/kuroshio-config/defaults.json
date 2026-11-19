@@ -143,7 +143,9 @@
     "autoStateFile": "./state/upstreams.json",
     "ipv6": "auto",
     "interceptPolicy": "skip-plain",
-    "pathCheck": true
+    "pathCheck": true,
+    "chain": true,
+    "allowDownstream": true
   },
   "resolver": {
     "timeoutMs": 1500,
@@ -170,7 +172,9 @@
     "parallel": "auto",
     "staleIfErrorSec": 86400,
     "warmNames": 2000,
-    "warmRate": "auto"
+    "warmRate": "auto",
+    "backfill": "cdn",
+    "backfillSample": 16
   },
   "iprank": {
     "port": 443,
@@ -275,7 +279,8 @@
         "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/doh-vpn-proxy-bypass.txt",
         "category": "malware",
         "name": "HaGeZi 加密 DNS／VPN／代理繞過（企業用：裝置無法自己改用其他 DNS）",
-        "enabled": false
+        "enabled": false,
+        "bypass": true
       }
     ],
     "updateIntervalHours": 24,
@@ -499,7 +504,9 @@
     "maxAvgLatencyMs": 250,
     "keepDays": 14,
     "subprocess": true,
-    "keepLastReport": true
+    "keepLastReport": true,
+    "coverageRegion": "near",
+    "nearMaxMs": 60
   },
   "scan": {
     "samplesPerSubnet": 6,

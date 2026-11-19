@@ -509,6 +509,18 @@ fn convert(uci: &Value, env: &Env, w: &Warns) -> Value {
         "upstream.",
         w,
     );
+    // 串接的兩個開關（3.4.0，規格 1.11）：名稱靠上面的 snake_case → camelCase（chain、allow_downstream → allowDownstream）。
+    // 一般的開關把看不懂的寫法當成關；這兩個照規格改用預設值（開）並記警告（早期草稿的 'auto'、'ask'）
+    for (opt, key) in [("chain", "chain"), ("allow_downstream", "allowDownstream")] {
+        let Some(v) = sec("upstream").and_then(|u| u.get(opt)).filter(|v| v.as_str() != Some("")) else {
+            continue;
+        };
+        let (b, bad) = crate::chain::flex_bool(Some(v), true);
+        if let Some(m) = bad {
+            warn(w, format!("UCI 選項 upstream.{opt}：{m}"));
+        }
+        up.insert(key.into(), json!(b));
+    }
     // 固定上游沒填 = 不用（路由器本身當上游會變成迴圈）
     up.insert("pinned".into(), json!(list(sec("upstream").and_then(|u| u.get("pinned")))));
     out.insert("upstream".into(), Value::Object(up));
@@ -550,6 +562,10 @@ fn convert(uci: &Value, env: &Env, w: &Warns) -> Value {
                 // 保護清單（記憶體不足也不停用）：沒寫時由分類決定（惡意 / 反詐騙是）
                 if let Some(p) = l.get("protect") {
                     o["protect"] = json!(truthy(p));
+                }
+                // 繞過防護類的清單（3.4.0，規格 4.1）：沒寫就不加這個鍵（= false）
+                if let Some(b) = l.get("bypass") {
+                    o["bypass"] = json!(truthy(b));
                 }
                 o
             })
