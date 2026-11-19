@@ -41,6 +41,15 @@ impl AsnInfo {
         }
     }
 
+    /// 顯示用的名稱：ip-api 沒給 AS 編號時 raw 會是「SHERNET__」這種半截的，改成標明查不到
+    /// （raw 本身不改：它是 2.x 相容的快取與分組鍵）
+    pub fn label(&self) -> String {
+        match self.raw.strip_suffix("__") {
+            Some(name) if !name.is_empty() => format!("{name}（查不到 AS 編號）"),
+            _ => self.raw.clone(),
+        }
+    }
+
     pub fn is_unknown(&self) -> bool {
         self.keywords.is_empty()
     }
@@ -652,6 +661,15 @@ mod tests {
 
     fn info(isp: &str, org: &str, as_: &str) -> AsnInfo {
         AsnInfo::from_ip_api(isp, org, as_)
+    }
+
+    #[test]
+    fn label_without_as_number() {
+        assert_eq!(info("SHERNET", "", "").label(), "SHERNET（查不到 AS 編號）");
+        assert_eq!(
+            info("Cloudflare, Inc.", "Cloudflare, Inc.", "AS13335 Cloudflare, Inc.").label(),
+            "Cloudflare,_Inc.__AS13335_Cloudflare,_Inc."
+        );
     }
 
     #[test]

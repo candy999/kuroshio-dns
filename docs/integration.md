@@ -356,6 +356,8 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 
 - 一般 DNS 候選的答案完全一樣時只算一票：沒偵測到攔截的情況下，幾百台一般 DNS 的答案其實都是同一個攔截者給的，不能讓它們變成「多數」。
 - 「網站無法驗證」（連不上）的可疑回答，同一個業者群組有 3 家以上互相獨立（不同網域）的加密 DNS 都這樣回答時，今天不用，但不記可疑天數（比較可能是網站或路徑的問題）。憑證不符的照舊。
+- 多家 CDN 的網域：規則外的回答裡已經有 2 個以上不同業者憑證有效（例如 `cdn-mum.alibabachengdun.com`），這個網域上的「連不上」也不記可疑天數（3.3.6 之後）。同一個網域底下的多個節點（例如 `sea01`、`sjc02.dnscry.pt`）在「互相獨立」的計算裡本來就算同一家。
+- 記錄與黑名單註解裡的業者名稱：ip-api 沒給 AS 編號時顯示「名稱（查不到 AS 編號）」，不再是 `SHERNET__` 這種半截的（`upstreams.json` 的 `owner` 仍是原本的值）。
 - 判斷過程的摘要寫成報表目錄的 `judge.log`。報表目錄在記憶體裡時（Flash 機器），最近一次的 `judge.log`、`eliminated.csv`、`upstreams.json`（各 128 KB 以內）另存到學習資料區的 `benchmark-last/`，重開機後還查得到（`benchmark.keepLastReport: false` 關掉）。
 
 ## 小記憶體的機器（128 MB 以下）

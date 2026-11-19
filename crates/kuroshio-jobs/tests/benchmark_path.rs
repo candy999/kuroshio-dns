@@ -81,7 +81,8 @@ impl Prober for Mapped {
     fn verify_site(&self, ip: std::net::IpAddr, _d: String, _t: Duration) -> BoxFuture<(SiteCheck, String)> {
         let s = ip.to_string();
         Box::pin(async move {
-            if s.starts_with("93.1.") || s.starts_with("94.2.") {
+            // 95.3 / 97.5：規則外，但真的在服務網站的 CDN（憑證有效）
+            if s.starts_with("93.1.") || s.starts_with("94.2.") || s.starts_with("95.3.") || s.starts_with("97.5.") {
                 (SiteCheck::Valid, "OK".to_string())
             } else {
                 (SiteCheck::Unverified, "ETIMEDOUT".to_string())
@@ -98,6 +99,8 @@ fn asn() -> Arc<dyn AsnSource> {
     add("93.1", "Alpha Networks", "AS100 Alpha Networks");
     add("94.2", "Beta Hosting", "AS200 Beta Hosting");
     add("98.6", "Quiet Hosting", "AS888 Quiet Hosting");
+    add("95.3", "Gamma Cloud", "AS300 Gamma Cloud");
+    add("97.5", "Unknown CDN", "AS777 Unknown CDN");
     add("99.7", "Plain Web", "AS999 Plain Web");
     add("1.1", "Cloudflare", "AS13335 Cloudflare");
     add("1.0", "Cloudflare", "AS13335 Cloudflare");
@@ -275,4 +278,46 @@ async fn independent_operators_are_not_suspects() {
     let up = read(&p.upstreams_file);
     let picked = up["selected"].to_string();
     assert!(!picked.contains("op-a") && !picked.contains("same-op"), "今天都不用：{picked}");
+}
+
+/// 多家 CDN 的網域（padavan-tw 3.3.6：cdn-mum.alibabachengdun.com）：規則外的回答裡已經有 2 個不同業者憑證有效，
+/// 同一家的 2 台回答第 3 個業者但連不上（TIMEOUT）→ 今天不用，但不記可疑
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_cdn_domain_timeouts_are_not_suspects() {
+    let mut ids = Vec::new();
+    for n in 1..=6u8 {
+        ids.push(mock(move |d| honest(d, n)).await.to_string());
+    }
+    let mut map = HashMap::new();
+    let mut doh = Vec::new();
+    let answers = [
+        ("cdn-a.op-x.example", [95, 3, 0, 1]),
+        ("cdn-b.op-y.example", [97, 5, 0, 1]),
+        ("sea01.same-op.example", [99, 7, 0, 1]),
+        ("sjc02.same-op.example", [99, 7, 0, 2]),
+    ];
+    for (k, (host, ip)) in answers.iter().enumerate() {
+        let ip = Ipv4Addr::from(*ip);
+        let a = mock(move |d| match d {
+            "www.alpha.com" => Some(vec![ip]),
+            _ => honest(d, 40 + k as u8),
+        })
+        .await;
+        map.insert(host.to_string(), a);
+        doh.push(format!("https://{host}/dns-query"));
+    }
+    let root = tmp("multicdn");
+    let p = paths(&root);
+    std::fs::write(p.list_dir.join("iplist.txt"), ids.join("\n")).unwrap();
+    std::fs::write(p.list_dir.join("dohlist.txt"), doh.join("\n")).unwrap();
+    std::fs::write(p.list_dir.join("web.txt"), "www.alpha.com\ncdn.beta.com\n").unwrap();
+    let mut b = Benchmark::with(p.clone(), Arc::new(Mapped(map)), asn());
+    b.keep_last = Some(root.join("persist/benchmark-last"));
+    run(&root, b, &["udp", "doh"]).await;
+    let suspects = std::fs::read_to_string(root.join("state/blacklist-suspects.json")).unwrap_or_default();
+    assert!(!suspects.contains("same-op"), "多家 CDN 的網域連不上不記可疑：{suspects}");
+    let log = std::fs::read_to_string(root.join("persist/benchmark-last/judge.log")).unwrap();
+    assert!(log.contains("多家 CDN") && log.contains("sea01.same-op"), "{log}");
+    let up = read(&p.upstreams_file);
+    assert!(!up["selected"].to_string().contains("same-op"), "今天不用：{up:#}");
 }

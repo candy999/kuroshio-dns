@@ -206,7 +206,8 @@ async fn upstream_kuroshio_takes_all_port_53() {
     assert!(r.plain_v6.is_none() && !r.v6_usable());
     let w = r.warnings("skip-plain");
     assert!(
-        w.iter().any(|s| s.contains("黑潮（3.3.6）") && s.contains("評測不測一般 DNS")),
+        w.iter()
+            .any(|s| s.starts_with("一般 DNS 被路由器") && s.contains("黑潮（3.3.6）") && s.contains("評測不測一般 DNS")),
         "{w:?}"
     );
     assert!(w.iter().any(|s| s.contains("QUIC")), "{w:?}");

@@ -563,7 +563,12 @@ impl Report {
                 "ignore" => "",
                 _ => "評測不測一般 DNS，一般 DNS 只當最後備援",
             };
-            let mut s = format!("一般 DNS{which}被{}接走", self.interceptor_text());
+            // 「一般 DNS 被…」：中文前後的英文留空格；括號說明時接在括號後面
+            let mut s = if which.is_empty() {
+                format!("一般 DNS 被{}接走", self.interceptor_text())
+            } else {
+                format!("一般 DNS{which}被{}接走", self.interceptor_text())
+            };
             if !effect.is_empty() {
                 s.push('：');
                 s.push_str(effect);

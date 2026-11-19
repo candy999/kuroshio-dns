@@ -701,6 +701,8 @@ fn append_blacklist(file: &Path, lines: &[String]) {
 const SUSPECT_DAYS: usize = 3;
 /// 同一個業者群組有幾家互相獨立（不同經營者）的加密 DNS 都「網站無法驗證」時，不記可疑天數
 const INDEPENDENT_OPERATORS: usize = 3;
+/// 規則外但憑證有效的回答來自幾個以上不同業者時，這個網域算「多家 CDN」：連不上不記可疑天數
+const MULTI_CDN_GROUPS: usize = 2;
 /// 「憑證不符」幾天（不同日期）才列入永久黑名單。當天一律淘汰不用；隔天以後再犯才永久排除——
 /// 正常的 DNS 也可能有一天回了舊位址（網站剛搬家、快取還沒過期），那個位址上的憑證就不是這個網站的。
 /// 永久黑名單要手動編輯才能恢復，不能因為一天的一題就定罪；真的在劫持的 DNS 隔天還是會被抓到
@@ -1062,6 +1064,19 @@ impl Benchmark {
                 }
                 out
             };
+            // 多家 CDN 的網域：規則外的回答裡，已經有 2 個以上不同業者的回答憑證有效（真的在服務這個網站），
+            // 這種網域本來就由很多業者提供，「連不上」不能當成竄改的證據 → 今天不用，但不記可疑天數
+            // （padavan-tw 3.3.6：cdn-mum.alibabachengdun.com 有 39 個規則外但憑證有效的回答，dnscry.pt 兩台卻因為 TIMEOUT 被記可疑）
+            let multi_cdn = {
+                let mut seen: Vec<&AsnInfo> = Vec::new();
+                for (k, _) in verdict.iter().filter(|(_, (c, _))| *c == SiteCheck::Valid) {
+                    let info = &infos[*k];
+                    if !seen.iter().any(|g| rules::is_same_group(Some(g), Some(info))) {
+                        seen.push(info);
+                    }
+                }
+                seen.len() >= MULTI_CDN_GROUPS
+            };
             let (mut polluted, mut suspicious, mut rescued) = (0usize, 0usize, 0usize);
             let mut newly_bl: Vec<String> = Vec::new();
             for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {
@@ -1074,47 +1089,60 @@ impl Benchmark {
                             journal,
                             "   [保留] {} -> {}：業者規則沒涵蓋，但 {domain} 的憑證有效（不是劫持）",
                             s.id,
-                            info.raw
+                            info.label()
                         );
                         s.record(dix, *ms, ips);
                     }
                     Some((SiteCheck::Invalid, why)) => {
-                        s.kill(format!("汙染 {domain} (判定為 {}，憑證不符 {why})", info.raw));
+                        s.kill(format!("汙染 {domain} (判定為 {}，憑證不符 {why})", info.label()));
                         polluted += 1;
                         if !s.pinned && strikes.add(&cert_key(&s.id), &today) >= CERT_DAYS {
                             jinfo!(
                                 journal,
                                 "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
                                 s.id,
-                                info.raw
+                                info.label()
                             );
                             if blacklist.insert(s.id.clone()) {
-                                newly_bl.push(format!("{}  # {today} 汙染：{domain} → {}（憑證不符 {why}）", s.id, info.raw));
+                                newly_bl.push(format!("{}  # {today} 汙染：{domain} → {}（憑證不符 {why}）", s.id, info.label()));
                             }
                         } else if !s.pinned {
                             jinfo!(
                                 journal,
                                 "   [今天不用] {} -> 汙染 {}：憑證不符 {why}（再發生一天就列入永久黑名單）",
                                 s.id,
-                                info.raw
+                                info.label()
+                            );
+                        }
+                    }
+                    Some((SiteCheck::Unverified, why)) if multi_cdn && !independent.contains(&k) => {
+                        s.kill(format!(
+                            "可疑 {domain} (判定為 {}，網站無法驗證 {why}；多家 CDN 的網域，不記可疑)",
+                            info.label()
+                        ));
+                        suspicious += 1;
+                        if !s.pinned {
+                            jinfo!(journal,
+                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但這個網域有 {MULTI_CDN_GROUPS} 家以上業者的回答憑證有效（多家 CDN），連不上不當成竄改，不記可疑",
+                                s.id, info.label()
                             );
                         }
                     }
                     Some((SiteCheck::Unverified, why)) if independent.contains(&k) => {
                         s.kill(format!(
                             "可疑 {domain} (判定為 {}，網站無法驗證 {why}；多家獨立 DNS 相同，不記可疑)",
-                            info.raw
+                            info.label()
                         ));
                         suspicious += 1;
                         if !s.pinned {
                             jinfo!(journal,
                                 "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但有 {INDEPENDENT_OPERATORS} 家以上獨立的 DNS 同樣回答，判為網站或路徑問題，不記可疑",
-                                s.id, info.raw
+                                s.id, info.label()
                             );
                         }
                     }
                     Some((SiteCheck::Unverified, why)) => {
-                        s.kill(format!("可疑 {domain} (判定為 {}，網站無法驗證 {why})", info.raw));
+                        s.kill(format!("可疑 {domain} (判定為 {}，網站無法驗證 {why})", info.label()));
                         suspicious += 1;
                         if !s.pinned && strikes.add(&s.id, &today) >= SUSPECT_DAYS && blacklist.insert(s.id.clone()) {
                             jinfo!(
@@ -1124,10 +1152,16 @@ impl Benchmark {
                             );
                             newly_bl.push(format!(
                                 "{}  # {today} 汙染：{domain} → {}（連續 {SUSPECT_DAYS} 天網站無法驗證）",
-                                s.id, info.raw
+                                s.id,
+                                info.label()
                             ));
                         } else if !s.pinned {
-                            jinfo!(journal, "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}）", s.id, info.raw);
+                            jinfo!(
+                                journal,
+                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}）",
+                                s.id,
+                                info.label()
+                            );
                         }
                     }
                 }
@@ -1138,7 +1172,7 @@ impl Benchmark {
             jinfo!(
                 journal,
                 "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、逾時 {errors}",
-                groups.first().map(|g| g.rep.raw.as_str()).unwrap_or("無法判定"),
+                groups.first().map(|g| g.rep.label()).unwrap_or_else(|| "無法判定".into()),
                 ok.len() - polluted - suspicious,
                 blocked.len()
             );
