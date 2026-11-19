@@ -78,6 +78,11 @@ check "UCI 轉換：dnsmasq 上游模式聽 5335" sh -c 'KUROSHIO_UCI_JSON=/tmp/
 check "記憶體保留量（沒有硬體等級）" sh -c '/usr/bin/kuroshio sysinfo --uci | grep -q 記憶體保留量'
 # 3.3.6 路徑檢查：UCI 有三個開關、指令跑得完並輸出 JSON（容器的網路狀況不一定，只檢查格式）
 eq "路徑檢查預設開啟" "$(uci -q get kuroshio.upstream.path_check)" "1"
+# 3.4.0 串接模式：兩個開關預設開；指令跑得完
+eq "串接（下游）預設開啟" "$(uci -q get kuroshio.upstream.chain)" "1"
+eq "提供資料給下游（上游）預設開啟" "$(uci -q get kuroshio.upstream.allow_downstream)" "1"
+check "kuroshio chain status --json" sh -c '/usr/bin/kuroshio chain status --json --uci 2>/dev/null | grep -q "\"state\"" || /usr/bin/kuroshio chain --help >/dev/null'
+eq "預設 UCI 有繞過防護標記" "$(grep -c "option bypass '1'" /usr/share/kuroshio/kuroshio.config)" "1"
 eq "一般 DNS 被接走時預設不測" "$(uci -q get kuroshio.upstream.intercept_policy)" "skip-plain"
 check "kuroshio check-path --json" sh -c '/usr/bin/kuroshio check-path --uci --json | grep -q "\"plain\""'
 check "重新啟動期間的 DNS 備援腳本" test -x /usr/libexec/kuroshio/guard.sh
