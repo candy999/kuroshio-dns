@@ -22,7 +22,7 @@ use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
@@ -155,11 +155,29 @@ enum Stored {
 
 struct Built {
     at: u64,
-    sealed: Vec<u8>,
+    /// 清單裡的物件（依處理順序）
+    list: Vec<Object>,
     objects: HashMap<[u8; 8], Stored>,
     /// 記憶體裡的物件合計
     mem: usize,
+    /// 簽好的清單（簽章的金鑰 ID，內容）：第一次有人問時才簽（背景建置不讀金鑰，沒人問 auth 就不建立金鑰檔）
+    sealed: Option<([u8; 8], Vec<u8>)>,
 }
+
+/// 清單的 CBOR 內容
+fn manifest_body(kid: &[u8], at: u64, list: &[Object]) -> Vec<u8> {
+    to_cbor(&ManifestBody {
+        v: PROTO,
+        t: "manifest".into(),
+        kid: kid.to_vec(),
+        at,
+        app: env!("CARGO_PKG_VERSION").into(),
+        objects: list.to_vec(),
+    })
+}
+
+/// `Sealed` 外層與簽章多出來的大小（CBOR 的 map、兩個鍵、64 bytes 簽章，留一點餘裕）
+const SEAL_OVERHEAD: usize = 128;
 
 #[derive(Default)]
 struct CacheState {
@@ -173,10 +191,21 @@ type SumKey = (String, u64, u64);
 type Sum = ([u8; 32], u64);
 
 /// 上游的共用結果快取
+///
+/// 清單在背景建置（`spawn_blocking`，同一時間最多一個）：壓縮評測結果與 CDN 資料、串流讀副本算
+/// SHA-256（最多 8 MiB）在小機器上可能要好幾秒，不能卡住回答 DNS 查詢的工作執行緒。
+/// 回答查詢時只拿已經建好的那一份（過期了也先用，背景建好再換）。
+///
+/// 記憶體：一份最多 [`CACHE_MAX`]（1 MiB）。建好換上的那一刻舊的才放掉，所以背景建置期間
+/// 短暫會有新舊兩份（最多 2 MiB），換上之後回到一份
 pub struct ShareCache {
     src: Arc<dyn ShareSource>,
     state: Mutex<CacheState>,
     sums: Mutex<Vec<(SumKey, Sum)>>,
+    /// 背景建置中（避免重複）
+    building: AtomicBool,
+    /// 建好幾次（測試用）
+    builds: AtomicU64,
 }
 
 /// zstd 等級 3（跟快照寫入器同一個 crate）
@@ -219,30 +248,91 @@ impl ShareCache {
             src,
             state: Mutex::new(CacheState::default()),
             sums: Mutex::new(Vec::new()),
+            building: AtomicBool::new(false),
+            builds: AtomicU64::new(0),
         }
     }
 
-    /// 簽好的清單（`Sealed`）。10 分鐘內回同一份；None = 現在不提供（記憶體壓力不是 Normal）
-    pub fn manifest(&self, key: &KeyPair, now_ms: u64) -> Option<Vec<u8>> {
+    /// 簽好的清單（`Sealed`），不在呼叫端建置：
+    /// - 有建好的就回那一份（10 分鐘內同一份；過期了也先回舊的，同時觸發背景重建）
+    /// - 還沒建好 → None（回應器回 REFUSED，下游晚點再來），同時觸發背景建置
+    /// - 記憶體壓力不是 Normal → None
+    pub fn manifest(self: &Arc<Self>, key: &KeyPair, now_ms: u64) -> Option<Vec<u8>> {
         if !self.src.pressure_ok() {
             return None;
         }
         let mut st = self.state.lock().unwrap();
-        st.last_used = now_ms;
-        if let Some(b) = &st.built {
-            if now_ms.saturating_sub(b.at) < MANIFEST_TTL_MS {
-                return Some(b.sealed.clone());
+        st.last_used = st.last_used.max(now_ms);
+        // 還沒建、或已經超過 10 分鐘：背景重建（舊的照樣先用）
+        if st.built.as_ref().map_or(true, |b| now_ms.saturating_sub(b.at) >= MANIFEST_TTL_MS) {
+            self.spawn_build(now_ms);
+        }
+        let b = st.built.as_mut()?;
+        match &b.sealed {
+            Some((kid, m)) if *kid == key.kid => Some(m.clone()),
+            // 簽章只要一下子（清單 16 KiB 以內）：在這裡做
+            _ => {
+                let m = proto::seal(key, "manifest", manifest_body(&key.kid, b.at, &b.list));
+                b.sealed = Some((key.kid, m.clone()));
+                Some(m)
             }
         }
-        // 舊的先放掉（新舊兩份不同時在記憶體裡）
-        st.built = None;
-        let b = self.build(key, now_ms);
-        let out = b.sealed.clone();
-        st.built = Some(b);
-        Some(out)
     }
 
-    fn build(&self, key: &KeyPair, now: u64) -> Built {
+    /// 啟動時先在背景建一次（第一個下游來問時大多已經就緒）
+    pub fn warm(self: &Arc<Self>) {
+        if self.src.pressure_ok() {
+            self.spawn_build(now_ms());
+        }
+    }
+
+    /// 已經有建好的清單
+    pub fn ready(&self) -> bool {
+        self.state.lock().unwrap().built.is_some()
+    }
+
+    /// 背景建置中
+    pub fn building(&self) -> bool {
+        self.building.load(Ordering::SeqCst)
+    }
+
+    /// 建置過幾次（測試用）
+    pub fn build_count(&self) -> u64 {
+        self.builds.load(Ordering::SeqCst)
+    }
+
+    /// 背景建置（同一時間最多一個）；在 tokio 裡用 `spawn_blocking`，不在 tokio 裡（測試）用執行緒
+    fn spawn_build(self: &Arc<Self>, now: u64) {
+        if self.building.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        let f = move || {
+            me.rebuild_now(now);
+            me.building.store(false, Ordering::SeqCst);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn_blocking(f);
+            }
+            Err(_) => {
+                std::thread::spawn(f);
+            }
+        }
+    }
+
+    /// 立刻建一份並換上（背景建置用；呼叫端會等到建好，不要在回答查詢的路徑上呼叫）。
+    /// 建置期間舊的那份照常提供，建好才換掉
+    pub fn rebuild_now(&self, now: u64) {
+        let b = self.build(now);
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        let mut st = self.state.lock().unwrap();
+        st.built = Some(b);
+        // 建好但一直沒人問（啟動時先建的）：從現在開始算 30 分鐘
+        st.last_used = st.last_used.max(now);
+    }
+
+    fn build(&self, now: u64) -> Built {
         // 1. 評測結果與 CDN 資料：壓縮後放記憶體
         let mut mem: Vec<(Object, Stored)> = Vec::new();
         if let Some(u) = self.src.upstreams() {
@@ -312,37 +402,31 @@ impl ShareCache {
                 },
             ));
         }
-        // 3. 簽章；超過 16 KiB 就從最後一份副本開始拿掉
+        // 3. 簽好的清單超過 16 KiB 就從最後一份副本開始拿掉（金鑰 ID 長度固定，先用 0 估大小）
         let mut all = mem;
         all.extend(files);
-        let seal = |objs: &[(Object, Stored)]| {
-            let body = ManifestBody {
-                v: PROTO,
-                t: "manifest".into(),
-                kid: key.kid.to_vec(),
-                at: now,
-                app: env!("CARGO_PKG_VERSION").into(),
-                objects: objs.iter().map(|(o, _)| o.clone()).collect(),
-            };
-            proto::seal(key, "manifest", to_cbor(&body))
+        let size_of = |objs: &[(Object, Stored)]| {
+            let list: Vec<Object> = objs.iter().map(|(o, _)| o.clone()).collect();
+            manifest_body(&[0u8; 8], now, &list).len() + SEAL_OVERHEAD
         };
-        let mut sealed = seal(&all);
-        while sealed.len() > MANIFEST_MAX && all.last().is_some_and(|(o, _)| o.k == KIND_FILTER_COPY) {
+        while size_of(&all) > MANIFEST_MAX && all.last().is_some_and(|(o, _)| o.k == KIND_FILTER_COPY) {
             all.pop();
-            sealed = seal(&all);
         }
+        let mut list = Vec::with_capacity(all.len());
         let mut objects = HashMap::new();
         for (o, s) in all {
             if let Ok(id) = <[u8; 8]>::try_from(o.id.as_slice()) {
                 objects.insert(id, s);
             }
+            list.push(o);
         }
         debug!("共用結果：產生清單（{} 個物件，記憶體 {} KB）", objects.len(), mem_bytes / 1024);
         Built {
             at: now,
-            sealed,
+            list,
             objects,
             mem: mem_bytes,
+            sealed: None,
         }
     }
 
@@ -385,7 +469,7 @@ impl ShareCache {
     pub fn chunk(&self, oid: &[u8; 8], idx: u32) -> Option<Vec<u8>> {
         let (file, off, len) = {
             let mut st = self.state.lock().unwrap();
-            st.last_used = now_ms();
+            st.last_used = st.last_used.max(now_ms());
             let s = st.built.as_ref()?.objects.get(oid)?;
             let off = idx as u64 * CHUNK as u64;
             let size = match s {
@@ -416,7 +500,12 @@ impl ShareCache {
 
     /// 目前佔的記憶體（清單＋記憶體裡的物件）
     pub fn bytes(&self) -> usize {
-        self.state.lock().unwrap().built.as_ref().map_or(0, |b| b.mem + b.sealed.len())
+        self.state
+            .lock()
+            .unwrap()
+            .built
+            .as_ref()
+            .map_or(0, |b| b.mem + b.sealed.as_ref().map_or(MANIFEST_MAX, |s| s.1.len()))
     }
 
     pub fn pressure_ok(&self) -> bool {
@@ -1083,10 +1172,22 @@ impl Syncer {
                 if !me.sleep_chained(t.first).await {
                     continue;
                 }
+                // 上游的清單還在背景建置（第一次、或 30 分鐘沒人用釋放過）時會先回 REFUSED：
+                // 隔 `first`（30 秒）再試，連續最多 3 次，之後回到正常的間隔
+                let mut refused = 0u32;
                 while alive(&me) && me.client.is_chained() {
                     let wait = if me.sink().pressure_ok() {
-                        me.sync_once().await;
+                        let rep = me.sync_once().await;
+                        let retry = rep.error.as_deref() == Some("refused") && refused < 3;
+                        refused = if retry { refused + 1 } else { 0 };
                         let j = t.jitter.as_millis() as u64;
+                        if retry {
+                            me.state.lock().unwrap().next_sync_at = Some(now_ms() + t.first.as_millis() as u64);
+                            if !me.sleep_chained(t.first).await {
+                                break;
+                            }
+                            continue;
+                        }
                         let d = t.every.as_millis() as u64 + random_below(2 * j + 1);
                         Duration::from_millis(d.saturating_sub(j).max(1000))
                     } else {
@@ -1390,6 +1491,8 @@ pub fn start(
     if let Some(r) = resolver.chain.get() {
         let cache = Arc::new(ShareCache::new(live.clone()));
         r.set_share(cache.clone());
+        // 先在背景建一次：第一個下游來問時大多已經就緒
+        cache.warm();
         let w: Weak<ShareCache> = Arc::downgrade(&cache);
         tokio::spawn(async move {
             loop {

@@ -35,10 +35,13 @@ struct FakeSource {
     copies: Mutex<Vec<FilterCopy>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
     pressure_bad: AtomicBool,
+    /// 建置時多花的時間（模擬小機器上壓縮、算雜湊很慢）
+    delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ShareSource for FakeSource {
     fn upstreams(&self) -> Option<Vec<u8>> {
+        std::thread::sleep(Duration::from_millis(self.delay_ms.load(Ordering::SeqCst)));
         self.upstreams.lock().unwrap().clone()
     }
     fn cdn(&self) -> Option<kuroshio_cdn::SharedExport> {
@@ -272,7 +275,10 @@ async fn upstream(allow: bool, src: Arc<FakeSource>, share: bool) -> (Arc<Up>, S
     let key = Arc::new(NodeKey::new(dir.0.join("keys")));
     let resp = Responder::new(&settings(true, allow), key.clone());
     if share {
-        resp.set_share(Arc::new(ShareCache::new(src.clone())));
+        let cache = Arc::new(ShareCache::new(src.clone()));
+        // 正式環境在啟動時背景先建；測試直接建好，下游第一次來就拿得到
+        cache.rebuild_now(now_ms());
+        resp.set_share(cache);
     }
     let up = Arc::new(Up {
         resp,
@@ -687,7 +693,7 @@ async fn stale_object_gives_nxdomain_then_recovers() {
         .unwrap();
     // 上游的評測換了，清單重新產生（超過 10 分鐘）
     *up.src.upstreams.lock().unwrap() = Some(upstreams_json("new"));
-    up.resp.share().unwrap().manifest(&up.keypair(), now_ms() + 11 * 60_000).unwrap();
+    up.resp.share().unwrap().rebuild_now(now_ms());
     assert_eq!(ask_tcp(addr, &proto::chunk_name(&old_oid, 0)).await.rcode, 3, "舊的物件 → NXDOMAIN");
     let rep = s.sync_once().await;
     assert_eq!(rep.error, None);
@@ -790,8 +796,18 @@ async fn jobs_skipped_only_when_fresh_and_chained() {
     assert!(JOBS.iter().all(|j| !na.skip_job(j)));
 }
 
-#[test]
-fn share_cache_bounded_and_released() {
+async fn wait_ready(c: &ShareCache) {
+    for _ in 0..500 {
+        if c.ready() && !c.building() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("背景建置沒有完成");
+}
+
+#[tokio::test]
+async fn share_cache_bounded_and_released() {
     let src = Arc::new(FakeSource::default());
     let rnd = |n: usize| -> Vec<u8> { (0..n / 32).flat_map(|_| random_bytes::<32>()).collect() };
     *src.upstreams.lock().unwrap() = Some(rnd(1 << 20));
@@ -800,40 +816,102 @@ fn share_cache_bounded_and_released() {
         v6: Some(rnd(1 << 20)),
         ranges: BTreeMap::new(),
     });
-    let c = ShareCache::new(src.clone());
+    let c = Arc::new(ShareCache::new(src.clone()));
     let key = KeyPair::generate();
     let now = now_ms();
+    assert!(c.manifest(&key, now).is_none(), "還沒建好：回 None，背景建置");
+    wait_ready(&c).await;
     let m = c.manifest(&key, now).unwrap();
     assert!(c.bytes() > 0);
     assert!(c.bytes() <= CACHE_MAX, "{} > 1 MiB", c.bytes());
     let mb: ManifestBody = from_cbor(&proto::open(&m, "manifest", &key.public).unwrap()).unwrap();
     assert_eq!(mb.objects.len(), 0, "每一種都超過 1 MiB：全部不列");
-    // 小一點的：v6 先被放棄
+    // 小一點的：v6 先被放棄。過了 10 分鐘：先回舊的，背景建好再換
     *src.upstreams.lock().unwrap() = Some(rnd(300 << 10));
     *src.cdn.lock().unwrap() = Some(kuroshio_cdn::SharedExport {
         pools: Some(rnd(400 << 10)),
         v6: Some(rnd(400 << 10)),
         ranges: BTreeMap::new(),
     });
+    assert_eq!(c.manifest(&key, now + 11 * 60_000).unwrap(), m, "過期了也先回舊的");
+    wait_ready(&c).await;
+    assert_eq!(c.build_count(), 2);
     let m = c.manifest(&key, now + 11 * 60_000).unwrap();
     let mb: ManifestBody = from_cbor(&proto::open(&m, "manifest", &key.public).unwrap()).unwrap();
     let kinds: Vec<&str> = mb.objects.iter().map(|o| o.k.as_str()).collect();
     assert_eq!(kinds, vec!["upstreams", "cdn-pools"]);
     assert!(c.bytes() <= CACHE_MAX);
-    // 10 分鐘內回同一份
+    // 10 分鐘內回同一份、不再建置
     assert_eq!(c.manifest(&key, now + 12 * 60_000).unwrap(), m);
+    assert!(!c.building());
+    assert_eq!(c.build_count(), 2);
     let oid: [u8; 8] = mb.objects[0].id.as_slice().try_into().unwrap();
     assert!(c.chunk(&oid, 0).is_some());
     // 記憶體壓力：不提供
     src.pressure_bad.store(true, Ordering::SeqCst);
     assert!(c.manifest(&key, now + 12 * 60_000).is_none());
     src.pressure_bad.store(false, Ordering::SeqCst);
-    // 30 分鐘沒人用：釋放
-    c.sweep(now_ms() + 29 * 60_000);
+    // 30 分鐘沒人用：釋放（最後一次用是 now + 12 分鐘）
+    c.sweep(now + 41 * 60_000);
     assert!(c.bytes() > 0);
-    c.sweep(now_ms() + 31 * 60_000);
+    c.sweep(now + 43 * 60_000);
     assert_eq!(c.bytes(), 0);
     assert!(c.chunk(&oid, 0).is_none());
+}
+
+/// 建置很慢（小機器）：第一次問清單立刻回 None、不等建置；同時很多次只建一次；建好之後回新的
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_never_blocks_and_builds_once() {
+    let src = src_basic();
+    src.delay_ms.store(400, Ordering::SeqCst);
+    let c = Arc::new(ShareCache::new(src.clone()));
+    let key = Arc::new(KeyPair::generate());
+    let t0 = std::time::Instant::now();
+    let mut hs = Vec::new();
+    for _ in 0..16 {
+        let (c, key) = (c.clone(), key.clone());
+        hs.push(tokio::spawn(async move { c.manifest(&key, now_ms()) }));
+    }
+    for h in hs {
+        assert!(h.await.unwrap().is_none(), "還沒建好：立即回 None");
+    }
+    assert!(t0.elapsed() < Duration::from_millis(300), "不等建置：{:?}", t0.elapsed());
+    assert!(c.building());
+    wait_ready(&c).await;
+    assert_eq!(c.build_count(), 1, "同時很多次只建一次");
+    let m = c.manifest(&key, now_ms()).unwrap();
+    let mb: ManifestBody = from_cbor(&proto::open(&m, "manifest", &key.public).unwrap()).unwrap();
+    assert_eq!(mb.objects.len(), 3);
+    // 簽章用問的那把金鑰（同一份內容換金鑰就重簽）
+    let other = KeyPair::generate();
+    let m2 = c.manifest(&other, now_ms()).unwrap();
+    assert!(proto::open(&m2, "manifest", &other.public).is_ok());
+    assert_eq!(c.build_count(), 1);
+    // 啟動時先建：之後第一次問就拿得到
+    let c2 = Arc::new(ShareCache::new(src));
+    c2.warm();
+    wait_ready(&c2).await;
+    assert!(c2.manifest(&key, now_ms()).is_some());
+    assert_eq!(c2.build_count(), 1);
+}
+
+/// 上游的清單還沒建好時回 REFUSED（不卡住回答查詢），建好之後下游同步成功
+#[tokio::test]
+async fn responder_refuses_until_built() {
+    let src = src_basic();
+    let dir = tmpdir("not-ready");
+    let resp = Responder::new(&settings(true, true), Arc::new(NodeKey::new(dir.0.join("keys"))));
+    resp.set_share(Arc::new(ShareCache::new(src)));
+    let q = Message::parse(&kuroshio_net::path::build_chaos_txt(1, proto::MANIFEST_NAME)).unwrap();
+    let ctx = Ctx {
+        proto: "tcp",
+        client: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    assert_eq!(resp.answer(&q, proto::MANIFEST_NAME, &ctx).rcode, 5);
+    wait_ready(resp.share().unwrap()).await;
+    let r = resp.answer(&q, proto::MANIFEST_NAME, &ctx);
+    assert_eq!(r.rcode, 0);
+    assert_eq!(resp.serving_json()["share"]["requests"], 1);
 }
 
 #[tokio::test]
@@ -964,7 +1042,9 @@ async fn filter_copy_end_to_end_with_live() {
     assert_eq!(downloads.load(Ordering::SeqCst), 1);
     assert_eq!(fu.shared_copies().len(), 1);
     let (_up, addr) = upstream(true, Arc::new(FakeSource::default()), false).await;
-    _up.resp.set_share(Arc::new(ShareCache::new(live(&ud.0, fu.clone()))));
+    let cache = Arc::new(ShareCache::new(live(&ud.0, fu.clone())));
+    cache.rebuild_now(now_ms());
+    _up.resp.set_share(cache);
     // 下游：沒有任何副本
     let dd = tmpdir("fc-down");
     let fd = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
@@ -1071,6 +1151,8 @@ async fn app_upstream_serves_benchmark_and_status() {
     let s = kuroshio::app::start(&cfg).await.unwrap();
     let r = s.resolver.chain.get().unwrap().clone();
     assert_eq!(r.caps(), vec!["share", "reg"], "CDN、過濾都啟動之後就緒（WP6 的登記一直都有）");
+    // 啟動時已經在背景建置
+    wait_ready(r.share().unwrap()).await;
     let d = down(true, s.bound[0]).await;
     assert_eq!(d.client.state(), (State::Chained, None));
     let sink = FakeSink::new();
