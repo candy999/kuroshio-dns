@@ -296,6 +296,33 @@ enum Cmd {
         #[command(subcommand)]
         event: NotifyEvent,
     },
+    /// 串接模式（3.4.0）：執行中服務的串接狀態、立刻重新偵測上游黑潮（經管理 API）。
+    /// 結束碼 0 = 成功，1 = 服務沒有回應，2 = 設定讀不到
+    Chain {
+        #[command(subcommand)]
+        action: ChainAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChainAction {
+    /// 串接狀態（同 /api/chain）
+    Status {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 輸出 JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// 立刻做一次路徑檢查與串接探測（背景進行；用 `kuroshio chain status` 看結果）
+    Recheck {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1184,6 +1211,7 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
         } => std::process::exit(health_cmd(&config, uci, timeout, json).await),
         Cmd::Status { config, uci, json } => std::process::exit(status_cmd(&config, uci, json).await),
         Cmd::Notify { event } => std::process::exit(notify_cmd(event).await),
+        Cmd::Chain { action } => std::process::exit(chain_cmd(action).await),
         Cmd::ServiceRun { .. } => unreachable!(),
         Cmd::Service { action, config } => winsvc::control(&action, &config)?,
         Cmd::Acme { action, force, config } => {
@@ -1697,17 +1725,68 @@ async fn check_path_cmd(config: &std::path::Path, uci: bool, as_json: bool) -> R
     );
     path::set_v6_mode(path::V6Mode::from_value(kuroshio_config::get(&cfg, "upstream.ipv6")));
     let policy = kuroshio::pathcheck::policy_of(&cfg);
-    let r = path::check(&path::Targets::default()).await;
+    let r = path::check(&kuroshio::pathcheck::targets()).await;
+    let chain = check_path_chain(&cfg, &r).await;
     if as_json {
         let mut j = r.to_json();
         j["policy"] = serde_json::json!(policy);
         j["summary"] = serde_json::json!(path::summary(&r));
         j["warnings"] = serde_json::json!(r.warnings(policy));
+        if let Some(i) = j.get_mut("interceptor").filter(|i| i.is_object()) {
+            i["chain"] = chain.as_ref().map(|c| c.1.clone()).unwrap_or(serde_json::Value::Null);
+        }
         println!("{}", serde_json::to_string_pretty(&j)?);
         return Ok(());
     }
-    println!("{}", check_path_text(&r, policy));
+    let mut text = check_path_text(&r, policy);
+    if let Some((line, _)) = chain {
+        // 「攔截者」那一行之後
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("  攔截者"))
+            .map(|i| i + 1)
+            .unwrap_or(lines.len());
+        lines.insert(at, format!("  串接：{line}"));
+        text = lines.join("\n");
+    }
+    println!("{text}");
     Ok(())
+}
+
+/// check-path 的串接那一行（規格 1.10）：攔截者是黑潮時才有；自己的 chain 關著不探測
+async fn check_path_chain(cfg: &serde_json::Value, r: &kuroshio_net::path::Report) -> Option<(String, serde_json::Value)> {
+    use kuroshio::chain::client;
+    let kuroshio_net::path::Interceptor::Kuroshio(ver) = r.interceptor.as_ref()? else {
+        return None;
+    };
+    if !r.plain_v4.intercepted() {
+        return None;
+    }
+    let settings = kuroshio_config::chain::ChainSettings::from_cfg(cfg);
+    if !settings.downstream_enabled() {
+        return Some(("這台的 chain 關閉：不辨識上游黑潮".into(), serde_json::Value::Null));
+    }
+    if !kuroshio_community::chain::version_ok(ver) {
+        return Some((format!("上游黑潮 {ver} 不支援串接（需要 3.4.0 以上）"), serde_json::Value::Null));
+    }
+    let hit = r.hit.filter(|a| a.is_ipv4())?;
+    let p = client::probe(hit, r.hit_tcp, client::Timing::default().ask).await;
+    let line = match (&p.error, p.allow) {
+        (None, true) => format!("上游允許串接，提供資料給下游（節點指紋 {}）", p.fingerprint().unwrap_or_default()),
+        (None, false) => "上游不提供資料（上游的 allow_downstream 關閉）：這台會自己做評測，重複使用網路".into(),
+        (Some(e), _) if p.supported => format!("上游的身分驗證失敗：{e}"),
+        (Some(_), _) => "上游沒有回應串接查詢".into(),
+    };
+    let j = serde_json::json!({
+        "supported": p.supported,
+        "allowDownstream": p.error.is_none() && p.allow,
+        "nodeId": p.kid.map(|k| kuroshio_community::util::hex(&k)),
+        "fingerprint": p.fingerprint(),
+        "caps": p.caps,
+        "error": p.error,
+    });
+    Some((line, j))
 }
 
 fn check_path_text(r: &kuroshio_net::path::Report, policy: &str) -> String {
@@ -2103,6 +2182,74 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
             fail_code
         }
     }
+}
+
+/// `kuroshio chain status|recheck`：結束碼 0 = 成功，1 = 服務沒有回應，2 = 設定讀不到
+async fn chain_cmd(action: ChainAction) -> i32 {
+    let (config, uci, method, path, json) = match action {
+        ChainAction::Status { config, uci, json } => (config, uci, "GET", "/api/chain", json),
+        ChainAction::Recheck { config, uci } => (config, uci, "POST", "/api/chain/recheck", false),
+    };
+    let cfg = match config_for_cli(&config, uci) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("設定讀不到：{e}");
+            return 2;
+        }
+    };
+    let Some(ep) = admin_endpoint(&cfg) else {
+        eprintln!("管理 API 沒有開啟（admin.enabled = false），無法查詢串接狀態");
+        return 1;
+    };
+    let body = (method == "POST").then_some(&b"{}"[..]);
+    match admin_call(&ep, method, path, body, std::time::Duration::from_secs(10)).await {
+        Err(e) => {
+            eprintln!("服務沒有回應（{}）：{e:#}", ep.0);
+            1
+        }
+        Ok((200, body)) => {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else if path == "/api/chain/recheck" {
+                println!("已開始重新偵測上游黑潮（背景進行）；稍後用 kuroshio chain status 看結果");
+            } else {
+                println!("{}", chain_status_text(&v));
+            }
+            0
+        }
+        Ok((code, body)) => {
+            eprintln!("服務拒絕：{}", api_error(code, &body));
+            1
+        }
+    }
+}
+
+fn chain_status_text(v: &serde_json::Value) -> String {
+    let s = |x: &serde_json::Value| x.as_str().unwrap_or("").to_string();
+    let mut out = vec![format!("串接：{}", s(&v["text"]))];
+    out.push(format!(
+        "  狀態：{}{}",
+        s(&v["state"]),
+        v["reason"].as_str().map(|r| format!("（{r}）")).unwrap_or_default()
+    ));
+    let u = &v["upstream"];
+    if u.is_object() {
+        if let Some(a) = u["address"].as_str() {
+            out.push(format!(
+                "  上游：{a}（{}{}）",
+                s(&u["proto"]),
+                u["via"].as_str().map(|x| format!("，{x}")).unwrap_or_default()
+            ));
+        }
+        if let Some(f) = u["fingerprint"].as_str() {
+            out.push(format!("  節點指紋：{f}"));
+        }
+        if let Some(p) = u["previousFingerprint"].as_str() {
+            out.push(format!("  之前的指紋：{p}"));
+        }
+    }
+    out.join("\n")
 }
 
 /// 執行中可以收的訊號（只有 Unix；Windows 沒有）

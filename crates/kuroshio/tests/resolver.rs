@@ -562,3 +562,27 @@ async fn answers_version_kuroshio_to_lan_plain_dns_only() {
         .iter()
         .all(|a| a.class != 3 || !matches!(&a.data, RData::Raw(b) if b.starts_with(b"\x0ekuroshio/"))));
 }
+
+fn chain_answer(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (0, vec![a(name, 300, [198, 51, 100, 10])], 0)
+}
+
+/// 3.4.0 串接：一般 DNS 被接走時，經由攔截者的答案會被排到後面；串接上游（就是那台上游黑潮）不算，
+/// 它的答案不能被排除（固定上游是一般 DNS，路上有攔截者，它的答案才是被排到後面的那一個）
+#[tokio::test]
+async fn chain_upstream_answers_are_not_demoted() {
+    let (pinned, _) = upstream(0, answer).await;
+    let (chain, n_chain) = upstream(40, chain_answer).await;
+    let c = cfg(&[pinned], json!({ "resolver": { "fastPath": false } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let spec = format!("udp://{chain}");
+    r.upstreams.set_chain(Some(kuroshio::upstream::Upstream::parse(&spec).unwrap()));
+    let mut rep = kuroshio_net::path::Report::default();
+    rep.plain_v4.udp = true;
+    kuroshio_net::path::apply(&rep, false);
+    let m = Message::parse(&r.handle(&q(1, "chain-decide.test", 1), &CTX).await.unwrap()).unwrap();
+    kuroshio_net::path::clear();
+    assert_eq!(n_chain.load(Ordering::SeqCst), 1);
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 10)), "{:?}", m.answers);
+    assert_eq!(r.upstreams.list_json()[0]["role"], "chain");
+}

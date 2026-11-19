@@ -132,7 +132,8 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         | "/api/cdn/verify"
         | "/api/cdn/policy"
         | "/api/cdn/ecs"
-        | "/api/notify/wan-changed" => true,
+        | "/api/notify/wan-changed"
+        | "/api/chain/recheck" => true,
         p => match p.strip_prefix("/api/community/") {
             Some("status" | "peers" | "events" | "scores" | "invite") => false,
             // 不帶 channel 是查詢，帶了是指定管道
@@ -616,8 +617,16 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             let synced = crate::clock::synced();
             let access = r.access.get().map(|a| a.status_json()).unwrap_or(Value::Null);
             let mut warnings = crate::integration::warnings(&data, synced, crate::app::pressure(), &filter, &access);
-            // 路徑檢查（3.3.6）：一般 DNS 被接走、協定被擋之類的狀況
+            // 路徑檢查（3.3.6）：一般 DNS 被接走、協定被擋之類的狀況（串接中不列「被接走」那一條）
             warnings.extend(crate::pathcheck::warnings());
+            // 串接（3.4.0）：上游節點的金鑰換過（24 小時內）
+            if let Some(w) = crate::chain::current().and_then(|c| c.key_change_warning(crate::backup::now_ms())) {
+                warnings.push(w);
+            }
+            let mut path = crate::pathcheck::status_json();
+            if let Some(i) = path.get_mut("interceptor").filter(|i| i.is_object()) {
+                i["chain"] = crate::chain::client::interceptor_api_json();
+            }
             ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
@@ -637,7 +646,9 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "ownIp": null,
                 "upstreams": r.upstreams.list_json(),
                 // 路徑檢查：IPv6、一般 DNS 有沒有被接走（被誰）、「不存在」被改寫、被擋的協定、TLS 攔截
-                "network": { "path": crate::pathcheck::status_json() },
+                "network": { "path": path },
+                // 串接模式（3.4.0，規格 1.10）：下游與上游兩種角色
+                "chain": crate::chain::client::api_json(),
                 "autoUpstreams": r.upstreams.auto_info(),
                 "filter": filter,
                 "cdn": r.cdn().map(|c| c.status_lite()),
@@ -666,6 +677,17 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             },
         },
         "/api/upstreams" => ok(r.upstreams.list_json()),
+        // 串接模式（3.4.0）：同 /api/status 的 chain；recheck = 立刻做一次路徑檢查與探測（背景進行）
+        "/api/chain" => ok(crate::chain::client::api_json()),
+        "/api/chain/recheck" => {
+            if !crate::pathcheck::enabled() {
+                return bad("路徑檢查關閉（upstream.pathCheck）：串接沒有偵測來源", 400);
+            }
+            tokio::spawn(async {
+                crate::pathcheck::run_once().await;
+            });
+            ok(json!({ "ok": true, "started": true }))
+        }
         "/api/benchmark" => ok(std::fs::read(r.upstreams.state_file())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -726,8 +748,18 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 None => "disabled",
             };
             crate::app::spawn_wan_subnet(r.clone(), 0);
+            // 串接（3.4.0）：立刻拿掉串接上游，接著的路徑檢查重新偵測、自動接回
+            let chain = match crate::chain::current() {
+                Some(c) if c.state().0 != crate::chain::client::State::None => {
+                    c.on_wan_changed();
+                    "released"
+                }
+                _ => "none",
+            };
             crate::pathcheck::trigger();
-            ok(json!({ "ok": true, "ddns": ddns, "ecs": "started", "pathCheck": "started", "clockSynced": crate::clock::synced() }))
+            ok(
+                json!({ "ok": true, "ddns": ddns, "ecs": "started", "pathCheck": "started", "clockSynced": crate::clock::synced(), "chain": chain }),
+            )
         }
         // 立即更新過濾清單（API 2：背景執行）：立刻回 `{started, running, runId, startedAt}`，
         // 進度與結果看 `/api/status` 的 `filter.update`。正在跑時再呼叫一次，回 `started: false` 與同一個 runId。
@@ -1029,6 +1061,7 @@ mod tests {
             "/api/cdn/policy",
             "/api/cdn/ecs",
             "/api/notify/wan-changed",
+            "/api/chain/recheck",
             "/api/community/add",
             "/api/community/accept",
             "/api/community/delete",
@@ -1043,6 +1076,7 @@ mod tests {
         }
         for p in [
             "/api/status",
+            "/api/chain",
             "/api/trace",
             "/api/filter/check",
             "/api/cdn/domains",

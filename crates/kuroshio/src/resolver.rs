@@ -692,12 +692,12 @@ impl Resolver {
                         note = Some(n);
                     }
                 }
-                // 「如果用一般 DNS 會怎樣」：固定上游以外的上游給的 A 記錄
+                // 「如果用一般 DNS 會怎樣」：固定上游以外的上游給的 A 記錄（串接上游也不採計：它是另一台黑潮挑過的答案）
                 let baseline = match (&cdn, qtype == rtype::A) {
                     (Some(c), true) => {
                         let others: Vec<&Message> = results
                             .iter()
-                            .filter(|r| r.class == Class::Ok && r.up.role != Role::Pinned)
+                            .filter(|r| r.class == Class::Ok && !matches!(r.up.role, Role::Pinned | Role::Chain))
                             .map(|r| &r.msg)
                             .collect();
                         c.baseline(&others)

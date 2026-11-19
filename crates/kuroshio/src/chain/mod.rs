@@ -15,3 +15,18 @@ pub mod grants;
 pub mod ident;
 pub mod responder;
 pub mod share;
+
+use std::sync::{Arc, Mutex};
+
+/// 行程層級的下游狀態（跨重新載入；做法同 `app.rs` 的 `CACHE_HANDOFF`）。不存檔、不跨重開機
+static CURRENT: Mutex<Option<Arc<client::Client>>> = Mutex::new(None);
+
+/// 目前的下游狀態機（服務還沒啟動過是 None）
+pub fn current() -> Option<Arc<client::Client>> {
+    CURRENT.lock().unwrap().clone()
+}
+
+/// 放進行程層級的持有者（第一次啟動時；之後的重新載入用 [`current`] 接回）
+pub fn install(c: Arc<client::Client>) {
+    *CURRENT.lock().unwrap() = Some(c);
+}

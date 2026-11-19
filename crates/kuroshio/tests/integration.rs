@@ -463,3 +463,143 @@ fn uci_reload_failure_keeps_running_and_config_hook_fires() {
     assert!(st.success(), "{st:?}\n{}", log.lock().unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 假的上游黑潮 3.4.0（UDP 與 TCP）：`version.kuroshio`、auth 挑戰；`.invalid` 回不存在、其他回固定位址
+async fn fake_upstream_kuroshio(allow: bool) -> (std::net::SocketAddr, String) {
+    use kuroshio_community::chain as proto;
+    use kuroshio_proto::message::{Message, RData, Record};
+    use std::sync::Arc;
+    let key = Arc::new(kuroshio_community::identity::KeyPair::generate());
+    let fp = key.fingerprint();
+    let answer = move |q: &[u8]| -> Option<Vec<u8>> {
+        let m = Message::parse(q).ok()?;
+        let qs = m.questions.first()?.clone();
+        let mut r = Message::response_to(&m, 0);
+        let txt = |payload: &[u8]| Record {
+            name: qs.name.clone(),
+            rtype: 16,
+            class: 3,
+            ttl: 0,
+            data: RData::Raw(proto::txt_rdata(payload)),
+        };
+        match (qs.qclass, proto::parse_name(&qs.name)) {
+            (3, Some(proto::Name::Auth(nonce))) => {
+                let body = proto::AuthBody {
+                    v: proto::PROTO,
+                    t: "auth".into(),
+                    nonce: nonce.to_vec(),
+                    kid: key.kid.to_vec(),
+                    public: key.public.to_vec(),
+                    app: "3.4.0".into(),
+                    allow,
+                    caps: if allow { vec!["share".into()] } else { vec![] },
+                    peer: "127.0.0.1".into(),
+                    tok: vec![0; 16],
+                    path: vec![key.kid.to_vec()],
+                    ..Default::default()
+                };
+                r.answers
+                    .push(txt(&proto::seal(&key, "auth", kuroshio_community::envelope::to_cbor(&body))));
+            }
+            (3, _) if qs.name == "version.kuroshio" => r.answers.push(txt(b"kuroshio/3.4.0")),
+            (3, _) => r.rcode = 5,
+            _ if qs.name.ends_with(".invalid") => r.rcode = 3,
+            _ => r.answers.push(Record::a(&qs.name, 60, "198.51.100.10".parse().unwrap())),
+        }
+        Some(r.encode())
+    };
+    let answer = Arc::new(answer);
+    // UDP 與 TCP 要同一個埠：TCP 那個埠剛好被占用就換一個
+    let (u, l) = loop {
+        let u = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(l) = tokio::net::TcpListener::bind(u.local_addr().unwrap()).await {
+            break (u, l);
+        }
+    };
+    let addr = u.local_addr().unwrap();
+    {
+        let answer = answer.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, from)) = u.recv_from(&mut buf).await else { break };
+                if let Some(r) = answer(&buf[..n]) {
+                    let _ = u.send_to(&r, from).await;
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut s, _)) = l.accept().await else { break };
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let Ok(len) = s.read_u16().await else { return };
+                let mut q = vec![0u8; len as usize];
+                if s.read_exact(&mut q).await.is_err() {
+                    return;
+                }
+                if let Some(r) = answer(&q) {
+                    let mut out = (r.len() as u16).to_be_bytes().to_vec();
+                    out.extend_from_slice(&r);
+                    let _ = s.write_all(&out).await;
+                }
+            });
+        }
+    });
+    (addr, fp)
+}
+
+/// 3.4.0：`kuroshio check-path` 在攔截者是黑潮 ≥ 3.4.0、而且自己的 chain 開著時多做一次探測
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_path_shows_chain_line() {
+    let dir = tmp("check-path-chain");
+    let (up, fp) = fake_upstream_kuroshio(true).await;
+    let (closed_up, _) = fake_upstream_kuroshio(false).await;
+    let targets = |a: std::net::SocketAddr| {
+        json!({ "testnetV4": [a.to_string()], "testnetV6": [], "gateway": null, "encrypted": false, "plainTimeoutMs": 500 }).to_string()
+    };
+    let check = |cfg: PathBuf, target: String, json_out: bool| {
+        tokio::task::spawn_blocking(move || {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_kuroshio"));
+            c.args(["check-path", "-c"])
+                .arg(&cfg)
+                .env("KUROSHIO_PATH_TARGETS", target)
+                .env("NO_COLOR", "1");
+            if json_out {
+                c.arg("--json");
+            }
+            let out = c.output().unwrap();
+            (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).to_string())
+        })
+    };
+    let on = dir.join("on.json");
+    write_cfg(&on, &json!({ "upstream": { "pinned": [] } }));
+    let (code, text) = check(on.clone(), targets(up), false).await.unwrap();
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("黑潮（3.4.0）"), "{text}");
+    assert!(text.contains("串接：上游允許串接"), "{text}");
+    assert!(text.contains(&fp), "{text}");
+
+    let (_, out) = check(on.clone(), targets(up), true).await.unwrap();
+    let j: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}：{out}"));
+    assert_eq!(j["interceptor"]["kind"], "kuroshio");
+    assert_eq!(j["interceptor"]["chain"]["allowDownstream"], true, "{j}");
+    assert_eq!(j["interceptor"]["chain"]["fingerprint"], fp);
+    assert!(j.get("hit").is_none(), "Report::to_json 的格式不變");
+
+    // 上游的 allow_downstream 關閉
+    let (_, text) = check(on.clone(), targets(closed_up), false).await.unwrap();
+    assert!(text.contains("上游不提供資料"), "{text}");
+
+    // 自己的 chain 關閉：不探測
+    let off = dir.join("off.json");
+    write_cfg(&off, &json!({ "upstream": { "pinned": [], "chain": false } }));
+    let (_, text) = check(off.clone(), targets(up), false).await.unwrap();
+    assert!(text.contains("這台的 chain 關閉：不辨識上游黑潮"), "{text}");
+    let (_, out) = check(off, targets(up), true).await.unwrap();
+    let j: Value = serde_json::from_str(&out).unwrap();
+    assert!(j["interceptor"]["chain"].is_null());
+    let _ = std::fs::remove_dir_all(&dir);
+}

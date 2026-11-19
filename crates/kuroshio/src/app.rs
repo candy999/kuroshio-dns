@@ -963,6 +963,22 @@ pub fn community_section(cfg: &Value, base: &std::path::Path) -> Option<Value> {
     Some(c)
 }
 
+/// 串接模式的下游狀態機（規格 10 的 1.4～1.8）：不存檔，綁定跨重新載入（行程層級）、不跨重開機
+fn start_chain(cfg: &Value, base_dir: &std::path::Path, resolver: &Arc<Resolver>) {
+    use crate::chain::{client, ident};
+    let settings = kuroshio_config::chain::ChainSettings::from_cfg(cfg);
+    let c = crate::chain::current().unwrap_or_else(|| {
+        let key = Arc::new(ident::NodeKey::new(ident::key_dir(cfg, base_dir)));
+        let c = client::Client::new(settings.clone(), key, client::Timing::from_env());
+        crate::chain::install(c.clone());
+        c
+    });
+    c.set_gateway_override(crate::pathcheck::gateway_override());
+    // 上游回應器（WP3）建立後改成 resolver.chain.get()
+    c.attach(settings, &resolver.upstreams, None);
+    c.spawn();
+}
+
 /// 社群共享 v2（規格 03）：金鑰在 community.dir，狀態經快照寫入器存在 state/community/
 fn start_community(
     cfg: &Value,
@@ -1798,6 +1814,8 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     if cdn.is_none() {
         spawn_wan_subnet(resolver.clone(), 5);
     }
+    // 串接模式（3.4.0）：行程層級的下游狀態機，新的一輪接上新的 Manager（原本串接中就立刻接回）
+    start_chain(cfg, &base_dir, &resolver);
     // 路徑檢查：啟動後、每 6 小時、WAN 變動時
     crate::pathcheck::spawn();
     let mut snap_sources: Vec<SnapSource> = Vec::new();
