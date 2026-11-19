@@ -213,6 +213,8 @@
               { "value": "warn", "label": "只提醒，照常測" },
               { "value": "ignore", "label": "不理會" }
             ] },
+            { "key": "upstream.chain", "type": "bool", "label": "串接上游的黑潮", "help": "辨識上游的黑潮並自動串接：直接用它的評測結果、CDN 節點池與清單副本。關閉時把上游黑潮當成一般的 DNS 攔截（跟 3.3.7 的「一般 DNS 被接走的網路」一樣），這台會自己重做評測、CDN 掃描、下載清單，重複使用網路。路徑檢查關閉時也不會串接。", "pro": true },
+            { "key": "upstream.allowDownstream", "type": "bool", "label": "提供資料給下游的黑潮", "help": "提供資料給接在後面的黑潮（串接、評測結果、CDN 節點池、清單副本，並放行它解析自己的上游）。關閉時仍然回答「我是黑潮」，但下游會自己重做評測、CDN 掃描、下載清單，重複浪費網路資源（含這台的頻寬）。開著時區網裡任何會講這個協定的裝置都拿得到；有啟用「繞過防護」清單、要管住區網裝置的環境請關閉。", "pro": true },
             { "key": "upstream.ipv6", "type": "select", "label": "用 IPv6 連上游", "fallbackDefault": "auto", "help": "自動：依這台的 IPv6 路由判斷，連線遇到「沒有路由」會暫停 IPv6 10 分鐘。", "pro": true, "options": [
               { "value": "auto", "label": "自動" },
               { "value": "1", "label": "使用" },
@@ -240,7 +242,12 @@
             { "key": "resolver.sendEcs", "type": "bool", "label": "對上游附帶 ECS（本機對外 IP 的 /24）" },
             { "key": "resolver.stripEch", "type": "bool", "label": "移除 HTTPS 記錄的 ECH", "help": "某些網路環境下 ECH 會讓網站連不上時再打開。" },
             { "key": "resolver.dnssec", "type": "bool", "label": "本機 DNSSEC 驗證" },
-            { "key": "resolver.cookies", "type": "bool", "label": "DNS Cookies" }
+            { "key": "resolver.cookies", "type": "bool", "label": "DNS Cookies" },
+            { "key": "resolver.backfill", "type": "select", "label": "背景補問", "fallbackDefault": "cdn", "help": "只同時問最快幾台上游時（同時問幾個上游有限制），CDN 相關的查詢與抽樣的查詢在回答之後，於背景再問這次沒問到的上游，合併節點與比對汙染。不增加回答的等待。", "options": [
+              { "value": "cdn", "label": "CDN 相關與抽樣（建議）" },
+              { "value": "off", "label": "不補問（3.3.7 的行為）" }
+            ] },
+            { "key": "resolver.backfillSample", "type": "int", "label": "非 CDN 查詢每幾次抽一次補問", "help": "0 = 不抽樣（CDN 相關的照樣補問）。", "min": 0 }
           ]
         },
         {
@@ -288,8 +295,9 @@
                 { "value": "", "label": "自動（惡意 / 詐騙保護）" },
                 { "value": true, "label": "保護" },
                 { "value": false, "label": "不保護" }
-              ] }
-            ] }
+              ] },
+              { "key": "bypass", "type": "bool", "label": "繞過防護", "default": false, "pro": true, "help": "這份是繞過防護類的清單。上游的 allow_downstream 開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。" }
+            ], "help": "「繞過防護」欄（專業模式）：這份是繞過防護類的清單（擋加密 DNS／VPN／代理）。「提供資料給下游的黑潮」（allow_downstream）開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。" }
           ]
         },
         {
@@ -576,6 +584,11 @@
             { "key": "benchmark.timeoutMs", "type": "int", "label": "逾時（毫秒）", "min": 1 },
             { "key": "benchmark.maxTimeouts", "type": "int", "label": "容許逾時次數", "min": 0 },
             { "key": "benchmark.coverageTarget", "type": "float", "label": "涵蓋率目標", "help": "0.97 = 97%", "min": 0, "max": 1 },
+            { "key": "benchmark.coverageRegion", "type": "select", "label": "覆蓋上游的範圍", "fallbackDefault": "near", "help": "鄰近優先：選「覆蓋」上游時先選鄰近的（台灣、日本、香港、新加坡，或延遲低的任播上游），CDN 才比較會回亞洲的節點；還有名額才選其他的。", "options": [
+              { "value": "near", "label": "鄰近優先（建議）" },
+              { "value": "any", "label": "不分遠近（3.3.7 的行為）" }
+            ] },
+            { "key": "benchmark.nearMaxMs", "type": "int", "label": "鄰近的延遲上限（毫秒）", "help": "最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。", "min": 0 },
             { "key": "benchmark.minAuto", "type": "int", "label": "至少選幾台", "min": 0 },
             { "key": "benchmark.maxAvgLatencyMs", "type": "int", "label": "平均延遲上限（毫秒）", "min": 1 },
             { "key": "benchmark.keepDays", "type": "int", "label": "報表保留天數", "min": 0 }

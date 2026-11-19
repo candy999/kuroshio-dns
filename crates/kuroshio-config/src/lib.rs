@@ -9,6 +9,7 @@
 //!   載入時依 CPU 核心數換算（[`derive_auto`]，規格 05 第 7 節）。使用者明確填的數字一律優先。
 //! - 舊版的 `system.profile` / `system.tier`（硬體等級）、`system.memoryBudgetMB` 照樣接受、不使用（[`legacy_keys`]）。
 
+pub mod chain;
 pub mod uci;
 pub mod uci_migrate;
 

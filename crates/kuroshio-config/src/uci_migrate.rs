@@ -5,7 +5,8 @@
 //! - **3.2**（`main.lists_version` 比 3.2 舊、或沒有時）：預設過濾清單更新。只動「跟 3.1.x 預設值完全相同」的
 //!   `filter_list`（啟用、分類、網址、名稱都沒改，也沒有其他選項）；加上 TWNIC-RPZ、OISD small、HaGeZi Light（同網址不重複加）；
 //!   清單順序沒被調整過的話，依新的預設順序排列
-//! - **3.3**（`lists_version` 比 3.3 舊時）：最後加上四份預設不勾選的大清單（同網址不重複加）
+//! - **3.3**（`lists_version` 比 3.3 舊時）：最後加上四份預設不勾選的大清單（同網址不重複加）；
+//!   其中 HaGeZi `doh-vpn-proxy-bypass` 那一份帶 `option bypass '1'`（3.4.0 的「繞過防護」標記）
 //!
 //! 做過的版本記在 `main.lists_version`，之後不再重做（使用者刪掉的清單不會被加回來）。版本號拆成「主.次」比大小，
 //! 降版或之後的版本號（3.10、4.0）不會重做；看不懂的版本號（例如 `abc`）什麼都不動，只在 log 記一筆。
@@ -317,6 +318,7 @@ pub fn migrate(text: &str) -> Result<Migrated> {
             L_TIF_BIG,
             "malware",
         );
+        let new_bypass = by_url(&secs, L_BYPASS).is_none();
         add(
             &mut secs,
             &mut log,
@@ -325,6 +327,12 @@ pub fn migrate(text: &str) -> Result<Migrated> {
             L_BYPASS,
             "malware",
         );
+        // 3.4.0：這一份是「繞過防護」類的清單（規格 4.1）；只標新加的，使用者原本就有的那一段不動
+        if new_bypass {
+            if let Some(k) = by_url(&secs, L_BYPASS) {
+                secs[k].set("bypass", "1");
+            }
+        }
         main_set(&mut secs, "lists_version", "3.3");
     }
 

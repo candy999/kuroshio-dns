@@ -197,6 +197,11 @@ return view.extend({
 		o.value('warn', _('只提醒，照常測'));
 		o.value('ignore', _('不理會'));
 		o.default = 'skip-plain';
+		// 串接（3.4.0）：只有這兩個開關，預設都開；兩邊都開才通訊
+		common.flag(s, null, 'chain', _('串接上游的黑潮'), 'upstream.chain',
+			_('辨識上游的黑潮並自動串接：直接用它的評測結果、CDN 節點池與清單副本。關閉時把上游黑潮當成一般的 DNS 攔截（跟 3.3.7 的「一般 DNS 被接走的網路」一樣），這台會自己重做評測、CDN 掃描、下載清單，重複使用網路。路徑檢查關閉時也不會串接。'));
+		common.flag(s, null, 'allow_downstream', _('提供資料給下游的黑潮'), 'upstream.allowDownstream',
+			_('提供資料給接在後面的黑潮（串接、評測結果、CDN 節點池、清單副本，並放行它解析自己的上游）。關閉時仍然回答「我是黑潮」，但下游會自己重做評測、CDN 掃描、下載清單，重複浪費網路資源（含這台的頻寬）。開著時區網裡任何會講這個協定的裝置都拿得到；有啟用「繞過防護」清單、要管住區網裝置的環境請關閉。'));
 		o = s.option(form.ListValue, 'ipv6', _('用 IPv6 連上游'),
 			_('自動：依這台的 IPv6 路由判斷，連線遇到「沒有路由」會暫停 IPv6 10 分鐘。路由器的 IPv6 關閉時可以選「不用」。'));
 		o.value('auto', _('自動'));
@@ -221,6 +226,13 @@ return view.extend({
 		num('cache_max', _('快取筆數上限'), 'resolver.cacheMax');
 		common.flag(s, null, 'send_ecs', _('對上游附帶 ECS（本機對外 IP 的 /24）'), 'resolver.sendEcs');
 		common.flag(s, null, 'android_probe_fast', _('Android 私人 DNS 驗證查詢立即回覆'), 'resolver.androidProbeFast');
+		// 背景補問（3.4.0）
+		o = s.option(form.ListValue, 'backfill', _('背景補問'),
+			_('只同時問最快幾台上游時（同時問幾個上游有限制），CDN 相關的查詢與抽樣的查詢在回答之後，於背景再問這次沒問到的上游，合併節點與比對汙染。不增加回答的等待。'));
+		o.value('cdn', _('CDN 相關與抽樣（建議）'));
+		o.value('off', _('不補問（3.3.7 的行為）'));
+		o.default = 'cdn';
+		num('backfill_sample', _('非 CDN 查詢每幾次抽一次補問'), 'resolver.backfillSample', _('0 = 不抽樣（CDN 相關的照樣補問）。'));
 
 		s = m.section(form.NamedSection, 'iprank', 'iprank', _('IP 測速'), _('以 TCP 連線測量每個 IP 的延遲。'));
 		num('port', _('測速埠號'), 'iprank.port', null, 'port');
@@ -260,6 +272,13 @@ return view.extend({
 		num('timeout_ms', _('逾時（毫秒）'), 'benchmark.timeoutMs');
 		num('max_timeouts', _('容許逾時次數'), 'benchmark.maxTimeouts');
 		num('coverage_target', _('涵蓋率目標'), 'benchmark.coverageTarget', _('0.97 = 97%'), 'ufloat');
+		// 上游多樣性（3.4.0）
+		o = s.option(form.ListValue, 'coverage_region', _('覆蓋上游的範圍'),
+			_('鄰近優先：選「覆蓋」上游時先選鄰近的（台灣、日本、香港、新加坡，或延遲低的任播上游），CDN 才比較會回亞洲的節點；還有名額才選其他的。'));
+		o.value('near', _('鄰近優先（建議）'));
+		o.value('any', _('不分遠近（3.3.7 的行為）'));
+		o.default = 'near';
+		num('near_max_ms', _('鄰近的延遲上限（毫秒）'), 'benchmark.nearMaxMs', _('最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。'));
 		num('min_auto', _('至少選幾台'), 'benchmark.minAuto');
 		num('max_avg_latency_ms', _('平均延遲上限（毫秒）'), 'benchmark.maxAvgLatencyMs');
 		num('keep_days', _('報表保留天數'), 'benchmark.keepDays');

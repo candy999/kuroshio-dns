@@ -584,3 +584,192 @@ fn path_check_options() {
     assert_eq!(g(&c, "upstream.interceptPolicy"), &json!("warn"));
     assert_eq!(g(&c, "upstream.pathCheck"), &json!(false));
 }
+
+// ---------------- 3.4.0 串接模式的設定（規格 10 第 10 節） ----------------
+
+const SHIPPED: &str = include_str!("../../../openwrt/kuroshio/files/kuroshio.config");
+const FIELDS: &str = include_str!("../../../data/admin/fields.json");
+const L_BYPASS: &str = "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/doh-vpn-proxy-bypass.txt";
+
+fn shipped_text() -> String {
+    SHIPPED.replace("\r\n", "\n")
+}
+
+/// 串接的兩個開關、背景補問、上游多樣性：靠 snake_case → camelCase 自動轉換，名稱與型別要對
+#[test]
+fn uci_chain_options_convert() {
+    use kuroshio_config::chain::{backfill_of, coverage_region_of, Backfill, ChainSettings, CoverageRegion};
+    let text = default_text()
+        .replace(
+            "config upstream 'upstream'\n",
+            "config upstream 'upstream'\n\toption chain '0'\n\toption allow_downstream '0'\n",
+        )
+        .replace(
+            "config resolver 'resolver'\n",
+            "config resolver 'resolver'\n\toption backfill 'off'\n\toption backfill_sample '0'\n",
+        )
+        .replace(
+            "config benchmark 'benchmark'\n",
+            "config benchmark 'benchmark'\n\toption coverage_region 'any'\n\toption near_max_ms '80'\n",
+        );
+    for opt in ["option chain", "option backfill_sample", "option near_max_ms"] {
+        assert!(text.contains(opt), "測試用的預設 UCI 要有對應的區段：{opt}");
+    }
+    let (o, warns) = load_warn(&text);
+    assert!(warns.is_empty(), "{warns:?}");
+    let raw = overrides(&parse_text(&text).unwrap(), &env());
+    assert_eq!(g(&raw, "upstream.chain"), &json!(false));
+    assert_eq!(g(&raw, "upstream.allowDownstream"), &json!(false));
+    assert!(get(&raw, "upstream.allow_downstream").is_none(), "不留 snake_case 的名稱");
+    assert_eq!(g(&raw, "resolver.backfill"), &json!("off"));
+    assert_eq!(g(&raw, "resolver.backfillSample"), &json!(0));
+    assert_eq!(g(&raw, "benchmark.coverageRegion"), &json!("any"));
+    assert_eq!(g(&raw, "benchmark.nearMaxMs"), &json!(80));
+    // 讀取函式讀得出來
+    let s = ChainSettings::from_cfg(&o);
+    assert!(!s.chain && !s.allow_downstream && !s.downstream_enabled());
+    assert!(s.warnings.is_empty());
+    assert_eq!(backfill_of(&o), (Backfill::Off, 0));
+    assert_eq!(coverage_region_of(&o), (CoverageRegion::Any, 80.0));
+
+    // '1'、空白（= 預設）、沒寫：開
+    let on = default_text().replace(
+        "config upstream 'upstream'\n",
+        "config upstream 'upstream'\n\toption chain '1'\n\toption allow_downstream ''\n",
+    );
+    let c = load(&on, &env());
+    assert_eq!(g(&c, "upstream.chain"), &json!(true));
+    assert_eq!(g(&c, "upstream.allowDownstream"), &json!(true));
+    let s = ChainSettings::from_cfg(&load(&default_text(), &env()));
+    assert!(s.chain && s.allow_downstream && s.downstream_enabled());
+
+    // 早期草稿的 'auto'、'ask'：不是合法的寫法 → 預設值（開）並記警告（一般的開關會把它當成關）
+    let draft = default_text().replace(
+        "config upstream 'upstream'\n",
+        "config upstream 'upstream'\n\toption chain 'auto'\n\toption allow_downstream 'ask'\n",
+    );
+    let (c, warns) = load_warn(&draft);
+    assert_eq!(g(&c, "upstream.chain"), &json!(true));
+    assert_eq!(g(&c, "upstream.allowDownstream"), &json!(true));
+    assert!(warns.iter().any(|w| w.contains("upstream.chain")), "{warns:?}");
+    assert!(warns.iter().any(|w| w.contains("upstream.allow_downstream")), "{warns:?}");
+}
+
+/// `config filter_list` 的 `option bypass '1'` → `filter.lists[i].bypass`；沒寫就沒有這個鍵
+#[test]
+fn uci_filter_list_bypass() {
+    let text = default_text()
+        + "\nconfig filter_list\n\toption name 'B'\n\toption url 'https://example.com/bypass.txt'\n\toption category 'malware'\n\toption bypass '1'\n"
+        + "\nconfig filter_list\n\toption name 'N'\n\toption url 'https://example.net/no.txt'\n\toption bypass '0'\n";
+    let c = load(&text, &env());
+    let lists = g(&c, "filter.lists").as_array().unwrap();
+    let find = |u: &str| lists.iter().find(|l| l["url"] == u).unwrap_or_else(|| panic!("{u}"));
+    assert_eq!(find("https://example.com/bypass.txt")["bypass"], json!(true));
+    assert_eq!(find("https://example.net/no.txt")["bypass"], json!(false));
+    assert!(
+        lists
+            .iter()
+            .filter(|l| !l["url"].as_str().unwrap().starts_with("https://example."))
+            .all(|l| l.get("bypass").is_none()),
+        "沒寫 bypass 的清單：沒有這個鍵"
+    );
+    assert!(kuroshio_config::chain::is_bypass_list(find("https://example.com/bypass.txt")));
+    assert!(!kuroshio_config::chain::is_bypass_list(&lists[0]));
+
+    // 從 3.2 遷移時新加的 doh-vpn-proxy-bypass 那一段帶 bypass '1'
+    let old = include_str!("fixtures/kuroshio-3.2.0.config").replace("\r\n", "\n");
+    let m = kuroshio_config::uci_migrate::migrate(&old).unwrap();
+    let v = parse_text(&m.text).unwrap();
+    let sec = v["values"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|s| s["url"] == L_BYPASS)
+        .expect("遷移後有 doh-vpn-proxy-bypass");
+    assert_eq!(sec["bypass"], json!("1"));
+}
+
+/// 附帶的 OpenWrt 預設設定檔：轉換後串接相關的值跟 defaults.json 一樣（防止兩邊不同步）
+#[test]
+fn shipped_uci_config_matches_defaults() {
+    let shipped = shipped_text();
+    let c = load(&shipped, &env());
+    let d = defaults();
+    for k in [
+        "upstream.chain",
+        "upstream.allowDownstream",
+        "upstream.pathCheck",
+        "resolver.backfill",
+        "resolver.backfillSample",
+        "benchmark.coverageRegion",
+        "benchmark.nearMaxMs",
+    ] {
+        assert!(get(&d, k).is_some(), "defaults.json 沒有 {k}");
+        assert_eq!(g(&c, k), g(&d, k), "{k}");
+    }
+    // 預設檔裡有明確寫出來（不是靠沒寫 = 預設）
+    let raw = overrides(&parse_text(&shipped).unwrap(), &env());
+    for k in [
+        "upstream.chain",
+        "upstream.allowDownstream",
+        "resolver.backfill",
+        "resolver.backfillSample",
+        "benchmark.coverageRegion",
+        "benchmark.nearMaxMs",
+    ] {
+        assert!(get(&raw, k).is_some(), "預設 UCI 沒寫 {k}");
+    }
+    // doh-vpn-proxy-bypass 那一筆：兩邊都標成 bypass（預設停用，所以轉換後不在清單裡，直接看 UCI 原文）
+    let v = parse_text(&shipped).unwrap();
+    let sec = v["values"].as_object().unwrap().values().find(|s| s["url"] == L_BYPASS).unwrap();
+    assert_eq!(sec["bypass"], json!("1"));
+    assert_eq!(sec["enabled"], json!("0"));
+    let dl = g(&d, "filter.lists")
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["url"] == L_BYPASS)
+        .unwrap();
+    assert_eq!(dl["bypass"], json!(true));
+    assert_eq!(dl["enabled"], json!(false));
+}
+
+/// 說明文字要寫出關掉的影響（重複使用網路）：設定頁與 UCI 預設檔的註解
+#[test]
+fn help_texts_mention_duplicate_work() {
+    fn walk(v: &Value, out: &mut std::collections::HashMap<String, String>) {
+        match v {
+            Value::Object(m) => {
+                if let (Some(Value::String(k)), Some(Value::String(h))) = (m.get("key"), m.get("help")) {
+                    out.insert(k.clone(), h.clone());
+                }
+                m.values().for_each(|x| walk(x, out));
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let f: Value = serde_json::from_str(FIELDS).unwrap();
+    let mut helps = std::collections::HashMap::new();
+    walk(&f, &mut helps);
+    for k in ["upstream.chain", "upstream.allowDownstream"] {
+        let h = helps.get(k).unwrap_or_else(|| panic!("fields.json 沒有 {k} 的說明"));
+        assert!(h.contains("重複"), "{k}：{h}");
+    }
+    assert!(helps["upstream.allowDownstream"].contains("頻寬"));
+    assert!(helps["upstream.allowDownstream"].contains("繞過防護"));
+    // UCI 預設檔：選項的前一行註解
+    let shipped = shipped_text();
+    let lines: Vec<&str> = shipped.lines().map(str::trim).collect();
+    for opt in ["option chain ", "option allow_downstream "] {
+        let i = lines
+            .iter()
+            .position(|l| l.starts_with(opt))
+            .unwrap_or_else(|| panic!("預設 UCI 沒有 {opt}"));
+        assert!(
+            lines[i - 1].starts_with('#') && lines[i - 1].contains("重複"),
+            "{opt} 的註解：{}",
+            lines[i - 1]
+        );
+    }
+}
