@@ -125,6 +125,11 @@ fn backoff() -> &'static Mutex<Option<Instant>> {
     B.get_or_init(|| Mutex::new(None))
 }
 
+/// 這台系統有沒有 IPv6（連 ::1 都綁不了 = 核心沒開 IPv6，或韌體把 IPv6 關掉）
+pub fn system_has_ipv6() -> bool {
+    std::net::UdpSocket::bind("[::1]:0").is_ok()
+}
+
 /// 不送封包的路由檢查：UDP connect 到一個公開的 IPv6 位址，看系統選了哪個來源位址
 pub fn v6_route_now() -> V6Route {
     let s = match std::net::UdpSocket::bind("[::]:0") {

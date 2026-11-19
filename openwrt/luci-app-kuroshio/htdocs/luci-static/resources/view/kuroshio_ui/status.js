@@ -186,14 +186,15 @@ return view.extend({
 
 		// 網路路徑（3.3.6）：一般 DNS 有沒有被接走、被誰；被擋的協定；IPv6
 		var np = (api.network && api.network.path) || null;
-		var pathSec = np ? common.section(_('網路路徑'), [
-			(np.warnings || []).map(function(w) { return E('div', { 'class': 'alert-message warning' }, w); }),
+		var pathSec = np ? common.section(_('網路路徑'), (np.warnings || []).map(function(w) {
+			return E('div', { 'class': 'alert-message warning' }, w);
+		}).concat([
 			E('p', {}, np.checkedAt ? [
 				np.summary || '',
 				' · ', _('檢查於 %s').format(fmtTime(np.checkedAt)),
 				np.enabled === false ? ' · ' + _('路徑檢查已關閉') : ''
 			] : (np.enabled === false ? _('路徑檢查已關閉') : _('還沒檢查（啟動後幾秒內完成）')))
-		], { 'id': 'kuroshio-path' }) : '';
+		]), { 'id': 'kuroshio-path' }) : '';
 
 		var ups = (api.upstreams || []).map(function(u) {
 			var role = { pinned: _('固定'), auto: _('自動'), fallback: _('備援') }[u.role] || u.role;

@@ -1777,7 +1777,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
             match server.listen(SocketAddr::new(ip, port), open).await {
                 Ok(b) => bound.extend(b),
                 // 這台沒有 IPv6（連 ::1 都沒有，padavan 關掉 IPv6 時）：正常狀況，不用警告
-                Err(e) if ip.is_ipv6() && addr_unavailable(&e) => {
+                Err(e) if ip.is_ipv6() && (addr_unavailable(&e) || !kuroshio_net::path::system_has_ipv6()) => {
                     info!("{e:#}（這台沒有 IPv6），略過這個位址")
                 }
                 Err(e) => warn!("{e:#}，略過這個位址"),
