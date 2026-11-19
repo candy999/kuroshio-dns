@@ -189,7 +189,9 @@ jobs:
           echo '{"system":{"profile":"tiny"}}' > /tmp/tiny.json
           $RUN sysinfo -c /tmp/tiny.json | tee /tmp/sysinfo.txt
           grep -q '記憶體保留量' /tmp/sysinfo.txt
-          grep -q '依 CPU 核心數換算的設定' /tmp/sysinfo.txt
+          # 3.4.0 起標題是「依 CPU 核心數（resolver.parallel 另看 AES 指令）換算的設定」
+          grep -q '依 CPU 核心數.*換算的設定' /tmp/sysinfo.txt
+          grep -q 'resolver.parallel' /tmp/sysinfo.txt
       - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
