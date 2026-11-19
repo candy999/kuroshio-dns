@@ -548,7 +548,8 @@ fn reject(i: &mut Inner, r: Reason, now: Now) -> Vec<Io> {
             Some(i.timing.retry_max)
         }
         Reason::VerifyFailed | Reason::NoResponse => Some(next_backoff(i)),
-        Reason::Loop | Reason::TooDeep => Some(i.timing.retry_max),
+        // 加 0～50% 的亂數：兩台同時因迴圈解除時，不會在同一時間重試、再一次同時互相綁定
+        Reason::Loop | Reason::TooDeep => Some(i.timing.retry_max.mul_f64(1.0 + 0.5 * now.rnd)),
         _ => None,
     };
     release(i, r, retry, now)
