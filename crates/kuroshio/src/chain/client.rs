@@ -334,6 +334,9 @@ struct Inner {
     previous_fp: Option<String>,
     backoff: Option<Duration>,
     unsupported_retried: bool,
+    /// 因為上游沒有回應而解除（`no-response`）、還在等它回來：這段期間重試的探測沒有回應
+    /// 仍然算 `no-response`（照退避繼續重試），不當成「不支援串接」
+    awaiting_return: bool,
     retry_at: Option<Instant>,
     retry_at_ms: Option<u64>,
     next_hb: Option<Instant>,
@@ -377,6 +380,7 @@ impl Inner {
             previous_fp: None,
             backoff: None,
             unsupported_retried: false,
+            awaiting_return: false,
             retry_at: None,
             retry_at_ms: None,
             next_hb: None,
@@ -493,6 +497,7 @@ fn release(i: &mut Inner, reason: Reason, retry: Option<Duration>, now: Now) -> 
         io.push(Io::Unbind);
     }
     set_state(i, State::Released, Some(reason));
+    i.awaiting_return = reason == Reason::NoResponse;
     i.next_hb = None;
     i.hb_fail = 0;
     i.retry_at = retry.map(|d| now.at + d);
@@ -515,6 +520,7 @@ fn to_none(i: &mut Inner, reason: Option<Reason>) -> Vec<Io> {
     i.retry_at_ms = None;
     i.backoff = None;
     i.unsupported_retried = false;
+    i.awaiting_return = false;
     io
 }
 
@@ -529,6 +535,13 @@ fn next_backoff(i: &mut Inner) -> Duration {
 
 /// 探測／驗證／心跳不能串接時的處理
 fn reject(i: &mut Inner, r: Reason, now: Now) -> Vec<Io> {
+    // 上游沒回應而解除之後的重試：還是沒有回應就維持 no-response，照退避繼續重試（規格 1.4、1.8：上游回來自動接回），
+    // 不能變成 unsupported（那個只重試一次，之後要等 6 小時後的路徑檢查）
+    let r = if r == Reason::Unsupported && i.awaiting_return {
+        Reason::NoResponse
+    } else {
+        r
+    };
     let retry = match r {
         Reason::Unsupported if !i.unsupported_retried => {
             i.unsupported_retried = true;
@@ -644,6 +657,7 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             i.remembered = Some(public);
             i.backoff = None;
             i.unsupported_retried = false;
+            i.awaiting_return = false;
             i.retry_at = None;
             i.retry_at_ms = None;
             i.hb_fail = 0;
@@ -1494,6 +1508,52 @@ mod tests {
         // 3.4.0-rc1 算 3.4.0
         let io = step(&mut i, Event::Report(view(Some("3.4.0-rc1"))), &[], now());
         assert!(matches!(io[0], Io::Probe { .. }));
+    }
+
+    /// 上游沒回應而解除之後，重試的探測一直沒有回應：維持 no-response、照退避一直重試（不變成 unsupported 而停止），
+    /// 上游回來就接回；接回之後同樣沒回應的探測照常算 unsupported
+    #[test]
+    fn no_response_keeps_retrying_until_upstream_returns() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        chained(&mut i, a);
+        for _ in 0..3 {
+            step(&mut i, Event::Heartbeat(Probe::failed(false, "逾時".into())), &[], now());
+        }
+        assert_eq!((i.state, i.reason), (State::Released, Some(Reason::NoResponse)));
+        let mut last = Duration::ZERO;
+        for _ in 0..6 {
+            let io = step(&mut i, Event::Retry, &[], now());
+            assert!(matches!(io[0], Io::Probe { .. }), "{io:?}");
+            assert_eq!(i.state, State::Detected);
+            step(&mut i, Event::Probed(Probe::failed(false, "沒有回應（逾時）".into())), &[], now());
+            assert_eq!((i.state, i.reason), (State::Released, Some(Reason::NoResponse)));
+            let wait = i.retry_at.expect("一直排重試").saturating_duration_since(now().at);
+            assert!(wait + Duration::from_millis(50) >= last, "退避不會變短");
+            assert!(wait <= i.timing.retry_max + Duration::from_secs(1), "最長 retry_max");
+            last = wait;
+        }
+        assert_eq!(i.backoff, Some(i.timing.retry_max));
+        // 上游回來：接回、清掉退避
+        step(&mut i, Event::Retry, &[], now());
+        step(&mut i, Event::Probed(ok_probe(a, vec![])), &[], now());
+        step(
+            &mut i,
+            Event::Verified {
+                again: ok_probe(a, vec![]),
+                gateway: None,
+            },
+            &[],
+            now(),
+        );
+        assert_eq!(i.state, State::Chained);
+        assert!(!i.awaiting_return);
+        assert!(i.key_changed_at.is_none(), "同一把金鑰");
+        // 沒有經過 no-response 的「沒回應串接查詢」：照舊是 unsupported
+        let mut j = inner(true);
+        step(&mut j, Event::Report(view(Some("3.4.0"))), &[], now());
+        step(&mut j, Event::Probed(Probe::failed(false, "沒有回應（逾時）".into())), &[], now());
+        assert_eq!((j.state, j.reason), (State::Released, Some(Reason::Unsupported)));
     }
 
     #[test]
