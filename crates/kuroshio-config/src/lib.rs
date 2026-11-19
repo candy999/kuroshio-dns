@@ -25,13 +25,45 @@ pub const DEFAULTS_JSON: &str = include_str!("../defaults.json");
 pub struct Host {
     /// CPU 核心數（可用的執行緒數）
     pub cores: usize,
+    /// CPU 有沒有 AES 指令（沒有的話加密上游的握手與解密都慢，`resolver.parallel` 收緊；規格 10 第 5.1 節）
+    pub aes: bool,
 }
 
 impl Host {
     pub fn detect() -> Host {
         Host {
             cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            aes: has_aes(),
         }
+    }
+}
+
+/// CPU 有沒有 AES 指令。MIPS、ARMv7、RISC-V 等沒有偵測方法的一律當成沒有（保守；可以手動設 `parallel = 0`）
+pub fn has_aes() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("aes")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// `resolver.parallel` 的 `"auto"`（規格 10 第 5.1 節）：
+/// 沒有 AES 指令 → 2（不管幾核心）；有 AES：單核心 2、雙核心 3、更多核心 0（＝ 全部一起問）
+pub fn auto_parallel(host: &Host) -> u64 {
+    if !host.aes {
+        return 2;
+    }
+    match host.cores.max(1) {
+        1 => 2,
+        2 => 3,
+        _ => 0,
     }
 }
 
@@ -83,15 +115,8 @@ pub fn derive_auto(cfg: &mut Value, host: &Host) {
     for (path, per, lo, hi) in PER_CORE {
         set(path, (per * c).clamp(lo, hi));
     }
-    // 同時問幾個上游：單核心 2、雙核心 3、更多核心全部一起問（0 = 全部）
-    set(
-        "resolver.parallel",
-        match c {
-            1 => 2,
-            2 => 3,
-            _ => 0,
-        },
-    );
+    // 同時問幾個上游（0 = 全部）：見 auto_parallel
+    set("resolver.parallel", auto_parallel(host));
 }
 
 /// 使用者設定裡已經不用的舊欄位（啟動時記一次說明，不算錯誤）
@@ -373,10 +398,39 @@ mod tests {
     }
 
     #[test]
+    fn auto_parallel_table() {
+        let par = |cores: usize, aes: bool, user: Value| {
+            let c = build_for(&Host { cores, aes }, &json!({ "resolver": user }));
+            get(&c, "resolver.parallel")
+                .and_then(Value::as_u64)
+                .expect("resolver.parallel 不是數字")
+        };
+        // 規格 10 第 5.1 節的表
+        for cores in [1, 2, 3, 4, 64] {
+            assert_eq!(par(cores, false, json!({})), 2, "沒有 AES、{cores} 核心");
+            assert_eq!(auto_parallel(&Host { cores, aes: false }), 2);
+        }
+        assert_eq!(par(1, true, json!({})), 2, "有 AES、單核心（跟 3.3.7 一樣）");
+        assert_eq!(par(2, true, json!({})), 3, "有 AES、雙核心（跟 3.3.7 一樣）");
+        assert_eq!(par(3, true, json!({})), 0, "有 AES、三核心（跟 3.3.7 一樣）");
+        assert_eq!(par(8, true, json!({})), 0, "有 AES、八核心（跟 3.3.7 一樣）");
+        assert_eq!(par(0, true, json!({})), 2, "偵測不到核心數當成單核心");
+        assert_eq!(par(4, true, json!({ "parallel": "auto" })), 0);
+        assert_eq!(par(4, false, json!({ "parallel": "auto" })), 2);
+        // 使用者填了數字一律優先（含 0 與 UCI 的字串 "0"）
+        for aes in [false, true] {
+            assert_eq!(par(1, aes, json!({ "parallel": 0 })), 0);
+            assert_eq!(par(1, aes, json!({ "parallel": "0" })), 0);
+            assert_eq!(par(8, aes, json!({ "parallel": 5 })), 5);
+            assert_eq!(par(8, aes, json!({ "parallel": "1" })), 1);
+        }
+    }
+
+    #[test]
     fn auto_values_follow_cores_and_user_wins() {
-        let one = build_for(&Host { cores: 1 }, &json!({}));
-        let four = build_for(&Host { cores: 4 }, &json!({}));
-        let many = build_for(&Host { cores: 64 }, &json!({}));
+        let one = build_for(&Host { cores: 1, aes: true }, &json!({}));
+        let four = build_for(&Host { cores: 4, aes: true }, &json!({}));
+        let many = build_for(&Host { cores: 64, aes: true }, &json!({}));
         let n = |c: &Value, k: &str| get(c, k).and_then(Value::as_u64).unwrap_or_else(|| panic!("{k} 不是數字"));
         // 每一項都換算成數字；核心越多越大，而且不超過上限、不低於下限
         for (k, _, lo, hi) in PER_CORE {
@@ -384,7 +438,7 @@ mod tests {
             assert!(n(&one, k) <= n(&four, k) && n(&four, k) <= n(&many, k), "{k}");
         }
         assert_eq!(n(&one, "resolver.parallel"), 2);
-        assert_eq!(n(&build_for(&Host { cores: 2 }, &json!({})), "resolver.parallel"), 3);
+        assert_eq!(n(&build_for(&Host { cores: 2, aes: true }, &json!({})), "resolver.parallel"), 3);
         assert_eq!(n(&four, "resolver.parallel"), 0, "四核心：全部一起問");
         assert_eq!(n(&one, "scan.concurrency"), 50);
         assert_eq!(n(&four, "scan.concurrency"), 200);
@@ -394,7 +448,7 @@ mod tests {
         assert_eq!(n(&one, "system.maxQuicConnections"), 32, "單核心也不關 QUIC（以前 tiny 等級是 0）");
         // 使用者填的數字（UCI 給的字串也算）優先；"auto" 照樣換算
         let u = build_for(
-            &Host { cores: 1 },
+            &Host { cores: 1, aes: true },
             &json!({ "resolver": { "parallel": 0, "warmRate": "7" }, "scan": { "concurrency": 999 }, "iprank": { "concurrency": "auto" } }),
         );
         assert_eq!(n(&u, "resolver.parallel"), 0);
@@ -421,11 +475,11 @@ mod tests {
     #[test]
     fn legacy_tier_keys_are_accepted_and_ignored() {
         let user = json!({ "system": { "tier": "tiny", "profile": "small", "memoryBudgetMB": 40 }, "resolver": { "cacheMax": 9999 } });
-        let c = build_for(&Host { cores: 4 }, &user);
+        let c = build_for(&Host { cores: 4, aes: true }, &user);
         assert_eq!(get(&c, "resolver.cacheMax"), Some(&json!(9999)));
         assert_eq!(
             get(&c, "cdn.maxEntries"),
-            get(&build_for(&Host { cores: 4 }, &json!({})), "cdn.maxEntries"),
+            get(&build_for(&Host { cores: 4, aes: true }, &json!({})), "cdn.maxEntries"),
             "等級不影響任何值"
         );
         assert_eq!(legacy_keys(&user).len(), 3);
@@ -459,7 +513,7 @@ mod tests {
 
     #[test]
     fn own_base_domains_from_config() {
-        let b = |user: Value| own_base_domains(&build_for(&Host { cores: 1 }, &user));
+        let b = |user: Value| own_base_domains(&build_for(&Host { cores: 1, aes: true }, &user));
         assert!(b(json!({})).is_empty(), "沒設定網域：沒有");
         assert_eq!(b(json!({ "domain": "dns.example.net" })), vec!["example.net"]);
         assert_eq!(b(json!({ "domain": "DNS.Example.com.tw." })), vec!["example.com.tw"]);

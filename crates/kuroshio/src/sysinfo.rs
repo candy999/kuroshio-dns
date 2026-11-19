@@ -35,18 +35,7 @@ impl SysInfo {
 }
 
 fn has_aes() -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        std::arch::is_x86_feature_detected!("aes")
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        std::arch::is_aarch64_feature_detected!("aes")
-    }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        false
-    }
+    kuroshio_config::has_aes()
 }
 
 /// 自己的常駐記憶體（KB，/proc/self/status 的 VmRSS）

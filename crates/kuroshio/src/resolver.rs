@@ -7,6 +7,7 @@ use crate::iprank::IpRank;
 use crate::stats::{Kind as StatKind, Stats};
 use crate::upstream::Upstream;
 use crate::upstreams::{Manager, Role, Up};
+use kuroshio_config::chain::Backfill;
 use kuroshio_proto::logic::{self, ede, Class};
 use kuroshio_proto::message::{normalize, rtype, Message, RData, Record};
 use serde_json::{json, Value};
@@ -61,6 +62,12 @@ pub struct Params {
     pub hedge: Duration,
     /// 問上游時帶本機對外 IP 的 /24（ECS），讓 CDN 依台灣位置回答
     pub send_ecs: bool,
+    /// 背景補問（規格 10 第 5.2 節，`resolver.backfill`）：`parallel` 有限制時，回答之後在背景問這次沒問到的上游
+    pub backfill: Backfill,
+    /// 非 CDN 的 A／AAAA 查詢每幾次抽一次補問（`resolver.backfillSample`；0 = 不抽樣）
+    pub backfill_sample: u64,
+    /// 同時最多幾個補問（1～2 核心 2、其他 4；拿不到名額就不補問，不排隊）
+    pub backfill_max: usize,
 }
 
 impl Params {
@@ -75,6 +82,7 @@ impl Params {
                 .and_then(Value::as_bool)
                 .unwrap_or(d)
         };
+        let (backfill, backfill_sample) = kuroshio_config::chain::backfill_of(cfg);
         Params {
             timeout: Duration::from_millis(n("timeoutMs", 1500)),
             window: Duration::from_millis(n("collectWindowMs", 600)),
@@ -92,6 +100,9 @@ impl Params {
             parallel: n("parallel", 0) as usize,
             hedge: Duration::from_millis(300),
             send_ecs: b("sendEcs", true),
+            backfill,
+            backfill_sample,
+            backfill_max: if kuroshio_config::Host::detect().cores <= 2 { 2 } else { 4 },
         }
     }
 }
@@ -139,6 +150,13 @@ struct Answer {
     ms: f64,
 }
 
+/// `ask()` 的結果：收到的回答，以及這次沒有問到的上游（`parallel` 有限制時；背景補問用）
+#[derive(Default)]
+struct Asked {
+    answers: Vec<Arc<Answer>>,
+    unasked: Vec<Arc<Up>>,
+}
+
 struct Decided {
     msg: Message,
     class: Class,
@@ -179,6 +197,10 @@ pub struct Resolver {
     last_outage: AtomicU32,
     /// 查詢計數，用來每 20 次探索一個平常排在後面的上游
     picks: AtomicU32,
+    /// 背景補問的抽樣計數（非 CDN 的 A／AAAA 查詢；跟 `picks` 分開）
+    sample_tick: AtomicU32,
+    /// 背景補問的名額（`Params::backfill_max`）
+    backfills: Arc<tokio::sync::Semaphore>,
     base: Instant,
     errors: Mutex<(u64, Vec<(u64, String)>)>,
 }
@@ -230,6 +252,7 @@ impl Resolver {
         iprank: Arc<IpRank>,
         local: Option<LocalForward>,
     ) -> Arc<Resolver> {
+        let backfills = Arc::new(tokio::sync::Semaphore::new(params.backfill_max));
         Arc::new(Resolver {
             params,
             upstreams,
@@ -250,6 +273,8 @@ impl Resolver {
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
             picks: AtomicU32::new(0),
+            sample_tick: AtomicU32::new(0),
+            backfills,
             base: Instant::now(),
             errors: Mutex::new((0, Vec::new())),
         })
@@ -676,8 +701,8 @@ impl Resolver {
         let cdn = self.steer_cdn();
 
         let active = self.upstreams.active();
-        let results = self
-            .ask(&active, &upq, qtype, |a| {
+        let Asked { answers: results, unasked } = self
+            .ask(&active, &upq, qtype, false, |a| {
                 if fast_sent || !self.params.fast_path || a.class != Class::Ok {
                     return;
                 }
@@ -691,9 +716,11 @@ impl Resolver {
             })
             .await;
         let mut decided = decide(&results, false, cdn.as_deref(), qtype);
+        let mut used_backup = false;
         if decided.is_none() {
             // 全部失敗或都被上游擋：改問備援
-            let more = self.ask(&self.upstreams.backup(), &upq, qtype, |_| {}).await;
+            used_backup = true;
+            let more = self.ask(&self.upstreams.backup(), &upq, qtype, false, |_| {}).await.answers;
             decided = decide(&more, false, cdn.as_deref(), qtype).or_else(|| {
                 let all: Vec<Arc<Answer>> = results.iter().chain(&more).cloned().collect();
                 decide(&all, true, cdn.as_deref(), qtype)
@@ -725,35 +752,122 @@ impl Resolver {
                         note = Some(n);
                     }
                 }
-                // 「如果用一般 DNS 會怎樣」：固定上游以外的上游給的 A 記錄（串接上游也不採計：它是另一台黑潮挑過的答案）
-                let baseline = match (&cdn, qtype == rtype::A) {
-                    (Some(c), true) => {
-                        let others: Vec<&Message> = results
-                            .iter()
-                            .filter(|r| r.class == Class::Ok && !matches!(r.up.role, Role::Pinned | Role::Chain))
-                            .map(|r| &r.msg)
-                            .collect();
-                        c.baseline(&others)
-                    }
-                    _ => None,
-                };
+                let baseline = baseline_of(cdn.as_deref(), qtype, &results);
                 self.store(&key, &d.msg, d.class, d.source, &qname, false, note, baseline)
             }
         };
         self.notify(&key, &e, true);
         // 正常結束：notify 已經把鍵拿掉；之後同一個鍵可能已經有新的工作，不能再刪一次
         std::mem::forget(guard);
+        // 背景補問（規格 10 第 5.2 節）：一定在 notify 之後，用戶端已經拿到回應。
+        // 改問過備援的（主要上游都失敗）不補問；串接中只問上游黑潮（下游就是要省自己的加密上游），也不補問
+        if used_backup || active.iter().any(|u| u.role == Role::Chain) {
+            return;
+        }
+        self.backfill(Backfilling {
+            key,
+            qname,
+            upq,
+            qtype,
+            verbatim,
+            first: results,
+            unasked,
+            entry: e,
+            cdn,
+        });
+    }
+
+    /// 背景補問：條件符合就在背景問這次沒問到的上游，跟前面的回答合在一起重新 `decide()`、
+    /// `merge_rank()`、`store()`（快取換成合併後的）。不呼叫 `notify`（沒有人在等）。
+    /// 同時最多 `backfill_max` 個，拿不到名額就放棄（不排隊）；記憶體壓力不是 Normal 不做
+    fn backfill(self: &Arc<Self>, b: Backfilling) {
+        let p = &self.params;
+        // 便宜的條件先看：大部分查詢（parallel = 0、DO、非 A／AAAA、關掉）在這裡就結束
+        if !backfill_possible(p, b.qtype, b.verbatim, b.unasked.len()) {
+            return;
+        }
+        let cdn_hit = b.cdn.as_ref().is_some_and(|c| {
+            b.entry
+                .answers
+                .iter()
+                .filter(|r| r.rtype == b.qtype)
+                .filter_map(logic::ip_of)
+                .any(|ip| c.classify(ip).is_some())
+        });
+        let tick = if cdn_hit || p.backfill_sample == 0 {
+            0
+        } else {
+            self.sample_tick.fetch_add(1, Ordering::Relaxed).wrapping_add(1) as u64
+        };
+        if !backfill_wanted(p, b.qtype, b.verbatim, b.unasked.len(), cdn_hit, tick) {
+            return;
+        }
+        if crate::app::pressure() != crate::sysinfo::Pressure::Normal {
+            return;
+        }
+        let Ok(permit) = self.backfills.clone().try_acquire_owned() else {
+            debug!("背景補問名額已滿，略過：{}", b.qname);
+            return;
+        };
+        self.stats.count(StatKind::Backfill);
+        let me = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Backfilling {
+                key,
+                qname,
+                upq,
+                qtype,
+                first,
+                unasked,
+                cdn,
+                ..
+            } = b;
+            let more = me.ask(&unasked, &upq, qtype, true, |_| {}).await.answers;
+            if backfill_mismatch(&first, &more) {
+                me.stats.count(StatKind::BackfillMismatch);
+                debug!(
+                    "背景補問結果不一致：{qname}（類型 {qtype}）前面 {} 個回答、補問 {} 個回答（{}）",
+                    first.len(),
+                    more.len(),
+                    more.iter()
+                        .map(|a| format!("{}:{:?}", a.up.up.id, a.class))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                );
+            }
+            let all: Vec<Arc<Answer>> = first.into_iter().chain(more).collect();
+            let Some(mut d) = decide(&all, false, cdn.as_deref(), qtype) else {
+                return;
+            };
+            let mut note = None;
+            // 補問只做 A／AAAA、不做 verbatim（backfill_possible），這裡只看 rank_ips
+            if !d.oks.is_empty() && me.params.rank_ips {
+                if let Some((msg, source, n)) = me.merge_rank(&d.oks, &qname, qtype).await {
+                    d.msg = msg;
+                    d.source = source;
+                    note = Some(n);
+                }
+            }
+            let baseline = baseline_of(cdn.as_deref(), qtype, &all);
+            me.store(&key, &d.msg, d.class, d.source, &qname, false, note, baseline);
+        });
     }
 
     /// 並行詢問一組上游：全部回來，或第一個正常回應後再等 window；
-    /// `parallel` > 0 時先問前幾個，失敗或每隔 hedge 沒有正常回應再加問下一個
-    async fn ask(&self, list: &[Arc<Up>], q: &[u8], qtype: u16, mut on_each: impl FnMut(&Answer)) -> Vec<Arc<Answer>> {
+    /// `parallel` > 0 時先問前幾個，失敗或每隔 hedge 沒有正常回應再加問下一個。
+    /// `all`：不套 `parallel`，全部一起問（背景補問用）。回傳收到的回答與這次沒有問到的上游
+    async fn ask(&self, list: &[Arc<Up>], q: &[u8], qtype: u16, all: bool, mut on_each: impl FnMut(&Answer)) -> Asked {
         let mut out = Vec::new();
         if list.is_empty() {
-            return out;
+            return Asked::default();
         }
         let p = &self.params;
-        let first = if p.parallel == 0 { list.len() } else { p.parallel.min(list.len()) };
+        let first = if all || p.parallel == 0 {
+            list.len()
+        } else {
+            p.parallel.min(list.len())
+        };
         // 有並行限制時：先問平均延遲最低的（還沒有紀錄的排前面，讓它有機會被量到）；
         // 每 20 次把後段的一個換到前面探索（規格 06 第 2.1 節）
         let mut ordered: Vec<Arc<Up>> = list.to_vec();
@@ -832,7 +946,10 @@ impl Resolver {
             }
         }
         set.abort_all();
-        out
+        Asked {
+            answers: out,
+            unasked: rest.collect(),
+        }
     }
 
     /// 合併所有上游給的 IP（最終 CNAME 相同的才合併），TCP 443 測速後排序
@@ -970,6 +1087,67 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+/// `job()` 交給背景補問的資料
+struct Backfilling {
+    key: String,
+    qname: String,
+    upq: Vec<u8>,
+    qtype: u16,
+    verbatim: bool,
+    first: Vec<Arc<Answer>>,
+    unasked: Vec<Arc<Up>>,
+    entry: Arc<Entry>,
+    cdn: Option<Arc<kuroshio_cdn::Cdn>>,
+}
+
+/// 「如果用一般 DNS 會怎樣」：固定上游以外的上游給的 A 記錄（串接上游也不採計：它是另一台黑潮挑過的答案）
+fn baseline_of(cdn: Option<&kuroshio_cdn::Cdn>, qtype: u16, results: &[Arc<Answer>]) -> Option<kuroshio_cdn::Baseline> {
+    match (cdn, qtype == rtype::A) {
+        (Some(c), true) => {
+            let others: Vec<&Message> = results
+                .iter()
+                .filter(|r| r.class == Class::Ok && !matches!(r.up.role, Role::Pinned | Role::Chain))
+                .map(|r| &r.msg)
+                .collect();
+            c.baseline(&others)
+        }
+        _ => None,
+    }
+}
+
+/// 純函式：有沒有可能補問（跟 CDN、抽樣無關的條件）：沒關掉、不是 verbatim（DO、類別不是 IN）、
+/// A／AAAA、而且有沒問到的上游（`parallel` = 0 或串接中一定沒有）
+fn backfill_possible(p: &Params, qtype: u16, verbatim: bool, unasked: usize) -> bool {
+    p.backfill != Backfill::Off && !verbatim && (qtype == rtype::A || qtype == rtype::AAAA) && unasked > 0
+}
+
+/// 純函式：這次要不要補問（規格 10 第 5.2 節）。
+/// `cdn_hit`：答案裡有位址被 CDN 範圍認得；`sample_tick`：非 CDN 查詢的抽樣計數（從 1 開始）。
+/// 抽樣取每一輪的中間那一次（`backfillSample` = 16 時是第 8、24、40… 次），不是每輪的第一次：
+/// 開機後的第一個查詢不會馬上補問
+fn backfill_wanted(p: &Params, qtype: u16, verbatim: bool, unasked: usize, cdn_hit: bool, sample_tick: u64) -> bool {
+    if !backfill_possible(p, qtype, verbatim, unasked) {
+        return false;
+    }
+    if cdn_hit {
+        return true;
+    }
+    let n = p.backfill_sample;
+    n > 0 && sample_tick > 0 && sample_tick % n == n / 2
+}
+
+/// 純函式：抽樣比對有沒有不一致：前面有正常回應、補問的多數（至少 2 台而且過半）是 NXDOMAIN／NODATA；
+/// 或反過來（前面沒有正常回應、只有 NXDOMAIN／NODATA，補問的多數有正常回應）
+fn backfill_mismatch(first: &[Arc<Answer>], more: &[Arc<Answer>]) -> bool {
+    let neg = |a: &&Arc<Answer>| matches!(a.class, Class::NxDomain | Class::NoData);
+    let ok = |a: &&Arc<Answer>| a.class == Class::Ok;
+    let majority = |n: usize| n >= 2 && n * 2 > more.len();
+    if first.iter().any(|a| ok(&a)) {
+        return majority(more.iter().filter(neg).count());
+    }
+    first.iter().any(|a| neg(&a)) && majority(more.iter().filter(ok).count())
+}
+
 /// 從多個上游結果決定答案（同 2.x）：有正常回應取最快的；否則 nodata / nxdomain 多數決（平手以固定上游為準）
 fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_cdn::Cdn>, qtype: u16) -> Option<Decided> {
     // 一般 DNS 被路上的攔截者接走時（路徑檢查，3.3.6），它們的回答其實是攔截者給的：
@@ -1079,6 +1257,89 @@ mod tests {
         assert!(!l.matches("8.8.8.8.in-addr.arpa"));
         assert!(l.matches("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa"));
         assert!(!l.matches("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"));
+    }
+
+    fn params(extra: Value) -> Params {
+        let mut c = kuroshio_config::defaults();
+        kuroshio_config::merge(&mut c, &json!({ "resolver": extra }));
+        Params::from_cfg(&c)
+    }
+
+    #[test]
+    fn backfill_params_from_config() {
+        let p = params(json!({}));
+        assert_eq!((p.backfill, p.backfill_sample), (Backfill::Cdn, 16));
+        assert!(p.backfill_max == 2 || p.backfill_max == 4);
+        let p = params(json!({ "backfill": "off", "backfillSample": "4" }));
+        assert_eq!((p.backfill, p.backfill_sample), (Backfill::Off, 4));
+    }
+
+    #[test]
+    fn backfill_wanted_rules() {
+        let p = params(json!({ "backfillSample": 4 }));
+        let (a, aaaa) = (rtype::A, rtype::AAAA);
+        // CDN 相關：A／AAAA、有沒問到的上游就補問
+        assert!(backfill_wanted(&p, a, false, 2, true, 0));
+        assert!(backfill_wanted(&p, aaaa, false, 1, true, 0));
+        // 不補問：verbatim、不是 A／AAAA、沒有沒問到的上游（parallel = 0、串接中）
+        assert!(!backfill_wanted(&p, a, true, 2, true, 0));
+        assert!(!backfill_wanted(&p, rtype::TXT, false, 2, true, 0));
+        assert!(!backfill_wanted(&p, a, false, 0, true, 0));
+        // 抽樣：每 4 次抽 1 次
+        let hits = (1..=16).filter(|t| backfill_wanted(&p, a, false, 2, false, *t)).count();
+        assert_eq!(hits, 4);
+        assert!(!backfill_wanted(&p, a, false, 2, false, 0));
+        // backfillSample = 1：每次；0：不抽樣（CDN 相關的照樣補問）
+        let one = params(json!({ "backfillSample": 1 }));
+        assert!((1..=5).all(|t| backfill_wanted(&one, a, false, 2, false, t)));
+        let zero = params(json!({ "backfillSample": 0 }));
+        assert!((0..=40).all(|t| !backfill_wanted(&zero, a, false, 2, false, t)));
+        assert!(backfill_wanted(&zero, a, false, 2, true, 0));
+        // 關掉：什麼都不補問
+        let off = params(json!({ "backfill": "off", "backfillSample": 1 }));
+        assert!(!backfill_wanted(&off, a, false, 2, true, 1));
+        assert!(!backfill_wanted(&off, a, false, 2, false, 1));
+    }
+
+    #[test]
+    fn backfill_mismatch_rules() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-bf-{}", std::process::id()));
+        let cfg = kuroshio_config::with_overrides(&json!({
+            "upstream": { "pinned": ["udp://192.0.2.1:53"], "fallback": [] },
+            "system": { "persistDir": dir.to_string_lossy() }
+        }));
+        let m = Manager::new(&cfg, dir.join("upstreams.json"));
+        let up = m.active().into_iter().next().expect("固定上游");
+        let ans = |class: Class| {
+            Arc::new(Answer {
+                up: up.clone(),
+                msg: Message::default(),
+                class,
+                ms: 1.0,
+            })
+        };
+        let (ok, nx, nd, sf) = (Class::Ok, Class::NxDomain, Class::NoData, Class::ServFail);
+        let mm = |first: &[Class], more: &[Class]| {
+            let v = |c: &[Class]| c.iter().map(|c| ans(*c)).collect::<Vec<_>>();
+            backfill_mismatch(&v(first), &v(more))
+        };
+        // 前面正常、補問的多數（至少 2 台而且過半）是 NXDOMAIN／NODATA
+        assert!(mm(&[ok], &[nx, nd]));
+        assert!(mm(&[ok, nx], &[nx, nx, ok]));
+        assert!(!mm(&[ok], &[nx]), "只有 1 台不算");
+        assert!(!mm(&[ok], &[nx, ok]), "沒有過半");
+        assert!(!mm(&[ok], &[nx, nx, ok, ok]));
+        assert!(!mm(&[ok], &[ok, ok]));
+        // 反過來：前面只有 NXDOMAIN／NODATA，補問的多數有正常回應
+        assert!(mm(&[nx, nx], &[ok, ok, ok]));
+        assert!(mm(&[nd], &[ok, ok, sf]));
+        assert!(!mm(&[nx], &[ok]));
+        assert!(!mm(&[nx], &[nx, nx]));
+        // 前面全部失敗：沒有可以比對的
+        assert!(!mm(&[sf], &[ok, ok]));
+        assert!(!mm(&[], &[ok, ok]));
+        assert!(!mm(&[ok], &[]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
