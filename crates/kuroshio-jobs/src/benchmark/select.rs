@@ -24,6 +24,24 @@ pub struct Scored {
     /// 網域編號 → 解析到的 IPv4（不重複）
     pub history: Vec<(u32, Vec<u32>)>,
     pub ext: Ext,
+    /// 所在地（規格 10 的 6.1）："TW"（在台灣網段）、ip-api 的國別碼，或 ""（都沒有）
+    pub region: String,
+    /// 鄰近（台灣、日本、香港、新加坡且延遲合理，或延遲本身就夠低）：`coverage_region = near` 時優先挑
+    pub near: bool,
+}
+
+/// 鄰近的四地
+pub const NEAR_REGIONS: [&str; 4] = ["TW", "JP", "HK", "SG"];
+
+/// 判斷上游在哪裡、算不算鄰近（規格 10 的 6.1，純函式）：
+/// - `region` = "TW"（位址在台灣網段）、否則 ip-api 的國別碼、都沒有就是 ""
+/// - `near` = `region` 在鄰近四地而且 `min ≤ near_max_ms × 2`，或 `min ≤ near_max_ms`（不管國別，涵蓋任播與查不到國別的）
+///
+/// `min == 0` 是沒有成功紀錄，一律不算鄰近
+pub fn classify_region(in_tw: bool, cc: &str, min_ms: f64, near_max_ms: f64) -> (String, bool) {
+    let region = if in_tw { "TW".to_string() } else { cc.trim().to_ascii_uppercase() };
+    let near = min_ms > 0.0 && (min_ms <= near_max_ms || (NEAR_REGIONS.contains(&region.as_str()) && min_ms <= near_max_ms * 2.0));
+    (region, near)
 }
 
 /// 2.x 的 `ext`
@@ -178,6 +196,9 @@ pub struct SelectOpts {
     pub max_avg: f64,
     pub coverage_target: f64,
     pub min_auto: usize,
+    /// `benchmark.coverageRegion = near`：「覆蓋」階段先在鄰近的候選裡挑（規格 10 的 6.2）。
+    /// `false`（`any`）跟 3.3.7 一模一樣。`Default` 是 `false`（舊的行為）；設定的預設 `near` 由 `select_opts()` 帶入
+    pub near_first: bool,
 }
 
 impl Default for SelectOpts {
@@ -188,6 +209,7 @@ impl Default for SelectOpts {
             max_avg: 250.0,
             coverage_target: 0.97,
             min_auto: 3,
+            near_first: false,
         }
     }
 }
@@ -232,19 +254,33 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
             why: "最快",
         });
         let rest: Vec<usize> = eligible.iter().copied().filter(|&i| i != fastest).collect();
-        let rest_refs: Vec<&Scored> = rest.iter().map(|&i| finals[i]).collect();
-        let (steps, _) = greedy(&rest_refs, total, Strategy::Coverage, &covered);
-        for st in steps {
-            if selected.len() >= o.max_n || covered.len() as f64 >= total as f64 * o.coverage_target {
+        // 覆蓋：`near_first` 時分兩輪（先鄰近的、再其餘的），第二輪從第一輪結束時的覆蓋接著算；
+        // 兩輪共用台數上限與覆蓋率的停止條件。否則一輪、不分遠近（3.3.7）
+        let rounds: Vec<Vec<usize>> = if o.near_first {
+            let (near, far): (Vec<usize>, Vec<usize>) = rest.iter().partition(|&&i| finals[i].near);
+            vec![near, far]
+        } else {
+            vec![rest]
+        };
+        let done = |n: usize, c: usize| n >= o.max_n || c as f64 >= total as f64 * o.coverage_target;
+        'rounds: for round in rounds {
+            if done(selected.len(), covered.len()) {
                 break;
             }
-            let idx = rest[st.idx];
-            covered.extend(finals[idx].items());
-            selected.push(Pick {
-                idx,
-                newly: st.newly,
-                why: "覆蓋",
-            });
+            let refs: Vec<&Scored> = round.iter().map(|&i| finals[i]).collect();
+            let (steps, _) = greedy(&refs, total, Strategy::Coverage, &covered);
+            for st in steps {
+                if done(selected.len(), covered.len()) {
+                    break 'rounds;
+                }
+                let idx = round[st.idx];
+                covered.extend(finals[idx].items());
+                selected.push(Pick {
+                    idx,
+                    newly: st.newly,
+                    why: "覆蓋",
+                });
+            }
         }
     }
     for &i in &by_speed {
@@ -314,13 +350,13 @@ pub fn greedy_csv(servers: &[&Scored], total: usize, strategy: Strategy) -> Stri
     csv
 }
 
-/// final_dns_smart.csv（`finals` 依延遲排序）
+/// final_dns_smart.csv（`finals` 依延遲排序）。3.4.0 在最後加 `Region`、`Near` 兩欄（舊的欄位順序不變）
 pub fn final_csv(finals: &[&Scored]) -> String {
-    let mut csv = String::from("\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned\n");
+    let mut csv = String::from("\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near\n");
     for (i, s) in finals.iter().enumerate() {
         let e = &s.ext;
         csv.push_str(&format!(
-            "{},{},{},\"{}\",{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},\"{}\",{},{},{},{},{},{},{},{},{},{},{},{}\n",
             i + 1,
             s.id,
             s.kind,
@@ -334,7 +370,9 @@ pub fn final_csv(finals: &[&Scored]) -> String {
             e.exclusive_count,
             pct(e.exclusive_ratio_self, 2),
             pct(e.exclusive_ratio_global, 4),
-            if s.pinned { "Y" } else { "" }
+            if s.pinned { "Y" } else { "" },
+            s.region,
+            if s.near { "Y" } else { "" }
         ));
     }
     csv
@@ -389,5 +427,245 @@ mod tests {
         );
         assert_eq!(sel.covered, 6);
         assert!(greedy_csv(&refs, 7, Strategy::Coverage).contains("1,b,\"B__AS2\",udp,20.00,4,4,57.14%,貢獻 4 個新節點"));
+    }
+
+    fn near(mut s: Scored, n: bool) -> Scored {
+        s.near = n;
+        s
+    }
+
+    fn picks(sel: &Selection) -> Vec<(usize, usize, &'static str)> {
+        sel.selected.iter().map(|p| (p.idx, p.newly, p.why)).collect()
+    }
+
+    #[test]
+    fn classify_region_rules() {
+        assert_eq!(classify_region(true, "", 8.0, 60.0), ("TW".to_string(), true));
+        assert_eq!(
+            classify_region(true, "US", 100.0, 60.0),
+            ("TW".to_string(), true),
+            "台灣網段優先於國別"
+        );
+        assert_eq!(classify_region(false, "JP", 45.0, 60.0), ("JP".to_string(), true));
+        assert_eq!(
+            classify_region(false, "JP", 110.0, 60.0),
+            ("JP".to_string(), true),
+            "鄰近四地放寬到 2 倍"
+        );
+        assert_eq!(classify_region(false, "JP", 130.0, 60.0), ("JP".to_string(), false), "超過 2 倍");
+        assert_eq!(classify_region(false, "AU", 4.0, 60.0), ("AU".to_string(), true), "任播靠延遲");
+        assert_eq!(classify_region(false, "US", 90.0, 60.0), ("US".to_string(), false));
+        assert_eq!(classify_region(false, "", 80.0, 60.0), (String::new(), false));
+        assert_eq!(classify_region(false, "", 30.0, 60.0), (String::new(), true));
+        assert_eq!(classify_region(false, "sg", 70.0, 60.0), ("SG".to_string(), true));
+        assert_eq!(classify_region(false, "JP", 0.0, 60.0), ("JP".to_string(), false), "沒有成功紀錄");
+        assert_eq!(classify_region(true, "", 0.0, 60.0), ("TW".to_string(), false));
+    }
+
+    #[test]
+    fn near_candidates_picked_before_far() {
+        // 覆蓋量相同、一近一遠 → 近的（遠的比較快也一樣）
+        let mut v = vec![
+            near(srv("f", "F__AS1", 5.0, &[(0, 1)]), true),
+            near(srv("far", "X__AS2", 10.0, &[(1, 2), (1, 3)]), false),
+            near(srv("nr", "Y__AS3", 30.0, &[(2, 4), (2, 5)]), true),
+        ];
+        extended_metrics(&mut v, 10);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        let o = SelectOpts {
+            max_n: 2,
+            near_first: true,
+            ..Default::default()
+        };
+        assert_eq!(picks(&select(&refs, &asn, 5, &o)), vec![(0, 1, "最快"), (2, 2, "覆蓋")]);
+        let any = SelectOpts {
+            near_first: false,
+            ..o.clone()
+        };
+        assert_eq!(
+            picks(&select(&refs, &asn, 5, &any)),
+            vec![(0, 1, "最快"), (1, 2, "覆蓋")],
+            "any 照舊：一樣多取快的"
+        );
+
+        // 遠的覆蓋量較大，但近的也有新增 → 先近的
+        let mut v = vec![
+            near(srv("f", "F__AS1", 5.0, &[(0, 1)]), true),
+            near(srv("far", "X__AS2", 10.0, &[(1, 2), (1, 3), (1, 6), (1, 7)]), false),
+            near(srv("nr", "Y__AS3", 30.0, &[(2, 4)]), true),
+        ];
+        extended_metrics(&mut v, 10);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        assert_eq!(picks(&select(&refs, &asn, 7, &o)), vec![(0, 1, "最快"), (2, 1, "覆蓋")]);
+        assert_eq!(picks(&select(&refs, &asn, 7, &any)), vec![(0, 1, "最快"), (1, 4, "覆蓋")]);
+    }
+
+    #[test]
+    fn far_used_when_near_cannot_reach_target() {
+        let mut v = vec![
+            near(srv("f", "F__AS1", 5.0, &[(0, 1)]), true),
+            near(srv("n1", "A__AS2", 20.0, &[(1, 2)]), true),
+            near(srv("far1", "B__AS3", 10.0, &[(2, 3), (2, 4), (2, 5)]), false),
+            near(srv("n2", "C__AS4", 25.0, &[(0, 1)]), true), // 跟最快的一樣，沒有新增
+            near(srv("far2", "D__AS5", 15.0, &[(3, 6)]), false),
+        ];
+        extended_metrics(&mut v, 10);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        let o = SelectOpts {
+            max_n: 5,
+            near_first: true,
+            ..Default::default()
+        };
+        let sel = select(&refs, &asn, 6, &o);
+        assert_eq!(
+            picks(&sel),
+            vec![(0, 1, "最快"), (1, 1, "覆蓋"), (2, 3, "覆蓋"), (4, 1, "覆蓋")],
+            "近的用完還沒達標 → 補遠的（遠的之間照舊依新增量）"
+        );
+        assert_eq!(sel.covered, 6);
+        // 名額用完就不補
+        let o3 = SelectOpts { max_n: 2, ..o.clone() };
+        assert_eq!(picks(&select(&refs, &asn, 6, &o3)), vec![(0, 1, "最快"), (1, 1, "覆蓋")]);
+        // 近的就達標 → 不用遠的做「覆蓋」（不足 minAuto 台時照舊依速度補「備援」）
+        let ot = SelectOpts {
+            coverage_target: 0.3,
+            ..o.clone()
+        };
+        assert_eq!(
+            picks(&select(&refs, &asn, 6, &ot)),
+            vec![(0, 1, "最快"), (1, 1, "覆蓋"), (2, 0, "備援")]
+        );
+        // 一台近的都沒有 → 跟 any 一樣
+        let all_far: Vec<Scored> = v.iter().cloned().map(|s| near(s, false)).collect();
+        let refs2: Vec<&Scored> = all_far.iter().collect();
+        let any = SelectOpts {
+            near_first: false,
+            ..o.clone()
+        };
+        assert_eq!(select(&refs2, &asn, 6, &o), select(&refs2, &asn, 6, &any));
+    }
+
+    /// 3.3.7 的 `select()`（原封不動）：`near_first = false` 的結果要跟它逐項相同
+    fn select_337(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOpts) -> Selection {
+        let mut covered: HashSet<u64> = finals.iter().filter(|s| s.pinned).flat_map(|s| s.items()).collect();
+        let eligible: Vec<usize> = asn_best
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let s = finals[i];
+                !s.pinned && o.auto_types.contains(&s.kind) && s.avg <= o.max_avg && s.ext.success_rate >= 0.9
+            })
+            .collect();
+        let mut by_speed = eligible.clone();
+        by_speed.sort_by(|a, b| finals[*a].avg.partial_cmp(&finals[*b].avg).unwrap_or(std::cmp::Ordering::Equal));
+        let mut selected = Vec::new();
+        if let Some(&fastest) = by_speed.first() {
+            let nw: Vec<u64> = finals[fastest].items().filter(|k| !covered.contains(k)).collect();
+            let newly = nw.len();
+            covered.extend(nw);
+            selected.push(Pick {
+                idx: fastest,
+                newly,
+                why: "最快",
+            });
+            let rest: Vec<usize> = eligible.iter().copied().filter(|&i| i != fastest).collect();
+            let rest_refs: Vec<&Scored> = rest.iter().map(|&i| finals[i]).collect();
+            let (steps, _) = greedy(&rest_refs, total, Strategy::Coverage, &covered);
+            for st in steps {
+                if selected.len() >= o.max_n || covered.len() as f64 >= total as f64 * o.coverage_target {
+                    break;
+                }
+                let idx = rest[st.idx];
+                covered.extend(finals[idx].items());
+                selected.push(Pick {
+                    idx,
+                    newly: st.newly,
+                    why: "覆蓋",
+                });
+            }
+        }
+        for &i in &by_speed {
+            if selected.len() >= o.min_auto.min(o.max_n) {
+                break;
+            }
+            if !selected.iter().any(|p| p.idx == i) {
+                selected.push(Pick {
+                    idx: i,
+                    newly: 0,
+                    why: "備援",
+                });
+            }
+        }
+        Selection {
+            selected,
+            covered: covered.len(),
+        }
+    }
+
+    #[test]
+    fn any_matches_previous_selection() {
+        // 既有測試的預期值固定下來（near 標記不影響 any）
+        let mut v = vec![
+            near(srv("a", "A__AS1", 10.0, &[(0, 1), (1, 2)]), false),
+            near(srv("b", "B__AS2", 20.0, &[(0, 1), (1, 3), (2, 4), (2, 5)]), true),
+            near(srv("c", "C__AS3", 30.0, &[(0, 6)]), false),
+            near(srv("d", "D__AS2", 25.0, &[(0, 7)]), true),
+        ];
+        extended_metrics(&mut v, 10);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        let sel = select(&refs, &asn, 7, &SelectOpts::default());
+        assert_eq!(picks(&sel), vec![(0, 2, "最快"), (1, 3, "覆蓋"), (2, 1, "覆蓋")]);
+        assert_eq!(sel.covered, 6);
+        assert_eq!(sel, select_337(&refs, &asn, 7, &SelectOpts::default()));
+
+        // 亂數產生的多組輸入：any 跟 3.3.7 逐項相同
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..300 {
+            let n = 2 + rnd(12) as usize;
+            let mut v: Vec<Scored> = (0..n)
+                .map(|i| {
+                    let items: Vec<(u32, u32)> = (0..rnd(8)).map(|_| (rnd(4) as u32, rnd(10) as u32)).collect();
+                    let mut s = srv(&format!("s{i}"), &format!("O{}__AS{}", i, rnd(6)), (rnd(30) * 10) as f64, &items);
+                    s.pinned = rnd(10) == 0;
+                    s.near = rnd(2) == 0;
+                    s.count = 8 + rnd(3) as usize;
+                    s
+                })
+                .collect();
+            extended_metrics(&mut v, 10);
+            v.sort_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap());
+            let refs: Vec<&Scored> = v.iter().collect();
+            let asn = best_per_asn(&refs);
+            let o = SelectOpts {
+                max_n: 1 + rnd(5) as usize,
+                min_auto: rnd(5) as usize,
+                coverage_target: [0.5, 0.8, 0.97, 1.0][rnd(4) as usize],
+                max_avg: 250.0,
+                ..Default::default()
+            };
+            let total = 40;
+            assert_eq!(select(&refs, &asn, total, &o), select_337(&refs, &asn, total, &o), "第 {round} 組");
+        }
+    }
+
+    #[test]
+    fn final_csv_region_columns() {
+        let mut s = srv("a", "A__AS1", 10.0, &[(0, 1)]);
+        s.region = "JP".into();
+        s.near = true;
+        let csv = final_csv(&[&s]);
+        let mut lines = csv.lines();
+        assert!(lines.next().unwrap().ends_with(",Pinned,Region,Near"));
+        assert!(lines.next().unwrap().ends_with(",,JP,Y"));
     }
 }

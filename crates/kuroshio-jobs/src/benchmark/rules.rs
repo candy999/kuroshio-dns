@@ -3,11 +3,14 @@
 
 use serde_json::{json, Value};
 
-/// 一個 IP 的業者資訊（ip-api 查到的 ISP / AS，2.x 的 `{ raw, keywords }`，也是 cidr_cache.json 的格式）
+/// 一個 IP 的業者資訊（ip-api 查到的 ISP / AS，2.x 的 `{ raw, keywords }`，也是 cidr_cache.json 的格式）。
+/// 3.4.0 多一個選用的 `cc`（ip-api 的 `countryCode`，規格 10 的 6.1）；舊的快取沒有就是空字串
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AsnInfo {
     pub raw: String,
     pub keywords: Vec<String>,
+    /// 國別碼（大寫兩碼，例如 "TW"、"JP"）；查不到、或舊快取沒有時是空字串
+    pub cc: String,
 }
 
 impl AsnInfo {
@@ -16,11 +19,13 @@ impl AsnInfo {
         AsnInfo {
             raw: "Unknown_ISP".into(),
             keywords: Vec::new(),
+            cc: String::new(),
         }
     }
 
-    /// 由 ip-api 的欄位組出（同 2.x）：raw = `isp__as`（空白換成 _），關鍵字取自 `isp org as`
-    pub fn from_ip_api(isp: &str, org: &str, as_: &str) -> AsnInfo {
+    /// 由 ip-api 的欄位組出（同 2.x）：raw = `isp__as`（空白換成 _），關鍵字取自 `isp org as`；
+    /// `country_code` 是 ip-api 的 `countryCode`（沒有就給空字串）
+    pub fn from_ip_api(isp: &str, org: &str, as_: &str, country_code: &str) -> AsnInfo {
         let raw = format!("{isp}__{as_}");
         let mut out = String::with_capacity(raw.len());
         let mut in_space = false;
@@ -38,6 +43,7 @@ impl AsnInfo {
         AsnInfo {
             raw: out,
             keywords: extract_keywords(&format!("{isp} {org} {as_}")),
+            cc: country_code.trim().to_ascii_uppercase(),
         }
     }
 
@@ -54,8 +60,13 @@ impl AsnInfo {
         self.keywords.is_empty()
     }
 
+    /// 2.x 相容的兩個鍵不動；`cc` 不是空的時才寫
     pub fn to_json(&self) -> Value {
-        json!({ "raw": self.raw, "keywords": self.keywords })
+        let mut v = json!({ "raw": self.raw, "keywords": self.keywords });
+        if !self.cc.is_empty() {
+            v["cc"] = json!(self.cc);
+        }
+        v
     }
 
     pub fn from_json(v: &Value) -> Option<AsnInfo> {
@@ -66,6 +77,7 @@ impl AsnInfo {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_string)).collect())
                 .unwrap_or_default(),
+            cc: v.get("cc").and_then(Value::as_str).unwrap_or("").to_string(),
         })
     }
 
@@ -660,7 +672,19 @@ mod tests {
     use super::*;
 
     fn info(isp: &str, org: &str, as_: &str) -> AsnInfo {
-        AsnInfo::from_ip_api(isp, org, as_)
+        AsnInfo::from_ip_api(isp, org, as_, "")
+    }
+
+    #[test]
+    fn cc_in_cache_json() {
+        let old = json!({ "raw": "A__AS1_A", "keywords": ["a", "as1"] });
+        let i = AsnInfo::from_json(&old).unwrap();
+        assert_eq!(i.cc, "");
+        assert_eq!(i.to_json(), old, "沒有國別時寫出來跟 2.x 一樣");
+        let j = AsnInfo::from_ip_api("A", "A", "AS1 A", "jp");
+        assert_eq!(j.cc, "JP");
+        assert_eq!(j.to_json()["cc"], "JP");
+        assert_eq!(AsnInfo::from_json(&j.to_json()).unwrap(), j);
     }
 
     #[test]

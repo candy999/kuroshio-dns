@@ -94,7 +94,7 @@ impl Prober for Mapped {
 fn asn() -> Arc<dyn AsnSource> {
     let mut m = HashMap::new();
     let mut add = |k: &str, isp: &str, as_: &str| {
-        m.insert(k.to_string(), AsnInfo::from_ip_api(isp, isp, as_));
+        m.insert(k.to_string(), AsnInfo::from_ip_api(isp, isp, as_, ""));
     };
     add("93.1", "Alpha Networks", "AS100 Alpha Networks");
     add("94.2", "Beta Hosting", "AS200 Beta Hosting");

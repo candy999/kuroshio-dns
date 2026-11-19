@@ -23,6 +23,9 @@
 //! - 判斷：照原本的順序逐網域重跑同樣的規則（封殺、汙染、逾時淘汰），結果跟以前的流程相同。
 //!   原始答案只留到判斷完那個網域，被淘汰的候選隨即釋放。
 //! - 選擇與報表的計算放到 blocking 執行緒，不卡住 DNS。
+//!
+//! 3.4.0 的差異（上游多樣性，規格 10 第 6 節）：Phase 2 判斷每台上游的所在地（台灣網段、ip-api 的國別、
+//! 量到的最低延遲），`benchmark.coverageRegion = near`（預設）時「覆蓋」階段先挑鄰近的（台灣、日本、香港、新加坡）。
 
 pub mod probe;
 pub mod rules;
@@ -133,6 +136,21 @@ pub struct Benchmark {
     pub path: PathSource,
     /// 最近一次報表的摘要另存到這裡（報表目錄在記憶體裡時；重開機後還查得到）
     pub keep_last: Option<PathBuf>,
+    /// 台灣網段（`geo/tw-ip.json`）：判斷上游在不在台灣（規格 10 的 6.1）。None = 讀不到，只靠國別與延遲
+    pub tw: Option<Arc<crate::geo::TwIp>>,
+}
+
+/// 讀台灣網段（`tw-ip.json`，約 41 KB）給評測用；讀不到或格式錯誤是 None（不影響評測，只少一個訊號）。
+/// 評測在子程序跑時要在子程序裡自己讀
+pub fn read_tw_ip(path: &Path) -> Option<Arc<crate::geo::TwIp>> {
+    let bytes = std::fs::read(path).ok()?;
+    match crate::geo::TwIp::parse(&bytes) {
+        Ok(t) => Some(Arc::new(t)),
+        Err(e) => {
+            warn!("[{JOB_NAME}] {} 格式錯誤，判斷上游所在地時不用台灣網段：{e:#}", path.display());
+            None
+        }
+    }
 }
 
 /// 評測前的路徑檢查從哪裡來
@@ -168,7 +186,14 @@ impl Benchmark {
             progress: Arc::new(Mutex::new(None)),
             path: PathSource::Off,
             keep_last: None,
+            tw: None,
         }
+    }
+
+    /// 指定台灣網段（`read_tw_ip` 讀出來的）
+    pub fn with_tw(mut self, tw: Option<Arc<crate::geo::TwIp>>) -> Benchmark {
+        self.tw = tw;
+        self
     }
 
     /// 指定路徑檢查的結果（測試）
@@ -273,6 +298,8 @@ struct BenchCfg {
     keep_days: u64,
     pinned: Vec<String>,
     select: SelectOpts,
+    /// `benchmark.nearMaxMs`：最低延遲在這以內就算鄰近
+    near_max_ms: f64,
 }
 
 fn pos_f64(cfg: &Value, k: &str) -> Option<f64> {
@@ -290,6 +317,7 @@ impl BenchCfg {
             keep_days: pos_f64(cfg, "benchmark.keepDays").unwrap_or(14.0) as u64,
             pinned: strings(cfg, "upstream.pinned").unwrap_or_default(),
             select: select_opts(cfg),
+            near_max_ms: kuroshio_config::chain::coverage_region_of(cfg).1,
         }
     }
 }
@@ -386,7 +414,8 @@ fn strings(cfg: &Value, k: &str) -> Option<Vec<String>> {
         .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
 }
 
-/// 選上游的參數（`upstream.autoTypes`、`autoMax`，`benchmark.maxAvgLatencyMs`、`coverageTarget`、`minAuto`；0 或缺少時用 2.x 的預設）
+/// 選上游的參數（`upstream.autoTypes`、`autoMax`，`benchmark.maxAvgLatencyMs`、`coverageTarget`、`minAuto`；0 或缺少時用 2.x 的預設；
+/// `benchmark.coverageRegion`：預設 `near`）
 pub fn select_opts(cfg: &Value) -> SelectOpts {
     SelectOpts {
         auto_types: strings(cfg, "upstream.autoTypes").unwrap_or_else(|| SelectOpts::default().auto_types),
@@ -394,6 +423,7 @@ pub fn select_opts(cfg: &Value) -> SelectOpts {
         max_avg: pos_f64(cfg, "benchmark.maxAvgLatencyMs").unwrap_or(250.0),
         coverage_target: pos_f64(cfg, "benchmark.coverageTarget").unwrap_or(0.97),
         min_auto: pos_f64(cfg, "benchmark.minAuto").unwrap_or(3.0) as usize,
+        near_first: kuroshio_config::chain::coverage_region_of(cfg).0 == kuroshio_config::chain::CoverageRegion::Near,
     }
 }
 
@@ -403,6 +433,8 @@ struct AsnCache {
     map: HashMap<String, AsnInfo>,
     /// 這次執行查不到的 /16（不重複查；2.x 每個網域都會重查，ip-api 連不上時每題都要等）
     failed: HashSet<String>,
+    /// 這次執行已經向 ip-api 問過的 /16（含補問國別的）：快取裡沒有國別的舊資料只補問一次，查不到也不重問
+    cc_tried: HashSet<String>,
     dirty: bool,
 }
 
@@ -422,18 +454,25 @@ impl AsnCache {
         AsnCache {
             map,
             failed: HashSet::new(),
+            cc_tried: HashSet::new(),
             dirty: false,
         }
     }
 
-    async fn lookup(&mut self, src: &dyn AsnSource, ips: &[IpAddr]) -> HashMap<IpAddr, AsnInfo> {
+    /// 查業者。`want_cc`：快取裡有這個 /16 但沒有國別（3.4.0 以前的快取）時當成沒查過、補問一次
+    /// （只用在 Phase 2 決選的上游位址；汙染判斷的查詢量很大，不補問，也不整批重查 cidr_cache.json）
+    async fn lookup(&mut self, src: &dyn AsnSource, ips: &[IpAddr], want_cc: bool) -> HashMap<IpAddr, AsnInfo> {
         // 每個 /16 只查一個代表
         let mut reps: Vec<Ipv4Addr> = Vec::new();
         let mut seen = HashSet::new();
         for ip in ips {
             if let IpAddr::V4(v4) = ip {
                 let k = sub_key(*v4);
-                if !self.map.contains_key(&k) && !self.failed.contains(&k) && seen.insert(k) {
+                let need = match self.map.get(&k) {
+                    None => !self.failed.contains(&k),
+                    Some(i) => want_cc && i.cc.is_empty() && !self.cc_tried.contains(&k),
+                };
+                if need && seen.insert(k) {
                     reps.push(*v4);
                 }
             }
@@ -447,8 +486,9 @@ impl AsnCache {
             for ip in reps {
                 let k = sub_key(ip);
                 if !self.map.contains_key(&k) {
-                    self.failed.insert(k);
+                    self.failed.insert(k.clone());
                 }
+                self.cc_tried.insert(k);
             }
         }
         let mut out = HashMap::new();
@@ -560,6 +600,9 @@ impl Srv {
             count: self.lat_count,
             history: std::mem::take(&mut self.history),
             ext: Default::default(),
+            // Phase 2 查完業者之後才填（classify_region）
+            region: String::new(),
+            near: false,
         }
     }
 }
@@ -952,7 +995,7 @@ impl Benchmark {
 
             // 污染判斷（v16.1 邏輯）
             let all_ips: Vec<IpAddr> = ok.iter().flat_map(|(_, ips, _)| ips.iter().map(|i| IpAddr::V4(*i))).collect();
-            let ip_info = cache.lookup(&*self.asn, &all_ips).await;
+            let ip_info = cache.lookup(&*self.asn, &all_ips, false).await;
             for (_, ips, _) in &ok {
                 universe.extend(ips.iter().map(|ip| select::item(dix, u32::from(*ip))));
             }
@@ -1197,19 +1240,24 @@ impl Benchmark {
             host_ip.push(ip);
         }
         let owner_info = cache
-            .lookup(&*self.asn, &host_ip.iter().flatten().copied().collect::<Vec<_>>())
+            .lookup(&*self.asn, &host_ip.iter().flatten().copied().collect::<Vec<_>>(), true)
             .await;
+        // 所在地（規格 10 的 6.1）：台灣網段 → ip-api 的國別 → 都沒有；鄰近再看量到的最低延遲
+        let tw_nets = self.tw.as_ref().map(|t| t.all());
         let scored_list: Vec<Scored> = finals
             .iter()
             .zip(&host_ip)
             .map(|(&i, ip)| {
-                let owner = match ip {
-                    Some(ip) => owner_info.get(ip).map(|x| x.raw.clone()).unwrap_or_else(|| "Unknown".into()),
-                    None => "Unknown".into(),
-                };
-                all[i].scored(owner)
+                let info = ip.and_then(|ip| owner_info.get(&ip));
+                let owner = info.map(|x| x.raw.clone()).unwrap_or_else(|| "Unknown".into());
+                let mut s = all[i].scored(owner);
+                let in_tw = matches!((&tw_nets, ip), (Some(n), Some(ip)) if n.contains(*ip));
+                let cc = info.map(|x| x.cc.as_str()).unwrap_or("");
+                (s.region, s.near) = select::classify_region(in_tw, cc, s.min, cfg.near_max_ms);
+                s
             })
             .collect();
+        drop(tw_nets);
         let eliminated: Vec<(String, &'static str, String)> = all
             .iter()
             .filter(|s| !s.alive)
@@ -1233,7 +1281,7 @@ impl Benchmark {
             .iter()
             .map(|p| {
                 let s = &calc.finals[p.idx];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near })
             })
             .collect();
         let pinned: Vec<Value> = calc
@@ -1256,6 +1304,35 @@ impl Benchmark {
             "path": path.as_ref().map(|r| { let mut j = r.to_json(); j["policy"] = json!(policy); j }),
             "reportDir": out_dir.as_ref().map(|d| d.display().to_string()),
         });
+        // 覆蓋階段的遠近（規格 10 的 6.2）：寫進 judge.log
+        let (near_n, far_n) = calc
+            .selection
+            .selected
+            .iter()
+            .filter(|p| p.why == "覆蓋")
+            .fold(
+                (0usize, 0usize),
+                |(n, f), p| {
+                    if calc.finals[p.idx].near {
+                        (n + 1, f)
+                    } else {
+                        (n, f + 1)
+                    }
+                },
+            );
+        jinfo!(
+            journal,
+            "  覆蓋：鄰近 {near_n} 台、其他 {far_n} 台（{}）",
+            if cfg.select.near_first {
+                format!(
+                    "先挑鄰近的，最低延遲 {} ms 以內或台日港新 {} ms 以內",
+                    to_fixed(cfg.near_max_ms, 0),
+                    to_fixed(cfg.near_max_ms * 2.0, 0)
+                )
+            } else {
+                "不分遠近".to_string()
+            }
+        );
         write_json(&self.paths.upstreams_file, &state)?;
         if let Some(d) = &out_dir {
             for (name, body) in &calc.reports {
@@ -1755,6 +1832,98 @@ mod list_merge_tests {
         // 使用者沒有這個檔：只用程式附帶的
         std::fs::write(shipped.join("dotlist.txt"), "tls://dot.example\n").unwrap();
         assert_eq!(p.read_lists("dotlist.txt"), vec!["tls://dot.example"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod asn_cache_tests {
+    use super::*;
+
+    /// 記下每次被問了哪些位址；`offline` 時什麼都不回
+    struct Counting {
+        calls: Mutex<Vec<Vec<Ipv4Addr>>>,
+        offline: bool,
+    }
+
+    impl AsnSource for Counting {
+        fn lookup(&self, ips: Vec<Ipv4Addr>) -> BoxFuture<Vec<(Ipv4Addr, AsnInfo)>> {
+            self.calls.lock().unwrap().push(ips.clone());
+            let out = if self.offline {
+                Vec::new()
+            } else {
+                ips.into_iter()
+                    .map(|ip| (ip, AsnInfo::from_ip_api("Example Net", "", "AS64500 Example", "JP")))
+                    .collect()
+            };
+            Box::pin(async move { out })
+        }
+    }
+
+    fn v4(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn asn_cache_reads_old_format_and_backfills_cc() {
+        let root = std::env::temp_dir().join(format!("kuroshio-asncc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut p = BenchPaths::from_config(&json!({}), &root.join("state"), &root);
+        p.out_root = Some(root.join("out"));
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        // 3.3.7 的快取：沒有 cc
+        std::fs::write(
+            root.join("out/cidr_cache.json"),
+            r#"{"198.51":{"raw":"Old_Net__AS64501_Old","keywords":["old","as64501"]},"203.0":{"raw":"Other__AS64502","keywords":["other"]}}"#,
+        )
+        .unwrap();
+        for offline in [false, true] {
+            let mut c = AsnCache::load(&p);
+            assert_eq!(c.map.len(), 2, "舊格式讀得進來");
+            assert_eq!(c.map["198.51"].cc, "");
+            let src = Counting {
+                calls: Mutex::new(Vec::new()),
+                offline,
+            };
+            // 汙染判斷那邊（want_cc = false）不補查
+            let r = c.lookup(&src, &[v4("198.51.100.1"), v4("203.0.113.1")], false).await;
+            assert_eq!(r[&v4("198.51.100.1")].raw, "Old_Net__AS64501_Old");
+            assert!(src.calls.lock().unwrap().is_empty());
+            // 決選的上游位址（want_cc）：沒有國別的 /16 補查一次（同一個 /16 只送一個代表）
+            let r = c.lookup(&src, &[v4("198.51.100.1"), v4("198.51.100.2")], true).await;
+            assert_eq!(*src.calls.lock().unwrap(), vec![vec!["198.51.100.1".parse::<Ipv4Addr>().unwrap()]]);
+            let got = &r[&v4("198.51.100.1")];
+            if offline {
+                // 查不到：留著舊資料、國別是空的，不算失敗
+                assert_eq!(got.raw, "Old_Net__AS64501_Old");
+                assert_eq!(got.cc, "");
+                assert!(!c.dirty);
+            } else {
+                assert_eq!(got.cc, "JP");
+                assert!(c.dirty);
+            }
+            // 同一次執行不重複補查
+            c.lookup(&src, &[v4("198.51.100.3")], true).await;
+            assert_eq!(src.calls.lock().unwrap().len(), 1);
+            // 還沒補查過的另一個 /16 照樣補一次
+            c.lookup(&src, &[v4("203.0.113.9")], true).await;
+            assert_eq!(src.calls.lock().unwrap().len(), 2);
+            // 存檔：有國別的才多 "cc"，2.x 的兩個鍵不動
+            let f = root.join(format!("saved-{offline}.json"));
+            c.save(&f).unwrap();
+            let v: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+            assert_eq!(v["198.51"].get("cc").is_some(), !offline);
+            assert!(v["198.51"]["raw"].is_string() && v["198.51"]["keywords"].is_array());
+        }
+        // 這次執行查不到的 /16：want_cc 時也不重問
+        let mut c = AsnCache::load(&p);
+        let src = Counting {
+            calls: Mutex::new(Vec::new()),
+            offline: true,
+        };
+        c.lookup(&src, &[v4("192.0.2.1")], false).await;
+        c.lookup(&src, &[v4("192.0.2.1")], true).await;
+        assert_eq!(src.calls.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -97,6 +97,7 @@ pub fn sub_key(ip: Ipv4Addr) -> String {
 }
 
 // ---------------- ip-api.com（同 2.x：批次 100 筆、免費版只有 http、每分鐘 15 次） ----------------
+// 3.4.0 起多要 `countryCode`（上游多樣性判斷國別用，規格 10 的 6.1）
 
 /// ip-api.com 批次查詢。複製出來的共用同一份速率限制狀態，同一個實例在多次評測之間重複使用。
 #[derive(Clone)]
@@ -162,7 +163,7 @@ impl IpApiInner {
             .await
             .map_err(|_| anyhow!("連線逾時"))??;
         let req = format!(
-            "POST /batch?fields=status,query,isp,as,org HTTP/1.1\r\nHost: {}\r\nUser-Agent: kuroshio/{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /batch?fields=status,query,isp,as,org,countryCode HTTP/1.1\r\nHost: {}\r\nUser-Agent: kuroshio/{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.host,
             env!("CARGO_PKG_VERSION"),
             body.len()
@@ -217,7 +218,7 @@ impl IpApiInner {
                     }
                     let f = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let Ok(ip) = f("query").parse::<Ipv4Addr>() else { continue };
-                    out.push((ip, AsnInfo::from_ip_api(&f("isp"), &f("org"), &f("as"))));
+                    out.push((ip, AsnInfo::from_ip_api(&f("isp"), &f("org"), &f("as"), &f("countryCode"))));
                 }
                 // 速率：X-Rl 剩餘次數、X-Ttl 幾秒後重置；同 2.x 每批之間至少間隔 4.2 秒
                 let left: Option<u64> = resp.header("x-rl").and_then(|v| v.parse().ok());
