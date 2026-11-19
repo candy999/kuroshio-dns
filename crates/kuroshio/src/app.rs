@@ -975,11 +975,7 @@ fn start_community(
     if !c.enabled {
         return None;
     }
-    let key_dir = get(cfg, "community.dir")
-        .and_then(Value::as_str)
-        .filter(|d| !d.is_empty())
-        .map(|d| rel_path(base_dir, d))
-        .unwrap_or_else(|| base_dir.join("community"));
+    let key_dir = crate::chain::ident::key_dir(cfg, base_dir);
     let mut opts = Options::new(key_dir, persist_dir(cfg));
     opts.provider = Arc::new(crate::community_bridge::CdnData {
         cdn: cdn.clone(),
@@ -1759,6 +1755,15 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         f.set_copies(persister.clone());
         f.spawn();
         resolver.set_filter(Some(f.clone()));
+    }
+    // 串接模式的上游回應器（規格 1.9）：在明文監聽之前接上；金鑰等第一次有下游來問才讀／建立
+    {
+        let settings = kuroshio_config::chain::ChainSettings::from_cfg(cfg);
+        for w in &settings.warnings {
+            warn!("{w}");
+        }
+        let key = Arc::new(crate::chain::ident::NodeKey::new(crate::chain::ident::key_dir(cfg, &base_dir)));
+        let _ = resolver.chain.set(crate::chain::responder::Responder::new(&settings, key));
     }
     // 明文 DNS 監聽：越早越好（重新啟動時區網斷線的時間越短）。CDN 網域資料庫、過濾清單等大的載入都在這之後
     let acl_list = strings(get(cfg, "listen.plain.allowFrom"));

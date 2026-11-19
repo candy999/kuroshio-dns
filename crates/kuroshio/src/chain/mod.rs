@@ -15,3 +15,6 @@ pub mod grants;
 pub mod ident;
 pub mod responder;
 pub mod share;
+
+pub use ident::{key_dir, NodeKey};
+pub use responder::Responder;

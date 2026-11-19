@@ -167,6 +167,8 @@ pub struct Resolver {
     pub presence: std::sync::OnceLock<Arc<crate::presence::Presence>>,
     /// 來源 IP 存取控制（規格 08）；沒設定 = 不擋
     pub access: std::sync::OnceLock<Arc<crate::ipfilter::Access>>,
+    /// 串接模式的上游回應器（`chain.kuroshio` 的 CH 查詢）；沒設定 = 一律 REFUSED
+    pub chain: std::sync::OnceLock<Arc<crate::chain::responder::Responder>>,
     /// 本機對外 IP 的 /24（啟動後偵測）
     pub ecs_subnet: RwLock<Option<(IpAddr, u8)>>,
     inflight: Mutex<HashMap<String, Waiters>>,
@@ -240,6 +242,7 @@ impl Resolver {
             site: std::sync::OnceLock::new(),
             presence: std::sync::OnceLock::new(),
             access: std::sync::OnceLock::new(),
+            chain: std::sync::OnceLock::new(),
             ecs_subnet: RwLock::new(None),
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
@@ -423,6 +426,16 @@ impl Resolver {
                 });
             }
             return msg(r);
+        }
+        // 串接模式（3.4.0）：CH 類別的 chain.kuroshio 一律在這裡回答，不過濾、不快取、不轉給上游。
+        // 條件同 version.kuroshio：只回答區網的一般 DNS，公開的加密監聽一律 REFUSED
+        if qclass == 3 && kuroshio_community::chain::in_zone(&qname) {
+            self.stats.count(StatKind::Local);
+            return msg(match self.chain.get() {
+                Some(c) if matches!(ctx.proto, "udp" | "tcp") && is_private_client(ctx.client) => c.answer(&query, &qname, ctx),
+                Some(c) => c.refuse_not_private(&query),
+                None => Message::response_to(&query, 5),
+            });
         }
         if qclass == 1 && (qname == "_dns.resolver.arpa" || qname == "resolver.arpa") {
             self.stats.count(StatKind::Local);
