@@ -2,13 +2,14 @@
 //!
 //! - 只有 `resolver.rs::handle_inner` 呼叫：CH 類別、名稱在 `chain.kuroshio` 區域裡的查詢一律交給這裡，
 //!   不論結果都不往下走（不過濾、不快取、不轉給上游）
-//! - auth（挑戰／回應，WP3）、reg（下游登記，WP6：四項檢查都過才寫進登記表）；manifest、分段由 WP5 接上
+//! - auth（挑戰／回應）；reg（下游登記，WP6：四項檢查都過才寫進登記表）；共用結果的清單與分段（WP5，只接受 TCP）
 //! - `allow_downstream` 關著時照樣簽章回答 auth（`allow = false`、`caps` 是空的），並記下有下游來問過（`probes`）
 //! - 速率限制（簽章要花 CPU）：每個來源每秒 4 次、可累積 8 次；全部來源合計每秒 32 次、可累積 64 次；
 //!   來源表最多 64 筆，滿了丟最久沒更新的
 
 use super::grants::Grants;
 use super::ident::NodeKey;
+use super::share::ShareCache;
 use crate::resolver::Ctx;
 use kuroshio_community::chain::{open_reg, parse_name, seal, token, token_ok, txt_rdata, AuthBody, Name, OPT_CODE, PROTO, TOKEN_WINDOW_MS};
 use kuroshio_community::envelope::to_cbor;
@@ -17,8 +18,8 @@ use kuroshio_proto::message::{Message, RData, Record};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 /// 每個來源每秒補幾次
@@ -32,17 +33,21 @@ const GLOBAL_BURST: f64 = 64.0;
 /// 速率限制表最多記幾個來源
 pub const MAX_SOURCES: usize = 64;
 
-/// `allow_downstream` 開著時公告的能力（共用結果的 `share` 由 WP5 加進來；登記的 `reg` 在 [`Responder::caps`] 加）。
-/// 沒有的能力下游不會去問
-const CAPS: &[&str] = &[];
+/// 共用結果的分段：每個來源每秒 64 段（可累積 64 段）；全部來源合計每秒 128 段
+const CHUNK_RATE: (f64, f64, f64, f64) = (64.0, 64.0, 128.0, 128.0);
+/// 同時在傳分段的請求數上限（規格 3.3：同時最多 2 條在傳分段的 TCP 連線）
+const MAX_CHUNK_INFLIGHT: usize = 2;
 
 const RCODE_SERVFAIL: u16 = 2;
+const RCODE_NXDOMAIN: u16 = 3;
 const RCODE_REFUSED: u16 = 5;
 
 /// 權杖桶：每個來源一個，再加一個全域的
 struct Limiter {
     sources: HashMap<IpAddr, (f64, Instant)>,
     global: (f64, Instant),
+    /// （每個來源每秒、每個來源累積、全域每秒、全域累積）
+    rates: (f64, f64, f64, f64),
 }
 
 fn refill(b: &mut (f64, Instant), rate: f64, burst: f64, now: Instant) {
@@ -53,9 +58,14 @@ fn refill(b: &mut (f64, Instant), rate: f64, burst: f64, now: Instant) {
 
 impl Limiter {
     fn new() -> Limiter {
+        Limiter::with((PER_SOURCE_RATE, PER_SOURCE_BURST, GLOBAL_RATE, GLOBAL_BURST))
+    }
+
+    fn with(rates: (f64, f64, f64, f64)) -> Limiter {
         Limiter {
             sources: HashMap::new(),
-            global: (GLOBAL_BURST, Instant::now()),
+            global: (rates.3, Instant::now()),
+            rates,
         }
     }
 
@@ -67,9 +77,10 @@ impl Limiter {
                 self.sources.remove(&oldest);
             }
         }
-        refill(&mut self.global, GLOBAL_RATE, GLOBAL_BURST, now);
-        let src = self.sources.entry(ip).or_insert((PER_SOURCE_BURST, now));
-        refill(src, PER_SOURCE_RATE, PER_SOURCE_BURST, now);
+        let (rate, burst, grate, gburst) = self.rates;
+        refill(&mut self.global, grate, gburst, now);
+        let src = self.sources.entry(ip).or_insert((burst, now));
+        refill(src, rate, burst, now);
         if src.0 < 1.0 || self.global.0 < 1.0 {
             return false;
         }
@@ -144,6 +155,24 @@ pub struct Responder {
     bypass_list_active: AtomicBool,
     /// 登記中的下游（規格第 4 節；只在記憶體，跟著回應器重建）
     grants: Arc<Grants>,
+    /// 共用結果（`app` 在 CDN、過濾都啟動之後設定；沒設定 = 還沒就緒，不公告 `share`）
+    share: OnceLock<Arc<ShareCache>>,
+    /// 分段的速率限制（另一組桶）
+    chunk_limiter: Mutex<Limiter>,
+    /// 正在回答的分段請求數
+    chunk_inflight: AtomicUsize,
+    share_requests: AtomicU64,
+    share_chunks: AtomicU64,
+    share_last: AtomicU64,
+}
+
+/// 分段請求數：離開時減 1
+struct Inflight<'a>(&'a AtomicUsize);
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Responder {
@@ -166,7 +195,23 @@ impl Responder {
             key_warned: AtomicBool::new(false),
             bypass_list_active: AtomicBool::new(false),
             grants,
+            share: OnceLock::new(),
+            chunk_limiter: Mutex::new(Limiter::with(CHUNK_RATE)),
+            chunk_inflight: AtomicUsize::new(0),
+            share_requests: AtomicU64::new(0),
+            share_chunks: AtomicU64::new(0),
+            share_last: AtomicU64::new(0),
         })
+    }
+
+    /// 接上共用結果（只能設定一次）；之後 `allow_downstream` 開著時公告 `share`
+    pub fn set_share(&self, cache: Arc<ShareCache>) {
+        let _ = self.share.set(cache);
+    }
+
+    /// 共用結果的快取（還沒就緒是 None）
+    pub fn share(&self) -> Option<&Arc<ShareCache>> {
+        self.share.get()
     }
 
     /// qname 在 chain.kuroshio 區域裡時呼叫；一定回一個回應（成功或 REFUSED / SERVFAIL）
@@ -178,13 +223,9 @@ impl Responder {
         };
         match parse_name(qname) {
             Some(Name::Auth(nonce)) => self.auth(query, q.qtype, &nonce, ctx),
+            Some(Name::Manifest) => self.shared(query, q.qtype, None, ctx),
+            Some(Name::Chunk { oid, idx }) => self.shared(query, q.qtype, Some((oid, idx)), ctx),
             Some(Name::Reg) => self.reg(query, q.qtype, ctx),
-            Some(Name::Manifest | Name::Chunk { .. }) => {
-                if !self.allow_downstream {
-                    self.refused_not_allowed.fetch_add(1, Ordering::Relaxed);
-                }
-                Message::response_to(query, RCODE_REFUSED)
-            }
             None => Message::response_to(query, RCODE_REFUSED),
         }
     }
@@ -327,6 +368,70 @@ impl Responder {
         r
     }
 
+    /// 共用結果的清單（`chunk` = None）與分段（規格 3.2、3.3）：只接受 TCP、`allow_downstream` 開著、
+    /// 記憶體壓力是 Normal；不符合回 REFUSED。分段的物件不在目前的快取裡回 NXDOMAIN
+    fn shared(&self, query: &Message, qtype: u16, chunk: Option<([u8; 8], u32)>, ctx: &Ctx) -> Message {
+        if !self.allow_downstream {
+            self.refused_not_allowed.fetch_add(1, Ordering::Relaxed);
+            return Message::response_to(query, RCODE_REFUSED);
+        }
+        let Some(cache) = self.share.get() else {
+            return Message::response_to(query, RCODE_REFUSED);
+        };
+        if ctx.proto != "tcp" || !cache.pressure_ok() {
+            return Message::response_to(query, RCODE_REFUSED);
+        }
+        if qtype != 16 && qtype != 255 {
+            return Message::response_to(query, 0);
+        }
+        let ip = ctx.client.to_canonical();
+        let payload = match chunk {
+            None => {
+                // 清單要簽章：沿用 auth 的速率限制
+                if !self.rate_ok(ip) {
+                    return Message::response_to(query, RCODE_REFUSED);
+                }
+                let Ok(key) = self.key.get() else {
+                    return Message::response_to(query, RCODE_SERVFAIL);
+                };
+                let now = now_ms();
+                let Some(m) = cache.manifest(&key, now) else {
+                    return Message::response_to(query, RCODE_REFUSED);
+                };
+                self.share_requests.fetch_add(1, Ordering::Relaxed);
+                self.share_last.store(now, Ordering::Relaxed);
+                m
+            }
+            Some((oid, idx)) => {
+                if !self.chunk_limiter.lock().unwrap().allow(ip, Instant::now()) {
+                    self.refused_rate.fetch_add(1, Ordering::Relaxed);
+                    return Message::response_to(query, RCODE_REFUSED);
+                }
+                let n = self.chunk_inflight.fetch_add(1, Ordering::SeqCst);
+                let _g = Inflight(&self.chunk_inflight);
+                if n >= MAX_CHUNK_INFLIGHT {
+                    return Message::response_to(query, RCODE_REFUSED);
+                }
+                match cache.chunk(&oid, idx) {
+                    Some(b) => {
+                        self.share_chunks.fetch_add(1, Ordering::Relaxed);
+                        b
+                    }
+                    None => return Message::response_to(query, RCODE_NXDOMAIN),
+                }
+            }
+        };
+        let mut r = Message::response_to(query, 0);
+        r.answers.push(Record {
+            name: query.questions[0].name.clone(),
+            rtype: 16,
+            class: 3,
+            ttl: 0,
+            data: RData::Raw(txt_rdata(&payload)),
+        });
+        r
+    }
+
     /// 繞過防護清單的豁免：這個來源是登記中的下游、而且名稱在它登記的 names 裡（解析流程只在命中 `bypass` 清單後呼叫）
     pub fn exempt(&self, client: IpAddr, qname: &str) -> bool {
         self.grants.exempt(client, qname, Instant::now())
@@ -342,15 +447,18 @@ impl Responder {
         *self.upstream_path.lock().unwrap() = path;
     }
 
-    /// 公告的能力（`allow_downstream` 關著是空的）
+    /// 公告的能力（`allow_downstream` 關著是空的）：`share` = 共用結果已就緒（WP6 加 `reg`）
     pub fn caps(&self) -> Vec<&'static str> {
+        let mut caps = Vec::new();
         if !self.allow_downstream {
-            return Vec::new();
+            return caps;
         }
-        let mut v = CAPS.to_vec();
+        if self.share.get().is_some() {
+            caps.push("share");
+        }
         // 下游登記（放行：存取控制與繞過防護清單）
-        v.push("reg");
-        v
+        caps.push("reg");
+        caps
     }
 
     /// `upstream.allowDownstream`
@@ -431,7 +539,13 @@ impl Responder {
             "nodeId": self.key.node_id(),
             "fingerprint": self.key.fingerprint(),
             "downstreams": downstreams,
-            "share": { "requests": 0, "lastAt": null, "cacheBytes": 0 },
+            "share": {
+                "ready": self.allow_downstream && self.share.get().is_some(),
+                "requests": self.share_requests.load(Ordering::Relaxed),
+                "chunks": self.share_chunks.load(Ordering::Relaxed),
+                "lastAt": match self.share_last.load(Ordering::Relaxed) { 0 => Value::Null, t => json!(t) },
+                "cacheBytes": self.share.get().map_or(0, |c| c.bytes()),
+            },
             "probes": { "count24h": count24h, "lastAt": last },
             "refused": {
                 "rate": self.refused_rate.load(Ordering::Relaxed),

@@ -649,7 +649,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "network": { "path": path },
                 // 串接模式（3.4.0，規格 1.10）：下游與上游兩種角色
                 "chain": crate::chain::client::api_json(),
-                "autoUpstreams": r.upstreams.auto_info(),
+                // source：chain（上游黑潮給的）／benchmark（自己評測的）
+                "autoUpstreams": crate::chain::share::auto_info(&r.upstreams),
                 "filter": filter,
                 "cdn": r.cdn().map(|c| c.status_lite()),
                 "jobs": st.scheduler.as_ref().map(|s| s.status()),

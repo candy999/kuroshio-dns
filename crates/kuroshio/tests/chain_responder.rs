@@ -272,7 +272,13 @@ async fn chain_queries_never_reach_upstream() {
     ];
     for (i, name) in names.iter().enumerate() {
         assert_eq!(rcode(&ask_udp(s.bound[0], &chaos(i as u16, name)).await), 5, "{name}");
-        assert_eq!(rcode(&ask_tcp(s.bound[1], &chaos(i as u16, name)).await), 5, "{name}（TCP）");
+        // 共用結果（WP5）：TCP 問清單會回答、問不在快取裡的分段是 NXDOMAIN（一樣不轉給上游）
+        let tcp = match *name {
+            "m.s.chain.kuroshio" => 0,
+            "0.0011223344556677.s.chain.kuroshio" => 3,
+            _ => 5,
+        };
+        assert_eq!(rcode(&ask_tcp(s.bound[1], &chaos(i as u16, name)).await), tcp, "{name}（TCP）");
     }
     // 其他型別的 auth 名稱：空答案，也不問上游
     let mut q = Message::parse(&chaos(99, &auth_name(&nonce(1)))).unwrap();

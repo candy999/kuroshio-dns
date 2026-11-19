@@ -449,7 +449,12 @@ pub struct FilterService {
     update_run: Mutex<UpdateRun>,
     /// 每次更新結束時送出那一次的 runId（`?wait=1` 等結果用）
     update_done: tokio::sync::watch::Sender<u64>,
+    /// 串接模式（3.4.0）：從上游黑潮拿到副本的清單（網址 → Unix 秒）；6 小時內的這一輪不下載（當成 304）
+    shared_at: Mutex<HashMap<String, u64>>,
 }
+
+/// 從上游黑潮拿到的副本多久內不再自己下載（規格 10 第 3.4 節）
+const SHARED_FRESH_SECS: u64 = 6 * 3600;
 
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -542,6 +547,7 @@ impl FilterService {
             missing: Mutex::new(Vec::new()),
             update_run: Mutex::new(UpdateRun::default()),
             update_done: tokio::sync::watch::channel(0).0,
+            shared_at: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -628,6 +634,79 @@ impl FilterService {
 
     pub fn copies(&self) -> Option<&ListCopies> {
         self.copies.get()
+    }
+
+    // ---------------- 串接模式的清單副本（3.4.0，規格 10 第 3.3、3.4 節） ----------------
+
+    /// 上游：可以分享的副本（目前啟用、沒有被停用、檔案已經寫在磁碟上的）：（網址，紀錄，檔案路徑）。
+    /// 只列檔案，不讀內容
+    pub fn shared_copies(&self) -> Vec<(String, CopyMeta, PathBuf)> {
+        let Some(c) = self.copies.get() else { return Vec::new() };
+        let ex = self.excluded();
+        let mut out = Vec::new();
+        for (i, s) in self.sources.iter().enumerate() {
+            if ex[i] {
+                continue;
+            }
+            let Some(m) = c.meta(&s.url) else { continue };
+            let path = c.persister.lock().unwrap().file_path(&m.file);
+            if path.is_file() {
+                out.push((s.url.clone(), m, path));
+            }
+        }
+        out
+    }
+
+    /// 下游：這個網址是不是這台有啟用的清單
+    pub fn subscribes(&self, url: &str) -> bool {
+        let ex = self.excluded();
+        self.sources.iter().enumerate().any(|(i, s)| !ex[i] && s.url == url)
+    }
+
+    /// 下游：重建時多 `rules` 條規則放不放得下（記憶體控制提供的重建空間；沒有限制時一定可以）
+    pub fn build_room_ok(&self, rules: u64) -> bool {
+        let need = rules.saturating_mul(BUILD_BYTES_PER_RULE);
+        self.build_room.get().and_then(|f| f()).map_or(true, |room| need <= room)
+    }
+
+    /// 下游：留不留得下這麼大的副本（沒有副本功能＝留不下）
+    pub fn copy_wanted(&self, size: u64) -> bool {
+        self.copies.get().is_some_and(|c| c.wanted(size))
+    }
+
+    /// 下游：從上游黑潮拿到、雜湊驗過的副本（zstd 壓縮的原始清單），原樣存成本機副本。回傳有沒有登記新的副本
+    pub fn import_shared_copy(&self, url: &str, hash: u64, compressed: Vec<u8>, v: &Validators, rules: u64) -> bool {
+        let Some(c) = self.copies.get() else { return false };
+        let now = crate::persist::now_secs();
+        let staged = c.offer(url, hash, Some(compressed), v, now, rules);
+        if staged || c.meta(url).is_some_and(|m| m.hash == hash) {
+            self.shared_at.lock().unwrap().insert(url.to_string(), now);
+        }
+        staged
+    }
+
+    /// 這份清單是不是 6 小時內從上游黑潮拿到的
+    fn shared_recently(&self, url: &str) -> bool {
+        let now = crate::persist::now_secs();
+        self.shared_at
+            .lock()
+            .unwrap()
+            .get(url)
+            .is_some_and(|t| now.saturating_sub(*t) < SHARED_FRESH_SECS)
+    }
+
+    /// 下游：拿到新的副本之後，用「副本優先」重建一次（既有的重建入口；全部清單暫停中時不建）。
+    /// 重建只讀磁碟上的副本：剛登記、還在等寫出的副本先寫出去（最多每 6 小時一次，清單有變才會發生）
+    pub async fn rebuild_from_copies(&self) -> anyhow::Result<bool> {
+        let _g = self.rebuild_lock.lock().await;
+        if self.all_suspended() || self.sources.is_empty() {
+            return Ok(false);
+        }
+        if let Some(c) = self.copies.get() {
+            let p = c.persister.clone();
+            tokio::task::spawn_blocking(move || p.lock().unwrap().flush_all(crate::persist::now_secs())).await??;
+        }
+        self.rebuild_mode(Source::PreferCopy, &[]).await.map(|_| true)
     }
 
     /// 開機時：有本機副本的清單先用副本建好過濾器（不必等下載、也不必等對時），驗證資訊也接上
@@ -752,9 +831,19 @@ impl FilterService {
         // 有變的那份不在這裡下載（收到第一段就停），重建時才下載一次；沒變而且有本機副本的，重建時直接讀副本
         let mut reuse = vec![false; self.sources.len()];
         let missing = !self.missing.lock().unwrap().is_empty();
-        if !force && have && active.iter().any(|&i| prev[i].etag.is_some() || prev[i].last_modified.is_some()) {
+        if !force
+            && have
+            && active
+                .iter()
+                .any(|&i| prev[i].etag.is_some() || prev[i].last_modified.is_some() || self.shared_recently(&self.sources[i].url))
+        {
             let mut changed = missing;
             for &i in &active {
+                // 串接：6 小時內從上游黑潮拿到的副本，這一輪不下載（當成 304；沒有串接時這個表是空的）
+                if self.shared_recently(&self.sources[i].url) {
+                    reuse[i] = true;
+                    continue;
+                }
                 if prev[i].etag.is_none() && prev[i].last_modified.is_none() {
                     changed = true;
                     continue;

@@ -771,7 +771,12 @@ pub struct Client {
     generation: AtomicU64,
     /// 「直連閘道」的覆寫（測試用；None = 用路徑檢查讀到的預設閘道）
     gateway_override: Mutex<Option<Option<SocketAddr>>>,
+    /// 狀態改變時的回呼（WP5 的共用結果：串接解除時檢查資料新不新鮮、叫醒同步）
+    on_change: Mutex<Vec<StateFn>>,
 }
+
+/// 狀態改變的回呼：（原本的狀態，新的狀態）。不拿著狀態的鎖呼叫
+pub type StateFn = Arc<dyn Fn(State, State) + Send + Sync>;
 
 impl Client {
     pub fn new(settings: ChainSettings, key: Arc<NodeKey>, timing: Timing) -> Arc<Client> {
@@ -784,7 +789,23 @@ impl Client {
             run: tokio::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
             gateway_override: Mutex::new(None),
+            on_change: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 狀態改變時呼叫 `f`（狀態離開 `Chained`、進入 `Chained` 等；同一個狀態換原因不算）
+    pub fn on_state_change(&self, f: StateFn) {
+        self.on_change.lock().unwrap().push(f);
+    }
+
+    fn changed(&self, from: State) {
+        let to = self.inner.lock().unwrap().state;
+        if to != from {
+            let fs = self.on_change.lock().unwrap().clone();
+            for f in fs {
+                f(from, to);
+            }
+        }
     }
 
     /// 驗證時「直連閘道」的位址覆寫：`Some(None)` = 沒有閘道；`Some(Some(位址))` = 用這個（含埠，不檢查私有位址）；
@@ -818,6 +839,7 @@ impl Client {
             }));
         }
         let enabled = settings.downstream_enabled();
+        let before = self.inner.lock().unwrap().state;
         let (io, rebind) = {
             let mut i = self.inner.lock().unwrap();
             i.settings = settings;
@@ -837,6 +859,7 @@ impl Client {
             self.bind(addr, tcp, path);
         }
         self.exec_sync(io);
+        self.changed(before);
     }
 
     fn bind(&self, addr: SocketAddr, tcp: bool, path: Vec<Vec<u8>>) {
@@ -889,10 +912,12 @@ impl Client {
         let mut queue = vec![ev];
         while let Some(ev) = queue.pop() {
             let own = self.key.own_kids();
-            let io = {
+            let (io, before) = {
                 let mut i = self.inner.lock().unwrap();
-                step(&mut i, ev, &own, Now::get())
+                let before = i.state;
+                (step(&mut i, ev, &own, Now::get()), before)
             };
+            self.changed(before);
             for x in io {
                 match x {
                     Io::Probe { addr, tcp } => queue.push(Event::Probed(probe(addr, tcp, ask).await)),
@@ -1066,11 +1091,13 @@ impl Client {
     }
 
     pub fn on_wan_changed(&self) {
-        let io = {
+        let (io, before) = {
             let mut i = self.inner.lock().unwrap();
-            step(&mut i, Event::WanChanged, &[], Now::get())
+            let before = i.state;
+            (step(&mut i, Event::WanChanged, &[], Now::get()), before)
         };
         self.exec_sync(io);
+        self.changed(before);
     }
 
     /// 串接上游連續失敗（解析流程）：立刻補一次心跳
@@ -1211,9 +1238,11 @@ impl Client {
         })
     }
 
-    /// 規格 1.10 的 `chain`（不含 `shared`，由 WP5 填）；`serving` 是這台的上游角色（回應器的 `serving_json`）
+    /// 規格 1.10 的 `chain`（`shared` 是共用結果的同步、`serving` 是上游角色）
     pub fn status_json(&self) -> Value {
         let suspended = self.manager().is_some_and(|m| m.chain_suspended());
+        // 這兩個會回頭問狀態機（拿狀態的鎖）：先算好
+        let shared = crate::chain::share::shared_json();
         let serving = self.responder().map(|r| r.serving_json()).unwrap_or(Value::Null);
         let i = self.inner.lock().unwrap();
         let now = now_ms();
@@ -1225,7 +1254,7 @@ impl Client {
             "upstream": if i.settings.chain { Self::upstream_json(&i) } else { Value::Null },
             "backupActive": suspended || (i.state == State::Released && i.reason == Some(Reason::NoResponse)),
             "retryAt": i.retry_at_ms,
-            "shared": Value::Null,
+            "shared": if i.settings.chain { shared } else { Value::Null },
             "serving": serving,
         })
     }

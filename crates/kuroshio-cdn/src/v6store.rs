@@ -189,6 +189,26 @@ impl V6Store {
         self.providers.get(provider).map(|p| p.len()).unwrap_or(0)
     }
 
+    /// 有紀錄的 CDN（共用結果匯入用）
+    pub fn provider_names(&self) -> Vec<String> {
+        self.providers.keys().cloned().collect()
+    }
+
+    /// 共用結果匯入（串接模式）：整家換成這些節點（依延遲排序後留前 `max` 個），標成要寫檔
+    pub fn set_provider(&mut self, provider: &str, mut nodes: Vec<V6Entry>) {
+        nodes.sort_by(|a, b| {
+            a.node
+                .ms
+                .or(999.0)
+                .partial_cmp(&b.node.ms.or(999.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        nodes.truncate(self.max);
+        let m: IndexMap<IpAddr, V6Node> = nodes.into_iter().map(|e| (e.ip, e.node)).collect();
+        self.providers.insert(provider.to_string(), m);
+        self.touch();
+    }
+
     /// 測試用：整家移除
     pub fn remove_provider(&mut self, provider: &str) {
         self.providers.shift_remove(provider);
