@@ -179,7 +179,7 @@ impl Benchmark {
 
     /// 評測前的路徑檢查（`upstream.pathCheck` 關閉時不做）
     async fn path_report(&self, cfg: &Value) -> Option<kuroshio_net::path::Report> {
-        if get(cfg, "upstream.pathCheck").and_then(Value::as_bool) == Some(false) {
+        if !kuroshio_config::chain::flex_bool(get(cfg, "upstream.pathCheck"), true).0 {
             return None;
         }
         match &self.path {

@@ -43,7 +43,8 @@ pub fn policy_of(cfg: &Value) -> &'static str {
 }
 
 pub fn enabled_of(cfg: &Value) -> bool {
-    get(cfg, "upstream.pathCheck").and_then(Value::as_bool) != Some(false)
+    // 跟 ChainSettings 同一套讀法：布林、"0"／"1"、數字都接受
+    kuroshio_config::chain::flex_bool(get(cfg, "upstream.pathCheck"), true).0
 }
 
 /// 讀設定（啟動與每次重新載入）：IPv6 模式立刻生效；路徑檢查關閉時清掉舊的判斷

@@ -219,6 +219,8 @@ if lists_version_older 3 3; then
 	add_filter_list 0 'AdGuard DNS filter（約 19 萬條）' "$L_ADGUARD" ads
 	add_filter_list 0 'HaGeZi TIF 完整版（威脅情資，約 146 萬條、15 MB 記憶體）' "$L_TIF_BIG" malware
 	add_filter_list 0 'HaGeZi 加密 DNS／VPN／代理繞過（企業用：裝置無法自己改用其他 DNS）' "$L_BYPASS" malware
+	# 3.4.0「繞過防護」標記（跟 uci_migrate.rs 一樣只在新加的那一份帶；舊的那一份靠程式依網址認得）
+	_b=$(filter_list_by_url "$L_BYPASS") && [ -n "$_b" ] && [ -z "$(uci -q get "kuroshio.$_b.bypass")" ] && uci set "kuroshio.$_b.bypass=1"
 	uci set kuroshio.main.lists_version='3.3'
 	uci commit kuroshio
 	[ -n "$lists_log" ] && logger -t kuroshio "過濾清單：加上預設不勾選的大清單（${lists_log#；}）"

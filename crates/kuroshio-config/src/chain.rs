@@ -143,14 +143,34 @@ pub fn coverage_region_of(cfg: &Value) -> (CoverageRegion, f64 /* nearMaxMs */) 
 
 /// 過濾清單（`filter.lists[]` 的一筆）是不是「繞過防護」類的清單（規格 4.1，`bypass`，預設 false）
 pub fn is_bypass_list(list: &Value) -> bool {
-    flex_bool(list.get("bypass"), false).0
+    match list.get("bypass") {
+        // 明確寫了就照寫的
+        Some(v) if !v.is_null() && v.as_str() != Some("") => flex_bool(Some(v), false).0,
+        // 沒寫：預設的 HaGeZi doh-vpn-proxy-bypass 依網址認得（3.4.0 之前存下的設定沒有這個標記，不用另外遷移）
+        _ => list
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|u| KNOWN_BYPASS_URLS.contains(&u)),
+    }
 }
+
+/// 沒寫 `bypass` 時也當成「繞過防護」清單的預設清單網址
+pub const KNOWN_BYPASS_URLS: &[&str] = &["https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/doh-vpn-proxy-bypass.txt"];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{build, defaults};
     use serde_json::json;
+
+    #[test]
+    fn bypass_list_recognized_by_url_without_flag() {
+        let url = KNOWN_BYPASS_URLS[0];
+        assert!(is_bypass_list(&json!({ "url": url })), "3.4.0 之前存下的設定沒有標記");
+        assert!(!is_bypass_list(&json!({ "url": url, "bypass": false })), "明確關掉的照設定");
+        assert!(is_bypass_list(&json!({ "url": "https://example.com/list.txt", "bypass": "1" })));
+        assert!(!is_bypass_list(&json!({ "url": "https://example.com/list.txt" })));
+    }
 
     #[test]
     fn flex_bool_accepts_uci_and_json() {
