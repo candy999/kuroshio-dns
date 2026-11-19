@@ -68,6 +68,8 @@ pub struct Up {
     stats: Mutex<Stats>,
     /// 每日評測選上的原因（最快、覆蓋）
     reason: Mutex<Option<String>>,
+    /// 評測判斷的所在地區（ISO 國碼，3.4.0；沒有是 None）
+    region: Mutex<Option<String>>,
     /// 只有串接上游：連續失敗時通知誰
     trouble: Option<Arc<Trouble>>,
 }
@@ -79,6 +81,7 @@ impl Up {
             role,
             stats: Mutex::new(Stats::default()),
             reason: Mutex::new(None),
+            region: Mutex::new(None),
             trouble: None,
         })
     }
@@ -89,6 +92,7 @@ impl Up {
             role: Role::Chain,
             stats: Mutex::new(Stats::default()),
             reason: Mutex::new(None),
+            region: Mutex::new(None),
             trouble: Some(trouble),
         })
     }
@@ -182,6 +186,7 @@ impl Up {
             "paused": s.open_until.map(|t| t > Instant::now()).unwrap_or(false),
             // 3.3.6：選上的原因、路徑檢查判斷不能用、經由攔截者（一般 DNS 被接走時）
             "reason": self.reason.lock().unwrap().clone(),
+            "region": self.region.lock().unwrap().clone(),
             "pathBlocked": self.path_blocked(),
             "via": if self.via_interceptor() { Value::from("interceptor") } else { Value::Null },
         })
@@ -334,6 +339,10 @@ impl Manager {
         let old: Vec<Arc<Up>> = self.auto.read().unwrap().list.clone();
         let mut list = Vec::new();
         for s in st["selected"].as_array().unwrap() {
+            // 先檢查上限：autoMax = 0 時一台都不載入（以前先 push 才檢查，0 也會載入 1 台）
+            if list.len() >= self.auto_max {
+                break;
+            }
             let (Some(id), ty) = (
                 s.get("id").and_then(Value::as_str),
                 s.get("type").and_then(Value::as_str).unwrap_or("udp"),
@@ -353,10 +362,13 @@ impl Manager {
                 .cloned()
                 .unwrap_or_else(|| Up::new(u, Role::Auto));
             *up.reason.lock().unwrap() = s.get("reason").and_then(Value::as_str).map(str::to_string);
+            // 上游多樣性（3.4.0）：評測判斷的所在地區
+            *up.region.lock().unwrap() = s
+                .get("region")
+                .and_then(Value::as_str)
+                .filter(|r| !r.is_empty())
+                .map(str::to_string);
             list.push(up);
-            if list.len() >= self.auto_max {
-                break;
-            }
         }
         let generated_at = st.get("generatedAt").and_then(Value::as_str).map(str::to_string);
         info!(
@@ -496,6 +508,30 @@ mod tests {
             "upstream": { "pinned": ["udp://10.0.0.1"], "fallback": ["udp://1.0.0.2"], "autoTypes": ["udp", "doh"], "autoMax": 2 },
             "resolver": { "lastResort": ["udp://8.8.8.8"] }
         }))
+    }
+
+    /// autoMax = 0：一台自動上游都不載入；selected[].region 帶到狀態
+    #[test]
+    fn auto_max_zero_and_region() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-up0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("upstreams.json");
+        std::fs::write(
+            &f,
+            r#"{"generatedAt":"2026-11-10 04:30","selected":[
+                {"id":"udp://192.0.2.10","type":"udp","region":"TW","near":true},
+                {"id":"udp://192.0.2.11","type":"udp","region":""}]}"#,
+        )
+        .unwrap();
+        let mut c = cfg();
+        c["upstream"]["autoMax"] = json!(0);
+        let m = Manager::new(&c, f.clone());
+        assert_eq!(m.active().len(), 1, "只有固定上游");
+        let m = Manager::new(&cfg(), f);
+        let list = m.list_json();
+        let by = |id: &str| list.as_array().unwrap().iter().find(|u| u["id"] == id).cloned().unwrap();
+        assert_eq!(by("udp://192.0.2.10:53")["region"], "TW");
+        assert_eq!(by("udp://192.0.2.11:53")["region"], Value::Null);
     }
 
     #[test]
