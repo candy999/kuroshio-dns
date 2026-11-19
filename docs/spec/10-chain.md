@@ -1,0 +1,753 @@
+# 10 串接模式、共用結果與 3.4.0 的其他項目
+
+3.4.0 的規格。六個項目：
+
+1. **串接模式**：兩層黑潮（例如 Newifi D3 接在跑黑潮的主路由器後面）時，下游認出上游、驗證身分、把上游當成第一順位上游。
+2. **共用結果**：下游直接拿上游的每日評測結果、CDN 節點池、過濾清單副本，不自己重算。
+3. **上游放行下游**：上游對核准過的下游放寬存取控制與「繞過防護」清單（預設關）。
+4. **低階機器的並行數**：沒有 AES 指令的 CPU 先問最快的 2 個上游，其他上游在背景補問。
+5. **上游多樣性**：每日評測選「覆蓋」上游時優先台灣、日本、香港、新加坡（`coverage_region`）。
+6. **重新載入時不斷線**（選做）：SIGHUP 後不再有 Connection refused。
+
+工作分解在 [10-chain-tasks.md](10-chain-tasks.md)。名詞：**上游**＝離網際網路近的那台黑潮（主路由器），**下游**＝接在它後面的黑潮。
+文件裡的區網位址用 `192.168.1.1`（上游）、`192.168.1.2`（下游），跟 `docs/integration.md` 既有的範例一致；公網位址一律用文件用位址。
+
+---
+
+## 0. 現況查證（設計的依據）
+
+| 項目 | 程式裡現在怎麼做 | 對設計的影響 |
+|---|---|---|
+| 攔截偵測 | `kuroshio_net::path::check`：對 `192.0.2.1`、`198.51.100.1`（、`2001:db8::1`）的 53 埠查詢，有回答 = 被接走；`identify()` 再對**同一個位址**問 CH TXT `version.kuroshio`。`Report.interceptor = Some(Interceptor::Kuroshio(版本))`，`Report.gateway` 是預設閘道（只有 Linux 讀得到） | 被接走的保留位址就是「一定到得了上游黑潮」的通道（上游用 DNAT 回應，來源位址是保留位址）。`Report` 目前沒有把命中的位址留下來，要加 |
+| `version.kuroshio` | `resolver.rs::handle_inner`：`qclass == 3`、`proto` 是 `udp`/`tcp`、`is_private_client(ctx.client)` 才回答 `kuroshio/<版本>` | 串接的查詢沿用同樣的三個條件。3.3.6／3.3.7 只認得 `version.kuroshio`，其他 CH 查詢會當成一般查詢往上游轉送 |
+| 上游管理 | `upstreams.rs`：`Role::{Pinned, Auto, Fallback, LastResort}`；`Manager::active()` = 固定 + 沒暫停的自動；`backup()` = 備援 + 最後手段；固定上游永不暫停；`via_interceptor()` 讓 `decide()` 把「經由攔截者」的一般 DNS 答案排到後面 | 串接上游要新的 `Role::Chain`：可以暫停、不算「經由攔截者」 |
+| 節點金鑰 | `kuroshio_community::identity`：`Identity::load_or_create(dir)`、`KeyPair::sign`、`verify`、`kid_of`、`fingerprint`。金鑰在 `community.dir`（OpenWrt：`/etc/kuroshio/community/key.pem`）。`community.enabled` 預設 `false`，沒啟用時金鑰不會被建立 | 串接要能在社群共享沒啟用時自己載入（或建立）同一把金鑰 |
+| 存取控制 | `ipfilter.rs`：迴路 → `deny` → 私有／本機網段 → 好友 → `allow` → 模式。**私有位址一律允許**（除非在 `deny`）；核心層 nftables 規則只放在 WAN 輸入鏈，區網完全不受影響。一般 DNS 另外有 `listen.plain.allowFrom`（預設只有私有網段） | 區網裡用私有位址的下游，**現在就連得到**上游的加密 DNS。會被擋的只有：來源是公網位址（IPv6 GUA 不在上游網卡的網段、區網用公網 IP）且不在允許的台灣群組。第 3 項的放行就是針對這種來源 |
+| 「繞過防護」清單 | 只是 `filter.lists` 裡一份預設停用的清單（HaGeZi `doh-vpn-proxy-bypass`），分類是 `malware`，**沒有獨立的分類**。`FilterCheck::check(name, qtype)` 不知道用戶端是誰；`kuroshio_filter::Verdict.list` 有命中清單的索引，但 `resolver::Verdict` 沒帶出來。CNAME 目標命中時記在快取項目的 `Entry.blocked`（所有用戶端共用） | 要加清單層級的 `bypass` 標記，並把它帶到 `resolver::Verdict` 與 `Entry` |
+| 並行數 | `resolver.parallel` 預設 `"auto"`，`kuroshio_config::derive_auto` 只看核心數：1 核 → 2、2 核 → 3、其他 → 0（全部）。`sysinfo::has_aes()` 只在 x86／aarch64 偵測，其他架構（MIPS、ARMv7）回 `false`，目前只拿來顯示 | MT7621 是 4 個執行緒，現在會全部一起問。`Host` 要多一個 `aes` |
+| 上游所在地 | `data/geo/` 只有 `tw-ip.json`（台灣網段）。評測的業者資料來自 ip-api（`fields=status,query,isp,as,org`），以 /16 為鍵快取在 `cidr_cache.json`，**沒有國別**。`Scored.min` 是量到的最低延遲 | 見第 6 節 |
+| 重新載入 | `main.rs`：每一輪在自己的 tokio runtime 裡跑；舊的 `rt.shutdown_timeout(3s)` 結束後才建新的、才綁監聽。跨輪保留的東西用行程層級的 `static`（`CACHE_HANDOFF`） | 見第 7 節 |
+
+---
+
+## 1. 串接模式
+
+### 1.1 目標
+
+- 下游認出「一般 DNS 被上游黑潮接走」之後，確認對方真的是那台黑潮（節點金鑰簽章），把它當成第一順位上游：下游只問它一台，省掉加密上游的並行查詢。
+- 沒有攔截、攔截者不是黑潮、或上游版本低於 3.4.0：**不發任何串接查詢**，行為跟 3.3.7 完全一樣。
+- 使用者沒同意之前（`chain = ask`）不改變解析行為。
+- 上游換掉、沒回應、換網路時自動解除，退回自己的上游。
+
+### 1.2 通道：一般 DNS 的 CHAOS TXT
+
+所有串接訊息都是 **CH 類別、TXT 型別**的查詢，名稱在 `chain.kuroshio` 底下，送到「路徑檢查命中的那個保留位址」的 53 埠。
+
+**為什麼不用管理 API、社群 transport 或上游的 DoH／DoT**：
+
+- 下游只確定兩件事：53 埠會被接走、預設閘道是哪個位址。攔截者不一定是閘道（中間可能還有一台不跑黑潮的路由器）。被接走的 53 埠是唯一「不需要知道上游位址、不需要上游多開任何埠」就到得了的路。
+- 管理 API 預設只聽 `127.0.0.1`；社群 transport 走加密監聽、需要網域與憑證，而且預設沒開。
+- 上游回答的條件沿用 `version.kuroshio`：`proto` 是 `udp`／`tcp`、來源是私有位址、通過 `listen.plain.allowFrom` 與 `access` 的 `plain`。公開的 DoH／DoT 一律不回答（不透露節點資訊）。
+
+名稱一覽（`<…>` 是變數；全部小寫）：
+
+| 名稱 | 用途 | 傳輸 | 誰簽章 |
+|---|---|---|---|
+| `<nonce>.a.chain.kuroshio` | 挑戰／回應（auth） | UDP，TC 時改 TCP | 上游 |
+| `r.chain.kuroshio` ＋ EDNS 選項 65313 | 下游登記（reg，第 4 節才用到） | TCP 優先 | 下游簽請求、上游簽回應 |
+| `m.s.chain.kuroshio` | 共用結果的清單（manifest，第 3 節） | 只有 TCP | 上游 |
+| `<idx>.<oid>.s.chain.kuroshio` | 共用結果的分段（第 3 節） | 只有 TCP | 不簽（用清單裡的雜湊驗證） |
+
+`<nonce>`：16 bytes 亂數的 32 個十六進位字。`<oid>`：物件 SHA-256 前 8 bytes 的 16 個十六進位字。`<idx>`：十進位。
+
+回應：`rcode = 0`、一筆 TXT 記錄（class 3、TTL 0），把內容切成每段最多 255 bytes 的字串，接起來就是原始 bytes（**二進位，不是 base64**）。
+不認得的名稱、來源不符、被速率限制：回 `REFUSED`（rcode 5），不轉給上游。
+
+### 1.3 訊息格式
+
+編碼用 CBOR（`kuroshio_community::envelope::{to_cbor, from_cbor}`），外層固定是：
+
+```
+Sealed = { "body": bytes, "sig": bytes(64) }
+sig = Ed25519( 節點私鑰, "kuroshio-chain/1\0" || kind || 0x00 || body )
+```
+
+`kind` 是 ASCII：`auth`、`reg`、`regack`、`manifest`。簽章的前綴跟社群共享的 `kuroshio/2\0` 不同，兩邊的簽章不能互相冒用。
+`body` 是下面各訊息的 CBOR（map，鍵是字串）。**不認得的欄位一律忽略；`v` 大於自己認得的版本就當成不支援。**
+
+#### AuthBody（上游 → 下游）
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `v` | u8 | 協定版本，3.4.0 是 `1` |
+| `t` | text | `"auth"` |
+| `nonce` | bytes(16) | 查詢名稱裡的 nonce 原樣帶回 |
+| `ts` | u64 | 上游的時間（Unix 毫秒）。**只供顯示與除錯**，不拿來判斷有效期（下游的時鐘可能還沒對時） |
+| `kid` | bytes(8) | 上游節點 ID（`kid_of(公鑰)`） |
+| `pub` | bytes(32) | 上游 Ed25519 公鑰 |
+| `app` | text | 上游版本（`CARGO_PKG_VERSION`） |
+| `allow` | bool | 上游的 `allow_downstream` |
+| `caps` | [text] | 能力：`"share"`（有共用結果可以拿）、`"reg"`（接受登記）。沒有的能力下游不會去問 |
+| `peer` | text | 上游看到的用戶端位址（下游據此知道自己有沒有經過 NAT；登記時要帶回去） |
+| `tok` | bytes(16) | 登記用的一次性憑據：`HMAC-SHA256(啟動時的亂數密鑰, "tok" || peer || 時間窗編號)[..16]`，時間窗 300 秒，上游接受目前與前一個時間窗 |
+| `path` | [bytes(8)] | 節點 ID 鏈，從最上層到自己（自己在最後）。沒有串接別人的節點是 `[自己]` |
+
+大小：約 270 bytes（`path` 4 層時約 300），UDP 不需要 EDNS。
+
+`allow = false` 時照樣簽章回答（下游才能顯示「上游不允許串接」），但 `caps` 是空的、之後的登記與共用結果一律 `REFUSED`。
+
+#### 防重放
+
+- nonce 由下游每次查詢新產生（`random_bytes::<16>()`），回應必須帶回同一個 nonce、簽章驗得過才算數；一個 nonce 只用一次，查詢逾時（1.5 秒）就作廢。攔下舊的回應重放沒有用。
+- **不依賴時間戳**：下游開機後時鐘可能還沒對時（`crate::clock`），用時間判斷有效期會誤判。
+- `tok` 綁來源位址與 5 分鐘時間窗，登記訊息由下游簽章並涵蓋 `tok` 與 `peer`：攔下登記封包從別的位址重送無效。
+
+### 1.4 狀態機（下游）
+
+```
+                 路徑檢查：攔截者是黑潮 ≥ 3.4.0，而且 chain ≠ 0
+   ┌────────┐ ─────────────────────────────────────────────▶ ┌──────────┐
+   │ none   │                                                │ detected │ 發一次 auth 挑戰（探測）
+   │ 未偵測 │ ◀──────── 路徑檢查：沒被接走／不是黑潮 ──────── └────┬─────┘
+   └────────┘                                                     │
+        ▲            探測失敗、allow=false、迴圈、太深、被記住的「不同意」
+        │         ┌────────────────────────────────────────────────┤
+        │         ▼                                                │ auto，或 ask 而且這個指紋已經同意過
+   ┌──────────┐   │        ask 而且這個指紋沒決定過                 │
+   │ released │ ◀─┘   ┌──────────────────────────┐                 ▼
+   │ 解除     │ ◀──── │ waiting 等待同意         │ ──同意──▶ ┌───────────┐
+   │（帶原因）│ 不同意 └──────────────────────────┘           │ verifying │ 重新挑戰＋直連閘道確認＋迴圈檢查
+   └────┬─────┘                                              │ 驗證中    │
+        │  重試計時到／下一次路徑檢查                         └─────┬─────┘
+        └──────────────▶ detected                                  │ 通過
+                                                                    ▼
+          心跳失敗、節點換了、allow 變 false、迴圈、竄改      ┌──────────┐
+   released ◀──────────────────────────────────────────────── │ chained  │ 每 5 分鐘心跳
+   none     ◀────────────── wan-changed、chain 改成 0 ──────── │ 串接中   │
+                                                              └──────────┘
+```
+
+| 狀態（`state`） | 意思 | 解析行為 |
+|---|---|---|
+| `none` 未偵測 | 沒有攔截、攔截者不是黑潮、還沒檢查過、或 `chain = 0` | 跟 3.3.7 一樣 |
+| `detected` 偵測到 | 路徑檢查認出上游黑潮（≥ 3.4.0），正在探測 | 同上 |
+| `waiting` 等待同意 | 探測通過，等使用者在狀態頁按同意 | 同上 |
+| `verifying` 驗證中 | 已同意，做綁定前的最後確認（幾秒） | 同上 |
+| `chained` 串接中 | 上游黑潮是第一順位上游 | 見 1.6 |
+| `released` 解除 | 串接不成立或中斷，`reason` 寫原因 | 跟 3.3.7 一樣 |
+
+`released` 的 `reason`：
+
+| 代碼 | 意思 | 之後 |
+|---|---|---|
+| `upstream-too-old` | 上游黑潮低於 3.4.0（只認得 `version.kuroshio`） | 不發挑戰；下一次路徑檢查再看版本 |
+| `unsupported` | 版本夠新但挑戰沒有回應、格式不對、`v` 太新 | 10 分鐘後重試一次，之後跟著路徑檢查 |
+| `not-allowed` | 上游 `allow_downstream` 關閉 | 跟著路徑檢查重試（6 小時） |
+| `denied` | 使用者對這個指紋按過「不同意」 | 不再詢問，直到 `reset` 或指紋換了 |
+| `verify-failed` | 簽章不對、nonce 不符、公鑰與 `kid` 不符 | 60 秒起重試，每次加倍，最長 10 分鐘 |
+| `upstream-changed` | 心跳回來的節點 ID 跟綁定的不同 | 立刻回到 `detected` 重新走一次（`ask` 模式會再等同意） |
+| `no-response` | 心跳連續 3 次沒回應 | 60 秒起重試，最長 10 分鐘；同意紀錄保留，上游回來自動接回 |
+| `gone` | 路徑檢查：不再被接走，或攔截者不是黑潮了 | 回 `none` |
+| `loop` | 上游的 `path` 裡有自己 | 10 分鐘後重試 |
+| `too-deep` | 上游的 `path` 已經有 4 層（加上自己會超過上限） | 同上 |
+| `tampered` | 路徑檢查發現攔截者竄改答案或改寫「不存在」 | 下一次路徑檢查沒問題才重試 |
+
+**同意（`chain = ask`）**：決定綁在上游節點的公鑰上，存在快照目錄的 `chain.json`：
+
+```json
+{ "consent": [ { "pub": "<base64 公鑰>", "fingerprint": "3F2A-91C0-…", "decision": "allow", "at": 1795000000000 } ] }
+```
+
+最多 8 筆（超過丟最舊的）。同一把公鑰同意過，之後重開機、解除再接回都不再詢問；公鑰換了（上游重灌、換機器、金鑰輪替）要重新同意。
+3.4.0 **不自動跟隨上游的金鑰輪替**：輪替在家用環境很少發生，重新按一次同意比多一條驗證路徑單純（列為之後的版本）。
+
+`chain = auto`：第一次看到就綁定（等於信任路上那台會講這個協定的攔截者），公鑰換了也自動重新綁定，但記一行警告、`/api/status` 的 `warnings` 留 24 小時。見 8.1 的 T1。
+
+### 1.5 探測與驗證的步驟
+
+接在路徑檢查之後（`pathcheck::run_once()` 套用結果之後呼叫），**不是另一個排程**：
+
+1. 路徑檢查的結果不是「IPv4 的一般 DNS 被接走＋攔截者是 `Interceptor::Kuroshio(版本)`」→ `none`（原本是 `chained` 就先解除，原因 `gone`）。3.4.0 只走 IPv4 那條路。
+2. 版本低於 3.4.0 → `released(upstream-too-old)`，結束。版本字串取開頭的數字部分比較（`3.4.0-rc1` 算 3.4.0）。
+3. 路徑檢查有 `tampered` 或 `nx_rewrite` 而且 `via = "interceptor"` → `released(tampered)`，結束。
+4. **探測**：對命中的保留位址發 auth 挑戰（UDP 被接走用 UDP，只有 TCP 被接走用 TCP；逾時 1.5 秒，失敗再試一次）。驗證：
+   `Sealed` 解得開 → `body.t == "auth"`、`v == 1` → `nonce` 相同 → `kid == kid_of(pub)` → `verify(pub, 簽章輸入, sig)`。任何一步不過 → `verify-failed`（沒回應是 `unsupported`）。
+5. `allow == false` → `not-allowed`。`path` 裡有自己的 `kid` → `loop`。`path.len() >= 4` → `too-deep`。
+6. 看模式與同意紀錄 → `waiting`、`verifying` 或 `released(denied)`。探測結果（指紋、`allow`、版本）不管走到哪個狀態都放進 `/api/status`，`ask` 模式的使用者據此判斷。
+7. **驗證（`verifying`）**：
+   - 再發一次新的挑戰（新的 nonce），公鑰必須跟探測時相同。
+   - 預設閘道存在、是私有位址：對 `閘道:53` 直接發一次挑戰。回來的公鑰相同 → 綁定位址用閘道（`via = "gateway"`）；不同或沒回應 → 綁定位址用命中的保留位址（`via = "intercept"`）。
+   - 通過 → `chained`，並在 5～15 秒後（隨機）提早做一次心跳，縮短兩台同時互相綁定時的迴圈時間。
+
+**心跳**：`chained` 之後每 300 秒（±30 秒）對綁定位址發一次挑戰。公鑰不同 → `upstream-changed`；`allow` 變 `false` → `not-allowed`；`path` 檢查同上；連續 3 次沒回應 → `no-response`。
+另外，解析流程發現串接上游連續失敗 3 次時（見 1.6）立刻補一次心跳，不等 5 分鐘。
+
+### 1.6 綁定：用什麼位址與協定
+
+**建議：一般 DNS（UDP，只有 TCP 被接走時用 TCP），位址優先用驗證過的預設閘道，否則用命中的保留位址。**
+
+| 做法 | 優點 | 缺點 |
+|---|---|---|
+| 一般 DNS 到閘道／保留位址（建議） | 任何上游設定都能用（不需要上游開加密監聽、不需要憑證）；下游完全不做 TLS，正是 MT7621 這類機器要的；閘道直連不依賴 DNAT 規則一直存在 | 每一筆查詢沒有驗證：同一個區網裡能做 ARP 欺騙的裝置可以竄改答案（見 8.1 的 T3） |
+| 上游的 DoT／DoH | 每筆查詢有完整性與私密性 | 上游的加密監聽預設沒開；憑證綁的是上游的公開網域，下游只知道閘道 IP，要另外做「簽章公告的 SPKI 釘選」才驗得過；多一條 TLS 驗證路徑要維護 |
+
+理由：上游區網裡的其他裝置本來就是用一般 DNS 問這台上游，串接沒有讓下游比它們更弱；被犧牲的是「下游原本走加密上游、不受區網內主動攻擊影響」這一點，所以預設是 `ask`，而且保留 `chain_backup` 讓下游隨時退回加密上游。
+`AuthBody` 預留欄位 `dot`（`{ "port": u16, "spki": bytes(32) }`），3.4.0 的上游不送、下游忽略；之後要加「釘選公鑰的 DoT」不用改協定版本。
+
+綁定的實作（`upstreams.rs`）：
+
+- 新的 `Role::Chain`（`name()` = `"chain"`）。`Manager` 多一個 `chain: RwLock<Option<ChainSlot>>`，由串接模組用 `Manager::set_chain()` 設定／清除，不寫進設定檔。
+- 上游規格字串：`udp://<位址>:53` 或 `tcp://<位址>:53`，用現有的 `Upstream::parse`。跟使用者的 `upstream.pinned` 裡某一筆 `id` 相同時不重複加入。
+- `Up::via_interceptor()` 對 `Role::Chain` 回 `false`（它就是我們要的那台，`decide()` 不能把它的答案排到後面）。
+- `Manager::active()`（串接中、串接上游沒暫停）＝ `[串接上游] + 使用者的固定上游`。**自動上游不問。**
+- `Role::Chain` 連續失敗 3 次 → 暫停 30 秒（`open_until`），並通知串接模組立刻做心跳。暫停期間 `active()`：
+  - `chain_backup = encrypted`：跟沒串接時一樣（固定 + 自動），所以只有前 3 筆查詢會等到逾時。
+  - `chain_backup = none`：還是只有串接上游（加使用者的固定上游）。
+- `Manager::backup()`（串接中）：
+  - `encrypted`：沒暫停、`path_blocked()` 為否的自動上游 ＋ 備援 ＋ 最後手段，全部去掉 `via_interceptor()` 為真的（一般 DNS 會回到同一台掛掉的上游）。
+  - `none`：空的（上游掛掉時回舊資料或 SERVFAIL）。
+- 解析流程其他地方把 `Role::Chain` 當成固定上游以外的一般上游：可以當快速回應；不參與 `pinned_alias` 的剔除；`baseline`（「如果用一般 DNS 會怎樣」）不採計它的答案。
+- 串接中 `pathcheck::warnings()` 不再列「一般 DNS 被…接走」那一條（這是預期中的狀況），改由串接狀態說明。
+
+**跨重新載入**：串接狀態放在行程層級的持有者（做法同 `CACHE_HANDOFF`），新的一輪建立 `Manager` 之後立刻把綁定接回去，不重新等同意、不出現空窗；接回後在背景做一次心跳。
+
+### 1.7 防迴圈
+
+- 每個節點的 `path` ＝（自己串接中的上游的 `path`，沒串接就是空的）＋ `[自己的 kid]`。上游的 `path` 每次心跳更新，所以鏈的變動最慢 5 分鐘傳到下一層。
+- 下游在探測、驗證、每次心跳都檢查：`path` 裡有自己（含金鑰輪替 7 天內的舊 `kid`）→ `loop`；`path.len() >= 4` → `too-deep`。**上限是 4 層**（家用環境兩層，三層已經少見；每多一層多一次轉送延遲）。
+- A→B→A 的情形：B 串接 A 之後，B 回給別人的 `path` 是 `[A, B]`；A 若偵測到自己被 B 接走而去問 B，會在 `path` 裡看到自己而拒絕。
+- 兩台同時互相綁定（都還沒有對方的 `path`）：綁定後 5～15 秒的提早心跳會讓其中一台看到自己而解除。這段時間內的查詢不會放大：`Resolver::fetch` 的 singleflight 讓同一個名稱同時只問一次，互相等待到 `timeoutMs` 後回 SERVFAIL。
+- 不在每筆查詢上加跳數標記：多一個 EDNS 選項會讓每筆查詢變大、也讓上游的快取鍵與 3.3.x 的行為變複雜，鏈上的檢查已經足夠。
+
+### 1.8 自動解除
+
+| 事件 | 動作 |
+|---|---|
+| 心跳的公鑰跟綁定的不同（上游換掉） | `released(upstream-changed)` → 立刻回 `detected` 重新探測 |
+| 心跳連續 3 次沒回應 | `released(no-response)`，自動上游接手；60 秒起重試 |
+| `kuroshio notify wan-changed`（`/api/notify/wan-changed`） | 立刻回 `none`（拿掉串接上游），接著原本就會觸發的路徑檢查重新偵測；同意紀錄保留 |
+| 路徑檢查：不再被接走／攔截者不是黑潮／版本變舊 | `released(gone)` → `none` |
+| 路徑檢查：攔截者竄改答案 | `released(tampered)` |
+| 設定改成 `chain = 0`（重新載入） | `none`，不再發任何串接查詢 |
+| `path_check = 0` | 串接整個不啟用（沒有偵測來源）；狀態頁說明原因 |
+
+解除時：`Manager::set_chain(None)`、清掉 DNS 快取裡來源是串接上游的項目不需要（答案仍然有效，照 TTL 過期）、共用結果依第 3.6 節處理。
+
+### 1.9 上游端
+
+- `resolver.rs::handle_inner` 在 `version.kuroshio` 那一段之後：`qclass == 3` 而且名稱是 `chain.kuroshio` 或它底下的 → 交給 `chain::Responder`，**不論結果都不往下走**（不過濾、不快取、不轉給上游）。
+- 條件同 `version.kuroshio`：`proto ∈ {udp, tcp}`、`is_private_client`。不符合回 `REFUSED`。
+- `allow_downstream = false`：只回答 auth（`allow: false`、`caps: []`），其他 `REFUSED`。
+- 速率限制（簽章要花 CPU）：每個來源位址每秒 4 次、可累積 8 次；全部來源合計每秒 32 次；超過回 `REFUSED`。來源表最多 64 筆，滿了丟最久沒用的。
+- 金鑰：第一次需要時 `Identity::load_or_create(community.dir)`（社群共享沒啟用也一樣；跟社群共享是同一把）。每次心跳／每 5 分鐘看 `key.pem` 的修改時間，變了就重讀（社群共享做了金鑰輪替）。
+- 上游自己同時也可以是別人的下游（三層）：`path` 取自它自己的串接狀態。
+
+### 1.10 `check-path` 與狀態頁
+
+`kuroshio check-path`（不需要服務在跑）在攔截者是黑潮 ≥ 3.4.0 時多做一次探測，文字輸出多一行，`--json` 多 `interceptor.chain`：
+
+```
+一般 DNS：被路由器 192.168.1.1 上的黑潮（3.4.0）接走
+串接：上游允許串接（節點指紋 3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB）
+```
+
+其他情形的文字：`上游不允許串接（上游的 allow_downstream 關閉）`、`上游黑潮 3.3.7 不支援串接（需要 3.4.0 以上）`、`上游沒有回應串接查詢`。
+
+`/api/status` 的 `network.path.interceptor` 多一個 `chain`（還沒探測過是 `null`）：
+
+```json
+"interceptor": {
+  "kind": "kuroshio", "version": "3.4.0",
+  "chain": { "supported": true, "allowDownstream": true, "nodeId": "a1b2c3d4e5f60718",
+             "fingerprint": "3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB", "caps": ["share", "reg"], "error": null }
+}
+```
+
+`/api/status` 新增頂層 `chain`（下游與上游兩種角色都在這裡；沒有的部分是 `null`）：
+
+```json
+"chain": {
+  "mode": "ask", "backup": "encrypted", "share": "jobs",
+  "state": "chained", "reason": null,
+  "text": "串接中：上游 192.168.1.1（黑潮 3.4.0）",
+  "upstream": {
+    "address": "192.168.1.1", "proto": "udp", "via": "gateway",
+    "version": "3.4.0", "nodeId": "a1b2c3d4e5f60718",
+    "fingerprint": "3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB",
+    "allowDownstream": true, "caps": ["share", "reg"],
+    "path": ["a1b2c3d4e5f60718"], "depth": 2, "viaNat": false,
+    "since": 1795000000000, "lastOkAt": 1795000300000, "failures": 0
+  },
+  "consent": { "needed": false, "decision": "allow", "at": 1795000000000 },
+  "backupActive": false,
+  "retryAt": null,
+  "shared": { "…見 3.7…" },
+  "serving": { "…見 4.5…" }
+}
+```
+
+- `text` 是給狀態頁直接顯示的一行白話：`串接中：上游 192.168.1.1（黑潮 3.4.0）`、`等待同意：上游 192.168.1.1 的黑潮（3.4.0）允許串接`、`上游黑潮 3.3.7 不支援串接（需要 3.4.0 以上）`、`上游黑潮不允許串接`、`串接中斷：上游沒有回應，暫時用自己的加密上游`…。`via = "intercept"` 時位址顯示閘道並加註「（經攔截）」；讀不到閘道（Windows）時顯示 `上游黑潮`。
+- `state = "waiting"` 時 `consent.needed = true`，`upstream` 裡已經有指紋與 `allowDownstream`。
+- `upstreams[]` 裡串接上游的 `role` 是 `"chain"`。
+- `chain = 0` 而且沒有上游角色的資料時，`chain` 是 `{ "mode": "0", "state": "none", … }`（欄位都在，方便前端）。
+
+管理 API（都要登入；加進 `admin.rs` 需要 POST 的清單）：
+
+| 路徑 | 說明 |
+|---|---|
+| `GET /api/chain` | 同 `/api/status` 的 `chain` |
+| `POST /api/chain/consent?decision=allow\|deny&fp=<指紋>` | `waiting` 時記下決定。`fp` 必須等於目前探測到的指紋，不同回 409（避免畫面顯示的跟實際同意的不是同一台） |
+| `POST /api/chain/consent?decision=reset` | 清掉所有同意紀錄，回到 `detected` |
+| `POST /api/chain/recheck` | 立刻做一次路徑檢查與探測 |
+
+指令：`kuroshio chain status [--json]`、`kuroshio chain allow`、`kuroshio chain deny`、`kuroshio chain reset`、`kuroshio chain recheck`（包一層管理 API，做法同 `kuroshio notify`；`allow` 會先印出指紋再送出）。
+
+### 1.11 設定
+
+| UCI（`config upstream 'upstream'`） | JSON | 預設 | 值 | 角色 |
+|---|---|---|---|---|
+| `chain` | `upstream.chain` | `ask` | `auto`／`ask`／`0` | 下游 |
+| `chain_backup` | `upstream.chainBackup` | `encrypted` | `encrypted`／`none` | 下游 |
+| `chain_share` | `upstream.chainShare` | `jobs` | `jobs`／`none` | 下游 |
+| `allow_downstream` | `upstream.allowDownstream` | `1`／`true` | 布林 | 上游 |
+
+型別容忍（讀取端一律用同一個函式，做法同 `V6Mode::from_value`）：
+
+- `chain`：字串 `"auto"`、`"ask"`、`"0"`／`"off"`／`"false"`／`"no"`；數字 `0`；布林 `false` → 關閉。布林 `true`、數字非 0、`"1"`／`"on"` → `ask`（不讓含糊的寫法變成 `auto`）。其他字串 → `ask` 並記一行警告。
+- `chainBackup`、`chainShare`：字串；`"0"`、數字 `0`、布林 `false` → `none`；不認得的 → 預設值並記警告。
+- `allowDownstream`：布林；字串 `"0"`／`"1"`、數字都接受。
+
+UCI 的轉換：四個選項都在 `upstream` 區段，`uci.rs::apply` 的 snake_case → camelCase 會自動對到上面的 JSON 名稱，不用特別的改名規則；`defaults.json` 的預設值決定型別（`chain` 預設是字串 `"ask"`，所以 `option chain '0'` 會是字串 `"0"`；JSON 設定檔寫數字 `0` 也要能讀）。
+
+---
+
+## 2. 相容性（3.3.x 混搭）
+
+| 下游 | 上游 | 行為 |
+|---|---|---|
+| 3.4.0 | 3.4.0 | 完整功能 |
+| 3.4.0 | 3.3.6／3.3.7 | 路徑檢查認出 `kuroshio/3.3.x` → `released(upstream-too-old)`，**不發任何 `chain.kuroshio` 查詢**。解析行為跟 3.3.7 的下游一樣 |
+| 3.4.0 | ≤ 3.3.5（不回答 `version.kuroshio`） | 攔截者是「一般 DNS 軟體」或「不明」→ `none` |
+| 3.4.0 | 不是黑潮 | `none` |
+| 3.3.x | 3.4.0 | 下游不會問；上游的 `version.kuroshio` 回答格式不變（`kuroshio/3.4.0`），下游的路徑檢查照常運作 |
+| 3.4.0（`chain = 0`） | 任何 | 不發串接查詢 |
+
+- 中間夾一台 ≤ 3.3.5 的黑潮（它會把 CH 查詢原樣轉給更上面的 3.4.0）：下游可能跟隔一層的上游完成驗證，查詢實際經過中間那台再到上游，功能正常；`peer` 不是下游自己的位址，`viaNat = true`。
+- 降版：3.4.0 降回 3.3.x 時 `chain.json`、`chain-share.json` 沒人讀，設定裡的新欄位照「不認識的欄位保留」的規則留著，不影響啟動。
+- 共用結果的資料格式相容見 3.5。
+- 管理 API 版本（`API_VERSION`）不變：只有新增欄位與路徑。
+
+---
+
+## 3. 共用結果（`chain_share = jobs`）
+
+### 3.1 目標
+
+`chained` 而且上游的 `caps` 有 `"share"` 時，下游向上游拿：
+
+| 種類（`k`） | 內容 | 下游省掉的工作 |
+|---|---|---|
+| `upstreams` | 上游的 `upstreams.json`（每日評測結果） | `dns-benchmark`（最長 150 分鐘） |
+| `cdn-pools` | `cdn/pools.json`（台灣節點池） | `cdn-pool`、`cdn-scan` |
+| `cdn-v6` | 永久 IPv6 節點（`v6store::FILE`） | 同上 |
+| `cdn-ranges` | `cdn/ranges/*.txt`（官方範圍），包成一個 JSON：`{ "files": { "cloudflare-ipv4.txt": "…" } }` | `cdn-ranges` |
+| `filter-copy` | 一份過濾清單的本機副本（zstd 壓縮的原始清單；`name` 是清單網址） | 下載那一份清單 |
+
+兩台在同一條對外線路上，上游量到的延遲、CDN 節點品質對下游同樣成立。
+
+**過濾清單共用的是「清單副本」，不是建好的過濾器**：過濾器是記憶體裡的雜湊結構，沒有序列化格式，另訂一個格式要長期維護；副本是現成的（`filter-lists/<網址雜湊>.txt.zst`），下游用現有的「從副本建」路徑就能吃。上游沒有留副本（儲存空間不夠）或兩邊訂閱的網址不同的清單，下游照舊自己下載。
+
+### 3.2 通道與驗證
+
+走第 1.2 節的 `s.chain.kuroshio`，**只接受 TCP**（UDP 回 `REFUSED`）。保留位址的 TCP 沒被接走、而且沒有驗證過的閘道直連時，共用結果不可用（`shared.error = "no-tcp"`），下游自己算。
+
+1. 下游問 `m.s.chain.kuroshio` → `Sealed`（`kind = "manifest"`），用**綁定的上游公鑰**驗簽。
+2. 清單列出每個物件的雜湊；下游只抓雜湊跟上次不同的物件：依序問 `0.<oid>…`、`1.<oid>…`，每段 32,768 bytes（最後一段較短），接起來算 SHA-256，必須等於清單裡的 `sha`。
+3. 分段本身不簽章：內容位址（`oid` 是雜湊的前 8 bytes）加上簽過的清單已經保證完整性，路上的人改不了。
+
+ManifestBody：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `v` | u8 | `1` |
+| `t` | text | `"manifest"` |
+| `kid` | bytes(8) | 上游節點 ID |
+| `at` | u64 | 產生時間（Unix 毫秒，顯示用） |
+| `app` | text | 上游版本 |
+| `objects` | [Object] | 最多 64 個 |
+
+Object：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `k` | text | 種類（見 3.1）。不認得的種類略過 |
+| `fmt` | u8 | 這個種類的格式版本，3.4.0 都是 `1`。比自己認得的大 → 略過這個物件 |
+| `id` | bytes(8) | `sha` 的前 8 bytes（就是名稱裡的 `<oid>`） |
+| `sha` | bytes(32) | 傳輸內容（壓縮後）的 SHA-256 |
+| `size` | u64 | 傳輸內容的大小 |
+| `raw` | u64 | 解壓縮後的大小 |
+| `enc` | text | `"zstd"` 或 `"none"` |
+| `name` | text | `filter-copy`：清單網址；其他種類是空字串 |
+| `at` | u64 | 資料的時間（`upstreams`：評測的 `generatedAt`；其他：檔案時間） |
+| `rules` | u64 | 只有 `filter-copy`：規則數（下游估記憶體用） |
+| `hash` | text | 只有 `filter-copy`：原始內容的雜湊（`CopyMeta.hash` 的 16 個十六進位字），下游存副本時原樣記下 |
+| `etag`、`lastModified` | text | 只有 `filter-copy`：上游下載時拿到的驗證資訊（可以是空字串），下游之後自己下載時拿來問 304 |
+
+### 3.3 上游端
+
+- 第一次有人問清單時才產生，放在記憶體裡的 `ShareCache`；10 分鐘內重複問直接回同一份，超過 10 分鐘重新產生；30 分鐘沒人問就整個釋放。
+- `upstreams`、`cdn-pools`、`cdn-v6`、`cdn-ranges`：產生清單時讀進記憶體、用 zstd 壓縮後留著（實測種子資料：7 KB、72 KB、110 KB、76 KB，壓縮後合計約 80 KB）。**上限合計 1 MiB**，超過的種類不列進清單。
+- `filter-copy`：不進記憶體。清單只記檔名、大小與雜湊（第一次用串流算，結果跟 `CopyMeta.hash` 一起記著，副本沒變不重算）；分段請求時從檔案的對應位置讀 32 KiB。單一副本（壓縮後）超過 8 MiB 不分享。
+- 分段請求的物件不在目前的 `ShareCache` 裡 → `NXDOMAIN`（rcode 3），下游重新拿清單。
+- 沒有資料的種類不列（例如還沒評測過、CDN 沒啟用）。`upstreams.json` 是從種子來的（沒有 `generatedAt` 或 `selected` 是空的）也不列。
+- 同時最多 2 條在傳分段的 TCP 連線；每個來源每秒最多 64 段。記憶體壓力不是 `Normal` 時清單回 `REFUSED`（下游晚點再來）。
+
+### 3.4 下游端
+
+- 時機：進入 `chained` 後 30 秒做第一次；之後每 6 小時（±10 分鐘）拿一次清單。上游的評測在 04:10、節點池在 05:30，最慢 6 小時後拿到新資料。記憶體壓力不是 `Normal`、時鐘沒對時不影響（不靠 TLS）；壓力大時延後 10 分鐘。
+- 一次處理一個物件，處理完才抓下一個。順序：`upstreams` → `cdn-ranges` → `cdn-pools` → `cdn-v6` → `filter-copy`。
+- 匯入前的檢查（任何一項不過就丟掉這個物件、記在 `shared.objects[].error`，**不影響其他物件**）：
+
+| 種類 | 檢查 | 匯入方式 |
+|---|---|---|
+| `upstreams` | 解壓後 ≤ 256 KiB；是 JSON 物件、`selected` 是陣列、1～64 筆、每筆的 `id` 能用 `Upstream::parse` 解析而且 `supported()` | 拿掉 `type` 是 `udp`／`tcp` 的（對下游來說都會回到上游自己）；加上 `"source": { "chain": "<上游 kid>", "at": <時間> }`；寫到下游自己的 `upstream.autoStateFile`，`Manager::reload_auto()` 照檔案時間重讀。`autoTypes`、`autoMax` 照下游自己的設定再篩一次（現有行為） |
+| `cdn-ranges` | 解壓後 ≤ 2 MiB；檔名只能是 `[a-z0-9-]+-ipv[46]\.txt`；每行是合法的 CIDR | 寫到 `state/cdn/ranges/`，呼叫 `Cdn::reload_ranges()` |
+| `cdn-pools` | 解壓後 ≤ 1 MiB；能解析成 `PoolsFile`、不是空的；每家最多 `pool.poolSize × 4` 個節點；節點位址必須在那一家的官方範圍裡（`Pools::in_ranges`） | `Cdn::import_shared()`（新函式）換掉記憶體裡的節點池並標成 dirty，照平常的快照流程寫出；15 秒後重新量一次健康與品質（同 `cdn-pool` 工作結束後的做法） |
+| `cdn-v6` | 解壓後 ≤ 1 MiB；`V6Store::from_json` 解析得過 | 同上 |
+| `filter-copy` | `name` 是下游自己有啟用的清單網址；`size` ≤ 8 MiB、`raw` ≤ 64 MiB；記憶體控制允許（`rules × BUILD_BYTES_PER_RULE` 放得下） | 見下 |
+
+- **過濾清單副本**：
+  - 下游留得下副本（`ListCopies::wanted(size)` 為真）：分段抓下來（壓縮後的內容暫時放在記憶體，最多 8 MiB，跟現在下載清單時 `CopySink` 的做法一樣），雜湊驗過之後原樣交給 `ListCopies::offer()` 存成本機副本（不解壓、不重新壓縮），全部抓完後用「副本優先」重建一次過濾器（現有的 `Source::PreferCopy` 路徑）。
+  - 留不下副本（小 Flash）：不抓。這種機器照舊自己下載（每天一次、有 ETag）。**不做「邊抓邊餵建置器」**：那要在過濾器重建流程裡多一種來源，3.4.0 先不動那條路徑。
+  - 雜湊沒變的副本不重抓。下游自己的清單更新排程照常跑；副本是 6 小時內從上游拿到的清單，這一輪跳過下載（當成 304）。
+- **不採用 hosts 檔的 IP**：共用的節點池是上游實測的 CDN 節點，匯入時再用官方範圍檢查一次；清單副本只當過濾規則用，裡面的位址不會變成答案或節點。串接上游的位址只來自路由表的預設閘道與路徑檢查，不讀系統的 hosts 檔。
+
+### 3.5 跳過自己的工作、退回自己算
+
+`chain-share.json`（快照目錄，幾百 bytes）記每個種類最後一次成功匯入的時間與雜湊。
+
+- 「新鮮」＝ 36 小時內成功匯入過，而且現在是 `chained`。
+- `dns-benchmark`：`upstreams` 新鮮 → 這次不跑，工作狀態記「由上游黑潮提供，略過」。
+- `cdn-pool`、`cdn-scan`：`cdn-pools` 新鮮 → 不跑。`cdn-ranges`：`cdn-ranges` 新鮮 → 不跑。
+- 不新鮮（上游沒資料、驗證失敗、36 小時沒同步成功、串接解除、`chain_share = none`）→ 工作照原本的排程跑，跟 3.3.7 一樣。
+- 串接解除時，手上的資料已經超過 48 小時 → 向排程器 `request("dns-benchmark", "串接解除")`（照排程器現有的最小間隔與延後規則，不會馬上搶 CPU）。
+- 匯入的資料不刪：解除後繼續用，直到自己的工作算出新的。
+
+格式相容：`fmt` 只在資料格式有不相容的改變時加 1；下游遇到比自己新的 `fmt` 就略過那個物件、自己算。狀態檔格式在 3.x 之間沒有變過，所以 3.4.x 之間不看 `app` 版本，只看 `fmt` 與上面的內容檢查。
+
+### 3.6 記憶體與儲存上限
+
+| 項目 | 上限 | 備註 |
+|---|---|---|
+| 上游 `ShareCache`（記憶體） | 1 MiB，30 分鐘沒人用就釋放 | 過濾清單副本不進記憶體 |
+| 上游分段緩衝 | 32 KiB × 2 條連線 | |
+| 下游清單 | 16 KiB、64 個物件 | 超過整份丟掉 |
+| 下游非過濾類物件 | 壓縮 ≤ 1 MiB、解壓 ≤ 2 MiB；一次一個 | 尖峰約 3 MiB，處理完就釋放 |
+| 下游過濾清單副本 | 一次一份；壓縮後 ≤ 8 MiB 暫存在記憶體，存成副本後釋放 | 留不下副本的機器不抓；記憶體壓力不是 `Normal` 時不抓 |
+| 下游 Flash 寫入 | `upstreams.json` 每天約 7 KB、範圍每週約 76 KB、節點池照平常的快照 | 內容沒變不寫 |
+
+128 MB 的機器：非過濾類的尖峰 3 MiB 可以接受；過濾清單副本多半留不下（小 Flash）所以不抓，行為跟現在一樣。512 MB 的 D3 若有外接儲存、留得下副本，才會抓。
+
+### 3.7 狀態
+
+`/api/status` 的 `chain.shared`（下游；沒啟用或沒串接是 `null`）：
+
+```json
+"shared": {
+  "enabled": true, "lastSyncAt": 1795000500000, "nextSyncAt": 1795022100000, "error": null,
+  "objects": [
+    { "kind": "upstreams",  "at": 1794990000000, "bytes": 6624,  "importedAt": 1795000500000, "fresh": true,  "error": null },
+    { "kind": "cdn-pools",  "at": 1794994000000, "bytes": 71555, "importedAt": 1795000501000, "fresh": true,  "error": null },
+    { "kind": "filter-copy", "name": "https://filter.example.net/list.txt", "at": 1794980000000, "bytes": 412345, "importedAt": null, "fresh": false, "error": "no-room" }
+  ],
+  "skippedJobs": ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"]
+}
+```
+
+`autoUpstreams`（現有欄位）多一個 `source`：`"chain"` 或 `"benchmark"`。
+
+---
+
+## 4. 上游放行下游（預設關）
+
+### 4.1 目標與原則
+
+上游的管理者可以對**核准過的**下游放寬兩件事。兩個開關預設都關；開了也只對核准名單裡的節點有效；`access.deny` 永遠優先。
+
+| UCI（`config upstream 'upstream'`） | JSON | 預設 | 說明 |
+|---|---|---|---|
+| `downstream_encrypted` | `upstream.downstreamEncrypted` | `0`／`false` | 核准的下游目前的來源位址，在存取控制裡當成「社群好友」那一級允許 |
+| `downstream_bypass` | `upstream.downstreamBypass` | `0`／`false` | 核准的下游查它登記的上游主機名稱時，不套用標成 `bypass` 的清單 |
+
+另外，過濾清單多一個標記：
+
+| UCI（`config filter_list`） | JSON（`filter.lists[]`） | 預設 | 說明 |
+|---|---|---|---|
+| `option bypass '1'` | `"bypass": true` | `false` | 這份是「繞過防護」類的清單（擋加密 DNS／VPN／代理的主機名稱）。`defaults.json` 與預設 UCI 裡 HaGeZi `doh-vpn-proxy-bypass` 那一筆加上這個標記 |
+
+為什麼需要核准：節點金鑰是每台自己產生的，任何區網裝置都能跑一個「下游」來登記。如果登記就放行，被「繞過防護」清單管著的裝置只要裝個假下游就能解析 DoH 主機名稱，這份清單就失效了。
+
+### 4.2 登記（reg）
+
+下游在 `detected` 之後（**不必等串接成立**，因為等待同意期間下游還在用自己的加密上游，bootstrap 一樣會被上游的清單擋）、上游的 `caps` 有 `"reg"`、而且自己的 `chain ≠ 0` 時登記；之後每 5 分鐘跟著心跳更新。`caps` 沒有 `"reg"`（上游兩個放行開關都關）就不登記。
+
+查詢：`r.chain.kuroshio`、CH TXT，帶 EDNS 選項 **65313**，內容是 `Sealed`（`kind = "reg"`，**下游的金鑰簽章**）。
+
+RegBody：
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `v` | u8 | `1` |
+| `t` | text | `"reg"` |
+| `up` | bytes(8) | 上游的 `kid`（簽給別台的登記不能拿來這台用） |
+| `tok` | bytes(16) | 最近一次 auth 回應裡的 `tok` |
+| `peer` | text | 最近一次 auth 回應裡的 `peer` |
+| `kid`、`pub` | bytes | 下游的節點 ID 與公鑰 |
+| `app` | text | 下游版本 |
+| `names` | [text] | 下游的上游主機名稱（固定、自動、備援、最後手段裡不是 IP 的主機，去重複），最多 32 個、每個要通過 `valid_domain` |
+| `local` | bool | `peer` 是不是下游自己某張網卡的位址（否 = 中間有 NAT） |
+
+上游的檢查（任何一項不過回 `REFUSED`）：`Sealed` 驗簽（用 `body.pub`）→ `kid == kid_of(pub)` → `up` 是自己 → `peer` 等於這個查詢的來源位址 → `tok` 對這個來源位址有效（目前或前一個時間窗）→ `names` 合法。
+
+回應：`Sealed`（`kind = "regack"`，上游簽）：`{ v, t: "regack", kid: 下游的 kid, ttl: 900, approved: bool, grants: ["encrypted", "bypass"] 的子集 }`。下游把 `approved` 與 `grants` 顯示在狀態頁（`chain.upstream.registered`）。
+
+登記表（上游，記憶體）：最多 **16** 筆，每筆 `{ kid, pub, 來源位址, app, names, local, 到期時間 = 現在 + 900 秒 }`；同一個 `kid` 重新登記就更新（位址換了，舊位址的放行立刻失效）；滿了拒絕新的。重新載入後登記表清空，下游最慢 5 分鐘內重新登記。
+
+### 4.3 核准
+
+上游的狀態頁列出登記中的下游（位址、指紋、版本、有沒有經過 NAT），管理者按「核准」。核准紀錄存在快照目錄的 `chain.json`：
+
+```json
+{ "downstreams": [ { "pub": "<base64>", "fingerprint": "9C01-…", "approvedAt": 1795000000000, "note": "192.168.1.2" } ] }
+```
+
+最多 16 筆。管理 API：`POST /api/chain/downstream?decision=approve|revoke&fp=<指紋>`（`approve` 只能對目前登記中的節點）。
+
+### 4.4 放行的範圍
+
+**加密 DNS（`downstream_encrypted`）**
+
+- `ipfilter::Rules` 多一組 `chain`（`Dual`），判斷順序放在「社群好友」之後、`allow` 之前；`Reason::Downstream`，說明文字「已核准的下游黑潮」。`deny` 照樣優先。
+- 內容＝核准而且登記沒過期的下游的來源位址，**只放單一位址**（IPv4 /32、IPv6 /128），由 `Access::set_chain(&[IpAddr])` 更新（做法同 `set_friends`）；登記表每次變動與每分鐘各更新一次。
+- 套用到哪些服務照 `access.applyTo`，沒有新的規則。
+- 現況提醒（寫進設定頁的說明）：下游用私有位址時本來就允許，這個開關只對「來源是公網位址的下游」有差別。
+- `local = false`（下游在另一台 NAT 後面）：放行的是那台 NAT 的位址，它後面的裝置都一起放行。核准畫面要標「經 NAT」。
+- 核心層的 nftables 規則不用改：只在 WAN 輸入鏈，下游從區網來。
+
+**繞過防護清單（`downstream_bypass`）**
+
+三個條件都成立才不擋：
+
+1. 查詢的來源位址是核准而且登記沒過期的下游；
+2. 命中的是標成 `bypass` 的清單（自訂規則、其他清單命中照擋）；
+3. 查詢名稱（或 CNAME 目標）在這個下游登記的 `names` 裡（完全相同，不含子網域）。
+
+實作：
+
+- `resolver::Verdict` 加 `bypass: bool`（`FilterService::check` 用 `v.list` 對到 `sources[i].bypass`）。
+- `handle_inner` 的過濾步驟：`v.block && v.bypass && responder.exempt(ctx.client, &qname)` → 當成沒命中，繼續往下。
+- CNAME 目標命中：`cache::Entry` 加 `blocked_bypass: Option<String>`（命中 `bypass` 清單的那個 CNAME 目標）；`serve()` 多一個參數，來源是核准的下游而且那個目標在它的 `names` 裡時不回封鎖。其他用戶端拿同一個快取項目照樣被擋。
+- 不改快取鍵：過濾在快取之前判斷，快取項目本身存的是上游的原始答案。
+
+### 4.5 狀態
+
+`/api/status` 的 `chain.serving`（上游角色；`allow_downstream` 關而且沒有登記是 `null`）：
+
+```json
+"serving": {
+  "allowDownstream": true, "downstreamEncrypted": false, "downstreamBypass": true,
+  "nodeId": "a1b2c3d4e5f60718", "fingerprint": "3F2A-91C0-…",
+  "downstreams": [
+    { "address": "192.168.1.2", "nodeId": "0f1e2d3c4b5a6978", "fingerprint": "9C01-…", "version": "3.4.0",
+      "viaNat": false, "approved": true, "grants": ["bypass"], "names": 6, "lastSeen": 1795000300000, "expiresAt": 1795001200000 }
+  ],
+  "approved": [ { "fingerprint": "9C01-…", "approvedAt": 1795000000000, "note": "192.168.1.2", "online": true } ],
+  "share": { "requests": 12, "lastAt": 1795000500000, "cacheBytes": 81234 },
+  "refused": { "rate": 0, "notPrivate": 0 }
+}
+```
+
+上游的指紋要顯示在上游自己的狀態頁，讓使用者在下游按同意之前可以對照。
+
+---
+
+## 5. 低階機器的並行數
+
+### 5.1 `resolver.parallel` 的 `auto`
+
+`kuroshio_config::Host` 加 `aes: bool`（`has_aes()` 從 `sysinfo.rs` 搬到 `kuroshio-config`，`sysinfo` 改呼叫它）。`derive_auto`：
+
+| 條件 | `resolver.parallel` |
+|---|---|
+| 沒有 AES 指令 | 2（不管幾核心） |
+| 有 AES，1 核心 | 2（不變） |
+| 有 AES，2 核心 | 3（不變） |
+| 有 AES，3 核心以上 | 0 ＝ 全部（不變） |
+
+- 使用者填了數字一律優先（含 `0`；UCI 的 `option parallel '0'` 轉成數字 0 ＝ 全部）。
+- `has_aes()` 在 MIPS、ARMv7、RISC-V 一律是 `false`（沒有偵測的方法）。有硬體 AES 的 ARMv7 機器很少，被當成「沒有」只是保守一點，可以手動設 `0`。
+- `kuroshio sysinfo` 與啟動記錄說明原因：「沒有 AES 指令：先問最快的 2 個上游，其他在背景補問」。
+
+### 5.2 背景補問（backfill）
+
+`parallel` 有限制（`0 < parallel < 這次的上游數`）時，沒被問到的上游原本只在失敗或 300 ms 沒有正常回應時才補上，所以「覆蓋」上游幾乎不會被問到：CDN 網域少了別家給的節點、汙染也少了比對的對象。新行為：
+
+- 先照現在的流程回答用戶端（**不增加任何等待**）。
+- 回答之後，符合下面任一條件就在背景問「這次沒問到的上游」，把結果跟前面的合在一起重新走一次 `decide()`、`merge_rank()`、`store()`（快取項目換成合併後的）：
+  1. **CDN 相關**：查詢是 A／AAAA，而且剛才的答案裡有任何一個位址被 `Cdn::classify()` 認得（屬於某家 CDN 的範圍）。CDN 沒啟用時這一條不成立。
+  2. **抽樣**：其他 A／AAAA 查詢每 `backfillSample` 次抽一次（預設 16）。比對：前面是正常回應，補問的上游多數（至少 2 台而且過半）是 NXDOMAIN／NODATA，或反過來 → 記一筆 `stats` 的 `backfillMismatch`，快取換成合併後 `decide()` 的結果。
+- 不補問：`verbatim`（DO、類別不是 IN）、串接中（只有一台上游）、所有上游都已經問過、記憶體壓力不是 `Normal`、同時已經有 `backfillMax` 個補問在跑（1～2 核心：2；其他：4。超過就跳過，不排隊）。
+- 補問的失敗照樣記在各上游的統計（`Up::record`），自動上游的暫停機制照常運作。
+
+| UCI（`config resolver 'resolver'`） | JSON | 預設 | 說明 |
+|---|---|---|---|
+| `backfill` | `resolver.backfill` | `cdn` | `cdn`：上面的行為；`off`（或 `0`／`false`）：不補問（3.3.7 的行為） |
+| `backfill_sample` | `resolver.backfillSample` | `16` | 非 CDN 查詢每幾次抽一次；`0` ＝ 不抽樣 |
+
+`/api/status` 的 `stats` 多 `backfill`（補問次數）、`backfillMismatch`。
+
+---
+
+## 6. 上游多樣性（`coverage_region`）
+
+### 6.1 怎麼判斷上游在哪裡
+
+**程式裡現在沒有全球的 geo 資料**：`data/geo/tw-ip.json` 只有台灣網段（`kuroshio_jobs::geo::TwIp`），評測的 ip-api 查詢只拿業者與 AS。三個訊號合起來用：
+
+| 訊號 | 來源 | 可靠度 |
+|---|---|---|
+| 台灣網段 | `tw-ip.json`（已經隨程式附帶、每月在本機更新），離線可用 | 高，但任播位址（anycast）登記在國外的不算 |
+| 國別 | ip-api 批次查詢的 `fields` 多要 `countryCode`，跟業者資料一起存進 `cidr_cache.json`（每筆多一個選用的 `"cc"`；舊的快取沒有就是空的，只對決選的上游補查，不整批重查） | 中：任播位址給的是登記地（`1.1.1.1` 是 AU），/16 的粒度也粗 |
+| 量到的最低延遲 | `Scored.min`（評測本來就有） | 高：任播位址實際落在哪個節點，延遲最老實。從台灣量，台灣 < 15 ms、香港 15～30、日本 30～50、新加坡 40～60、美西 > 110 |
+
+判斷（`Scored` 多 `region: String` 與 `near: bool`）：
+
+```
+region = "TW"              如果上游位址在 tw-ip.json 裡
+       = 國別碼            如果 ip-api 有給
+       = ""                都沒有
+near   = region ∈ {TW, JP, HK, SG} 而且 min ≤ nearMaxMs × 2
+      或 min ≤ nearMaxMs（預設 60 ms；不管國別，涵蓋任播與查不到國別的）
+```
+
+理由：我們要的其實是「這台上游從哪裡去問權威伺服器」，因為那決定 CDN 回的是不是亞洲節點；對任播上游來說這只能從延遲看出來。國別是補充（延遲在 60～120 ms 之間、但確實在鄰近四地的非任播上游），也是報表上給人看的標籤。
+ip-api 查不到（離線、被限速）時只靠 `tw-ip.json` 與延遲，功能不受影響。
+
+### 6.2 選擇
+
+`select::select()` 的「覆蓋」階段分兩輪（「最快」與「備援」不變）：
+
+1. 只在 `near` 的候選裡做貪婪覆蓋，直到台數上限或覆蓋率達標；
+2. 還有名額而且覆蓋率還沒達標，才在剩下的候選裡繼續。
+
+`coverage_region = any` 時跟 3.3.7 一樣（一輪、不分遠近）。
+
+| UCI（`config benchmark 'benchmark'`） | JSON | 預設 | 說明 |
+|---|---|---|---|
+| `coverage_region` | `benchmark.coverageRegion` | `near` | `near`／`any` |
+| `near_max_ms` | `benchmark.nearMaxMs` | `60` | 最低延遲在這以內就算鄰近 |
+
+輸出：`upstreams.json` 的 `selected[]` 每筆多 `"region"`（`"TW"`、`"JP"`…或 `""`）與 `"near"`；`final_dns_smart.csv` 多 `Region`、`Near` 兩欄（加在最後，舊的欄位順序不變）；`/api/status` 的 `upstreams[]` 多 `region`。`reason` 的文字（最快、覆蓋、備援）不變。評測記錄多一行「覆蓋：鄰近 N 台、其他 M 台」。
+
+---
+
+## 7. 重新載入時不斷線（選做）
+
+### 7.1 評估
+
+| 做法 | 評估 |
+|---|---|
+| `SO_REUSEPORT`：新的一輪先綁好再關舊的 | **不建議。**前提是兩輪同時活著，但現在的設計是舊的 runtime 完全結束才建新的；兩輪並存會讓快照寫入器、排程器的鎖、行程層級的狀態（路徑檢查、快取交接）同時有兩份。另外 Linux 關掉其中一個監聽時，已經排進它佇列的 TCP 連線會被重設；Windows 沒有對等的行為 |
+| 把 socket 傳給新的行程 | 不適用：重新載入是同一個行程 |
+| **監聽 socket 留在行程層級，每一輪拿複製品（建議）** | 可行、改動小、Linux 與 Windows 都能用 |
+
+### 7.2 設計：`ListenBank`
+
+- 行程層級的表（`static`，做法同 `CACHE_HANDOFF`）：鍵 `(用途, 協定, 位址)` → `std::net::UdpSocket`／`std::net::TcpListener`。
+- 每一輪要監聽時向它要：表裡有就 `try_clone()`（`dup`）一份交給 tokio；沒有才綁定、放進表裡再複製。
+- 舊的一輪結束時只關掉它自己的複製品，**核心裡的 socket 一直開著**：空窗期間 UDP 封包留在接收緩衝區、TCP 連線留在 accept 佇列，新的一輪接手後照常回答。用戶端看到的是 0.2～0.4 秒的延遲，不是 Connection refused。
+- 新的一輪啟動完成後，表裡這一輪沒人要的項目（設定改了位址或埠、關掉了某個協定）才關掉。
+- 埠是 0 的（測試）不進表。
+- 範圍：一般 DNS（UDP／TCP 53）、DoT 與 DoH 的 TCP 監聽、管理介面。QUIC（DoQ／DoH3）：socket 一樣可以留著，新的 quinn `Endpoint` 建在複製的 socket 上；進行中的 QUIC 連線照舊會斷（跟現在一樣），這一點不是這次的目標。HTTP.sys 模式不適用。
+- 限制：空窗期間到達、但已經被舊的一輪讀走還沒回答的 UDP 查詢會掉（用戶端重送）；啟動失敗改回上一份設定時 socket 還在表裡，不受影響。
+
+列為選做：跟其他五項沒有相依；驗收是「重新載入期間連續查詢，沒有任何一筆被拒絕」。來不及就延到 3.4.1，不影響其他項目。
+
+---
+
+## 8. 安全分析
+
+### 8.1 威脅與對策
+
+| # | 威脅 | 對策 | 殘餘風險 |
+|---|---|---|---|
+| T1 | 區網裡的裝置冒充上游黑潮（自己產生金鑰、回答挑戰） | 簽章只證明「持有某把金鑰」，信任來自**同意**：`ask` 模式下使用者核對指紋（上游的狀態頁有顯示）後才綁定，決定綁在公鑰上；公鑰換了要重新同意 | `auto` 模式等於信任路上任何會講這個協定的攔截者。預設是 `ask`；`auto` 的說明文字要寫清楚「只在自己的網路用」 |
+| T2 | 重放舊的簽章回應 | 每次挑戰用新的 16 bytes nonce，回應必須帶回而且在 1.5 秒內；不靠時鐘 | 無 |
+| T3 | 區網內的主動攻擊者（ARP 欺騙）把挑戰原樣轉給真的上游，之後竄改一般 DNS 的答案 | 一般 DNS 的通道本身防不了。緩解：路徑檢查每 6 小時（與 WAN 變動時）對攔截者做已知答案與 `.invalid` 檢查，發現竄改就解除；`chain_backup = encrypted` 保留加密上游；共用結果有簽章，改不了 | **存在**，程度等同上游區網裡其他用一般 DNS 的裝置。要完全排除需要「釘選公鑰的 DoT」（協定已預留 `dot` 欄位，列為後續） |
+| T4 | 攻擊者擋掉串接查詢（降級） | 降級的結果是下游用自己的加密上游，比串接更安全 | 無 |
+| T5 | 竄改共用結果（讓下游用壞的上游或節點） | 清單由綁定的公鑰簽章，物件用 SHA-256 驗證；匯入前有格式、大小、官方範圍的檢查 | 惡意的「已同意的上游」可以給不好的資料，等同它本來就能回答任何 DNS |
+| T6 | 迴圈（A→B→A） | 節點 ID 鏈、上限 4 層、綁定後的提早心跳、singleflight | 兩台同時互綁時最多 15 秒的查詢逾時 |
+| T7 | 用挑戰查詢耗盡上游的 CPU（簽章）或當放大器 | 只回答私有來源的一般 DNS；每來源每秒 4 次、全域每秒 32 次；回應約 300 bytes | 區網內的小幅放大（約 4 倍），受速率限制 |
+| T8 | 假的下游騙取放行（存取控制、繞過防護清單） | 兩個開關預設關；只對**核准過的指紋**有效；登記要下游簽章、綁來源位址與 5 分鐘的憑據、15 分鐘到期；放行單一位址；繞過只限登記的主機名稱而且只對 `bypass` 清單 | 核准的下游可以登記任意 32 個名稱（它是管理者核准的）；下游在 NAT 後面時整個 NAT 一起放行（畫面有標示） |
+| T9 | 攔下登記封包從別的位址重送 | `tok` 與 `peer` 綁來源位址，上游比對查詢的實際來源 | UDP 偽造來源位址只能讓「被偽造的那個位址」被放行，攻擊者自己拿不到 |
+| T10 | 透過管理 API 偷偷同意／核准 | 兩個動作都是需要登入的 POST；`consent` 要帶目前的指紋 | 同現有管理 API |
+| T11 | 公開的加密監聽洩漏節點資訊 | `chain.kuroshio` 只在 `udp`／`tcp` 而且私有來源時回答，其他一律 `REFUSED` | 無 |
+| T12 | 上游的節點私鑰外洩 | 金鑰檔 0600；跟社群共享同一把，輪替方式相同。輪替後下游要重新同意 | 同社群共享 |
+
+### 8.2 隱私
+
+- auth 回應給區網裡任何問的裝置：節點 ID、公鑰、版本、`allow`。這些跟 `version.kuroshio` 已經透露的同一個等級。
+- 共用結果給區網裡任何問的裝置（不要求登記）：上游用哪些公開 DNS、CDN 節點、訂閱了哪些公開清單。沒有查詢紀錄、沒有自訂規則、沒有任何金鑰。不想分享就關 `allow_downstream`。
+- 登記時下游把自己的上游主機名稱告訴上游：上游本來就看得到這些查詢。
+
+---
+
+## 9. 記憶體上限總表
+
+| 結構 | 在哪一邊 | 上限 |
+|---|---|---|
+| 串接狀態（探測結果、綁定、`path`） | 下游 | 固定大小，< 1 KB |
+| 同意紀錄 `chain.json` | 下游 | 8 筆 |
+| 速率限制表 | 上游 | 64 個來源 |
+| 登記表 | 上游 | 16 筆 × 最多 32 個名稱（< 16 KB） |
+| 核准紀錄 | 上游 | 16 筆 |
+| 存取控制的 `chain` 集合 | 上游 | 16 個單一位址 |
+| `ShareCache` | 上游 | 1 MiB，30 分鐘沒用就釋放 |
+| 共用結果匯入 | 下游 | 一次一個物件；非過濾類尖峰約 3 MiB，過濾清單副本 ≤ 8 MiB（見 3.6） |
+| 背景補問 | 兩邊 | 同時 2 或 4 個，每個是一次查詢的大小 |
+| `ListenBank` | 兩邊 | 監聽數（十幾個 fd） |
+
+沒有新的、會隨時間長大的快取。
+
+---
+
+## 10. 設定總表
+
+| UCI 區段／選項 | JSON | 預設 | 型別 | 節 |
+|---|---|---|---|---|
+| `upstream` / `chain` | `upstream.chain` | `"ask"` | 字串（容忍數字、布林） | 1.11 |
+| `upstream` / `chain_backup` | `upstream.chainBackup` | `"encrypted"` | 字串 | 1.11 |
+| `upstream` / `chain_share` | `upstream.chainShare` | `"jobs"` | 字串 | 1.11 |
+| `upstream` / `allow_downstream` | `upstream.allowDownstream` | `true` | 布林 | 1.11 |
+| `upstream` / `downstream_encrypted` | `upstream.downstreamEncrypted` | `false` | 布林 | 4.1 |
+| `upstream` / `downstream_bypass` | `upstream.downstreamBypass` | `false` | 布林 | 4.1 |
+| `filter_list` / `bypass` | `filter.lists[].bypass` | `false` | 布林 | 4.1 |
+| `resolver` / `backfill` | `resolver.backfill` | `"cdn"` | 字串 | 5.2 |
+| `resolver` / `backfill_sample` | `resolver.backfillSample` | `16` | 數字 | 5.2 |
+| `benchmark` / `coverage_region` | `benchmark.coverageRegion` | `"near"` | 字串 | 6.2 |
+| `benchmark` / `near_max_ms` | `benchmark.nearMaxMs` | `60` | 數字 | 6.2 |
+
+每一個都要同時出現在：`crates/kuroshio-config/defaults.json`、`uci.rs`（確認自動轉換的結果，`filter_list` 的 `bypass` 要在清單區段的轉換裡加）、`openwrt/kuroshio/files/kuroshio.config`（含註解）、LuCI（`advanced.js`／`filter.js`）、`data/admin/fields.json`、`docs/integration.md`。
+`resolver.parallel` 的預設值不變（`"auto"`），只有換算規則變。
+
+`answer_fingerprint`（重新載入時要不要沿用 DNS 快取）要把 `upstream.chain`、`chainBackup` 算進去；`filter_fingerprint` 要把 `bypass` 標記與 `downstreamBypass` 算進去。
+
+---
+
+## 11. 尚待決定
+
+1. **串接通道的完整性（T3）**：3.4.0 用一般 DNS，接受「區網內主動攻擊者」這個殘餘風險；還是要把「釘選公鑰的 DoT」排進 3.4.0。建議：3.4.0 先不做（上游多數沒開加密監聽、下游的目標機型就是要省 TLS），3.4.x 再加成選項。
+2. **`chain_share` 的預設**：建議 `jobs`（串接已經需要使用者同意，同意之後省掉評測是主要的好處）。保守一點可以預設 `none`。
+3. **過濾清單共用的範圍**：建議 3.4.0 只共用「上游有留副本、網址相同、下游也留得下副本」的清單；小 Flash 的機器照舊自己下載。若要讓小 Flash 的機器也受惠（邊抓邊建、或串接時直接不載入清單、交給上游過濾），是另一個比較大的題目。
+4. **上限 4 層**是否足夠。
+5. **`auto` 模式在公鑰換了之後**：建議自動重新綁定並留警告 24 小時；也可以改成「換了就退回 `ask`」。
