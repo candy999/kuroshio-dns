@@ -59,8 +59,18 @@ fn one_line_json(s: &str) -> Value {
     serde_json::from_str(s.trim()).unwrap_or_else(|e| panic!("{e}：{s}"))
 }
 
+/// 空著的埠。同一個測試行程裡不會給同一個埠兩次（系統配的埠關掉之後很快又會配出來，
+/// 平行跑的測試各自起的服務會撞在同一個埠上）
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut given = GIVEN.lock().unwrap();
+        if !given.contains(&port) {
+            given.push(port);
+            return port;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -602,4 +612,372 @@ async fn check_path_shows_chain_line() {
     let j: Value = serde_json::from_str(&out).unwrap();
     assert!(j["interceptor"]["chain"].is_null());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------- 3.4.0 WP10：重新載入不斷線（listenbank） ----------------
+#[cfg(unix)]
+mod reload {
+    use super::*;
+
+    /// UDP 與 TCP 都空著的埠
+    fn free_dns_port() -> u16 {
+        loop {
+            let port = free_port();
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+    }
+
+    /// 假的上游（UDP）：A 查詢一律回 198.51.100.10，其他類型回沒有答案
+    fn fake_a_upstream() -> std::net::SocketAddr {
+        use kuroshio_proto::message::{Message, Record};
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = u.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = u.recv_from(&mut buf) {
+                let Ok(m) = Message::parse(&buf[..n]) else { continue };
+                let Some(q) = m.questions.first().cloned() else { continue };
+                let mut r = Message::response_to(&m, 0);
+                if q.qtype == 1 {
+                    r.answers.push(Record::a(&q.name, 300, "198.51.100.10".parse().unwrap()));
+                }
+                let _ = u.send_to(&r.encode(), from);
+            }
+        });
+        addr
+    }
+
+    /// 重新載入測試用的設定：上游只有假的上游（種子資料裡的自動上游不用、不做路徑檢查與串接，不連外）
+    fn reload_cfg(dir: &Path, dns: u16, admin: u16, up: std::net::SocketAddr) -> Value {
+        let mut v = user_cfg(dir, dns, admin, false);
+        v["upstream"] = json!({
+            "pinned": [format!("udp://{up}")], "fallback": [], "autoTypes": [], "pathCheck": false, "chain": false,
+        });
+        v
+    }
+
+    /// 查 example.com 的 A：回答案裡的位址（`None` = 等不到）；拒絕連線回 `Err(ConnectionRefused)`
+    fn query_a(sock: &std::net::UdpSocket, id: u16, wait: std::time::Duration) -> std::io::Result<Option<Vec<std::net::IpAddr>>> {
+        use kuroshio_proto::message::{Message, RData};
+        let t0 = std::time::Instant::now();
+        sock.send(&kuroshio_proto::build_query(id, "example.com", 1))?;
+        let mut buf = vec![0u8; 4096];
+        while let Some(left) = wait.checked_sub(t0.elapsed()).filter(|d| !d.is_zero()) {
+            sock.set_read_timeout(Some(left))?;
+            match sock.recv(&mut buf) {
+                Ok(n) => {
+                    let Ok(m) = Message::parse(&buf[..n]) else { continue };
+                    if m.id != id {
+                        continue; // 上一筆查詢遲到的回應
+                    }
+                    let ips = m
+                        .answers
+                        .iter()
+                        .filter_map(|r| match r.data {
+                            RData::A(a) => Some(std::net::IpAddr::V4(a)),
+                            _ => None,
+                        })
+                        .collect();
+                    return Ok(Some(ips));
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// 用戶端的來源位址：Linux 整段 127/8 都是本機，用 127.0.0.2 —— 連續開的大量用戶端埠
+    /// 不會占到平行跑的其他測試剛挑好、還沒綁定的 127.0.0.1 埠
+    fn client_ip() -> std::net::IpAddr {
+        if cfg!(target_os = "linux") {
+            [127, 0, 0, 2].into()
+        } else {
+            [127, 0, 0, 1].into()
+        }
+    }
+
+    fn connected_udp(port: u16) -> std::net::UdpSocket {
+        let s = std::net::UdpSocket::bind((client_ip(), 0)).unwrap();
+        s.connect(("127.0.0.1", port)).unwrap();
+        s
+    }
+
+    /// 新的 TCP 連線（來源位址同 `client_ip`）
+    fn tcp_connect(port: u16) -> std::io::Result<std::net::TcpStream> {
+        use socket2::{Domain, Socket, Type};
+        let s = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+        s.bind(&std::net::SocketAddr::new(client_ip(), 0).into())?;
+        let to: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        s.connect_timeout(&to.into(), std::time::Duration::from_secs(2))?;
+        Ok(s.into())
+    }
+
+    fn answer_ip() -> std::net::IpAddr {
+        "198.51.100.10".parse().unwrap()
+    }
+
+    /// 服務在跑的時候兩條執行緒連續發 UDP 查詢與新的 TCP 連線（每 5 ms 一次），記下拒絕連線與沒有回應
+    struct Prober {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        threads: Vec<std::thread::JoinHandle<usize>>,
+    }
+
+    impl Prober {
+        fn start(port: u16) -> Prober {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex};
+            use std::time::Duration;
+            let stop = Arc::new(AtomicBool::new(false));
+            let errors: Arc<Mutex<Vec<String>>> = Default::default();
+            let udp = {
+                let (stop, errors) = (stop.clone(), errors.clone());
+                std::thread::spawn(move || {
+                    let sock = connected_udp(port);
+                    let (mut id, mut ok) = (0u16, 0usize);
+                    while !stop.load(Ordering::Relaxed) {
+                        id = id.wrapping_add(1);
+                        // 第一次等 2 秒，沒回應重送一次再等 2 秒
+                        let mut got = None;
+                        for _ in 0..2 {
+                            match query_a(&sock, id, Duration::from_secs(2)) {
+                                Ok(Some(ips)) => {
+                                    got = Some(ips);
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    errors.lock().unwrap().push(format!("UDP 查詢 #{id}：{e}（{:?}）", e.kind()));
+                                    break;
+                                }
+                            }
+                        }
+                        match got {
+                            Some(ips) if ips == [answer_ip()] => ok += 1,
+                            Some(ips) => errors.lock().unwrap().push(format!("UDP 查詢 #{id}：答案不對 {ips:?}")),
+                            None => errors.lock().unwrap().push(format!("UDP 查詢 #{id}：重送一次之後還是沒有回應")),
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    ok
+                })
+            };
+            let tcp = {
+                let (stop, errors) = (stop.clone(), errors.clone());
+                std::thread::spawn(move || {
+                    let mut ok = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        match tcp_connect(port) {
+                            Ok(_) => ok += 1,
+                            Err(e) => errors.lock().unwrap().push(format!("TCP 連線：{e}（{:?}）", e.kind())),
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    ok
+                })
+            };
+            Prober {
+                stop,
+                errors,
+                threads: vec![udp, tcp],
+            }
+        }
+
+        /// 停下來：回（錯誤、UDP 成功次數、TCP 成功次數）
+        fn finish(self) -> (Vec<String>, usize, usize) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let n: Vec<usize> = self.threads.into_iter().map(|t| t.join().unwrap()).collect();
+            let errors = std::mem::take(&mut *self.errors.lock().unwrap());
+            (errors, n[0], n[1])
+        }
+    }
+
+    /// 子程序 `kuroshio run`，收集輸出
+    struct Svc {
+        child: std::process::Child,
+        log: std::sync::Arc<std::sync::Mutex<String>>,
+        conf: String,
+    }
+
+    impl Svc {
+        fn start(conf: &Path) -> Svc {
+            use std::io::{BufRead, BufReader};
+            let mut child = Command::new(env!("CARGO_BIN_EXE_kuroshio"))
+                .args(["run", "-c"])
+                .arg(conf)
+                .env("NO_COLOR", "1")
+                .env("KUROSHIO_LOG", "info")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let log: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+            for pipe in [
+                Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+                Box::new(child.stderr.take().unwrap()),
+            ] {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    for l in BufReader::new(pipe).lines().map_while(Result::ok) {
+                        let mut g = log.lock().unwrap();
+                        g.push_str(&l);
+                        g.push('\n');
+                    }
+                });
+            }
+            let svc = Svc {
+                child,
+                log,
+                conf: conf.to_string_lossy().to_string(),
+            };
+            svc.until("服務回答", &|| run(&["health", "-c", &svc.conf, "--timeout", "500"]).0 == 0);
+            svc.until("啟動完成", &|| svc.rounds() >= 1);
+            svc
+        }
+
+        fn log(&self) -> String {
+            self.log.lock().unwrap().clone()
+        }
+
+        /// 啟動完成的輪數（每一輪啟動完成記一次快照目錄）
+        fn rounds(&self) -> usize {
+            self.log().matches("快照目錄 ").count()
+        }
+
+        fn until(&self, what: &str, f: &dyn Fn() -> bool) {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_secs(30) {
+                if f() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("等不到 {what}：\n{}", self.log());
+        }
+
+        fn hup(&self) {
+            assert_eq!(unsafe { libc::kill(self.child.id() as i32, libc::SIGHUP) }, 0);
+        }
+
+        /// 送 SIGHUP，等新的一輪啟動完成
+        fn reload(&self) {
+            let n = self.rounds();
+            self.hup();
+            self.until("重新載入完成", &|| self.rounds() > n);
+        }
+
+        fn stop(mut self) {
+            assert_eq!(unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) }, 0);
+            let t0 = std::time::Instant::now();
+            let st = loop {
+                if let Some(st) = self.child.try_wait().unwrap() {
+                    break st;
+                }
+                assert!(t0.elapsed() < std::time::Duration::from_secs(30), "SIGTERM 後要結束");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            assert!(st.success(), "{st:?}\n{}", self.log());
+        }
+    }
+
+    /// 重新載入期間連續查詢：沒有任何一次 Connection refused；UDP 在一次重送內都有回應；答案正確
+    #[test]
+    fn reload_never_refuses() {
+        let dir = tmp("reload-refuse");
+        let (dns, admin, up) = (free_dns_port(), free_port(), fake_a_upstream());
+        let conf = dir.join("config.json");
+        write_cfg(&conf, &reload_cfg(&dir, dns, admin, up));
+        let svc = Svc::start(&conf);
+        let probe = Prober::start(dns);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        for _ in 0..3 {
+            svc.reload();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        let (errors, udp_ok, tcp_ok) = probe.finish();
+        assert!(errors.is_empty(), "重新載入期間不能拒絕連線：{errors:#?}\n{}", svc.log());
+        assert!(udp_ok > 10 && tcp_ok > 10, "UDP {udp_ok} 次、TCP {tcp_ok} 次");
+        // 重新載入之後答案正確
+        let ips = query_a(&connected_udp(dns), 7, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(ips, Some(vec![answer_ip()]));
+        assert_eq!(svc.log().matches("收到 SIGHUP").count(), 3);
+        svc.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 改了監聽埠重新載入：舊的埠在啟動完成後連不上（UDP、TCP 都拒絕），新的埠可以
+    #[test]
+    fn reload_with_changed_port_closes_old() {
+        let dir = tmp("reload-port");
+        let (old, admin, up) = (free_dns_port(), free_port(), fake_a_upstream());
+        let conf = dir.join("config.json");
+        write_cfg(&conf, &reload_cfg(&dir, old, admin, up));
+        let svc = Svc::start(&conf);
+        let new = loop {
+            let p = free_dns_port();
+            if p != old {
+                break p;
+            }
+        };
+        write_cfg(&conf, &reload_cfg(&dir, new, admin, up));
+        svc.reload();
+        // 新的埠可以
+        let ips = query_a(&connected_udp(new), 1, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(ips, Some(vec![answer_ip()]), "{}", svc.log());
+        tcp_connect(new).expect("新的 TCP 埠可以連");
+        // 舊的埠：啟動完成（sweep）之後就關掉了
+        let e = tcp_connect(old).expect_err("舊的 TCP 埠要關掉");
+        assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
+        let sock = connected_udp(old);
+        let mut refused = false;
+        for id in 0..3 {
+            match query_a(&sock, id, std::time::Duration::from_millis(500)) {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    refused = true;
+                    break;
+                }
+                Ok(Some(ips)) => panic!("舊的 UDP 埠還在回答：{ips:?}"),
+                _ => {}
+            }
+        }
+        assert!(refused, "舊的 UDP 埠要關掉");
+        assert!(svc.log().contains("關掉上一輪的監聽 plain"), "{}", svc.log());
+        svc.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 給一份啟動不了的設定：服務用上一份設定繼續跑，期間同樣沒有拒絕連線
+    #[test]
+    fn failed_reload_keeps_sockets() {
+        let dir = tmp("reload-failed");
+        let (dns, admin, up) = (free_dns_port(), free_port(), fake_a_upstream());
+        let conf = dir.join("config.json");
+        let good = reload_cfg(&dir, dns, admin, up);
+        write_cfg(&conf, &good);
+        let svc = Svc::start(&conf);
+        let probe = Prober::start(dns);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // 只監聽一個這台沒有的位址（文件用位址）：沒有任何監聽位址，啟動失敗
+        let mut bad = good.clone();
+        bad["listen"]["plain"]["binds"] = json!(["192.0.2.1"]);
+        write_cfg(&conf, &bad);
+        let n = svc.rounds();
+        svc.hup();
+        svc.until("改回上一份設定", &|| svc.log().contains("改回上一份可以用的設定"));
+        svc.until("用上一份設定重新啟動", &|| svc.rounds() > n);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (errors, udp_ok, tcp_ok) = probe.finish();
+        assert!(errors.is_empty(), "啟動失敗期間不能拒絕連線：{errors:#?}\n{}", svc.log());
+        assert!(udp_ok > 10 && tcp_ok > 10, "UDP {udp_ok} 次、TCP {tcp_ok} 次");
+        let now: Value = serde_json::from_slice(&std::fs::read(&conf).unwrap()).unwrap();
+        assert_eq!(now, good, "設定檔改回上一份");
+        let ips = query_a(&connected_udp(dns), 1, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(ips, Some(vec![answer_ip()]));
+        svc.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
