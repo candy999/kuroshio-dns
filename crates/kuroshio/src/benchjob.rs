@@ -51,7 +51,8 @@ pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchma
     let reserve = crate::memgov::reserve_from_cfg(cfg);
     let mut b = Benchmark::new(paths).with_headroom(Arc::new(move || crate::memgov::headroom(&crate::memgov::Reading::now(), &reserve)));
     b.keep_last = keep_last;
-    b
+    // 上游多樣性（3.4.0）：台灣網段判斷「鄰近」；用唯讀資料目錄的公版（評測只需要大致的範圍）
+    b.with_tw(kuroshio_jobs::benchmark::read_tw_ip(&share_dir(cfg).join("geo").join("tw-ip.json")))
 }
 
 /// 子程序用哪個執行檔：設定允許、而且目前的執行檔是 kuroshio 本身才用
