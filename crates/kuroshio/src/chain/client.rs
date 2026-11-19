@@ -14,7 +14,6 @@
 //! - 登記（規格 4.2，[`Client::register`]）：探測／驗證／心跳之後，上游 `allow = true` 而且 `caps` 有 `reg` 時送出
 //!   （不必等串接成立）；登記失敗不影響串接狀態，只記在 `chain.upstream.registered`。
 
-use super::AtomicU64; // 32 位元 MIPS 沒有 std 的 AtomicU64
 use crate::chain::ident::NodeKey;
 use crate::chain::responder::Responder;
 use crate::upstream::Upstream;
@@ -28,7 +27,8 @@ use kuroshio_config::chain::ChainSettings;
 use kuroshio_net::path::{Interceptor, Report};
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
+// 32 位元 MIPS（MT7621）沒有 AtomicU64：世代編號用 AtomicU32（只比相等，繞回去也沒關係）
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -784,7 +784,7 @@ pub struct Client {
     /// 同一時間只跑一個流程（路徑檢查之後的探測、心跳、重試）
     run: tokio::sync::Mutex<()>,
     /// 背景工作的代數：每一輪 runtime 呼叫一次 spawn，舊的那個看到代數變了就結束
-    generation: AtomicU64,
+    generation: AtomicU32,
     /// 「直連閘道」的覆寫（測試用；None = 用路徑檢查讀到的預設閘道）
     gateway_override: Mutex<Option<Option<SocketAddr>>>,
     /// 狀態改變時的回呼（WP5 的共用結果：串接解除時檢查資料新不新鮮、叫醒同步）
@@ -803,7 +803,7 @@ impl Client {
             responder: Mutex::new(None),
             wake: Notify::new(),
             run: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
             gateway_override: Mutex::new(None),
             on_change: Mutex::new(Vec::new()),
         })
@@ -1307,7 +1307,7 @@ impl Client {
 
     /// 心跳與重試的背景工作（每一輪 runtime 呼叫一次；舊的一輪的工作跟著 runtime 結束）
     pub fn spawn(self: &Arc<Self>) {
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         let me = self.clone();
         tokio::spawn(async move {
             // chain 剛打開（重新載入）：用上一次路徑檢查的結果，不等 6 小時

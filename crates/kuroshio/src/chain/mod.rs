@@ -52,33 +52,3 @@ pub fn install_syncer(s: Arc<share::Syncer>) {
 pub fn share_skips(job: &str) -> bool {
     syncer().is_some_and(|s| s.skip_job(job))
 }
-
-/// 64 位元計數器：32 位元 MIPS（mipsel／mips，例如 MT7621）沒有 `AtomicU64`，所以用鎖包一個 u64，
-/// 介面跟 `std::sync::atomic::AtomicU64` 一樣（`Ordering` 參數不用；鎖本身就是完整的同步）。
-/// 串接模組的計數器都很少更新（每筆串接查詢最多幾次），鎖的成本可以忽略
-#[derive(Debug, Default)]
-pub struct AtomicU64(std::sync::Mutex<u64>);
-
-impl AtomicU64 {
-    pub const fn new(v: u64) -> AtomicU64 {
-        AtomicU64(std::sync::Mutex::new(v))
-    }
-    fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-    pub fn load(&self, _: std::sync::atomic::Ordering) -> u64 {
-        *self.lock()
-    }
-    pub fn store(&self, v: u64, _: std::sync::atomic::Ordering) {
-        *self.lock() = v;
-    }
-    pub fn fetch_add(&self, v: u64, _: std::sync::atomic::Ordering) -> u64 {
-        let mut g = self.lock();
-        let old = *g;
-        *g = old.wrapping_add(v);
-        old
-    }
-    pub fn swap(&self, v: u64, _: std::sync::atomic::Ordering) -> u64 {
-        std::mem::replace(&mut *self.lock(), v)
-    }
-}

@@ -10,7 +10,6 @@
 //! - `chain-share.json`（快照目錄，幾百 bytes）記每個種類最後一次成功匯入的時間與雜湊。
 
 use super::client::{Client, State};
-use super::AtomicU64; // 32 位元 MIPS 沒有 std 的 AtomicU64
 use crate::upstream::{Kind, Upstream};
 use anyhow::{anyhow, bail, Context, Result};
 use kuroshio_community::chain::{self as proto, ManifestBody, Object, CHUNK, MANIFEST_NAME, PROTO};
@@ -23,7 +22,8 @@ use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+// 32 位元 MIPS（MT7621）沒有 AtomicU64：建置次數與世代編號用 AtomicU32（不用鎖）
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
@@ -206,7 +206,7 @@ pub struct ShareCache {
     /// 背景建置中（避免重複）
     building: AtomicBool,
     /// 建好幾次（測試用）
-    builds: AtomicU64,
+    builds: AtomicU32,
 }
 
 /// zstd 等級 3（跟快照寫入器同一個 crate）
@@ -250,7 +250,7 @@ impl ShareCache {
             state: Mutex::new(CacheState::default()),
             sums: Mutex::new(Vec::new()),
             building: AtomicBool::new(false),
-            builds: AtomicU64::new(0),
+            builds: AtomicU32::new(0),
         }
     }
 
@@ -299,7 +299,7 @@ impl ShareCache {
 
     /// 建置過幾次（測試用）
     pub fn build_count(&self) -> u64 {
-        self.builds.load(Ordering::SeqCst)
+        self.builds.load(Ordering::SeqCst) as u64
     }
 
     /// 背景建置（同一時間最多一個）；在 tokio 裡用 `spawn_blocking`，不在 tokio 裡（測試）用執行緒
@@ -759,7 +759,7 @@ pub struct Syncer {
     timing: Mutex<ShareTiming>,
     wake: Notify,
     run: tokio::sync::Mutex<()>,
-    generation: AtomicU64,
+    generation: AtomicU32,
 }
 
 /// 一次同步裡要整次放棄的錯誤
@@ -791,7 +791,7 @@ impl Syncer {
             timing: Mutex::new(ShareTiming::from_env()),
             wake: Notify::new(),
             run: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
         });
         let w = Arc::downgrade(&s);
         client.on_state_change(Arc::new(move |from, to| {
@@ -1158,7 +1158,7 @@ impl Syncer {
     /// 背景同步：串接後 `first`（30 秒）做第一次，之後每 `every`（6 小時 ±10 分鐘）；
     /// 記憶體壓力大時延後 10 分鐘。每一輪 runtime 呼叫一次（舊的一輪的工作跟著 runtime 結束）
     pub fn spawn(self: &Arc<Self>) {
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         let me = self.clone();
         tokio::spawn(async move {
             let alive = |me: &Syncer| me.generation.load(Ordering::SeqCst) == generation;

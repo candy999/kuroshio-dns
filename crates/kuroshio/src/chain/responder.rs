@@ -10,7 +10,6 @@
 use super::grants::Grants;
 use super::ident::NodeKey;
 use super::share::ShareCache;
-use super::AtomicU64; // 32 位元 MIPS 沒有 std 的 AtomicU64
 use crate::resolver::Ctx;
 use kuroshio_community::chain::{open_reg, parse_name, seal, token, token_ok, txt_rdata, AuthBody, Name, OPT_CODE, PROTO, TOKEN_WINDOW_MS};
 use kuroshio_community::envelope::to_cbor;
@@ -19,7 +18,8 @@ use kuroshio_proto::message::{Message, RData, Record};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+// 計數器一律 AtomicU32：32 位元 MIPS（MT7621）沒有 AtomicU64；AtomicU32 在每個平台都是不用鎖的原生指令
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -147,9 +147,9 @@ pub struct Responder {
     /// 自己串接中的上游的鏈（沒串接是 None）
     upstream_path: Mutex<Option<Vec<Vec<u8>>>>,
     probes: Mutex<Probes>,
-    refused_rate: AtomicU64,
-    refused_not_private: AtomicU64,
-    refused_not_allowed: AtomicU64,
+    refused_rate: AtomicU32,
+    refused_not_private: AtomicU32,
+    refused_not_allowed: AtomicU32,
     /// 讀不到金鑰的警告只記一次
     key_warned: AtomicBool,
     /// 有沒有啟用「繞過防護」清單（`app.rs` 依過濾設定設定；只記著，不影響回答）
@@ -162,9 +162,10 @@ pub struct Responder {
     chunk_limiter: Mutex<Limiter>,
     /// 正在回答的分段請求數
     chunk_inflight: AtomicUsize,
-    share_requests: AtomicU64,
-    share_chunks: AtomicU64,
-    share_last: AtomicU64,
+    share_requests: AtomicU32,
+    share_chunks: AtomicU32,
+    /// 最後一次回答清單的時間（Unix 秒；u32 到 2106 年）
+    share_last: AtomicU32,
 }
 
 /// 分段請求數：離開時減 1
@@ -190,18 +191,18 @@ impl Responder {
             limiter: Mutex::new(Limiter::new()),
             upstream_path: Mutex::new(None),
             probes: Mutex::new(Probes::default()),
-            refused_rate: AtomicU64::new(0),
-            refused_not_private: AtomicU64::new(0),
-            refused_not_allowed: AtomicU64::new(0),
+            refused_rate: AtomicU32::new(0),
+            refused_not_private: AtomicU32::new(0),
+            refused_not_allowed: AtomicU32::new(0),
             key_warned: AtomicBool::new(false),
             bypass_list_active: AtomicBool::new(false),
             grants,
             share: OnceLock::new(),
             chunk_limiter: Mutex::new(Limiter::with(CHUNK_RATE)),
             chunk_inflight: AtomicUsize::new(0),
-            share_requests: AtomicU64::new(0),
-            share_chunks: AtomicU64::new(0),
-            share_last: AtomicU64::new(0),
+            share_requests: AtomicU32::new(0),
+            share_chunks: AtomicU32::new(0),
+            share_last: AtomicU32::new(0),
         })
     }
 
@@ -400,7 +401,7 @@ impl Responder {
                     return Message::response_to(query, RCODE_REFUSED);
                 };
                 self.share_requests.fetch_add(1, Ordering::Relaxed);
-                self.share_last.store(now, Ordering::Relaxed);
+                self.share_last.store((now / 1000) as u32, Ordering::Relaxed);
                 m
             }
             Some((oid, idx)) => {
@@ -544,7 +545,7 @@ impl Responder {
                 "ready": self.allow_downstream && self.share.get().is_some(),
                 "requests": self.share_requests.load(Ordering::Relaxed),
                 "chunks": self.share_chunks.load(Ordering::Relaxed),
-                "lastAt": match self.share_last.load(Ordering::Relaxed) { 0 => Value::Null, t => json!(t) },
+                "lastAt": match self.share_last.load(Ordering::Relaxed) { 0 => Value::Null, t => json!(t as u64 * 1000) },
                 "cacheBytes": self.share.get().map_or(0, |c| c.bytes()),
             },
             "probes": { "count24h": count24h, "lastAt": last },
