@@ -9,6 +9,7 @@ pub mod backup;
 pub mod benchjob;
 pub mod cache;
 pub mod certinfo;
+pub mod chain;
 pub mod clock;
 pub mod cloudflare;
 pub mod community_bridge;
