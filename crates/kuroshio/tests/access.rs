@@ -218,3 +218,54 @@ async fn listeners_reject_denied_sources() {
     let _ = std::fs::remove_dir_all(&dir);
     TEST_LOOPBACK_PUBLIC.store(false, Ordering::Relaxed);
 }
+
+// ---------------- 串接模式（3.4.0 WP6）：已登記的下游黑潮 ----------------
+
+/// 台灣模式（預設）、資料讀得到；`deny` 可以另外指定
+fn chain_access(deny: &[&str]) -> std::sync::Arc<kuroshio::ipfilter::Access> {
+    let cfg = json!({ "access": { "dataFile": data_file(), "deny": deny } });
+    kuroshio::ipfilter::Access::from_cfg(&cfg, std::path::Path::new("/nonexistent"), None)
+}
+
+fn addr(s: &str) -> std::net::IpAddr {
+    s.parse().unwrap()
+}
+
+#[test]
+fn downstream_addr_allowed_like_friend() {
+    let a = chain_access(&[]);
+    let ip = addr("203.0.113.5");
+    assert!(!a.allow(Kind::Dot, ip), "文件用位址不在台灣網段");
+    a.set_chain(&[ip]);
+    assert!(a.allow(Kind::Dot, ip));
+    assert!(a.allow(Kind::Doh, addr("::ffff:203.0.113.5")), "IPv4 對應的 IPv6 一樣");
+    assert_eq!(a.rules().explain(ip), (true, kuroshio::ipfilter::Reason::Downstream));
+    assert_eq!(kuroshio::ipfilter::Reason::Downstream.text(), "已登記的下游黑潮");
+    // 登記到期（集合清空）：立刻不再放行
+    a.set_chain(&[]);
+    assert!(!a.allow(Kind::Dot, ip));
+    // 好友在下游之前（說明文字以好友為準）
+    a.set_chain(&[ip]);
+    a.set_friends(&[ip]);
+    assert_eq!(a.rules().explain(ip), (true, kuroshio::ipfilter::Reason::Friend));
+}
+
+#[test]
+fn deny_beats_downstream() {
+    let a = chain_access(&["203.0.113.5"]);
+    let ip = addr("203.0.113.5");
+    a.set_chain(&[ip]);
+    assert!(!a.allow(Kind::Dot, ip));
+    assert!(matches!(a.rules().explain(ip), (false, kuroshio::ipfilter::Reason::CustomDeny(_))));
+}
+
+#[test]
+fn downstream_set_only_single_addresses() {
+    let a = chain_access(&[]);
+    a.set_chain(&[addr("203.0.113.5"), addr("2001:db8::5")]);
+    assert!(a.allow(Kind::Dot, addr("203.0.113.5")));
+    assert!(!a.allow(Kind::Dot, addr("203.0.113.6")), "只放單一位址，不放網段");
+    assert!(!a.allow(Kind::Dot, addr("203.0.113.4")));
+    assert!(a.allow(Kind::Dot, addr("2001:db8::5")));
+    assert!(!a.allow(Kind::Dot, addr("2001:db8::6")));
+}

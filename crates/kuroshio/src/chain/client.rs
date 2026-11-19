@@ -11,14 +11,18 @@
 //! - `chain` 關、沒有攔截、攔截者不是黑潮、版本低於 3.4.0：**不發任何 `chain.kuroshio` 查詢**。
 //! - 不存檔：綁定與「公鑰換過」的時間只在行程層級的 [`Client`] 裡（跨重新載入、不跨重開機）。
 //! - 不用時間戳判斷回應有沒有過期（下游的時鐘可能還沒對時）：只靠一次性的 nonce 與簽章。
+//! - 登記（規格 4.2，[`Client::register`]）：探測／驗證／心跳之後，上游 `allow = true` 而且 `caps` 有 `reg` 時送出
+//!   （不必等串接成立）；登記失敗不影響串接狀態，只記在 `chain.upstream.registered`。
 
 use crate::chain::ident::NodeKey;
 use crate::chain::responder::Responder;
 use crate::upstream::Upstream;
 use crate::upstreams::Manager;
 use kuroshio_community::chain as proto;
+use kuroshio_community::chain::RegAck;
+use kuroshio_community::envelope::{from_cbor, to_cbor};
 use kuroshio_community::identity::fingerprint;
-use kuroshio_community::util::{hex, random_bytes};
+use kuroshio_community::util::{hex, random_bytes, valid_domain};
 use kuroshio_config::chain::ChainSettings;
 use kuroshio_net::path::{Interceptor, Report};
 use serde_json::{json, Value};
@@ -334,6 +338,28 @@ struct Inner {
     retry_at_ms: Option<u64>,
     next_hb: Option<Instant>,
     hb_fail: u32,
+    /// 最近一次登記的結果（`chain.upstream.registered`）
+    registered: Option<Registered>,
+}
+
+/// 最近一次登記的結果
+#[derive(Debug, Clone)]
+struct Registered {
+    ok: bool,
+    at: u64,
+    expires_at: Option<u64>,
+    names: usize,
+    error: Option<String>,
+}
+
+impl Registered {
+    fn json(&self) -> Value {
+        if self.ok {
+            json!({ "ok": true, "at": self.at, "expiresAt": self.expires_at, "names": self.names })
+        } else {
+            json!({ "ok": false, "at": self.at, "names": self.names, "error": self.error })
+        }
+    }
 }
 
 impl Inner {
@@ -355,6 +381,7 @@ impl Inner {
             retry_at_ms: None,
             next_hb: None,
             hb_fail: 0,
+            registered: None,
         }
     }
 }
@@ -483,6 +510,7 @@ fn to_none(i: &mut Inner, reason: Option<Reason>) -> Vec<Io> {
     set_state(i, State::None, reason);
     i.next_hb = None;
     i.hb_fail = 0;
+    i.registered = None;
     i.retry_at = None;
     i.retry_at_ms = None;
     i.backoff = None;
@@ -885,6 +913,107 @@ impl Client {
                 }
             }
         }
+        // 探測、驗證、心跳之後登記（條件不符時不發任何查詢）
+        self.register().await;
+    }
+
+    /// 送出登記（規格 4.2）：狀態在 detected 之後、最近一次探測驗證通過、`allow = true` 而且 `caps` 有 `reg`、
+    /// 自己的 `chain` 開著。回應用探測到（或綁定）的上游公鑰驗 `regack`。失敗只記在狀態裡，不影響串接
+    pub async fn register(&self) -> Option<RegAck> {
+        let (addr, tcp, probe, ask) = {
+            let i = self.inner.lock().unwrap();
+            // 上游沒回應、攔截者竄改答案：不登記（上游不在、或不是可以信任的路徑）
+            if !i.settings.downstream_enabled() || i.state == State::None || matches!(i.reason, Some(Reason::Tampered | Reason::NoResponse))
+            {
+                return None;
+            }
+            let p = i.probe.clone()?;
+            if p.error.is_some() || !p.allow || !p.caps.iter().any(|c| c == "reg") || p.public.is_none() || p.kid.is_none() {
+                return None;
+            }
+            // 綁定中用綁定的位址；還沒綁定（或中斷）用攔截命中的保留位址。TCP 可用就走 TCP（登記封包比較大）
+            let (addr, tcp) = match &i.bound {
+                Some(b) => (b.addr, b.tcp || b.tcp_ok),
+                None => {
+                    let v = i.view.as_ref()?;
+                    let (a, tcp_only) = v.usable_hit()?;
+                    (a, tcp_only || v.tcp_ok)
+                }
+            };
+            (addr, tcp, p, i.timing.ask)
+        };
+        let names = self.manager().map(|m| upstream_hostnames(&m)).unwrap_or_default();
+        let n = names.len();
+        let res = self.send_reg(addr, tcp, &probe, names, ask).await;
+        let at = now_ms();
+        let mut i = self.inner.lock().unwrap();
+        // 登記期間設定關掉或回到未偵測：結果不記
+        if i.state == State::None {
+            return None;
+        }
+        match res {
+            Ok(ack) => {
+                if !i.registered.as_ref().is_some_and(|r| r.ok) {
+                    info!("串接：已向上游黑潮登記（{n} 個主機名稱，{} 秒有效）", ack.ttl);
+                }
+                i.registered = Some(Registered {
+                    ok: true,
+                    at,
+                    expires_at: Some(at + u64::from(ack.ttl) * 1000),
+                    names: n,
+                    error: None,
+                });
+                Some(ack)
+            }
+            Err(e) => {
+                if i.registered.as_ref().map_or(true, |r| r.ok) {
+                    warn!("串接：向上游黑潮登記失敗：{e}");
+                }
+                i.registered = Some(Registered {
+                    ok: false,
+                    at,
+                    expires_at: None,
+                    names: n,
+                    error: Some(e),
+                });
+                None
+            }
+        }
+    }
+
+    async fn send_reg(&self, addr: SocketAddr, tcp: bool, p: &Probe, names: Vec<String>, ask: Duration) -> Result<RegAck, String> {
+        let (Some(up_pub), Some(up_kid)) = (p.public, p.kid) else {
+            return Err("沒有上游的公鑰".into());
+        };
+        // 這時才讀（或建立）自己的節點金鑰
+        let key = self.key.get().map_err(|e| format!("讀不到也建立不了節點金鑰：{e:#}"))?;
+        let local = p.peer.parse::<IpAddr>().is_ok_and(is_local_addr);
+        let body = proto::RegBody {
+            v: proto::PROTO,
+            t: "reg".into(),
+            up: up_kid.to_vec(),
+            tok: p.tok.clone(),
+            peer: p.peer.clone(),
+            kid: key.kid.to_vec(),
+            public: key.public.to_vec(),
+            app: env!("CARGO_PKG_VERSION").into(),
+            names,
+            local,
+        };
+        let sealed = proto::seal(&key, "reg", to_cbor(&body));
+        let r = kuroshio_net::path::chaos_txt(addr, proto::REG_NAME, tcp, Some((proto::OPT_CODE, sealed)), ask)
+            .await
+            .map_err(|e| format!("上游沒有回應登記（{e:#}）"))?;
+        if r.rcode != 0 {
+            return Err(format!("上游拒絕登記（rcode {}）", r.rcode));
+        }
+        let txt = r.txt.ok_or("登記的回應裡沒有資料")?;
+        let b = proto::open(&txt, "regack", &up_pub).map_err(|e| format!("登記的回應驗不過（{e:#}）"))?;
+        let ack: RegAck = from_cbor(&b).map_err(|_| "登記的回應格式不對".to_string())?;
+        if ack.t != "regack" || ack.kid.as_slice() != key.kid {
+            return Err("登記的回應不是給這台的".into());
+        }
+        Ok(ack)
     }
 
     /// 上游看到的位址是不是自己某張網卡的位址（否 = 中間有 NAT）
@@ -897,7 +1026,7 @@ impl Client {
             .as_ref()
             .and_then(|p| p.peer.parse::<IpAddr>().ok());
         let Some(peer) = peer else { return };
-        let local = peer.is_loopback() || crate::netif::list().iter().any(|f| f.addrs.iter().any(|a| a.ip == peer));
+        let local = is_local_addr(peer);
         if let Some(b) = self.inner.lock().unwrap().bound.as_mut() {
             b.via_nat = !local;
         }
@@ -1077,14 +1206,15 @@ impl Client {
             "failures": b.map(|b| b.failures).unwrap_or(i.hb_fail),
             "keyChangedAt": i.key_changed_at,
             "previousFingerprint": i.previous_fp,
-            "registered": Value::Null,
+            "registered": i.registered.as_ref().map(Registered::json),
             "error": p.error,
         })
     }
 
-    /// 規格 1.10 的 `chain`（不含 `shared`、`serving`，那兩個由 WP5、WP3 填）
+    /// 規格 1.10 的 `chain`（不含 `shared`，由 WP5 填）；`serving` 是這台的上游角色（回應器的 `serving_json`）
     pub fn status_json(&self) -> Value {
         let suspended = self.manager().is_some_and(|m| m.chain_suspended());
+        let serving = self.responder().map(|r| r.serving_json()).unwrap_or(Value::Null);
         let i = self.inner.lock().unwrap();
         let now = now_ms();
         json!({
@@ -1096,7 +1226,7 @@ impl Client {
             "backupActive": suspended || (i.state == State::Released && i.reason == Some(Reason::NoResponse)),
             "retryAt": i.retry_at_ms,
             "shared": Value::Null,
-            "serving": Value::Null,
+            "serving": serving,
         })
     }
 
@@ -1182,6 +1312,43 @@ impl Client {
     pub fn key(&self) -> &Arc<NodeKey> {
         &self.key
     }
+}
+
+/// 位址是不是這台自己某張網卡的（含迴路）：上游看到的 `peer` 不是自己的位址 = 中間有 NAT
+fn is_local_addr(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback()
+        || crate::netif::list()
+            .iter()
+            .any(|f| f.addrs.iter().any(|a| a.ip.to_canonical() == ip))
+}
+
+/// 下游要登記的主機名稱：固定、自動、備援、最後手段裡不是 IP 的主機，去重複、最多 32 個
+pub fn upstream_hostnames(mgr: &Manager) -> Vec<String> {
+    let mut ids: Vec<String> = mgr
+        .list_json()
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|u| u["role"] != "chain")
+                .filter_map(|u| u["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.extend(mgr.last_resort.iter().map(|u| u.up.id.clone()));
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        let Ok(u) = Upstream::parse(&id) else { continue };
+        let h = u.host.trim_end_matches('.').to_ascii_lowercase();
+        if h.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().is_ok() || !valid_domain(&h) || out.contains(&h) {
+            continue;
+        }
+        out.push(h);
+        if out.len() >= proto::MAX_REG_NAMES {
+            break;
+        }
+    }
+    out
 }
 
 /// `/api/status` 的 `chain` 與 `GET /api/chain`：服務還沒建立狀態機時也是完整的物件（方便前端）

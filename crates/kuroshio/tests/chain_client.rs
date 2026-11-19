@@ -44,6 +44,8 @@ struct Upstream {
     chain_tcp: AtomicUsize,
     /// 最近一次合法回應的內容（重放用）
     recorded: Mutex<Option<Vec<u8>>>,
+    /// 收到並接受的登記（WP6）
+    regs: Mutex<Vec<proto::RegBody>>,
 }
 
 impl Upstream {
@@ -58,6 +60,7 @@ impl Upstream {
             chain_udp: AtomicUsize::new(0),
             chain_tcp: AtomicUsize::new(0),
             recorded: Mutex::new(None),
+            regs: Mutex::new(Vec::new()),
         })
     }
 
@@ -86,6 +89,13 @@ impl Upstream {
         let mut r = Message::response_to(&m, 0);
         let payload = match (qs.qclass, proto::parse_name(&name)) {
             (3, Some(proto::Name::Auth(nonce))) => self.auth(&nonce),
+            (3, Some(proto::Name::Reg)) => match self.reg(&m) {
+                Some(p) => p,
+                None => {
+                    r.rcode = 5;
+                    return Some(r.encode());
+                }
+            },
             (3, _) => {
                 r.rcode = 5;
                 return Some(r.encode());
@@ -103,6 +113,24 @@ impl Upstream {
             data: RData::Raw(proto::txt_rdata(&payload)),
         });
         Some(r.encode())
+    }
+
+    /// 登記：驗下游的簽章、`up` 是自己，回 regack（真的上游另外檢查 peer 與 tok，見 chain_grants.rs）
+    fn reg(&self, m: &Message) -> Option<Vec<u8>> {
+        let opt = m.opt.as_ref()?.options.iter().find(|(c, _)| *c == proto::OPT_CODE)?;
+        let body = proto::open_reg(&opt.1).ok()?;
+        let key = self.key.lock().unwrap();
+        if body.up != key.kid.to_vec() {
+            return None;
+        }
+        let ack = proto::RegAck {
+            v: proto::PROTO,
+            t: "regack".into(),
+            kid: body.kid.clone(),
+            ttl: 900,
+        };
+        self.regs.lock().unwrap().push(body);
+        Some(proto::seal(&key, "regack", to_cbor(&ack)))
     }
 
     fn auth(&self, nonce: &[u8; 16]) -> Vec<u8> {
@@ -401,14 +429,29 @@ async fn detects_verifies_and_chains_automatically() {
     assert_eq!(ic["allowDownstream"], true);
     assert_eq!(ic["caps"], json!(["share", "reg"]));
     assert!(d.mgr.list_json()[0]["role"] == "chain");
-    // 不寫任何狀態檔、也不建立自己的金鑰
+    // 不寫任何狀態檔（金鑰只在 community 目錄裡）
     let after: Vec<_> = std::fs::read_dir(&d.dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .collect();
     assert_eq!(before, after);
-    assert_eq!(std::fs::read_dir(d.dir.join("community")).unwrap().count(), 0);
+    // 上游公告了 reg：探測之後登記（WP6），這時才建立自己的節點金鑰
+    assert_eq!(s["upstream"]["registered"]["ok"], true, "{s}");
+    assert_eq!(
+        s["upstream"]["registered"]["names"], 1,
+        "自動上游 dns.example.net（固定上游是 IP，不算）"
+    );
+    assert!(s["upstream"]["registered"]["expiresAt"].as_u64().unwrap() > s["upstream"]["registered"]["at"].as_u64().unwrap());
+    {
+        let regs = u.regs.lock().unwrap();
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0].names, vec!["dns.example.net".to_string()]);
+        assert_eq!(regs[0].peer, "127.0.0.1");
+        assert_eq!(regs[0].tok, vec![7; 16]);
+        assert!(regs[0].local, "127.0.0.1 是這台自己的位址：沒有經過 NAT");
+    }
+    assert!(d.dir.join("community").join("key.pem").exists());
     assert!(d.client.key_change_warning(kuroshio_community::util::now_ms()).is_none());
     // 提早心跳之後照樣串接中
     tokio::time::sleep(Duration::from_millis(400)).await;

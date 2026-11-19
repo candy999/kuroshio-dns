@@ -963,6 +963,28 @@ pub fn community_section(cfg: &Value, base: &std::path::Path) -> Option<Value> {
     Some(c)
 }
 
+/// 串接模式（規格 10 的 4.4）：登記中下游的來源位址更新到存取控制（每 60 秒清一次過期的；登記表變動時立刻）。
+/// `allow_downstream` 關著時登記表永遠是空的，不用起工作。重新載入後回應器（連同登記表）重建，舊的工作自己結束
+fn spawn_chain_grants(grants: &Arc<crate::chain::grants::Grants>, access: &Arc<crate::ipfilter::Access>) {
+    if !grants.allow_downstream() {
+        return;
+    }
+    let (g, a) = (Arc::downgrade(grants), Arc::downgrade(access));
+    tokio::spawn(async move {
+        loop {
+            let Some(grants) = g.upgrade() else { return };
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = grants.changed() => {}
+            }
+            let Some(access) = a.upgrade() else { return };
+            let now = std::time::Instant::now();
+            grants.sweep(now);
+            access.set_chain(&grants.allowed_addrs(now));
+        }
+    });
+}
+
 /// 串接模式的下游狀態機（規格 10 的 1.4～1.8）：不存檔，綁定跨重新載入（行程層級）、不跨重開機
 fn start_chain(cfg: &Value, base_dir: &std::path::Path, resolver: &Arc<Resolver>) {
     use crate::chain::{client, ident};
@@ -1777,7 +1799,12 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         // 設定的警告由下游狀態機（start_chain → Client::attach）記一次，這裡不重複
         let settings = kuroshio_config::chain::ChainSettings::from_cfg(cfg);
         let key = Arc::new(crate::chain::ident::NodeKey::new(crate::chain::ident::key_dir(cfg, &base_dir)));
-        let _ = resolver.chain.set(crate::chain::responder::Responder::new(&settings, key));
+        let responder = crate::chain::responder::Responder::new(&settings, key);
+        if let Some(f) = &filter {
+            responder.set_bypass_list_active(f.sources().iter().any(|s| s.bypass));
+        }
+        spawn_chain_grants(responder.grants(), &access);
+        let _ = resolver.chain.set(responder);
     }
     // 明文 DNS 監聽：越早越好（重新啟動時區網斷線的時間越短）。CDN 網域資料庫、過濾清單等大的載入都在這之後
     let acl_list = strings(get(cfg, "listen.plain.allowFrom"));
