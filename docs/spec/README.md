@@ -15,6 +15,7 @@
 | [07-windows.md](07-windows.md) | Windows 版：cmd / 服務、跟 IIS 共用 443（HTTP.sys / 反向代理）、DoH3、憑證、權限、攜帶版 |
 | [08-access.md](08-access.md) | 來源 IP 存取控制：只開放台灣（依 ISP 勾選）、自訂允許 / 封鎖、OpenWrt 核心層丟棄 |
 | [09-memory.md](09-memory.md) | 記憶體控制：系統保留量、PSI、依序釋出到「純轉送」的底線與恢復、OOM 分數、當掉後快速重啟與 DNS 備援 |
+| [10-chain.md](10-chain.md) | 串接模式（3.4.0）：兩層黑潮自動串接、共用結果、上游放行下游；低階機器的並行數與背景補問、上游多樣性、重新載入不斷線（工作分解在 [10-chain-tasks.md](10-chain-tasks.md)） |
 
 ## 目標
 

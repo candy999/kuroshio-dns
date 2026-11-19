@@ -196,9 +196,35 @@ return view.extend({
 			] : (np.enabled === false ? _('路徑檢查已關閉') : _('還沒檢查（啟動後幾秒內完成）')))
 		]), { 'id': 'kuroshio-path' }) : '';
 
+		// 串接模式（3.4.0）：下游角色（這台向上游黑潮拿資料）與上游角色（提供資料給下游）兩個區塊都一定顯示。
+		// 主要的句子直接用 API 給的 text / serving.text / serving.note；沒有任何要按的按鈕（沒有同意、沒有核准）
+		var chain = api.chain || null, cv = chain ? common.chainView(chain) : null;
+		var kvTable = function(rows) { return rows.length ? table([_('項目'), _('內容')], rows.map(function(r) { return [r.label, r.value]; })) : ''; };
+		var say = function(text, warn) { return E('div', { 'class': warn ? 'alert-message warning' : 'cbi-section-descr', 'style': 'white-space:normal' }, text); };
+		var chainSec = chain ? common.section(_('串接'), cv ? [
+			E('div', { 'id': 'kuroshio-chain-down' }, [
+				E('h4', {}, [_('下游角色：向上游黑潮拿資料'), ' ', common.badge(cv.down.badge.text, cv.down.badge.kind)]),
+				say(cv.down.text, cv.down.warn),
+				kvTable(cv.down.rows),
+				cv.down.objects.length ? table([_('共用結果'), _('上游產生'), _('匯入'), _('狀態')], cv.down.objects.map(function(o) { return [o.name, o.at, o.imported, o.state]; })) : '',
+				cv.down.skipped ? E('p', { 'style': 'margin-top:.6em' }, _('略過的工作（由上游黑潮提供）：') + (cv.down.skipped.length ? cv.down.skipped.join('、') : _('沒有，照排程自己做'))) : ''
+			]),
+			E('div', { 'id': 'kuroshio-chain-up' }, [
+				E('h4', {}, [_('上游角色：提供資料給下游黑潮'), ' ', common.badge(cv.up.badge.text, cv.up.badge.kind)]),
+				say(cv.up.text, cv.up.warn),
+				cv.up.note ? E('p', { 'class': 'cbi-section-descr' }, cv.up.note) : '',
+				kvTable(cv.up.rows),
+				common.scroll(common.table([_('連上來的下游（指紋）'), _('位址'), _('版本'), _('第一次出現'), _('最後出現'), ''], cv.up.downstreams.map(function(d) {
+					return [d.fingerprint, d.address, d.version, d.firstSeen, d.lastSeen, d.nat];
+				}), _('目前沒有下游連上來')))
+			])
+		] : [say(chain.text || '-', false)], { 'id': 'kuroshio-chain' }) : '';
+
 		var ups = (api.upstreams || []).map(function(u) {
-			var role = { pinned: _('固定'), auto: _('自動'), fallback: _('備援') }[u.role] || u.role;
-			if (u.reason) role += '（' + u.reason + '）';
+			var role = { pinned: _('固定'), auto: _('自動'), fallback: _('備援'), chain: _('串接') }[u.role] || u.role;
+			// 選上的原因；上游所在地區（3.4.0，評測判斷的國別）放在原因旁邊
+			var why = [u.reason, u.region].filter(function(x) { return !!x; }).join(' · ');
+			if (why) role += '（' + why + '）';
 			var note = [];
 			if (u.paused) note.push(_('暫停中'));
 			if (u.pathBlocked) note.push(_('路徑不通，先不用'));
@@ -206,7 +232,9 @@ return view.extend({
 			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', note.join(' · ')];
 		});
 		var upSec = common.section(_('上游'), [
-			E('p', { 'class': 'cbi-section-descr' }, api.autoUpstreams ? _('自動上游來自 %s 的評測（最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
+			E('p', { 'class': 'cbi-section-descr' }, api.autoUpstreams ? (api.autoUpstreams.source === 'chain'
+				? _('自動上游來自上游黑潮 %s 的評測（串接的共用結果；最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)
+				: _('自動上游來自 %s 的評測（最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
 			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups, [2, 3, 4])
 		]);
 
@@ -249,7 +277,7 @@ return view.extend({
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at, 'sec') + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
-		return E([], [head, tiles, hw, memSec, accSec, lsSec, pathSec, upSec, jobSec, infoSec, actions, errSec]);
+		return E([], [head, tiles, hw, memSec, accSec, lsSec, pathSec, chainSec, upSec, jobSec, infoSec, actions, errSec]);
 	},
 
 	render: function(data) {
