@@ -14,6 +14,7 @@
 //! - 登記（規格 4.2，[`Client::register`]）：探測／驗證／心跳之後，上游 `allow = true` 而且 `caps` 有 `reg` 時送出
 //!   （不必等串接成立）；登記失敗不影響串接狀態，只記在 `chain.upstream.registered`。
 
+use super::AtomicU64; // 32 位元 MIPS 沒有 std 的 AtomicU64
 use crate::chain::ident::NodeKey;
 use crate::chain::responder::Responder;
 use crate::upstream::Upstream;
@@ -27,7 +28,7 @@ use kuroshio_config::chain::ChainSettings;
 use kuroshio_net::path::{Interceptor, Report};
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;

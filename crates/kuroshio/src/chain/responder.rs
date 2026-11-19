@@ -10,6 +10,7 @@
 use super::grants::Grants;
 use super::ident::NodeKey;
 use super::share::ShareCache;
+use super::AtomicU64; // 32 位元 MIPS 沒有 std 的 AtomicU64
 use crate::resolver::Ctx;
 use kuroshio_community::chain::{open_reg, parse_name, seal, token, token_ok, txt_rdata, AuthBody, Name, OPT_CODE, PROTO, TOKEN_WINDOW_MS};
 use kuroshio_community::envelope::to_cbor;
@@ -18,7 +19,7 @@ use kuroshio_proto::message::{Message, RData, Record};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 

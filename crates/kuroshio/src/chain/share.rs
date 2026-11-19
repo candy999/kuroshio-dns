@@ -10,6 +10,7 @@
 //! - `chain-share.json`（快照目錄，幾百 bytes）記每個種類最後一次成功匯入的時間與雜湊。
 
 use super::client::{Client, State};
+use super::AtomicU64; // 32 位元 MIPS 沒有 std 的 AtomicU64
 use crate::upstream::{Kind, Upstream};
 use anyhow::{anyhow, bail, Context, Result};
 use kuroshio_community::chain::{self as proto, ManifestBody, Object, CHUNK, MANIFEST_NAME, PROTO};
@@ -22,7 +23,7 @@ use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
