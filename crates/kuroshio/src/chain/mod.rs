@@ -33,3 +33,22 @@ pub fn current() -> Option<Arc<client::Client>> {
 pub fn install(c: Arc<client::Client>) {
     *CURRENT.lock().unwrap() = Some(c);
 }
+
+/// 行程層級的共用結果同步（跨重新載入；同 [`CURRENT`]）
+static SYNCER: Mutex<Option<Arc<share::Syncer>>> = Mutex::new(None);
+
+/// 目前的共用結果同步（服務還沒啟動過是 None）
+pub fn syncer() -> Option<Arc<share::Syncer>> {
+    SYNCER.lock().unwrap().clone()
+}
+
+/// 放進行程層級的持有者（第一次啟動時）
+pub fn install_syncer(s: Arc<share::Syncer>) {
+    *SYNCER.lock().unwrap() = Some(s);
+}
+
+/// 背景工作開頭呼叫：這個工作的結果由上游黑潮提供（共用結果新鮮、而且現在串接中）→ true，這次不跑。
+/// 沒有串接、`chain` 關著、上游不提供資料、共用結果不新鮮 → false（照原本的排程跑，跟 3.3.7 一樣）
+pub fn share_skips(job: &str) -> bool {
+    syncer().is_some_and(|s| s.skip_job(job))
+}

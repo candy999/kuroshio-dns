@@ -5,6 +5,7 @@ mod bench;
 mod jobs;
 mod parity;
 mod selftest;
+mod share;
 mod state;
 
 use crate::cdn::{Cdn, Paths};

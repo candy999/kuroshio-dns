@@ -98,6 +98,16 @@ impl BenchJob {
 
 impl Job for BenchJob {
     fn run(&self, ctx: JobCtx) -> BoxFuture<Result<()>> {
+        // 串接（3.4.0）：上游黑潮給的評測結果新鮮、而且串接中 → 這次不跑（不新鮮、沒串接時照常，跟 3.3.7 一樣）
+        if crate::chain::share_skips("dns-benchmark") {
+            info!("dns-benchmark：由上游黑潮提供，略過");
+            *self.last.lock().unwrap() = Some(json!({
+                "finishedAt": crate::persist::now_secs() * 1000,
+                "ok": true,
+                "skipped": "由上游黑潮提供，略過",
+            }));
+            return Box::pin(async { Ok(()) });
+        }
         match self.child.clone() {
             Some((exe, state, base)) => {
                 let (progress, last) = (self.progress.clone(), self.last.clone());
@@ -130,7 +140,8 @@ impl Job for BenchJob {
                     (None, None) => None,
                 }
             }
-            None => Job::detail(&self.inner),
+            // 在這個程式裡跑：`last` 只有「由上游黑潮提供，略過」時才有
+            None => Job::detail(&self.inner).or_else(|| self.last.lock().unwrap().clone().map(|l| json!({ "last": l }))),
         }
     }
 }

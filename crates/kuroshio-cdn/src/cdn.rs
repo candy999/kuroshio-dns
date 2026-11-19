@@ -3,12 +3,13 @@
 use crate::config::CdnConfig;
 use crate::db::{self, Db};
 use crate::net::Net;
-use crate::pools::{self, Classifier, Pools, PoolsFile};
+use crate::pools::{self, Classifier, PoolNode, Pools, PoolsFile, ProvEntry};
 use crate::util::{self, now_ms};
 use crate::v6store::{self, V6Store};
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -1075,6 +1076,188 @@ impl Cdn {
                 orig: e.orig_ip(fam),
             })
             .collect()
+    }
+}
+
+// ------------------------------------------------------------ 共用結果（串接模式，3.4.0）
+
+/// 上游黑潮給下游的 CDN 資料（規格 10 第 3.1 節）：節點池、永久 IPv6 節點、官方範圍
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedExport {
+    /// `cdn/pools.json` 的內容（只有節點池工作建過的才有；全部是種子資料時是 None）
+    pub pools: Option<Vec<u8>>,
+    /// `cdn/v6-nodes.json` 的內容（沒有任何節點是 None）
+    pub v6: Option<Vec<u8>>,
+    /// `cdn/ranges/*.txt`（只有每週工作抓過、在狀態目錄裡的；檔名 → 內容，依檔名排序）
+    pub ranges: BTreeMap<String, String>,
+}
+
+/// 範圍、分類用的 CIDR 字串的網路位址（`a.b.c.0/24`、`x::/48`）
+fn cidr_base(s: &str) -> Option<IpAddr> {
+    s.split('/').next()?.trim().parse().ok()
+}
+
+impl Cdn {
+    /// 共用結果的匯出（上游）：內容只跟資料有關（不加產生時間），資料沒變時每次的位元組都一樣
+    pub fn export_shared(&self) -> SharedExport {
+        let st = self.state();
+        // 節點池：至少有一家是節點池工作建的（有 updatedAt）才分享；種子資料下游自己也有
+        let built = st.pools.p.values().any(|d| d.rest.get("updatedAt").is_some_and(Value::is_string));
+        let pools = built.then(|| {
+            let mut providers: IndexMap<String, ProvEntry> = IndexMap::new();
+            for (name, d) in &st.pools.p {
+                providers.insert(
+                    name.to_string(),
+                    ProvEntry {
+                        v4: (d.has_v4 || !d.pool4.is_empty()).then(|| d.pool4.clone()),
+                        v6: (d.has_v6 || !d.pool6.is_empty()).then(|| d.pool6.clone()),
+                        rest: d.rest.clone(),
+                    },
+                );
+            }
+            serde_json::to_vec(&PoolsFile {
+                saved_at: None,
+                providers,
+                extra: Default::default(),
+            })
+            .unwrap_or_default()
+        });
+        let v6 = (!st.v6.is_empty()).then(|| st.v6.to_json());
+        let names: Vec<&'static str> = st.pools.p.keys().copied().collect();
+        drop(st);
+        let mut ranges = BTreeMap::new();
+        for name in names {
+            for fam in ["ipv4", "ipv6"] {
+                let file = format!("{name}-{fam}.txt");
+                let p = self.paths.state_dir.join("cdn").join("ranges").join(&file);
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    if !t.trim().is_empty() {
+                        ranges.insert(file, t);
+                    }
+                }
+            }
+        }
+        SharedExport { pools, v6, ranges }
+    }
+
+    /// 共用結果的匯入（下游）：換掉節點池／永久 IPv6 節點（各自可以是 None）。
+    ///
+    /// - 節點一律要在那一家的官方範圍裡（不在的丟掉並記數），每家最多 `max_per_provider` 個
+    /// - 全部被丟掉的那一家保留原本的池；這台沒有啟用的 CDN 不收
+    /// - 換掉之後標成要寫檔（照平常的快照流程寫出）；重新量健康與品質由呼叫端排
+    ///
+    /// 回傳各家收了幾個節點
+    pub fn import_shared(&self, pools: Option<&[u8]>, v6: Option<&[u8]>, max_per_provider: usize) -> anyhow::Result<Vec<(String, usize)>> {
+        let max = max_per_provider.max(1);
+        let mut out: Vec<(String, usize)> = Vec::new();
+        let mut dropped = 0usize;
+        if let Some(b) = pools {
+            let mut f: PoolsFile = serde_json::from_slice(b).map_err(|e| anyhow::anyhow!("節點池格式錯誤：{e}"))?;
+            if f.is_empty() {
+                anyhow::bail!("節點池是空的");
+            }
+            let mut st = self.state();
+            let st = &mut *st;
+            let names: Vec<&'static str> = st.pools.p.keys().copied().collect();
+            for name in names {
+                let Some(e) = f.providers.shift_remove(name) else { continue };
+                let total = e.v4.as_ref().map_or(0, Vec::len) + e.v6.as_ref().map_or(0, Vec::len);
+                let mut pool4: Vec<PoolNode> = e.v4.unwrap_or_default();
+                pool4.retain(|x| x.ip.is_ipv4() && st.pools.in_ranges(name, x.ip));
+                pool4.truncate(max);
+                let mut pool6: Vec<PoolNode> = e.v6.unwrap_or_default();
+                pool6.retain(|x| x.ip.is_ipv6() && st.pools.in_ranges(name, x.ip));
+                pool6.truncate(max.saturating_sub(pool4.len()));
+                let kept = pool4.len() + pool6.len();
+                dropped += total.saturating_sub(kept);
+                if kept == 0 {
+                    warn!("共用的節點池：{name} 的節點都不在官方範圍裡，保留原本的節點池");
+                    continue;
+                }
+                // 這台永久紀錄的台灣 v6 節點一律併入（同節點池工作的做法）
+                for k in st.v6.list(name) {
+                    if !pool6.iter().any(|x| x.ip == k.ip) && st.pools.in_ranges(name, k.ip) {
+                        let mut n = PoolNode::new(k.ip);
+                        n.ms = k.node.ms;
+                        n.pop = k.node.pop.as_deref().map(util::intern);
+                        n.permanent = Some(true);
+                        pool6.push(n);
+                    }
+                }
+                // updatedAt、tw48、prefixes 用上游的（網段也要在官方範圍裡）；其他欄位照這台原本的
+                let mut rest = st.pools.p.get(name).map(|d| d.rest.clone()).unwrap_or_default();
+                if let Some(u) = e.rest.get("updatedAt").filter(|v| v.is_string()) {
+                    rest.insert("updatedAt".into(), u.clone());
+                }
+                let in_range = |s: &str| cidr_base(s).is_some_and(|ip| st.pools.in_ranges(name, ip));
+                if let Some(a) = e.rest.get("tw48").and_then(Value::as_array) {
+                    let l: Vec<Value> = a.iter().filter(|v| v.as_str().is_some_and(in_range)).cloned().collect();
+                    rest.insert("tw48".into(), Value::Array(l));
+                }
+                if let Some(m) = e.rest.get("prefixes").and_then(Value::as_object) {
+                    let m: serde_json::Map<String, Value> = m
+                        .iter()
+                        .map(|(pop, l)| {
+                            let l: Vec<Value> = l
+                                .as_array()
+                                .map(|a| a.iter().filter(|v| v.as_str().is_some_and(in_range)).cloned().collect())
+                                .unwrap_or_default();
+                            (pop.clone(), Value::Array(l))
+                        })
+                        .collect();
+                    rest.insert("prefixes".into(), Value::Object(m));
+                }
+                st.pools.replace(name, pool4, pool6, rest);
+                out.push((name.to_string(), kept));
+            }
+        }
+        if let Some(b) = v6 {
+            let incoming = V6Store::from_json(b, self.cfg.v6_max).map_err(|e| anyhow::anyhow!("IPv6 節點格式錯誤：{e}"))?;
+            let have = incoming.provider_names();
+            let mut st = self.state();
+            let st = &mut *st;
+            let names: Vec<&'static str> = st.pools.p.keys().copied().collect();
+            for name in names {
+                if !have.iter().any(|p| p == name) {
+                    continue;
+                }
+                let list = incoming.list(name);
+                let total = list.len();
+                let mut keep: Vec<v6store::V6Entry> = list
+                    .into_iter()
+                    .filter(|e| e.ip.is_ipv6() && st.pools.in_ranges(name, e.ip))
+                    .collect();
+                keep.truncate(max);
+                dropped += total - keep.len();
+                if keep.is_empty() {
+                    warn!("共用的 IPv6 節點：{name} 的節點都不在官方範圍裡，保留原本的紀錄");
+                    continue;
+                }
+                let n = keep.len();
+                // 也併進目前的 IPv6 節點池（同載入時的做法）
+                if let Some(d) = st.pools.p.get_mut(name) {
+                    for k in &keep {
+                        if !d.pool6.iter().any(|x| x.ip == k.ip) {
+                            let mut p = PoolNode::new(k.ip);
+                            p.ms = k.node.ms;
+                            p.pop = k.node.pop.as_deref().map(util::intern);
+                            p.permanent = Some(true);
+                            d.pool6.push(p);
+                        }
+                    }
+                }
+                st.pools.dirty = true;
+                st.v6.set_provider(name, keep);
+                match out.iter_mut().find(|(p, _)| p == name) {
+                    Some(x) => x.1 += n,
+                    None => out.push((name.to_string(), n)),
+                }
+            }
+        }
+        if dropped > 0 {
+            warn!("共用的 CDN 節點：{dropped} 個不在官方範圍裡（或超過上限），已丟掉");
+        }
+        Ok(out)
     }
 }
 

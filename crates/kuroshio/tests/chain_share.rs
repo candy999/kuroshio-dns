@@ -1,0 +1,1094 @@
+//! 串接模式（3.4.0 WP5，規格 10 第 3 節）的共用結果：上游用真的 `Responder` ＋ 假的 `ShareSource`，
+//! 下游用 `Syncer` ＋ 假的 `ShareSink`，中間是本機 TCP（同一個埠也聽 UDP，給 auth 用）。
+
+use kuroshio::chain::client::{Client, Reason, State, Timing};
+use kuroshio::chain::ident::NodeKey;
+use kuroshio::chain::responder::Responder;
+use kuroshio::chain::share::{
+    check_ranges, check_upstreams, FilterCopy, ShareCache, ShareSink, ShareSource, Syncer, CACHE_MAX, KIND_CDN_POOLS, KIND_CDN_RANGES,
+    KIND_UPSTREAMS,
+};
+use kuroshio::resolver::Ctx;
+use kuroshio_community::chain::{self as proto, ManifestBody, Object, CHUNK};
+use kuroshio_community::envelope::{from_cbor, to_cbor};
+use kuroshio_community::identity::KeyPair;
+use kuroshio_community::util::{now_ms, random_bytes, sha256};
+use kuroshio_config::chain::ChainSettings;
+use kuroshio_net::path::{Interceptor, Plain, Report};
+use kuroshio_proto::message::{Message, RData};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+// ---------------- 上游的假資料來源 ----------------
+
+#[derive(Default)]
+struct FakeSource {
+    upstreams: Mutex<Option<Vec<u8>>>,
+    cdn: Mutex<Option<kuroshio_cdn::SharedExport>>,
+    copies: Mutex<Vec<FilterCopy>>,
+    files: Mutex<HashMap<String, Vec<u8>>>,
+    pressure_bad: AtomicBool,
+}
+
+impl ShareSource for FakeSource {
+    fn upstreams(&self) -> Option<Vec<u8>> {
+        self.upstreams.lock().unwrap().clone()
+    }
+    fn cdn(&self) -> Option<kuroshio_cdn::SharedExport> {
+        self.cdn.lock().unwrap().clone()
+    }
+    fn filter_copies(&self) -> Vec<FilterCopy> {
+        self.copies.lock().unwrap().clone()
+    }
+    fn read_copy(&self, file: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let f = self.files.lock().unwrap();
+        let b = f.get(file)?;
+        let s = (offset as usize).min(b.len());
+        Some(b[s..(s + len).min(b.len())].to_vec())
+    }
+    fn pressure_ok(&self) -> bool {
+        !self.pressure_bad.load(Ordering::SeqCst)
+    }
+}
+
+fn upstreams_json(tag: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "generatedAt": "2026-11-18T04:30:00.000Z",
+        "tag": tag,
+        "selected": [
+            { "id": "https://dns.example.net/dns-query", "type": "doh" },
+            { "id": "192.0.2.53", "type": "udp" },
+            { "id": "tls://dns.example.com", "type": "dot" }
+        ]
+    }))
+    .unwrap()
+}
+
+fn pools_json() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "providers": { "cloudflare": { "v4": [{ "ip": "104.16.1.1", "ms": 5 }], "updatedAt": "2026-11-18T05:30:00.000Z" } }
+    }))
+    .unwrap()
+}
+
+fn export(pools: Option<Vec<u8>>, ranges: &[(&str, &str)]) -> kuroshio_cdn::SharedExport {
+    kuroshio_cdn::SharedExport {
+        pools,
+        v6: None,
+        ranges: ranges.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    }
+}
+
+// ---------------- 下游的假匯入端 ----------------
+
+struct FakeSink {
+    calls: Mutex<Vec<String>>,
+    upstreams: Mutex<Option<Vec<u8>>>,
+    ranges: Mutex<Option<BTreeMap<String, String>>>,
+    pools: Mutex<Option<Vec<u8>>>,
+    copies: Mutex<Vec<(Object, Vec<u8>)>>,
+    want: Mutex<Result<(), &'static str>>,
+    done: AtomicUsize,
+    pressure_bad: AtomicBool,
+}
+
+impl FakeSink {
+    fn new() -> Arc<FakeSink> {
+        Arc::new(FakeSink {
+            calls: Mutex::new(Vec::new()),
+            upstreams: Mutex::new(None),
+            ranges: Mutex::new(None),
+            pools: Mutex::new(None),
+            copies: Mutex::new(Vec::new()),
+            want: Mutex::new(Ok(())),
+            done: AtomicUsize::new(0),
+            pressure_bad: AtomicBool::new(false),
+        })
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+    fn note(&self, s: &str) {
+        self.calls.lock().unwrap().push(s.to_string());
+    }
+}
+
+impl ShareSink for FakeSink {
+    fn import_upstreams(&self, json: Vec<u8>) -> anyhow::Result<()> {
+        self.note("upstreams");
+        *self.upstreams.lock().unwrap() = Some(json);
+        Ok(())
+    }
+    fn import_cdn_ranges(&self, files: BTreeMap<String, String>) -> anyhow::Result<()> {
+        self.note("cdn-ranges");
+        *self.ranges.lock().unwrap() = Some(files);
+        Ok(())
+    }
+    fn import_cdn_pools(&self, json: &[u8]) -> anyhow::Result<()> {
+        self.note("cdn-pools");
+        *self.pools.lock().unwrap() = Some(json.to_vec());
+        Ok(())
+    }
+    fn import_cdn_v6(&self, _json: &[u8]) -> anyhow::Result<()> {
+        self.note("cdn-v6");
+        Ok(())
+    }
+    fn wants_filter_copy(&self, _o: &Object) -> Result<(), &'static str> {
+        *self.want.lock().unwrap()
+    }
+    fn import_filter_copy(&self, o: &Object, compressed: Vec<u8>) -> anyhow::Result<()> {
+        self.note("filter-copy");
+        self.copies.lock().unwrap().push((o.clone(), compressed));
+        Ok(())
+    }
+    fn filter_copies_done(&self, changed: usize) {
+        self.done.fetch_add(changed, Ordering::SeqCst);
+    }
+    fn pressure_ok(&self) -> bool {
+        !self.pressure_bad.load(Ordering::SeqCst)
+    }
+}
+
+// ---------------- 上游：真的 Responder，外面包一層本機 DNS 伺服器 ----------------
+
+/// 自己組的清單與分段（冒充者、宣稱的大小不對、未來的種類）
+struct Custom {
+    manifest: Vec<u8>,
+    objects: HashMap<[u8; 8], Vec<u8>>,
+}
+
+struct Up {
+    resp: Arc<Responder>,
+    key: Arc<NodeKey>,
+    src: Arc<FakeSource>,
+    manifests: AtomicUsize,
+    chunks: AtomicUsize,
+    /// 分段的內容改掉一個 byte（路上的人竄改）
+    tamper: AtomicBool,
+    custom: Mutex<Option<Custom>>,
+    _dir: TempDir,
+}
+
+impl Up {
+    fn share_queries(&self) -> usize {
+        self.manifests.load(Ordering::SeqCst) + self.chunks.load(Ordering::SeqCst)
+    }
+
+    fn keypair(&self) -> Arc<KeyPair> {
+        self.key.get().unwrap()
+    }
+
+    fn answer(&self, q: &[u8], tcp: bool) -> Option<Vec<u8>> {
+        let m = Message::parse(q).ok()?;
+        let qs = m.questions.first()?.clone();
+        let name = qs.name.trim_end_matches('.').to_ascii_lowercase();
+        if qs.qclass != 3 || !proto::in_zone(&name) {
+            return Some(Message::response_to(&m, 0).encode());
+        }
+        let parsed = proto::parse_name(&name);
+        match parsed {
+            Some(proto::Name::Manifest) => self.manifests.fetch_add(1, Ordering::SeqCst),
+            Some(proto::Name::Chunk { .. }) => self.chunks.fetch_add(1, Ordering::SeqCst),
+            _ => 0,
+        };
+        let custom = self.custom.lock().unwrap();
+        let mut r = match (&*custom, &parsed) {
+            (Some(c), Some(proto::Name::Manifest)) => txt(&m, &c.manifest),
+            (Some(c), Some(proto::Name::Chunk { oid, idx })) => match c.objects.get(oid) {
+                Some(b) => {
+                    let off = (*idx as usize * CHUNK).min(b.len());
+                    txt(&m, &b[off..(off + CHUNK).min(b.len())])
+                }
+                None => Message::response_to(&m, 3),
+            },
+            _ => {
+                let ctx = Ctx {
+                    proto: if tcp { "tcp" } else { "udp" },
+                    client: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                };
+                self.resp.answer(&m, &name, &ctx)
+            }
+        };
+        drop(custom);
+        if self.tamper.load(Ordering::SeqCst) && matches!(parsed, Some(proto::Name::Chunk { .. })) {
+            if let Some(RData::Raw(b)) = r.answers.first_mut().map(|a| &mut a.data) {
+                if b.len() > 10 {
+                    b[10] ^= 0x01;
+                }
+            }
+        }
+        Some(r.encode())
+    }
+}
+
+fn txt(q: &Message, payload: &[u8]) -> Message {
+    let mut r = Message::response_to(q, 0);
+    r.answers.push(kuroshio_proto::message::Record {
+        name: q.questions[0].name.clone(),
+        rtype: 16,
+        class: 3,
+        ttl: 0,
+        data: RData::Raw(proto::txt_rdata(payload)),
+    });
+    r
+}
+
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tmpdir(tag: &str) -> TempDir {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "kuroshio-share-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    TempDir(d)
+}
+
+fn settings(chain: bool, allow: bool) -> ChainSettings {
+    ChainSettings::from_cfg(&kuroshio_config::build(
+        &json!({ "upstream": { "chain": chain, "allowDownstream": allow } }),
+    ))
+}
+
+/// 上游（`share` = 接上共用結果）。回傳（上游，位址）
+async fn upstream(allow: bool, src: Arc<FakeSource>, share: bool) -> (Arc<Up>, SocketAddr) {
+    let dir = tmpdir("up");
+    let key = Arc::new(NodeKey::new(dir.0.join("keys")));
+    let resp = Responder::new(&settings(true, allow), key.clone());
+    if share {
+        resp.set_share(Arc::new(ShareCache::new(src.clone())));
+    }
+    let up = Arc::new(Up {
+        resp,
+        key,
+        src,
+        manifests: AtomicUsize::new(0),
+        chunks: AtomicUsize::new(0),
+        tamper: AtomicBool::new(false),
+        custom: Mutex::new(None),
+        _dir: dir,
+    });
+    let (s, l) = loop {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(l) = TcpListener::bind(s.local_addr().unwrap()).await {
+            break (s, l);
+        }
+    };
+    let addr = s.local_addr().unwrap();
+    {
+        let u = up.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, from)) = s.recv_from(&mut buf).await else { break };
+                if let Some(r) = u.answer(&buf[..n], false) {
+                    let _ = s.send_to(&r, from).await;
+                }
+            }
+        });
+    }
+    {
+        let u = up.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { break };
+                let u = u.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let Ok(len) = s.read_u16().await else { return };
+                        let mut q = vec![0u8; len as usize];
+                        if s.read_exact(&mut q).await.is_err() {
+                            return;
+                        }
+                        let Some(r) = u.answer(&q, true) else { continue };
+                        let mut out = (r.len() as u16).to_be_bytes().to_vec();
+                        out.extend_from_slice(&r);
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+    (up, addr)
+}
+
+// ---------------- 下游 ----------------
+
+struct Down {
+    client: Arc<Client>,
+    _dir: TempDir,
+}
+
+fn timing() -> Timing {
+    Timing {
+        ask: Duration::from_millis(500),
+        heartbeat: Duration::from_secs(60),
+        early_min: Duration::from_secs(30),
+        early_max: Duration::from_secs(40),
+        retry_min: Duration::from_secs(30),
+        retry_max: Duration::from_secs(60),
+        fail_limit: 3,
+    }
+}
+
+fn kuroshio(addr: SocketAddr) -> Report {
+    Report {
+        plain_v4: Plain { udp: true, tcp: true },
+        interceptor: Some(Interceptor::Kuroshio("3.4.0".into())),
+        hit: Some(addr),
+        ..Report::default()
+    }
+}
+
+/// 下游的狀態機，對 `addr` 做一次路徑檢查之後的流程（通過就綁定）
+async fn down(chain: bool, addr: SocketAddr) -> Down {
+    let dir = tmpdir("down");
+    let key = Arc::new(NodeKey::new(dir.0.join("keys")));
+    let client = Client::new(settings(chain, true), key, timing());
+    client.set_gateway_override(Some(None));
+    client.on_path_report(&kuroshio(addr)).await;
+    Down { client, _dir: dir }
+}
+
+/// 兩邊都開、上游有評測結果與節點池
+async fn pair(src: Arc<FakeSource>) -> (Arc<Up>, Down, Arc<Syncer>, Arc<FakeSink>) {
+    let (up, addr) = upstream(true, src, true).await;
+    let d = down(true, addr).await;
+    assert_eq!(d.client.state(), (State::Chained, None));
+    let sink = FakeSink::new();
+    let s = Syncer::new(d.client.clone(), sink.clone(), None);
+    (up, d, s, sink)
+}
+
+fn src_basic() -> Arc<FakeSource> {
+    let s = Arc::new(FakeSource::default());
+    *s.upstreams.lock().unwrap() = Some(upstreams_json("a"));
+    *s.cdn.lock().unwrap() = Some(export(Some(pools_json()), &[("cloudflare-ipv4.txt", "104.16.0.0/13\n")]));
+    s
+}
+
+async fn ask_tcp(addr: SocketAddr, name: &str) -> Message {
+    let q = kuroshio_net::path::build_chaos_txt(7, name);
+    let mut t = TcpStream::connect(addr).await.unwrap();
+    let mut m = (q.len() as u16).to_be_bytes().to_vec();
+    m.extend_from_slice(&q);
+    t.write_all(&m).await.unwrap();
+    let len = t.read_u16().await.unwrap() as usize;
+    let mut r = vec![0u8; len];
+    t.read_exact(&mut r).await.unwrap();
+    Message::parse(&r).unwrap()
+}
+
+async fn ask_udp(addr: SocketAddr, name: &str) -> Message {
+    let q = kuroshio_net::path::build_chaos_txt(8, name);
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    s.send_to(&q, addr).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(3), s.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    Message::parse(&buf[..n]).unwrap()
+}
+
+fn txt_of(m: &Message) -> Vec<u8> {
+    let RData::Raw(b) = &m.answers[0].data else { panic!() };
+    proto::txt_payload(b).unwrap()
+}
+
+/// 用 `key` 簽一份清單；`objects` =（物件，傳輸內容）。物件的 id／sha／size 沒填就照內容算
+fn craft(key: &KeyPair, objects: Vec<(Object, Vec<u8>)>) -> Custom {
+    let mut map = HashMap::new();
+    let mut list = Vec::new();
+    for (mut o, body) in objects {
+        if o.sha.is_empty() {
+            let sha = sha256(&[&body]);
+            o.sha = sha.to_vec();
+            o.id = sha[..8].to_vec();
+        }
+        if o.size == 0 {
+            o.size = body.len() as u64;
+        }
+        if o.enc.is_empty() {
+            o.enc = "zstd".into();
+        }
+        map.insert(<[u8; 8]>::try_from(o.id.as_slice()).unwrap(), body);
+        list.push(o);
+    }
+    let body = ManifestBody {
+        v: proto::PROTO,
+        t: "manifest".into(),
+        kid: key.kid.to_vec(),
+        at: 1,
+        app: "3.4.0".into(),
+        objects: list,
+    };
+    Custom {
+        manifest: proto::seal(key, "manifest", to_cbor(&body)),
+        objects: map,
+    }
+}
+
+fn obj(k: &str, raw: u64) -> Object {
+    Object {
+        k: k.into(),
+        fmt: 1,
+        raw,
+        ..Default::default()
+    }
+}
+
+fn zstd(b: &[u8]) -> Vec<u8> {
+    zstd::bulk::compress(b, 3).unwrap()
+}
+
+fn status_obj(s: &Syncer, kind: &str) -> Value {
+    s.status_json()["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["kind"] == kind)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+// ---------------- 測試 ----------------
+
+#[tokio::test]
+async fn manifest_signed_and_objects_verify() {
+    let (up, d, s, sink) = pair(src_basic()).await;
+    // 上游公告 share，下游看得到
+    assert_eq!(up.resp.caps(), vec!["share"]);
+    assert!(d.client.last_probe().unwrap().caps.contains(&"share".to_string()));
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None, "{rep:?}");
+    assert_eq!(sink.calls(), vec!["upstreams", "cdn-ranges", "cdn-pools"], "照規格的順序");
+    // 節點池原封不動
+    assert_eq!(sink.pools.lock().unwrap().as_deref(), Some(&pools_json()[..]));
+    assert_eq!(
+        sink.ranges.lock().unwrap().as_ref().unwrap()["cloudflare-ipv4.txt"],
+        "104.16.0.0/13\n"
+    );
+    // 評測結果：明文拿掉、加上來源
+    let u: Value = serde_json::from_slice(sink.upstreams.lock().unwrap().as_ref().unwrap()).unwrap();
+    let ids: Vec<&str> = u["selected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["https://dns.example.net/dns-query", "tls://dns.example.com"]);
+    assert_eq!(u["source"]["chain"], kuroshio_community::util::hex(&up.keypair().kid));
+    assert_eq!(u["tag"], "a");
+    // 狀態
+    let st = s.status_json();
+    assert_eq!(st["enabled"], true);
+    assert!(st["error"].is_null());
+    assert!(st["lastSyncAt"].as_u64().is_some());
+    let o = status_obj(&s, "upstreams");
+    assert_eq!(o["fresh"], true);
+    assert!(o["importedAt"].as_u64().is_some());
+    assert_eq!(o["at"].as_u64().unwrap(), 1_794_976_200_000, "評測的 generatedAt");
+    assert_eq!(st["skippedJobs"], json!(["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"]));
+    // 上游的狀態
+    let sv = up.resp.serving_json();
+    assert_eq!(sv["share"]["requests"], 1);
+    assert_eq!(sv["share"]["ready"], true);
+    assert!(sv["share"]["cacheBytes"].as_u64().unwrap() > 0);
+    assert!(sv["share"]["lastAt"].as_u64().is_some());
+    // 狀態檔
+    let snap: Value = serde_json::from_slice(&s.snapshot()).unwrap();
+    assert!(snap["kinds"]["upstreams"]["sha"].as_str().unwrap().len() == 64);
+}
+
+#[tokio::test]
+async fn multi_chunk_object() {
+    let src = Arc::new(FakeSource::default());
+    // 亂數壓不小：壓縮後還是 200 KiB 多一點 → 7 段
+    let data: Vec<u8> = (0..200 * 1024 / 32).flat_map(|_| random_bytes::<32>()).collect();
+    *src.cdn.lock().unwrap() = Some(export(Some(data.clone()), &[]));
+    let (up, _d, s, sink) = pair(src).await;
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None, "{rep:?}");
+    assert_eq!(rep.chunks, 7);
+    assert_eq!(up.chunks.load(Ordering::SeqCst), 7);
+    assert_eq!(sink.pools.lock().unwrap().as_deref(), Some(&data[..]));
+    assert!(rep.imported.contains(&KIND_CDN_POOLS.to_string()));
+}
+
+#[tokio::test]
+async fn udp_is_refused() {
+    let (up, addr) = upstream(true, src_basic(), true).await;
+    assert_eq!(ask_udp(addr, proto::MANIFEST_NAME).await.rcode, 5);
+    // TCP 拿得到清單；同一個物件的分段用 UDP 問也是 REFUSED
+    let m = ask_tcp(addr, proto::MANIFEST_NAME).await;
+    assert_eq!(m.rcode, 0);
+    let body = proto::open(&txt_of(&m), "manifest", &up.keypair().public).unwrap();
+    let mb: ManifestBody = from_cbor(&body).unwrap();
+    let oid: [u8; 8] = mb.objects[0].id.as_slice().try_into().unwrap();
+    assert_eq!(ask_udp(addr, &proto::chunk_name(&oid, 0)).await.rcode, 5);
+    assert_eq!(ask_tcp(addr, &proto::chunk_name(&oid, 0)).await.rcode, 0);
+}
+
+#[tokio::test]
+async fn allow_downstream_off_refuses_share() {
+    let (up, addr) = upstream(false, src_basic(), true).await;
+    assert!(up.resp.caps().is_empty());
+    assert_eq!(up.resp.serving_json()["share"]["ready"], false);
+    assert_eq!(ask_tcp(addr, proto::MANIFEST_NAME).await.rcode, 5);
+    assert_eq!(ask_tcp(addr, &proto::chunk_name(&[1; 8], 0)).await.rcode, 5);
+    up.manifests.store(0, Ordering::SeqCst);
+    up.chunks.store(0, Ordering::SeqCst);
+    // 正常的下游：Released(NotAllowed)，根本不會來問
+    let d = down(true, addr).await;
+    assert_eq!(d.client.state(), (State::Released, Some(Reason::NotAllowed)));
+    let sink = FakeSink::new();
+    let s = Syncer::new(d.client.clone(), sink.clone(), None);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error.as_deref(), Some("not-chained"));
+    assert_eq!(up.share_queries(), 0);
+    for k in [KIND_UPSTREAMS, KIND_CDN_POOLS, KIND_CDN_RANGES] {
+        assert!(!s.fresh(k));
+    }
+    for j in ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"] {
+        assert!(!s.skip_job(j), "{j}");
+    }
+    assert!(sink.calls().is_empty());
+    assert!(s.status_json().is_null(), "沒串接時 shared 是 null");
+}
+
+#[tokio::test]
+async fn tampered_chunk_rejected() {
+    let (up, _d, s, sink) = pair(src_basic()).await;
+    up.tamper.store(true, Ordering::SeqCst);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert!(sink.calls().is_empty(), "{:?}", sink.calls());
+    for k in [KIND_UPSTREAMS, KIND_CDN_RANGES, KIND_CDN_POOLS] {
+        assert_eq!(status_obj(&s, k)["error"], "hash-mismatch", "{k}");
+        assert_eq!(status_obj(&s, k)["fresh"], false);
+        assert!(!s.fresh(k));
+    }
+    assert!(!s.skip_job("dns-benchmark"));
+    // 竄改停止後下一次就正常
+    up.tamper.store(false, Ordering::SeqCst);
+    s.sync_once().await;
+    assert_eq!(sink.calls(), vec!["upstreams", "cdn-ranges", "cdn-pools"]);
+}
+
+#[tokio::test]
+async fn manifest_signed_by_other_key_rejected() {
+    let (up, _d, s, sink) = pair(src_basic()).await;
+    let other = KeyPair::generate();
+    let body = zstd(&upstreams_json("x"));
+    *up.custom.lock().unwrap() = Some(craft(&other, vec![(obj(KIND_UPSTREAMS, 1000), body)]));
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error.as_deref(), Some("manifest-signature"));
+    assert_eq!(rep.chunks, 0);
+    assert_eq!(up.chunks.load(Ordering::SeqCst), 0);
+    assert!(sink.calls().is_empty());
+    assert_eq!(s.status_json()["error"], "manifest-signature");
+    assert!(!s.skip_job("dns-benchmark"));
+}
+
+#[tokio::test]
+async fn oversize_and_bomb_rejected() {
+    let (up, _d, s, sink) = pair(src_basic()).await;
+    let key = up.keypair();
+    // 宣稱 2 MiB 的評測結果：不抓
+    let mut big = obj(KIND_UPSTREAMS, 1000);
+    big.size = 2 << 20;
+    let big_body = zstd(b"{}");
+    // 宣稱解壓後 100 bytes，實際是 900 KiB 的零：解壓到超過就中止
+    let bomb_body = zstd(&vec![0u8; 900 << 10]);
+    let bomb = obj(KIND_CDN_POOLS, 100);
+    *up.custom.lock().unwrap() = Some(craft(&key, vec![(big, big_body), (bomb, bomb_body)]));
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None, "{rep:?}");
+    assert_eq!(status_obj(&s, KIND_UPSTREAMS)["error"], "too-large");
+    assert_eq!(status_obj(&s, KIND_CDN_POOLS)["error"], "too-large");
+    assert_eq!(rep.chunks, 1, "只抓了節點池那一段");
+    assert!(sink.calls().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_kind_and_newer_fmt_skipped() {
+    let (up, _d, s, sink) = pair(src_basic()).await;
+    let key = up.keypair();
+    let mut newer = obj(KIND_CDN_POOLS, pools_json().len() as u64);
+    newer.fmt = 2;
+    let u = upstreams_json("b");
+    *up.custom.lock().unwrap() = Some(craft(
+        &key,
+        vec![
+            (obj("future", 10), zstd(b"0123456789")),
+            (newer, zstd(&pools_json())),
+            (obj(KIND_UPSTREAMS, u.len() as u64), zstd(&u)),
+        ],
+    ));
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert_eq!(sink.calls(), vec!["upstreams"]);
+    assert_eq!(status_obj(&s, KIND_CDN_POOLS)["error"], "newer-format");
+    assert!(status_obj(&s, "future").is_null(), "不認得的種類不列");
+    assert_eq!(rep.chunks, 1);
+    assert!(s.skip_job("dns-benchmark"));
+    assert!(!s.skip_job("cdn-pool"));
+}
+
+#[tokio::test]
+async fn unchanged_objects_not_refetched() {
+    let (up, _d, s, sink) = pair(src_basic()).await;
+    let first = s.sync_once().await;
+    assert!(first.chunks >= 3);
+    let n = up.chunks.load(Ordering::SeqCst);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert_eq!(rep.manifests, 1);
+    assert_eq!(rep.chunks, 0);
+    assert_eq!(up.chunks.load(Ordering::SeqCst), n);
+    assert_eq!(sink.calls().len(), 3, "沒有重新匯入");
+    assert_eq!(status_obj(&s, KIND_UPSTREAMS)["fresh"], true);
+}
+
+#[tokio::test]
+async fn stale_object_gives_nxdomain_then_recovers() {
+    let (up, d, s, sink) = pair(src_basic()).await;
+    let (addr, _) = d.client.bound_addr().unwrap();
+    s.sync_once().await;
+    let old = ask_tcp(addr, proto::MANIFEST_NAME).await;
+    let mb: ManifestBody = from_cbor(&proto::open(&txt_of(&old), "manifest", &up.keypair().public).unwrap()).unwrap();
+    let old_oid: [u8; 8] = mb
+        .objects
+        .iter()
+        .find(|o| o.k == KIND_UPSTREAMS)
+        .unwrap()
+        .id
+        .as_slice()
+        .try_into()
+        .unwrap();
+    // 上游的評測換了，清單重新產生（超過 10 分鐘）
+    *up.src.upstreams.lock().unwrap() = Some(upstreams_json("new"));
+    up.resp.share().unwrap().manifest(&up.keypair(), now_ms() + 11 * 60_000).unwrap();
+    assert_eq!(ask_tcp(addr, &proto::chunk_name(&old_oid, 0)).await.rcode, 3, "舊的物件 → NXDOMAIN");
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert_eq!(rep.imported, vec![KIND_UPSTREAMS.to_string()]);
+    let u: Value = serde_json::from_slice(sink.upstreams.lock().unwrap().as_ref().unwrap()).unwrap();
+    assert_eq!(u["tag"], "new");
+}
+
+#[test]
+fn upstreams_import_filters_plain_and_marks_source() {
+    let kid = [0xab; 8];
+    let out: Value = serde_json::from_slice(&check_upstreams(&upstreams_json("t"), &kid, 42).unwrap()).unwrap();
+    assert_eq!(out["selected"].as_array().unwrap().len(), 2);
+    assert!(out["selected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["type"] != "udp" && s["type"] != "tcp"));
+    assert_eq!(out["source"], json!({ "chain": "abababababababab", "at": 42 }));
+    assert_eq!(out["generatedAt"], "2026-11-18T04:30:00.000Z", "其他欄位照舊");
+    let bad = |v: Value| check_upstreams(&serde_json::to_vec(&v).unwrap(), &kid, 1).is_err();
+    assert!(bad(json!({ "selected": { "id": "x" } })), "selected 不是陣列");
+    assert!(bad(json!({ "selected": [] })));
+    assert!(bad(json!({ "selected": [{ "id": "gopher://dns.example.net" }] })), "id 解析不了");
+    assert!(bad(json!({ "selected": [{ "type": "doh" }] })), "沒有 id");
+    assert!(
+        bad(json!({ "selected": [{ "id": "udp://dns.example.net", "type": "udp" }] })),
+        "不支援"
+    );
+    let many: Vec<Value> = (0..65)
+        .map(|i| json!({ "id": format!("https://dns{i}.example.net/dns-query"), "type": "doh" }))
+        .collect();
+    assert!(bad(json!({ "selected": many })), "超過 64 筆");
+    assert!(
+        bad(json!({ "selected": [{ "id": "192.0.2.1", "type": "udp" }, { "id": "tcp://192.0.2.2", "type": "tcp" }] })),
+        "全部是明文"
+    );
+    assert!(bad(json!([1, 2])), "不是物件");
+    assert!(check_upstreams(b"not json", &kid, 1).is_err());
+    assert!(check_upstreams(&vec![b' '; 300 << 10], &kid, 1).is_err(), "太大");
+}
+
+#[test]
+fn ranges_reject_bad_names_and_cidrs() {
+    let ok = |files: Value| check_ranges(&serde_json::to_vec(&json!({ "files": files })).unwrap());
+    let r = ok(json!({ "cloudflare-ipv4.txt": "104.16.0.0/13\n\n173.245.48.0/20\n", "cloudflare-ipv6.txt": "2606:4700::/32\n" })).unwrap();
+    assert_eq!(r.len(), 2);
+    assert!(ok(json!({ "../cloudflare-ipv4.txt": "104.16.0.0/13" })).is_err());
+    assert!(ok(json!({ "cloudflare/x-ipv4.txt": "104.16.0.0/13" })).is_err());
+    assert!(ok(json!({ "cloudflare.txt": "104.16.0.0/13" })).is_err());
+    assert!(ok(json!({ "Cloudflare-ipv4.txt": "104.16.0.0/13" })).is_err());
+    assert!(ok(json!({ "-ipv4.txt": "104.16.0.0/13" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "not a cidr" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "104.16.0.0/33" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "2606:4700::/32" })).is_err(), "家族不符");
+    assert!(ok(json!({ "cloudflare-ipv4.txt": 5 })).is_err());
+    assert!(ok(json!({})).is_err());
+    assert!(check_ranges(b"[]").is_err());
+}
+
+fn saved(at: u64) -> Vec<u8> {
+    let k = |sha: &str| json!({ "sha": sha.repeat(64), "at": 1, "importedAt": at, "bytes": 10 });
+    serde_json::to_vec(&json!({ "v": 1, "kinds": { "upstreams": k("a"), "cdn-pools": k("b"), "cdn-ranges": k("c") } })).unwrap()
+}
+
+#[tokio::test]
+async fn jobs_skipped_only_when_fresh_and_chained() {
+    const JOBS: [&str; 4] = ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"];
+    // 行程裡沒有同步：一律不略過（跟 3.3.7 一樣）
+    assert!(JOBS.iter().all(|j| !kuroshio::chain::share_skips(j)));
+    // 新鮮＋串接：略過
+    let (_up, d, s, _sink) = pair(src_basic()).await;
+    s.sync_once().await;
+    assert!(JOBS.iter().all(|j| s.skip_job(j)));
+    assert!(!s.skip_job("tw-ip"));
+    // 新鮮但解除（換網路）：不略過
+    d.client.on_wan_changed();
+    assert!(!d.client.is_chained());
+    assert!(JOBS.iter().all(|j| !s.skip_job(j)));
+    // 串接中，但匯入是 37 小時前（狀態檔讀回來的）：不略過；1 小時前：略過
+    let (up2, addr2) = upstream(true, src_basic(), true).await;
+    let d2 = down(true, addr2).await;
+    let old = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 37 * 3600 * 1000)));
+    assert!(JOBS.iter().all(|j| !old.skip_job(j)));
+    let recent = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 3600 * 1000)));
+    assert!(JOBS.iter().all(|j| recent.skip_job(j)));
+    // chain 關著：不發查詢、不略過
+    up2.manifests.store(0, Ordering::SeqCst);
+    let d3 = down(false, addr2).await;
+    assert_eq!(d3.client.state(), (State::None, None));
+    let off = Syncer::new(d3.client.clone(), FakeSink::new(), Some(&saved(now_ms())));
+    assert_eq!(off.sync_once().await.error.as_deref(), Some("not-chained"));
+    assert!(JOBS.iter().all(|j| !off.skip_job(j)));
+    assert_eq!(up2.share_queries(), 0);
+    // 上游 allow = false：不略過
+    let (_up4, addr4) = upstream(false, src_basic(), true).await;
+    let d4 = down(true, addr4).await;
+    assert_eq!(d4.client.state().1, Some(Reason::NotAllowed));
+    let na = Syncer::new(d4.client.clone(), FakeSink::new(), Some(&saved(now_ms())));
+    assert!(JOBS.iter().all(|j| !na.skip_job(j)));
+}
+
+#[test]
+fn share_cache_bounded_and_released() {
+    let src = Arc::new(FakeSource::default());
+    let rnd = |n: usize| -> Vec<u8> { (0..n / 32).flat_map(|_| random_bytes::<32>()).collect() };
+    *src.upstreams.lock().unwrap() = Some(rnd(1 << 20));
+    *src.cdn.lock().unwrap() = Some(kuroshio_cdn::SharedExport {
+        pools: Some(rnd(1 << 20)),
+        v6: Some(rnd(1 << 20)),
+        ranges: BTreeMap::new(),
+    });
+    let c = ShareCache::new(src.clone());
+    let key = KeyPair::generate();
+    let now = now_ms();
+    let m = c.manifest(&key, now).unwrap();
+    assert!(c.bytes() > 0);
+    assert!(c.bytes() <= CACHE_MAX, "{} > 1 MiB", c.bytes());
+    let mb: ManifestBody = from_cbor(&proto::open(&m, "manifest", &key.public).unwrap()).unwrap();
+    assert_eq!(mb.objects.len(), 0, "每一種都超過 1 MiB：全部不列");
+    // 小一點的：v6 先被放棄
+    *src.upstreams.lock().unwrap() = Some(rnd(300 << 10));
+    *src.cdn.lock().unwrap() = Some(kuroshio_cdn::SharedExport {
+        pools: Some(rnd(400 << 10)),
+        v6: Some(rnd(400 << 10)),
+        ranges: BTreeMap::new(),
+    });
+    let m = c.manifest(&key, now + 11 * 60_000).unwrap();
+    let mb: ManifestBody = from_cbor(&proto::open(&m, "manifest", &key.public).unwrap()).unwrap();
+    let kinds: Vec<&str> = mb.objects.iter().map(|o| o.k.as_str()).collect();
+    assert_eq!(kinds, vec!["upstreams", "cdn-pools"]);
+    assert!(c.bytes() <= CACHE_MAX);
+    // 10 分鐘內回同一份
+    assert_eq!(c.manifest(&key, now + 12 * 60_000).unwrap(), m);
+    let oid: [u8; 8] = mb.objects[0].id.as_slice().try_into().unwrap();
+    assert!(c.chunk(&oid, 0).is_some());
+    // 記憶體壓力：不提供
+    src.pressure_bad.store(true, Ordering::SeqCst);
+    assert!(c.manifest(&key, now + 12 * 60_000).is_none());
+    src.pressure_bad.store(false, Ordering::SeqCst);
+    // 30 分鐘沒人用：釋放
+    c.sweep(now_ms() + 29 * 60_000);
+    assert!(c.bytes() > 0);
+    c.sweep(now_ms() + 31 * 60_000);
+    assert_eq!(c.bytes(), 0);
+    assert!(c.chunk(&oid, 0).is_none());
+}
+
+#[tokio::test]
+async fn filter_copy_only_when_wanted() {
+    let src = Arc::new(FakeSource::default());
+    let list = "||ads.example.com^\n||track.example.net^\n".repeat(2000);
+    let z = zstd(list.as_bytes());
+    src.files.lock().unwrap().insert("copy-1".into(), z.clone());
+    *src.copies.lock().unwrap() = vec![FilterCopy {
+        url: "https://filter.example.net/list.txt".into(),
+        file: "copy-1".into(),
+        bytes: z.len() as u64,
+        raw: 0,
+        hash: 0x1234,
+        rules: 4000,
+        etag: Some("\"v1\"".into()),
+        last_modified: None,
+        at: 1_794_980_000_000,
+    }];
+    let (up, _d, s, sink) = pair(src).await;
+    *sink.want.lock().unwrap() = Err("no-room");
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert_eq!(rep.chunks, 0);
+    assert_eq!(up.chunks.load(Ordering::SeqCst), 0);
+    let o = status_obj(&s, "filter-copy");
+    assert_eq!(o["error"], "no-room");
+    assert_eq!(o["name"], "https://filter.example.net/list.txt");
+    assert_eq!(o["fresh"], false);
+    assert!(o["importedAt"].is_null());
+    assert!(sink.calls().is_empty());
+    assert_eq!(sink.done.load(Ordering::SeqCst), 0);
+    // 留得下：抓回來原樣交給匯入端，抓完叫一次重建
+    *sink.want.lock().unwrap() = Ok(());
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert_eq!(sink.calls(), vec!["filter-copy"]);
+    let (o, body) = sink.copies.lock().unwrap()[0].clone();
+    assert_eq!(body, z, "壓縮後的內容原樣存成副本");
+    assert_eq!(o.raw, list.len() as u64);
+    assert_eq!(o.rules, 4000);
+    assert_eq!(o.etag, "\"v1\"");
+    assert_eq!(o.hash.len(), 16);
+    assert_eq!(sink.done.load(Ordering::SeqCst), 1);
+    // 雜湊沒變：不重抓
+    let rep = s.sync_once().await;
+    assert_eq!(rep.chunks, 0);
+    assert_eq!(sink.done.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pressure_defers_sync() {
+    let (up, _d, s, sink) = pair(src_basic()).await;
+    sink.pressure_bad.store(true, Ordering::SeqCst);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error.as_deref(), Some("memory"));
+    assert_eq!(rep.manifests, 0);
+    assert_eq!(up.share_queries(), 0);
+    assert!(sink.calls().is_empty());
+    // 上游記憶體壓力大：清單 REFUSED
+    sink.pressure_bad.store(false, Ordering::SeqCst);
+    up.src.pressure_bad.store(true, Ordering::SeqCst);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error.as_deref(), Some("refused"));
+    assert!(sink.calls().is_empty());
+    assert!(!s.skip_job("dns-benchmark"));
+}
+
+/// 只會回同一份清單的 HTTP 伺服器；記下載了幾次
+async fn list_server(body: String) -> (SocketAddr, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else { break };
+            n2.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let r = format!("HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let _ = s.write_all(r.as_bytes()).await;
+            });
+        }
+    });
+    (addr, n)
+}
+
+fn persister(dir: &std::path::Path) -> Arc<Mutex<kuroshio::persist::Persister>> {
+    let mut p = kuroshio::persist::Persister::new(
+        dir.join("state"),
+        kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+    );
+    p.set_free_probe(|_| Some(10 << 30));
+    Arc::new(Mutex::new(p))
+}
+
+fn live(dir: &std::path::Path, filter: Arc<kuroshio::filtering::FilterService>) -> Arc<kuroshio::chain::share::Live> {
+    let cfg = kuroshio_config::with_overrides(&json!({ "upstream": { "pinned": ["udp://192.0.2.53"], "fallback": [] } }));
+    Arc::new(kuroshio::chain::share::Live {
+        mgr: Arc::new(kuroshio::upstreams::Manager::new(&cfg, dir.join("state").join("upstreams.json"))),
+        cdn: None,
+        filter: Some(filter),
+        seed_upstreams: dir.join("no-seed.json"),
+        max_per_provider: 48,
+    })
+}
+
+/// 過濾清單副本（兩邊都是正式的 `Live`）：上游下載過、留了副本 → 下游不下載，拿副本建過濾器；
+/// 6 小時內的更新也不下載（當成 304）；上游的副本不整份讀進記憶體（分段時才從檔案讀）
+#[tokio::test]
+async fn filter_copy_end_to_end_with_live() {
+    use kuroshio::resolver::FilterCheck;
+    let body: String = (0..3000).map(|i| format!("||ads{i}.example.com^\n")).collect();
+    let (srv, downloads) = list_server(body).await;
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "A", "url": format!("http://{srv}/a.txt"), "category": "ads" }
+    ] } }));
+    // 上游：下載一次、留副本、寫到磁碟
+    let ud = tmpdir("fc-up");
+    let up_p = persister(&ud.0);
+    let fu = kuroshio::filtering::FilterService::from_cfg(&cfg, &ud.0).unwrap();
+    fu.set_copies(up_p.clone());
+    assert!(fu.update_lists(false).await.unwrap());
+    up_p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(fu.shared_copies().len(), 1);
+    let (_up, addr) = upstream(true, Arc::new(FakeSource::default()), false).await;
+    _up.resp.set_share(Arc::new(ShareCache::new(live(&ud.0, fu.clone()))));
+    // 下游：沒有任何副本
+    let dd = tmpdir("fc-down");
+    let fd = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
+    fd.set_copies(persister(&dd.0));
+    let d = down(true, addr).await;
+    assert!(d.client.is_chained());
+    let s = Syncer::new(d.client.clone(), live(&dd.0, fd.clone()), None);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None, "{rep:?}");
+    assert_eq!(rep.imported, vec![format!("filter-copy http://{srv}/a.txt")]);
+    // 背景重建：等它建好
+    for _ in 0..200 {
+        if fd.check("ads2999.example.com", 1).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fd.check("ads2999.example.com", 1).unwrap().block, "用上游給的副本建好");
+    assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
+    let m = fd.copies().unwrap().meta(&format!("http://{srv}/a.txt")).unwrap();
+    assert_eq!(m.rules, 3000);
+    assert_eq!(m.etag.as_deref(), Some("\"v1\""));
+    // 下游自己的定時更新：6 小時內拿到的副本這一輪不下載
+    assert!(!fd.update_lists(false).await.unwrap());
+    assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    // 不在下游清單裡的網址：不抓
+    let cfg2 = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "B", "url": "http://198.51.100.1/other.txt", "category": "ads" }
+    ] } }));
+    let fo = kuroshio::filtering::FilterService::from_cfg(&cfg2, &dd.0).unwrap();
+    fo.set_copies(persister(&dd.0));
+    let s2 = Syncer::new(d.client.clone(), live(&dd.0, fo), None);
+    let rep = s2.sync_once().await;
+    assert_eq!(rep.chunks, 0);
+    assert_eq!(status_obj(&s2, "filter-copy")["error"], "not-subscribed");
+}
+
+/// 正式的匯入端：評測結果寫到 `upstream.autoStateFile`、Manager 重讀（明文拿掉），`autoUpstreams.source` 是 chain；
+/// 種子資料的評測結果上游不分享
+#[tokio::test]
+async fn live_upstreams_import_and_source() {
+    let dd = tmpdir("live-up");
+    std::fs::create_dir_all(dd.0.join("state")).unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "upstream": { "pinned": ["udp://192.0.2.53"], "fallback": [], "autoTypes": ["udp", "doh", "dot"] }
+    }));
+    let state = dd.0.join("state").join("upstreams.json");
+    std::fs::write(
+        &state,
+        br#"{"generatedAt":"2026-11-01 04:30","selected":[{"id":"192.0.2.99","type":"udp"}]}"#,
+    )
+    .unwrap();
+    let mgr = Arc::new(kuroshio::upstreams::Manager::new(&cfg, state.clone()));
+    assert_eq!(kuroshio::chain::share::auto_info(&mgr)["source"], "benchmark");
+    let l = kuroshio::chain::share::Live {
+        mgr: mgr.clone(),
+        cdn: None,
+        filter: None,
+        seed_upstreams: dd.0.join("seed.json"),
+        max_per_provider: 48,
+    };
+    let j = check_upstreams(&upstreams_json("live"), &[1; 8], 5).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    ShareSink::import_upstreams(&l, j).unwrap();
+    let ids: Vec<String> = mgr
+        .list_json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|u| u["id"].as_str().map(String::from))
+        .collect();
+    assert!(ids.iter().any(|i| i.starts_with("https://dns.example.net")), "{ids:?}");
+    assert!(!ids.iter().any(|i| i.contains("192.0.2.99")), "{ids:?}");
+    let auto = kuroshio::chain::share::auto_info(&mgr);
+    assert_eq!(auto["source"], "chain");
+    assert_eq!(auto["generatedAt"], "2026-11-18T04:30:00.000Z");
+    // 上游：種子資料（generatedAt 跟附帶的種子一樣）不分享；CDN、過濾沒啟用 → 沒有
+    assert!(ShareSource::upstreams(&l).is_some());
+    std::fs::copy(&state, dd.0.join("seed.json")).unwrap();
+    assert!(ShareSource::upstreams(&l).is_none());
+    assert!(ShareSource::cdn(&l).is_none());
+    assert!(ShareSource::filter_copies(&l).is_empty());
+    // 沒有 CDN：節點池匯入失敗（不會被當成匯入過）
+    assert!(ShareSink::import_cdn_pools(&l, &pools_json()).is_err());
+}
+
+/// 真的服務當上游（評測結果在快照目錄、不是種子）：auth 公告 share、下游拿得到評測結果；
+/// `/api/status` 的 `chain.serving.share` 與下游的 `chain.shared`
+#[tokio::test]
+async fn app_upstream_serves_benchmark_and_status() {
+    let dir = tmpdir("app");
+    std::fs::create_dir_all(dir.0.join("state")).unwrap();
+    std::fs::write(dir.0.join("state").join("upstreams.json"), upstreams_json("app")).unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "admin": { "enabled": false },
+        "filter": { "enabled": false },
+        "cdn": { "enabled": false },
+        "system": { "persistDir": dir.0.join("state").to_string_lossy() },
+        "community": { "enabled": false, "dir": dir.0.join("keys").to_string_lossy() },
+        "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
+        "upstream": { "pinned": ["udp://192.0.2.53"], "fallback": [], "pathCheck": false },
+        "resolver": { "timeoutMs": 800, "lastResort": [], "rankIps": false }
+    }));
+    let s = kuroshio::app::start(&cfg).await.unwrap();
+    let r = s.resolver.chain.get().unwrap().clone();
+    assert_eq!(r.caps(), vec!["share"], "CDN、過濾都啟動之後就緒");
+    let d = down(true, s.bound[0]).await;
+    assert_eq!(d.client.state(), (State::Chained, None));
+    let sink = FakeSink::new();
+    let sy = Syncer::new(d.client.clone(), sink.clone(), None);
+    let rep = sy.sync_once().await;
+    assert_eq!(rep.error, None, "{rep:?}");
+    assert_eq!(sink.calls(), vec!["upstreams"], "CDN 沒啟用：只有評測結果");
+    let u: Value = serde_json::from_slice(sink.upstreams.lock().unwrap().as_ref().unwrap()).unwrap();
+    assert_eq!(u["tag"], "app");
+    // 上游的 /api/status.chain（這個行程的狀態機是上游自己的，沒有串接：shared 是 null）
+    let st = kuroshio::chain::client::api_json();
+    let share = &st["serving"]["share"];
+    println!("chain.serving.share = {share}");
+    println!("chain.shared（下游）= {}", sy.status_json());
+    assert_eq!(share["requests"], 1);
+    assert_eq!(share["ready"], true);
+    assert!(share["cacheBytes"].as_u64().unwrap() > 0);
+    assert!(st["shared"].is_null());
+    let auto = kuroshio::chain::share::auto_info(&s.resolver.upstreams);
+    assert_eq!(auto["source"], "benchmark");
+}

@@ -850,6 +850,10 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
     sched.register("cdn-ranges", move |ctx: kuroshio_jobs::JobCtx| {
         let c = c.clone();
         async move {
+            if crate::chain::share_skips("cdn-ranges") {
+                info!("cdn-ranges：由上游黑潮提供，略過");
+                return Ok(());
+            }
             let r = ranges::run(&cdn_job_ctx(ctx, c)).await?;
             info!(
                 "CDN 官方範圍：{} 家，{}",
@@ -863,6 +867,10 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
     sched.register("cdn-scan", move |ctx: kuroshio_jobs::JobCtx| {
         let c = c.clone();
         async move {
+            if crate::chain::share_skips("cdn-scan") {
+                info!("cdn-scan：由上游黑潮提供，略過");
+                return Ok(());
+            }
             let r = scan::run(&cdn_job_ctx(ctx, c)).await?;
             info!(
                 "CDN 網段分類：{} 家，{}",
@@ -876,6 +884,10 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
     sched.register("cdn-pool", move |ctx: kuroshio_jobs::JobCtx| {
         let c = c.clone();
         async move {
+            if crate::chain::share_skips("cdn-pool") {
+                info!("cdn-pool：由上游黑潮提供，略過");
+                return Ok(());
+            }
             let r = pool::run(&cdn_job_ctx(ctx, c.clone())).await?;
             info!(
                 "台灣節點池更新：{} 家（IPv6 {}）",
@@ -1861,6 +1873,9 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     }
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));
+    // 串接的共用結果（3.4.0，規格 10 第 3 節）：CDN、過濾、排程器都啟動之後。上游接上 ShareCache、
+    // 下游建立／接回同步（工作開頭的 share_skips 只在共用結果新鮮、而且串接中時略過）
+    crate::chain::share::start(cfg, &resolver, cdn.clone(), filter.clone(), &persister, scheduler.as_ref());
     let ddns = crate::ddns::Config::from_cfg(cfg).map(crate::ddns::Ddns::new);
     if let Some(d) = &ddns {
         d.spawn();
