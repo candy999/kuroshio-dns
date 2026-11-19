@@ -476,7 +476,14 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
         // Windows：跟 IIS 共用 443 的方式（規格 07 第 2 節），啟動時決定一次
         let configured = crate::httpsys::configured(cfg);
         let host_ips: Vec<IpAddr> = hosts.iter().filter_map(|h| parse_host(h)).collect();
-        let (mode, mode_reason) = crate::httpsys::decide(&configured, cfg!(windows), port, || crate::httpsys::probe_port(&host_ips, port));
+        // 埠被自己上一輪留在 listenbank 的監聽占著（重新載入）：上一輪就是自己監聽，不是 IIS
+        let (mode, mode_reason) = crate::httpsys::decide(&configured, cfg!(windows), port, || {
+            if port != 0 && crate::listenbank::holds_tcp_port(port) {
+                crate::httpsys::PortProbe::Free
+            } else {
+                crate::httpsys::probe_port(&host_ips, port)
+            }
+        });
         if cfg!(windows) {
             info!("DoH 的 Windows 模式：{}（{mode_reason}）", mode.name());
         } else if configured == "httpsys" {
@@ -540,6 +547,11 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
         let mut urls_json = Vec::new();
         if mode == WinMode::HttpSys {
             out.httpsys_port = Some(port);
+            // 上一輪自己監聽這個埠（改成 HTTP.sys 共用之後重新載入）：先關掉留著的，讓 HTTP.sys 接手
+            crate::listenbank::release_unused(crate::listenbank::Proto::Tcp, port);
+            if plan3 == Doh3Plan::HttpSys {
+                crate::listenbank::release_unused(crate::listenbank::Proto::Udp, port);
+            }
             let started = crate::httpsys::plan(cfg)
                 .map_err(anyhow::Error::msg)
                 .and_then(|(_, _, p)| crate::httpsys::start(&p, resolver.clone(), opts.clone(), limits.clone()));
@@ -1749,6 +1761,8 @@ fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>, reserv
 }
 
 pub async fn start(cfg: &Value) -> Result<Started> {
+    // 新的一輪：監聽 socket 向行程層級的 listenbank 拿（重新載入時不拒絕連線，規格 10 第 7 節）
+    crate::listenbank::begin();
     // 系統時間有沒有對時（沒有 RTC 的路由器開機時是 1970 年）：決定能不能用加密上游、背景工作要不要延後
     crate::clock::refresh();
     crate::clock::spawn_monitor();
@@ -1947,6 +1961,9 @@ pub async fn start(cfg: &Value) -> Result<Started> {
             Err(e) => warn!("管理 API 無法監聽 {host}:{port}：{e}"),
         }
     }
+    // 全部監聽都建立了：上一輪留著、這一輪沒用到的（設定換了位址或埠、關掉了某個協定）才關掉。
+    // 啟動失敗時不會走到這裡：改回上一份設定的下一輪還用得到
+    crate::listenbank::sweep();
     Ok(Started {
         encrypted,
         server,

@@ -24,6 +24,7 @@ pub mod httpsys;
 pub mod iiscert;
 pub mod integration;
 pub mod ipfilter;
+pub mod listenbank;
 pub mod logring;
 pub mod manifest;
 pub mod memgov;

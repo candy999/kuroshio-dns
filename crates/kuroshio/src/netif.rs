@@ -524,6 +524,15 @@ pub fn json() -> Value {
 
 /// TCP 監聽：IPv6 位址一律 `IPV6_V6ONLY`，`0.0.0.0` 與 `::` 才能同時綁同一個埠
 pub fn bind_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::from_std(std_tcp(addr)?)
+}
+
+/// 同 `bind_tcp`，但經過 `listenbank`（`tag` 是用途，例如 "dot"）：重新載入時沿用上一輪的核心 socket
+pub fn shared_tcp(tag: &'static str, addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::from_std(crate::listenbank::tcp(tag, addr, || std_tcp(addr))?)
+}
+
+fn std_tcp(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     if addr.is_ipv6() {
@@ -535,7 +544,7 @@ pub fn bind_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpLi
     s.set_nonblocking(true)?;
     s.bind(&addr.into())?;
     s.listen(1024)?;
-    tokio::net::TcpListener::from_std(s.into())
+    Ok(s.into())
 }
 
 /// UDP（QUIC）監聽：同樣對 IPv6 設 `IPV6_V6ONLY`
@@ -548,6 +557,11 @@ pub fn bind_udp(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSock
     s.set_nonblocking(true)?;
     s.bind(&addr.into())?;
     Ok(s.into())
+}
+
+/// 同 `bind_udp`，但經過 `listenbank`（`tag` 是用途，例如 "doq"）
+pub fn shared_udp(tag: &'static str, addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    crate::listenbank::udp(tag, addr, || bind_udp(addr))
 }
 
 #[cfg(test)]

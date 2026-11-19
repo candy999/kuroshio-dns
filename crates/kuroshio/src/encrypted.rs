@@ -334,7 +334,7 @@ impl Limits {
 // ---------------- DoT ----------------
 
 pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<Resolver>, limits: Limits) -> Result<SocketAddr> {
-    let l = crate::netif::bind_tcp(addr).with_context(|| format!("DoT 監聽 {addr} 失敗"))?;
+    let l = crate::netif::shared_tcp("dot", addr).with_context(|| format!("DoT 監聽 {addr} 失敗"))?;
     let bound = l.local_addr()?;
     // 社群共享開著時同一個埠也接 ALPN kuroshio/2（規格 03 第 4 節）
     let community = resolver.community.get().is_some();
@@ -649,7 +649,7 @@ pub async fn listen_doh(
     opts: DohOptions,
     limits: Limits,
 ) -> Result<SocketAddr> {
-    let l = crate::netif::bind_tcp(addr).with_context(|| format!("DoH 監聽 {addr} 失敗"))?;
+    let l = crate::netif::shared_tcp("doh", addr).with_context(|| format!("DoH 監聽 {addr} 失敗"))?;
     let bound = l.local_addr()?;
     let acceptor = certs
         .as_ref()
@@ -705,11 +705,13 @@ pub async fn listen_doh(
 // ---------------- QUIC：DoQ（RFC 9250）與 DoH3 ----------------
 
 /// QUIC 端點：IPv6 位址設 `IPV6_V6ONLY`（`0.0.0.0` 與 `::` 可以同時綁同一個埠）
-fn quic_endpoint(cfg: quinn::ServerConfig, addr: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+/// UDP socket 經過 `listenbank`：重新載入時新的 `Endpoint` 建在同一個核心 socket 的複製品上
+/// （空窗期間的封包留在接收緩衝區；進行中的 QUIC 連線照舊會斷）
+fn quic_endpoint(tag: &'static str, cfg: quinn::ServerConfig, addr: SocketAddr) -> std::io::Result<quinn::Endpoint> {
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(cfg),
-        crate::netif::bind_udp(addr)?,
+        crate::netif::shared_udp(tag, addr)?,
         Arc::new(quinn::TokioRuntime),
     )
 }
@@ -732,6 +734,7 @@ fn quic_server(certs: &Arc<CertStore>, alpn: &[&[u8]], max_conns: u32) -> Result
 pub async fn listen_doq(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<Resolver>, limits: Limits) -> Result<SocketAddr> {
     let max = limits.conns.available_permits() as u32;
     let ep = quic_endpoint(
+        "doq",
         quic_server(
             &certs,
             if resolver.community.get().is_some() {
@@ -812,7 +815,7 @@ pub async fn listen_doh3(
 ) -> Result<SocketAddr> {
     use bytes::Buf;
     let max = limits.conns.available_permits() as u32;
-    let ep = quic_endpoint(quic_server(&certs, &[b"h3"], max)?, addr).with_context(|| format!("DoH3 監聽 UDP {addr} 失敗"))?;
+    let ep = quic_endpoint("doh3", quic_server(&certs, &[b"h3"], max)?, addr).with_context(|| format!("DoH3 監聽 UDP {addr} 失敗"))?;
     let bound = ep.local_addr()?;
     info!("DoH3 監聽 UDP {bound}{}", opts.path);
     let opts = Arc::new(opts);
