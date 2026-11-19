@@ -97,6 +97,9 @@ pub struct ListSource {
     pub category: Category,
     /// 保護清單：記憶體不足時也不停用（設定 `filter.lists[].protect`；沒寫時惡意 / 反詐騙類是 true）
     pub protect: bool,
+    /// 「繞過防護」類的清單（設定 `filter.lists[].bypass`；沒寫時預設的 HaGeZi doh-vpn-proxy-bypass 依網址認得）。
+    /// 串接模式（3.4.0）：登記中的下游查它登記的上游主機名稱時，這類清單不擋（規格 10 的 4.4）
+    pub bypass: bool,
 }
 
 /// 暫時停用的清單
@@ -1267,11 +1270,13 @@ fn list_source(l: &Value) -> Option<ListSource> {
     let name = l.get("name").and_then(Value::as_str).unwrap_or(&url).to_string();
     // 惡意（含反詐騙，例如 TW165）預設是保護清單：記憶體不足也不停用
     let protect = l.get("protect").and_then(Value::as_bool).unwrap_or(category == Category::Malware);
+    let bypass = kuroshio_config::chain::is_bypass_list(l);
     Some(ListSource {
         url,
         name,
         category,
         protect,
+        bypass,
     })
 }
 
@@ -1284,12 +1289,14 @@ fn resolve(base: &Path, p: &str) -> PathBuf {
     }
 }
 
-fn verdict(v: kuroshio_filter::Verdict<'_>) -> Verdict {
+/// `bypass`：命中的是不是「繞過防護」清單（自訂規則層沒有 `list`，一律 false）
+fn verdict(v: kuroshio_filter::Verdict<'_>, bypass: bool) -> Verdict {
     Verdict {
         block: v.is_block(),
         allow: v.is_allow(),
         category: v.category.as_str(),
         rule: v.rule().into_owned(),
+        bypass,
     }
 }
 
@@ -1297,7 +1304,7 @@ impl FilterCheck for FilterService {
     fn check(&self, name: &str, qtype: u16) -> Option<Verdict> {
         let custom = self.custom.read().unwrap().clone();
         if let Some(v) = custom.check(name, qtype) {
-            return Some(verdict(v));
+            return Some(verdict(v, false));
         }
         let lists = self.lists.read().unwrap().clone();
         let v = lists.check(name, qtype)?;
@@ -1306,7 +1313,8 @@ impl FilterCheck for FilterService {
             h.fetch_add(1, Ordering::Relaxed);
             self.hits_dirty.store(true, Ordering::Relaxed);
         }
-        Some(verdict(v))
+        let bypass = v.list.and_then(|i| self.sources.get(i)).is_some_and(|s| s.bypass);
+        Some(verdict(v, bypass))
     }
 
     /// 對齊 2.x `filter.stats`（LuCI 狀態頁用 lists / custom），另外附上來源明細與記憶體
@@ -1474,6 +1482,7 @@ mod tests {
             name: name.into(),
             category: cat,
             protect,
+            bypass: false,
         }
     }
 

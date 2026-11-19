@@ -29,6 +29,9 @@ pub struct Verdict {
     pub category: &'static str,
     /// 給日誌與 EDE 看的說明（命中的規則或網域）
     pub rule: String,
+    /// 命中的是「繞過防護」清單（`filter.lists[].bypass`；自訂規則一律 false）。
+    /// 串接模式（3.4.0）：登記中的下游查它登記的名稱時不擋（規格 10 的 4.4）
+    pub bypass: bool,
 }
 
 pub trait FilterCheck: Send + Sync {
@@ -287,6 +290,21 @@ impl Resolver {
         f.and_then(|f| f.check(name, qtype))
     }
 
+    /// 串接模式（3.4.0）：這個來源查這個名稱時，「繞過防護」清單的命中豁免（登記中的下游、名稱在它登記的
+    /// names 裡）。只在命中 `bypass` 清單之後才呼叫；沒有回應器（或 allow_downstream 關）一律 false
+    fn bypass_exempt(&self, client: IpAddr, name: &str) -> bool {
+        self.chain.get().is_some_and(|c| c.exempt(client, name))
+    }
+
+    /// 快取項目對這個來源是不是封鎖（CNAME 目標被擋）：只有 `bypass` 清單擋的、而且來源是登記了那個目標的下游時不算
+    fn entry_blocked(&self, e: &Entry, client: Option<IpAddr>) -> Option<&'static str> {
+        let cat = e.blocked?;
+        match (&e.blocked_bypass, client) {
+            (Some(t), Some(c)) if self.bypass_exempt(c, t) => None,
+            _ => Some(cat),
+        }
+    }
+
     /// 每分鐘呼叫：清快取（保留到 stale-if-error 的期限）
     pub fn sweep(&self) {
         self.cache
@@ -461,7 +479,8 @@ impl Resolver {
 
         // 1. 過濾
         if let Some(v) = self.filter_check(&qname, qtype) {
-            if v.block {
+            // 串接模式（3.4.0）：只有「繞過防護」清單擋的、而且來源是登記了這個名稱的下游黑潮時不擋（照一般查詢往下走）
+            if v.block && !(v.bypass && self.bypass_exempt(ctx.client, &qname)) {
                 self.stats.blocked(v.category);
                 self.stats.blocked_name(&qname, ctx.client, v.category);
                 let code = if v.category == "malware" { ede::BLOCKED } else { ede::FILTERED };
@@ -503,11 +522,11 @@ impl Resolver {
                 if stale {
                     self.stats.count(StatKind::Stale);
                 }
-                if let Some(cat) = e.blocked {
+                if let Some(cat) = self.entry_blocked(&e, Some(ctx.client)) {
                     self.stats.blocked(cat);
                     self.stats.blocked_name(&qname, ctx.client, cat);
                 }
-                let out = self.serve(&query, &e, if stale { Some(10) } else { None });
+                let out = self.serve(&query, &e, if stale { Some(10) } else { None }, Some(ctx.client));
                 self.stats.hit(t0.elapsed().as_secs_f64() * 1000.0);
                 return msg(out);
             }
@@ -521,21 +540,22 @@ impl Resolver {
         if stale {
             self.stats.count(StatKind::Stale);
         }
-        if let Some(cat) = e.blocked {
+        if let Some(cat) = self.entry_blocked(&e, Some(ctx.client)) {
             self.stats.blocked(cat);
             self.stats.blocked_name(&qname, ctx.client, cat);
         }
         if e.class == Class::ServFail {
             self.stats.count(StatKind::ServFail);
         }
-        let out = self.serve(&query, &e, stale.then_some(10));
+        let out = self.serve(&query, &e, stale.then_some(10), Some(ctx.client));
         self.stats.latency(false, t0.elapsed().as_secs_f64() * 1000.0);
         msg(out)
     }
 
-    /// 由快取項目產生回應：答案 TTL 統一成剩餘秒數（過期回舊資料時用 10 秒）
-    fn serve(&self, query: &Message, e: &Entry, force_ttl: Option<u32>) -> Message {
-        if let Some(cat) = e.blocked {
+    /// 由快取項目產生回應：答案 TTL 統一成剩餘秒數（過期回舊資料時用 10 秒）。
+    /// `client`：查詢的來源（CNAME 目標命中「繞過防護」清單時，依來源判斷要不要豁免）
+    fn serve(&self, query: &Message, e: &Entry, force_ttl: Option<u32>, client: Option<IpAddr>) -> Message {
+        if let Some(cat) = self.entry_blocked(e, client) {
             let code = if cat == "malware" { ede::BLOCKED } else { ede::FILTERED };
             return logic::blocked_response(query, code, &format!("{cat}：CNAME"));
         }
@@ -880,15 +900,28 @@ impl Resolver {
         let p = &self.params;
         let qtype = Cache::key_qtype(key);
         let mut blocked = None;
+        // 串接模式（3.4.0）：擋下的 CNAME 目標是「繞過防護」清單命中的（只記名稱；放不放行在 serve() 依來源判斷）
+        let mut blocked_bypass = None;
         if class == Class::Ok {
             let me = self.filter_check(qname, qtype);
             if !me.map(|v| v.allow).unwrap_or(false) {
                 for t in logic::cname_targets(msg) {
                     if let Some(v) = self.filter_check(&t, qtype) {
-                        if v.block {
-                            blocked = Some(v.category);
-                            break;
+                        if !v.block {
+                            continue;
                         }
+                        if v.bypass && blocked.is_none() {
+                            // 第一個命中的是 bypass 清單：再看後面的目標有沒有被其他清單擋
+                            blocked = Some(v.category);
+                            blocked_bypass = Some(t);
+                            continue;
+                        }
+                        // 其他清單或自訂規則擋的、或第二個 bypass 目標（只記得一個名稱）：任何來源都擋
+                        blocked_bypass = None;
+                        if !v.bypass {
+                            blocked = Some(v.category);
+                        }
+                        break;
                     }
                 }
             }
@@ -921,6 +954,7 @@ impl Resolver {
             ranked,
         );
         e.blocked = blocked;
+        e.blocked_bypass = blocked_bypass;
         e.baseline = baseline;
         cache.insert(key.to_string(), e, now)
     }

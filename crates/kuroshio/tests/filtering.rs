@@ -573,3 +573,54 @@ async fn partial_loads_copies_and_truncated_lists() {
     assert!(f2.check("aa2050.example", 1).unwrap().block && f2.check("bb1.example", 1).unwrap().block);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 串接模式（3.4.0 WP6）：標了 `bypass` 的清單命中 → `Verdict.bypass`；其他清單與自訂規則 → false。
+/// 沒寫標記的預設 HaGeZi doh-vpn-proxy-bypass 依網址認得（WP2 的 `is_bypass_list`）
+#[tokio::test]
+async fn bypass_flag_reaches_verdict() {
+    use kuroshio::resolver::FilterCheck;
+    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let srv = lists_by_path(
+        vec![
+            ("bypass.txt", "||dns.example.net^\n||both.example.org^\n".into()),
+            ("ads.txt", "||ads.example.net^\n".into()),
+        ],
+        down,
+    )
+    .await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-filter-bypass-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("custom.txt"), "||mine.example.net^\n").unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "filter": {
+            "customRules": ["./custom.txt"],
+            "lists": [
+                { "name": "廣告", "url": format!("http://{srv}/ads.txt"), "category": "ads" },
+                { "name": "繞過防護", "url": format!("http://{srv}/bypass.txt"), "category": "ads", "bypass": "1" }
+            ]
+        }
+    }));
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    assert_eq!(f.sources().iter().map(|s| s.bypass).collect::<Vec<_>>(), vec![false, true]);
+    f.reload_custom(true);
+    f.update_lists(true).await.unwrap();
+    let v = f.check("dns.example.net", 1).unwrap();
+    assert!(v.block && v.bypass, "{v:?}");
+    assert!(f.check("x.dns.example.net", 1).unwrap().bypass, "子網域一樣是 bypass 清單命中");
+    let v = f.check("ads.example.net", 1).unwrap();
+    assert!(v.block && !v.bypass, "一般清單");
+    let v = f.check("mine.example.net", 1).unwrap();
+    assert!(v.block && !v.bypass, "自訂規則");
+    assert!(f.check("fine.example.net", 1).is_none());
+    // 沒寫標記：預設的 HaGeZi doh-vpn-proxy-bypass 依網址認得；其他清單沒寫就是 false
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "filter": { "lists": [
+            { "url": kuroshio_config::chain::KNOWN_BYPASS_URLS[0] },
+            { "url": "https://example.com/list.txt" }
+        ] }
+    }));
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    assert_eq!(f.sources().iter().map(|s| s.bypass).collect::<Vec<_>>(), vec![true, false]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

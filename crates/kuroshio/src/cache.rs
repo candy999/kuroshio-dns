@@ -21,6 +21,9 @@ pub struct Entry {
     pub source: String,
     /// 回應裡的 CNAME 指向被封鎖的網域（分類）
     pub blocked: Option<&'static str>,
+    /// 串接模式（3.4.0）：`blocked` 是因為這個 CNAME 目標命中「繞過防護」清單（`bypass`）。
+    /// 只記目標名稱；放不放行每次依查詢的來源判斷（登記中的下游、名稱在它登記的 names 裡），不寫進快取
+    pub blocked_bypass: Option<String>,
     /// 第一個上游先回的「快速回應」，之後會被合併測速後的結果取代
     pub fast: bool,
     /// IP 測速摘要，例如「12ms/6IP」
@@ -63,6 +66,7 @@ impl Entry {
             class,
             source,
             blocked: None,
+            blocked_bypass: None,
             fast,
             ranked,
             baseline: None,
@@ -85,7 +89,10 @@ impl Entry {
 
     pub fn approx_bytes(&self) -> usize {
         let rec = |r: &Record| r.name.len() + 48 + matches!(r.data, kuroshio_proto::RData::Raw(ref d) if !d.is_empty()) as usize * 32;
-        160 + self.source.len() + self.answers.iter().map(rec).sum::<usize>() + self.authorities.iter().map(rec).sum::<usize>()
+        160 + self.source.len()
+            + self.blocked_bypass.as_ref().map_or(0, String::len)
+            + self.answers.iter().map(rec).sum::<usize>()
+            + self.authorities.iter().map(rec).sum::<usize>()
     }
 }
 

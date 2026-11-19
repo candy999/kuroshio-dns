@@ -188,6 +188,8 @@ pub enum Reason {
     Private,
     LocalNet,
     Friend,
+    /// 已登記的下游黑潮（串接模式 3.4.0，規格 10 的 4.4）
+    Downstream,
     CustomAllow(String),
     Open,
     /// 台灣 IP 資料讀不到：公網來源擋下（fail closed）
@@ -204,6 +206,7 @@ impl Reason {
             Reason::Private => "私有 / 區網位址（永遠允許）".into(),
             Reason::LocalNet => "本機網卡所在的網段（永遠允許）".into(),
             Reason::Friend => "社群好友目前的 IP".into(),
+            Reason::Downstream => "已登記的下游黑潮".into(),
             Reason::CustomAllow(c) => format!("自訂允許 {c}"),
             Reason::Open => "全開放模式".into(),
             Reason::NoData => "台灣 IP 資料讀不到：公網來源暫時一律擋下".into(),
@@ -226,7 +229,7 @@ const PRIVATE: [&str; 9] = [
     "::1/128",
 ];
 
-/// 編譯好的規則（設定 + 資料 + 本機網段 + 好友 IP）。任何一項變動就重建一份換上去
+/// 編譯好的規則（設定 + 資料 + 本機網段 + 好友 IP + 登記中的下游）。任何一項變動就重建一份換上去
 pub struct Rules {
     pub mode: Mode,
     deny: Dual,
@@ -236,6 +239,8 @@ pub struct Rules {
     private: Dual,
     local: Dual,
     friends: Dual,
+    /// 已登記的下游黑潮目前的來源位址（只有單一位址，最多 16 個）
+    chain: Dual,
     /// 允許的台灣網段（勾選的群組聯集）；None = 不用台灣網段（open 模式或資料讀不到）
     geo: Option<Dual>,
     data: Option<Arc<TwIp>>,
@@ -244,7 +249,7 @@ pub struct Rules {
 }
 
 impl Rules {
-    pub fn build(st: &Settings, data: Option<Arc<TwIp>>, local: Dual, friends: Dual) -> Rules {
+    pub fn build(st: &Settings, data: Option<Arc<TwIp>>, local: Dual, friends: Dual, chain: Dual) -> Rules {
         let (deny, bad_d) = Dual::parse(st.deny.iter().map(String::as_str));
         let (allow, bad_a) = Dual::parse(st.allow.iter().map(String::as_str));
         for b in bad_d.iter().chain(bad_a.iter()) {
@@ -281,6 +286,7 @@ impl Rules {
             private,
             local,
             friends,
+            chain,
             geo,
             data,
             groups,
@@ -306,6 +312,7 @@ impl Rules {
         if (self.private.contains(ip) && !ip.is_loopback())
             || self.local.contains(ip)
             || self.friends.contains(ip)
+            || self.chain.contains(ip)
             || self.allow.contains(ip)
         {
             return true;
@@ -335,6 +342,9 @@ impl Rules {
         if self.friends.contains(ip) {
             return (true, Reason::Friend);
         }
+        if self.chain.contains(ip) {
+            return (true, Reason::Downstream);
+        }
         if self.allow.contains(ip) {
             return (true, Reason::CustomAllow(Self::which(&self.allow_src, ip)));
         }
@@ -360,7 +370,7 @@ impl Rules {
 
     /// 合併後的區間數與大約占用的記憶體（位元組）
     pub fn footprint(&self) -> (usize, usize) {
-        let sets = [&self.deny, &self.allow, &self.private, &self.local, &self.friends];
+        let sets = [&self.deny, &self.allow, &self.private, &self.local, &self.friends, &self.chain];
         let mut n: usize = sets.iter().map(|d| d.v4.len() + d.v6.len()).sum();
         let mut b: usize = sets.iter().map(|d| d.heap_bytes()).sum();
         if let Some(g) = &self.geo {
@@ -392,6 +402,8 @@ pub struct Access {
     data_error: RwLock<Option<String>>,
     local: RwLock<Dual>,
     friends: RwLock<Dual>,
+    /// 已登記的下游黑潮（串接模式；由 `app.rs` 每分鐘與登記表變動時更新）
+    chain: RwLock<Dual>,
     denied: Denied,
     update_status: std::sync::OnceLock<Arc<dyn Fn() -> Value + Send + Sync>>,
 }
@@ -418,12 +430,19 @@ impl Access {
 
     pub fn new(settings: Settings, data: Option<Arc<TwIp>>, source: String, error: Option<String>) -> Arc<Access> {
         let a = Access {
-            rules: RwLock::new(Arc::new(Rules::build(&settings, data.clone(), Dual::default(), Dual::default()))),
+            rules: RwLock::new(Arc::new(Rules::build(
+                &settings,
+                data.clone(),
+                Dual::default(),
+                Dual::default(),
+                Dual::default(),
+            ))),
             settings,
             data: RwLock::new((data, source)),
             data_error: RwLock::new(error),
             local: RwLock::new(Dual::default()),
             friends: RwLock::new(Dual::default()),
+            chain: RwLock::new(Dual::default()),
             denied: Denied::default(),
             update_status: std::sync::OnceLock::new(),
         };
@@ -494,6 +513,7 @@ impl Access {
             self.data.read().unwrap().0.clone(),
             self.local.read().unwrap().clone(),
             self.friends.read().unwrap().clone(),
+            self.chain.read().unwrap().clone(),
         );
         *self.rules.write().unwrap() = Arc::new(r);
     }
@@ -521,6 +541,17 @@ impl Access {
         let (d, _) = Dual::parse(list.iter().map(String::as_str));
         if *self.friends.read().unwrap() != d {
             *self.friends.write().unwrap() = d;
+            self.rebuild();
+        }
+    }
+
+    /// 已登記的下游黑潮目前的來源位址（串接模式，規格 10 的 4.4）：只放單一位址（IPv4 /32、IPv6 /128），
+    /// 判斷順序在社群好友之後、自訂允許之前；`deny` 照樣優先。位址沒變不重建
+    pub fn set_chain(&self, ips: &[IpAddr]) {
+        let list: Vec<String> = ips.iter().map(|i| canonical(*i).to_string()).collect();
+        let (d, _) = Dual::parse(list.iter().map(String::as_str));
+        if *self.chain.read().unwrap() != d {
+            *self.chain.write().unwrap() = d;
             self.rebuild();
         }
     }
@@ -1004,7 +1035,7 @@ mod tests {
 
     #[test]
     fn taiwan_mode_allows_every_group() {
-        let r = Rules::build(&st(json!({})), Some(data()), Dual::default(), Dual::default());
+        let r = Rules::build(&st(json!({})), Some(data()), Dual::default(), Dual::default(), Dual::default());
         for ok in [
             "1.160.0.1",
             "168.95.1.1",
@@ -1028,6 +1059,7 @@ mod tests {
             Some(data()),
             Dual::default(),
             Dual::default(),
+            Dual::default(),
         );
         assert!(r.allows(ip("118.232.1.1")));
         assert!(!r.allows(ip("1.160.0.1")), "沒勾中華電信");
@@ -1041,6 +1073,7 @@ mod tests {
             Some(data()),
             Dual::default(),
             Dual::default(),
+            Dual::default(),
         );
         assert!(!r.allows(ip("118.232.1.1")));
         assert!(r.allows(ip("8.8.8.8")));
@@ -1049,6 +1082,7 @@ mod tests {
         let r = Rules::build(
             &st(json!({ "mode": "custom", "groups": ["*"] })),
             Some(data()),
+            Dual::default(),
             Dual::default(),
             Dual::default(),
         );
@@ -1071,6 +1105,7 @@ mod tests {
                 )],
                 vec![],
             ),
+            Dual::default(),
         );
         assert!(!r.allows(ip("1.160.1.1")), "封鎖勝過自訂允許");
         assert!(!r.allows(ip("1.160.2.2")), "封鎖勝過好友");
@@ -1087,7 +1122,13 @@ mod tests {
     #[test]
     fn lan_and_private_always_allowed() {
         let local = Dual::parse(["203.0.113.0/24", "2001:db8:1:2::/64"]).0;
-        let r = Rules::build(&st(json!({ "mode": "custom", "groups": [] })), Some(data()), local, Dual::default());
+        let r = Rules::build(
+            &st(json!({ "mode": "custom", "groups": [] })),
+            Some(data()),
+            local,
+            Dual::default(),
+            Dual::default(),
+        );
         for ok in [
             "10.1.2.3",
             "172.31.0.1",
@@ -1114,6 +1155,7 @@ mod tests {
             None,
             Dual::default(),
             Dual::default(),
+            Dual::default(),
         );
         assert!(!r.allows(ip("8.8.8.8")), "資料讀不到：公網來源擋下");
         assert!(!r.allows(ip("9.9.9.9")), "自訂封鎖照樣有效");
@@ -1121,7 +1163,13 @@ mod tests {
         assert!(r.allows(ip("192.168.1.5")), "區網照常");
         assert_eq!(r.explain(ip("8.8.8.8")), (false, Reason::NoData));
         // open 模式不受影響
-        let o = Rules::build(&st(json!({ "mode": "open" })), None, Dual::default(), Dual::default());
+        let o = Rules::build(
+            &st(json!({ "mode": "open" })),
+            None,
+            Dual::default(),
+            Dual::default(),
+            Dual::default(),
+        );
         assert!(o.allows(ip("8.8.8.8")));
         let dir = std::env::temp_dir().join(format!("kuroshio-access-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("geo")).unwrap();
@@ -1294,7 +1342,7 @@ mod tests {
         for foreign in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"] {
             assert!(!all.contains(ip(foreign)), "{foreign}");
         }
-        let r = Rules::build(&st(json!({})), Some(Arc::new(t)), Dual::default(), Dual::default());
+        let r = Rules::build(&st(json!({})), Some(Arc::new(t)), Dual::default(), Dual::default(), Dual::default());
         let (n, bytes) = r.footprint();
         assert!(n < 10_000, "{n} 個區間");
         assert!(bytes < 200 * 1024, "全部群組約 {bytes} 位元組");

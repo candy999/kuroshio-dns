@@ -2,14 +2,15 @@
 //!
 //! - 只有 `resolver.rs::handle_inner` 呼叫：CH 類別、名稱在 `chain.kuroshio` 區域裡的查詢一律交給這裡，
 //!   不論結果都不往下走（不過濾、不快取、不轉給上游）
-//! - 3.4.0 的 WP3 只回答 auth（挑戰／回應）；reg、manifest、分段先回 `REFUSED`（WP5、WP6 接上）
+//! - auth（挑戰／回應，WP3）、reg（下游登記，WP6：四項檢查都過才寫進登記表）；manifest、分段由 WP5 接上
 //! - `allow_downstream` 關著時照樣簽章回答 auth（`allow = false`、`caps` 是空的），並記下有下游來問過（`probes`）
 //! - 速率限制（簽章要花 CPU）：每個來源每秒 4 次、可累積 8 次；全部來源合計每秒 32 次、可累積 64 次；
 //!   來源表最多 64 筆，滿了丟最久沒更新的
 
+use super::grants::Grants;
 use super::ident::NodeKey;
 use crate::resolver::Ctx;
-use kuroshio_community::chain::{parse_name, seal, token, token_ok, txt_rdata, AuthBody, Name, PROTO, TOKEN_WINDOW_MS};
+use kuroshio_community::chain::{open_reg, parse_name, seal, token, token_ok, txt_rdata, AuthBody, Name, OPT_CODE, PROTO, TOKEN_WINDOW_MS};
 use kuroshio_community::envelope::to_cbor;
 use kuroshio_community::util::{now_ms, random_bytes};
 use kuroshio_proto::message::{Message, RData, Record};
@@ -31,8 +32,8 @@ const GLOBAL_BURST: f64 = 64.0;
 /// 速率限制表最多記幾個來源
 pub const MAX_SOURCES: usize = 64;
 
-/// `allow_downstream` 開著時公告的能力。WP3 還沒有共用結果與登記，所以是空的；
-/// WP5（`share`）、WP6（`reg`）接上之後加進來（沒有的能力下游不會去問）
+/// `allow_downstream` 開著時公告的能力（共用結果的 `share` 由 WP5 加進來；登記的 `reg` 在 [`Responder::caps`] 加）。
+/// 沒有的能力下游不會去問
 const CAPS: &[&str] = &[];
 
 const RCODE_SERVFAIL: u16 = 2;
@@ -139,12 +140,19 @@ pub struct Responder {
     refused_not_allowed: AtomicU64,
     /// 讀不到金鑰的警告只記一次
     key_warned: AtomicBool,
-    /// 有沒有啟用「繞過防護」清單（WP6 設定；目前只記著，不影響回答）
+    /// 有沒有啟用「繞過防護」清單（`app.rs` 依過濾設定設定；只記著，不影響回答）
     bypass_list_active: AtomicBool,
+    /// 登記中的下游（規格第 4 節；只在記憶體，跟著回應器重建）
+    grants: Arc<Grants>,
 }
 
 impl Responder {
     pub fn new(settings: &kuroshio_config::chain::ChainSettings, key: Arc<NodeKey>) -> Arc<Responder> {
+        Self::with_grants(settings, key, Grants::new(settings))
+    }
+
+    /// 指定登記表（測試用：`Grants::with_ttl`）
+    pub fn with_grants(settings: &kuroshio_config::chain::ChainSettings, key: Arc<NodeKey>, grants: Arc<Grants>) -> Arc<Responder> {
         Arc::new(Responder {
             allow_downstream: settings.allow_downstream,
             key,
@@ -157,6 +165,7 @@ impl Responder {
             refused_not_allowed: AtomicU64::new(0),
             key_warned: AtomicBool::new(false),
             bypass_list_active: AtomicBool::new(false),
+            grants,
         })
     }
 
@@ -169,7 +178,8 @@ impl Responder {
         };
         match parse_name(qname) {
             Some(Name::Auth(nonce)) => self.auth(query, q.qtype, &nonce, ctx),
-            Some(Name::Reg | Name::Manifest | Name::Chunk { .. }) => {
+            Some(Name::Reg) => self.reg(query, q.qtype, ctx),
+            Some(Name::Manifest | Name::Chunk { .. }) => {
                 if !self.allow_downstream {
                     self.refused_not_allowed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -240,6 +250,93 @@ impl Responder {
         r
     }
 
+    /// 下游登記（規格 4.2）。四項檢查一項都不能省（沒有核准之後，這是「綁來源位址、防重放」唯一的保證）：
+    /// 1. `Sealed` 用 `body.pub` 驗簽、`kid == kid_of(pub)`、`names` 合法（`open_reg`）
+    /// 2. `up` 是自己（含輪替中的舊 kid）
+    /// 3. `peer` 等於這個查詢的來源位址
+    /// 4. `tok` 對這個來源位址在目前或前一個時間窗有效
+    ///
+    /// 任何一步不過、`allow_downstream` 關、登記表滿了 → `REFUSED`
+    fn reg(&self, query: &Message, qtype: u16, ctx: &Ctx) -> Message {
+        let refused = || Message::response_to(query, RCODE_REFUSED);
+        if !self.allow_downstream {
+            self.refused_not_allowed.fetch_add(1, Ordering::Relaxed);
+            return refused();
+        }
+        if qtype != 16 && qtype != 255 {
+            return refused();
+        }
+        let ip = ctx.client.to_canonical();
+        // 驗簽與回應的簽章都要花 CPU：跟 auth 共用速率限制
+        if !self.rate_ok(ip) {
+            return refused();
+        }
+        let Some(sealed) = query
+            .opt
+            .as_ref()
+            .and_then(|o| o.options.iter().find(|(c, _)| *c == OPT_CODE))
+            .map(|(_, v)| v)
+        else {
+            return refused();
+        };
+        // 1. 下游的簽章、kid、names
+        let body = match open_reg(sealed) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("串接：{ip} 的登記驗不過：{e:#}");
+                return refused();
+            }
+        };
+        let key = match self.key.get() {
+            Ok(k) => k,
+            Err(_) => return Message::response_to(query, RCODE_SERVFAIL),
+        };
+        // 2. 簽給這台的登記（簽給別台的不能拿來這台用）
+        if !self.key.own_kids().iter().any(|k| k.as_slice() == body.up.as_slice()) {
+            tracing::debug!("串接：{ip} 的登記是簽給別台上游的");
+            return refused();
+        }
+        // 3. peer = 實際來源（錄下別人的登記封包、從別的位址重送）
+        let peer = ip.to_string();
+        if body.peer != peer {
+            tracing::debug!("串接：{ip} 的登記 peer（{}）跟來源不同", body.peer);
+            return refused();
+        }
+        // 4. tok 對這個來源有效（目前或前一個時間窗）
+        let now = now_ms();
+        if !token_ok(&self.secret, &peer, now, &body.tok) {
+            tracing::debug!("串接：{ip} 的登記憑據無效或過期");
+            return refused();
+        }
+        let ack = match self.grants.register(&body, ip, Instant::now(), now) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!("串接：{ip} 的登記不接受：{e}");
+                return refused();
+            }
+        };
+        let sealed = seal(&key, "regack", to_cbor(&ack));
+        let mut r = Message::response_to(query, 0);
+        r.answers.push(Record {
+            name: query.questions[0].name.clone(),
+            rtype: 16,
+            class: 3,
+            ttl: 0,
+            data: RData::Raw(txt_rdata(&sealed)),
+        });
+        r
+    }
+
+    /// 繞過防護清單的豁免：這個來源是登記中的下游、而且名稱在它登記的 names 裡（解析流程只在命中 `bypass` 清單後呼叫）
+    pub fn exempt(&self, client: IpAddr, qname: &str) -> bool {
+        self.grants.exempt(client, qname, Instant::now())
+    }
+
+    /// 登記表（`app.rs` 用它更新存取控制）
+    pub fn grants(&self) -> &Arc<Grants> {
+        &self.grants
+    }
+
     /// 下游狀態機（WP4）在綁定、解除時設定：自己串接中的上游的鏈
     pub fn set_upstream_path(&self, path: Option<Vec<Vec<u8>>>) {
         *self.upstream_path.lock().unwrap() = path;
@@ -247,11 +344,13 @@ impl Responder {
 
     /// 公告的能力（`allow_downstream` 關著是空的）
     pub fn caps(&self) -> Vec<&'static str> {
-        if self.allow_downstream {
-            CAPS.to_vec()
-        } else {
-            Vec::new()
+        if !self.allow_downstream {
+            return Vec::new();
         }
+        let mut v = CAPS.to_vec();
+        // 下游登記（放行：存取控制與繞過防護清單）
+        v.push("reg");
+        v
     }
 
     /// `upstream.allowDownstream`
@@ -267,6 +366,12 @@ impl Responder {
     /// 登記（WP6）：`tok` 對這個來源在目前或前一個時間窗有效
     pub fn token_ok(&self, peer: &str, tok: &[u8]) -> bool {
         token_ok(&self.secret, peer, now_ms(), tok)
+    }
+
+    /// 測試用：這台在 `at_ms` 那個時間窗發給 `peer` 的 `tok`（驗證「過期的憑據」被拒）
+    #[doc(hidden)]
+    pub fn token_at(&self, peer: &str, at_ms: u64) -> [u8; 16] {
+        token(&self.secret, peer, at_ms / TOKEN_WINDOW_MS)
     }
 
     /// 速率限制：這個來源現在可不可以再回答一次需要簽章的查詢（可以就扣掉一次；WP5 的清單也要用）
@@ -299,9 +404,15 @@ impl Responder {
             let p = self.probes.lock().unwrap();
             (p.count24h(now), p.last_within_24h(now))
         };
+        let downstreams = self.grants.json();
         let (text, note) = if self.allow_downstream {
+            let n = downstreams.as_array().map_or(0, Vec::len);
             (
-                "提供資料給下游黑潮：目前沒有下游連上來".to_string(),
+                if n == 0 {
+                    "提供資料給下游黑潮：目前沒有下游連上來".to_string()
+                } else {
+                    format!("提供資料給下游黑潮：目前 {n} 台")
+                },
                 json!("區網裡任何會講這個協定的裝置都拿得到資料與放行；有啟用「繞過防護」清單時建議關閉 allow_downstream"),
             )
         } else {
@@ -319,7 +430,7 @@ impl Responder {
             "note": note,
             "nodeId": self.key.node_id(),
             "fingerprint": self.key.fingerprint(),
-            "downstreams": [],
+            "downstreams": downstreams,
             "share": { "requests": 0, "lastAt": null, "cacheBytes": 0 },
             "probes": { "count24h": count24h, "lastAt": last },
             "refused": {

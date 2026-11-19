@@ -144,6 +144,7 @@ impl FilterCheck for Block {
             allow: false,
             category: "ads",
             rule: format!("||{name}^"),
+            bypass: false,
         })
     }
 }
