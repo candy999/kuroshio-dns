@@ -224,6 +224,41 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
                 ? ok('狀態頁：網路路徑（一般 DNS 被誰接走、提醒）') : bad('狀態頁的網路路徑區塊不對（沒有提醒，或出現 [object …]）');
             /自動（最快）/.test(text) && /路徑不通，先不用/.test(text) && /經由攔截者/.test(text)
                 ? ok('狀態頁：上游的選上原因、路徑不通、經由攔截者') : bad('狀態頁的上游沒有原因 / 路徑標示');
+            // 3.4.0：上游所在地區顯示在原因旁邊；串接上游的角色是「串接」
+            /自動（覆蓋 · JP）/.test(text) && /udp:\/\/192\.168\.1\.1:53\s+串接/.test(text)
+                ? ok('狀態頁：上游的地區（覆蓋 · JP）與串接上游') : bad('狀態頁的上游沒有地區或「串接」角色');
+            // 3.4.0 串接：下游與上游兩種角色都顯示，句子用 API 給的；沒有任何按鈕
+            {
+                const chainText = async () => (await page.locator('#kuroshio-chain').innerText().catch(() => '')).replace(/[ \t]+/g, ' ');
+                const chainButtons = () => page.locator('#kuroshio-chain button').count();
+                let c = await chainText();
+                /下游角色/.test(c) && /串接中：上游 192\.168\.1\.1（黑潮 3\.4\.0），評測結果與 CDN 節點由上游提供/.test(c) && /3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB/.test(c)
+                    && /CDN 節點池/.test(c) && /這台留不下副本/.test(c) && /略過的工作（由上游黑潮提供）：DNS 評測、台灣節點池、CDN 網段分類、CDN IP 範圍/.test(c)
+                    ? ok('狀態頁：串接（下游角色：串接中、上游指紋、共用結果、略過的工作）') : bad(`狀態頁：串接的下游角色不對\n     ${c.slice(0, 600)}`);
+                /上游角色/.test(c) && /提供資料給下游黑潮：目前 2 台/.test(c) && /有啟用「繞過防護」清單時建議關閉 allow_downstream/.test(c)
+                    && /9C01-55E2-0A7B-31D4-8F6C-2E90-B135-7A42/.test(c) && /192\.168\.1\.2/.test(c) && /7E44-0C19-D2A8-6B53-1F07-94CE-38A1-E560/.test(c) && /經 NAT/.test(c)
+                    ? ok('狀態頁：串接（上游角色：自己的指紋、連上來的下游、經 NAT）') : bad(`狀態頁：串接的上游角色不對\n     ${c.slice(0, 900)}`);
+                (await chainButtons()) === 0 ? ok('狀態頁：串接區塊沒有任何按鈕') : bad('狀態頁：串接區塊有按鈕');
+                await mockGet('/__mock/chain?mode=released');
+                await page.reload();
+                await page.waitForSelector('#kuroshio-chain', { timeout: 15000 }).catch(() => {});
+                c = await chainText();
+                /上游黑潮 3\.4\.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路/.test(c)
+                    && /不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）；最近有下游黑潮來問過/.test(c)
+                    && /24 小時內來問過的下游\s+4 次/.test(c) && /目前沒有下游連上來/.test(c) && !/建議關閉 allow_downstream/.test(c)
+                    ? ok('狀態頁：串接（上游不提供資料、這台 allow_downstream 關：整句「重複使用網路」）') : bad(`狀態頁：串接（不提供資料）不對\n     ${c.slice(0, 900)}`);
+                await mockGet('/__mock/chain?mode=off');
+                await page.reload();
+                await page.waitForSelector('#kuroshio-chain', { timeout: 15000 }).catch(() => {});
+                c = await chainText();
+                /已關閉/.test(c) && /已關閉串接（chain 關閉）：把上游黑潮當成一般的 DNS 攔截，自己做評測，會重複使用網路/.test(c) && /上游角色/.test(c)
+                    ? ok('狀態頁：串接（chain 關閉：兩個區塊都還在）') : bad(`狀態頁：串接（chain 關閉）不對\n     ${c.slice(0, 600)}`);
+                await page.screenshot({ path: `${SHOTS}/status-chain-off.png`, fullPage: true });
+                await mockGet('/__mock/chain?mode=chained');
+                await page.reload();
+                await page.waitForSelector('#kuroshio-chain', { timeout: 15000 }).catch(() => {});
+                if (errors.length) bad(`狀態頁切換串接狀態後 JavaScript 錯誤\n     ${errors.join('\n     ')}`);
+            }
             /立即儲存學習資料/.test(text) && /更新韌體或要斷電前先按一下，學到的資料會馬上寫進儲存空間/.test(text)
                 ? ok('狀態頁：操作區有「立即儲存學習資料」與說明') : bad('狀態頁沒有「立即儲存學習資料」');
             {

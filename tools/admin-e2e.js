@@ -186,6 +186,75 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.waitForFunction(t => document.getElementById('st-updated').textContent !== t, t1, { timeout: 12000 }).then(() => ok('狀態每 5 秒自動更新'), () => bad('狀態沒有自動更新'));
         await shot('02-status');
 
+        console.log('狀態：串接（3.4.0）');
+        {
+            // 真的服務：兩個角色的區塊都一定顯示（這台沒有上游黑潮），句子用 API 給的
+            const realChain = JSON.parse((await raw(adminPort, 'GET', '/api/chain', { Authorization: `Bearer ${token}` })).body || 'null');
+            const downReal = await page.textContent('#st-chain-down').catch(() => '');
+            const upReal = await page.textContent('#st-chain-up').catch(() => '');
+            // 節點金鑰第一次需要時才建立：還沒有時指紋是 null，畫面寫「還沒有節點金鑰」
+            check(realChain && downReal.includes(realChain.text) && realChain.serving && upReal.includes(realChain.serving.text)
+                && upReal.includes(realChain.serving.fingerprint || '還沒有節點金鑰'),
+                '串接：下游與上游角色都顯示，文字照 /api/chain', `${downReal.slice(0, 200)} / ${upReal.slice(0, 200)}`);
+            // 假的 /api/status：串接中、上游不提供資料、上游角色（allow_downstream 關 / 開著有下游）
+            const FP_UP = '3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB', FP_ME = '9C01-55E2-0A7B-31D4-8F6C-2E90-B135-7A42', FP_DOWN = '7E44-0C19-D2A8-6B53-1F07-94CE-38A1-E560';
+            const now = Date.now();
+            const servingOn = { allowDownstream: true, text: '提供資料給下游黑潮：目前 1 台',
+                note: '區網裡任何會講這個協定的裝置都拿得到資料與放行；有啟用「繞過防護」清單時建議關閉 allow_downstream', nodeId: '0f1e2d3c4b5a6978', fingerprint: FP_ME,
+                downstreams: [{ address: '192.168.1.2', nodeId: '1a2b3c4d5e6f7081', fingerprint: FP_DOWN, version: '3.4.0', viaNat: true, names: 6, firstSeen: now - 7200e3, lastSeen: now - 60e3, expiresAt: now + 840e3 }],
+                share: { ready: true, requests: 3, chunks: 9, lastAt: now - 600e3, cacheBytes: 81234 }, probes: { count24h: 0, lastAt: null }, refused: { rate: 0, notPrivate: 0, notAllowed: 0 } };
+            const servingOff = Object.assign({}, servingOn, { allowDownstream: false, note: null, downstreams: [],
+                text: '不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）',
+                share: { ready: false, requests: 0, chunks: 0, lastAt: null, cacheBytes: 0 }, probes: { count24h: 2, lastAt: now - 300e3 } });
+            const upstream = { address: '192.168.1.1', proto: 'udp', via: 'gateway', version: '3.4.0', nodeId: 'a1b2c3d4e5f60718', fingerprint: FP_UP, allowDownstream: true,
+                caps: ['share', 'reg'], path: ['a1b2c3d4e5f60718'], depth: 2, viaNat: false, since: now - 3600e3, lastOkAt: now - 20e3, failures: 0, keyChangedAt: null, previousFingerprint: null,
+                registered: { ok: true, at: now - 300e3, expiresAt: now + 600e3, names: 6 }, error: null };
+            const CASES = {
+                chained: { enabled: true, state: 'chained', reason: null, text: '串接中：上游 192.168.1.1（黑潮 3.4.0），評測結果與 CDN 節點由上游提供', upstream, backupActive: false, retryAt: null,
+                    shared: { enabled: true, lastSyncAt: now - 1800e3, nextSyncAt: now + 3600e3, error: null, skippedJobs: ['dns-benchmark', 'cdn-pool'],
+                        objects: [{ kind: 'upstreams', at: now - 7200e3, bytes: 6624, importedAt: now - 1800e3, fresh: true, error: null }] }, serving: servingOff },
+                notAllowed: { enabled: true, state: 'released', reason: 'not-allowed', text: '上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路',
+                    upstream: Object.assign({}, upstream, { via: null, allowDownstream: false, caps: [], since: null, lastOkAt: null, registered: null }), backupActive: false, retryAt: null, shared: null, serving: servingOn }
+            };
+            let mode = 'chained';
+            await page.route('**/api/status', async r => {
+                const res = await r.fetch();
+                const j = await res.json();
+                j.chain = CASES[mode];
+                j.upstreams = [{ id: 'udp://192.168.1.1:53', type: 'udp', role: 'chain', ok: 10, fail: 0, avgMs: 2.1, reason: null, region: null, pathBlocked: false, via: null },
+                    { id: 'tls://dns.example.net', type: 'dot', role: 'auto', ok: 5, fail: 0, avgMs: 31, reason: '覆蓋', region: 'JP', pathBlocked: false, via: null }].concat(j.upstreams || []);
+                r.fulfill({ response: res, body: JSON.stringify(j) });
+            });
+            const show = async m => {
+                mode = m;
+                await page.goto(`${BASE}/#settings`);
+                await page.goto(`${BASE}/#status`);
+                await page.waitForFunction(t => (document.getElementById('st-chain-down') || {}).textContent && document.getElementById('st-chain-down').textContent.includes(t), CASES[m].text, { timeout: 10000 }).catch(() => {});
+                return [await page.textContent('#st-chain-down').catch(() => ''), await page.textContent('#st-chain-up').catch(() => '')];
+            };
+            let [down, up] = await show('chained');
+            check(down.includes('串接中：上游 192.168.1.1（黑潮 3.4.0），評測結果與 CDN 節點由上游提供') && down.includes(FP_UP) && /上游評測結果/.test(down) && /略過的工作（由上游黑潮提供）：DNS 評測、台灣節點池/.test(down),
+                '串接畫面：串接中（上游指紋、共用結果、略過的工作）', down.slice(0, 400));
+            const upTable = await page.textContent('#st-up');
+            check(/串接/.test(upTable) && /自動（覆蓋 · JP）/.test(upTable), '上游表格：串接上游的角色、地區顯示在原因旁邊', upTable.slice(0, 300));
+            check(up.includes('不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）') && /目前沒有下游連上來/.test(up) && !/建議關閉/.test(up),
+                '串接畫面：上游角色 allow_downstream 關閉的說明（整句）', up.slice(0, 400));
+            check((await page.locator('#st-chain button').count()) === 0, '串接畫面：沒有任何按鈕');
+            await shot('02b-status-chain');
+            [down, up] = await show('notAllowed');
+            check(down.includes('上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路') && await page.isVisible('#st-chain-down .msg.warn'),
+                '串接畫面：上游不提供資料（allow_downstream 關閉）…會重複使用網路（提醒樣式、整句）', down.slice(0, 300));
+            check(up.includes('提供資料給下游黑潮：目前 1 台') && up.includes('有啟用「繞過防護」清單時建議關閉 allow_downstream') && up.includes(FP_ME) && up.includes(FP_DOWN) && up.includes('192.168.1.2') && /經 NAT/.test(up),
+                '串接畫面：上游角色開著時的說明與連上來的下游清單（指紋、位址、經 NAT）', up.slice(0, 500));
+            await page.setViewportSize({ width: 390, height: 800 });
+            await page.waitForTimeout(300);
+            const w = await page.evaluate(() => document.documentElement.scrollWidth);
+            check(w <= 391, '串接畫面：390 px 寬沒有水平捲動', `scrollWidth = ${w}`);
+            await shot('02c-status-chain-mobile');
+            await page.setViewportSize({ width: 1280, height: 900 });
+            await page.unroute('**/api/status');
+        }
+
         console.log('設定：簡易 / 專業');
         await page.evaluate(() => localStorage.removeItem('kuroshio-ui-mode'));
         await page.goto(`${BASE}/#settings`);

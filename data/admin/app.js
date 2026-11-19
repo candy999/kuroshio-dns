@@ -525,7 +525,7 @@
 	}
 
 	// ---------------------------------------------------------------- 狀態分頁
-	var ROLE = { pinned: '固定', auto: '自動', fallback: '備援' };
+	var ROLE = { pinned: '固定', auto: '自動', fallback: '備援', chain: '串接' };
 	var statusBusy = false;
 
 	function tile(k, v, s) {
@@ -656,7 +656,8 @@
 
 		// 上游
 		var au = st.autoUpstreams;
-		$('st-up-desc').textContent = au ? '自動上游來自 ' + fmtTime(au.generatedAt) + ' 的評測（' + fmtNum(au.count) + ' 台）。' : '還沒有每日評測結果，暫時使用固定上游與備援。';
+		$('st-up-desc').textContent = au ? (au.source === 'chain' ? '自動上游來自上游黑潮 ' : '自動上游來自 ') + fmtTime(au.generatedAt) + ' 的評測（' + fmtNum(au.count) + ' 台）' +
+			(au.source === 'chain' ? '，是串接的共用結果。' : '。') : '還沒有每日評測結果，暫時使用固定上游與備援。';
 		tableRows($('st-up').tBodies[0], (st.upstreams || []).map(function (u) {
 			var n = (u.ok || 0) + (u.fail || 0), rate = n ? u.ok / n : null, h;
 			if (u.paused) h = badge('暫停中', 'warn');
@@ -665,9 +666,13 @@
 			else if (rate >= 0.9) h = badge('正常 ' + Math.round(rate * 100) + '%', 'ok');
 			else if (rate >= 0.5) h = badge('不穩 ' + Math.round(rate * 100) + '%', 'warn');
 			else h = badge('異常 ' + Math.round(rate * 100) + '%', 'err');
-			var role = (ROLE[u.role] || u.role) + (u.reason ? '（' + u.reason + '）' : '') + (u.via === 'interceptor' ? ' · 經由攔截者' : '');
+			// 選上的原因；上游所在地區（3.4.0，評測判斷的國別）放在原因旁邊
+			var why = [u.reason, u.region].filter(function (x) { return !!x; }).join(' · ');
+			var role = (ROLE[u.role] || u.role) + (why ? '（' + why + '）' : '') + (u.via === 'interceptor' ? ' · 經由攔截者' : '');
 			return [{ text: u.id, cls: 'mono' }, role, { text: fmtNum(u.ok), cls: 'num' }, { text: fmtNum(u.fail), cls: 'num' }, { text: u.avgMs != null ? u.avgMs + ' ms' : '-', cls: 'num' }, h];
 		}), 6);
+
+		renderChain(st.chain);
 
 		// 憑證、最近的錯誤
 		var ex = clear($('st-extra'));
@@ -696,6 +701,52 @@
 			ex.appendChild(el('h3', { text: '最近的錯誤（共 ' + fmtNum(st.errors.count) + ' 次）' }));
 			ex.appendChild(el('pre', { class: 'out', text: errs.slice(0, 10).map(function (e) { return fmtTime(e.at, 'sec') + '  ' + (e.msg || pretty(e)); }).join('\n') }));
 		}
+	}
+
+	/**
+	 * 串接模式（3.4.0）：下游角色（這台向上游黑潮拿資料）與上游角色（提供資料給下游）兩個區塊都一定顯示。
+	 * 主要的句子直接用 API 給的 text / serving.text / serving.note（整理由 ui-core.js 的 chainView 做）；
+	 * 沒有任何要按的按鈕（沒有同意、沒有核准）
+	 */
+	function renderChain(chain) {
+		var box = $('st-chain');
+		if (!box) return;
+		clear(box);
+		if (!chain) { box.appendChild(el('p', { class: 'muted', text: '這個版本的服務沒有串接的資料。' })); return; }
+		// ui-core.js 是舊的（瀏覽器快取）：至少把 API 給的那句顯示出來
+		if (typeof core.chainView !== 'function') { box.appendChild(el('p', { class: 'msg info', text: chain.text || '-' })); return; }
+		var v = core.chainView(chain);
+		var kv = function (rows) {
+			if (!rows.length) return null;
+			var tb = el('tbody');
+			rows.forEach(function (r) { tb.appendChild(el('tr', {}, [el('th', { text: r.label }), el('td', { text: r.value })])); });
+			return el('div', { class: 'table-wrap' }, el('table', { class: 'kv' }, tb));
+		};
+		var grid = function (id, head, rows, empty) {
+			var tb = el('tbody');
+			var t = el('table', { id: id }, [el('thead', {}, el('tr', {}, head.map(function (h) { return el('th', { text: h }); }))), tb]);
+			if (!rows.length) tb.appendChild(el('tr', {}, el('td', { class: 'empty', colspan: head.length, text: empty })));
+			else rows.forEach(function (r) { tb.appendChild(el('tr', {}, r.map(function (c) { return el('td', { text: c }); }))); });
+			return el('div', { class: 'table-wrap' }, t);
+		};
+		var d = v.down, u = v.up;
+		append(box, [
+			el('div', { class: 'card chain-role', id: 'st-chain-down' }, [
+				el('h4', {}, ['下游角色：向上游黑潮拿資料 ', badge(d.badge.text, d.badge.kind)]),
+				el('p', { class: d.warn ? 'msg warn' : 'msg info', text: d.text }),
+				kv(d.rows),
+				d.objects.length ? grid('st-chain-shared', ['共用結果', '上游產生', '匯入', '狀態'], d.objects.map(function (o) { return [o.name, o.at, o.imported, o.state]; }), '') : null,
+				d.skipped ? el('p', { class: 'muted', text: '略過的工作（由上游黑潮提供）：' + (d.skipped.length ? d.skipped.join('、') : '沒有，照排程自己做') }) : null
+			].filter(Boolean)),
+			el('div', { class: 'card chain-role', id: 'st-chain-up' }, [
+				el('h4', {}, ['上游角色：提供資料給下游黑潮 ', badge(u.badge.text, u.badge.kind)]),
+				el('p', { class: u.warn ? 'msg warn' : 'msg info', text: u.text }),
+				u.note ? el('p', { class: 'muted', text: u.note }) : null,
+				kv(u.rows),
+				grid('st-chain-downstreams', ['連上來的下游（指紋）', '位址', '版本', '第一次出現', '最後出現', ''],
+					u.downstreams.map(function (x) { return [x.fingerprint, x.address, x.version, x.firstSeen, x.lastSeen, x.nat]; }), '目前沒有下游連上來')
+			].filter(Boolean))
+		]);
 	}
 
 	/** 一個監聽位址的狀態（/api/status 的 listenersDetail） */

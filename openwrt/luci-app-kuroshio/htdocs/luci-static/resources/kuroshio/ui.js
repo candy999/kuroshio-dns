@@ -253,6 +253,12 @@ return baseclass.extend({
 	restorePlan: restorePlan,
 	restoreSummary: restoreSummary,
 
+	/** 串接模式（3.4.0）：/api/status 的 chain → 顯示用的資料（ui-core.js 的 chainView）；ui-core.js 是舊的（瀏覽器快取）時回 null */
+	chainView: function(c) {
+		var x = core();
+		return x && typeof x.chainView === 'function' ? x.chainView(c, function(s) { return _(s); }) : null;
+	},
+
 	/** 小標籤（狀態用）：kind = ok / warn / err / off */
 	badge: function(text, kind) {
 		return T('span', { 'class': 'kuroshio-badge', 'data-kind': kind || 'off',

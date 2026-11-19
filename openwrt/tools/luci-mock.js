@@ -89,7 +89,7 @@ const STATUS = {
     cacheEntries: 800, cacheBytes: 300000, errors: { count: 0, recent: [] }, ownIp: null,
     upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ok: 100, fail: 1, avgMs: 12 },
       { id: 'https://doh.example/dns-query', role: 'auto', reason: '最快', ok: 50, fail: 0, avgMs: 20 },
-      { id: 'quic://doq.example:853', role: 'auto', reason: '覆蓋', ok: 0, fail: 0, avgMs: null, pathBlocked: true },
+      { id: 'quic://doq.example:853', role: 'auto', reason: '覆蓋', region: 'JP', ok: 0, fail: 0, avgMs: null, pathBlocked: true },
       { id: 'udp://8.8.4.4:53', role: 'fallback', ok: 0, fail: 0, avgMs: null, via: 'interceptor' }], autoUpstreams: null,
     network: { path: { enabled: true, policy: 'skip-plain', checkedAt: 1795000000000, summary: 'IPv6 不可用，一般 DNS 被路由器 192.0.2.1 上的黑潮（3.3.6）接走',
       warnings: ['一般 DNS 被路由器 192.0.2.1 上的黑潮（3.3.6）接走：評測不測一般 DNS，一般 DNS 只當最後備援'] } },
@@ -258,6 +258,40 @@ const DOMAINS_API = query => {
 const BENCH = { generatedAt: Date.now() - 3 * 3600e3, counts: { total: 120, survivors: 40, eliminated: 80 }, coverage: 0.93,
     selected: [{ id: 'https://dns.example.org/dns-query', avgMs: 14.2, newItems: 12, reason: '涵蓋率最高', owner: 'Example_Org' }],
     pinned: [{ id: 'udp://1.1.1.1', avgMs: 12.4, coverageItems: 3, issues: [] }], blocked: [] };
+// 串接模式（3.4.0）：/__mock/chain?mode=chained（預設）/ released（上游不提供資料）/ off（這台的 chain 關、上游角色也關）切換
+const CHAIN_FP = '3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB';
+const CHAIN_SERVING_ON = { allowDownstream: true, text: '提供資料給下游黑潮：目前 2 台',
+    note: '區網裡任何會講這個協定的裝置都拿得到資料與放行；有啟用「繞過防護」清單時建議關閉 allow_downstream',
+    nodeId: '0f1e2d3c4b5a6978', fingerprint: '9C01-55E2-0A7B-31D4-8F6C-2E90-B135-7A42',
+    downstreams: [
+        { address: '192.168.1.2', nodeId: '1a2b3c4d5e6f7081', fingerprint: '7E44-0C19-D2A8-6B53-1F07-94CE-38A1-E560', version: '3.4.0', viaNat: false, names: 6, firstSeen: Date.now() - 20 * 3600e3, lastSeen: Date.now() - 60e3, expiresAt: Date.now() + 840e3 },
+        { address: '198.51.100.20', nodeId: '2b3c4d5e6f708192', fingerprint: '0B7D-4410-AA21-93C5-6E0F-1D88-C2A4-5B39', version: '3.4.0', viaNat: true, names: 2, firstSeen: Date.now() - 3 * 3600e3, lastSeen: Date.now() - 120e3, expiresAt: Date.now() + 780e3 }],
+    share: { ready: true, requests: 12, chunks: 30, lastAt: Date.now() - 600e3, cacheBytes: 81234 },
+    probes: { count24h: 0, lastAt: null }, refused: { rate: 0, notPrivate: 0, notAllowed: 0 } };
+const CHAIN_SERVING_OFF = Object.assign({}, CHAIN_SERVING_ON, { allowDownstream: false, note: null, downstreams: [],
+    text: '不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）；最近有下游黑潮來問過（3 分鐘前）',
+    share: { ready: false, requests: 0, chunks: 0, lastAt: null, cacheBytes: 0 }, probes: { count24h: 4, lastAt: Date.now() - 180e3 }, refused: { rate: 0, notPrivate: 0, notAllowed: 4 } });
+const CHAIN = {
+    chained: { enabled: true, state: 'chained', reason: null, text: '串接中：上游 192.168.1.1（黑潮 3.4.0），評測結果與 CDN 節點由上游提供',
+        upstream: { address: '192.168.1.1', proto: 'udp', via: 'gateway', version: '3.4.0', nodeId: 'a1b2c3d4e5f60718', fingerprint: CHAIN_FP, allowDownstream: true,
+            caps: ['share', 'reg'], path: ['a1b2c3d4e5f60718'], depth: 2, viaNat: false, since: Date.now() - 6 * 3600e3, lastOkAt: Date.now() - 30e3, failures: 0,
+            keyChangedAt: null, previousFingerprint: null, registered: { ok: true, at: Date.now() - 300e3, expiresAt: Date.now() + 600e3, names: 6 }, error: null },
+        backupActive: false, retryAt: null,
+        shared: { enabled: true, lastSyncAt: Date.now() - 1800e3, nextSyncAt: Date.now() + 5 * 3600e3, error: null,
+            objects: [{ kind: 'upstreams', at: Date.now() - 8 * 3600e3, bytes: 6624, importedAt: Date.now() - 1800e3, fresh: true, error: null },
+                { kind: 'cdn-pools', at: Date.now() - 7 * 3600e3, bytes: 71555, importedAt: Date.now() - 1799e3, fresh: true, error: null },
+                { kind: 'filter-copy', name: 'https://filter.example.net/list.txt', at: Date.now() - 9 * 3600e3, bytes: 412345, importedAt: null, fresh: false, error: 'no-room' }],
+            skippedJobs: ['dns-benchmark', 'cdn-pool', 'cdn-scan', 'cdn-ranges'] },
+        serving: CHAIN_SERVING_ON },
+    released: { enabled: true, state: 'released', reason: 'not-allowed', text: '上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路',
+        upstream: { address: '192.168.1.1', proto: 'udp', via: null, version: '3.4.0', nodeId: 'a1b2c3d4e5f60718', fingerprint: CHAIN_FP, allowDownstream: false, caps: [],
+            path: [], depth: 1, viaNat: null, since: null, lastOkAt: null, failures: 0, keyChangedAt: null, previousFingerprint: null, registered: null, error: null },
+        backupActive: false, retryAt: null, shared: null, serving: CHAIN_SERVING_OFF },
+    off: { enabled: false, state: 'none', reason: null, text: '已關閉串接（chain 關閉）：把上游黑潮當成一般的 DNS 攔截，自己做評測，會重複使用網路',
+        upstream: null, backupActive: false, retryAt: null, shared: null, serving: CHAIN_SERVING_OFF }
+};
+STATUS.chain = CHAIN.chained;
+STATUS.upstreams.unshift({ id: 'udp://192.168.1.1:53', type: 'udp', role: 'chain', ok: 300, fail: 0, avgMs: 2.1, reason: null, region: null, pathBlocked: false, via: null });
 STATUS.jobs = { config: { 'dns-benchmark': { at: ['04:10'] }, 'filter-update': { at: ['03:30'], weekdays: [1, 4] } }, state: { 'dns-benchmark': { lastCode: 0, lastEnd: Date.now() - 3600e3 } }, running: null };
 STATUS.stats.topDomains = [{ name: 'www.youtube.com', count: 812 }, { name: 'i.ytimg.com', count: 640 }];
 STATUS.stats.topBlocked = [{ name: 'googleads.g.doubleclick.net', count: 120 }];
@@ -448,6 +482,12 @@ http.createServer((req, res) => {
     // 給 luci-e2e.js（MOCK=1）讀結果
     // kuroshio action 呼叫紀錄（?since=N 只回第 N 筆之後的）
     if (url.pathname === '/__mock/calls') return send(200, MIME['.json'], JSON.stringify(calls.slice(+(url.searchParams.get('since') || 0))));
+    if (url.pathname === '/__mock/chain') {
+        const mode = url.searchParams.get('mode') || 'chained';
+        if (!CHAIN[mode]) return send(404, 'text/plain; charset=utf-8', 'mode: chained / released / off');
+        STATUS.chain = CHAIN[mode];
+        return send(200, 'text/plain; charset=utf-8', mode);
+    }
     if (url.pathname === '/__mock/uci') {
         const [c, sct, o] = (url.searchParams.get('key') || '').split('.');
         // 跟 uci 指令一樣支援 @type[i]（負數從後面算）

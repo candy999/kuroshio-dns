@@ -109,7 +109,7 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 | `upstreams` | array | 上游清單，每一筆 `{url, type, role, ok}` |
 | `upstreams[].url` | string | 上游網址（例如 `udp://192.0.2.53:53`、`https://dns.example.net/dns-query`） |
 | `upstreams[].type` | string | `udp` / `tcp` / `dot` / `doh` / `doh3` / `doq` / `dnscrypt` |
-| `upstreams[].role` | string | `pinned`（固定）/ `auto`（每日評測選出）/ `fallback`（備援） |
+| `upstreams[].role` | string | `pinned`（固定）/ `auto`（每日評測選出）/ `fallback`（備援）/ `lastResort`（最後手段）/ `chain`（串接中的上游黑潮，3.4.0 起，見下面「串接模式」） |
 | `upstreams[].ok` | bool | 沒有被暫停，而且不是「只失敗過、從沒成功」 |
 | `cache.entries` | number | 快取筆數 |
 | `cache.hitRate` | number \| null | 今天的快取命中率（0–1）；今天還沒有查詢是 `null` |
@@ -193,6 +193,8 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 | `kuroshio url [-c 設定檔] [--uci] [--open]` | 設定頁、公開頁的網址。要登入時印出含**一次性登入碼**的網址（`/login?code=…`，10 分鐘內、只能用一次；3.3.2 起），不含長期的 token。服務沒在執行時拿不到登入碼，改印說明 |
 | `kuroshio query <網域> -s <伺服器>` | 診斷查詢（類似 dig） |
 | `kuroshio check-path [-c 設定檔] [--uci] [--json]` | 路徑檢查（3.3.6 起）：立刻檢查這台機器到網際網路的路上有沒有人動手腳，印出結果。不需要服務在跑；見下面「路徑檢查」 |
+| `kuroshio chain status [-c 設定檔] [--uci] [--json]` | 串接狀態（3.4.0 起，同 `GET /api/chain`）；見下面「串接模式」 |
+| `kuroshio chain recheck [-c 設定檔] [--uci]` | 立刻重新做一次路徑檢查與串接探測（背景進行，同 `POST /api/chain/recheck`） |
 
 ## 訊號（只有 Unix；Windows 沒有）
 
@@ -222,6 +224,7 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 | `KUROSHIO_ACCESS_HOOK` | 每月的台灣 IP 清單更新換上之後執行這個程式，參數是 `apply`（OpenWrt 用它重新產生 nftables 規則） |
 | `KUROSHIO_ON_CONFIG_WRITE` | 黑潮 DNS 寫入**設定目錄**之後執行的指令（`sh -c`；Windows 是 `cmd /C`），見下面「寫入設定後的外部指令」 |
 | `NO_COLOR` | 有設定（任何值）就不輸出 ANSI 色碼（日誌交給 syslog、檔案時用） |
+| `KUROSHIO_PATH_TARGETS`、`KUROSHIO_CHAIN_TIMING` | **只給整合測試用，不是穩定介面**，以後可能改名或拿掉。前者把路徑檢查的保留位址、閘道換成本機的假伺服器；後者縮短串接的心跳與重試時間（JSON，毫秒）。正式環境不要設定 |
 
 `KUROSHIO_LOG` 沒設定時，QUIC 函式庫（`quinn_proto`）只記錯誤：它的警告（例如某些伺服器造成的 `duplicate reset token`，每十幾秒一行）跟查詢結果無關，會洗掉路由器很小的 syslog。要看的話設定 `KUROSHIO_LOG=info,quinn_proto=warn`。
 
@@ -295,8 +298,9 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 | `fmtTime(t, mode, tzOffsetMin)` | 日期時間固定格式：`2026-11-12 10:22`；`mode` = `'sec'`（加秒）、`'date'`、`'time'`、`'timesec'`。`t` 是毫秒、毫秒字串或 ISO 字串，空的回 `-`。`tzOffsetMin` 指定時區（UTC 往東幾分鐘，台灣 = 480），不給 = 瀏覽器的本地時區 |
 | `fmtBytes(b)` | `1023 B`、`12 KB`、`1.5 MB` |
 | `certCovers(info, domain)` | 憑證（`san` = `DNS:a.example.com, DNS:*.example.net`）有沒有涵蓋這個網域，含萬用字元 |
-| `restorePlan(cur, defs, removeOwn)` | 「恢復預設清單」：比對目前的過濾清單與預設清單（先比網址、再比名稱），回傳新的順序 `result` 與變更 `changes`（新增、移除、網址、啟用、其他、保留、順序、`count`） |
+| `restorePlan(cur, defs, removeOwn)` | 「恢復預設清單」：比對目前的過濾清單與預設清單（先比網址、再比名稱），回傳新的順序 `result` 與變更 `changes`（新增、移除、網址、啟用、其他、保留、順序、`count`）。名稱、分類、保護、繞過防護（`bypass`，3.4.0 起）不同都算「其他」 |
 | `restoreSummary(changes, tr)` | 把 `changes` 變成要顯示的文字：`{ empty, blocks: [{ cls, title, items }] }`，畫面自己組；`tr` 是翻譯函式（可省略） |
+| `chainView(chain, tr, now)` | 3.4.0 起：`/api/status` 的 `chain` → 狀態頁顯示用的資料 `{ down, up }`（各有 `badge`、`text`、`warn`、`rows: [{ label, value }]`；`down` 另有 `objects`、`skipped`，`up` 另有 `note`、`downstreams`）。主要的句子照 API 原樣；`now` 用來判斷公鑰是不是 24 小時內換過（可省略） |
 | `format(template, args)` | `%s` / `%d` 代換 |
 
 - 也可以在 Node 用 `require('data/shared/ui-core.js')`（有 `module.exports`）。語法是 ES5，舊瀏覽器也能用。
@@ -348,7 +352,9 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 
 還沒檢查過時只有 `enabled`、`policy`、`checkedAt: null`、`ipv6`、`warnings: []`。有狀況時同樣的白話提醒也會放進 `/api/status` 的 `warnings`。
 
-`/api/status` 的 `upstreams[]` 多了：`reason`（每日評測選上的原因：最快、覆蓋）、`pathBlocked`（路徑檢查判斷現在不能用）、`via`（`"interceptor"`：一般 DNS 而且路上有攔截者）。
+`/api/status` 的 `upstreams[]` 多了：`reason`（每日評測選上的原因：最快、覆蓋）、`pathBlocked`（路徑檢查判斷現在不能用）、`via`（`"interceptor"`：一般 DNS 而且路上有攔截者）。3.4.0 起再多 `region`（上游所在地區，見下面「上游多樣性」），`role` 多一種 `chain`。
+
+3.4.0 起，攔截者是黑潮時 `network.path.interceptor` 多一個 `chain`（串接探測的結果；還沒探測過、或這台的 `chain` 關著是 `null`），`kuroshio check-path` 也多一行，見下面「串接模式」。
 
 每日評測的 `upstreams.json` 多了 `path`（評測當時的路徑檢查結果，同上的格式加 `policy`）與 `pathSkipped`（依路徑檢查略過的候選數：`plain-intercepted`、`ipv6-unavailable`、`blocked-dot`、`blocked-doh`、`blocked-quic`）。依路徑略過的候選不記可疑、不進黑名單。
 
@@ -373,6 +379,223 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 - 每次排程檢查（30 秒）重新看時鐘，不先算好要等多久：開機時還沒對時也不會算錯。
 - `/api/jobs` 多了 `catchUpWindow`（設定的時段，沒設是 `null`）與 `catchUpWaiting`（正在等時段的工作名稱）；LuCI 與設定頁的排程工作表顯示「等補跑時段（01:00-06:00）」。
 
+## 串接模式（3.4.0 起）
+
+兩台黑潮接在一起（例如 D3 接在另一台跑黑潮、而且積極劫持 53 埠的主路由器後面）：下游自動認出上游黑潮、驗證身分、把它當第一順位的上游，並直接拿上游算好的評測結果與 CDN 節點池，不用自己再做一次。**不用任何設定，也沒有同意或核准的步驟。**
+
+### 兩個開關
+
+只有兩個，都在 `config upstream 'upstream'`（JSON 在 `upstream`），預設都開。**兩邊都開才會通訊**，任一邊關掉就各做各的，行為跟 3.3.7 一樣。
+
+| UCI | JSON | 預設 | 角色 | 意思 |
+|---|---|---|---|---|
+| `chain` | `chain` | `1` / `true` | 下游 | 要不要辨識上游黑潮並索取需要的資料。關掉：上游是黑潮時，這台會自己重做評測、CDN 掃描、下載清單，重複使用網路 |
+| `allow_downstream` | `allowDownstream` | `1` / `true` | 上游 | 要不要提供資料給下游黑潮。關掉：下游會重複做評測、CDN 掃描、下載清單，浪費網路（含這台的頻寬）。開著時區網裡任何會講這個協定的裝置都拿得到資料與放行；有啟用「繞過防護」清單、要管住區網裝置的環境請關掉 |
+
+兩個都是布林；也接受字串 `"1"` / `"0"` / `"on"` / `"off"` / `"true"` / `"false"` / `"yes"` / `"no"` 與數字（0 = 關）。其他寫法當成預設值（開）並記一行警告。
+
+| 下游 `chain` | 上游 `allow_downstream` | 結果 |
+|---|---|---|
+| 開 | 開 | 串接、登記、共用結果 |
+| 開 | 關 | 下游探測一次（之後每次路徑檢查再探測一次），知道上游不提供，自己算 |
+| 關 | 開或關 | 下游不發任何串接查詢；上游看不出下游是黑潮 |
+
+上游掛掉時，下游幾秒內改回自己的加密上游；上游回來後自動接回（固定行為，沒有開關）。
+
+### 怎麼運作（整合者需要知道的部分）
+
+- 通道是一般 DNS 的 CHAOS TXT（`chain.kuroshio` 底下），只在路徑檢查發現「一般 DNS 被上游的黑潮接走」時才用。上游只回答區網（私有）來源的 UDP / TCP 53，其他一律 `REFUSED`。
+- 身分用節點金鑰的簽章驗證（跟社群共用同一把金鑰，放在 `community.dir`，預設是設定目錄的 `community/`）。金鑰第一次需要時才建立，所以剛裝好、還沒有下游來問時，上游角色的指紋是 `null`。
+- 上游換了金鑰（重新安裝、換機器）：下游自動改綁新的金鑰，`/api/status` 的 `warnings` 留一行提醒 24 小時，狀態頁顯示新舊指紋。
+- 最多 4 層（A ← B ← C ← D）；會形成迴圈時不串接。
+- 串接狀態跨重新載入（SIGHUP、設定頁存檔）保留，不跨重開機。`kuroshio notify wan-changed` 會先離開串接，路徑檢查後自動接回。
+
+### 相容性
+
+| 下游 | 上游 | 行為 |
+|---|---|---|
+| 3.4.0 | 3.4.0 | 完整功能 |
+| 3.4.0 | 3.3.6 / 3.3.7 | 認出是舊版（`upstream-too-old`），不發任何串接查詢，跟 3.3.7 的下游一樣 |
+| 3.4.0 | 3.3.5 以前、不是黑潮 | `none`（沒有偵測到上游黑潮） |
+| 3.3.x | 3.4.0 | 下游不會問；上游的 `version.kuroshio` 回答格式不變 |
+
+管理 API 版本（`api`）不變，只有新增欄位與路徑。
+
+### 共用結果與略過的工作
+
+串接中，下游每隔幾小時向上游拿一次共用結果（有簽章，路上的人改不了；匯入前還會檢查格式與範圍）：
+
+| 種類（`kind`） | 內容 | 新鮮時略過的工作 |
+|---|---|---|
+| `upstreams` | 每日評測的結果 | `dns-benchmark` |
+| `cdn-pools`、`cdn-v6` | 台灣節點池 | `cdn-pool`、`cdn-scan` |
+| `cdn-ranges` | CDN 官方範圍 | `cdn-ranges` |
+| `filter-copy` | 過濾清單副本（只有上游有留副本、網址相同、下游也留得下副本的清單） | （清單照原本的更新排程，改向上游拿） |
+
+- 「新鮮」＝ 36 小時內成功匯入過，而且現在是串接中。略過時日誌寫「由上游黑潮提供，略過」（`dns-benchmark` 在 `/api/jobs` 的 `detail.dns-benchmark.last.skipped` 也有）。
+- 不新鮮（上游沒資料、驗證失敗、36 小時沒同步成功、串接解除、`chain` 關著）時，工作照原本的排程自己跑，跟 3.3.7 一樣。匯入的資料不刪，解除後繼續用，直到自己的工作算出新的。
+- 狀態記在快照目錄的 `chain-share.json`（幾百 bytes）。`/api/status` 的 `autoUpstreams.source` 是 `"chain"`（上游給的）或 `"benchmark"`（自己評測的）。
+
+### 上游放行下游
+
+`allow_downstream` 開著時，登記過的下游（15 分鐘到期、自動續約）另外得到兩件事：
+
+- 下游的來源位址通過連線來源限制（`access`）。這只對「來源是公網位址的下游」有差別，私有位址本來就允許；`access.deny` 仍然優先。下游在另一台 NAT 後面時放行的是那台 NAT 的位址，狀態頁標「經 NAT」。
+- 標成 `bypass`（繞過防護）的清單不擋下游解析**它自己登記的上游主機名稱**（例如它的 DoT 上游）。其他清單、自訂規則照擋；其他用戶端照擋。
+
+UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: true`。預設只有 HaGeZi 的 `doh-vpn-proxy-bypass` 帶這個標記（這份清單預設停用）。
+
+### 狀態欄位
+
+`/api/status` 新增頂層 `chain`（下游與上游兩種角色都在這裡），`GET /api/chain` 回同一個物件：
+
+```json
+"chain": {
+  "enabled": true,
+  "state": "chained", "reason": null,
+  "text": "串接中：上游 192.168.1.1（黑潮 3.4.0），評測結果與 CDN 節點由上游提供",
+  "upstream": {
+    "address": "192.168.1.1", "proto": "udp", "via": "gateway",
+    "version": "3.4.0", "nodeId": "a1b2c3d4e5f60718",
+    "fingerprint": "3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB",
+    "allowDownstream": true, "caps": ["share", "reg"],
+    "path": ["a1b2c3d4e5f60718"], "depth": 2, "viaNat": false,
+    "since": 1795000000000, "lastOkAt": 1795000300000, "failures": 0,
+    "keyChangedAt": null, "previousFingerprint": null,
+    "registered": { "ok": true, "at": 1795000300000, "expiresAt": 1795001200000, "names": 6 },
+    "error": null
+  },
+  "backupActive": false,
+  "retryAt": null,
+  "shared": {
+    "enabled": true, "lastSyncAt": 1795000500000, "nextSyncAt": 1795022100000, "error": null,
+    "objects": [
+      { "kind": "upstreams", "at": 1794990000000, "bytes": 6624, "importedAt": 1795000500000, "fresh": true, "error": null },
+      { "kind": "filter-copy", "name": "https://filter.example.net/list.txt", "at": 1794980000000, "bytes": 412345, "importedAt": null, "fresh": false, "error": "no-room" }
+    ],
+    "skippedJobs": ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"]
+  },
+  "serving": {
+    "allowDownstream": true,
+    "text": "提供資料給下游黑潮：目前 1 台",
+    "note": "區網裡任何會講這個協定的裝置都拿得到資料與放行；有啟用「繞過防護」清單時建議關閉 allow_downstream",
+    "nodeId": "0f1e2d3c4b5a6978", "fingerprint": "9C01-55E2-0A7B-31D4-8F6C-2E90-B135-7A42",
+    "downstreams": [
+      { "address": "192.168.1.2", "nodeId": "1a2b3c4d5e6f7081", "fingerprint": "7E44-0C19-D2A8-6B53-1F07-94CE-38A1-E560",
+        "version": "3.4.0", "viaNat": false, "names": 6,
+        "firstSeen": 1794990000000, "lastSeen": 1795000300000, "expiresAt": 1795001200000 }
+    ],
+    "share": { "ready": true, "requests": 12, "chunks": 30, "lastAt": 1795000500000, "cacheBytes": 81234 },
+    "probes": { "count24h": 0, "lastAt": null },
+    "refused": { "rate": 0, "notPrivate": 0, "notAllowed": 0 }
+  }
+}
+```
+
+（時間都是 Unix 毫秒。）
+
+| 欄位 | 說明 |
+|---|---|
+| `enabled` | 這台的 `chain` 開關 |
+| `state` | `none`（沒有偵測到）/ `detected`（偵測到，驗證中）/ `verifying`（做最後確認）/ `chained`（串接中）/ `released`（偵測到但沒有串接，原因在 `reason`） |
+| `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案） |
+| `text` | 給狀態頁直接顯示的一行白話，每一種情況都寫出原因與影響（例如「上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路」）。文字內容不是約定；請整句顯示，不要截斷或自己拼 |
+| `upstream` | 探測到的上游（沒探測過、或 `chain` 關著是 `null`）。`via`：`gateway`（上游就是預設閘道）/ `intercept`（經攔截，`address` 是被轉走的保留位址，`text` 寫閘道並加註「經攔截」）；`depth` 是含這台的層數；`viaNat`：上游看到的來源不是這台（中間隔了 NAT） |
+| `backupActive` | 串接上游暫時不能用，正在用自己的加密上游 |
+| `retryAt` | `released` 時下一次重試的時間 |
+| `shared` | 共用結果（沒有串接是 `null`）。`error` 與 `objects[].error` 是代碼，例如 `memory`（記憶體不夠，這次沒同步）、`no-room`（留不下清單副本）、`not-subscribed`、`newer-format` |
+| `serving` | 上游角色（服務還沒啟動完成時是 `null`）。`text` 開著時是「提供資料給下游黑潮：目前 N 台」或「…目前沒有下游連上來」；關著時是「不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）」，24 小時內有下游來問過時接著寫「最近有下游黑潮來問過（…）」。`note` 只有開著時有。`probes` 是 `allow_downstream` 關著時收到的探測；`refused` 是拒絕的串接查詢（太頻繁、不是私有來源、沒有開放） |
+
+`chain` 關著而且服務還沒準備好上游角色時，`chain` 仍然是完整的物件（`enabled: false`、`state: "none"`、其他欄位 `null`）。
+
+`network.path.interceptor.chain`（攔截者是黑潮時的探測結果）：
+
+```json
+"interceptor": {
+  "kind": "kuroshio", "version": "3.4.0",
+  "chain": { "supported": true, "allowDownstream": true, "nodeId": "a1b2c3d4e5f60718",
+             "fingerprint": "3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB", "caps": ["share", "reg"], "error": null }
+}
+```
+
+串接中時 `upstreams[]` 第一筆是 `role: "chain"` 的上游黑潮；`warnings` 不列「一般 DNS 被接走」那一條（被接走正是串接的前提）。
+
+### 管理 API 與指令
+
+| 路徑 | 說明 |
+|---|---|
+| `GET /api/chain` | 同 `/api/status` 的 `chain` |
+| `POST /api/chain/recheck` | 立刻做一次路徑檢查與串接探測（背景進行），回 `{"ok":true,"started":true}`；路徑檢查關著（`upstream.pathCheck: false`）回 HTTP 400 |
+
+兩個都要登入（跟其他管理 API 一樣）。`kuroshio chain status`（`--json` 印出同樣的 JSON）與 `kuroshio chain recheck` 是包一層管理 API，結束碼：`0` 成功、`1` 服務沒有回應或拒絕、`2` 設定讀不到。
+
+`kuroshio check-path`（不需要服務在跑）在攔截者是黑潮時，「攔截者」那一行下面多一行：
+
+```
+  串接：上游允許串接，提供資料給下游（節點指紋 3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB）
+```
+
+其他情形：`上游不提供資料（上游的 allow_downstream 關閉）：這台會自己做評測，重複使用網路`、`上游黑潮 3.3.7 不支援串接（需要 3.4.0 以上）`、`上游沒有回應串接查詢`、`上游的身分驗證失敗：…`、`這台的 chain 關閉：不辨識上游黑潮`（這時不發探測）。`--json` 的 `interceptor.chain` 同上。
+
+### 狀態頁
+
+LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角色與上游角色兩部分一定都顯示，主要的句子直接用 `text`、`serving.text`、`serving.note`，沒有任何要按的按鈕。自己做管理頁面時可以用 `data/shared/ui-core.js` 的 `chainView(chain, tr, now)` 把這個物件整理成「標籤：值」（見上面「網頁共用檔」）。
+
+## 並行數與背景補問（3.4.0 起）
+
+`resolver.parallel` 是 `auto`（預設）時，同時問幾台上游依 CPU 決定：
+
+| 條件 | 同時問幾台 |
+|---|---|
+| 沒有 AES 指令（MIPS、ARMv7、RISC-V 一律當成沒有） | 2（不管幾核心） |
+| 有 AES，1 核心 | 2 |
+| 有 AES，2 核心 | 3 |
+| 有 AES，3 核心以上 | 全部 |
+
+填了數字一律照填的（`0` ＝ 全部）。`kuroshio sysinfo` 與啟動記錄會寫原因。
+
+只問一部分上游時，回答用戶端之後（**不增加等待**）在背景補問這次沒問到的上游，把結果合併後更新快取：
+
+- CDN 相關的查詢（答案裡有位址屬於某家 CDN）一定補問；其他 A / AAAA 查詢每 `backfillSample` 次抽一次，比對「前面說有、補問的多數說沒有」（或反過來）的情形。
+- 不補問：DNSSEC（DO）與不是 IN 類別的查詢、串接中（只有一台上游）、所有上游都問過了、記憶體吃緊、同時已經有 2 個（1～2 核心）或 4 個補問在跑（超過就跳過，不排隊）。
+
+| UCI（`config resolver 'resolver'`） | JSON | 預設 | 說明 |
+|---|---|---|---|
+| `backfill` | `resolver.backfill` | `cdn` | `cdn`：上面的行為；`off`（或 `0` / `false`）：不補問（3.3.7 的行為） |
+| `backfill_sample` | `resolver.backfillSample` | `16` | 非 CDN 查詢每幾次抽一次；`0` ＝ 不抽樣 |
+
+`/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。
+
+## 上游多樣性（3.4.0 起）
+
+每日評測選「覆蓋」上游時，先在鄰近（台灣、日本、香港、新加坡，或延遲夠低）的候選裡選；名額還有、覆蓋率還不夠才選遠的。這樣 CDN 回的節點比較常在亞洲。
+
+| UCI（`config benchmark 'benchmark'`） | JSON | 預設 | 說明 |
+|---|---|---|---|
+| `coverage_region` | `benchmark.coverageRegion` | `near` | `near`：上面的做法；`any`：不分遠近（3.3.7 的行為） |
+| `near_max_ms` | `benchmark.nearMaxMs` | `60` | 最低延遲在這以內就算鄰近（不管國別；任播位址靠這個判斷）。國別在鄰近四地時放寬到 2 倍 |
+
+地區：位址在 `tw-ip.json` 裡是 `TW`，否則用 ip-api 給的國別，都沒有是空的。輸出：
+
+- `upstreams.json` 的 `selected[]` 每筆多 `region` 與 `near`；`final_dns_smart.csv` 最後多 `Region`、`Near` 兩欄（舊的欄位順序不變）。
+- `/api/status` 的 `upstreams[]` 多 `region`（沒有是 `null`）。狀態頁顯示在選上原因的旁邊，例如「自動（覆蓋 · JP）」。
+
+## 重新載入不斷線（3.4.0 起）
+
+重新載入設定（SIGHUP、設定頁存檔）時，舊的一輪要完全結束才建新的一輪，中間有 0.2～0.4 秒沒有人在聽。3.4.0 起監聽 socket 留在程式裡，不跟著舊的一輪關掉：
+
+- 一般 DNS（UDP / TCP 53）、DoT 與 DoH 的 TCP、DoQ 與 DoH3 的 UDP 在空窗期間不會 Connection refused；用戶端看到的是零點幾秒的延遲。
+- 設定改了位址、埠或關掉某個協定時，舊的監聽等新的一輪啟動完成後才關掉。新設定啟動不了時，服務照舊用上一份設定，監聽不受影響。
+- 已經被舊的一輪讀走、還沒回答的 UDP 查詢會掉（用戶端會重送）；進行中的 QUIC 連線照舊會斷。
+- 整合者不用改什麼：`kill -HUP` 與 procd 的 reload 照舊。
+
+## 已知限制（3.4.0）
+
+- **串接的一般 DNS 通道每筆查詢沒有驗證**：身分只在建立串接與心跳時驗證。區網裡能接走下游 53 埠的攻擊者（例如 ARP 欺騙、假 DHCP）可以讓下游把它當上游，之後的查詢都經過它。路徑檢查每 6 小時（與 WAN 變動時）檢查竄改，發現就解除。不信任所在的區網就關掉這台的 `chain`。
+- **區網裝置可以自己架一個「下游」，繞過「繞過防護」清單**：上游不逐台核准，任何會講這個協定的裝置都能登記，它登記的主機名稱不會被 `bypass` 清單擋（已決定接受）。啟用「繞過防護」清單、要管住區網裝置的環境，請關掉上游的 `allow_downstream`。
+- **規則重疊時，bypass 豁免可能連帶蓋掉另一份清單的同一條規則**：同一個網域同時在 `bypass` 清單與其他清單裡、而且命中時記到的是 `bypass` 那份時，對登記中的下游可能整筆放行。只影響登記中的下游，而且只限它登記的主機名稱。
+- **管理 API 重新載入時仍有短暫空窗**：重新載入不斷線只涵蓋 DNS 監聽；設定頁與管理 API 在那零點幾秒可能連不上，重試就好。
+
 ## 小記憶體的機器（128 MB 以下）
 
 黑潮 DNS 不依記憶體分等級，**不需要手動設定大小**：
@@ -384,6 +607,7 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 - 背景工作在記憶體吃緊時延後、執行中的會暫停（每日評測、CDN 的範圍 / 網段分類 / 節點池都一樣）。每日評測（dns-benchmark）同時只測 `benchmark.concurrency` 個候選（`auto` = 每核心 8 個，8–50），也不超過「可用記憶體扣掉保留量的 1/4 ÷ 512 KB（3.3.3 起；以前是 128 KB）」；每個候選測完就關閉連線，暫停時先關閉手上的連線。
 - 各結構目前的用量在 `/api/status` 的 `memory.sizes`（`cacheBytes`、`cdnBytes`、`filterListsBytes` 等，都是估計值）。背景工作在 `memory.jobs`：`{"running":執行中的工作 | null,"rawBytes":每日評測手上的原始答案（估計）,"openConnections":每日評測開著的連線,"processRssBytes":評測子程序目前的實體記憶體,"processPeakRssBytes":評測子程序的最高值,"lastBenchmark":{"finishedAt":Unix 毫秒,"ok":true,"durationSec":秒,"processPeakRssBytes":上一次評測子程序的最高值}}`（`lastBenchmark` 在評測結束後也查得到，服務重新啟動前一直留著），工作結束後回到 `null` / `0`（資格賽階段也有連線數；3.3.3 起）。
 - **每日評測在子程序裡跑**（3.3.3 起）：同一個執行檔的隱藏指令，結束時記憶體全部還給系統，主程式的 RSS 不會停在評測的高點（以前會因為記憶體碎片多留 20 MB 左右）。日誌照樣出現在主程式的日誌裡，結束時記一行「評測子程序結束，記憶體最高 X MB」。進行中 `ps` 會多看到一個 `kuroshio __job-dns-benchmark`；服務管理程式只要管主程式（主程式結束時子程序會跟著結束）。不想要子程序時設 `benchmark.subprocess: false`。
+- **串接的共用結果**（3.4.0 起）：下游一次只處理一個物件，非過濾類的尖峰約 3 MiB，處理完就釋放；過濾清單副本（壓縮後最多 8 MiB）只在留得下副本、記憶體狀態正常時才抓，小 Flash 的機器照舊自己下載。上游的共用快取最多 1 MiB，30 分鐘沒人用就釋放。串接中的下游不跑每日評測與 CDN 掃描，尖峰反而比較低。
 - **`kuroshio memory-plan`**（3.3.3 起）：用跟執行時同一套規則推算這台機器（或 `--ram 64 128` 指定的大小、`--bits 32` 指定 32 位元）的保留量、常駐用量、會載入哪些清單、每日評測同時測幾個、會不會暫停；`--json` 給程式用。常數是實測推算的，輸出裡有列出來。
 
 真的要限制時可以調的設定：
@@ -403,7 +627,7 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 - **停止**送 `SIGTERM`，等至少 15 秒。不要直接 `SIGKILL`：還沒寫出的學習資料（快照）會遺失。
 - **斷電前**（例如 UPS 通知）送 `SIGUSR1`，或執行 `kuroshio notify save`（Windows 只能用這個），先把快照寫出。
 - **WAN 變動**時執行 `kuroshio notify wan-changed`（也會重新做路徑檢查）。
-- **多台路由器串在一起**（例如 D3 接在另一台跑黑潮的主路由器後面）：不用特別設定。下游的路徑檢查會認出「一般 DNS 被上游的黑潮接走」，評測只測加密 DNS；上游路由器把 IPv6 關掉時，下游可以帶 `upstream.ipv6 0`。
+- **多台路由器串在一起**（例如 D3 接在另一台跑黑潮的主路由器後面）：不用特別設定。下游的路徑檢查會認出「一般 DNS 被上游的黑潮接走」；兩台都是 3.4.0 以上時自動串接（見上面「串接模式」），否則評測只測加密 DNS；上游路由器把 IPv6 關掉時，下游可以帶 `upstream.ipv6 0`。
 - **要做很佔記憶體的事之前**（韌體更新把映像檔寫進 tmpfs、解壓縮大檔案）執行 `kuroshio notify trim`。沒有 PSI 的舊核心（例如 Linux 4.4）只能輪詢可用記憶體，突然的大量配置可能來不及讓出；黑潮 DNS 的 `oom_score_adj` 是 -500，來不及時被核心結束的會是別的程式。
 - **設定放在記憶體**（要另外存進 Flash）的韌體：設定 `KUROSHIO_ON_CONFIG_WRITE`。
 - **容器**：把設定檔與快照目錄放在掛載的磁碟區（例如 `/config/config.json`、`system.persistDir: "/config/state"`），用 `KUROSHIO_INIT_CONFIG` 提供第一次啟動的預設設定，`KUROSHIO_SHARE` 指向映像裡的 data/。
