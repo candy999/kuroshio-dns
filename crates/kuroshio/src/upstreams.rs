@@ -42,6 +42,8 @@ pub struct Up {
     pub up: Upstream,
     pub role: Role,
     stats: Mutex<Stats>,
+    /// 每日評測選上的原因（最快、覆蓋）
+    reason: Mutex<Option<String>>,
 }
 
 impl Up {
@@ -50,7 +52,33 @@ impl Up {
             up,
             role,
             stats: Mutex::new(Stats::default()),
+            reason: Mutex::new(None),
         })
+    }
+
+    /// 路徑檢查（3.3.6）判斷現在不能用：協定整條被擋、IPv6 位址但這台沒有 IPv6
+    pub fn path_blocked(&self) -> bool {
+        use kuroshio_net::path::{self, Proto};
+        let proto = match self.up.kind {
+            Kind::Dot => Some(Proto::Dot),
+            Kind::Doh => Some(Proto::Doh),
+            Kind::Doq | Kind::Doh3 => Some(Proto::Quic),
+            _ => None,
+        };
+        if proto.is_some_and(path::blocked) {
+            return true;
+        }
+        matches!(self.up.host.parse::<std::net::IpAddr>(), Ok(ip) if !path::addr_usable(ip))
+    }
+
+    /// 一般 DNS 而且路上有攔截者：實際回答的是攔截者，不是這台
+    pub fn via_interceptor(&self) -> bool {
+        is_plain(self.up.kind)
+            && self
+                .up
+                .host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(kuroshio_net::path::plain_intercepted_for)
     }
 
     fn paused(&self, now: Instant) -> bool {
@@ -94,6 +122,10 @@ impl Up {
             "ok": s.ok, "fail": s.fail,
             "avgMs": s.ewma.map(|e| (e * 10.0).round() / 10.0),
             "paused": s.open_until.map(|t| t > Instant::now()).unwrap_or(false),
+            // 3.3.6：選上的原因、路徑檢查判斷不能用、經由攔截者（一般 DNS 被接走時）
+            "reason": self.reason.lock().unwrap().clone(),
+            "pathBlocked": self.path_blocked(),
+            "via": if self.via_interceptor() { Value::from("interceptor") } else { Value::Null },
         })
     }
 }
@@ -218,12 +250,13 @@ impl Manager {
             if pinned.contains(&u.id.as_str()) || !u.supported() {
                 continue;
             }
-            list.push(
-                old.iter()
-                    .find(|o| o.up.id == u.id)
-                    .cloned()
-                    .unwrap_or_else(|| Up::new(u, Role::Auto)),
-            );
+            let up = old
+                .iter()
+                .find(|o| o.up.id == u.id)
+                .cloned()
+                .unwrap_or_else(|| Up::new(u, Role::Auto));
+            *up.reason.lock().unwrap() = s.get("reason").and_then(Value::as_str).map(str::to_string);
+            list.push(up);
             if list.len() >= self.auto_max {
                 break;
             }
@@ -246,7 +279,16 @@ impl Manager {
     pub fn active(&self) -> Vec<Arc<Up>> {
         let now = Instant::now();
         let mut list: Vec<Arc<Up>> = self.pinned.clone();
-        list.extend(self.auto.read().unwrap().list.iter().filter(|u| !u.paused(now)).cloned());
+        // 路徑檢查判斷不能用的（協定被擋、沒有 IPv6）先不用；路恢復了（下一次檢查）自動加回
+        list.extend(
+            self.auto
+                .read()
+                .unwrap()
+                .list
+                .iter()
+                .filter(|u| !u.paused(now) && !u.path_blocked())
+                .cloned(),
+        );
         select_active(list, &self.fallback, &self.last_resort, crate::clock::synced())
     }
 

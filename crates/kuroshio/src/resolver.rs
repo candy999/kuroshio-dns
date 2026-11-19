@@ -178,6 +178,20 @@ pub struct Resolver {
     errors: Mutex<(u64, Vec<(u64, String)>)>,
 }
 
+/// 區網 / 本機的用戶端（`version.kuroshio` 只回答這些）
+fn is_private_client(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_private() || v.is_loopback() || v.is_link_local() || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments()[0];
+            v.is_loopback() || (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 pub struct Ctx {
     pub proto: &'static str,
     pub client: IpAddr,
@@ -391,6 +405,25 @@ impl Resolver {
         let qname = normalize(&q.name);
         let (qtype, qclass) = (q.qtype, q.qclass);
 
+        // 路徑檢查（3.3.6）：下游的黑潮用 CHAOS TXT version.kuroshio 認出「一般 DNS 被上游的黑潮接走」。
+        // 只回答區網的一般 DNS（公開的 DoH / DoT 不透露版本）
+        if qclass == 3 && qname == "version.kuroshio" && matches!(ctx.proto, "udp" | "tcp") && is_private_client(ctx.client) {
+            self.stats.count(StatKind::Local);
+            let mut r = Message::response_to(&query, 0);
+            if qtype == 16 || qtype == 255 {
+                let v = format!("kuroshio/{}", env!("CARGO_PKG_VERSION"));
+                let mut b = vec![v.len() as u8];
+                b.extend_from_slice(v.as_bytes());
+                r.answers.push(Record {
+                    name: q.name.clone(),
+                    rtype: 16,
+                    class: 3,
+                    ttl: 0,
+                    data: RData::Raw(b),
+                });
+            }
+            return msg(r);
+        }
         if qclass == 1 && (qname == "_dns.resolver.arpa" || qname == "resolver.arpa") {
             self.stats.count(StatKind::Local);
             return msg(if qtype == rtype::SVCB && qname.starts_with('_') {
@@ -892,6 +925,15 @@ impl Drop for InflightGuard<'_> {
 
 /// 從多個上游結果決定答案（同 2.x）：有正常回應取最快的；否則 nodata / nxdomain 多數決（平手以固定上游為準）
 fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_cdn::Cdn>, qtype: u16) -> Option<Decided> {
+    // 一般 DNS 被路上的攔截者接走時（路徑檢查，3.3.6），它們的回答其實是攔截者給的：
+    // 有其他上游的回答時，不拿來合併 IP、也不參加多數決
+    let independent: Vec<Arc<Answer>>;
+    let results = if results.iter().any(|r| r.up.via_interceptor()) && results.iter().any(|r| !r.up.via_interceptor()) {
+        independent = results.iter().filter(|r| !r.up.via_interceptor()).cloned().collect();
+        &independent[..]
+    } else {
+        results
+    };
     let by = |c: Class| -> Vec<Arc<Answer>> { results.iter().filter(|r| r.class == c).cloned().collect() };
     let mut oks = by(Class::Ok);
     // 固定上游換過的 CDN IP（沒針對這個網站驗證過）：其他上游有給答案時從合併名單拿掉

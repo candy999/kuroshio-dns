@@ -532,3 +532,33 @@ async fn non_query_opcode_and_unknown_edns_version() {
     assert!(m.answers.is_empty());
     assert_eq!(n.load(Ordering::SeqCst), 0, "都不該問上游");
 }
+
+/// 3.3.6：下游的路徑檢查用 CHAOS TXT version.kuroshio 認出上游的黑潮；只回答區網的一般 DNS，不轉給上游
+#[tokio::test]
+async fn answers_version_kuroshio_to_lan_plain_dns_only() {
+    let (up, n) = upstream(0, answer).await;
+    let r = kuroshio::app::build_resolver(&cfg(&[up], json!({}))).unwrap();
+    let query = kuroshio_net::path::build_chaos_txt(9, "version.kuroshio");
+    let lan = Ctx {
+        proto: "udp",
+        client: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+    };
+    let m = Message::parse(&r.handle(&query, &lan).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 0);
+    let RData::Raw(b) = &m.answers[0].data else {
+        panic!("{:?}", m.answers)
+    };
+    assert_eq!(String::from_utf8_lossy(&b[1..]), format!("kuroshio/{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(m.answers[0].class, 3);
+    assert_eq!(n.load(Ordering::SeqCst), 0, "不轉給上游");
+    // 公開的 DoH 不回答版本（照一般 CHAOS 查詢處理）
+    let public = Ctx {
+        proto: "doh",
+        client: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+    };
+    let m = Message::parse(&r.handle(&query, &public).await.unwrap()).unwrap();
+    assert!(m
+        .answers
+        .iter()
+        .all(|a| a.class != 3 || !matches!(&a.data, RData::Raw(b) if b.starts_with(b"\x0ekuroshio/"))));
+}

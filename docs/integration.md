@@ -140,7 +140,7 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 
 | 事件 | 服務會做什麼 |
 |---|---|
-| `wan-changed` | WAN 變了（重新撥號、換 IP、換線路）：DDNS 立即檢查並更新（等同設定頁的「立即更新」）、重新偵測對外 IP（問上游時帶的 ECS 子網路）。都在背景進行，指令立刻回來 |
+| `wan-changed` | WAN 變了（重新撥號、換 IP、換線路）：DDNS 立即檢查並更新（等同設定頁的「立即更新」）、重新偵測對外 IP（問上游時帶的 ECS 子網路）、重新做路徑檢查（3.3.6 起，見下面「路徑檢查」）。都在背景進行，指令立刻回來 |
 | `save` | 立刻把所有還沒寫出的學習資料（快照）寫進快照目錄，不結束；寫完才回來（同 `SIGUSR1`、LuCI 狀態頁與設定頁的「立即儲存學習資料」）。**Windows 沒有訊號，要強制存檔就用這個**（例如關機、更新程式、UPS 通知之前） |
 | `trim` | 先讓出記憶體：立刻做記憶體「吃緊」時會做的釋出（診斷緩衝縮小、DNS 快取縮到 1/4、CDN 冷資料移出記憶體；**不停用過濾清單**），並在 `--hold` 秒內（預設 300，最多 3600）不讓記憶體結構長大、也不恢復。韌體要做很佔記憶體的事之前呼叫，例如把韌體映像檔寫進 tmpfs、解壓縮大檔案。做完才回來（CDN 冷資料移出前要先寫出快照，最多幾秒） |
 
@@ -154,7 +154,7 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 
 管理 API 的對應路徑（只接受 POST）：
 
-- `wan-changed`：`POST /api/notify/wan-changed`，回應 `{"ok":true,"ddns":"started"|"disabled","ecs":"started","clockSynced":bool}`。
+- `wan-changed`：`POST /api/notify/wan-changed`，回應 `{"ok":true,"ddns":"started"|"disabled","ecs":"started","pathCheck":"started","clockSynced":bool}`（`pathCheck` 3.3.6 起）。
 - `save`：`POST /api/persist/flush`，回應 `{"ok":true,"files":寫了幾份,"bytes":磁碟上一共幾 bytes,"at":完成時間（Unix 毫秒）,"dir":"快照目錄"}`；沒有新的變動時 `files` 是 `0`。寫入失敗回 HTTP 500 與 `{"error":"..."}`。
 - `trim`：`POST /api/memory/trim?holdSec=秒`，回應 `{"ok":true,"steps":[{"step","label","freedBytes","detail"} 或 {"step","label","skipped"}],"freedBytes":估計釋出的 bytes,"holdSec":實際的秒數,"availBeforeKB","availKB"}`。記憶體控制關掉（`system.memoryGovernor: false`）時回 `{"ok":true,"enabled":false,...}`。暫停期間 `/api/status` 的 `memory.holdUntil` 是結束時間（Unix 毫秒）。
 
@@ -192,6 +192,7 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 | `kuroshio import <檔案> [-c 設定檔] [--uci] [--json]` | 匯入（合併）備份。部分項目寫入失敗時結束碼 1（3.3.2 起；以前是 0），服務執行中合併時留下的備份檔改名成 `import-pending.kuroshio.failed` |
 | `kuroshio url [-c 設定檔] [--uci] [--open]` | 設定頁、公開頁的網址。要登入時印出含**一次性登入碼**的網址（`/login?code=…`，10 分鐘內、只能用一次；3.3.2 起），不含長期的 token。服務沒在執行時拿不到登入碼，改印說明 |
 | `kuroshio query <網域> -s <伺服器>` | 診斷查詢（類似 dig） |
+| `kuroshio check-path [-c 設定檔] [--uci] [--json]` | 路徑檢查（3.3.6 起）：立刻檢查這台機器到網際網路的路上有沒有人動手腳，印出結果。不需要服務在跑；見下面「路徑檢查」 |
 
 ## 訊號（只有 Unix；Windows 沒有）
 
@@ -303,6 +304,60 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 - **Padavan httpd 的限制**：它會解析 `.js` 檔裡的模板標記，所以 data/ 底下所有 `.js`、`.css` 都不會出現 `<%`、`%>`、`<#`、`#>` 這四種組合（註解、字串、正規表示式都算）。CI 用 `node tools/check-data-assets.js` 檢查，出現時列出檔名與行號並失敗。
 - 版本跟執行檔一起走：請用跟執行檔同一版的 data/。LuCI 載入時網址帶 `?v=版本`，升級後瀏覽器不會拿到快取的舊檔；自己嵌入時建議也這樣做。
 
+## 路徑檢查（3.3.6 起）
+
+判斷「這台機器到網際網路的路上」有沒有人動手腳，而不是哪台上游壞了。啟動後幾秒、每 6 小時、`kuroshio notify wan-changed` 時各做一次；每日評測開始前（在評測子程序裡）也會再做一次。
+
+| 檢查 | 怎麼判斷 | 判斷之後 |
+|---|---|---|
+| IPv6 能不能用 | 不送封包的路由檢查（UDP connect 到公開的 IPv6 位址，看系統選的來源位址）；連線時遇到「位址不可用」「網路無法到達」就暫停 IPv6 10 分鐘 | 不能用時只用 IPv4 連上游（DoT / DoH / DoQ / DoH3 / bootstrap 都一樣），評測不測 IPv6 位址的候選 |
+| 一般 DNS（53 埠）被接走 | 對文件用的保留位址（192.0.2.1、198.51.100.1、2001:db8::1）查詢，有回答就是路上有人把 53 埠全部轉走。UDP、TCP 分開測；保留位址剛好是預設閘道時不用它 | 評測不測一般 DNS 候選（`intercept_policy`）；執行時一般 DNS 的回答不拿來合併 IP、不參加多數決；一般 DNS 只當最後備援，狀態標成「經由攔截者」 |
+| 攔截者是誰 | CHAOS TXT `version.kuroshio`（黑潮 3.3.6 起只對區網的一般 DNS 回答 `kuroshio/版本`）→ 上游的黑潮；`version.bind` → 一般 DNS 軟體；都沒有 → 不明 | 顯示在狀態頁與 `warnings` |
+| 「不存在」被改寫 | `.invalid` 底下的隨機名稱一定不存在（RFC 6761），回答了位址就是被改寫 | bootstrap（解析加密上游的主機名稱）改用 IP 直連的 DoH（1.1.1.1、8.8.8.8） |
+| 答案被竄改 | `dns.google`、`one.one.one.one` 的答案不對 | 同上 |
+| 加密協定整條被擋 | DoT 853、DoH 443、QUIC（DoH3 / DoQ）各試三台知名伺服器；某個協定全部失敗、其他協定可以 | 那種上游先不用（評測也不測），下一次檢查恢復了自動加回 |
+| TLS 中途攔截 | 兩台以上出現憑證錯誤 | 顯示提醒；憑證錯誤不算「協定被擋」 |
+
+加密協定全部連不上（網路斷了）時，這次不判斷協定被擋。
+
+設定（UCI 在 `config upstream 'upstream'`；JSON 在 `upstream`）：
+
+| UCI | JSON | 預設 | 說明 |
+|---|---|---|---|
+| `path_check` | `pathCheck` | `1` / `true` | `0` 整個關掉（不檢查，也不依結果調整） |
+| `intercept_policy` | `interceptPolicy` | `skip-plain` | 一般 DNS 被接走時：`skip-plain` 評測不測一般 DNS；`warn` 只提醒，照常測；`ignore` 當成沒被接走 |
+| `ipv6` | `ipv6` | `auto` | 用 IPv6 連上游：`auto` 依路由判斷；`1` 一律使用；`0` 不用（路由器的 IPv6 關閉時可以帶 `0`） |
+
+`/api/status` 的 `network.path`：
+
+```json
+{
+  "enabled": true, "policy": "skip-plain", "checkedAt": 1795000000000,
+  "summary": "IPv6 不可用，一般 DNS 被路由器 192.168.1.1 上的黑潮（3.3.6）接走",
+  "warnings": ["一般 DNS 被路由器 192.168.1.1 上的黑潮（3.3.6）接走：評測不測一般 DNS，一般 DNS 只當最後備援"],
+  "ipv6": { "mode": "auto", "route": "global" | "ula" | "none", "usable": false, "reason": "沒有 IPv6 路由（…）" },
+  "plain": { "intercepted": true, "v4": { "udp": true, "tcp": true, "intercepted": true }, "v6": null },
+  "interceptor": { "kind": "kuroshio" | "dns-software" | "unknown", "version": "3.3.6" },
+  "interceptorText": "路由器 192.168.1.1 上的黑潮（3.3.6）",
+  "gateway": "192.168.1.1",
+  "nxRewrite": [], "nxVia": null, "tampered": [], "bootstrapViaDoh": false,
+  "protocols": { "dot": { "ok": 3, "fail": 0, "certErrors": 0, "lastError": null }, "doh": { … }, "quic": { … } },
+  "blocked": [], "tlsIntercept": null, "offline": false
+}
+```
+
+還沒檢查過時只有 `enabled`、`policy`、`checkedAt: null`、`ipv6`、`warnings: []`。有狀況時同樣的白話提醒也會放進 `/api/status` 的 `warnings`。
+
+`/api/status` 的 `upstreams[]` 多了：`reason`（每日評測選上的原因：最快、覆蓋）、`pathBlocked`（路徑檢查判斷現在不能用）、`via`（`"interceptor"`：一般 DNS 而且路上有攔截者）。
+
+每日評測的 `upstreams.json` 多了 `path`（評測當時的路徑檢查結果，同上的格式加 `policy`）與 `pathSkipped`（依路徑檢查略過的候選數：`plain-intercepted`、`ipv6-unavailable`、`blocked-dot`、`blocked-doh`、`blocked-quic`）。依路徑略過的候選不記可疑、不進黑名單。
+
+**每日評測的判斷也跟著改**（3.3.6 起）：
+
+- 一般 DNS 候選的答案完全一樣時只算一票：沒偵測到攔截的情況下，幾百台一般 DNS 的答案其實都是同一個攔截者給的，不能讓它們變成「多數」。
+- 「網站無法驗證」（連不上）的可疑回答，同一個業者群組有 3 家以上互相獨立（不同網域）的加密 DNS 都這樣回答時，今天不用，但不記可疑天數（比較可能是網站或路徑的問題）。憑證不符的照舊。
+- 判斷過程的摘要寫成報表目錄的 `judge.log`。報表目錄在記憶體裡時（Flash 機器），最近一次的 `judge.log`、`eliminated.csv`、`upstreams.json`（各 128 KB 以內）另存到學習資料區的 `benchmark-last/`，重開機後還查得到（`benchmark.keepLastReport: false` 關掉）。
+
 ## 小記憶體的機器（128 MB 以下）
 
 黑潮 DNS 不依記憶體分等級，**不需要手動設定大小**：
@@ -332,7 +387,8 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 - **健康檢查**用 `kuroshio health`（不需要管理 API、不需要 token，成本很低，可以每幾秒跑一次）；要細節才用 `kuroshio status --json`。
 - **停止**送 `SIGTERM`，等至少 15 秒。不要直接 `SIGKILL`：還沒寫出的學習資料（快照）會遺失。
 - **斷電前**（例如 UPS 通知）送 `SIGUSR1`，或執行 `kuroshio notify save`（Windows 只能用這個），先把快照寫出。
-- **WAN 變動**時執行 `kuroshio notify wan-changed`。
+- **WAN 變動**時執行 `kuroshio notify wan-changed`（也會重新做路徑檢查）。
+- **多台路由器串在一起**（例如 D3 接在另一台跑黑潮的主路由器後面）：不用特別設定。下游的路徑檢查會認出「一般 DNS 被上游的黑潮接走」，評測只測加密 DNS；上游路由器把 IPv6 關掉時，下游可以帶 `upstream.ipv6 0`。
 - **要做很佔記憶體的事之前**（韌體更新把映像檔寫進 tmpfs、解壓縮大檔案）執行 `kuroshio notify trim`。沒有 PSI 的舊核心（例如 Linux 4.4）只能輪詢可用記憶體，突然的大量配置可能來不及讓出；黑潮 DNS 的 `oom_score_adj` 是 -500，來不及時被核心結束的會是別的程式。
 - **設定放在記憶體**（要另外存進 Flash）的韌體：設定 `KUROSHIO_ON_CONFIG_WRITE`。
 - **容器**：把設定檔與快照目錄放在掛載的磁碟區（例如 `/config/config.json`、`system.persistDir: "/config/state"`），用 `KUROSHIO_INIT_CONFIG` 提供第一次啟動的預設設定，`KUROSHIO_SHARE` 指向映像裡的 data/。

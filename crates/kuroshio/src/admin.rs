@@ -615,7 +615,9 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             let data = crate::manifest::check(&crate::app::share_dir(&st.cfg));
             let synced = crate::clock::synced();
             let access = r.access.get().map(|a| a.status_json()).unwrap_or(Value::Null);
-            let warnings = crate::integration::warnings(&data, synced, crate::app::pressure(), &filter, &access);
+            let mut warnings = crate::integration::warnings(&data, synced, crate::app::pressure(), &filter, &access);
+            // 路徑檢查（3.3.6）：一般 DNS 被接走、協定被擋之類的狀況
+            warnings.extend(crate::pathcheck::warnings());
             ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
@@ -634,6 +636,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "errors": r.errors_json(),
                 "ownIp": null,
                 "upstreams": r.upstreams.list_json(),
+                // 路徑檢查：IPv6、一般 DNS 有沒有被接走（被誰）、「不存在」被改寫、被擋的協定、TLS 攔截
+                "network": { "path": crate::pathcheck::status_json() },
                 "autoUpstreams": r.upstreams.auto_info(),
                 "filter": filter,
                 "cdn": r.cdn().map(|c| c.status_lite()),
@@ -722,7 +726,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 None => "disabled",
             };
             crate::app::spawn_wan_subnet(r.clone(), 0);
-            ok(json!({ "ok": true, "ddns": ddns, "ecs": "started", "clockSynced": crate::clock::synced() }))
+            crate::pathcheck::trigger();
+            ok(json!({ "ok": true, "ddns": ddns, "ecs": "started", "pathCheck": "started", "clockSynced": crate::clock::synced() }))
         }
         // 立即更新過濾清單（API 2：背景執行）：立刻回 `{started, running, runId, startedAt}`，
         // 進度與結果看 `/api/status` 的 `filter.update`。正在跑時再呼叫一次，回 `started: false` 與同一個 runId。

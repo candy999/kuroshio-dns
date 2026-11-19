@@ -56,7 +56,7 @@ var tile = function(label, value, sub) { return common.tile(label, value, sub); 
 
 // 瀏覽器快取：LuCI 用固定的 ?v=（LuCI 本身的版本）載入外掛的檔案，升級黑潮之後瀏覽器可能還拿到舊的 common.js，
 // 新功能就會按了沒反應。版本對不上時重新下載本外掛的所有檔案（更新瀏覽器快取）再重新整理一次；還是對不上就提示
-var BUILD = '3.3.5';
+var BUILD = '3.3.6';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
@@ -184,12 +184,28 @@ return view.extend({
 			common.scroll(common.listenerTable(detail))
 		], { 'id': 'kuroshio-listeners' }) : '';
 
+		// 網路路徑（3.3.6）：一般 DNS 有沒有被接走、被誰；被擋的協定；IPv6
+		var np = (api.network && api.network.path) || null;
+		var pathSec = np ? common.section(_('網路路徑'), [
+			(np.warnings || []).map(function(w) { return E('div', { 'class': 'alert-message warning' }, w); }),
+			E('p', {}, np.checkedAt ? [
+				np.summary || '',
+				' · ', _('檢查於 %s').format(fmtTime(np.checkedAt)),
+				np.enabled === false ? ' · ' + _('路徑檢查已關閉') : ''
+			] : (np.enabled === false ? _('路徑檢查已關閉') : _('還沒檢查（啟動後幾秒內完成）')))
+		], { 'id': 'kuroshio-path' }) : '';
+
 		var ups = (api.upstreams || []).map(function(u) {
 			var role = { pinned: _('固定'), auto: _('自動'), fallback: _('備援') }[u.role] || u.role;
-			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', u.paused ? _('暫停中') : ''];
+			if (u.reason) role += '（' + u.reason + '）';
+			var note = [];
+			if (u.paused) note.push(_('暫停中'));
+			if (u.pathBlocked) note.push(_('路徑不通，先不用'));
+			if (u.via === 'interceptor') note.push(_('經由攔截者'));
+			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', note.join(' · ')];
 		});
 		var upSec = common.section(_('上游'), [
-			E('p', { 'class': 'cbi-section-descr' }, api.autoUpstreams ? _('自動上游來自 %s 的評測').format(api.autoUpstreams.generatedAt) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
+			E('p', { 'class': 'cbi-section-descr' }, api.autoUpstreams ? _('自動上游來自 %s 的評測（最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
 			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups, [2, 3, 4])
 		]);
 
@@ -232,7 +248,7 @@ return view.extend({
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at, 'sec') + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
-		return E([], [head, tiles, hw, memSec, accSec, lsSec, upSec, jobSec, infoSec, actions, errSec]);
+		return E([], [head, tiles, hw, memSec, accSec, lsSec, pathSec, upSec, jobSec, infoSec, actions, errSec]);
 	},
 
 	render: function(data) {

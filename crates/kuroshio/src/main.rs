@@ -215,6 +215,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 路徑檢查：立刻檢查這台機器到網際網路的路上有沒有人動手腳
+    /// （IPv6、一般 DNS 被接走（被誰）、「不存在」被改寫、答案被竄改、加密協定被擋、TLS 中途攔截）
+    CheckPath {
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+        /// 輸出 JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// 顯示偵測到的硬體、記憶體 / 儲存保留量、依 CPU 核心數換算的值
     Sysinfo {
         #[arg(short, long, default_value_os_t = default_config_path())]
@@ -1058,6 +1069,7 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
         Cmd::Sysinfo { config, uci } => sysinfo_report(&config, uci)?,
+        Cmd::CheckPath { config, uci, json } => check_path_cmd(&config, uci, json).await?,
         Cmd::MemoryPlan {
             config,
             uci,
@@ -1673,6 +1685,114 @@ async fn import_cmd(file: &std::path::Path, config: &std::path::Path, uci: bool,
 }
 
 /// `kuroshio memory-plan`
+/// `kuroshio check-path`：在這個行程裡做一次完整的路徑檢查（不需要服務在跑）
+async fn check_path_cmd(config: &std::path::Path, uci: bool, as_json: bool) -> Result<()> {
+    use kuroshio_net::path;
+    let cfg = config_for_cli(config, uci).unwrap_or_else(|_| kuroshio_config::build(&serde_json::json!({})));
+    kuroshio::tls::set_bootstrap(
+        &kuroshio_config::get(&cfg, "upstream.bootstrap")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    path::set_v6_mode(path::V6Mode::from_value(kuroshio_config::get(&cfg, "upstream.ipv6")));
+    let policy = kuroshio::pathcheck::policy_of(&cfg);
+    let r = path::check(&path::Targets::default()).await;
+    if as_json {
+        let mut j = r.to_json();
+        j["policy"] = serde_json::json!(policy);
+        j["summary"] = serde_json::json!(path::summary(&r));
+        j["warnings"] = serde_json::json!(r.warnings(policy));
+        println!("{}", serde_json::to_string_pretty(&j)?);
+        return Ok(());
+    }
+    println!("{}", check_path_text(&r, policy));
+    Ok(())
+}
+
+fn check_path_text(r: &kuroshio_net::path::Report, policy: &str) -> String {
+    use kuroshio_net::path::{Proto, V6Route};
+    let yes = |b: bool| if b { "是" } else { "否" };
+    let mut out = Vec::new();
+    out.push("路徑檢查".to_string());
+    out.push(format!(
+        "  IPv6：{}（設定 {}，路由 {}）",
+        if r.v6_usable() { "可用" } else { "不可用" },
+        r.v6_mode.as_str(),
+        match &r.v6_route {
+            V6Route::Global => "全域位址".to_string(),
+            V6Route::Ula => "只有 ULA".to_string(),
+            V6Route::None(why) => why.clone(),
+        }
+    ));
+    out.push(format!(
+        "  一般 DNS 被接走：IPv4 UDP {}、TCP {}{}",
+        yes(r.plain_v4.udp),
+        yes(r.plain_v4.tcp),
+        match &r.plain_v6 {
+            Some(p) => format!("；IPv6 UDP {}、TCP {}", yes(p.udp), yes(p.tcp)),
+            None => String::new(),
+        }
+    ));
+    if r.plain_intercepted() {
+        out.push(format!("  攔截者：{}", r.interceptor_text()));
+    }
+    if let Some(g) = r.gateway {
+        out.push(format!("  預設閘道：{g}"));
+    }
+    out.push(format!(
+        "  「不存在」被改寫：{}",
+        if r.nx_rewrite.is_empty() {
+            "否".to_string()
+        } else {
+            r.nx_rewrite.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("、")
+        }
+    ));
+    out.push(format!(
+        "  答案被竄改：{}",
+        if r.tampered.is_empty() {
+            "否".to_string()
+        } else {
+            r.tampered
+                .iter()
+                .map(|t| format!("{}（{}）", t.name, t.via))
+                .collect::<Vec<_>>()
+                .join("、")
+        }
+    ));
+    for (p, x) in &r.protocols {
+        let name = match p {
+            Proto::Dot => "DoT 853",
+            Proto::Doh => "DoH 443",
+            Proto::Quic => "QUIC",
+        };
+        out.push(format!(
+            "  {name}：成功 {} / 失敗 {}{}{}",
+            x.ok,
+            x.fail,
+            if r.blocked.contains(p) { "（被擋）" } else { "" },
+            match (&x.last_error, x.ok) {
+                (Some(e), 0) => format!("：{e}"),
+                _ => String::new(),
+            }
+        ));
+    }
+    if let Some(t) = &r.tls_intercept {
+        out.push(format!("  TLS 中途攔截：{t}"));
+    }
+    if r.offline {
+        out.push("  加密 DNS 全部連不上：網路可能斷了，這次不判斷協定是否被擋".into());
+    }
+    let w = r.warnings(policy);
+    if !w.is_empty() {
+        out.push(String::new());
+        for x in w {
+            out.push(format!("⚠ {x}"));
+        }
+    }
+    out.join("\n")
+}
+
 async fn memory_plan_cmd(config: &std::path::Path, uci: bool, ram: Vec<u64>, bits: Option<u32>, as_json: bool) -> Result<()> {
     use kuroshio::memplan::{plan, text, Assumptions, Input};
     use serde_json::{json, Value};

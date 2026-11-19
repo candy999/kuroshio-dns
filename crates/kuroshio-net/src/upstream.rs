@@ -220,10 +220,13 @@ fn next_id() -> u16 {
 }
 
 async fn udp_exchange(addr: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
+    if !crate::path::addr_usable(addr.ip()) {
+        bail!("IPv6 目前不能用（{addr}）");
+    }
     let bind: SocketAddr = if addr.is_ipv4() { "0.0.0.0:0".parse()? } else { "[::]:0".parse()? };
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(addr).await?;
-    sock.send(q).await?;
+    sock.send(q).await.inspect_err(|e| crate::path::note_conn_error(addr.ip(), e))?;
     let mut buf = vec![0u8; 65535];
     loop {
         let n = sock.recv(&mut buf).await?;
@@ -236,7 +239,12 @@ async fn udp_exchange(addr: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
 
 /// TCP 查詢：id 或問題不相符的回應（偽造或錯置的）丟掉、繼續讀，跟 UDP 一樣等到相符的或逾時（呼叫端限時）
 pub async fn tcp_exchange(addr: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
-    let mut s = TcpStream::connect(addr).await?;
+    if !crate::path::addr_usable(addr.ip()) {
+        bail!("IPv6 目前不能用（{addr}）");
+    }
+    let mut s = TcpStream::connect(addr)
+        .await
+        .inspect_err(|e| crate::path::note_conn_error(addr.ip(), e))?;
     let mut msg = Vec::with_capacity(q.len() + 2);
     msg.extend_from_slice(&(q.len() as u16).to_be_bytes());
     msg.extend_from_slice(q);

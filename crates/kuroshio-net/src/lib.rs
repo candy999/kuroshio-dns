@@ -5,6 +5,7 @@
 pub mod clock;
 pub mod fetch;
 pub mod iprank;
+pub mod path;
 pub mod probe;
 pub mod quic;
 pub mod tls;

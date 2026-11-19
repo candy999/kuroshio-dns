@@ -132,7 +132,7 @@ var JOBS = {
 
 // 瀏覽器快取：LuCI 用固定的 ?v=（LuCI 本身的版本）載入外掛的檔案，升級黑潮之後瀏覽器可能還拿到舊的 common.js，
 // 新功能就會按了沒反應。版本對不上時重新下載本外掛的所有檔案（更新瀏覽器快取）再重新整理一次；還是對不上就提示
-var BUILD = '3.3.5';
+var BUILD = '3.3.6';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
@@ -188,6 +188,21 @@ return view.extend({
 		o.value('udp', 'UDP');
 		o.value('doh', 'DoH');
 		o.value('dot', 'DoT');
+		// 路徑檢查（3.3.6）
+		common.flag(s, null, 'path_check', _('路徑檢查'), 'upstream.pathCheck',
+			_('啟動後、每 6 小時、WAN 變動時檢查路上有沒有人動手腳：一般 DNS 被接走（上游路由器、業者）、「不存在」被改成廣告頁、加密協定被擋、TLS 中途攔截、IPv6 能不能用。評測與上游選擇照結果調整。'));
+		o = s.option(form.ListValue, 'intercept_policy', _('一般 DNS 被接走時'),
+			_('路上有人把 53 埠接走時，一般 DNS 的答案其實都是攔截者給的。'));
+		o.value('skip-plain', _('評測不測一般 DNS（建議）'));
+		o.value('warn', _('只提醒，照常測'));
+		o.value('ignore', _('不理會'));
+		o.default = 'skip-plain';
+		o = s.option(form.ListValue, 'ipv6', _('用 IPv6 連上游'),
+			_('自動：依這台的 IPv6 路由判斷，連線遇到「沒有路由」會暫停 IPv6 10 分鐘。路由器的 IPv6 關閉時可以選「不用」。'));
+		o.value('auto', _('自動'));
+		o.value('1', _('使用'));
+		o.value('0', _('不用'));
+		o.default = 'auto';
 
 		// ---------------- 解析 ----------------
 		s = m.section(form.NamedSection, 'resolver', 'resolver', _('解析行為'));

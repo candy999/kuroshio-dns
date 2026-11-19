@@ -32,12 +32,20 @@ pub fn state_path(cfg: &Value, rel: &str) -> PathBuf {
     persist_dir(cfg).join(rel)
 }
 
+/// 錯誤是不是「位址不可用」（系統沒有這個位址，例如關掉 IPv6 時的 ::1）
+fn addr_unavailable(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::AddrNotAvailable)
+}
+
 /// 由設定組出解析器
 pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
     let state = get(cfg, "upstream.autoStateFile")
         .and_then(Value::as_str)
         .unwrap_or("./state/upstreams.json");
     crate::tls::set_bootstrap(&strings(get(cfg, "upstream.bootstrap")));
+    crate::pathcheck::configure(cfg);
     let ups = Arc::new(Manager::new(cfg, state_path(cfg, state)));
     if ups.active().is_empty() && ups.backup().is_empty() {
         bail!("沒有可用的上游（upstream.pinned / upstream.fallback / resolver.lastResort）");
@@ -1768,6 +1776,10 @@ pub async fn start(cfg: &Value) -> Result<Started> {
                 .any(|o| o.parse::<IpAddr>().ok() == Some(ip));
             match server.listen(SocketAddr::new(ip, port), open).await {
                 Ok(b) => bound.extend(b),
+                // 這台沒有 IPv6（連 ::1 都沒有，padavan 關掉 IPv6 時）：正常狀況，不用警告
+                Err(e) if ip.is_ipv6() && addr_unavailable(&e) => {
+                    info!("{e:#}（這台沒有 IPv6），略過這個位址")
+                }
                 Err(e) => warn!("{e:#}，略過這個位址"),
             }
         }
@@ -1779,6 +1791,8 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     if cdn.is_none() {
         spawn_wan_subnet(resolver.clone(), 5);
     }
+    // 路徑檢查：啟動後、每 6 小時、WAN 變動時
+    crate::pathcheck::spawn();
     let mut snap_sources: Vec<SnapSource> = Vec::new();
     {
         let r = resolver.clone();

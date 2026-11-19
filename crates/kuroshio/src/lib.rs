@@ -28,6 +28,7 @@ pub mod manifest;
 pub mod memgov;
 pub mod memplan;
 pub mod netif;
+pub mod pathcheck;
 pub mod persist;
 pub mod presence;
 pub mod resolver;

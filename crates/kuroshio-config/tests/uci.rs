@@ -565,3 +565,22 @@ fn manual_cert_needs_both_halves() {
     assert_eq!(g(&c, "listen.dot.key"), &json!("/mnt/certs/privkey.pem"));
     assert!(!warns.iter().any(|w| w.contains("只填了一個")));
 }
+
+/// 3.3.6 路徑檢查的開關：UCI `upstream` 段的 ipv6 / intercept_policy / path_check
+#[test]
+fn path_check_options() {
+    let d = load(&default_text(), &env());
+    assert_eq!(g(&d, "upstream.ipv6"), &json!("auto"));
+    assert_eq!(g(&d, "upstream.interceptPolicy"), &json!("skip-plain"));
+    assert_eq!(g(&d, "upstream.pathCheck"), &json!(true));
+    let text = default_text().replace(
+        "config upstream 'upstream'\n",
+        "config upstream 'upstream'\n\toption ipv6 '0'\n\toption intercept_policy 'warn'\n\toption path_check '0'\n",
+    );
+    assert_ne!(text, default_text(), "測試用的預設 UCI 要有 upstream 段");
+    let c = load(&text, &env());
+    // UCI 的 '0' 轉換後是數字 0：讀的地方用 V6Mode::from_value（字串、數字、布林都接受）
+    assert_eq!(g(&c, "upstream.ipv6"), &json!(0));
+    assert_eq!(g(&c, "upstream.interceptPolicy"), &json!("warn"));
+    assert_eq!(g(&c, "upstream.pathCheck"), &json!(false));
+}

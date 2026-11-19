@@ -47,7 +47,7 @@ pub fn set_bootstrap(list: &[String]) {
     }
 }
 
-fn bootstrap_servers() -> Vec<IpAddr> {
+pub fn bootstrap_servers() -> Vec<IpAddr> {
     let b = BOOTSTRAP.read().unwrap().clone();
     if b.is_empty() {
         vec![IpAddr::from([1, 1, 1, 1]), IpAddr::from([8, 8, 8, 8])]
@@ -78,8 +78,33 @@ async fn udp_query(server: IpAddr, name: &str, qtype: u16) -> Result<(Vec<IpAddr
     Ok((ips, ttl))
 }
 
-/// 解析加密上游的主機名稱（IP 直接回傳）；快取至少 5 分鐘，查不到時先用過期的
+/// 一般 DNS 被竄改時（路徑檢查判斷）bootstrap 改用這兩台：IP 直連的 DoH，不需要先解析主機名稱
+const BOOT_DOH: [[u8; 4]; 2] = [[1, 1, 1, 1], [8, 8, 8, 8]];
+
+fn boot_doh() -> &'static [Doh; 2] {
+    static D: OnceLock<[Doh; 2]> = OnceLock::new();
+    D.get_or_init(|| [Doh::default(), Doh::default()])
+}
+
+async fn doh_query(i: usize, name: &str, qtype: u16) -> Result<(Vec<IpAddr>, u32)> {
+    let ip = IpAddr::from(BOOT_DOH[i]);
+    let q = kuroshio_proto::build_query(0, name, qtype);
+    let r = boot_doh()[i]
+        .exchange(&ip.to_string(), 443, "/dns-query", &q, Duration::from_secs(3))
+        .await?;
+    let m = kuroshio_proto::Message::parse(&r)?;
+    let ips = kuroshio_proto::logic::ips_of(&m, qtype);
+    let ttl = m.answers.iter().map(|r| r.ttl).min().unwrap_or(300);
+    Ok((ips, ttl))
+}
+
+/// 解析加密上游的主機名稱（IP 直接回傳）；快取至少 5 分鐘，查不到時先用過期的。
+/// 不能用 IPv6 時（路徑檢查）回傳的位址拿掉 IPv6
 pub async fn resolve_host(host: &str) -> Result<Vec<IpAddr>> {
+    resolve_host_all(host).await.map(crate::path::filter_addrs)
+}
+
+async fn resolve_host_all(host: &str) -> Result<Vec<IpAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
@@ -90,7 +115,36 @@ pub async fn resolve_host(host: &str) -> Result<Vec<IpAddr>> {
             return Ok(ips.clone());
         }
     }
+    let store = |ips: &Vec<IpAddr>, ttl: u32| {
+        let now = Instant::now();
+        let exp = now + Duration::from_secs(ttl.max(300) as u64);
+        boot_cache_insert(&mut boot_cache().lock().unwrap(), key.clone(), (ips.clone(), exp), now);
+    };
+    // 一般 DNS 被竄改：先用 IP 直連的 DoH；DoH 也不通才退回一般 DNS
+    if crate::path::bootstrap_via_doh() && !crate::path::blocked(crate::path::Proto::Doh) {
+        for i in 0..BOOT_DOH.len() {
+            let mut ips = Vec::new();
+            let mut ttl = u32::MAX;
+            for t in [1u16, 28] {
+                // Box::pin：DoH 連線本身也會呼叫 resolve_host（IP 直接回傳，不會真的遞迴），型別上要有間接層
+                match Box::pin(doh_query(i, &key, t)).await {
+                    Ok((v, tl)) => {
+                        ips.extend(v);
+                        ttl = ttl.min(tl);
+                    }
+                    Err(e) => debug!("bootstrap DoH 查詢 {key} 失敗：{e}"),
+                }
+            }
+            if !ips.is_empty() {
+                store(&ips, ttl);
+                return Ok(ips);
+            }
+        }
+    }
     for server in bootstrap_servers() {
+        if !crate::path::addr_usable(server) {
+            continue;
+        }
         let mut ips = Vec::new();
         let mut ttl = u32::MAX;
         for t in [1u16, 28] {
@@ -100,9 +154,7 @@ pub async fn resolve_host(host: &str) -> Result<Vec<IpAddr>> {
             }
         }
         if !ips.is_empty() {
-            let now = Instant::now();
-            let exp = now + Duration::from_secs(ttl.max(300) as u64);
-            boot_cache_insert(&mut boot_cache().lock().unwrap(), key, (ips.clone(), exp), now);
+            store(&ips, ttl);
             return Ok(ips);
         }
     }
@@ -149,7 +201,7 @@ pub async fn lookup_txt(name: &str) -> Result<Vec<String>> {
 }
 
 /// TXT 的 rdata：多段 <長度><內容>，串成一個字串
-fn txt_strings(d: &kuroshio_proto::message::RData) -> Option<String> {
+pub(crate) fn txt_strings(d: &kuroshio_proto::message::RData) -> Option<String> {
     let kuroshio_proto::message::RData::Raw(b) = d else { return None };
     let mut out = String::new();
     let mut i = 0;
@@ -385,7 +437,9 @@ async fn connect_with(
     let mut last = anyhow!("沒有可用的位址");
     for ip in ips {
         let r = tokio::time::timeout(timeout, async {
-            let tcp = tcp_connect(SocketAddr::new(ip, port), from).await?;
+            let tcp = tcp_connect(SocketAddr::new(ip, port), from)
+                .await
+                .inspect_err(|e| crate::path::note_conn_error(ip, e))?;
             tcp.set_nodelay(true)?;
             Ok::<_, anyhow::Error>(connector.connect(name.clone(), tcp).await?)
         })

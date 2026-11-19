@@ -97,6 +97,12 @@ async fn connect(host: &str, port: u16, alpn: &[u8], timeout: Duration) -> Resul
     let sni = host.trim_matches(|c| c == '[' || c == ']');
     let mut last = anyhow!("沒有可用的位址");
     for ip in ips {
+        // 不能用 IPv6 時 resolve_host 已經拿掉 IPv6 位址；只剩 IPv6（例如 IPv6 位址的上游）就直接回錯誤，
+        // 不送封包（quinn 送不出去時只會記一行 sendmsg 警告、等到逾時）
+        if !crate::path::addr_usable(ip) {
+            last = anyhow!("IPv6 目前不能用（{ip}）");
+            continue;
+        }
         let ep = endpoint(matches!(ip, IpAddr::V6(_)))?;
         let r = async {
             let connecting = ep.connect_with(cfg.clone(), SocketAddr::new(ip, port), sni)?;

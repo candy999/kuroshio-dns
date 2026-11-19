@@ -140,7 +140,10 @@
       "dot",
       "doq"
     ],
-    "autoStateFile": "./state/upstreams.json"
+    "autoStateFile": "./state/upstreams.json",
+    "ipv6": "auto",
+    "interceptPolicy": "skip-plain",
+    "pathCheck": true
   },
   "resolver": {
     "timeoutMs": 1500,
@@ -495,7 +498,8 @@
     "minAuto": 3,
     "maxAvgLatencyMs": 250,
     "keepDays": 14,
-    "subprocess": true
+    "subprocess": true,
+    "keepLastReport": true
   },
   "scan": {
     "samplesPerSubnet": 6,

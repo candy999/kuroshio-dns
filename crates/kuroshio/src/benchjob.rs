@@ -38,13 +38,20 @@ pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchma
     if shipped.is_dir() && shipped != paths.list_dir {
         paths.default_list_dir = Some(shipped);
     }
-    // 評測報表放記憶體：Flash 上不寫每天的報表
+    // 評測報表放記憶體：Flash 上不寫每天的報表；
+    // 最近一次的摘要（judge.log、eliminated.csv、upstreams.json，各 128 KB 以內）另存到學習資料區，重開機後還查得到
+    let mut keep_last = None;
     if storage_class(cfg) != StorageClass::Disk {
         paths.out_root = Some(runtime_dir(cfg).join("benchmark"));
+        if get(cfg, "benchmark.keepLastReport").and_then(Value::as_bool) != Some(false) {
+            keep_last = Some(crate::app::persist_dir(cfg).join("benchmark-last"));
+        }
     }
     // 同時測幾個候選也看可用記憶體（扣掉保留量之後的 1/4）
     let reserve = crate::memgov::reserve_from_cfg(cfg);
-    Benchmark::new(paths).with_headroom(Arc::new(move || crate::memgov::headroom(&crate::memgov::Reading::now(), &reserve)))
+    let mut b = Benchmark::new(paths).with_headroom(Arc::new(move || crate::memgov::headroom(&crate::memgov::Reading::now(), &reserve)));
+    b.keep_last = keep_last;
+    b
 }
 
 /// 子程序用哪個執行檔：設定允許、而且目前的執行檔是 kuroshio 本身才用

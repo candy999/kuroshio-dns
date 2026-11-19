@@ -66,6 +66,7 @@
 - **汙染判斷**：用網站憑證檢查答案有沒有被竄改，並先確認多數答案本身正確，避免把只支援 HTTP 的網站誤判成汙染；同一個上游要在不同的兩天都出問題才列入永久黑名單。
 - **並行查詢**：同時問多個上游，最快的回答勝出；多個上游的 IP 合併後依實測速度排序。
 - **上游連線重用**：DoT / DoH 持久連線、HTTP/2 多工，UDP 連線重用。
+- **路徑檢查**（3.3.6）：分辨「上游壞了」和「路上有人動手腳」。一般 DNS（53 埠）被上游路由器或業者接走時，認出是誰（上游的黑潮、一般 DNS 軟體、不明設備），評測只測加密 DNS，那幾百台一般 DNS 的答案不會變成「多數」、冤枉正常的加密 DNS；「不存在」被改成廣告頁、答案被竄改時，主機名稱改用加密 DNS 解析；DoT / QUIC 整條被擋時先不用那種上游；沒有 IPv6 時只用 IPv4。多台路由器串在一起（例如接在另一台跑黑潮的主路由器後面）不用特別設定。`kuroshio check-path` 可以立刻檢查一次。
 
 ### 快取
 - 依 TTL 快取，失敗結果也快取；熱門網域在過期前自動更新。
@@ -294,12 +295,13 @@ docker compose up -d     # 第一次啟動建立 ./config/config.json，改完 d
 kuroshio run [-c 設定檔]                    執行（設定檔只寫跟預設值不同的欄位）
 kuroshio health [--json] [--timeout 毫秒]    健康檢查：本機 DNS 有沒有在回答（結束碼 0 / 1 / 2）
 kuroshio status [--json]                    執行中服務的狀態（--json 是給其他程式用的固定格式）
-kuroshio notify wan-changed                 通知服務 WAN 變了：DDNS 立即檢查、重新偵測對外 IP
+kuroshio notify wan-changed                 通知服務 WAN 變了：DDNS 立即檢查、重新偵測對外 IP、重新做路徑檢查
 kuroshio notify save                        立刻把學到的資料寫進儲存空間（Windows 要強制存檔用這個）
 kuroshio defaults                           印出完整預設設定
 kuroshio check-config <檔案>                檢查設定檔並印出合併後的結果
 kuroshio sysinfo [-c 設定檔]                 偵測到的硬體、記憶體 / 儲存保留量、依 CPU 核心數換算的值
 kuroshio memory-plan [--ram MB…] [--bits 32]  推算這台（或 64 / 128 / 256 / 512 MB 的機器）會怎樣運作
+kuroshio check-path [--json]                路徑檢查：IPv6、一般 DNS 有沒有被接走（被誰）、協定被擋、TLS 攔截
 kuroshio paths                              設定、狀態、憑證、token 等檔案的位置
 kuroshio url [--open]                       設定頁、公開頁的網址與裝置要填的 DoH / DoT 位址
 kuroshio query <網域> [-t 類型] [-s 伺服器]    查詢（診斷用，類似 dig）

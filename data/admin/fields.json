@@ -206,6 +206,17 @@
               { "value": "doh3", "label": "DoH3" },
               { "value": "dot", "label": "DoT" },
               { "value": "doq", "label": "DoQ" }
+            ] },
+            { "key": "upstream.pathCheck", "type": "bool", "label": "路徑檢查", "help": "啟動後、每 6 小時、WAN 變動時檢查路上有沒有人動手腳：一般 DNS 被接走（上游路由器、業者）、「不存在」被改成廣告頁、加密協定被擋、TLS 中途攔截、IPv6 能不能用。評測與上游選擇照結果調整。", "pro": true },
+            { "key": "upstream.interceptPolicy", "type": "select", "label": "一般 DNS 被接走時", "fallbackDefault": "skip-plain", "help": "路上有人把 53 埠接走時，一般 DNS 的答案其實都是攔截者給的。", "pro": true, "options": [
+              { "value": "skip-plain", "label": "評測不測一般 DNS（建議）" },
+              { "value": "warn", "label": "只提醒，照常測" },
+              { "value": "ignore", "label": "不理會" }
+            ] },
+            { "key": "upstream.ipv6", "type": "select", "label": "用 IPv6 連上游", "fallbackDefault": "auto", "help": "自動：依這台的 IPv6 路由判斷，連線遇到「沒有路由」會暫停 IPv6 10 分鐘。", "pro": true, "options": [
+              { "value": "auto", "label": "自動" },
+              { "value": "1", "label": "使用" },
+              { "value": "0", "label": "不用" }
             ] }
           ]
         },

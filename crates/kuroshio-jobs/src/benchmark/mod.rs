@@ -129,6 +129,21 @@ pub struct Benchmark {
     pub headroom: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     /// 執行中的進度（`/api/jobs` 的 `detail.dns-benchmark`）
     progress: Arc<Mutex<Option<Value>>>,
+    /// 評測前的路徑檢查（3.3.6）
+    pub path: PathSource,
+    /// 最近一次報表的摘要另存到這裡（報表目錄在記憶體裡時；重開機後還查得到）
+    pub keep_last: Option<PathBuf>,
+}
+
+/// 評測前的路徑檢查從哪裡來
+#[derive(Clone)]
+pub enum PathSource {
+    /// 不檢查（測試；或 `upstream.pathCheck` 關閉時效果相同）
+    Off,
+    /// 實際檢查（`kuroshio_net::path::check`），結果套用到這個行程的連線層
+    Live,
+    /// 固定的結果（測試）
+    Fixed(Box<kuroshio_net::path::Report>),
 }
 
 /// 每個測試中的候選估計要多少記憶體（一條 TLS / QUIC 連線加上緩衝）。
@@ -138,7 +153,9 @@ const PER_CANDIDATE_BYTES: u64 = 512 * 1024;
 impl Benchmark {
     /// 正式環境：kuroshio-net 傳輸 + ip-api.com
     pub fn new(paths: BenchPaths) -> Benchmark {
-        Benchmark::with(paths, Arc::new(NetProber), Arc::new(IpApi::default()))
+        let mut b = Benchmark::with(paths, Arc::new(NetProber), Arc::new(IpApi::default()));
+        b.path = PathSource::Live;
+        b
     }
 
     pub fn with(paths: BenchPaths, prober: Arc<dyn Prober>, asn: Arc<dyn AsnSource>) -> Benchmark {
@@ -149,6 +166,31 @@ impl Benchmark {
             preflight: (PREFLIGHT_DOMAIN.into(), PREFLIGHT_EXPECTED.to_vec()),
             headroom: None,
             progress: Arc::new(Mutex::new(None)),
+            path: PathSource::Off,
+            keep_last: None,
+        }
+    }
+
+    /// 指定路徑檢查的結果（測試）
+    pub fn with_path(mut self, r: kuroshio_net::path::Report) -> Benchmark {
+        self.path = PathSource::Fixed(Box::new(r));
+        self
+    }
+
+    /// 評測前的路徑檢查（`upstream.pathCheck` 關閉時不做）
+    async fn path_report(&self, cfg: &Value) -> Option<kuroshio_net::path::Report> {
+        if get(cfg, "upstream.pathCheck").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+        match &self.path {
+            PathSource::Off => None,
+            PathSource::Fixed(r) => Some((**r).clone()),
+            PathSource::Live => {
+                kuroshio_net::path::set_v6_mode(kuroshio_net::path::V6Mode::from_value(get(cfg, "upstream.ipv6")));
+                let r = kuroshio_net::path::check(&kuroshio_net::path::Targets::default()).await;
+                kuroshio_net::path::apply(&r, intercept_policy(cfg) == "ignore");
+                Some(r)
+            }
         }
     }
 
@@ -250,6 +292,92 @@ impl BenchCfg {
             select: select_opts(cfg),
         }
     }
+}
+
+/// `upstream.interceptPolicy`：skip-plain（預設）、warn、ignore
+fn intercept_policy(cfg: &Value) -> &'static str {
+    match get(cfg, "upstream.interceptPolicy").and_then(Value::as_str).unwrap_or("") {
+        "warn" => "warn",
+        "ignore" => "ignore",
+        _ => "skip-plain",
+    }
+}
+
+/// 候選的「經營者」：主機名稱的可註冊網域（例如 dns.example.co.jp → example.co.jp），IP 用 /16。
+/// 用來判斷好幾台可疑的回答是不是來自「互相獨立」的業者
+fn operator_of(host: &str) -> String {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v) => sub_key(v),
+            IpAddr::V6(v) => format!("{:x}:{:x}", v.segments()[0], v.segments()[1]),
+        };
+    }
+    let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
+    let n = labels.len();
+    if n <= 2 {
+        return host.to_ascii_lowercase();
+    }
+    // co.jp、com.tw 這類兩層的國家網域：取三層
+    let take = if labels[n - 1].len() == 2 && labels[n - 2].len() <= 3 {
+        3
+    } else {
+        2
+    };
+    labels[n - take.min(n)..].join(".").to_ascii_lowercase()
+}
+
+/// 依路徑檢查結果，這個候選今天要不要略過（回傳原因的代號）
+fn path_skip(r: Option<&kuroshio_net::path::Report>, policy: &str, up: &Upstream) -> Option<&'static str> {
+    use kuroshio_net::path::Proto;
+    use kuroshio_net::upstream::Kind;
+    let r = r?;
+    let literal = up.host.parse::<IpAddr>().ok();
+    if literal.is_some_and(|ip| ip.is_ipv6()) && !r.v6_usable() {
+        return Some("ipv6-unavailable");
+    }
+    if matches!(up.kind, Kind::Udp | Kind::Tcp) && policy == "skip-plain" {
+        let v6 = literal.is_some_and(|ip| ip.is_ipv6());
+        let hit = if v6 {
+            r.plain_v6.as_ref().is_some_and(|p| p.intercepted())
+        } else if up.kind == Kind::Udp {
+            r.plain_v4.udp
+        } else {
+            r.plain_v4.tcp
+        };
+        if hit {
+            return Some("plain-intercepted");
+        }
+    }
+    let proto = match up.kind {
+        Kind::Dot => Some(Proto::Dot),
+        Kind::Doh => Some(Proto::Doh),
+        Kind::Doq | Kind::Doh3 => Some(Proto::Quic),
+        _ => None,
+    };
+    if proto.is_some_and(|p| r.blocked.contains(&p)) {
+        return Some(match proto.unwrap() {
+            Proto::Dot => "blocked-dot",
+            Proto::Doh => "blocked-doh",
+            Proto::Quic => "blocked-quic",
+        });
+    }
+    None
+}
+
+fn path_skip_label(k: &str) -> &'static str {
+    match k {
+        "ipv6-unavailable" => "IPv6 位址（這台沒有 IPv6）",
+        "plain-intercepted" => "一般 DNS（53 埠被路上的攔截者接走）",
+        "blocked-dot" => "DoT（853 埠被擋）",
+        "blocked-doh" => "DoH（443 埠被擋）",
+        "blocked-quic" => "DoQ / DoH3（QUIC 被擋）",
+        _ => "其他",
+    }
+}
+
+/// 一般 DNS（會被路上的攔截者接走的那種）
+fn is_plain(kind: &str) -> bool {
+    kind == "udp" || kind == "tcp"
 }
 
 fn strings(cfg: &Value, k: &str) -> Option<Vec<String>> {
@@ -571,6 +699,8 @@ fn append_blacklist(file: &Path, lines: &[String]) {
 
 /// 網站「無法驗證」幾天（不同日期）才列入永久黑名單
 const SUSPECT_DAYS: usize = 3;
+/// 同一個業者群組有幾家互相獨立（不同經營者）的加密 DNS 都「網站無法驗證」時，不記可疑天數
+const INDEPENDENT_OPERATORS: usize = 3;
 /// 「憑證不符」幾天（不同日期）才列入永久黑名單。當天一律淘汰不用；隔天以後再犯才永久排除——
 /// 正常的 DNS 也可能有一天回了舊位址（網站剛搬家、快取還沒過期），那個位址上的憑證就不是這個網站的。
 /// 永久黑名單要手動編輯才能恢復，不能因為一天的一題就定罪；真的在劫持的 DNS 隔天還是會被抓到
@@ -651,6 +781,18 @@ impl Benchmark {
         }
         blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
+        // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
+        let mut journal = Journal::default();
+        // 路徑檢查：一般 DNS 被接走、IPv6 不能用、協定被擋時，那些候選今天不測（測了也只會冤枉它們）
+        let policy = intercept_policy(&ctx.cfg);
+        let path = self.path_report(&ctx.cfg).await;
+        if let Some(r) = &path {
+            jinfo!(journal, "[路徑檢查] {}", kuroshio_net::path::summary(r));
+            for w in r.warnings(policy) {
+                warn!("[路徑檢查] {w}");
+            }
+        }
+        let mut path_skipped: BTreeMap<&'static str, usize> = BTreeMap::new();
 
         // 候選：固定上游在前；同一個上游（正規化後）只測一次
         let mut seen: HashSet<String> = HashSet::new();
@@ -679,7 +821,21 @@ impl Benchmark {
                 *skipped.entry(kind_name(up.kind)).or_default() += 1;
                 continue;
             }
+            if !pinned {
+                if let Some(why) = path_skip(path.as_ref(), policy, &up) {
+                    *path_skipped.entry(why).or_default() += 1;
+                    continue;
+                }
+            }
             all.push(Srv::new(spec.clone(), up, pinned));
+        }
+        if !path_skipped.is_empty() {
+            let parts: Vec<String> = path_skipped.iter().map(|(k, n)| format!("{} {n}", path_skip_label(k))).collect();
+            jinfo!(
+                journal,
+                "依路徑檢查略過：{}（不是那些伺服器的問題，不記可疑、不進黑名單）",
+                parts.join("、")
+            );
         }
         let unsupported: Vec<String> = skipped
             .iter()
@@ -687,9 +843,10 @@ impl Benchmark {
             .map(|(k, n)| format!("{k} {n}"))
             .collect();
         if !unsupported.is_empty() {
-            info!("這個版本還不支援的類型先略過（之後版本加入）：{}", unsupported.join("、"));
+            jinfo!(journal, "這個版本還不支援的類型先略過（之後版本加入）：{}", unsupported.join("、"));
         }
-        info!(
+        jinfo!(
+            journal,
             "候選 {} 個（固定上游 {}，永久黑名單略過 {}）",
             all.len(),
             all.iter().filter(|s| s.pinned).count(),
@@ -698,7 +855,7 @@ impl Benchmark {
 
         // Phase 0：資格賽
         let (pf_domain, pf_expected) = self.preflight.clone();
-        info!("[Phase 0] 資格賽 ({pf_domain})");
+        jinfo!(journal, "[Phase 0] 資格賽 ({pf_domain})");
         let results = self.query_all(&all, (0..all.len()).collect(), &pf_domain, &cfg).await;
         for (i, r) in results {
             let pass = matches!(&r.outcome, Outcome::Ok(ips) if ips.iter().any(|ip| pf_expected.contains(ip)));
@@ -707,7 +864,7 @@ impl Benchmark {
             }
         }
         let verified: Vec<usize> = (0..all.len()).filter(|i| all[*i].alive).collect();
-        info!("資格賽結束：通過 {} / 淘汰 {}", verified.len(), all.len() - verified.len());
+        jinfo!(journal, "資格賽結束：通過 {} / 淘汰 {}", verified.len(), all.len() - verified.len());
         if !verified.iter().any(|i| !all[*i].pinned) {
             bail!("沒有任何 DNS 通過資格賽（本機網路可能異常），保留昨天的結果");
         }
@@ -738,7 +895,7 @@ impl Benchmark {
             if survivors.is_empty() {
                 break;
             }
-            info!("[{}/{}] {domain}（倖存 {}）", di + 1, domains.len(), survivors.len());
+            jinfo!(journal, "[{}/{}] {domain}（倖存 {}）", di + 1, domains.len(), survivors.len());
             let kept: usize = raw.iter().map(|v| v.iter().filter(|x| x.is_some()).count()).sum();
             self.set_progress(json!({
                 "phase": "judge", "domain": di + 1, "domains": domains.len(), "survivors": survivors.len(), "openConnections": 0,
@@ -770,7 +927,8 @@ impl Benchmark {
             let answered = ok.len() + blocked.len();
             // 多數 DNS 都解析不到 → 網域本身有問題（下線 / 只在特定地區），本題不計分
             if answered == 0 || (ok.len() as f64 / answered as f64) < 0.3 {
-                info!(
+                jinfo!(
+                    journal,
                     "   -> 多數 DNS 都解析不到（成功 {} / 封鎖 {}），此網域略過",
                     ok.len(),
                     blocked.len()
@@ -786,7 +944,7 @@ impl Benchmark {
                     blocked_report.push(json!({ "dns": s.id, "domain": domain, "reason": reason, "pinned": s.pinned }));
                 }
                 if !s.pinned {
-                    info!("   [淘汰] {} -> 封殺 ({reason})", s.id);
+                    jinfo!(journal, "   [淘汰] {} -> 封殺 ({reason})", s.id);
                 }
             }
 
@@ -802,11 +960,24 @@ impl Benchmark {
                 .collect();
             let unknown = infos.iter().filter(|i| i.is_unknown()).count();
             if unknown > 0 {
-                info!("   ⚠ {unknown} 筆結果查不到 ASN（ip-api 無法連線或受限），這些結果不做污染判斷");
+                jinfo!(
+                    journal,
+                    "   ⚠ {unknown} 筆結果查不到 ASN（ip-api 無法連線或受限），這些結果不做污染判斷"
+                );
             }
             let mut groups: Vec<Group> = Vec::new();
-            for info in infos.iter().filter(|i| !i.is_unknown()) {
-                let w = rules::calculate_weight(Some(info), domain);
+            // 一般 DNS 的答案完全一樣時只算一票：路上有攔截者（沒偵測到的也算）時，幾百台一般 DNS 的答案
+            // 其實都是同一個攔截者給的，不能讓它們變成「多數」（padavan-tw 11-19：306 台一般 DNS 全是上游黑潮在回答）
+            let mut plain_seen: HashSet<Vec<Ipv4Addr>> = HashSet::new();
+            for ((i, ips, _), info) in ok.iter().zip(&infos).filter(|(_, i)| !i.is_unknown()) {
+                let mut w = rules::calculate_weight(Some(info), domain);
+                if is_plain(all[*i].kind) {
+                    let mut key = ips.clone();
+                    key.sort_unstable();
+                    if !plain_seen.insert(key) {
+                        w = 0.0;
+                    }
+                }
                 match groups.iter_mut().find(|g| rules::is_same_group(Some(&g.rep), Some(info))) {
                     Some(g) => g.score += w,
                     None => groups.push(Group {
@@ -861,13 +1032,36 @@ impl Benchmark {
                         .await;
                     verdict = suspects.into_iter().zip(checks).collect();
                 } else {
-                    info!(
+                    jinfo!(
+                        journal,
                         "   -> {domain} 的正常回答也無法用憑證驗證（{}），這個網域不判斷汙染（{} 個不同業者的回答照常計分）",
                         baseline.1,
                         suspects.len()
                     );
                 }
             }
+            // 「網站無法驗證」的可疑回答：同一個業者群組有好幾家互相獨立的加密 DNS 都這樣回答，
+            // 比較可能是網站或這條路連不上那些位址，不是這些 DNS 一起竄改 → 今天不用，但不記可疑天數
+            let independent: HashSet<usize> = {
+                let unverified: Vec<usize> = verdict
+                    .iter()
+                    .filter(|(_, (c, _))| *c == SiteCheck::Unverified)
+                    .map(|(k, _)| *k)
+                    .filter(|k| !is_plain(all[ok[*k].0].kind))
+                    .collect();
+                let mut out = HashSet::new();
+                for &k in &unverified {
+                    let ops: HashSet<String> = unverified
+                        .iter()
+                        .filter(|j| rules::is_same_group(Some(&infos[**j]), Some(&infos[k])))
+                        .map(|j| operator_of(&all[ok[*j].0].up.host))
+                        .collect();
+                    if ops.len() >= INDEPENDENT_OPERATORS {
+                        out.insert(k);
+                    }
+                }
+                out
+            };
             let (mut polluted, mut suspicious, mut rescued) = (0usize, 0usize, 0usize);
             let mut newly_bl: Vec<String> = Vec::new();
             for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {
@@ -876,9 +1070,11 @@ impl Benchmark {
                     None => s.record(dix, *ms, ips),
                     Some((SiteCheck::Valid, _)) => {
                         rescued += 1;
-                        info!(
+                        jinfo!(
+                            journal,
                             "   [保留] {} -> {}：業者規則沒涵蓋，但 {domain} 的憑證有效（不是劫持）",
-                            s.id, info.raw
+                            s.id,
+                            info.raw
                         );
                         s.record(dix, *ms, ips);
                     }
@@ -886,16 +1082,33 @@ impl Benchmark {
                         s.kill(format!("汙染 {domain} (判定為 {}，憑證不符 {why})", info.raw));
                         polluted += 1;
                         if !s.pinned && strikes.add(&cert_key(&s.id), &today) >= CERT_DAYS {
-                            info!(
+                            jinfo!(
+                                journal,
                                 "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
-                                s.id, info.raw
+                                s.id,
+                                info.raw
                             );
                             if blacklist.insert(s.id.clone()) {
                                 newly_bl.push(format!("{}  # {today} 汙染：{domain} → {}（憑證不符 {why}）", s.id, info.raw));
                             }
                         } else if !s.pinned {
-                            info!(
+                            jinfo!(
+                                journal,
                                 "   [今天不用] {} -> 汙染 {}：憑證不符 {why}（再發生一天就列入永久黑名單）",
+                                s.id,
+                                info.raw
+                            );
+                        }
+                    }
+                    Some((SiteCheck::Unverified, why)) if independent.contains(&k) => {
+                        s.kill(format!(
+                            "可疑 {domain} (判定為 {}，網站無法驗證 {why}；多家獨立 DNS 相同，不記可疑)",
+                            info.raw
+                        ));
+                        suspicious += 1;
+                        if !s.pinned {
+                            jinfo!(journal,
+                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但有 {INDEPENDENT_OPERATORS} 家以上獨立的 DNS 同樣回答，判為網站或路徑問題，不記可疑",
                                 s.id, info.raw
                             );
                         }
@@ -904,13 +1117,17 @@ impl Benchmark {
                         s.kill(format!("可疑 {domain} (判定為 {}，網站無法驗證 {why})", info.raw));
                         suspicious += 1;
                         if !s.pinned && strikes.add(&s.id, &today) >= SUSPECT_DAYS && blacklist.insert(s.id.clone()) {
-                            info!("   [淘汰] {} -> 連續 {SUSPECT_DAYS} 天回答無法驗證的位址（加入永久黑名單）", s.id);
+                            jinfo!(
+                                journal,
+                                "   [淘汰] {} -> 連續 {SUSPECT_DAYS} 天回答無法驗證的位址（加入永久黑名單）",
+                                s.id
+                            );
                             newly_bl.push(format!(
                                 "{}  # {today} 汙染：{domain} → {}（連續 {SUSPECT_DAYS} 天網站無法驗證）",
                                 s.id, info.raw
                             ));
                         } else if !s.pinned {
-                            info!("   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}）", s.id, info.raw);
+                            jinfo!(journal, "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}）", s.id, info.raw);
                         }
                     }
                 }
@@ -918,7 +1135,8 @@ impl Benchmark {
             if !newly_bl.is_empty() {
                 append_blacklist(&bl_file, &newly_bl);
             }
-            info!(
+            jinfo!(
+                journal,
                 "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、逾時 {errors}",
                 groups.first().map(|g| g.rep.raw.as_str()).unwrap_or("無法判定"),
                 ok.len() - polluted - suspicious,
@@ -934,7 +1152,7 @@ impl Benchmark {
         }
 
         // Phase 2：查 DNS 擁有者
-        info!("=== 最終結算：查詢 DNS 擁有者 ===");
+        jinfo!(journal, "=== 最終結算：查詢 DNS 擁有者 ===");
         let mut host_ip: Vec<Option<IpAddr>> = Vec::with_capacity(finals.len());
         for &i in &finals {
             let host = &all[i].up.host;
@@ -1000,6 +1218,8 @@ impl Benchmark {
             "counts": counts,
             "blocked": blocked_report,
             "skippedTypes": skipped.iter().filter(|(k, _)| **k != "blacklist").map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
+            "pathSkipped": path_skipped.iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
+            "path": path.as_ref().map(|r| { let mut j = r.to_json(); j["policy"] = json!(policy); j }),
             "reportDir": out_dir.as_ref().map(|d| d.display().to_string()),
         });
         write_json(&self.paths.upstreams_file, &state)?;
@@ -1008,10 +1228,12 @@ impl Benchmark {
                 report(&d.join(name), body.as_bytes());
             }
             report(&d.join("upstreams.json"), &serde_json::to_vec_pretty(&state).unwrap_or_default());
+            report(&d.join("judge.log"), journal.text().as_bytes());
         }
-        info!("=== 今日選出的上游 ===");
+        jinfo!(journal, "=== 今日選出的上游 ===");
         for x in state["selected"].as_array().into_iter().flatten() {
-            info!(
+            jinfo!(
+                journal,
                 "  {:<48} {:<4} {:>7}ms  +{}  ({}) {}",
                 x["id"].as_str().unwrap_or(""),
                 x["type"].as_str().unwrap_or(""),
@@ -1035,7 +1257,8 @@ impl Benchmark {
                 )
             })
             .collect();
-        info!(
+        jinfo!(
+            journal,
             "  固定上游：{}",
             if pinned_line.is_empty() {
                 "無".into()
@@ -1043,7 +1266,8 @@ impl Benchmark {
                 pinned_line.join("、")
             }
         );
-        info!(
+        jinfo!(
+            journal,
             "  總涵蓋率 {}%（{}/{total}）",
             to_fixed(
                 if total > 0 {
@@ -1060,7 +1284,10 @@ impl Benchmark {
         if let Some(root) = &self.paths.out_root {
             cleanup_reports(root, ctx.now_ms(), cfg.keep_days);
         }
-        info!("[{}] 結束 {}", JOB_NAME, fmt_time(ctx.now_ms()));
+        jinfo!(journal, "[{}] 結束 {}", JOB_NAME, fmt_time(ctx.now_ms()));
+        if let (Some(keep), Some(d)) = (&self.keep_last, &out_dir) {
+            keep_last_report(d, keep, &journal);
+        }
         Ok(state)
     }
 
@@ -1372,6 +1599,72 @@ fn compute(
         finals,
         selection,
         reports,
+    }
+}
+
+/// 判斷過程摘要的上限（評測一次幾千行；只留前面這麼多）
+const JOURNAL_MAX: usize = 192 * 1024;
+/// 另存到持久資料區的每個檔案上限（Flash 上每天寫一次，不要太大）
+const KEEP_FILE_MAX: usize = 128 * 1024;
+
+macro_rules! jinfo {
+    ($j:expr, $($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        info!("{s}");
+        $j.push(s);
+    }};
+}
+use jinfo;
+
+#[derive(Default)]
+struct Journal {
+    lines: Vec<String>,
+    bytes: usize,
+    dropped: usize,
+}
+
+impl Journal {
+    fn push(&mut self, s: String) {
+        if self.bytes + s.len() < JOURNAL_MAX {
+            self.bytes += s.len() + 1;
+            self.lines.push(s);
+        } else {
+            self.dropped += 1;
+        }
+    }
+    fn text(&self) -> String {
+        let mut t = self.lines.join("\n");
+        if self.dropped > 0 {
+            t.push_str(&format!("\n…（後面還有 {} 行，見系統記錄）", self.dropped));
+        }
+        t.push('\n');
+        t
+    }
+}
+
+/// 最近一次評測的摘要另存一份（judge.log、eliminated.csv、upstreams.json，各自截到上限）
+fn keep_last_report(out_dir: &Path, keep: &Path, journal: &Journal) {
+    let cut = |b: Vec<u8>| -> Vec<u8> {
+        if b.len() <= KEEP_FILE_MAX {
+            return b;
+        }
+        let mut end = KEEP_FILE_MAX;
+        while end > 0 && (b[end] & 0xc0) == 0x80 {
+            end -= 1; // 不切在 UTF-8 字元中間
+        }
+        let mut v = b[..end].to_vec();
+        v.extend_from_slice("\n…（已截斷）\n".as_bytes());
+        v
+    };
+    if let Err(e) = std::fs::create_dir_all(keep) {
+        warn!("最近一次評測報表另存失敗（{}）：{e}", keep.display());
+        return;
+    }
+    report(&keep.join("judge.log"), &cut(journal.text().into_bytes()));
+    for name in ["eliminated.csv", "upstreams.json"] {
+        if let Ok(b) = std::fs::read(out_dir.join(name)) {
+            report(&keep.join(name), &cut(b));
+        }
     }
 }
 

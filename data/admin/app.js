@@ -3,7 +3,7 @@
 // 原生 JS、不需要編譯。伺服器給的字串一律用 textContent 放進頁面，不組 HTML。
 (function () {
 	/** 這個設定頁本身的版本（核心版本由 /api/about 提供；兩者不同時「關於」分頁兩個都會顯示） */
-	var UI_VERSION = '3.3.5';
+	var UI_VERSION = '3.3.6';
 
 	// ---------------------------------------------------------------- 小工具
 	var $ = function (id) { return document.getElementById(id); };
@@ -660,15 +660,25 @@
 		tableRows($('st-up').tBodies[0], (st.upstreams || []).map(function (u) {
 			var n = (u.ok || 0) + (u.fail || 0), rate = n ? u.ok / n : null, h;
 			if (u.paused) h = badge('暫停中', 'warn');
+			else if (u.pathBlocked) h = badge('路徑不通，先不用', 'warn');
 			else if (rate == null) h = badge('尚無查詢', 'off');
 			else if (rate >= 0.9) h = badge('正常 ' + Math.round(rate * 100) + '%', 'ok');
 			else if (rate >= 0.5) h = badge('不穩 ' + Math.round(rate * 100) + '%', 'warn');
 			else h = badge('異常 ' + Math.round(rate * 100) + '%', 'err');
-			return [{ text: u.id, cls: 'mono' }, ROLE[u.role] || u.role, { text: fmtNum(u.ok), cls: 'num' }, { text: fmtNum(u.fail), cls: 'num' }, { text: u.avgMs != null ? u.avgMs + ' ms' : '-', cls: 'num' }, h];
+			var role = (ROLE[u.role] || u.role) + (u.reason ? '（' + u.reason + '）' : '') + (u.via === 'interceptor' ? ' · 經由攔截者' : '');
+			return [{ text: u.id, cls: 'mono' }, role, { text: fmtNum(u.ok), cls: 'num' }, { text: fmtNum(u.fail), cls: 'num' }, { text: u.avgMs != null ? u.avgMs + ' ms' : '-', cls: 'num' }, h];
 		}), 6);
 
 		// 憑證、最近的錯誤
 		var ex = clear($('st-extra'));
+		// 網路路徑（3.3.6）：一般 DNS 有沒有被接走、被誰；被擋的協定；IPv6
+		var np = st.network && st.network.path;
+		if (np && (np.checkedAt || np.enabled === false)) {
+			ex.appendChild(el('h3', { text: '網路路徑' }));
+			(np.warnings || []).forEach(function (w) { ex.appendChild(el('p', { class: 'msg warn', text: w })); });
+			ex.appendChild(el('p', { class: 'msg info', id: 'st-path',
+				text: np.enabled === false ? '路徑檢查已關閉' : (np.summary || '') + ' · 檢查於 ' + fmtTime(np.checkedAt) }));
+		}
 		var ac = st.access;
 		if (ac && (ac.failClosed || ac.warning)) {
 			ex.appendChild(el('h3', { text: '連線來源' }));
