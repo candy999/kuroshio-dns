@@ -232,6 +232,42 @@ pub fn at_minutes(c: &Value) -> Vec<u32> {
     out
 }
 
+/// 補跑時段（`system.catchUpWindow`，例如 "01:00-06:00"，台北時間）：（開始分鐘, 結束分鐘）。
+/// 可以跨午夜（"23:00-05:00"）。空白、格式錯誤、開始等於結束 → None（不限制，跟以前一樣）
+pub fn parse_window(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.trim().split_once('-')?;
+    let hm = |x: &str| -> Option<u32> {
+        let (h, m) = x.trim().split_once(':')?;
+        let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+        (h < 24 && m < 60).then_some(h * 60 + m)
+    };
+    let (a, b) = (hm(a)?, hm(b)?);
+    (a != b).then_some((a, b))
+}
+
+/// 這個時間（台北）在不在補跑時段裡
+pub fn in_window(ms: u64, w: (u32, u32)) -> bool {
+    let p = time::taipei_parts(ms);
+    let m = p.h * 60 + p.mi;
+    if w.0 < w.1 {
+        m >= w.0 && m < w.1
+    } else {
+        m >= w.0 || m < w.1
+    }
+}
+
+/// 設定裡的補跑時段
+fn catch_up_window(cfg: &Value) -> Option<(u32, u32)> {
+    cfg.get("system")
+        .and_then(|s| s.get("catchUpWindow"))
+        .and_then(Value::as_str)
+        .and_then(parse_window)
+}
+
+fn fmt_window(w: (u32, u32)) -> String {
+    format!("{:02}:{:02}-{:02}:{:02}", w.0 / 60, w.0 % 60, w.1 / 60, w.1 % 60)
+}
+
 /// `weekdays`（0 = 星期日）；不是陣列就是每天
 pub fn weekdays(c: &Value) -> Option<Vec<u32>> {
     c.get("weekdays")
@@ -384,6 +420,8 @@ struct St {
     started_ms: Option<u64>,
     /// 上次 `tick` 的時間：兩次檢查之間跨過了排定時間（系統休眠、時鐘往前跳）就知道是錯過了
     last_tick: Option<u64>,
+    /// 等補跑時段的工作（`/api/jobs` 的 `catchUpWaiting`）
+    waiting: HashSet<String>,
 }
 
 struct Inner {
@@ -421,6 +459,7 @@ impl Scheduler {
                     unknown_warned: HashSet::new(),
                     started_ms: None,
                     last_tick: None,
+                    waiting: HashSet::new(),
                 }),
                 notify: Notify::new(),
             }),
@@ -454,10 +493,23 @@ impl Scheduler {
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
         let now = self.inner.opts.clock.now_ms();
         self.inner.st.lock().unwrap().started_ms = Some(now);
+        let window = catch_up_window(&self.inner.st.lock().unwrap().cfg);
         for (name, delay, why) in self.catch_up_plan() {
             let me = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(delay)).await;
+                // 補跑時段（3.4.0）：只有補跑（首次執行、上次成功太久）要等；排定時間與手動不受影響。
+                // 每次 tick 重新看一次時鐘，不先算好要等多久：開機時還沒對時的話，算出來的會是錯的
+                if let Some(w) = window {
+                    if !in_window(me.inner.opts.clock.now_ms(), w) {
+                        info!("工作 {name} 要{why}，等到補跑時段 {}（system.catchUpWindow）", fmt_window(w));
+                        me.inner.st.lock().unwrap().waiting.insert(name.clone());
+                        while !in_window(me.inner.opts.clock.now_ms(), w) {
+                            tokio::time::sleep(me.inner.opts.tick_interval).await;
+                        }
+                        me.inner.st.lock().unwrap().waiting.remove(&name);
+                    }
+                }
                 me.request(&name, &why);
             });
         }
@@ -769,6 +821,8 @@ impl Scheduler {
             .iter()
             .filter_map(|(n, j)| j.detail().map(|d| (n.clone(), d)))
             .collect();
+        let mut waiting: Vec<&String> = st.waiting.iter().collect();
+        waiting.sort();
         json!({
             "detail": Value::Object(detail),
             "running": st.running.as_ref().map(|r| json!({
@@ -778,6 +832,9 @@ impl Scheduler {
             "state": Value::Object(st.state.clone()),
             "config": Value::Object(cfg),
             "nextRun": Value::Object(next),
+            // 補跑時段（3.4.0）：設定的時段與正在等的補跑
+            "catchUpWindow": catch_up_window(&st.cfg).map(fmt_window),
+            "catchUpWaiting": waiting,
         })
     }
 

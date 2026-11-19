@@ -242,6 +242,13 @@ return view.extend({
 		num('concurrency', _('同時測速數'), 'iprank.concurrency');
 
 		// ---------------- 排程 ----------------
+		s = m.section(form.NamedSection, 'main', 'kuroshio', _('補跑時段'));
+		o = s.option(form.Value, 'catchup_window', _('補跑只在這段時間'),
+			_('台北時間，例如 01:00-06:00（可以跨午夜）。剛刷機、學習資料不見、或很久沒跑時的補跑（DNS 評測、CDN 掃描等）只在這段時間進行，期間先用預設上游；排定時間與手動執行不受影響。空白 = 開機後幾分鐘就補跑。'));
+		o.placeholder = '01:00-06:00';
+		o.rmempty = true;
+		o.validate = function(id, v) { return !v || /^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/.test(v) || _('格式：HH:MM-HH:MM'); };
+
 		s = m.section(form.GridSection, 'job', _('排程工作（台北時間）'), _('到時間以獨立程序在背景執行，不影響 DNS 回應。路由器在排定時間沒開機，下次啟動會自動補跑。'));
 		s.anonymous = false;
 		s.addremove = false;

@@ -802,6 +802,12 @@ fn convert(uci: &Value, env: &Env, w: &Warns) -> Value {
             out.insert(name.into(), Value::Object(m));
         }
     }
+    // 補跑時段（3.4.0，main.catchup_window，例如 '01:00-06:00'）：沒填 = 跟以前一樣開機後就補跑
+    let window = s("main", "catchup_window");
+    if !window.is_empty() {
+        let sys = out.entry("system").or_insert_with(|| json!({}));
+        sys["catchUpWindow"] = json!(window);
+    }
     // 資料目錄（main.data_dir，可以改到外接硬碟）
     let data_dir = s("main", "data_dir");
     if !data_dir.is_empty() {

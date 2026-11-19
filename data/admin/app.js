@@ -2147,7 +2147,8 @@
 					});
 				});
 				var sched = (c.monthDays ? '每月 ' + [].concat(c.monthDays).join('、') + ' 日' + (c.jitterDays ? '起（每台錯開）' : '') + ' ' : '') + [].concat(c.at || []).join(', ') + (c.weekdays ? '（' + [].concat(c.weekdays).map(function (w) { return '週' + ('日一二三四五六'.charAt(+w) || w); }).join('、') + '）' : '') + (c.enabled === false ? ' 已停用' : '');
-				var res = running === n ? '執行中…' : queue.indexOf(n) >= 0 ? '排隊中' : s.lastCode === 0 ? '成功' : s.lastCode == null ? '-' : '失敗（' + s.lastCode + '）';
+				var waiting = (j.catchUpWaiting || []).indexOf(n) >= 0;
+				var res = running === n ? '執行中…' : queue.indexOf(n) >= 0 ? '排隊中' : waiting ? '等補跑時段（' + j.catchUpWindow + '）' : s.lastCode === 0 ? '成功' : s.lastCode == null ? '-' : '失敗（' + s.lastCode + '）';
 				// 有自己進度的工作（台灣 IP 清單）：顯示進度、暫停原因、上次結果
 				if (detail[n] && detail[n].text) res = detail[n].text;
 				return [JOBS[n] || n, sched, fmtTime(next[n]), fmtTime(s.lastEnd), res, b];

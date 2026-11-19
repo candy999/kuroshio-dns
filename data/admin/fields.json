@@ -566,6 +566,7 @@
           "desc": "到時間在背景執行，不影響 DNS 回應。電腦在排定時間沒開機，下次啟動會自動補跑。",
           "pro": true,
           "fields": [
+            { "key": "system.catchUpWindow", "type": "text", "label": "補跑只在這段時間", "help": "台北時間，例如 01:00-06:00（可以跨午夜）。剛安裝、學習資料不見、或很久沒跑時的補跑（DNS 評測、CDN 掃描等）只在這段時間進行，期間先用預設上游；排定時間與手動執行不受影響。空白 = 啟動後幾分鐘就補跑。", "placeholder": "01:00-06:00", "pattern": "^$|^([01]\\d|2[0-3]):[0-5]\\d-([01]\\d|2[0-3]):[0-5]\\d$", "patternMsg": "格式：HH:MM-HH:MM" },
             { "key": "jobs.dns-benchmark.enabled", "type": "bool", "label": "DNS 評測（選出最佳上游組合、剔除汙染）" },
             { "key": "jobs.dns-benchmark.at", "type": "text", "label": "DNS 評測時間", "help": "HH:MM", "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$", "patternMsg": "格式：HH:MM" },
             { "key": "jobs.cdn-ranges.enabled", "type": "bool", "label": "抓 CDN 官方 IP 範圍" },

@@ -360,6 +360,19 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 - 記錄與黑名單註解裡的業者名稱：ip-api 沒給 AS 編號時顯示「名稱（查不到 AS 編號）」，不再是 `SHERNET__` 這種半截的（`upstreams.json` 的 `owner` 仍是原本的值）。
 - 判斷過程的摘要寫成報表目錄的 `judge.log`。報表目錄在記憶體裡時（Flash 機器），最近一次的 `judge.log`、`eliminated.csv`、`upstreams.json`（各 128 KB 以內）另存到學習資料區的 `benchmark-last/`，重開機後還查得到（`benchmark.keepLastReport: false` 關掉）。
 
+## 補跑時段（3.4.0 起）
+
+剛刷機、學習資料不見、或很久沒跑時，排程工作（DNS 評測、CDN 範圍／掃描／節點池等）會在啟動後幾分鐘「補跑」。白天正在用網路時不想被打擾，可以限定補跑的時段：
+
+| UCI | JSON | 預設 | 說明 |
+|---|---|---|---|
+| `main.catchup_window` | `system.catchUpWindow` | 空白 | 台北時間 `HH:MM-HH:MM`，例如 `01:00-06:00`，可以跨午夜（`23:00-05:00`）。空白、格式錯誤、開始等於結束 = 不限制（跟以前一樣） |
+
+- 只影響補跑：排定時間（`jobs.*.at`）與手動執行（`/api/jobs/run`、設定頁的「立即執行」）照常。
+- 等補跑的期間先用預設上游（備援、最後手段，沒有評測結果時本來就是這樣）；串接模式下共用結果照常從上游拿。
+- 每次排程檢查（30 秒）重新看時鐘，不先算好要等多久：開機時還沒對時也不會算錯。
+- `/api/jobs` 多了 `catchUpWindow`（設定的時段，沒設是 `null`）與 `catchUpWaiting`（正在等時段的工作名稱）；LuCI 與設定頁的排程工作表顯示「等補跑時段（01:00-06:00）」。
+
 ## 小記憶體的機器（128 MB 以下）
 
 黑潮 DNS 不依記憶體分等級，**不需要手動設定大小**：

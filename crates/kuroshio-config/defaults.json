@@ -24,7 +24,8 @@
     "memoryGovernor": true,
     "memoryReserveMB": 0,
     "memoryReservePercent": 0,
-    "oomScoreAdj": -500
+    "oomScoreAdj": -500,
+    "catchUpWindow": ""
   },
   "listen": {
     "doh": {

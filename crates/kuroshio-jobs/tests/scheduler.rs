@@ -539,3 +539,94 @@ fn run_if_missing_accepts_compressed_state_file() {
     assert!((o.file_exists)("state/cdn/pools.json"), "一般檔也算有");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn catch_up_window_parse_and_match() {
+    use scheduler::{in_window, parse_window};
+    assert_eq!(parse_window("01:00-06:00"), Some((60, 360)));
+    assert_eq!(parse_window(" 23:30 - 05:00 "), Some((1410, 300)));
+    assert_eq!(parse_window(""), None);
+    assert_eq!(parse_window("01:00"), None);
+    assert_eq!(parse_window("25:00-06:00"), None);
+    assert_eq!(parse_window("03:00-03:00"), None, "開始等於結束 = 不限制");
+    let w = parse_window("01:00-06:00").unwrap();
+    assert!(in_window(tpe(2026, 11, 10, 1, 0), w));
+    assert!(in_window(tpe(2026, 11, 10, 5, 59), w));
+    assert!(!in_window(tpe(2026, 11, 10, 6, 0), w));
+    assert!(!in_window(tpe(2026, 11, 10, 12, 0), w));
+    let night = parse_window("23:00-05:00").unwrap();
+    assert!(in_window(tpe(2026, 11, 10, 23, 30), night));
+    assert!(in_window(tpe(2026, 11, 11, 4, 0), night));
+    assert!(!in_window(tpe(2026, 11, 10, 12, 0), night));
+}
+
+/// 3.4.0 補跑時段（padavan-tw 建議）：白天開機時，缺檔的補跑等到時段內才跑；排定時間與手動不受影響
+#[tokio::test(start_paused = true)]
+async fn catch_up_waits_for_window() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let mut o = opts(&clock);
+    o.file_exists = Arc::new(|_: &str| false);
+    o.tick_interval = Duration::from_secs(60);
+    let s = Scheduler::new(
+        json!({
+            "system": { "catchUpWindow": "01:00-06:00" },
+            "jobs": { "a": { "at": "04:10", "runIfMissing": "state/upstreams.json", "startDelaySec": 60 } }
+        }),
+        None,
+        o,
+    );
+    let runs = Arc::new(AtomicU32::new(0));
+    let r = runs.clone();
+    s.register("a", move |_ctx: JobCtx| {
+        let r = r.clone();
+        async move {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let h = s.start();
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "白天不補跑");
+    let st = s.status();
+    assert_eq!(st["catchUpWindow"], "01:00-06:00");
+    assert_eq!(st["catchUpWaiting"], json!(["a"]));
+    // 手動照樣可以跑
+    assert_eq!(s.request("a", "手動")["ok"], true);
+    idle(&s).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    // 時鐘走到補跑時段：等著的補跑開始
+    clock.set(tpe(2026, 11, 11, 1, 5));
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    idle(&s).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert_eq!(s.status()["catchUpWaiting"], json!([]));
+    h.abort();
+}
+
+/// 沒設補跑時段：跟以前一樣，啟動延遲後就補跑
+#[tokio::test(start_paused = true)]
+async fn catch_up_without_window_runs_immediately() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let mut o = opts(&clock);
+    o.file_exists = Arc::new(|_: &str| false);
+    let s = Scheduler::new(
+        json!({ "system": { "catchUpWindow": "" }, "jobs": { "a": { "at": "04:10", "runIfMissing": "x", "startDelaySec": 60 } } }),
+        None,
+        o,
+    );
+    let runs = Arc::new(AtomicU32::new(0));
+    let r = runs.clone();
+    s.register("a", move |_ctx: JobCtx| {
+        let r = r.clone();
+        async move {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let h = s.start();
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    idle(&s).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(s.status()["catchUpWindow"], Value::Null);
+    h.abort();
+}

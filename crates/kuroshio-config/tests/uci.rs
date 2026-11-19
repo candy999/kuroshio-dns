@@ -773,3 +773,18 @@ fn help_texts_mention_duplicate_work() {
         );
     }
 }
+
+/// 3.4.0 補跑時段：main.catchup_window → system.catchUpWindow；沒填就沒有這個鍵（跟以前一樣）
+#[test]
+fn catchup_window_option() {
+    let d = load(&default_text(), &env());
+    assert_eq!(g(&d, "system.catchUpWindow"), &json!(""));
+    // 測試用的預設 UCI 是舊的寫法（section 類型不是 kuroshio），接在 data_dir 後面
+    let text = default_text().replace(
+        "\toption data_dir ''\n",
+        "\toption data_dir ''\n\toption catchup_window '01:00-06:00'\n",
+    );
+    assert_ne!(text, default_text());
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "system.catchUpWindow"), &json!("01:00-06:00"));
+}
