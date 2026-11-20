@@ -842,6 +842,15 @@ impl Governor {
         let protected = self.steps.iter().any(|s| s.key() == "protected" && s.is_shed());
         let i = self.inner.lock().unwrap();
         let r = i.last;
+        // 3.4.1：分項加總與「其他」（程式本身、連線與背景工作、配置器還沒還給系統的空間）。
+        // 「其他」很大而且讓出記憶體後也不降，多半是配置器沒把空出來的記憶體還給系統
+        let accounted: u64 = sizes
+            .iter()
+            .filter(|(k, _)| k.ends_with("Bytes"))
+            .filter_map(|(_, v)| v.as_u64())
+            .sum();
+        sizes.insert("accountedBytes".into(), json!(accounted));
+        sizes.insert("otherBytes".into(), json!(r.rss.map(|rss| rss.saturating_sub(accounted))));
         let kb = |x: Option<u64>| x.map(|v| v / 1024);
         json!({
             "enabled": true,

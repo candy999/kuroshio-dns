@@ -155,6 +155,17 @@ impl Cdn {
         VState::Trial
     }
 
+    /// 這個回應是哪家 CDN（只判斷、不改寫、不排背景工作；串接上游給的答案用，3.4.1）
+    pub fn provider_of(&self, msg: &Message, qtype: u16) -> Option<&'static str> {
+        if !self.cfg.enabled || msg.answers.is_empty() {
+            return None;
+        }
+        if qtype != rtype::A && qtype != rtype::AAAA && qtype != rtype::HTTPS {
+            return None;
+        }
+        self.with_classifier(|c| Self::detect(c, msg)).map(|(p, _)| p)
+    }
+
     /// 找出這個回應屬於哪家 CDN（IP 範圍優先，再看 CNAME 鏈最末端）
     /// 每個 A / AAAA / HTTPS 回應都會跑（絕大多數不是 CDN）：不拿狀態鎖、不配置記憶體
     fn detect(cls: &Classifier, msg: &Message) -> Option<(&'static str, &'static str)> {

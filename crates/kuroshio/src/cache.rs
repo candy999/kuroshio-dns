@@ -30,6 +30,8 @@ pub struct Entry {
     pub ranked: Option<String>,
     /// 「如果用一般 DNS 會怎樣」：固定上游以外的上游給的 A 記錄（CDN 路由統計用）
     pub baseline: Option<kuroshio_cdn::Baseline>,
+    /// 答案來自串接上游（上游黑潮，3.4.1）：回應時不做 CDN 改寫與背景驗證（上游已經做過）
+    pub chained: bool,
     pub stored_at: Instant,
     pub expires_at: Instant,
     /// 寫入時的 TTL（自適應預取用）
@@ -70,6 +72,7 @@ impl Entry {
             fast,
             ranked,
             baseline: None,
+            chained: false,
             stored_at: now,
             expires_at: now + Duration::from_secs(ttl as u64),
             ttl,

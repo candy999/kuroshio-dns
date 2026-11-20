@@ -170,6 +170,52 @@ struct Bg {
     verify: HashSet<String>,
     ecs: HashSet<String>,
     cross: HashSet<String>,
+    /// 進行中的節點延遲量測（3.4.1：設上限）
+    latency: usize,
+    /// 排隊已滿、這次沒有排的背景工作數（3.4.1；之後的查詢會再排）
+    deferred: u64,
+}
+
+/// 每種背景工作（驗證、ECS、跨 CDN）最多排幾個在等（含進行中）：同時可以做的數量 × 這個倍數，至少 [`QUEUE_MIN`]。
+/// 3.4.1：以前每個工作先開好再等名額，MT7621 這種慢 CPU 一波查詢就能堆上千個（記憶體跟著漲，也都很晚才做完）。
+/// 排不進的不記任何狀態：網域還是「驗證中」，下一次查詢會再排
+const QUEUE_PER_PERMIT: usize = 16;
+const QUEUE_MIN: usize = 32;
+/// 同時進行的節點延遲量測上限
+const LATENCY_MAX: usize = 64;
+
+fn queue_cap(concurrency: usize) -> usize {
+    (concurrency.max(1) * QUEUE_PER_PERMIT).max(QUEUE_MIN)
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Verify,
+    Ecs,
+    Cross,
+    Latency,
+}
+
+/// 背景工作結束時把名額還回去；工作被取消（重新載入時舊的 runtime 結束）也一樣，
+/// 不然留在名單裡的鍵會一直佔著排隊上限
+struct BgSlot(Arc<Cdn>, Kind, String);
+
+impl Drop for BgSlot {
+    fn drop(&mut self) {
+        let mut bg = self.0.bg.lock().unwrap();
+        match self.1 {
+            Kind::Verify => {
+                bg.verify.remove(&self.2);
+            }
+            Kind::Ecs => {
+                bg.ecs.remove(&self.2);
+            }
+            Kind::Cross => {
+                bg.cross.remove(&self.2);
+            }
+            Kind::Latency => bg.latency = bg.latency.saturating_sub(1),
+        }
+    }
 }
 
 pub struct Cdn {
@@ -790,41 +836,62 @@ impl Cdn {
                 orig,
             } => {
                 let key = format!("{name}|{family}");
+                if bg.verify.len() >= queue_cap(self.cfg.verify_concurrency) && !bg.verify.contains(&key) {
+                    bg.deferred += 1;
+                    return;
+                }
                 if !bg.verify.insert(key.clone()) {
                     return;
                 }
                 rt.spawn(async move {
-                    let _permit = me.verify_sem.clone().acquire_owned().await;
-                    me.verify(&name, &provider, family, orig).await;
-                    me.bg.lock().unwrap().verify.remove(&key);
+                    let g = BgSlot(me, Kind::Verify, key);
+                    let _permit = g.0.verify_sem.clone().acquire_owned().await;
+                    g.0.verify(&name, &provider, family, orig).await;
                 });
             }
             Task::Ecs { name, ips4, ips6 } => {
+                if bg.ecs.len() >= queue_cap(self.cfg.ecs.concurrency) && !bg.ecs.contains(&name) {
+                    bg.deferred += 1;
+                    return;
+                }
                 if !bg.ecs.insert(name.clone()) {
                     return;
                 }
                 rt.spawn(async move {
-                    let _permit = me.ecs_sem.clone().acquire_owned().await;
-                    me.ecs_probe(&name, &ips4, &ips6).await;
-                    me.bg.lock().unwrap().ecs.remove(&name);
+                    let g = BgSlot(me, Kind::Ecs, name);
+                    let _permit = g.0.ecs_sem.clone().acquire_owned().await;
+                    g.0.ecs_probe(&g.2, &ips4, &ips6).await;
                 });
             }
             Task::Cross { name, from, orig } => {
-                if !self.cfg.cross.enabled || !bg.cross.insert(name.clone()) {
+                if !self.cfg.cross.enabled {
+                    return;
+                }
+                if bg.cross.len() >= queue_cap(self.cfg.cross.concurrency) && !bg.cross.contains(&name) {
+                    bg.deferred += 1;
+                    return;
+                }
+                if !bg.cross.insert(name.clone()) {
                     return;
                 }
                 rt.spawn(async move {
-                    let _permit = me.cross_sem.clone().acquire_owned().await;
-                    me.cross_explore(&name, &from, orig).await;
-                    me.bg.lock().unwrap().cross.remove(&name);
+                    let g = BgSlot(me, Kind::Cross, name);
+                    let _permit = g.0.cross_sem.clone().acquire_owned().await;
+                    g.0.cross_explore(&g.2, &from, orig).await;
                 });
             }
             Task::TryV6 { provider, ip } => {
                 rt.spawn(async move { me.try_v6(&provider, ip).await });
             }
             Task::Latency(ip) => {
+                if bg.latency >= LATENCY_MAX {
+                    bg.deferred += 1;
+                    return;
+                }
+                bg.latency += 1;
                 rt.spawn(async move {
-                    me.net.latency(ip).await;
+                    let g = BgSlot(me, Kind::Latency, String::new());
+                    g.0.net.latency(ip).await;
                 });
             }
         }
@@ -834,6 +901,11 @@ impl Cdn {
         for t in tasks {
             self.schedule(t);
         }
+    }
+
+    /// 排隊已滿而沒有排的背景工作累計數（3.4.1）
+    pub fn deferred(&self) -> u64 {
+        self.bg.lock().unwrap().deferred
     }
 
     /// 背景工作中的數量（驗證，ECS，跨 CDN）
@@ -870,13 +942,23 @@ impl Cdn {
 
     /// 記憶體裡的網域資料庫大約多大（bytes；狀態頁分項用量用，不必精確）
     pub fn approx_ram_bytes(&self) -> usize {
-        self.state().db.domains.values().map(|d| d.approx_bytes()).sum()
+        // 每筆的估計裡含雜湊表的一格；雜湊表實際配置的格數（容量）比筆數多，空格也佔記憶體（3.4.1 起算進去）
+        let st = self.state();
+        let m = &st.db.domains;
+        let slot = std::mem::size_of::<(Arc<str>, crate::db::Domain)>();
+        let items: usize = m.values().map(|d| d.approx_bytes()).sum();
+        items + m.capacity().saturating_sub(m.len()) * slot + m.capacity() + 16
     }
 
     /// `/api/status` 的 cdn 區塊
     pub fn status_lite(&self) -> Value {
         let st = self.state();
-        json!({ "enabled": self.cfg.enabled, "stats": st.stats, "domains": st.db.domains.len() })
+        let (verify, ecs, cross, deferred) = {
+            let bg = self.bg.lock().unwrap();
+            (bg.verify.len(), bg.ecs.len(), bg.cross.len(), bg.deferred)
+        };
+        json!({ "enabled": self.cfg.enabled, "stats": st.stats, "domains": st.db.domains.len(),
+                "background": { "verify": verify, "ecs": ecs, "cross": cross, "deferred": deferred } })
     }
 
     /// 狀態（同 2.x `optimizer.status()`）

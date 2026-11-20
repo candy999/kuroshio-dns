@@ -4,6 +4,7 @@ mod behaviors;
 mod bench;
 mod jobs;
 mod parity;
+mod queue;
 mod selftest;
 mod share;
 mod state;

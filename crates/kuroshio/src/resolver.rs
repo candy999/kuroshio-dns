@@ -162,6 +162,8 @@ struct Decided {
     class: Class,
     source: String,
     oks: Vec<Arc<Answer>>,
+    /// 用的是串接上游（上游黑潮）的回答：CDN 節點與 IP 排序上游已經做過（3.4.1）
+    chained: bool,
 }
 
 type Waiters = Vec<oneshot::Sender<Arc<Entry>>>;
@@ -600,7 +602,13 @@ impl Resolver {
         r.answers = e.answers.iter().map(|a| Record { ttl, ..a.clone() }).collect();
         // CDN 調整會改寫答案：要 DNSSEC 記錄或類別不是 IN 的查詢不動（同 job() 的 verbatim）
         let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1;
-        if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim) {
+        if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim && e.chained) {
+            // 串接上游（上游黑潮）給的答案：CDN 節點上游已經驗證、換好（3.4.1）。
+            // 下游不再改寫、不排背景驗證（MIPS 上的 TLS 驗證很吃 CPU），只記哪家 CDN（統計用，唯讀快照）
+            if let Some(p) = cdn.provider_of(&r, query.questions[0].qtype) {
+                self.stats.cdn(p, None, None);
+            }
+        } else if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim) {
             let (qname, qtype) = (&query.questions[0].name, query.questions[0].qtype);
             let res = cdn.apply(&mut r, qname, qtype);
             if let Some(cap) = res.ttl_cap {
@@ -711,7 +719,17 @@ impl Resolver {
                     return;
                 }
                 fast_sent = true;
-                let e = self.store(&key, &a.msg, Class::Ok, a.up.up.id.clone(), &qname, true, None, None);
+                let e = self.store(
+                    &key,
+                    &a.msg,
+                    Class::Ok,
+                    a.up.up.id.clone(),
+                    &qname,
+                    true,
+                    None,
+                    None,
+                    a.up.role == Role::Chain,
+                );
                 self.notify(&key, &e, false);
             })
             .await;
@@ -742,6 +760,7 @@ impl Resolver {
                 false,
                 None,
                 None,
+                false,
             ),
             Some(mut d) => {
                 let mut note = None;
@@ -753,7 +772,7 @@ impl Resolver {
                     }
                 }
                 let baseline = baseline_of(cdn.as_deref(), qtype, &results);
-                self.store(&key, &d.msg, d.class, d.source, &qname, false, note, baseline)
+                self.store(&key, &d.msg, d.class, d.source, &qname, false, note, baseline, d.chained)
             }
         };
         self.notify(&key, &e, true);
@@ -850,7 +869,7 @@ impl Resolver {
                 }
             }
             let baseline = baseline_of(cdn.as_deref(), qtype, &all);
-            me.store(&key, &d.msg, d.class, d.source, &qname, false, note, baseline);
+            me.store(&key, &d.msg, d.class, d.source, &qname, false, note, baseline, d.chained);
         });
     }
 
@@ -954,6 +973,10 @@ impl Resolver {
 
     /// 合併所有上游給的 IP（最終 CNAME 相同的才合併），TCP 443 測速後排序
     async fn merge_rank(&self, oks: &[Arc<Answer>], qname: &str, qtype: u16) -> Option<(Message, String, String)> {
+        // 串接上游（上游黑潮）的回答已經合併、測速、排好序（3.4.1）：不在下游再測一次 TCP 443
+        if oks.iter().all(|a| a.up.role == Role::Chain) {
+            return None;
+        }
         let mut all: Vec<IpAddr> = Vec::new();
         for a in oks {
             for ip in logic::ips_of(&a.msg, qtype) {
@@ -1013,6 +1036,7 @@ impl Resolver {
         fast: bool,
         ranked: Option<String>,
         baseline: Option<kuroshio_cdn::Baseline>,
+        chained: bool,
     ) -> Arc<Entry> {
         let p = &self.params;
         let qtype = Cache::key_qtype(key);
@@ -1073,6 +1097,7 @@ impl Resolver {
         e.blocked = blocked;
         e.blocked_bypass = blocked_bypass;
         e.baseline = baseline;
+        e.chained = chained;
         cache.insert(key.to_string(), e, now)
     }
 }
@@ -1197,6 +1222,7 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
             class: Class::Ok,
             source: first.up.up.id.clone(),
             oks: oks.clone(),
+            chained: first.up.role == Role::Chain,
         });
     }
     let pinned_first = |v: &[Arc<Answer>]| -> Option<Arc<Answer>> {
@@ -1222,6 +1248,7 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
             class: pick.class,
             source: pick.up.up.id.clone(),
             oks: vec![],
+            chained: pick.up.role == Role::Chain,
         });
     }
     if accept_blocked {
@@ -1231,6 +1258,7 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
                 class: Class::Ok,
                 source: format!("{}(上游已擋)", b.up.up.id),
                 oks: vec![],
+                chained: b.up.role == Role::Chain,
             });
         }
     }

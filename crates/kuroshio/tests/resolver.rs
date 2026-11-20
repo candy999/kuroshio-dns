@@ -866,3 +866,75 @@ async fn backfill_skipped_while_chained() {
     assert_eq!((chain.n(), pinned.n()), (1, 0));
     assert_eq!(today(&r, "backfill"), 0);
 }
+
+// ---------------------------------------------------------------- 3.4.1 串接時下游不重做 CDN 與 IP 測速
+
+/// 測速埠：記錄有幾個連線進來（IP 測速用 TCP 連線）
+async fn probe_port() -> (u16, Arc<AtomicUsize>) {
+    let l = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    tokio::spawn(async move {
+        loop {
+            if l.accept().await.is_ok() {
+                n2.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    (port, n)
+}
+
+fn two_cdn_ips(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (0, vec![a(name, 300, [127, 0, 0, 8]), a(name, 300, [127, 0, 0, 9])], 0)
+}
+
+fn recording_cdn(r: &kuroshio::resolver::Resolver, c: &serde_json::Value, tag: &str) -> Arc<kuroshio_cdn::Cdn> {
+    let dir = std::env::temp_dir().join(format!("kuroshio-ch-{tag}-{}", std::process::id()));
+    let net: Arc<dyn kuroshio_cdn::Net> = Arc::new(kuroshio_cdn::RealNet::new(r.iprank.clone()));
+    let cdn = kuroshio_cdn::Cdn::load(c, kuroshio_cdn::Paths::new(dir.join("state"), dir.join("data")), net);
+    cdn.record_tasks();
+    cdn.with_state(|st| st.pools.p.get_mut("fastly").expect("fastly").range4 = kuroshio_cdn::pools::cidr(&["127.0.0.0/24"]));
+    r.set_cdn(Some(cdn.clone()));
+    cdn
+}
+
+/// 答案來自串接上游（上游黑潮已經換好 CDN 節點、測速排序）：下游不再做 TCP 443 測速、
+/// 不排 CDN 背景工作、CDN 資料庫不記這個網域；只統計是哪家 CDN。
+/// 同樣的答案從一般上游來時照舊測速（確認這個測試抓得到差別）
+#[tokio::test]
+async fn chained_answers_skip_cdn_and_ranking() {
+    let (port, probes) = probe_port().await;
+    let extra = json!({ "resolver": { "rankIps": true, "fastPath": false }, "iprank": { "port": port, "timeoutMs": 300 } });
+
+    // 一般上游：會測速
+    let (plain, _) = upstream(0, two_cdn_ips).await;
+    let c = cfg(&[plain], extra.clone());
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let _cdn = recording_cdn(&r, &c, "plain");
+    r.handle(&q(1, "cdn-plain.example.com", 1), &CTX).await.unwrap();
+    assert!(probes.load(Ordering::SeqCst) > 0, "一般上游給兩個位址：照舊測速");
+
+    // 串接上游：不測速、不排背景工作
+    let (chain, n_chain) = upstream(0, two_cdn_ips).await;
+    let mut c = cfg(&[], extra);
+    // 備援（自己的上游的替身）：串接上游正常時不會被問
+    let (own, n_own) = upstream(0, two_cdn_ips).await;
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    let cdn = recording_cdn(&r, &c, "chain");
+    let before = probes.load(Ordering::SeqCst);
+    for i in 0..3 {
+        let m = Message::parse(&r.handle(&q(i, "cdn-chain.example.com", 1), &CTX).await.unwrap()).unwrap();
+        assert_eq!(m.answers.len(), 2, "上游給的兩個位址原樣回給用戶端");
+        assert!(m.answers.iter().all(|x| x.ttl > 10), "不套用 CDN 試用期的短 TTL：{:?}", m.answers);
+    }
+    assert_eq!(n_chain.load(Ordering::SeqCst), 1, "第二次起是快取");
+    assert_eq!(n_own.load(Ordering::SeqCst), 0, "串接上游正常：不問自己的上游");
+    assert_eq!(probes.load(Ordering::SeqCst), before, "串接上游的答案不再測速");
+    assert!(cdn.take_tasks().is_empty(), "不排 CDN 背景工作");
+    assert!(cdn.state().db.get("cdn-chain.example.com").is_none(), "CDN 資料庫不記這個網域");
+    assert_eq!(r.stats.summary()["today"]["cdn"]["fastly"], 3, "還是統計是哪家 CDN");
+}
