@@ -528,12 +528,12 @@ impl Persister {
 
     /// 定時呼叫：到了間隔、而且今天的寫入量還沒超過節奏目標的才寫；到了最久未存上限的一定寫
     pub fn flush(&mut self, now: u64) -> std::io::Result<usize> {
-        self.flush_inner(now, false, false).map(|x| x.0)
+        self.flush_inner(now, false, false, false).map(|x| x.0)
     }
 
     /// 關機時：有變動的全部寫出
     pub fn flush_all(&mut self, now: u64) -> std::io::Result<usize> {
-        self.flush_inner(now, true, false).map(|x| x.0)
+        self.flush_inner(now, true, false, false).map(|x| x.0)
     }
 
     /// 關機：有變動的全部寫出，回傳（寫了幾份, 磁碟上一共幾 bytes）。
@@ -541,12 +541,14 @@ impl Persister {
     /// 斷電時的保證跟一份一份寫一樣（內容落地之後才改名），但 fsync 次數從「每份兩次」變成幾次（3.4.2：
     /// D3 的 USB 隨身碟上幾百份 CDN 分片一份一份寫，30 秒內寫不完被強制停止，排程紀錄也沒寫到）
     pub fn flush_for_shutdown(&mut self, now: u64) -> std::io::Result<(usize, u64)> {
-        self.flush_inner(now, true, cfg!(unix))
+        // 先寫暫存檔、最後一起落地（batch）只在 Unix：Windows 沒有 syncfs，暫存檔要各自 FlushFileBuffers。
+        // 小檔先寫與 10 秒的上限兩邊都要（3.4.2 Windows 實測：以前只有 Unix 有，Windows 照名稱一份一份寫、沒有上限）
+        self.flush_inner(now, true, cfg!(unix), true)
     }
 
     /// 有變動的全部寫出，回傳（寫了幾份, 磁碟上一共幾 bytes）：管理介面的「立即儲存學習資料」
     pub fn flush_all_counted(&mut self, now: u64) -> std::io::Result<(usize, u64)> {
-        self.flush_inner(now, true, false)
+        self.flush_inner(now, true, false, false)
     }
 
     /// 估計大小（磁碟上）
@@ -734,7 +736,7 @@ impl Persister {
         false
     }
 
-    fn flush_inner(&mut self, now: u64, force: bool, batch: bool) -> std::io::Result<(usize, u64)> {
+    fn flush_inner(&mut self, now: u64, force: bool, batch: bool, shutdown: bool) -> std::io::Result<(usize, u64)> {
         self.roll_day(now);
         let interval = effective_interval(&self.policy, self.mem);
         let critical = self.mem.pressure() == Pressure::Critical;
@@ -742,7 +744,7 @@ impl Persister {
             .entries
             .iter()
             .filter_map(|(k, e)| {
-                let size = if batch { self.size_estimate(k, e) } else { 0 };
+                let size = if shutdown { self.size_estimate(k, e) } else { 0 };
                 e.pending.as_ref().map(|p| (!p.opts.after.is_empty(), size, k.clone()))
             })
             .collect();
@@ -759,7 +761,7 @@ impl Persister {
         for (_, _, name) in names {
             // 關機有時間限制（整合方通常等 15～30 秒就強制結束）：寫到 SHUTDOWN_BUDGET 就停，剩下的（排在後面的大檔，
             // 通常是 CDN 分片）下次啟動用上一次存的。小檔先寫，排程紀錄這類小檔一定寫得到（3.4.2）
-            if batch && t0.elapsed() >= SHUTDOWN_BUDGET {
+            if shutdown && t0.elapsed() >= SHUTDOWN_BUDGET {
                 skipped_for_time += 1;
                 continue;
             }
@@ -856,10 +858,11 @@ impl Persister {
             }
             if why == Why::Age {
                 self.stats.forced_by_age += 1;
+                // 硬碟的上限是 10 分鐘：以前印成「已經 0.2 小時沒存（上限 0 小時）」
                 info!(
-                    "{name} 已經 {:.1} 小時沒存（上限 {} 小時）：不管今天的寫入量，直接寫入 {disk} bytes",
-                    age as f64 / 3600.0,
-                    self.policy.max_age / 3600
+                    "{name} 已經 {} 沒存（上限 {}）：不管今天的寫入量，直接寫入 {disk} bytes",
+                    fmt_age(age),
+                    fmt_age(self.policy.max_age)
                 );
             }
             let e = self.entries.get_mut(&name).unwrap();
@@ -1003,6 +1006,15 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// 同 `write_atomic`，內容由 `f` 邊產生邊寫進暫存檔（經過緩衝）。回傳（內容雜湊，大小）
 pub fn write_atomic_with(path: &Path, gen: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<(u64, u64)> {
     write_file(path, false, gen)
+}
+
+/// 「多久沒存」的文字：一小時以上用小時（一位小數），以下用分鐘
+fn fmt_age(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{:.1} 小時", secs as f64 / 3600.0)
+    } else {
+        format!("{} 分鐘", secs.div_ceil(60))
+    }
 }
 
 /// 寫檔（`compress` = 邊寫邊 zstd 壓縮）。回傳（壓縮前內容的雜湊，磁碟上的大小）
@@ -1261,6 +1273,13 @@ mod tests {
         d.stage("b", vec![2; 4096]);
         assert_eq!(d.flush(t).unwrap(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn age_text_uses_minutes_below_an_hour() {
+        assert_eq!(fmt_age(600), "10 分鐘");
+        assert_eq!(fmt_age(720), "12 分鐘");
+        assert_eq!(fmt_age(86400), "24.0 小時");
     }
 
     #[test]

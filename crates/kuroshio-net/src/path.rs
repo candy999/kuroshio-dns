@@ -837,12 +837,63 @@ async fn identify(addr: SocketAddr, tcp: bool, limit: Duration) -> Interceptor {
     }
 }
 
-/// 預設閘道（Linux 讀 /proc/net/route；其他系統回 None）
+/// 預設閘道（Linux 讀 /proc/net/route；Windows 讀 `route print -4 0.0.0.0`，取計量最小的一筆；其他系統回 None）。
+/// 3.4.2 以前 Windows 一律 None：串接只能靠「被攔截的一般 DNS」，路由器不攔截 53 埠時就串不起來，
+/// 狀態頁與 check-path 也寫不出上游是哪一台路由器
 pub fn default_gateway() -> Option<IpAddr> {
-    let s = std::fs::read_to_string("/proc/net/route").ok()?;
-    parse_route_gateway(&s)
+    #[cfg(windows)]
+    {
+        windows_default_gateway()
+    }
+    #[cfg(not(windows))]
+    {
+        let s = std::fs::read_to_string("/proc/net/route").ok()?;
+        parse_route_gateway(&s)
+    }
 }
 
+#[cfg(windows)]
+fn windows_default_gateway() -> Option<IpAddr> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // 用完整路徑（不靠 PATH）；路由表的數字欄位不受系統語言影響
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let exe = std::path::Path::new(&root).join("System32").join("ROUTE.EXE");
+    let out = Command::new(exe)
+        .args(["print", "-4", "0.0.0.0"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    parse_route_print(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `route print -4` 的「使用中的路由」：目的地與遮罩都是 0.0.0.0、閘道是位址（不是 On-link）的，取計量最小的。
+/// 「持續路由」那一段只有四欄（沒有介面），不算
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_route_print(s: &str) -> Option<IpAddr> {
+    let mut best: Option<(u32, Ipv4Addr)> = None;
+    for line in s.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() != 5 || f[0] != "0.0.0.0" || f[1] != "0.0.0.0" {
+            continue;
+        }
+        let (Ok(gw), Ok(_), Ok(metric)) = (f[2].parse::<Ipv4Addr>(), f[3].parse::<Ipv4Addr>(), f[4].parse::<u32>()) else {
+            continue;
+        };
+        if gw.is_unspecified() {
+            continue;
+        }
+        if best.is_none() || best.is_some_and(|(m, _)| metric < m) {
+            best = Some((metric, gw));
+        }
+    }
+    best.map(|(_, g)| IpAddr::V4(g))
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_route_gateway(s: &str) -> Option<IpAddr> {
     for line in s.lines().skip(1) {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -975,7 +1026,12 @@ pub async fn check(t: &Targets) -> Report {
             vec![(Proto::Dot, a), (Proto::Doh, b), (Proto::Quic, c)]
         })
     };
-    let gateway = if t.read_gateway { default_gateway() } else { None };
+    // Windows 要執行 ROUTE.EXE：不佔非同步的執行緒
+    let gateway = if t.read_gateway {
+        tokio::task::spawn_blocking(default_gateway).await.ok().flatten()
+    } else {
+        None
+    };
     // 保留位址剛好是預設閘道（有些網路真的這樣設）：它本來就可能有 DNS，不能拿來判斷攔截
     let testnet_v4: Vec<SocketAddr> = t.testnet_v4.iter().copied().filter(|a| Some(a.ip()) != gateway).collect();
     let (plain_v4, hit4) = probe_plain(&testnet_v4, t.plain_timeout).await;
@@ -1139,6 +1195,39 @@ mod tests {
         if cfg!(target_endian = "little") {
             assert_eq!(g, IpAddr::from([10, 0, 0, 1]));
         }
+    }
+
+    #[test]
+    fn route_print_picks_lowest_metric_default_route() {
+        // Windows 11（兩張網卡，兩個預設閘道；介面計量 15 / 25），加上持續路由一筆
+        let s = "===========================================================================
+                 Active Routes:
+                 Network Destination        Netmask          Gateway       Interface  Metric
+                           0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.104     25
+                           0.0.0.0          0.0.0.0         10.0.0.1       10.0.0.108     15
+                          10.0.0.0    255.255.255.0         On-link        10.0.0.108    271
+                 ===========================================================================
+                 Persistent Routes:
+                   Network Address          Netmask  Gateway Address  Metric
+                           0.0.0.0          0.0.0.0      172.16.0.1  Default
+";
+        assert_eq!(parse_route_print(s), Some("10.0.0.1".parse().unwrap()));
+        // 只有 On-link（點對點 VPN）或沒有預設路由
+        assert_eq!(
+            parse_route_print(
+                "  0.0.0.0  0.0.0.0  On-link  10.8.0.2  35
+"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_route_print(
+                "Active Routes:
+None
+"
+            ),
+            None
+        );
     }
 
     #[test]

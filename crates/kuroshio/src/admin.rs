@@ -122,7 +122,10 @@ pub fn host_allowed(host: Option<&str>, allowed: &[String]) -> bool {
     if name.is_empty() {
         return false;
     }
-    local_host(Some(h)) || name.parse::<IpAddr>().is_ok() || allowed.iter().any(|a| a.eq_ignore_ascii_case(name))
+    // 結尾的點（完整網域名稱 `nas.example.com.`）跟 allowedHosts 一樣去掉再比：以前設定裡的會去掉、Host 的不會，
+    // 用「名稱.」開永遠被擋，訊息還叫人把「名稱.」加進設定（加了也會被去掉）
+    let bare = name.strip_suffix('.').unwrap_or(name);
+    local_host(Some(h)) || name.parse::<IpAddr>().is_ok() || allowed.iter().any(|a| a.eq_ignore_ascii_case(bare))
 }
 
 /// 匯入備份的路徑（內容上限是備份檔的上限，不是 1 MB）
@@ -1080,6 +1083,7 @@ mod tests {
         let allowed = vec!["nas.example.com".to_string()];
         assert!(host_allowed(Some("NAS.example.com:8054"), &allowed));
         assert!(!host_allowed(Some("nas.example.com.evil.example:8054"), &allowed));
+        assert!(host_allowed(Some("nas.example.com.:8054"), &allowed), "結尾的點跟設定一樣去掉");
         assert_eq!(qtype_num("https"), Some(65));
         assert_eq!(qtype_num("nope"), None);
     }
