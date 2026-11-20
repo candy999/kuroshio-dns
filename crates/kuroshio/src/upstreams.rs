@@ -61,6 +61,9 @@ struct Stats {
     open_until: Option<Instant>,
 }
 
+/// 暫停過的自動上游，暫停結束後要穩定這麼久才把暫停次數歸零（暫停時間重新從 1 分鐘算）
+const TRIP_RESET: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Debug)]
 pub struct Up {
     pub up: Upstream,
@@ -147,7 +150,12 @@ impl Up {
         if ok {
             s.ok += 1;
             s.consec_fail = 0;
-            s.trips = 0;
+            // 暫停結束後成功一筆就歸零的話，「時好時壞」的上游（3.4.2 Windows 實測：tls://ordns.he.net 每次接回後
+            // 先答幾十筆、再連續逾時）永遠是「暫停 1 分鐘」，每 70 秒重來一輪，暫停時間不會拉長。
+            // 改成暫停結束後穩定 10 分鐘才歸零
+            if s.open_until.map_or(true, |t| t + TRIP_RESET <= Instant::now()) {
+                s.trips = 0;
+            }
             s.ewma = Some(s.ewma.map(|e| e * 0.8 + ms * 0.2).unwrap_or(ms));
         } else {
             s.fail += 1;
@@ -652,6 +660,35 @@ mod tests {
         let (_, b) = select_chain(None, false, &pinned, auto.clone(), &fb, &lr);
         assert_eq!(b.len(), 2, "沒串接時備援照舊");
         kuroshio_net::path::clear();
+    }
+
+    /// 3.4.2：時好時壞的自動上游，暫停時間照樣拉長（1 → 2 分鐘），不會被暫停結束後的一筆成功歸零
+    #[test]
+    fn flapping_auto_upstream_backs_off() {
+        let u = Up::new(Upstream::parse("tls://dns.example.net").unwrap(), Role::Auto);
+        let fail5 = |u: &Up| (0..5).for_each(|_| u.record(false, 0.0));
+        let pause_left = |u: &Up| {
+            u.stats
+                .lock()
+                .unwrap()
+                .open_until
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+        };
+        fail5(&u);
+        assert!(pause_left(&u) <= Duration::from_secs(60));
+        // 暫停結束（把時間撥到過去），答對一筆，又連續失敗
+        u.stats.lock().unwrap().open_until = Some(Instant::now() - Duration::from_secs(1));
+        u.record(true, 5.0);
+        fail5(&u);
+        assert!(pause_left(&u) > Duration::from_secs(90), "第二次暫停 2 分鐘");
+        // 暫停結束已經超過 10 分鐘：歸零（開機不到 10 分鐘的機器上 Instant 撥不回去，略過這一段）
+        if let Some(t) = Instant::now().checked_sub(TRIP_RESET + Duration::from_secs(1)) {
+            u.stats.lock().unwrap().open_until = Some(t);
+            u.record(true, 5.0);
+            fail5(&u);
+            assert!(pause_left(&u) <= Duration::from_secs(60), "穩定 10 分鐘之後重新從 1 分鐘算");
+        }
     }
 
     #[test]

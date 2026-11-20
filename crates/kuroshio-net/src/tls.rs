@@ -453,6 +453,66 @@ pub async fn connect_ip_with(
     .map_err(|_| anyhow!("連線逾時 {ip}:{port}"))?
 }
 
+// ---------------- 連線位址的順序：上次連上的排前面，沒連上（或還沒連上就被取消）的放最後 ----------------
+//
+// 3.4.2 Windows 實測：anycast.dns.nextdns.io 解析出 45.90.28.0 與 45.90.30.0，第一個 853 埠連不上（SYN 沒回應）。
+// 依序試、每個位址等滿逾時，但查詢通常 0.3～0.6 秒就由別的上游回答、這邊被取消，永遠輪不到第二個位址；
+// 被取消的不算失敗，上游也不會被暫停，於是每筆查詢都白送一次 SYN（單獨運作每秒 10 筆時 13 分鐘 885 次）
+
+/// 主機 →（上次連上的位址，上次沒連上的位址）
+type AddrMemo = Mutex<HashMap<String, (Option<IpAddr>, Option<IpAddr>)>>;
+const ADDR_MEMO_MAX: usize = 512;
+
+fn addr_memo() -> &'static AddrMemo {
+    static M: OnceLock<AddrMemo> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 依上次的結果排位址：上次沒連上的放最後；上次連上的排第一
+fn order_addrs(host: &str, ips: &mut Vec<IpAddr>) {
+    let m = addr_memo().lock().unwrap();
+    let Some(&(ok, bad)) = m.get(host) else { return };
+    if let Some(i) = bad.and_then(|b| ips.iter().position(|x| *x == b)) {
+        let x = ips.remove(i);
+        ips.push(x);
+    }
+    if let Some(i) = ok.filter(|g| Some(*g) != bad).and_then(|g| ips.iter().position(|x| *x == g)) {
+        let x = ips.remove(i);
+        ips.insert(0, x);
+    }
+}
+
+fn note_addr(host: &str, ip: IpAddr, ok: bool) {
+    let mut m = addr_memo().lock().unwrap();
+    if m.len() >= ADDR_MEMO_MAX && !m.contains_key(host) {
+        m.clear();
+    }
+    let e = m.entry(host.to_string()).or_insert((None, None));
+    if ok {
+        *e = (Some(ip), None);
+    } else {
+        e.1 = Some(ip);
+        if e.0 == Some(ip) {
+            e.0 = None;
+        }
+    }
+}
+
+/// 正在試的位址：沒有成功就結束（失敗、逾時、或整個查詢被取消）都記成「沒連上」
+struct Trying<'a> {
+    host: &'a str,
+    ip: IpAddr,
+    done: bool,
+}
+
+impl Drop for Trying<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            note_addr(self.host, self.ip, false);
+        }
+    }
+}
+
 async fn connect_with(
     host: &str,
     port: u16,
@@ -465,6 +525,7 @@ async fn connect_with(
     if let Some(b) = from {
         ips.retain(|ip| ip.is_ipv4() == b.ip.is_ipv4());
     }
+    order_addrs(host, &mut ips);
     let name = match host.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
         Err(_) => ServerName::try_from(host.to_string()).context("主機名稱格式錯誤")?,
@@ -472,6 +533,7 @@ async fn connect_with(
     let connector = tokio_rustls::TlsConnector::from(cfg);
     let mut last = anyhow!("沒有可用的位址");
     for ip in ips {
+        let mut trying = Trying { host, ip, done: false };
         let r = tokio::time::timeout(timeout, async {
             let tcp = tcp_connect(SocketAddr::new(ip, port), from)
                 .await
@@ -481,7 +543,11 @@ async fn connect_with(
         })
         .await;
         match r {
-            Ok(Ok(s)) => return Ok(s),
+            Ok(Ok(s)) => {
+                trying.done = true;
+                note_addr(host, ip, true);
+                return Ok(s);
+            }
             Ok(Err(e)) => last = e,
             Err(_) => last = anyhow!("連線逾時 {ip}:{port}"),
         }
@@ -816,6 +882,27 @@ async fn h1_post(s: &mut TlsStream<TcpStream>, host: &str, path: &str, body: &[u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.4.2：上次沒連上（或被取消）的位址放最後，上次連上的排第一
+    #[test]
+    fn connect_order_remembers_bad_and_good_addrs() {
+        let a: IpAddr = "192.0.2.10".parse().unwrap();
+        let b: IpAddr = "192.0.2.20".parse().unwrap();
+        let host = "order-test.example";
+        let order = || {
+            let mut v = vec![a, b];
+            order_addrs(host, &mut v);
+            v
+        };
+        assert_eq!(order(), vec![a, b], "沒有紀錄：照解析的順序");
+        // 試 a 的途中被取消（guard 沒標成功就丟掉）
+        drop(Trying { host, ip: a, done: false });
+        assert_eq!(order(), vec![b, a]);
+        note_addr(host, b, true);
+        assert_eq!(order(), vec![b, a], "b 連上了：之後先試 b");
+        note_addr(host, b, false);
+        assert_eq!(order(), vec![a, b], "b 也壞了：換回 a");
+    }
 
     #[test]
     fn boot_cache_prunes_and_caps() {
