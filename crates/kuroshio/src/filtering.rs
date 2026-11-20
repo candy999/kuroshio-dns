@@ -456,6 +456,12 @@ pub struct FilterService {
 /// 從上游黑潮拿到的副本多久內不再自己下載（規格 10 第 3.4 節）
 const SHARED_FRESH_SECS: u64 = 6 * 3600;
 
+/// 錯誤是不是「工作被取消」（runtime 結束時 `spawn_blocking` 的工作）
+fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<tokio::task::JoinError>().is_some_and(|j| j.is_cancelled()))
+}
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -739,6 +745,11 @@ impl FilterService {
                     info!("過濾清單：用本機副本建好（不必等下載），稍後檢查有沒有更新");
                 }
                 true
+            }
+            Err(e) if is_cancelled(&e) => {
+                // 重新載入（或停止）時舊的 runtime 結束、建到一半的工作被取消：新的 runtime 會重新用副本建，不是失敗（3.4.1）
+                info!("過濾清單：重新載入中斷了用本機副本建立的工作，由新的設定接手");
+                false
             }
             Err(e) => {
                 warn!("用本機副本建過濾器失敗：{e:#}，改成下載");

@@ -217,7 +217,7 @@
 				row(down.rows, '串接層數', format(t('%d 層（上限 4 層）'), [u.depth || 2]));
 				if (u.viaNat) row(down.rows, '經 NAT', t('是：上游看到的是另一台 NAT 的位址'));
 				row(down.rows, '串接開始', u.since ? fmtTime(u.since) : null);
-				row(down.rows, '上游上次回應', u.lastOkAt ? fmtTime(u.lastOkAt, 'sec') : null);
+				row(down.rows, '上游最後確認（心跳）', u.lastOkAt ? fmtTime(u.lastOkAt, 'sec') : null);
 			}
 			if (u.failures) row(down.rows, '連續失敗', format(t('%d 次'), [u.failures]));
 			var r = u.registered;

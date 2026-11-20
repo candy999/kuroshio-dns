@@ -2090,15 +2090,19 @@ async fn status_cmd(config: &std::path::Path, uci: bool, json: bool) -> i32 {
         }
         code
     };
-    let cfg = match config_for_cli(config, uci) {
-        Ok(c) => c,
-        Err(e) => return fail(false, e, 2),
-    };
-    let Some(ep) = admin_endpoint(&cfg) else {
+    let (cfg, why) = cli_config_or_default(config, uci, json);
+    let Some(mut ep) = admin_endpoint(&cfg) else {
         return fail(false, "管理 API 沒有開啟（admin.enabled = false），無法查詢狀態".into(), 1);
     };
+    if why.is_some() {
+        ep.1 = None;
+    }
     match admin_call(&ep, "GET", "/api/status", None, std::time::Duration::from_secs(5)).await {
-        Err(e) => fail(false, format!("管理 API 沒有回應（{}）：{e:#}", ep.0), 1),
+        // 讀不到設定、預設的管理埠也沒回應：照樣把設定的錯誤（含 KUROSHIO_UCI_FILE 的提示）講出來
+        Err(e) => match &why {
+            Some(w) => fail(false, format!("設定讀不到：{w}（預設的管理埠 {} 也沒有回應：{e:#}）", ep.0), 2),
+            None => fail(false, format!("管理 API 沒有回應（{}）：{e:#}", ep.0), 1),
+        },
         Ok((401, _)) => fail(
             true,
             "管理 API 需要登入，讀不到登入 token（請用同一個設定檔、有權限讀 token 檔的帳號執行）".into(),
@@ -2120,6 +2124,21 @@ async fn status_cmd(config: &std::path::Path, uci: bool, json: bool) -> i32 {
     }
 }
 
+/// 讀設定給只需要管理 API 的指令（notify、status、chain）：讀不到時改用預設的管理埠（127.0.0.1:8054、不帶 token），
+/// 第三方韌體沒有設 `KUROSHIO_UCI_FILE` 也查得到（3.4.1 起 status、chain 也這樣）。
+/// 回傳 (設定, 讀不到設定的原因)；有原因（備援）時呼叫端要把 token 拿掉，送不到時結束碼用 2（設定讀不到）
+fn cli_config_or_default(config: &std::path::Path, uci: bool, quiet: bool) -> (serde_json::Value, Option<String>) {
+    match config_for_cli(config, uci) {
+        Ok(c) => (c, None),
+        Err(e) => {
+            if !quiet {
+                eprintln!("注意：設定讀不到（{e}）；改用預設的管理埠 8054");
+            }
+            (kuroshio_config::build(&serde_json::json!({})), Some(e))
+        }
+    }
+}
+
 /// `kuroshio notify <事件>`：結束碼 0 = 已送達，1 = 服務沒有回應，2 = 設定讀不到
 async fn notify_cmd(event: NotifyEvent) -> i32 {
     let (config, uci, path, timeout) = match event {
@@ -2132,13 +2151,9 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
     let path = path.as_str();
     // 讀不到設定也試一次預設的管理埠（127.0.0.1:8054，不帶 token）：通知送得到就好，不必知道其他設定。
     // 送不到時結束碼照樣是 2（設定讀不到）
-    let (cfg, fail_code) = match config_for_cli(&config, uci) {
-        Ok(c) => (c, 1),
-        Err(e) => {
-            eprintln!("注意：設定讀不到（{e}）；改用預設的管理埠 8054 送出");
-            (kuroshio_config::build(&serde_json::json!({})), 2)
-        }
-    };
+    let (cfg, why) = cli_config_or_default(&config, uci, false);
+    let fallback = why.is_some();
+    let fail_code = if fallback { 2 } else { 1 };
     let Some(mut ep) = admin_endpoint(&cfg) else {
         eprintln!("管理 API 沒有開啟（admin.enabled = false），無法通知服務");
         return 1;
@@ -2191,22 +2206,24 @@ async fn chain_cmd(action: ChainAction) -> i32 {
         ChainAction::Status { config, uci, json } => (config, uci, "GET", "/api/chain", json),
         ChainAction::Recheck { config, uci } => (config, uci, "POST", "/api/chain/recheck", false),
     };
-    let cfg = match config_for_cli(&config, uci) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("設定讀不到：{e}");
-            return 2;
-        }
-    };
-    let Some(ep) = admin_endpoint(&cfg) else {
+    let (cfg, why) = cli_config_or_default(&config, uci, json);
+    let fallback = why.is_some();
+    let fail_code = if fallback { 2 } else { 1 };
+    let Some(mut ep) = admin_endpoint(&cfg) else {
         eprintln!("管理 API 沒有開啟（admin.enabled = false），無法查詢串接狀態");
         return 1;
     };
+    if fallback {
+        ep.1 = None;
+    }
     let body = (method == "POST").then_some(&b"{}"[..]);
     match admin_call(&ep, method, path, body, std::time::Duration::from_secs(10)).await {
         Err(e) => {
-            eprintln!("服務沒有回應（{}）：{e:#}", ep.0);
-            1
+            match &why {
+                Some(w) => eprintln!("設定讀不到（{w}），預設的管理埠也沒有回應（{}）：{e:#}", ep.0),
+                None => eprintln!("服務沒有回應（{}）：{e:#}", ep.0),
+            }
+            fail_code
         }
         Ok((200, body)) => {
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -2221,7 +2238,7 @@ async fn chain_cmd(action: ChainAction) -> i32 {
         }
         Ok((code, body)) => {
             eprintln!("服務拒絕：{}", api_error(code, &body));
-            1
+            fail_code
         }
     }
 }
