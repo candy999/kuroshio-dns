@@ -100,6 +100,8 @@ struct FakeSink {
     want: Mutex<Result<(), &'static str>>,
     done: AtomicUsize,
     pressure_bad: AtomicBool,
+    /// 這台的副本跟上游的一樣（3.4.2）
+    current: AtomicBool,
 }
 
 impl FakeSink {
@@ -113,6 +115,7 @@ impl FakeSink {
             want: Mutex::new(Ok(())),
             done: AtomicUsize::new(0),
             pressure_bad: AtomicBool::new(false),
+            current: AtomicBool::new(false),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -142,6 +145,13 @@ impl ShareSink for FakeSink {
     fn import_cdn_v6(&self, _json: &[u8]) -> anyhow::Result<()> {
         self.note("cdn-v6");
         Ok(())
+    }
+    fn filter_copy_current(&self, _o: &Object) -> bool {
+        let c = self.current.load(Ordering::SeqCst);
+        if c {
+            self.note("copy-current");
+        }
+        c
     }
     fn wants_filter_copy(&self, _o: &Object) -> Result<(), &'static str> {
         *self.want.lock().unwrap()
@@ -1173,4 +1183,36 @@ async fn app_upstream_serves_benchmark_and_status() {
     assert!(st["shared"].is_null());
     let auto = kuroshio::chain::share::auto_info(&s.resolver.upstreams);
     assert_eq!(auto["source"], "benchmark");
+}
+
+/// 3.4.2：這台的副本跟上游的一樣（重新啟動後第一次同步）：不再傳一次，但每次同步都標成「剛從上游確認過」
+/// （清單更新那一輪才不會改從網路下載）
+#[tokio::test]
+async fn current_filter_copy_marked_without_transfer() {
+    let src = Arc::new(FakeSource::default());
+    let z = zstd("||ads.example.com^\n".repeat(500).as_bytes());
+    src.files.lock().unwrap().insert("copy-1".into(), z.clone());
+    *src.copies.lock().unwrap() = vec![FilterCopy {
+        url: "https://filter.example.net/list.txt".into(),
+        file: "copy-1".into(),
+        bytes: z.len() as u64,
+        raw: 0,
+        hash: 0x1234,
+        rules: 500,
+        etag: None,
+        last_modified: None,
+        at: 1_794_980_000_000,
+    }];
+    let (up, _d, s, sink) = pair(src).await;
+    sink.current.store(true, Ordering::SeqCst);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert_eq!((rep.chunks, up.chunks.load(Ordering::SeqCst)), (0, 0), "一樣的副本不再傳");
+    assert_eq!(sink.calls(), vec!["copy-current"]);
+    assert_eq!(status_obj(&s, "filter-copy")["fresh"], true);
+    assert_eq!(sink.done.load(Ordering::SeqCst), 0, "沒有新副本：不重建");
+    // 下一次同步（雜湊還是一樣）：照樣再標一次
+    s.sync_once().await;
+    assert_eq!(sink.calls(), vec!["copy-current", "copy-current"]);
+    assert!(!s.never_synced());
 }

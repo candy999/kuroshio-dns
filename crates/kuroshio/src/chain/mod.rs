@@ -34,6 +34,24 @@ pub fn install(c: Arc<client::Client>) {
     *CURRENT.lock().unwrap() = Some(c);
 }
 
+/// 串接中：CDN 節點由上游黑潮處理（下游不改寫、不驗證、不做 CDN 的定時檢查；3.4.2）
+pub fn cdn_by_upstream() -> bool {
+    current().is_some_and(|c| c.is_chained())
+}
+
+/// 正在等第一次跟上游黑潮同步共用結果：正在驗證上游黑潮，或已經串接（上游有提供共用結果）但還沒同步完成過。
+/// 過濾清單在這段期間不從網路下載（3.4.2）
+pub fn share_pending() -> bool {
+    let Some(c) = current() else { return false };
+    match c.state().0 {
+        client::State::Detected | client::State::Verifying => true,
+        client::State::Chained => {
+            c.last_probe().is_some_and(|p| p.caps.iter().any(|x| x == "share")) && syncer().is_some_and(|s| s.never_synced())
+        }
+        _ => false,
+    }
+}
+
 /// 行程層級的共用結果同步（跨重新載入；同 [`CURRENT`]）
 static SYNCER: Mutex<Option<Arc<share::Syncer>>> = Mutex::new(None);
 

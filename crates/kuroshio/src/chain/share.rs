@@ -610,6 +610,10 @@ pub trait ShareSink: Send + Sync {
     /// Err = 不抓的原因（`no-room`、`not-subscribed`、`memory`…）
     fn wants_filter_copy(&self, o: &Object) -> Result<(), &'static str>;
     fn import_filter_copy(&self, o: &Object, compressed: Vec<u8>) -> Result<()>;
+    /// 這台的清單副本跟上游的一樣（內容雜湊相同）：不必再傳，標成「剛從上游確認過」，回傳 true（3.4.2）
+    fn filter_copy_current(&self, _o: &Object) -> bool {
+        false
+    }
     /// 有新副本 → 用副本優先重建一次
     fn filter_copies_done(&self, changed: usize);
     fn pressure_ok(&self) -> bool;
@@ -859,6 +863,11 @@ impl Syncer {
     }
 
     /// 這個工作要不要略過（規格 3.5 的對照）
+    /// 這個行程還沒有成功跟上游同步過（重新啟動後）
+    pub fn never_synced(&self) -> bool {
+        self.state.lock().unwrap().last_sync_at.is_none()
+    }
+
     pub fn skip_job(&self, job: &str) -> bool {
         job_kind(job).is_some_and(|k| self.fresh(k))
     }
@@ -1079,6 +1088,20 @@ impl Syncer {
         let key = kind_key(&o.k, &o.name);
         let sha_hex = hex(&sha);
         let filter = o.k == KIND_FILTER_COPY;
+        // 清單副本跟這台的一樣（重新啟動後第一次同步、或上游沒有更新）：不再傳一次，但要標成「剛從上游確認過」，
+        // 不然清單更新那一輪會當成沒有副本、改從網路下載（3.4.2：padavan-tw 的串接壓測從其他位址收到 44.5 MB）
+        if filter && sink.filter_copy_current(o) {
+            self.state.lock().unwrap().kinds.insert(
+                key,
+                Imported {
+                    sha: sha_hex,
+                    at: o.at,
+                    imported_at: now_ms(),
+                    bytes: o.size,
+                },
+            );
+            return Ok(Fetch::Done);
+        }
         // 雜湊沒變：不重抓
         if self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex) {
             return Ok(Fetch::Done);
@@ -1429,6 +1452,13 @@ impl ShareSink for Live {
             bail!("沒有可用的節點");
         }
         Ok(())
+    }
+
+    fn filter_copy_current(&self, o: &Object) -> bool {
+        let (Some(f), Ok(hash)) = (&self.filter, u64::from_str_radix(&o.hash, 16)) else {
+            return false;
+        };
+        f.subscribes(&o.name) && f.mark_shared_if_same(&o.name, hash)
     }
 
     fn wants_filter_copy(&self, o: &Object) -> Result<(), &'static str> {

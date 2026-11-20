@@ -1108,8 +1108,10 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
         tokio::spawn(async move {
             tokio::time::sleep(first).await;
             loop {
-                // 系統時間沒對時：驗證、量測的結果帶著錯的時間，不做（不寫進學到的資料）
-                if pressure() == Pressure::Normal && crate::clock::synced() {
+                // 系統時間沒對時：驗證、量測的結果帶著錯的時間，不做（不寫進學到的資料）。
+                // 串接中：CDN 節點由上游黑潮處理，這台不改寫，健康檢查、品質量測、複驗都不做（3.4.2：
+                // 以前重新啟動 2 分鐘後的複驗照樣連到 CDN 節點）
+                if pressure() == Pressure::Normal && crate::clock::synced() && !crate::chain::cdn_by_upstream() {
                     f(c.clone()).await;
                 }
                 tokio::time::sleep(every).await;

@@ -691,6 +691,16 @@ impl FilterService {
         staged
     }
 
+    /// 下游：上游黑潮的副本跟這台的本機副本內容一樣（雜湊相同）→ 標成剛從上游確認過，回傳 true（3.4.2）
+    pub fn mark_shared_if_same(&self, url: &str, hash: u64) -> bool {
+        let Some(c) = self.copies.get() else { return false };
+        if !c.meta(url).is_some_and(|m| m.hash == hash) {
+            return false;
+        }
+        self.shared_at.lock().unwrap().insert(url.to_string(), crate::persist::now_secs());
+        true
+    }
+
     /// 這份清單是不是 6 小時內從上游黑潮拿到的
     fn shared_recently(&self, url: &str) -> bool {
         let now = crate::persist::now_secs();
@@ -1323,6 +1333,15 @@ impl FilterService {
                 info!("系統時間還沒對時：過濾清單等對時後再下載");
                 while !crate::clock::synced() && t0.elapsed() < Duration::from_secs(600) {
                     tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+            // 串接中（或正在驗證上游黑潮）、還沒跟上游同步過清單副本：先等第一次同步（最多 10 分鐘），
+            // 不然沒有驗證資訊的清單會在同步前從網路整份下載（3.4.2：重新啟動後的串接壓測）
+            let t1 = std::time::Instant::now();
+            if crate::chain::share_pending() {
+                info!("過濾清單：等跟上游黑潮同步清單副本之後再檢查更新");
+                while crate::chain::share_pending() && t1.elapsed() < Duration::from_secs(600) {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                 }
             }
             // 有清單下載失敗（或還有沒載入的）時短間隔重試：1、2、5 分鐘，之後每 30 分鐘；全部成功就回到正常間隔

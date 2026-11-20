@@ -1181,13 +1181,14 @@ fn backfill_mismatch(first: &[Arc<Answer>], more: &[Arc<Answer>]) -> bool {
 }
 
 /// 從多個上游結果決定答案（同 2.x）：有正常回應取最快的；否則 nodata / nxdomain 多數決（平手以固定上游為準）
-/// 串接上游（上游黑潮）多等的時間：它自己問上游逾時（`resolver.timeoutMs`）之後才回 SERVFAIL，
-/// 下游用一樣的逾時會先放棄、改問自己的加密上游（3.4.2）
+/// 串接上游（上游黑潮）多等的時間。上游解析不到時最久要：問自己的上游逾時（`resolver.timeoutMs`）＋
+/// 改問備援再逾時一次，才回 SERVFAIL。下游等得比這短，就會先放棄、改問自己的加密上游（3.4.2：
+/// padavan-tw 的串接壓測裡，自己的 DoH／DoT 一直被問到「連續失敗」）。所以等兩倍的逾時再加 1 秒
 const CHAIN_EXTRA_TIMEOUT: Duration = Duration::from_millis(1000);
 
 fn timeout_for(p: &Params, up: &Up) -> Duration {
     if up.role == Role::Chain {
-        p.timeout + CHAIN_EXTRA_TIMEOUT
+        p.timeout * 2 + CHAIN_EXTRA_TIMEOUT
     } else {
         p.timeout
     }

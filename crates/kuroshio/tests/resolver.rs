@@ -983,7 +983,7 @@ fn answer_ok_ip(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
     (0, vec![a(name, 300, [198, 51, 100, 77])], 0)
 }
 
-/// 串接上游沒有回應（逾時）：這一筆照舊改問自己的上游，連續 3 次才暫停串接
+/// 串接上游沒有回應（逾時；等兩倍的 timeoutMs 再加 1 秒）：這一筆照舊改問自己的上游，連續 3 次才暫停串接
 #[tokio::test]
 async fn chain_timeout_still_falls_back() {
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap(); // 收了不回
