@@ -1232,7 +1232,8 @@ impl Cdn {
     pub fn import_shared(&self, pools: Option<&[u8]>, v6: Option<&[u8]>, max_per_provider: usize) -> anyhow::Result<Vec<(String, usize)>> {
         let max = max_per_provider.max(1);
         let mut out: Vec<(String, usize)> = Vec::new();
-        let mut dropped = 0usize;
+        // 丟掉的節點分兩種：不在官方範圍裡（資料有問題）、超過每家的上限（只是太多）
+        let (mut out_of_range, mut over_cap) = (0usize, 0usize);
         if let Some(b) = pools {
             let mut f: PoolsFile = serde_json::from_slice(b).map_err(|e| anyhow::anyhow!("節點池格式錯誤：{e}"))?;
             if f.is_empty() {
@@ -1246,12 +1247,14 @@ impl Cdn {
                 let total = e.v4.as_ref().map_or(0, Vec::len) + e.v6.as_ref().map_or(0, Vec::len);
                 let mut pool4: Vec<PoolNode> = e.v4.unwrap_or_default();
                 pool4.retain(|x| x.ip.is_ipv4() && st.pools.in_ranges(name, x.ip));
-                pool4.truncate(max);
                 let mut pool6: Vec<PoolNode> = e.v6.unwrap_or_default();
                 pool6.retain(|x| x.ip.is_ipv6() && st.pools.in_ranges(name, x.ip));
+                let in_range = pool4.len() + pool6.len();
+                pool4.truncate(max);
                 pool6.truncate(max.saturating_sub(pool4.len()));
                 let kept = pool4.len() + pool6.len();
-                dropped += total.saturating_sub(kept);
+                out_of_range += total.saturating_sub(in_range);
+                over_cap += in_range - kept;
                 if kept == 0 {
                     warn!("共用的節點池：{name} 的節點都不在官方範圍裡，保留原本的節點池");
                     continue;
@@ -1309,8 +1312,9 @@ impl Cdn {
                     .into_iter()
                     .filter(|e| e.ip.is_ipv6() && st.pools.in_ranges(name, e.ip))
                     .collect();
+                out_of_range += total - keep.len();
+                over_cap += keep.len().saturating_sub(max);
                 keep.truncate(max);
-                dropped += total - keep.len();
                 if keep.is_empty() {
                     warn!("共用的 IPv6 節點：{name} 的節點都不在官方範圍裡，保留原本的紀錄");
                     continue;
@@ -1336,8 +1340,11 @@ impl Cdn {
                 }
             }
         }
-        if dropped > 0 {
-            warn!("共用的 CDN 節點：{dropped} 個不在官方範圍裡（或超過上限），已丟掉");
+        if out_of_range > 0 {
+            warn!("共用的 CDN 節點：{out_of_range} 個不在官方範圍裡，已丟掉");
+        }
+        if over_cap > 0 {
+            info!("共用的 CDN 節點：{over_cap} 個超過每家 {max} 個的上限，沒有收");
         }
         Ok(out)
     }
