@@ -322,6 +322,8 @@ pub struct Persister {
     extra_files: Vec<(PathBuf, Tier)>,
     /// 最近因為空間不足刪掉的檔（時間，相對路徑，大小；最多 20 筆）
     deleted: Vec<(u64, String, u64)>,
+    /// 關機批次寫入中、還沒改名的暫存檔（空間不夠時不能刪）
+    staged_tmp: Vec<PathBuf>,
 }
 
 /// 內容雜湊：分段餵進去跟整份一次餵結果相同（串流寫入時邊寫邊算）
@@ -389,6 +391,7 @@ impl Persister {
             fs_total: None,
             extra_files: Vec::new(),
             deleted: Vec::new(),
+            staged_tmp: Vec::new(),
         }
         .with_fs_total()
     }
@@ -646,10 +649,14 @@ impl Persister {
 
     /// 同 [`Persister::make_room`]，只刪比 `below` 低一級以下的檔
     fn make_room_below(&mut self, need: u64, keep: Option<&Path>, below: Tier) -> u64 {
+        let staged = std::mem::take(&mut self.staged_tmp);
         let list: Vec<_> = space::candidates(&self.dir, &self.extra_files)
             .into_iter()
             .filter(|c| keep.map_or(true, |k| c.path != k) && c.tier < below)
+            // 關機批次寫入中、還沒改名的暫存檔不能刪（3.4.2：被當成可刪的 .tmp 刪掉，改名時 No such file or directory）
+            .filter(|c| !staged.contains(&c.path))
             .collect();
+        self.staged_tmp = staged;
         let sizes: HashMap<String, u64> = list.iter().map(|c| (c.rel.clone(), c.size)).collect();
         let (gone, freed) = space::free_up(list, |f| f >= need);
         let now = now_secs();
@@ -744,10 +751,18 @@ impl Persister {
         names.sort();
         // 批次模式（關機）：先寫暫存檔，最後一起落地、改名
         let mut staged: Vec<Staged> = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut skipped_for_time = 0usize;
         let (mut n, mut bytes) = (0, 0u64);
         // 一份寫失敗：放回待寫、繼續寫下一份（不讓後面的檔整輪都寫不到），最後回報第一個錯誤
         let mut first_err: Option<std::io::Error> = None;
         for (_, _, name) in names {
+            // 關機有時間限制（整合方通常等 15～30 秒就強制結束）：寫到 SHUTDOWN_BUDGET 就停，剩下的（排在後面的大檔，
+            // 通常是 CDN 分片）下次啟動用上一次存的。小檔先寫，排程紀錄這類小檔一定寫得到（3.4.2）
+            if batch && t0.elapsed() >= SHUTDOWN_BUDGET {
+                skipped_for_time += 1;
+                continue;
+            }
             let (why, size, age) = {
                 let e = &self.entries[&name];
                 let Some(p) = e.pending.as_ref() else { continue };
@@ -794,6 +809,7 @@ impl Persister {
                     Data::Stream(f) => write_tmp(&stored, compress, &mut |w| f(w), false),
                 };
                 r.map(|(tmp, h, disk)| {
+                    self.staged_tmp.push(tmp.clone());
                     staged.push(Staged {
                         tmp,
                         path: stored.clone(),
@@ -854,6 +870,13 @@ impl Persister {
             self.stats.writes_today += 1;
             n += 1;
             bytes += disk;
+        }
+        self.staged_tmp.clear();
+        if skipped_for_time > 0 {
+            warn!(
+                "關機時間有限（{} 秒）：還有 {skipped_for_time} 份快照沒寫，下次啟動用上一次存的",
+                SHUTDOWN_BUDGET.as_secs()
+            );
         }
         if !staged.is_empty() {
             // 內容先落地，再依寫的順序改名（分片清單在分片之後），每個資料夾 fsync 一次
@@ -983,6 +1006,9 @@ pub fn write_atomic_with(path: &Path, gen: &mut dyn FnMut(&mut dyn Write) -> std
 }
 
 /// 寫檔（`compress` = 邊寫邊 zstd 壓縮）。回傳（壓縮前內容的雜湊，磁碟上的大小）
+/// 關機時寫快照最多花這麼久（之後的不寫）：padavan 等 30 秒、Docker 預設等 10 秒（文件建議 15 秒）就強制結束
+pub const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 批次寫入（關機）時寫好、還沒改名的一份
 struct Staged {
     tmp: PathBuf,
@@ -1355,6 +1381,30 @@ mod tests {
         let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
         q.set_compress(|n| n.starts_with("cdn/"));
         assert_eq!(q.load("cdn/d2.json").unwrap(), vec![b'b'; 4000]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 3.4.2：關機批次寫入時空間吃緊，「先刪可刪的檔」不能刪到前面已寫好、還沒改名的暫存檔
+    #[test]
+    fn shutdown_batch_keeps_staged_tmp_when_space_is_low() {
+        let dir = tmpdir("batchlow");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
+        // 每一份先回報空間不夠（會先刪可刪的檔，.tmp 是最先被刪的那一級），刪完再回報夠了
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        p.set_free_probe(move |_| {
+            let n = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(if n % 2 == 0 { 1024 } else { 1 << 30 })
+        });
+        let t = 6_000 * 86400;
+        p.stage_with("a.json", Snapshot::Bytes(vec![b'a'; 100]), Opts::default(), t);
+        p.stage_with("b.json", Snapshot::Bytes(vec![b'b'; 200]), Opts::default(), t);
+        p.stage_with("c.json", Snapshot::Bytes(vec![b'c'; 300]), Opts::default(), t);
+        p.flush_for_shutdown(t).unwrap();
+        assert_eq!(std::fs::read(dir.join("a.json")).unwrap(), vec![b'a'; 100]);
+        assert_eq!(std::fs::read(dir.join("b.json")).unwrap(), vec![b'b'; 200]);
+        assert_eq!(std::fs::read(dir.join("c.json")).unwrap(), vec![b'c'; 300]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
