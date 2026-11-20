@@ -1,7 +1,7 @@
 //! 管理 API（規格 02 第 6 節）：只聽 127.0.0.1，路徑與回應格式沿用 2.x，LuCI 經 rpcd 呼叫。
 //!
 //! 只是本機用的小型 HTTP/1.1 伺服器（一個請求一條連線），不需要完整的 HTTP 函式庫。
-//! Host 標頭必須是本機名稱，防止 DNS rebinding 從瀏覽器打進來。
+//! Host 標頭必須是本機名稱、IP 位址或 `admin.allowedHosts` 裡的名稱，防止 DNS rebinding 從瀏覽器打進來。
 
 use crate::app::AppState;
 use crate::webui::Req;
@@ -97,13 +97,32 @@ pub fn parse_query(q: &str) -> HashMap<String, String> {
 /// Host 標頭是不是本機（沒有 Host 的 HTTP/1.0 請求也算，uclient-fetch 會帶）
 pub fn local_host(host: Option<&str>) -> bool {
     let Some(h) = host else { return true };
+    let name = host_name(h);
+    name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// Host 標頭裡的名稱（去掉埠號與 IPv6 的方括號）
+fn host_name(h: &str) -> &str {
     let h = h.trim();
-    let name = if let Some(rest) = h.strip_prefix('[') {
+    if let Some(rest) = h.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {
         h.rsplit_once(':').map(|x| x.0).unwrap_or(h)
-    };
-    name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    }
+}
+
+/// 管理介面接受的 Host（3.4.2）：
+/// - 本機名稱（localhost、127.0.0.1、::1），以及沒有 Host 的（指令列工具、rpcd）
+/// - 任何 IP 位址：DNS rebinding 一定要透過網域名稱（攻擊者的網域改指到這台），直接用 IP 開的不會是這種攻擊。
+///   管理介面聽在 0.0.0.0 時（Docker、NAS），區網其他電腦用這台的 IP 開才開得起來
+/// - `admin.allowedHosts` 裡的名稱（例如反向代理或 NAS 的名稱 `nas.example.com`、`diskstation.local`），不分大小寫
+pub fn host_allowed(host: Option<&str>, allowed: &[String]) -> bool {
+    let Some(h) = host else { return true };
+    let name = host_name(h);
+    if name.is_empty() {
+        return false;
+    }
+    local_host(Some(h)) || name.parse::<IpAddr>().is_ok() || allowed.iter().any(|a| a.eq_ignore_ascii_case(name))
 }
 
 /// 匯入備份的路徑（內容上限是備份檔的上限，不是 1 MB）
@@ -245,7 +264,7 @@ async fn read_req(s: &mut TcpStream, ui: &crate::webui::WebUi) -> anyhow::Result
     let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
     // 大檔案只收「會被處理的」：已登入、本機來源的匯入。沒登入的人不能讓服務先收下 64 MB 再回 401
     let mut _slot = None;
-    let max = if req.path == IMPORT_PATH && req.method == "POST" && req.same_origin() && ui.authorized(&req) {
+    let max = if req.path == IMPORT_PATH && req.method == "POST" && req.same_origin_with(&ui.allowed_hosts) && ui.authorized(&req) {
         deadline += Duration::from_secs(50);
         _slot = Some(IMPORT_SLOT.try_acquire().map_err(|_| anyhow::anyhow!("已經有一個匯入正在上傳"))?);
         let lim = import_limit();
@@ -374,13 +393,17 @@ async fn conn(st: Arc<AppState>, mut s: TcpStream) -> anyhow::Result<()> {
 }
 
 async fn handle(st: &Arc<AppState>, req: &Req) -> Out {
-    if !local_host(req.header("host")) {
-        return Out::from_response(bad("只接受本機連線", 403));
-    }
     let ui = &st.webui;
+    if !host_allowed(req.header("host"), &ui.allowed_hosts) {
+        let name = req.header("host").map(host_name).unwrap_or_default();
+        return Out::from_response(bad(
+            &format!("不接受用「{name}」這個名稱開管理介面：請改用 IP 位址開，或把 {name} 加到設定的 admin.allowedHosts"),
+            403,
+        ));
+    }
     let m = req.method.as_str();
     let write = m == "POST" || m == "PUT";
-    if write && !req.same_origin() {
+    if write && !req.same_origin_with(&ui.allowed_hosts) {
         return Out::from_response(bad("拒絕跨站請求", 403));
     }
     // 瀏覽器會標明請求是不是別的網站發的：別的網站連讀取類的 API 也不給碰（不讓它量回應時間、或幫忙猜 token）
@@ -1042,6 +1065,21 @@ mod tests {
         assert!(local_host(None));
         assert!(!local_host(Some("evil.example.com:8054")), "DNS rebinding");
         assert!(!local_host(Some("192.168.1.1")));
+    }
+
+    /// 3.4.2：管理介面聽在 0.0.0.0（Docker、NAS）時，區網用 IP 開要開得起來；網域名稱只接受 allowedHosts 裡的
+    #[test]
+    fn host_allow_policy() {
+        let none: Vec<String> = Vec::new();
+        assert!(host_allowed(Some("127.0.0.1:8054"), &none));
+        assert!(host_allowed(None, &none));
+        assert!(host_allowed(Some("192.168.1.2:8054"), &none), "IP 位址：不會是 DNS rebinding");
+        assert!(host_allowed(Some("[2001:db8::2]:8054"), &none));
+        assert!(!host_allowed(Some("evil.example.com:8054"), &none), "DNS rebinding");
+        assert!(!host_allowed(Some(""), &none));
+        let allowed = vec!["nas.example.com".to_string()];
+        assert!(host_allowed(Some("NAS.example.com:8054"), &allowed));
+        assert!(!host_allowed(Some("nas.example.com.evil.example:8054"), &allowed));
         assert_eq!(qtype_num("https"), Some(65));
         assert_eq!(qtype_num("nope"), None);
     }

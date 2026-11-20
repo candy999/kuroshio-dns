@@ -114,7 +114,8 @@
   "admin": {
     "enabled": true,
     "host": "127.0.0.1",
-    "port": 8054
+    "port": 8054,
+    "allowedHosts": []
   },
   "log": {
     "queryLog": false,

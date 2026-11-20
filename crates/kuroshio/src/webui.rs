@@ -1,11 +1,11 @@
 //! Windows 本機設定頁（規格 02 第 6、7.2 節、規格 07）
 //!
-//! - 只聽 127.0.0.1（管理 API 同一個埠）；Host 必須是本機名稱（防 DNS rebinding）
+//! - 預設只聽 127.0.0.1（管理 API 同一個埠）；Host 必須是本機名稱、IP 位址或 `admin.allowedHosts` 裡的名稱（防 DNS rebinding）
 //! - 登入：token（`admin.token`，第一次啟動時產生，只有系統管理員可讀的資料夾；長期有效）→
 //!   HttpOnly、SameSite=Strict 的 cookie；腳本也可以用 `Authorization: Bearer <token>`
 //! - 印給人點的網址用一次性登入碼（`/login?code=`，10 分鐘內、只能用一次），長期的 token 不會留在瀏覽器歷史；
 //!   舊的 `/login?token=` 照樣接受
-//! - 會改東西的請求（POST / PUT）檢查 Origin 必須是本機
+//! - 會改東西的請求（POST / PUT）檢查 Origin 必須跟 Host 相同，而且是上面那些名稱
 //! - `admin.auth`：`auto`（預設：Windows 開、OpenWrt 關——OpenWrt 由 rpcd 代理，只聽本機）/ true / false
 //! - 靜態檔：`<share>/admin/`（index.html、app.js、style.css、fields.json）
 //! - `/api/config`（只有用 JSON 設定檔時）：GET 讀、PUT 整份寫入後重新載入；`/api/log`：最近的日誌
@@ -46,6 +46,8 @@ pub struct WebUi {
     pub token_file: Option<PathBuf>,
     sessions: Sessions,
     pub static_dir: PathBuf,
+    /// 除了本機名稱與 IP 位址之外，管理介面還接受的 Host 名稱（`admin.allowedHosts`，小寫）
+    pub allowed_hosts: Vec<String>,
     /// 共用儀表板（dashboard.js、dashboard.css）：設定頁用 `/dashboard/<檔名>` 載入
     pub dashboard_dir: PathBuf,
     /// 介面共用邏輯（ui-core.js）：設定頁用 `/shared/<檔名>` 載入
@@ -206,6 +208,26 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// `admin.allowedHosts`：字串陣列（或用逗號、空白分開的一個字串），去掉埠號、轉小寫
+pub fn allowed_hosts_of(cfg: &Value) -> Vec<String> {
+    let raw: Vec<String> = match get(cfg, "admin.allowedHosts") {
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        Some(Value::String(s)) => s.split([',', ' ']).map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    raw.iter()
+        .map(|s| s.trim().trim_end_matches('.'))
+        .map(|s| {
+            s.rsplit_once(':')
+                .filter(|(_, p)| p.parse::<u16>().is_ok())
+                .map(|x| x.0)
+                .unwrap_or(s)
+        })
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// 設定頁要不要登入；要的話 token 檔在哪裡（`admin.auth`、`admin.tokenFile`）
 pub fn token_file(cfg: &Value, base_dir: &std::path::Path) -> Option<PathBuf> {
     let auth = match get(cfg, "admin.auth") {
@@ -256,11 +278,13 @@ impl WebUi {
         };
         let dashboard_dir = sibling("dashboard");
         let shared_dir = sibling("shared");
+        let allowed_hosts = allowed_hosts_of(cfg);
         WebUi {
             token,
             token_file,
             sessions,
             static_dir,
+            allowed_hosts,
             dashboard_dir,
             shared_dir,
             config_file: OnceLock::new(),
@@ -440,6 +464,11 @@ impl Req {
     /// 會改東西的請求：Origin（有的話）必須是本機，而且跟這個請求的 Host 是同一個（同主機、同埠）。
     /// 只檢查「是本機」不夠：同一台電腦上別的埠的網頁（開發用的伺服器、其他程式的介面）也是本機
     pub fn same_origin(&self) -> bool {
+        self.same_origin_with(&[])
+    }
+
+    /// 同 [`Req::same_origin`]，Origin 的名稱另外可以是 IP 位址或 `admin.allowedHosts` 裡的（3.4.2）
+    pub fn same_origin_with(&self, allowed: &[String]) -> bool {
         match self.header("origin") {
             None => true,
             Some(o) => {
@@ -448,7 +477,7 @@ impl Req {
                     Some(h) => h.trim().eq_ignore_ascii_case(host),
                     None => true,
                 };
-                crate::admin::local_host(Some(host)) && same_host
+                crate::admin::host_allowed(Some(host), allowed) && same_host
             }
         }
     }
@@ -535,6 +564,20 @@ mod tests {
         assert!(req(&[("Host", "LOCALHOST:8054"), ("Origin", "http://localhost:8054")]).same_origin());
         assert!(!req(&[("Host", "127.0.0.1:8054"), ("Origin", "http://127.0.0.1:3000")]).same_origin());
         assert!(!req(&[("Host", "127.0.0.1:8054"), ("Origin", "http://localhost:8054")]).same_origin());
+        // 3.4.2：用 IP 或 allowedHosts 裡的名稱開的，同一個來源可以送出
+        let lan = req(&[("Host", "192.168.1.2:8054"), ("Origin", "http://192.168.1.2:8054")]);
+        assert!(lan.same_origin_with(&[]));
+        assert!(!req(&[("Host", "192.168.1.2:8054"), ("Origin", "http://evil.example")]).same_origin_with(&[]));
+        let named = req(&[("Host", "nas.example.com:8054"), ("Origin", "http://nas.example.com:8054")]);
+        assert!(named.same_origin_with(&["nas.example.com".into()]) && !named.same_origin_with(&[]));
+        assert_eq!(
+            allowed_hosts_of(&serde_json::json!({ "admin": { "allowedHosts": ["NAS.example.com:8054", " diskstation.local. ", ""] } })),
+            vec!["nas.example.com", "diskstation.local"]
+        );
+        assert_eq!(
+            allowed_hosts_of(&serde_json::json!({ "admin": { "allowedHosts": "a.example.com, b.example.com" } })),
+            vec!["a.example.com", "b.example.com"]
+        );
         assert!(req(&[("Sec-Fetch-Site", "cross-site")]).cross_site_fetch());
         assert!(req(&[("Sec-Fetch-Site", "same-site")]).cross_site_fetch());
         assert!(!req(&[("Sec-Fetch-Site", "same-origin")]).cross_site_fetch());

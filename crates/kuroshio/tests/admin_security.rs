@@ -245,3 +245,53 @@ async fn login_secrets_and_upload_limits() {
     started.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 送出指定 Host（與 Origin）的請求
+async fn with_host(addr: SocketAddr, method: &str, target: &str, host: &str, origin: Option<&str>) -> (u16, String, Vec<u8>) {
+    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n");
+    if let Some(o) = origin {
+        head.push_str(&format!("Origin: {o}\r\n"));
+    }
+    head.push_str("\r\n");
+    send(addr, &head, b"").await
+}
+
+/// 3.4.2：管理介面聽在 0.0.0.0（Docker、NAS）時，區網的電腦用這台的 IP 開得起來；
+/// 用別的網域名稱開（DNS rebinding）照樣擋，除非放進 admin.allowedHosts
+#[tokio::test]
+async fn lan_ip_and_allowed_hosts() {
+    let dir = tmp("hosts");
+    let mut cfg = config(&dir, true);
+    kuroshio_config::merge(&mut cfg, &json!({ "admin": { "allowedHosts": ["nas.example.com"] } }));
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let admin = started.admin.unwrap();
+    let port = admin.port();
+    // 用 IP 開：通過 Host 檢查（還沒登入，所以是 401，不是 403）
+    let (code, _, body) = with_host(admin, "GET", "/api/status", &format!("192.168.1.2:{port}"), None).await;
+    assert_eq!(code, 401, "{}", String::from_utf8_lossy(&body));
+    // 登入頁也開得起來
+    assert_ne!(with_host(admin, "GET", "/login", &format!("192.168.1.2:{port}"), None).await.0, 403);
+    // allowedHosts 裡的名稱
+    assert_eq!(
+        with_host(admin, "GET", "/api/status", &format!("NAS.example.com:{port}"), None)
+            .await
+            .0,
+        401
+    );
+    // 其他網域名稱：403，訊息說明怎麼辦
+    let (code, _, body) = with_host(admin, "GET", "/api/status", &format!("evil.example.com:{port}"), None).await;
+    assert_eq!(code, 403);
+    let msg = js(&body)["error"].as_str().unwrap_or_default().to_string();
+    assert!(msg.contains("allowedHosts") && msg.contains("evil.example.com"), "{msg}");
+    // 用 IP 開、同一個來源的 POST 過得了來源檢查（沒登入所以 401）；別的網站送來的 403
+    let host = format!("192.168.1.2:{port}");
+    let same = format!("http://{host}");
+    assert_eq!(with_host(admin, "POST", "/api/cache/flush", &host, Some(&same)).await.0, 401);
+    assert_eq!(
+        with_host(admin, "POST", "/api/cache/flush", &host, Some("http://evil.example"))
+            .await
+            .0,
+        403
+    );
+    drop(started);
+}

@@ -88,6 +88,14 @@ docker exec kuroshio kuroshio url -c /config/config.json
 
 會印出含一次性登入碼的網址 `http://127.0.0.1:8054/login?code=…`（10 分鐘內有效、只能用一次，要再拿一個就再執行一次）。在別台電腦開的話把 `127.0.0.1` 換成這台主機的 IP。長期的登入 token 存在 `./config/admin.token`，也可以在登入頁貼上它；刪掉後重新啟動會產生新的。
 
+用 IP 開（`http://192.168.1.2:8054/`）一定可以。想用名稱開（例如 NAS 的 `diskstation.local`、反向代理的 `kuroshio.example.com`）時，把名稱加到 `admin.allowedHosts`，不然會看到「不接受用『…』這個名稱開管理介面」：
+
+```json
+"admin": { "host": "0.0.0.0", "auth": true, "tokenFile": "/config/admin.token", "allowedHosts": ["diskstation.local"] }
+```
+
+這是防 DNS rebinding 的檢查（別的網站把自己的網域改指到你的 NAS，借你的瀏覽器操作設定頁），只擋網域名稱；3.4.1 以前連用 IP 開都會被擋成「只接受本機連線」。
+
 ### /config 裡有什麼
 
 | 檔案 | 內容 |

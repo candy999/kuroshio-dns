@@ -631,4 +631,4 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - **要做很佔記憶體的事之前**（韌體更新把映像檔寫進 tmpfs、解壓縮大檔案）執行 `kuroshio notify trim`。沒有 PSI 的舊核心（例如 Linux 4.4）只能輪詢可用記憶體，突然的大量配置可能來不及讓出；黑潮 DNS 的 `oom_score_adj` 是 -500，來不及時被核心結束的會是別的程式。
 - **設定放在記憶體**（要另外存進 Flash）的韌體：設定 `KUROSHIO_ON_CONFIG_WRITE`。
 - **容器**：把設定檔與快照目錄放在掛載的磁碟區（例如 `/config/config.json`、`system.persistDir: "/config/state"`），用 `KUROSHIO_INIT_CONFIG` 提供第一次啟動的預設設定，`KUROSHIO_SHARE` 指向映像裡的 data/。
-- 管理 API 只聽本機（`127.0.0.1`）、只接受本機的 `Host`；要從別的地方管理請經過反向代理並開啟登入（`admin.auth`）。
+- 管理 API 預設只聽本機（`127.0.0.1`）。`Host` 只接受本機名稱、IP 位址與 `admin.allowedHosts` 裡的名稱（防 DNS rebinding；3.4.2 起接受 IP 位址與 `allowedHosts`，以前只接受本機名稱）。聽在其他位址（`admin.host`，例如 Docker 的 `0.0.0.0`）時請開啟登入（`admin.auth`）；經過反向代理時，把代理用的名稱加到 `allowedHosts`。
