@@ -254,7 +254,7 @@ kuroshio.exe query www.google.com -s quic://dns.example.net
 
 ## 6. 升級
 
-停止（`quit` 或 `service stop`）→ 用新版的 `kuroshio.exe` 和 `data\` 取代舊的 → 啟動。`config.json`、`state\`、`custom-rules.txt` 不用動。
+停止（`quit` 或 `service stop`）→ 用新版的 `kuroshio.exe` 和 `data\` 取代舊的 → 啟動。`config.json`、`state\`、`custom-rules.txt` 不用動，新設定的預設值就是建議值。每一版的變更見 [release-notes](release-notes/)。
 
 ## 常見問題
 
@@ -270,6 +270,8 @@ kuroshio.exe query www.google.com -s quic://dns.example.net
 | 憑證續期了但 HTTPS 還是舊的 | HTTP.sys / IIS 的綁定要系統管理員權限才能更新：cmd 用系統管理員執行，或改用服務。`kuroshio.exe httpsys cert` 立即同步 |
 | 53 埠被占用（日誌說監聽失敗） | Hyper-V 的預設交換器、網路連線共用（ICS）、其他 DNS 軟體會佔 53 埠：`netstat -ano \| findstr :53` 找出程式（最後一欄是 PID），或改 `listen.plain.port` |
 | cmd 視窗點一下之後畫面不動、DNS 也沒回應，按 Esc 才恢復 | 傳統主控台的「快速編輯模式」。3.1.0 起啟動時會自動關掉；以前的版本在標題列右鍵 →「內容」取消，或改用服務 |
+| 狀態頁「網路路徑」說「一般 DNS 被路由器 … 上的黑潮接走」 | 這台電腦接在跑黑潮、而且把 53 埠接走的路由器後面。兩台都是 3.4.0 以上時會自動串接（狀態頁的「串接」區塊顯示「串接中」），直接用路由器的評測結果與 CDN 節點，不用處理。不想串接：設定頁專業模式關掉「串接上游的黑潮」（`upstream.chain: false`），這台會自己重做評測、CDN 掃描、下載清單 |
+| 「網路路徑」說「一般 DNS 被路由器或業者的設備（不明）接走」「這條網路擋了 DoT」 | 路上有設備把 53 埠或 853 埠接走、擋掉。黑潮會自動避開：評測不測一般 DNS、先不用被擋的協定；`kuroshio.exe check-path` 可以立刻再檢查一次 |
 | 啟動失敗、不知道設定哪裡錯 | `kuroshio.exe check-config config.json`；設定頁存了一份啟動不了的設定時，程式會自動退回上一份能用的 |
 
 更多細節：[規格 07 · Windows 版](spec/07-windows.md)。
