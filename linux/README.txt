@@ -25,6 +25,11 @@
   4. ./kuroshio query example.com -s 127.0.0.1:5336
      ./kuroshio url -c config.json            設定頁網址（預設 http://127.0.0.1:8054/ ，只有本機能開）
 
+  要從區網其他電腦開設定頁：在 config.json 加
+       "admin": { "host": "0.0.0.0", "auth": true }
+  （一定要開登入），之後用 http://<這台的 IP>:8054/ 開。想用名稱開（例如 nas.local）時把名稱加到
+  "allowedHosts": ["nas.local"]；其他名稱會被擋（防 DNS rebinding）。
+
 注意：
   - system.persistDir 沒設定時，快照放在 /etc/kuroshio/state；admin.token、custom-rules.txt 等
     相對路徑都以 persistDir 的上一層為準（上面的例子是 /var/lib/kuroshio）。

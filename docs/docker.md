@@ -70,13 +70,13 @@ Ubuntu（以及其他用 systemd-resolved 的發行版）在 `127.0.0.53:53` 有
 {
   "system": { "persistDir": "/config/state", "dataDir": "/usr/share/kuroshio" },
   "listen": { "plain": { "binds": ["0.0.0.0", "::"], "port": 53 } },
-  "admin": { "host": "0.0.0.0", "auth": true, "tokenFile": "/config/admin.token" },
+  "admin": { "host": "0.0.0.0", "auth": true, "tokenFile": "/config/admin.token", "allowedHosts": [] },
   "filter": { "customRules": ["/config/custom-rules.txt"] }
 }
 ```
 
 - 明文 DNS 開在所有位址的 53 埠，`listen.plain.allowFrom` 用預設值：只回答私有網段（區網）的查詢。
-- 設定頁開在 `8054`、所有位址，**一定要登入**（容器裡用 `0.0.0.0`，所以把 Linux 預設不登入的設定頁打開登入）。不想讓區網其他電腦開設定頁，把 `admin.host` 改回 `127.0.0.1`。
+- 設定頁開在 `8054`、所有位址，**一定要登入**（容器裡用 `0.0.0.0`，所以把 Linux 預設不登入的設定頁打開登入）。區網其他電腦用這台主機的 IP 開（`http://192.168.1.2:8054/`）；想用名稱開（例如 `diskstation.local`）時把名稱加到 `admin.allowedHosts`，見下面的「設定頁」。不想讓區網其他電腦開設定頁，把 `admin.host` 改回 `127.0.0.1`。
 - 改的方法：直接編輯 `./config/config.json`（只寫跟預設值不同的欄位，完整預設值 `docker exec kuroshio kuroshio defaults`），或在設定頁上改。手動編輯後 `docker restart kuroshio`。
 - 檢查設定檔：`docker exec kuroshio kuroshio check-config /config/config.json`
 
@@ -138,7 +138,7 @@ host 網路下沒有 IPv6 路由時，路徑檢查會自動只用 IPv4 連上游
 
 原則都一樣：**網路用 host**、**把一個資料夾對應到 `/config`**。NAS 自己的 DNS 伺服器套件（例如 Synology 的 DNS Server）如果在用 53 埠，要先停用或改埠。
 
-- **Synology（Container Manager）**：「專案」→ 新增，路徑選例如 `/volume1/docker/kuroshio`，貼上上面的 `compose.yml`。或「映像」下載 `ghcr.io/candy999/kuroshio-dns` 後建立容器：網路選 `host`，「儲存空間設定」把 `docker/kuroshio/config` 對應到 `/config`。
+- **Synology（Container Manager）**：「專案」→ 新增，路徑選例如 `/volume1/docker/kuroshio`，貼上上面的 `compose.yml`。或「映像」下載 `ghcr.io/candy999/kuroshio-dns` 後建立容器：網路選 `host`，「儲存空間設定」把 `docker/kuroshio/config` 對應到 `/config`。設定頁用 `http://<NAS 的 IP>:8054/` 開；想用 `diskstation.local`（或你在 DSM 設的名稱）開，把它加到 `config.json` 的 `admin.allowedHosts`。
 - **QNAP（Container Station）**：「應用程式」→ 建立，貼上 `compose.yml`；或建立容器時網路模式選「Host」，共用資料夾對應到 `/config`。
 - **Unraid**：Docker → Add Container，Repository 填 `ghcr.io/candy999/kuroshio-dns:latest`，Network Type 選 `Host`，新增 Path：Container Path `/config`、Host Path `/mnt/user/appdata/kuroshio`。
 
@@ -150,6 +150,8 @@ host 網路下沒有 IPv6 路由時，路徑檢查會自動只用 IPv4 連上游
 2. **帶 `X-Forwarded-For`**，黑潮 DNS 設 `listen.doh.trustProxy: true`。只有連線來自本機（127.0.0.1 / ::1）時才採用這個標頭，所以反向代理要跟黑潮 DNS 在同一台主機、用 host 網路。
 3. **代理到黑潮 DNS 用不加密的 HTTP**：`listen.doh.tls: false`，HTTPS 由網站伺服器處理。
 4. **HTTP/3**：網站伺服器有提供（Caddy 預設就有）就好；沒有的話黑潮 DNS 可以自己聽 UDP 443：`listen.doh.http3: true`、`http3Port: 443`、`http3Binds: ["0.0.0.0", "::"]`，並設定 `tls.cert` / `tls.key`（DoH3 一定要憑證）。
+
+設定頁（8054）也要經過反向代理、用網域名稱開時，把那個名稱加到 `admin.allowedHosts`（不然會被防 DNS rebinding 的檢查擋下）。
 
 對應的黑潮 DNS 設定（[`docker/config.caddy.json`](../docker/config.caddy.json)）：
 

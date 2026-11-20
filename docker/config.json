@@ -12,7 +12,8 @@
   "admin": {
     "host": "0.0.0.0",
     "auth": true,
-    "tokenFile": "/config/admin.token"
+    "tokenFile": "/config/admin.token",
+    "allowedHosts": []
   },
   "filter": {
     "customRules": ["/config/custom-rules.txt"]
