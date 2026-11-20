@@ -213,7 +213,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
                 chained: { enabled: true, state: 'chained', reason: null, text: '串接中：上游 192.168.1.1（黑潮 3.4.0），評測結果與 CDN 節點由上游提供', upstream, backupActive: false, retryAt: null,
                     shared: { enabled: true, lastSyncAt: now - 1800e3, nextSyncAt: now + 3600e3, error: null, skippedJobs: ['dns-benchmark', 'cdn-pool'],
                         objects: [{ kind: 'upstreams', at: now - 7200e3, bytes: 6624, importedAt: now - 1800e3, fresh: true, error: null }] }, serving: servingOff },
-                notAllowed: { enabled: true, state: 'released', reason: 'not-allowed', text: '上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路',
+                notAllowed: { enabled: true, state: 'released', reason: 'not-allowed', text: '上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路；每 10 分鐘確認一次，上游重新開放就自動接回',
                     upstream: Object.assign({}, upstream, { via: null, allowDownstream: false, caps: [], since: null, lastOkAt: null, registered: null }), backupActive: false, retryAt: null, shared: null, serving: servingOn }
             };
             let mode = 'chained';
@@ -242,7 +242,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             check((await page.locator('#st-chain button').count()) === 0, '串接畫面：沒有任何按鈕');
             await shot('02b-status-chain');
             [down, up] = await show('notAllowed');
-            check(down.includes('上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路') && await page.isVisible('#st-chain-down .msg.warn'),
+            check(down.includes('上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路；每 10 分鐘確認一次，上游重新開放就自動接回') && await page.isVisible('#st-chain-down .msg.warn'),
                 '串接畫面：上游不提供資料（allow_downstream 關閉）…會重複使用網路（提醒樣式、整句）', down.slice(0, 300));
             check(up.includes('提供資料給下游黑潮：目前 1 台') && up.includes('有啟用「繞過防護」清單時建議關閉 allow_downstream') && up.includes(FP_ME) && up.includes(FP_DOWN) && up.includes('192.168.1.2') && /經 NAT/.test(up),
                 '串接畫面：上游角色開著時的說明與連上來的下游清單（指紋、位址、經 NAT）', up.slice(0, 500));

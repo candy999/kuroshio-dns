@@ -246,7 +246,7 @@ return view.extend({
 				JOBS[n] || n,
 				(c.monthDays ? _('每月 %s 日').format([].concat(c.monthDays).join(',')) + (c.jitterDays ? _('起（每台錯開）') : '') + ' ' : '') + [].concat(c.at || []).join(', ') + (c.weekdays ? ' (' + c.weekdays.join(',') + ')' : '') + (c.enabled === false ? ' ' + _('已停用') : ''),
 				running ? _('執行中…') : fmtTime(s.lastEnd),
-				(jobs.detail && jobs.detail[n] && jobs.detail[n].text) || ((jobs.catchUpWaiting || []).indexOf(n) >= 0 ? _('等補跑時段（%s）').format(jobs.catchUpWindow) : '') || (s.lastCode === 0 ? _('成功') : (s.lastCode == null ? '-' : _('失敗（%s）').format(s.lastCode))),
+				(jobs.detail && jobs.detail[n] && jobs.detail[n].text) || ((jobs.catchUpProvided || []).indexOf(n) >= 0 ? _('由上游黑潮提供，暫不補跑') : (jobs.catchUpWaiting || []).indexOf(n) >= 0 ? _('等補跑時段（%s）').format(jobs.catchUpWindow) : '') || (s.lastCode === 0 ? _('成功') : (s.lastCode == null ? '-' : _('失敗（%s）').format(s.lastCode))),
 				E('button', { 'class': 'btn cbi-button', 'disabled': running ? '' : null, 'click': ui.createHandlerFn(self, 'runJob', n) }, _('立即執行'))
 			];
 		});

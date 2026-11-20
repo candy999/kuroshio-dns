@@ -174,6 +174,8 @@ pub fn state_file_exists(p: &Path) -> bool {
 }
 
 pub type ExistsFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// 工作的結果現在由別處提供（串接中由上游黑潮提供）
+pub type ProvidedFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub struct Options {
     pub clock: Arc<dyn Clock>,
@@ -191,6 +193,9 @@ pub struct Options {
     pub defer_poll: Duration,
     /// 排定時間過了多久內還算數（檢查被延誤時不會錯過）
     pub slot_grace_ms: u64,
+    /// 這個工作的結果現在由別處提供（串接中由上游黑潮提供，3.4.2）：補跑不排隊、不跑，
+    /// 狀態列在 `catchUpProvided`；之後不再提供（串接解除）時照補跑時段補跑
+    pub provided: Option<ProvidedFn>,
 }
 
 impl Options {
@@ -205,6 +210,7 @@ impl Options {
             tick_interval: Duration::from_secs(30),
             defer_poll: Duration::from_secs(5),
             slot_grace_ms: 5 * MIN_MS,
+            provided: None,
         }
     }
 }
@@ -422,6 +428,8 @@ struct St {
     last_tick: Option<u64>,
     /// 等補跑時段的工作（`/api/jobs` 的 `catchUpWaiting`）
     waiting: HashSet<String>,
+    /// 要補跑、但結果現在由上游黑潮提供而暫不補跑的工作（`catchUpProvided`，3.4.2）
+    provided: HashSet<String>,
 }
 
 struct Inner {
@@ -460,6 +468,7 @@ impl Scheduler {
                     started_ms: None,
                     last_tick: None,
                     waiting: HashSet::new(),
+                    provided: HashSet::new(),
                 }),
                 notify: Notify::new(),
             }),
@@ -498,17 +507,34 @@ impl Scheduler {
             let me = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(delay)).await;
+                let planned = me.inner.opts.clock.now_ms();
                 // 補跑時段（3.4.0）：只有補跑（首次執行、上次成功太久）要等；排定時間與手動不受影響。
-                // 每次 tick 重新看一次時鐘，不先算好要等多久：開機時還沒對時的話，算出來的會是錯的
-                if let Some(w) = window {
-                    if !in_window(me.inner.opts.clock.now_ms(), w) {
-                        info!("工作 {name} 要{why}，等到補跑時段 {}（system.catchUpWindow）", fmt_window(w));
-                        me.inner.st.lock().unwrap().waiting.insert(name.clone());
-                        while !in_window(me.inner.opts.clock.now_ms(), w) {
+                // 每次 tick 重新看一次時鐘，不先算好要等多久：開機時還沒對時的話，算出來的會是錯的。
+                // 結果由上游黑潮提供時（串接中，3.4.2）不排隊也不跑：到時段才跑只會被略過，狀態也會誤導；
+                // 串接解除、不再提供之後，照時段補跑
+                let mut logged = false;
+                loop {
+                    if me.is_provided(&name) {
+                        me.set_catch_up(&name, false, true);
+                        tokio::time::sleep(me.inner.opts.tick_interval).await;
+                        continue;
+                    }
+                    match window {
+                        Some(w) if !in_window(me.inner.opts.clock.now_ms(), w) => {
+                            if !logged {
+                                info!("工作 {name} 要{why}，等到補跑時段 {}（system.catchUpWindow）", fmt_window(w));
+                                logged = true;
+                            }
+                            me.set_catch_up(&name, true, false);
                             tokio::time::sleep(me.inner.opts.tick_interval).await;
                         }
-                        me.inner.st.lock().unwrap().waiting.remove(&name);
+                        _ => break,
                     }
+                }
+                me.set_catch_up(&name, false, false);
+                // 等的這段期間已經照排定時間（或手動）成功跑過：不必再補
+                if me.last_ok_after(&name, planned) {
+                    return;
                 }
                 me.request(&name, &why);
             });
@@ -524,6 +550,38 @@ impl Scheduler {
                 }
             }
         })
+    }
+
+    fn is_provided(&self, name: &str) -> bool {
+        self.inner.opts.provided.as_ref().is_some_and(|f| f(name))
+    }
+
+    /// 補跑的狀態：等時段（`catchUpWaiting`）、由上游提供（`catchUpProvided`）
+    fn set_catch_up(&self, name: &str, waiting: bool, provided: bool) {
+        let mut st = self.inner.st.lock().unwrap();
+        if waiting {
+            st.waiting.insert(name.to_string());
+        } else {
+            st.waiting.remove(name);
+        }
+        if provided {
+            st.provided.insert(name.to_string());
+        } else {
+            st.provided.remove(name);
+        }
+    }
+
+    /// `t`（含）之後有沒有成功跑完過
+    fn last_ok_after(&self, name: &str, t: u64) -> bool {
+        let st = self.inner.st.lock().unwrap();
+        let s = st.state.get(name);
+        let ok_code = s.and_then(|s| s.get("lastCode")).and_then(Value::as_i64) == Some(0);
+        let last_ok = if ok_code {
+            ms_field(s, "lastEnd")
+        } else {
+            ms_field(s, "lastOkEnd")
+        };
+        last_ok.is_some_and(|e| e >= t)
     }
 
     /// 啟動補跑的計畫：（工作、延遲秒數、原因），依延遲排序
@@ -823,6 +881,8 @@ impl Scheduler {
             .collect();
         let mut waiting: Vec<&String> = st.waiting.iter().collect();
         waiting.sort();
+        let mut provided: Vec<&String> = st.provided.iter().collect();
+        provided.sort();
         json!({
             "detail": Value::Object(detail),
             "running": st.running.as_ref().map(|r| json!({
@@ -835,6 +895,8 @@ impl Scheduler {
             // 補跑時段（3.4.0）：設定的時段與正在等的補跑
             "catchUpWindow": catch_up_window(&st.cfg).map(fmt_window),
             "catchUpWaiting": waiting,
+            // 3.4.2：要補跑、但現在由上游黑潮提供（串接中）而暫不補跑的工作
+            "catchUpProvided": provided,
         })
     }
 

@@ -848,7 +848,7 @@ fn e2e_upstream_allow_off() {
     let text = c["text"].as_str().unwrap();
     assert!(text.starts_with("上游黑潮 "), "{text}");
     assert!(
-        text.ends_with("不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路"),
+        text.ends_with("不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路；每 10 分鐘確認一次，上游重新開放就自動接回"),
         "{text}"
     );
     assert_eq!(down.resolve(other_client()), Some((0, vec![OWN])), "{}", down.log());

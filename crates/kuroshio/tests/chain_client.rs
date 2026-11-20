@@ -531,17 +531,27 @@ async fn allow_false_is_not_allowed() {
     assert_eq!(s["upstream"]["allowDownstream"], false);
     assert_eq!(
         s["text"],
-        "上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路"
+        "上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路；每 10 分鐘確認一次，上游重新開放就自動接回"
     );
+    assert!(s["retryAt"].is_u64(), "排了下一次確認：{s}");
     assert_eq!(d.client.interceptor_json()["allowDownstream"], false);
-    // 只有那一次探測；之後不重試、不登記、不問共用結果
     assert_eq!(u.chain_queries(), 1);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(u.chain_queries(), 1);
-    // 下一次路徑檢查再探測一次
-    d.client.on_path_report(&kuroshio(a)).await;
-    assert_eq!(u.chain_queries(), 2);
+    // 3.4.2：每隔 retry_max（測試裡 0.8 秒，加 0～20%）只探測一次，不登記、不問共用結果
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(u.chain_queries(), 2, "過了一次 retry_max：再探測一次");
     assert_eq!(d.client.state().1, Some(Reason::NotAllowed));
+    // 上游重新開放：下一次確認就自動接回，不必等路徑檢查
+    u.allow.store(true, Ordering::SeqCst);
+    let t0 = std::time::Instant::now();
+    while d.client.state().0 != State::Chained {
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "上游重新開放後沒有自動接回：{:?}",
+            d.client.state()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(d.mgr.active()[0].role, Role::Chain);
 }
 
 #[tokio::test]

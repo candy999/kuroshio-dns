@@ -938,3 +938,64 @@ async fn chained_answers_skip_cdn_and_ranking() {
     assert!(cdn.state().db.get("cdn-chain.example.com").is_none(), "CDN 資料庫不記這個網域");
     assert_eq!(r.stats.summary()["today"]["cdn"]["fastly"], 3, "還是統計是哪家 CDN");
 }
+
+// ---------------------------------------------------------------- 3.4.2 串接上游的 SERVFAIL／擋掉是最後答案
+
+fn servfail(_name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (2, vec![], 0)
+}
+
+fn sinkhole(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (0, vec![a(name, 300, [0, 0, 0, 0])], 0)
+}
+
+/// 串接上游（上游黑潮）自己解析不到（SERVFAIL）、或用它的過濾擋掉（0.0.0.0）：下游照它的答案回，
+/// 不再問自己的加密上游；SERVFAIL 也不算串接失敗（以前連續 3 次就暫停串接 30 秒、全部改走自己的上游）
+#[tokio::test]
+async fn chain_servfail_and_blocked_are_final() {
+    for (answer, tag) in [
+        (servfail as fn(&str, u16) -> (u16, Vec<Record>, u32), "servfail"),
+        (sinkhole, "blocked"),
+    ] {
+        let (chain, n_chain) = upstream(0, answer).await;
+        let (own, n_own) = upstream(0, answer_ok_ip).await;
+        let mut c = cfg(&[], json!({}));
+        kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+        let r = kuroshio::app::build_resolver(&c).unwrap();
+        r.upstreams
+            .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+        for i in 0..5u16 {
+            let m = Message::parse(&r.handle(&q(i, &format!("{tag}{i}.example.com"), 1), &CTX).await.unwrap()).unwrap();
+            if tag == "servfail" {
+                assert_eq!(m.rcode, 2, "上游黑潮解析不到：照樣回 SERVFAIL");
+            } else {
+                assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(0, 0, 0, 0)), "上游黑潮擋掉的：照樣擋");
+            }
+        }
+        assert_eq!(n_chain.load(Ordering::SeqCst), 5, "{tag}");
+        assert_eq!(n_own.load(Ordering::SeqCst), 0, "{tag}：不問自己的上游");
+        assert!(!r.upstreams.chain_suspended(), "{tag}：連續 5 次也不暫停串接");
+        assert_eq!(r.upstreams.active()[0].role, kuroshio::upstreams::Role::Chain);
+    }
+}
+
+fn answer_ok_ip(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (0, vec![a(name, 300, [198, 51, 100, 77])], 0)
+}
+
+/// 串接上游沒有回應（逾時）：這一筆照舊改問自己的上游，連續 3 次才暫停串接
+#[tokio::test]
+async fn chain_timeout_still_falls_back() {
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap(); // 收了不回
+    let chain = dead.local_addr().unwrap();
+    let (own, n_own) = upstream(0, answer_ok_ip).await;
+    let mut c = cfg(&[], json!({ "resolver": { "timeoutMs": 200 } }));
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    let m = Message::parse(&r.handle(&q(1, "dead-chain.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 77)));
+    assert_eq!(n_own.load(Ordering::SeqCst), 1);
+    drop(dead);
+}

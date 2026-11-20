@@ -329,6 +329,8 @@ struct Inner {
     /// 最近一次探測／驗證／心跳的結果
     probe: Option<Probe>,
     bound: Option<Bound>,
+    /// 最近一次綁定的上游位址（解除後狀態頁照樣顯示真正的位址，不顯示探測用的保留位址；3.4.2）
+    last_addr: Option<(SocketAddr, bool, Via)>,
     /// 最近一次綁定的公鑰（連續性：跟它不同就是「上游換了」；第一次綁定不算）
     remembered: Option<[u8; 32]>,
     key_changed_at: Option<u64>,
@@ -376,6 +378,7 @@ impl Inner {
             view: None,
             probe: None,
             bound: None,
+            last_addr: None,
             remembered: None,
             key_changed_at: None,
             previous_fp: None,
@@ -549,6 +552,9 @@ fn reject(i: &mut Inner, r: Reason, now: Now) -> Vec<Io> {
             Some(i.timing.retry_max)
         }
         Reason::VerifyFailed | Reason::NoResponse => Some(next_backoff(i)),
+        // 上游關了 allow_downstream：每 10 分鐘（加 0～20% 亂數）探測一次，上游重新開放後自動接回（3.4.2；
+        // 以前要等下一次路徑檢查，最久 6 小時）。探測只是一筆 CH TXT 查詢
+        Reason::NotAllowed => Some(i.timing.retry_max.mul_f64(1.0 + 0.2 * now.rnd)),
         // 加 0～50% 的亂數：兩台同時因迴圈解除時，不會在同一時間重試、再一次同時互相綁定
         Reason::Loop | Reason::TooDeep => Some(i.timing.retry_max.mul_f64(1.0 + 0.5 * now.rnd)),
         _ => None,
@@ -575,12 +581,14 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
         Event::Disabled => {
             i.probe = None;
             i.remembered = None;
+            i.last_addr = None;
             to_none(i, None)
         }
         Event::WanChanged => {
             i.view = None;
             i.probe = None;
             i.remembered = None;
+            i.last_addr = None;
             to_none(i, None)
         }
         Event::Report(v) => {
@@ -664,6 +672,7 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             i.retry_at_ms = None;
             i.hb_fail = 0;
             let tcp_ok = via == Via::Gateway || i.view.as_ref().is_some_and(|v| v.tcp_ok);
+            i.last_addr = Some((addr, tcp, via));
             i.bound = Some(Bound {
                 addr,
                 tcp,
@@ -1197,7 +1206,7 @@ impl Client {
             (State::Detected, _) => format!("偵測到上游黑潮 {ver}：驗證身分中"),
             (State::Verifying, _) => format!("上游黑潮 {ver}：驗證通過，做最後確認中"),
             (State::Released, Some(Reason::NotAllowed)) => {
-                format!("上游黑潮 {ver} 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路")
+                format!("上游黑潮 {ver} 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路；每 10 分鐘確認一次，上游重新開放就自動接回")
             }
             (State::Released, Some(Reason::UpstreamTooOld)) => format!("上游黑潮 {ver} 不支援串接（需要 3.4.0 以上）"),
             (State::Released, Some(Reason::NoResponse)) => "串接中斷：上游沒有回應，暫時用自己的加密上游".into(),
@@ -1224,14 +1233,30 @@ impl Client {
                 Value::from(if b.tcp { "tcp" } else { "udp" }),
                 Value::from(if b.via == Via::Gateway { "gateway" } else { "intercept" }),
             ),
-            None => match i.view.as_ref().and_then(View::usable_hit) {
-                Some((a, tcp)) => (
-                    Value::from(a.ip().to_string()),
-                    Value::from(if tcp { "tcp" } else { "udp" }),
-                    Value::Null,
-                ),
-                None => (Value::Null, Value::Null, Value::Null),
-            },
+            // 沒有綁定（解除、驗證中）：顯示真正的上游位址。探測用的是保留位址（例如 192.0.2.1，被上游接走），
+            // 不是上游本身的位址（3.4.2）。依序：最近一次綁定的位址 → 預設閘道 → 才是保留位址（標成經攔截）
+            None => {
+                let hit = i.view.as_ref().and_then(View::usable_hit);
+                let gw = i.view.as_ref().and_then(|v| v.gateway_ip);
+                match (i.last_addr, gw, hit) {
+                    (Some((a, tcp, via)), _, _) => (
+                        Value::from(a.ip().to_string()),
+                        Value::from(if tcp { "tcp" } else { "udp" }),
+                        Value::from(if via == Via::Gateway { "gateway" } else { "intercept" }),
+                    ),
+                    (None, Some(g), Some((_, tcp))) => (
+                        Value::from(g.to_string()),
+                        Value::from(if tcp { "tcp" } else { "udp" }),
+                        Value::Null,
+                    ),
+                    (None, _, Some((a, tcp))) => (
+                        Value::from(a.ip().to_string()),
+                        Value::from(if tcp { "tcp" } else { "udp" }),
+                        Value::from("intercept"),
+                    ),
+                    _ => (Value::Null, Value::Null, Value::Null),
+                }
+            }
         };
         let b = i.bound.as_ref();
         json!({
@@ -1497,6 +1522,47 @@ mod tests {
             assert!(step(&mut i, Event::Report(v), &[], now()).is_empty());
             assert_eq!(i.state, State::None);
         }
+    }
+
+    /// 3.4.2：解除之後狀態頁的上游位址是真正的上游（最近一次綁定的位址），不是探測用的保留位址 192.0.2.1；
+    /// 從來沒綁定過時用預設閘道，連閘道都沒有才顯示保留位址並標成經攔截
+    #[test]
+    fn released_shows_real_upstream_address() {
+        let mut i = inner(true);
+        chained(&mut i, [7u8; 32]);
+        assert_eq!(Client::upstream_json(&i)["address"], "192.168.1.1");
+        for _ in 0..3 {
+            step(&mut i, Event::Heartbeat(Probe::failed(false, "逾時".into())), &[], now());
+        }
+        assert_eq!(i.state, State::Released);
+        let u = Client::upstream_json(&i);
+        assert_eq!(
+            (u["address"].clone(), u["via"].clone()),
+            (json!("192.168.1.1"), json!("gateway")),
+            "{u}"
+        );
+        // 沒有綁定過：用預設閘道
+        let mut j = inner(true);
+        step(&mut j, Event::Report(view(Some("3.4.0"))), &[], now());
+        let mut p = ok_probe([8u8; 32], vec![]);
+        p.allow = false;
+        step(&mut j, Event::Probed(p.clone()), &[], now());
+        assert_eq!((j.state, j.reason), (State::Released, Some(Reason::NotAllowed)));
+        assert!(j.retry_at.is_some(), "not-allowed 也排重試");
+        assert_eq!(Client::upstream_json(&j)["address"], "192.168.1.1");
+        // 連閘道都沒有：保留位址，標成經攔截
+        let mut k = inner(true);
+        let mut v = view(Some("3.4.0"));
+        v.gateway = None;
+        v.gateway_ip = None;
+        step(&mut k, Event::Report(v), &[], now());
+        step(&mut k, Event::Probed(p), &[], now());
+        let u = Client::upstream_json(&k);
+        assert_eq!(
+            (u["address"].clone(), u["via"].clone()),
+            (json!("192.0.2.1"), json!("intercept")),
+            "{u}"
+        );
     }
 
     #[test]

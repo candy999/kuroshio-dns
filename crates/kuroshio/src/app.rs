@@ -774,6 +774,8 @@ fn start_scheduler(
     // 記憶體吃緊、或系統時間還沒對時（排程與 TLS 都靠正確的時間）：不啟動新工作，執行中的在 checkpoint 暫停
     o.should_defer = Some(Arc::new(|| pressure() != Pressure::Normal || !crate::clock::synced()));
     o.lock_dir = Some(runtime_dir(cfg).join("locks"));
+    // 串接中由上游黑潮提供結果的工作：補跑不排隊、不跑（3.4.2）
+    o.provided = Some(Arc::new(crate::chain::share_skips));
     let slot: Arc<std::sync::OnceLock<std::sync::Weak<Scheduler>>> = Arc::new(std::sync::OnceLock::new());
     let (s2, p2) = (slot.clone(), persister.clone());
     o.on_state_change = Some(Arc::new(move || {

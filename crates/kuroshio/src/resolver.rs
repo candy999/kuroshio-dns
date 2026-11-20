@@ -602,7 +602,7 @@ impl Resolver {
         r.answers = e.answers.iter().map(|a| Record { ttl, ..a.clone() }).collect();
         // CDN 調整會改寫答案：要 DNSSEC 記錄或類別不是 IN 的查詢不動（同 job() 的 verbatim）
         let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1;
-        if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim && e.chained) {
+        if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim && (e.chained || self.chain_active())) {
             // 串接上游（上游黑潮）給的答案：CDN 節點上游已經驗證、換好（3.4.1）。
             // 下游不再改寫、不排背景驗證（MIPS 上的 TLS 驗證很吃 CPU），只記哪家 CDN（統計用，唯讀快照）
             if let Some(p) = cdn.provider_of(&r, query.questions[0].qtype) {
@@ -639,6 +639,12 @@ impl Resolver {
             logic::add_ede(&mut r, ede::STALE_ANSWER, "上游更新中，先回舊資料");
         }
         r
+    }
+
+    /// 串接中（有串接上游、沒有暫停）：CDN 節點由上游處理，下游不改寫也不驗證（3.4.2：
+    /// 串接之前存下的、或重新啟動時讀回來的快取也一樣，到期後由上游重新回答）
+    fn chain_active(&self) -> bool {
+        self.upstreams.chain().is_some_and(|c| c.role == Role::Chain) && !self.upstreams.chain_suspended()
     }
 
     fn refresh(self: &Arc<Self>, key: String, query: Message) {
@@ -907,7 +913,7 @@ impl Resolver {
         let mut set = JoinSet::new();
         let spawn = |set: &mut JoinSet<_>, up: Arc<Up>| {
             let q = q.to_vec();
-            let t = p.timeout;
+            let t = timeout_for(p, &up);
             set.spawn(async move {
                 let t0 = Instant::now();
                 let r = up.up.exchange(&q, t).await;
@@ -918,7 +924,8 @@ impl Resolver {
             spawn(&mut set, u.clone());
         }
         let mut rest = list.iter().skip(first).cloned();
-        let hard = tokio::time::sleep(p.timeout + Duration::from_millis(100));
+        let longest = list.iter().map(|u| timeout_for(p, u)).max().unwrap_or(p.timeout);
+        let hard = tokio::time::sleep(longest + Duration::from_millis(100));
         tokio::pin!(hard);
         let mut window: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let mut hedge = Box::pin(tokio::time::sleep(p.hedge));
@@ -938,7 +945,7 @@ impl Resolver {
                     match r.ok().and_then(|b| Message::parse(&b).ok()) {
                         Some(msg) => {
                             let class = logic::classify(&msg, qtype);
-                            up.record(class != Class::Error && class != Class::ServFail, ms);
+                            up.record(answered_ok(&up, class), ms);
                             let a = Arc::new(Answer { up, msg, class, ms });
                             on_each(&a);
                             if a.class == Class::Ok && window.is_none() {
@@ -1174,6 +1181,29 @@ fn backfill_mismatch(first: &[Arc<Answer>], more: &[Arc<Answer>]) -> bool {
 }
 
 /// 從多個上游結果決定答案（同 2.x）：有正常回應取最快的；否則 nodata / nxdomain 多數決（平手以固定上游為準）
+/// 串接上游（上游黑潮）多等的時間：它自己問上游逾時（`resolver.timeoutMs`）之後才回 SERVFAIL，
+/// 下游用一樣的逾時會先放棄、改問自己的加密上游（3.4.2）
+const CHAIN_EXTRA_TIMEOUT: Duration = Duration::from_millis(1000);
+
+fn timeout_for(p: &Params, up: &Up) -> Duration {
+    if up.role == Role::Chain {
+        p.timeout + CHAIN_EXTRA_TIMEOUT
+    } else {
+        p.timeout
+    }
+}
+
+/// 這個回答算不算上游「有回應」（健康紀錄用）。串接上游回 SERVFAIL 是它自己解析不到（例如權威伺服器太慢），
+/// 上游黑潮本身是好的：不算串接失敗。以前算失敗，連續 3 次就暫停串接 30 秒、全部改走自己的加密上游（3.4.2）
+fn answered_ok(up: &Up, class: Class) -> bool {
+    match class {
+        Class::Error => false,
+        Class::ServFail => up.role == Role::Chain,
+        Class::Refused => up.role != Role::Chain,
+        _ => true,
+    }
+}
+
 fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_cdn::Cdn>, qtype: u16) -> Option<Decided> {
     // 一般 DNS 被路上的攔截者接走時（路徑檢查，3.3.6），它們的回答其實是攔截者給的：
     // 有其他上游的回答時，不拿來合併 IP、也不參加多數決
@@ -1249,6 +1279,25 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
             source: pick.up.up.id.clone(),
             oks: vec![],
             chained: pick.up.role == Role::Chain,
+        });
+    }
+    // 串接上游（上游黑潮）已經用它自己的上游與過濾解析過：它擋掉的（過濾清單）、解析失敗的（SERVFAIL），
+    // 就是最後的答案，下游不再問自己的加密上游重做一次（3.4.2；以前會，重複使用網路，也繞過上游的過濾）
+    if let Some(c) = results
+        .iter()
+        .find(|r| r.up.role == Role::Chain && matches!(r.class, Class::Blocked | Class::ServFail))
+    {
+        let blocked = c.class == Class::Blocked;
+        return Some(Decided {
+            msg: c.msg.clone(),
+            class: if blocked { Class::Ok } else { Class::ServFail },
+            source: if blocked {
+                format!("{}(上游已擋)", c.up.up.id)
+            } else {
+                c.up.up.id.clone()
+            },
+            oks: vec![],
+            chained: true,
         });
     }
     if accept_blocked {

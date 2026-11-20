@@ -283,7 +283,7 @@ const CHAIN = {
                 { kind: 'filter-copy', name: 'https://filter.example.net/list.txt', at: Date.now() - 9 * 3600e3, bytes: 412345, importedAt: null, fresh: false, error: 'no-room' }],
             skippedJobs: ['dns-benchmark', 'cdn-pool', 'cdn-scan', 'cdn-ranges'] },
         serving: CHAIN_SERVING_ON },
-    released: { enabled: true, state: 'released', reason: 'not-allowed', text: '上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路',
+    released: { enabled: true, state: 'released', reason: 'not-allowed', text: '上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路；每 10 分鐘確認一次，上游重新開放就自動接回',
         upstream: { address: '192.168.1.1', proto: 'udp', via: null, version: '3.4.0', nodeId: 'a1b2c3d4e5f60718', fingerprint: CHAIN_FP, allowDownstream: false, caps: [],
             path: [], depth: 1, viaNat: null, since: null, lastOkAt: null, failures: 0, keyChangedAt: null, previousFingerprint: null, registered: null, error: null },
         backupActive: false, retryAt: null, shared: null, serving: CHAIN_SERVING_OFF },

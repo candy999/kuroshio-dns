@@ -594,11 +594,70 @@ async fn catch_up_waits_for_window() {
     assert_eq!(s.request("a", "手動")["ok"], true);
     idle(&s).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
-    // 時鐘走到補跑時段：等著的補跑開始
+    // 時鐘走到補跑時段：等的這段期間已經手動成功跑過，補跑不再重做（3.4.2）
     clock.set(tpe(2026, 11, 11, 1, 5));
     tokio::time::sleep(Duration::from_secs(120)).await;
     idle(&s).await;
-    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(s.status()["catchUpWaiting"], json!([]));
+    h.abort();
+}
+
+/// 3.4.2：結果由上游黑潮提供（串接中）的工作，補跑不排隊、到時段也不跑，狀態列在 catchUpProvided；
+/// 串接解除（不再提供）之後照補跑時段補跑
+#[tokio::test(start_paused = true)]
+async fn catch_up_skipped_while_provided() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let provided = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut o = opts(&clock);
+    o.file_exists = Arc::new(|_: &str| false);
+    o.tick_interval = Duration::from_secs(60);
+    let p2 = provided.clone();
+    o.provided = Some(Arc::new(move |n: &str| n == "a" && p2.load(Ordering::SeqCst)));
+    let s = Scheduler::new(
+        json!({
+            "system": { "catchUpWindow": "01:00-06:00" },
+            // 只在週日排定（測試走的 11/10～11/12 不會碰到排定時間，只看補跑）
+            "jobs": { "a": { "at": "04:10", "weekdays": [0], "runIfMissing": "state/upstreams.json", "startDelaySec": 60 } }
+        }),
+        None,
+        o,
+    );
+    let runs = Arc::new(AtomicU32::new(0));
+    let r = runs.clone();
+    s.register("a", move |_ctx: JobCtx| {
+        let r = r.clone();
+        async move {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let h = s.start();
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    let st = s.status();
+    assert_eq!(st["catchUpWaiting"], json!([]), "由上游提供：不列成等時段");
+    assert_eq!(st["catchUpProvided"], json!(["a"]));
+    // 到了時段也不跑（跑了只會被略過）
+    clock.set(tpe(2026, 11, 11, 1, 5));
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    idle(&s).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(s.status()["catchUpProvided"], json!(["a"]));
+    // 串接解除（白天）：改成等時段
+    clock.set(tpe(2026, 11, 11, 12, 0));
+    provided.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let st = s.status();
+    assert_eq!(
+        (st["catchUpWaiting"].clone(), st["catchUpProvided"].clone()),
+        (json!(["a"]), json!([]))
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    // 下一個時段：補跑
+    clock.set(tpe(2026, 11, 12, 1, 5));
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    idle(&s).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(s.status()["catchUpWaiting"], json!([]));
     h.abort();
 }
