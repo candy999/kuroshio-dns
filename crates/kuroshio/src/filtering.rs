@@ -162,6 +162,8 @@ pub struct CopyMeta {
     pub at: u64,
     /// 這份清單的規則數（開機時估記憶體、檢查新下載的有沒有少一大半；舊版的索引沒有是 0）
     pub rules: u64,
+    /// 上次成功檢查更新的時間（Unix 秒；3.4.2 起，舊版的索引沒有是 0）：重新啟動後不必馬上再問一次
+    pub checked: u64,
 }
 
 /// [`ListCopies::stream`] 送回來的一段
@@ -253,6 +255,7 @@ impl ListCopies {
                             bytes: n("bytes"),
                             at: n("at"),
                             rules: n("rules"),
+                            checked: n("checked"),
                         },
                     );
                 }
@@ -353,6 +356,7 @@ impl ListCopies {
                 return false;
             }
             let file = url_id(url);
+            let checked = idx.get(url).map_or(0, |m| m.checked);
             idx.insert(
                 url.to_string(),
                 CopyMeta {
@@ -363,6 +367,7 @@ impl ListCopies {
                     bytes: z.len() as u64,
                     at: now,
                     rules,
+                    checked,
                 },
             );
             self.persister.lock().unwrap().stage(&file, z);
@@ -377,6 +382,35 @@ impl ListCopies {
         // 索引內容沒變時，快照寫入器不會重寫
         self.persister.lock().unwrap().stage(COPY_INDEX, body);
         staged
+    }
+
+    /// 這幾份清單剛檢查過更新（全部沒變、或有變的已經下載換上）：記下時間。每次定時更新最多寫一次小小的索引
+    pub fn note_checked(&self, urls: &[&str], now: u64) {
+        let mut idx = self.index.lock().unwrap();
+        let mut any = false;
+        for u in urls {
+            if let Some(m) = idx.get_mut(*u) {
+                m.checked = now;
+                any = true;
+            }
+        }
+        if !any {
+            return;
+        }
+        let body = Self::index_json(&idx);
+        drop(idx);
+        self.persister.lock().unwrap().stage(COPY_INDEX, body);
+    }
+
+    /// 這幾份清單「最早」的上次檢查時間；有一份沒有副本或沒記過就是 None（照舊開機後就檢查）
+    pub fn last_checked(&self, urls: &[&str]) -> Option<u64> {
+        let idx = self.index.lock().unwrap();
+        let mut min: Option<u64> = None;
+        for u in urls {
+            let c = idx.get(*u).map(|m| m.checked).filter(|&c| c > 0)?;
+            min = Some(min.map_or(c, |m: u64| m.min(c)));
+        }
+        min
     }
 
     /// 補記規則數（索引裡是 0 的時候）。索引內容沒變時快照寫入器不會重寫
@@ -400,7 +434,7 @@ impl ListCopies {
                 let c = &idx[k];
                 (
                     k.clone(),
-                    json!({ "hash": format!("{:016x}", c.hash), "etag": c.etag, "lastModified": c.last_modified, "bytes": c.bytes, "at": c.at, "rules": c.rules }),
+                    json!({ "hash": format!("{:016x}", c.hash), "etag": c.etag, "lastModified": c.last_modified, "bytes": c.bytes, "at": c.at, "rules": c.rules, "checked": c.checked }),
                 )
             })
             .collect();
@@ -880,12 +914,50 @@ impl FilterService {
             }
             if !changed {
                 self.status.lock().unwrap()["checkedAt"] = json!(crate::persist::now_secs() * 1000);
+                self.note_checked(&active);
                 return Ok(false);
             }
         }
         // 2. 載入前先看記憶體預算：量過大小的清單估計會超過，就依停用順序先不載入（看得到原因）
         self.fit_allowance();
-        self.rebuild_mode(Source::Download, &reuse).await.map(|_| true)
+        let r = self.rebuild_mode(Source::Download, &reuse).await.map(|_| true);
+        let failed = self.status.lock().unwrap()["errors"].as_array().is_some_and(|a| !a.is_empty());
+        if r.is_ok() && !failed && self.missing.lock().unwrap().is_empty() && self.unloaded.lock().unwrap().is_empty() {
+            self.note_checked(&active);
+        }
+        r
+    }
+
+    /// 記下這幾份清單剛檢查過更新
+    fn note_checked(&self, active: &[usize]) {
+        if let Some(c) = self.copies.get() {
+            let urls: Vec<&str> = active.iter().map(|&i| self.sources[i].url.as_str()).collect();
+            c.note_checked(&urls, crate::persist::now_secs());
+        }
+    }
+
+    /// 開機用副本建好之後，離下一次該檢查更新還有多久：全部清單都有副本、都記過上次檢查時間，
+    /// 而且還沒到更新間隔才有值（重新啟動、重新載入不再一分鐘後就把清單全部問一次、有變的整份重新下載）
+    pub fn first_check_delay(&self, now: u64) -> Option<Duration> {
+        let c = self.copies.get()?;
+        if !self.missing.lock().unwrap().is_empty() || !self.unloaded.lock().unwrap().is_empty() {
+            return None;
+        }
+        let ex = self.excluded();
+        let urls: Vec<&str> = (0..self.sources.len())
+            .filter(|&i| !ex[i])
+            .map(|i| self.sources[i].url.as_str())
+            .collect();
+        if urls.is_empty() {
+            return None;
+        }
+        let last = c.last_checked(&urls)?;
+        // 時間倒退（還沒對時、或改過系統時間）：照舊馬上檢查
+        if last > now {
+            return None;
+        }
+        let next = last.saturating_add(self.interval.as_secs());
+        (next > now).then(|| Duration::from_secs(next - now))
     }
 
     /// 依記憶體預算（記憶體控制提供）先排除會放不下的清單：只用量過的大小估，依停用順序（保護清單絕不排除；
@@ -1324,7 +1396,8 @@ impl FilterService {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
             // 有本機副本：先用副本建好，1 分鐘後再問上游有沒有更新（大多是 304，不必重建）
-            if me.build_from_copies().await {
+            let built = me.build_from_copies().await;
+            if built {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
             // 下載要 TLS：系統時間還沒對時（路由器開機時常是 1970）先等，最多 10 分鐘
@@ -1342,6 +1415,17 @@ impl FilterService {
                 info!("過濾清單：等跟上游黑潮同步清單副本之後再檢查更新");
                 while crate::chain::share_pending() && t1.elapsed() < Duration::from_secs(600) {
                     tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+            // 上次檢查還沒過更新間隔（重新啟動、重新載入、換版）：等到該檢查的時候，不必一開機就全部問一次
+            if built {
+                if let Some(w) = me.first_check_delay(crate::persist::now_secs()) {
+                    info!(
+                        "過濾清單：{} 分鐘前檢查過更新，{} 分鐘後再檢查",
+                        (me.interval.saturating_sub(w)).as_secs() / 60,
+                        w.as_secs() / 60
+                    );
+                    tokio::time::sleep(w).await;
                 }
             }
             // 有清單下載失敗（或還有沒載入的）時短間隔重試：1、2、5 分鐘，之後每 30 分鐘；全部成功就回到正常間隔

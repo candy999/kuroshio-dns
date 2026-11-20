@@ -574,6 +574,71 @@ async fn partial_loads_copies_and_truncated_lists() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 3.4.2：記下上次檢查更新的時間；重新啟動後還沒過更新間隔就不馬上再問一次（以前開機一分鐘後就全部問、
+/// 有變的整份重新下載：padavan-tw 的 D3 每次重啟約 9 MB、Windows 串接中重啟約 12 MB）
+#[tokio::test]
+async fn restart_waits_for_next_check() {
+    use std::sync::{Arc, Mutex};
+    let st = Arc::new(Mutex::new(EtagLists::default()));
+    {
+        let mut g = st.lock().unwrap();
+        g.lists.insert("a.txt".into(), ("\"a1\"".into(), many("aa", 200)));
+        g.lists.insert("b.txt".into(), ("\"b1\"".into(), many("bb", 200)));
+    }
+    let srv = etag_server(st.clone()).await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-checked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let lists = json!([
+        { "name": "A", "url": format!("http://{srv}/a.txt"), "category": "ads" },
+        { "name": "B", "url": format!("http://{srv}/b.txt"), "category": "ads" },
+    ]);
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": lists } }));
+    let persister = || {
+        let mut p = kuroshio::persist::Persister::new(
+            dir.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        p.set_free_probe(|_| Some(10 << 30));
+        Arc::new(Mutex::new(p))
+    };
+    let now = kuroshio::persist::now_secs();
+    let p = persister();
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(p.clone());
+    // 還沒有副本：沒有等待時間（照舊）
+    assert_eq!(f.first_check_delay(now), None);
+    assert!(f.update_lists(false).await.unwrap());
+    p.lock().unwrap().flush_all(now).unwrap();
+
+    // 重新啟動：用副本建好，上次檢查是剛剛 → 等到更新間隔（預設 24 小時）到了才檢查
+    let f2 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f2.set_copies(persister());
+    assert!(f2.build_from_copies().await);
+    let w = f2.first_check_delay(now + 600).expect("剛檢查過：要等");
+    let day = 24 * 3600;
+    assert!(w.as_secs() <= day - 600 && w.as_secs() >= day - 700, "{w:?}");
+    // 過了更新間隔、或時間倒退（還沒對時）：馬上檢查
+    assert_eq!(f2.first_check_delay(now + day + 1), None);
+    assert_eq!(f2.first_check_delay(now.saturating_sub(3600)), None);
+
+    // 全部 304 的那一輪也記時間；之後加了一份新清單（沒有副本）：馬上檢查
+    let p3 = persister();
+    let f3 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f3.set_copies(p3.clone());
+    assert!(f3.build_from_copies().await);
+    assert!(!f3.update_lists(false).await.unwrap(), "都沒變：不重建");
+    assert_eq!(st.lock().unwrap().full.get("a.txt"), Some(&1), "只下載過第一次");
+    p3.lock().unwrap().flush_all(now).unwrap();
+    let mut more = lists.as_array().unwrap().clone();
+    more.push(json!({ "name": "C", "url": format!("http://{srv}/c.txt"), "category": "ads" }));
+    let cfg2 = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": more } }));
+    let f4 = kuroshio::filtering::FilterService::from_cfg(&cfg2, &dir).unwrap();
+    f4.set_copies(persister());
+    assert!(f4.build_from_copies().await);
+    assert_eq!(f4.first_check_delay(now + 600), None, "有清單沒有副本：照舊馬上檢查");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 串接模式（3.4.0 WP6）：標了 `bypass` 的清單命中 → `Verdict.bypass`；其他清單與自訂規則 → false。
 /// 沒寫標記的預設 HaGeZi doh-vpn-proxy-bypass 依網址認得（WP2 的 `is_bypass_list`）
 #[tokio::test]
