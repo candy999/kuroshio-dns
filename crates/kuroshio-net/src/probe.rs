@@ -96,7 +96,7 @@ impl SiteCheck {
 
 /// 驗證「這個 IP 是不是真的在服務這個網域」（每日評測判斷汙染、黑名單體檢共用）
 pub async fn verify_site(ip: IpAddr, domain: &str, timeout: Duration) -> (SiteCheck, String) {
-    match crate::tls::connect_ip(ip, 443, domain, true, timeout).await {
+    match crate::tls::connect_ip_with(ip, 443, domain, true, timeout, true).await {
         Ok(_) => (SiteCheck::Valid, "OK".into()),
         Err(e) => {
             let (code, tls) = classify_error(&e);
@@ -289,12 +289,8 @@ async fn run(addr: SocketAddr, tls: Option<(&str, bool)>, req: String, timeout: 
     let t0 = Instant::now();
     let r = tokio::time::timeout(timeout, async {
         let mut s: Box<dyn Io> = match tls {
-            Some((sni, verify)) => Box::new(crate::tls::connect_ip(addr.ip(), addr.port(), sni, verify, timeout).await?),
-            None => {
-                let tcp = TcpStream::connect(addr).await?;
-                tcp.set_nodelay(true)?;
-                Box::new(tcp)
-            }
+            Some((sni, verify)) => Box::new(crate::tls::connect_ip_with(addr.ip(), addr.port(), sni, verify, timeout, true).await?),
+            None => Box::new(crate::tls::probe_tcp(addr).await?),
         };
         exchange(&mut *s, req.as_bytes(), max_body, head_only).await
     })
@@ -351,8 +347,13 @@ pub async fn https_probe(addr: SocketAddr, hostname: &str, path: &str, opts: &Ht
     .await
 }
 
+/// 節點池下載測速每次最多收多少（3.4.2 以前是 30 MiB：網路快的時候每個節點都把整個測速檔收完，
+/// 一次節點池工作就是數百 MB 到 1 GB）。8 MiB 在 100 Mbps 要 0.7 秒，分得出快慢，也遠高於「慢」的門檻 1 MB/s
+pub const SPEED_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 下載測速：連到 `ip`（`port` 沒給就用網址的埠），Host / SNI 用網址的主機，回傳 MB/s（兩位小數）。
-/// 跟 2.x 一樣：收到標頭後開始計時，`max_ms + 3` 秒或收到 `max_bytes` 就停；不到 0.2 秒或狀態碼 ≥ 300 回 0。
+/// 跟 2.x 一樣：收到標頭後開始計時，`max_ms + 3` 秒或收到 `max_bytes` 就停；狀態碼 ≥ 300 回 0。
+/// 沒收滿 `max_bytes` 又不到 0.2 秒（檔案太小、連線被關）回 0；收滿了就照實際時間算（網路很快時不到 0.2 秒）
 pub async fn download_speed(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u64, max_bytes: u64) -> f64 {
     let Ok(u) = crate::fetch::parse_url(url) else { return 0.0 };
     let addr = SocketAddr::new(ip, port.unwrap_or(u.port));
@@ -408,9 +409,13 @@ pub async fn download_speed(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u6
     }
     .await;
     match r {
-        Ok((bytes, sec)) if sec > 0.2 => (bytes as f64 / 1_048_576.0 / sec * 100.0).round() / 100.0,
+        Ok((bytes, sec)) if sec > 0.2 || (bytes >= max_bytes && sec > 0.0) => speed_mbs(bytes, sec),
         _ => 0.0,
     }
+}
+
+fn speed_mbs(bytes: u64, sec: f64) -> f64 {
+    (bytes as f64 / 1_048_576.0 / sec.max(0.001) * 100.0).round() / 100.0
 }
 
 #[cfg(test)]
@@ -432,6 +437,55 @@ mod tests {
         assert_eq!((b.as_slice(), done), (&b"hellowo"[..], true));
         assert_eq!(host_header("::1", 8443, 443), "[::1]:8443");
         assert_eq!(host_header("a.test", 443, 443), "a.test");
+    }
+
+    /// 3.4.2：測速收滿上限就停（以前 30 MiB：網路快時每個節點都把整個測速檔收完）；收滿得很快也照算速度
+    #[tokio::test]
+    async fn speed_test_stops_at_cap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let sent = Arc::new(AtomicU64::new(0));
+        let s2 = sent.clone();
+        let total: u64 = 64 * 1024 * 1024;
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+            s.write_all(head.as_bytes()).await.unwrap();
+            let chunk = vec![0u8; 65536];
+            while s2.load(Ordering::Relaxed) < total {
+                if s.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                s2.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
+        });
+        let url = format!("http://speed.example.com:{}/file", addr.port());
+        let mbs = download_speed(addr.ip(), Some(addr.port()), &url, 5000, SPEED_MAX_BYTES).await;
+        assert!(mbs > 0.0, "收滿上限：照算速度（本機很快，不到 0.2 秒）");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 收滿就關：對方送出的量 = 上限 + 雙方的緩衝區，遠少於整個檔案
+        let n = sent.load(Ordering::Relaxed);
+        assert!(n < total / 2, "送了 {n} bytes");
+        // 檔案比上限小、又很快收完：照舊回 0（量不準）
+        assert_eq!(speed_mbs(0, 0.0), 0.0);
+    }
+
+    /// 3.4.2：探測用的連線接收緩衝區小（只讀前段就關，對方先送進來的資料也算流量）
+    #[tokio::test]
+    async fn probe_socket_has_small_receive_buffer() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let acc = tokio::spawn(async move { l.accept().await.unwrap() });
+        let s = crate::tls::probe_tcp(addr).await.unwrap();
+        let _peer = acc.await.unwrap();
+        let sock = tokio::net::TcpSocket::from_std_stream(s.into_std().unwrap());
+        let n = sock.recv_buffer_size().unwrap();
+        // Linux 會把設定值加倍（含簿記空間）
+        assert!(n <= crate::tls::PROBE_RCVBUF * 2, "接收緩衝區 {n}");
     }
 
     #[tokio::test]

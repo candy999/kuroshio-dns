@@ -135,7 +135,7 @@ impl Net for RealNet {
             } else {
                 self.https_port
             };
-            probe::download_speed(ip, Some(port), url, max_ms, 30 * 1024 * 1024).await
+            probe::download_speed(ip, Some(port), url, max_ms, probe::SPEED_MAX_BYTES).await
         })
     }
 

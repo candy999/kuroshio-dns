@@ -403,14 +403,50 @@ fn cached_config_probe(verify: bool) -> Arc<rustls::ClientConfig> {
 /// `verify = false` 時不檢查憑證（2.x 的 `verifyCert: false`）。
 /// 握手失敗時錯誤裡帶著 `rustls::Error`（可用 `downcast_ref` 判斷是不是 TLS 問題）。
 pub async fn connect_ip(ip: IpAddr, port: u16, sni: &str, verify: bool, timeout: Duration) -> Result<TlsStream<TcpStream>> {
+    connect_ip_with(ip, port, sni, verify, timeout, false).await
+}
+
+/// 探測（驗證節點、標頭探測）用的接收緩衝區：只讀標頭和內容前幾 KB 就關，緩衝區小，
+/// 對方在關之前能先送進來的資料就少（系統預設會自動放大到數百 KB 到數 MB，關掉前那些都算流量）
+pub const PROBE_RCVBUF: u32 = 32 * 1024;
+
+/// 探測用的 TCP 連線：接收緩衝區設成 [`PROBE_RCVBUF`]（要在連線前設，視窗大小在握手時就定了）
+pub async fn probe_tcp(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    let s = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // 設不了（少數平台）就用系統預設，不影響連線
+    let _ = s.set_recv_buffer_size(PROBE_RCVBUF);
+    let tcp = s.connect(addr).await?;
+    tcp.set_nodelay(true)?;
+    Ok(tcp)
+}
+
+/// 同 [`connect_ip`]，`probe` = 用 [`probe_tcp`]（只讀前段就關的探測）
+pub async fn connect_ip_with(
+    ip: IpAddr,
+    port: u16,
+    sni: &str,
+    verify: bool,
+    timeout: Duration,
+    probe: bool,
+) -> Result<TlsStream<TcpStream>> {
     let name = match sni.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
         Err(_) => ServerName::try_from(sni.to_string()).context("主機名稱格式錯誤")?,
     };
     let connector = tokio_rustls::TlsConnector::from(cached_config_probe(verify));
     tokio::time::timeout(timeout, async {
-        let tcp = TcpStream::connect(SocketAddr::new(ip, port)).await?;
-        tcp.set_nodelay(true)?;
+        let addr = SocketAddr::new(ip, port);
+        let tcp = if probe {
+            probe_tcp(addr).await?
+        } else {
+            let tcp = TcpStream::connect(addr).await?;
+            tcp.set_nodelay(true)?;
+            tcp
+        };
         Ok::<_, anyhow::Error>(connector.connect(name, tcp).await?)
     })
     .await

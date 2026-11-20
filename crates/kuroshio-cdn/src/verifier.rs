@@ -140,6 +140,10 @@ struct Done {
     retry_at: Option<u64>,
 }
 
+/// 驗證時內容最多讀多少：判斷只看狀態碼與標頭（內容只用來找 Cloudflare 的 `colo=`，那在 /cdn-cgi/trace，
+/// 不在首頁），跟純 HTTP 探測一樣讀 4 KB 就關（3.4.2 以前讀 16 KB）
+const VERIFY_MAX_BODY: usize = 4096;
+
 impl Cdn {
     fn until(&self, ok: bool, fails: u32) -> u64 {
         let now = now_ms();
@@ -164,6 +168,7 @@ impl Cdn {
                     "/",
                     HttpsOpts {
                         timeout: t,
+                        max_body: VERIFY_MAX_BODY,
                         ..Default::default()
                     },
                 )
