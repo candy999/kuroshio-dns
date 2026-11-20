@@ -119,6 +119,32 @@ docker compose pull && docker compose up -d
 
 `/config` 不受影響。想固定在某個版本，把 `latest` 改成例如 `3.4.1`；只想收 3.4.x 的修正就用 `3.4`。
 
+### 試用還沒發布的修正版（Actions 的測試建置）
+
+回報問題後拿到 GitHub Actions 的網址（`https://github.com/candy999/kuroshio-dns/actions/runs/<編號>`）時，可以先把容器裡的執行檔換成測試建置，不用等新的映像檔。測試建置只有執行檔，映像檔照舊用 `latest`。
+
+1. 確認架構：在主機上執行 `uname -m`。`x86_64` 用 `bin-x86_64-unknown-linux-musl`，`aarch64` 用 `bin-aarch64-unknown-linux-musl`（`armv7l` 用 `bin-armv7-unknown-linux-musleabihf`）。
+2. 下載：在那個網址的頁面最下面「Artifacts」下載對應的檔案（要登入 GitHub；建置還在跑時不會出現）。解開後是一個 `kuroshio` 執行檔（靜態連結，不需要其他函式庫）。
+3. 放到 `compose.yml` 旁邊，改名成 `kuroshio-test`，加上執行權限：`chmod +x kuroshio-test`。
+4. `compose.yml` 的 `volumes` 加一行，蓋過容器裡的執行檔：
+
+   ```yaml
+       volumes:
+         - ./config:/config
+         - ./kuroshio-test:/usr/bin/kuroshio:ro
+   ```
+
+5. 重新建立容器並確認版本：
+
+   ```sh
+   docker compose up -d
+   docker exec kuroshio kuroshio --version
+   ```
+
+6. 正式版發布後：拿掉那一行 `volumes`，`docker compose pull && docker compose up -d`。
+
+Synology（Container Manager）沒有用 `compose.yml` 時：停止容器 →「編輯」→「儲存空間設定」新增一筆，檔案選 `kuroshio-test`、掛載路徑填 `/usr/bin/kuroshio`、勾「唯讀」→ 啟動。`/config` 裡的設定與學習資料不受影響，換回正式版時把這筆刪掉。
+
 ### 健康檢查
 
 映像檔內建 `HEALTHCHECK`（`kuroshio health`：明文 DNS 有在回答就是 healthy），`docker ps` 看得到狀態。停止時送 SIGTERM，黑潮 DNS 會寫出快照再結束，所以 `stop_grace_period` 給 15 秒。
