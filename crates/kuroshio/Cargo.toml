@@ -16,8 +16,11 @@ path = "src/main.rs"
 
 [features]
 acme = ["dep:instant-acme"]
+# 實驗（3.4.1）：改用 mimalloc 配置記憶體（預設不開；musl 內建的配置器較慢、空出來的記憶體不太還給系統）
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true, default-features = false }
 kuroshio-config = { path = "../kuroshio-config" }
 kuroshio-proto = { path = "../kuroshio-proto" }
 kuroshio-filter = { path = "../kuroshio-filter" }

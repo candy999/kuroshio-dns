@@ -890,6 +890,11 @@ async fn generation(
     Ok(again)
 }
 
+/// 實驗（3.4.1，`--features mimalloc`）：改用 mimalloc。預設的建置不受影響
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let cli = Cli::parse();
     // 容器：設定檔不存在時從 KUROSHIO_INIT_CONFIG 複製映像附的預設設定（之後使用者可以自己改）

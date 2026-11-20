@@ -95,7 +95,7 @@ jobs:
           if-no-files-found: ignore
 
   binaries:
-    name: 執行檔 ${{ matrix.target }}
+    name: 執行檔 ${{ matrix.target }}${{ matrix.suffix }}
     needs: test
     runs-on: ubuntu-latest
     strategy:
@@ -108,6 +108,9 @@ jobs:
           # MIPS 在 Rust 是 tier 3：用 nightly 自己編標準函式庫（OpenWrt 的 mips_24kc / mipsel_24kc 都是軟體浮點，跟這兩個 target 相同）
           - { target: mipsel-unknown-linux-musl,      qemu: qemu-mipsel, nightly: true }
           - { target: mips-unknown-linux-musl,        qemu: qemu-mips,   nightly: true }
+          # 實驗（3.4.1）：mimalloc 版的 mipsel 執行檔，給 MT7621 實機對照記憶體與 CPU（只出單獨執行檔
+          # kuroshio-mipsel-unknown-linux-musl-mimalloc，不打 Linux 通用包、不進 OpenWrt 套件）
+          - { target: mipsel-unknown-linux-musl,      qemu: qemu-mipsel, nightly: true, features: mimalloc, suffix: -mimalloc }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -123,20 +126,22 @@ jobs:
         run: rustup toolchain install "$MIPS_NIGHTLY_FALLBACK" --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}${{ matrix.suffix }}
       - name: 安裝 zig 與 cargo-zigbuild
         run: pip install ziglang cargo-zigbuild
       - name: 編譯
         run: |
+          FEAT=""
+          if [ -n "${{ matrix.features }}" ]; then FEAT="--features ${{ matrix.features }}"; fi
           if [ "${{ matrix.nightly }}" = "true" ]; then
             # MIPS 的 static-pie 執行檔一啟動就 segfault：改成非 PIE 的靜態執行檔
             export RUSTFLAGS="-C relocation-model=static"
-            if ! cargo +nightly zigbuild --release -p kuroshio --target ${{ matrix.target }} -Zbuild-std=std,panic_abort; then
+            if ! cargo +nightly zigbuild --release -p kuroshio $FEAT --target ${{ matrix.target }} -Zbuild-std=std,panic_abort; then
               echo "::warning::最新的 nightly 編不過，改用 $MIPS_NIGHTLY_FALLBACK"
-              cargo "+$MIPS_NIGHTLY_FALLBACK" zigbuild --release -p kuroshio --target ${{ matrix.target }} -Zbuild-std=std,panic_abort
+              cargo "+$MIPS_NIGHTLY_FALLBACK" zigbuild --release -p kuroshio $FEAT --target ${{ matrix.target }} -Zbuild-std=std,panic_abort
             fi
           else
-            cargo zigbuild --release -p kuroshio --target ${{ matrix.target }}
+            cargo zigbuild --release -p kuroshio $FEAT --target ${{ matrix.target }}
           fi
           ls -la target/${{ matrix.target }}/release/kuroshio
           file target/${{ matrix.target }}/release/kuroshio
@@ -194,10 +199,11 @@ jobs:
           grep -q 'resolver.parallel' /tmp/sysinfo.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: bin-${{ matrix.target }}
+          name: bin-${{ matrix.target }}${{ matrix.suffix }}
           path: target/${{ matrix.target }}/release/kuroshio
       # Linux 通用版：kuroshio/ 資料夾裡有執行檔、data/（執行檔旁的 data/ 會自動使用）、授權、說明
       - name: 打包 Linux 通用版
+        if: ${{ !matrix.suffix }}
         run: |
           mkdir -p dist/kuroshio
           install -m 755 target/${{ matrix.target }}/release/kuroshio dist/kuroshio/kuroshio
@@ -211,6 +217,7 @@ jobs:
           tar -C dist --owner=0 --group=0 --numeric-owner -czf dist/kuroshio-linux-${{ matrix.target }}.tar.gz kuroshio
           tar -tvzf dist/kuroshio-linux-${{ matrix.target }}.tar.gz | sed -n "1,5p"
       - uses: actions/upload-artifact@v7
+        if: ${{ !matrix.suffix }}
         with:
           name: kuroshio-linux-${{ matrix.target }}
           path: dist/kuroshio-linux-${{ matrix.target }}.tar.gz
