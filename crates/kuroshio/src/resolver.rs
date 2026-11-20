@@ -954,14 +954,28 @@ impl Resolver {
                             }
                             let a = Arc::new(Answer { up, msg, class, ms });
                             on_each(&a);
-                            if a.class == Class::Ok && window.is_none() {
+                            if a.class == Class::Ok {
+                                // 否定答案先開了 window 也一樣：有正常回應之後不再加問其他上游
                                 got_ok = true;
+                                if window.is_none() {
+                                    window = Some(Box::pin(tokio::time::sleep(p.window)));
+                                }
+                            } else if matches!(a.class, Class::NoData | Class::NxDomain) && window.is_none() {
+                                // 否定答案也只再等 window 收其他上游的回答（多數決），不等到逾時：以前要等並行的
+                                // 每一台都回來，其中一台慢或掛掉（例如一直連續失敗的 DoT）時，每一筆 NODATA／NXDOMAIN
+                                // （包括只有 IPv4 的網站的 AAAA）都卡滿 timeoutMs（3.4.2 Windows 實測：1,502 ms）
                                 window = Some(Box::pin(tokio::time::sleep(p.window)));
                             }
                             if a.class != Class::Ok {
                                 if let Some(u) = rest.next() { spawn(&mut set, u); }
                             }
                             out.push(a);
+                            // 已經有兩台回否定答案、還沒有正常回應：多數決已經定了，不再等其他上游
+                            // （正常回應一拿到就先回給用戶端，否定答案以前要等每一台；只有 IPv4 的網站的 AAAA
+                            // 在上游 A 實測中位 424 ms、32% 卡 1.5 秒，有 AAAA 的只要 53 ms）
+                            if !got_ok && out.iter().filter(|x| matches!(x.class, Class::NoData | Class::NxDomain)).count() >= 2 {
+                                break;
+                            }
                         }
                         None => {
                             up.record(false, ms);

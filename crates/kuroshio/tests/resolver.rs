@@ -374,6 +374,43 @@ async fn warmup_from_hot_names() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// 3.4.2 Windows 實測：否定答案（NXDOMAIN／NODATA）不等不回應的上游逾時，只再等 collectWindowMs
+#[tokio::test]
+async fn negative_answer_does_not_wait_for_silent_upstream() {
+    let (up, _n) = upstream(0, answer).await;
+    // 收得到查詢、永遠不回的上游
+    let hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent = hole.local_addr().unwrap();
+    let c = cfg(&[up, silent], json!({ "resolver": { "parallel": 0, "timeoutMs": 1500 } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let t0 = std::time::Instant::now();
+    let m = Message::parse(&r.handle(&q(1, "nx.test", 1), &CTX).await.unwrap()).unwrap();
+    let ms = t0.elapsed().as_millis();
+    assert_eq!(m.rcode, 3);
+    assert!(ms < 1000, "只等 collectWindowMs（100 ms），不等 1,500 ms 的逾時：{ms} ms");
+    drop(hole);
+}
+
+/// 兩台都回 NXDOMAIN、第三台不回：不等 collectWindowMs，第二個否定答案到了就回
+#[tokio::test]
+async fn two_negative_answers_decide_without_waiting() {
+    let (a1, _) = upstream(0, answer).await;
+    let (a2, _) = upstream(20, answer).await;
+    let hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent = hole.local_addr().unwrap();
+    let c = cfg(
+        &[a1, a2, silent],
+        json!({ "resolver": { "parallel": 0, "timeoutMs": 1500, "collectWindowMs": 1000 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let t0 = std::time::Instant::now();
+    let m = Message::parse(&r.handle(&q(1, "nx.test", 1), &CTX).await.unwrap()).unwrap();
+    let ms = t0.elapsed().as_millis();
+    assert_eq!(m.rcode, 3);
+    assert!(ms < 700, "第二個否定答案（20 ms）到了就決定，不等 1,000 ms 的收集時間：{ms} ms");
+    drop(hole);
+}
+
 #[tokio::test]
 async fn parallel_limit_prefers_fastest_upstream() {
     let (slow, n_slow) = upstream(150, answer).await;
