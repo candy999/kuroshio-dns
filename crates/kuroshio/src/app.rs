@@ -1107,6 +1107,11 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
         let c = cdn.clone();
         tokio::spawn(async move {
             tokio::time::sleep(first).await;
+            // 開機時還不知道會不會串接（第一次路徑檢查、驗證上游黑潮）：先等，最多 3 分鐘
+            let t0 = Instant::now();
+            while crate::chain::deciding() && t0.elapsed() < Duration::from_secs(180) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
             loop {
                 // 系統時間沒對時：驗證、量測的結果帶著錯的時間，不做（不寫進學到的資料）。
                 // 串接中：CDN 節點由上游黑潮處理，這台不改寫，健康檢查、品質量測、複驗都不做（3.4.2：

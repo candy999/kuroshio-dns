@@ -39,6 +39,15 @@ pub fn cdn_by_upstream() -> bool {
     current().is_some_and(|c| c.is_chained())
 }
 
+/// 開機後還不知道會不會串接：`chain` 開著，而且第一次路徑檢查還沒做完、或正在驗證上游黑潮。
+/// CDN 的定時檢查先等這段過去（3.4.2：以前開機 20 秒就做節點健康檢查，串接還沒建立，
+/// Windows 實測串接中重啟一分鐘內連了約 800 個 CDN 節點）
+pub fn deciding() -> bool {
+    let Some(c) = current() else { return false };
+    c.downstream_enabled()
+        && (kuroshio_net::path::current().is_none() || matches!(c.state().0, client::State::Detected | client::State::Verifying))
+}
+
 /// 正在等第一次跟上游黑潮同步共用結果：正在驗證上游黑潮，或已經串接（上游有提供共用結果）但還沒同步完成過。
 /// 過濾清單在這段期間不從網路下載（3.4.2）
 pub fn share_pending() -> bool {

@@ -1144,6 +1144,11 @@ impl Client {
         self.inner.lock().unwrap().state == State::Chained
     }
 
+    /// 下游的 `chain` 開著
+    pub fn downstream_enabled(&self) -> bool {
+        self.inner.lock().unwrap().settings.downstream_enabled()
+    }
+
     /// 綁定中的上游公鑰（WP5 驗清單用）
     pub fn bound_key(&self) -> Option<[u8; 32]> {
         self.inner.lock().unwrap().bound.as_ref().map(|b| b.public)
