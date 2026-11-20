@@ -731,6 +731,8 @@ struct SyncState {
     kinds: BTreeMap<String, Imported>,
     objects: Vec<ObjStatus>,
     last_sync_at: Option<u64>,
+    /// 這個行程有沒有成功同步過（清單驗過了）。上游還在建置回 REFUSED 的那次不算（3.4.2）
+    synced_ok: bool,
     next_sync_at: Option<u64>,
     error: Option<String>,
 }
@@ -863,9 +865,11 @@ impl Syncer {
     }
 
     /// 這個工作要不要略過（規格 3.5 的對照）
-    /// 這個行程還沒有成功跟上游同步過（重新啟動後）
+    /// 這個行程還沒有成功跟上游同步過（重新啟動後）。
+    /// 失敗的同步不算：以前上游還在建置、第一次回 REFUSED 之後就當成「同步過」，
+    /// 30 秒後的重試之前，cdn-scan 的補跑就開跑了（3.4.2 Windows 實測）
     pub fn never_synced(&self) -> bool {
-        self.state.lock().unwrap().last_sync_at.is_none()
+        !self.state.lock().unwrap().synced_ok
     }
 
     pub fn skip_job(&self, job: &str) -> bool {
@@ -943,6 +947,9 @@ impl Syncer {
             match &r {
                 Err(Fatal(e)) if e == "memory" || e == "not-chained" => {}
                 _ => st.last_sync_at = Some(now),
+            }
+            if r.is_ok() {
+                st.synced_ok = true;
             }
             st.error = r.as_ref().err().map(|f| f.0.clone());
         }
@@ -1338,11 +1345,17 @@ impl Live {
         self.cdn.as_ref().ok_or_else(|| anyhow!("這台沒有啟用 CDN"))
     }
 
-    /// 新的節點池：15 秒後重新量一次健康與品質（同 `cdn-pool` 工作結束後的做法）
+    /// 新的節點池：15 秒後重新量一次健康與品質（同 `cdn-pool` 工作結束後的做法）。
+    /// 串接中不量：CDN 節點由上游黑潮處理（跟定時的健康檢查、品質量測一樣，3.4.2）。以前從上游匯入節點池
+    /// 15 秒後照樣量一輪（3.4.2 Windows 實測：重新串接後一秒內約 2,200 條連線、從 CDN 節點收了 664 KB）；
+    /// 串接解除之後由定時的檢查接手
     fn recheck_later(c: &Arc<kuroshio_cdn::Cdn>) {
         let c = c.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(15)).await;
+            if crate::chain::cdn_by_upstream() {
+                return;
+            }
             c.health_check().await;
             c.quality_check().await;
         });

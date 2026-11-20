@@ -196,7 +196,13 @@ pub struct Options {
     /// 這個工作的結果現在由別處提供（串接中由上游黑潮提供，3.4.2）：補跑不排隊、不跑，
     /// 狀態列在 `catchUpProvided`；之後不再提供（串接解除）時照補跑時段補跑
     pub provided: Option<ProvidedFn>,
+    /// 還不知道結果會不會由別處提供（串接中、還沒跟上游黑潮同步過，3.4.2）：補跑先等，最多 [`PROVIDED_WAIT_MS`]。
+    /// 以前第一次同步（串接後 30 秒，上游還在建置時再晚 30 秒）之前，cdn-ranges（30 秒）與 cdn-scan（60 秒）的補跑就開跑了
+    pub provided_pending: Option<DeferFn>,
 }
+
+/// 補跑等「是不是由別處提供」的上限（跟過濾清單等第一次同步一樣是 10 分鐘）
+pub const PROVIDED_WAIT_MS: u64 = 10 * MIN_MS;
 
 impl Options {
     pub fn new(state_dir: impl Into<PathBuf>, base_dir: impl Into<PathBuf>) -> Options {
@@ -211,6 +217,7 @@ impl Options {
             defer_poll: Duration::from_secs(5),
             slot_grace_ms: 5 * MIN_MS,
             provided: None,
+            provided_pending: None,
         }
     }
 }
@@ -513,11 +520,19 @@ impl Scheduler {
                 // 結果由上游黑潮提供時（串接中，3.4.2）不排隊也不跑：到時段才跑只會被略過，狀態也會誤導；
                 // 串接解除、不再提供之後，照時段補跑
                 let mut logged = false;
+                let mut pending_since: Option<tokio::time::Instant> = None;
                 loop {
                     if me.is_provided(&name) {
                         me.set_catch_up(&name, false, true);
                         tokio::time::sleep(me.inner.opts.tick_interval).await;
                         continue;
+                    }
+                    if me.provided_pending() {
+                        let since = *pending_since.get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() < Duration::from_millis(PROVIDED_WAIT_MS) {
+                            tokio::time::sleep(me.inner.opts.defer_poll).await;
+                            continue;
+                        }
                     }
                     match window {
                         Some(w) if !in_window(me.inner.opts.clock.now_ms(), w) => {
@@ -554,6 +569,10 @@ impl Scheduler {
 
     fn is_provided(&self, name: &str) -> bool {
         self.inner.opts.provided.as_ref().is_some_and(|f| f(name))
+    }
+
+    fn provided_pending(&self) -> bool {
+        self.inner.opts.provided_pending.as_ref().is_some_and(|f| f())
     }
 
     /// 補跑的狀態：等時段（`catchUpWaiting`）、由上游提供（`catchUpProvided`）

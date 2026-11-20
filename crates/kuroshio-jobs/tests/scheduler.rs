@@ -662,6 +662,79 @@ async fn catch_up_skipped_while_provided() {
     h.abort();
 }
 
+/// 3.4.2 Windows 實測：串接了、還沒跟上游黑潮同步過（`provided_pending`）時補跑先等；
+/// 同步完成後，由上游提供的不跑，其他的照常補跑
+#[tokio::test(start_paused = true)]
+async fn catch_up_waits_for_first_share_sync() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let pending = Arc::new(AtomicBool::new(true));
+    let provided = Arc::new(AtomicBool::new(false));
+    let mut o = opts(&clock);
+    o.file_exists = Arc::new(|_: &str| false);
+    let (p1, p2) = (pending.clone(), provided.clone());
+    o.provided_pending = Some(Arc::new(move || p1.load(Ordering::SeqCst)));
+    o.provided = Some(Arc::new(move |n: &str| n == "a" && p2.load(Ordering::SeqCst)));
+    let job = json!({ "at": "04:10", "weekdays": [0], "runIfMissing": "state/x.json", "startDelaySec": 30 });
+    let s = Scheduler::new(json!({ "jobs": { "a": job.clone(), "b": job } }), None, o);
+    let runs: Vec<Arc<AtomicU32>> = (0..2).map(|_| Arc::new(AtomicU32::new(0))).collect();
+    for (name, r) in ["a", "b"].into_iter().zip(runs.iter().cloned()) {
+        s.register(name, move |_ctx: JobCtx| {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+    }
+    let h = s.start();
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    idle(&s).await;
+    assert_eq!(
+        (runs[0].load(Ordering::SeqCst), runs[1].load(Ordering::SeqCst)),
+        (0, 0),
+        "還沒同步：先等"
+    );
+    // 第一次同步完成：a 由上游提供，b 沒有
+    provided.store(true, Ordering::SeqCst);
+    pending.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    idle(&s).await;
+    assert_eq!((runs[0].load(Ordering::SeqCst), runs[1].load(Ordering::SeqCst)), (0, 1));
+    assert_eq!(s.status()["catchUpProvided"], json!(["a"]));
+    h.abort();
+}
+
+/// 一直同步不起來（上游一直回 REFUSED）：最多等 10 分鐘，之後照常補跑
+#[tokio::test(start_paused = true)]
+async fn catch_up_pending_gives_up_after_10_minutes() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let mut o = opts(&clock);
+    o.file_exists = Arc::new(|_: &str| false);
+    o.provided_pending = Some(Arc::new(|| true));
+    let s = Scheduler::new(
+        json!({ "jobs": { "a": { "at": "04:10", "weekdays": [0], "runIfMissing": "state/x.json", "startDelaySec": 30 } } }),
+        None,
+        o,
+    );
+    let runs = Arc::new(AtomicU32::new(0));
+    let r = runs.clone();
+    s.register("a", move |_ctx: JobCtx| {
+        let r = r.clone();
+        async move {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let h = s.start();
+    tokio::time::sleep(Duration::from_secs(9 * 60)).await;
+    idle(&s).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    tokio::time::sleep(Duration::from_secs(2 * 60)).await;
+    idle(&s).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    h.abort();
+}
+
 /// 沒設補跑時段：跟以前一樣，啟動延遲後就補跑
 #[tokio::test(start_paused = true)]
 async fn catch_up_without_window_runs_immediately() {

@@ -776,6 +776,8 @@ fn start_scheduler(
     o.lock_dir = Some(runtime_dir(cfg).join("locks"));
     // 串接中由上游黑潮提供結果的工作：補跑不排隊、不跑（3.4.2）
     o.provided = Some(Arc::new(crate::chain::share_skips));
+    // 正在驗證上游黑潮、或串接了還沒同步過：先等第一次同步，再決定要不要補跑（最多 10 分鐘）
+    o.provided_pending = Some(Arc::new(crate::chain::share_pending));
     let slot: Arc<std::sync::OnceLock<std::sync::Weak<Scheduler>>> = Arc::new(std::sync::OnceLock::new());
     let (s2, p2) = (slot.clone(), persister.clone());
     o.on_state_change = Some(Arc::new(move || {
