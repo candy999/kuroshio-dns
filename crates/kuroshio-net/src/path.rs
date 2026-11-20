@@ -501,9 +501,12 @@ impl Report {
 
     /// 攔截者的白話說明
     pub fn interceptor_text(&self) -> String {
-        let gw = self.gateway.map(|g| format!(" {g}")).unwrap_or_default();
         match &self.interceptor {
-            Some(Interceptor::Kuroshio(v)) => format!("路由器{gw} 上的黑潮（{v}）"),
+            // 有閘道位址：「路由器 192.168.1.1 上的黑潮」；沒有：「路由器上的黑潮」（不留多的空格）
+            Some(Interceptor::Kuroshio(v)) => match self.gateway {
+                Some(g) => format!("路由器 {g} 上的黑潮（{v}）"),
+                None => format!("路由器上的黑潮（{v}）"),
+            },
             Some(Interceptor::Software(v)) => format!("路由器或業者的 DNS 軟體（{v}）"),
             Some(Interceptor::Unknown) | None => "路由器或業者的設備（不明）".to_string(),
         }
@@ -1088,6 +1091,17 @@ pub fn summary(r: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interceptor_text_with_and_without_gateway() {
+        let mut r = Report {
+            interceptor: Some(Interceptor::Kuroshio("3.4.1".into())),
+            ..Report::default()
+        };
+        assert_eq!(r.interceptor_text(), "路由器上的黑潮（3.4.1）", "沒有閘道位址：不留多的空格");
+        r.gateway = Some("192.168.1.1".parse().unwrap());
+        assert_eq!(r.interceptor_text(), "路由器 192.168.1.1 上的黑潮（3.4.1）");
+    }
 
     #[test]
     fn v6_source_kinds() {
