@@ -405,7 +405,7 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 ### 怎麼運作（整合者需要知道的部分）
 
 - 通道是一般 DNS 的 CHAOS TXT（`chain.kuroshio` 底下），只在路徑檢查發現「一般 DNS 被上游的黑潮接走」時才用。上游只回答區網（私有）來源的 UDP / TCP 53，其他一律 `REFUSED`。
-- 身分用節點金鑰的簽章驗證（跟社群共用同一把金鑰，放在 `community.dir`，預設是設定目錄的 `community/`）。金鑰第一次需要時才建立，所以剛裝好、還沒有下游來問時，上游角色的指紋是 `null`。
+- 身分用節點金鑰的簽章驗證（跟社群共用同一把金鑰，放在 `community.dir`：預設是設定檔旁邊的 `state/community/`，OpenWrt 是 `/etc/kuroshio/community/`）。金鑰第一次需要時才建立，所以剛裝好、還沒有下游來問時，上游角色的指紋是 `null`。
 - 上游換了金鑰（重新安裝、換機器）：下游自動改綁新的金鑰，`/api/status` 的 `warnings` 留一行提醒 24 小時，狀態頁顯示新舊指紋。
 - 最多 4 層（A ← B ← C ← D）；會形成迴圈時不串接。
 - 串接狀態跨重新載入（SIGHUP、設定頁存檔）保留，不跨重開機。`kuroshio notify wan-changed` 會先離開串接，路徑檢查後自動接回。

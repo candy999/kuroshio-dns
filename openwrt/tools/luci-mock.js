@@ -296,6 +296,55 @@ STATUS.jobs = { config: { 'dns-benchmark': { at: ['04:10'] }, 'filter-update': {
 STATUS.stats.topDomains = [{ name: 'www.youtube.com', count: 812 }, { name: 'i.ytimg.com', count: 640 }];
 STATUS.stats.topBlocked = [{ name: 'googleads.g.doubleclick.net', count: 120 }];
 STATUS.stats.topClients = [{ name: '192.168.1.23', count: 900 }, { name: 'fd12:3456::8', count: 400 }];
+// README 截圖用的情境：/__mock/scene?name=readme-chain（兩台黑潮串接中）/ readme-path（一般 DNS 被不明設備接走、DoT 被擋）/
+// default（回到上面的測試資料；luci-e2e.js 用的是 default）。記憶體正常、網路路徑與串接的說法互相一致
+const SCENE_DEFAULT = JSON.parse(JSON.stringify({ stats: STATUS.stats, cacheEntries: STATUS.cacheEntries, cdn: STATUS.cdn, upstreams: STATUS.upstreams, network: STATUS.network, filter: STATUS.filter, memory: STATUS.system.memory, jobs: STATUS.jobs, autoUpstreams: STATUS.autoUpstreams, listenersDetail: STATUS.listenersDetail }));
+const MEM_OK = Object.assign({}, SCENE_DEFAULT.memory, { state: 'normal', stateLabel: '正常', availKB: 118784, marginKB: 8192, headroomKB: 102400, psi: { someAvg10: 0.1, fullAvg10: 0 },
+    pollSec: 10, growth: true, floor: false, shed: [], freedBytes: 0, sizes: Object.assign({}, SCENE_DEFAULT.memory.sizes, { cacheEntries: 4210, cacheMax: 100000, cdnInRam: 4200, cdnOnDiskOnly: 0, filterListRules: 371204 }) });
+const LISTENERS_OK = [{ proto: 'dot', bind: '0.0.0.0', port: 853, ok: true, tls: true, error: null }, { proto: 'doh', bind: '0.0.0.0', port: 8443, ok: true, tls: true, error: null }];
+const FILTER_OK = { lists: 371204, custom: 12, domains: 352880, memoryBytes: 3400000, notice: null, unloaded: [] };
+const PATH_CHAIN = { enabled: true, policy: 'skip-plain', checkedAt: Date.now() - 40 * 60e3, summary: 'IPv6 不可用，一般 DNS 被路由器 192.168.1.1 上的黑潮（3.4.0）接走', warnings: [],
+    interceptor: { kind: 'kuroshio', version: '3.4.0', chain: { supported: true, allowDownstream: true, nodeId: 'a1b2c3d4e5f60718', fingerprint: CHAIN_FP, caps: ['share', 'reg'], error: null } },
+    interceptorText: '路由器 192.168.1.1 上的黑潮（3.4.0）', gateway: '192.168.1.1', blocked: [], tlsIntercept: null, offline: false };
+const PATH_BLOCKED = { enabled: true, policy: 'skip-plain', checkedAt: Date.now() - 25 * 60e3,
+    summary: 'IPv6 可用，一般 DNS 被路由器或業者的設備（不明）接走，DoT（853 埠） 被擋',
+    warnings: ['一般 DNS 被路由器或業者的設備（不明）接走：評測不測一般 DNS，一般 DNS 只當最後備援', '這條網路擋了 DoT（853 埠）：先不用這種上游，恢復後自動加回'],
+    interceptor: { kind: 'unknown' }, interceptorText: '路由器或業者的設備（不明）', gateway: '192.168.1.1', blocked: ['dot'], tlsIntercept: null, offline: false };
+const SCENES = {
+    'readme-chain': () => ({ chain: CHAIN.chained, network: { path: PATH_CHAIN }, autoUpstreams: { source: 'chain', generatedAt: '11-20 04:32' },
+        upstreams: [{ id: 'udp://192.168.1.1:53', type: 'udp', role: 'chain', ok: 18342, fail: 3, avgMs: 2.1, reason: null, region: null, pathBlocked: false, via: null },
+            { id: 'https://dns.example.net/dns-query', role: 'auto', reason: '最快', region: 'TW', ok: 0, fail: 0, avgMs: null },
+            { id: 'tls://dot.example.org', role: 'auto', reason: '覆蓋', region: 'JP', ok: 0, fail: 0, avgMs: null },
+            { id: 'https://1.1.1.1/dns-query', role: 'fallback', ok: 0, fail: 0, avgMs: null }],
+        jobs: { config: { 'dns-benchmark': { at: ['04:10'] }, 'cdn-pool': { at: ['05:20'] }, 'filter-update': { at: ['03:30'], weekdays: [1, 4] } },
+            state: { 'dns-benchmark': { lastCode: 0, lastEnd: Date.now() - 9 * 3600e3 }, 'cdn-pool': { lastCode: 0, lastEnd: Date.now() - 8 * 3600e3 }, 'filter-update': { lastCode: 0, lastEnd: Date.now() - 2 * 86400e3 } },
+            detail: { 'dns-benchmark': { text: '由上游黑潮提供，略過' }, 'cdn-pool': { text: '由上游黑潮提供，略過' } }, running: null } }),
+    'readme-path': () => ({ chain: { enabled: true, state: 'none', reason: null, text: '沒有偵測到上游黑潮', upstream: null, backupActive: false, retryAt: null, shared: null,
+            serving: Object.assign({}, CHAIN_SERVING_ON, { text: '提供資料給下游黑潮：目前沒有下游連上來', downstreams: [], share: { ready: true, requests: 0, chunks: 0, lastAt: null, cacheBytes: 0 } }) }, network: { path: PATH_BLOCKED }, autoUpstreams: { source: 'benchmark', generatedAt: '11-20 04:32' },
+        upstreams: [{ id: 'https://dns.example.net/dns-query', role: 'auto', reason: '最快', region: 'TW', ok: 9120, fail: 4, avgMs: 11.8 },
+            { id: 'h3://doh3.example.org/dns-query', role: 'auto', reason: '覆蓋', region: 'JP', ok: 3310, fail: 2, avgMs: 38.5 },
+            { id: 'tls://dot.example.com', role: 'auto', reason: '覆蓋', region: 'HK', ok: 0, fail: 0, avgMs: null, pathBlocked: true },
+            { id: 'udp://8.8.8.8:53', role: 'fallback', ok: 0, fail: 0, avgMs: null, via: 'interceptor' }],
+        jobs: { config: { 'dns-benchmark': { at: ['04:10'] }, 'filter-update': { at: ['03:30'], weekdays: [1, 4] } },
+            state: { 'dns-benchmark': { lastCode: 0, lastEnd: Date.now() - 9 * 3600e3 }, 'filter-update': { lastCode: 0, lastEnd: Date.now() - 2 * 86400e3 } }, running: null } })
+};
+function setScene(name) {
+    const d = JSON.parse(JSON.stringify(SCENE_DEFAULT));
+    if (name === 'default') {
+        Object.assign(STATUS, { stats: d.stats, cacheEntries: d.cacheEntries, cdn: d.cdn, upstreams: d.upstreams, network: d.network, filter: d.filter, jobs: d.jobs, autoUpstreams: d.autoUpstreams, listenersDetail: d.listenersDetail, chain: CHAIN.chained });
+        STATUS.system.memory = d.memory;
+        return true;
+    }
+    if (!SCENES[name]) return false;
+    const today = Object.assign({}, d.stats.today, { query: 18420, hit: 13262, hitRate: 72.0, blocked: 1540, blockedAds: 1180, blockedTelemetry: 320, blockedMalware: 40, prefetch: 820, stale: 12,
+        route: { cloudflare: { n: 900, acc: 612 }, cloudfront: { n: 420, acc: 251 }, fastly: { n: 130, acc: 38 } }, latency: { hit: { p50: 1, p95: 2 }, miss: { p50: 18, p95: 64 } } });
+    Object.assign(STATUS, { filter: FILTER_OK, listenersDetail: LISTENERS_OK, cacheEntries: 4210, stats: Object.assign({}, d.stats, { uptimeSec: 3 * 86400 + 5 * 3600, today: today }),
+        cdn: Object.assign({}, d.cdn, { domains: 3850, stats: { rewrites: 862, ecsRewrites: 140, crossRewrites: 22 } }) }, SCENES[name]());
+    STATUS.system.memory = MEM_OK;
+    STATUS.system.memAvailableMB = 116;
+    return true;
+}
+if (process.env.MOCK_SCENE) setScene(process.env.MOCK_SCENE);
 const API = { '/api/access': ACCESS, '/api/community/status': COMMUNITY_STATUS, '/api/community/peers': () => community.peers, '/api/community/events': COMMUNITY_EVENTS, '/api/community/invite': INVITE, '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS,
     '/api/dashboard': DASH, '/api/benchmark': () => BENCH, '/api/cdn/pools': () => POOLS, '/api/cdn/v6nodes': () => V6NODES, '/api/cdn/domains': DOMAINS_API,
     '/api/filter/check': query => (/ads\./.test(new URLSearchParams(query || '').get('name') || '') ? { action: 'block', rule: '||ads.example.com^', cat: 'ads', tier: 'list' } : { action: 'none' }),
@@ -487,6 +536,10 @@ http.createServer((req, res) => {
         if (!CHAIN[mode]) return send(404, 'text/plain; charset=utf-8', 'mode: chained / released / off');
         STATUS.chain = CHAIN[mode];
         return send(200, 'text/plain; charset=utf-8', mode);
+    }
+    if (url.pathname === '/__mock/scene') {
+        const name = url.searchParams.get('name') || 'default';
+        return setScene(name) ? send(200, 'text/plain; charset=utf-8', name) : send(404, 'text/plain; charset=utf-8', 'name: default / readme-chain / readme-path');
     }
     if (url.pathname === '/__mock/uci') {
         const [c, sct, o] = (url.searchParams.get('key') || '').split('.');
