@@ -999,3 +999,29 @@ async fn chain_timeout_still_falls_back() {
     assert_eq!(n_own.load(Ordering::SeqCst), 1);
     drop(dead);
 }
+
+/// 3.4.2：SERVFAIL 只在同一筆有別的上游正常回答時才算那台失敗（大家都解析不到是網域的問題）
+#[tokio::test]
+async fn servfail_counts_only_when_others_answer() {
+    let fail_of = |r: &kuroshio::resolver::Resolver, id: &str| -> u64 {
+        r.upstreams.list_json().as_array().unwrap().iter().find(|u| u["id"] == id).unwrap()["fail"]
+            .as_u64()
+            .unwrap()
+    };
+    let (a, _) = upstream(0, servfail).await;
+    let (b, _) = upstream(0, servfail).await;
+    let c = cfg(&[a, b], json!({ "resolver": { "parallel": 0 } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    for i in 0..4u16 {
+        r.handle(&q(i, &format!("broken{i}.example.com"), 1), &CTX).await.unwrap();
+    }
+    let (ida, idb) = (format!("udp://{a}"), format!("udp://{b}"));
+    assert_eq!((fail_of(&r, &ida), fail_of(&r, &idb)), (0, 0), "兩台都 SERVFAIL：不算失敗");
+    // 一台正常、一台 SERVFAIL：SERVFAIL 的那台算失敗
+    let (ok, _) = upstream(0, answer_ok_ip).await;
+    let c = cfg(&[ok, a], json!({ "resolver": { "parallel": 0, "collectWindowMs": 300 } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.handle(&q(9, "mixed.example.com", 1), &CTX).await.unwrap();
+    assert_eq!(fail_of(&r, &ida), 1);
+    assert_eq!(fail_of(&r, &format!("udp://{ok}")), 0);
+}

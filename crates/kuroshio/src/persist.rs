@@ -525,17 +525,25 @@ impl Persister {
 
     /// 定時呼叫：到了間隔、而且今天的寫入量還沒超過節奏目標的才寫；到了最久未存上限的一定寫
     pub fn flush(&mut self, now: u64) -> std::io::Result<usize> {
-        self.flush_inner(now, false).map(|x| x.0)
+        self.flush_inner(now, false, false).map(|x| x.0)
     }
 
     /// 關機時：有變動的全部寫出
     pub fn flush_all(&mut self, now: u64) -> std::io::Result<usize> {
-        self.flush_inner(now, true).map(|x| x.0)
+        self.flush_inner(now, true, false).map(|x| x.0)
+    }
+
+    /// 關機：有變動的全部寫出，回傳（寫了幾份, 磁碟上一共幾 bytes）。
+    /// 先把每份寫成暫存檔（不各自 fsync），整個檔案系統 sync 一次，再依序改名、每個資料夾 fsync 一次。
+    /// 斷電時的保證跟一份一份寫一樣（內容落地之後才改名），但 fsync 次數從「每份兩次」變成幾次（3.4.2：
+    /// D3 的 USB 隨身碟上幾百份 CDN 分片一份一份寫，30 秒內寫不完被強制停止，排程紀錄也沒寫到）
+    pub fn flush_for_shutdown(&mut self, now: u64) -> std::io::Result<(usize, u64)> {
+        self.flush_inner(now, true, cfg!(unix))
     }
 
     /// 有變動的全部寫出，回傳（寫了幾份, 磁碟上一共幾 bytes）：管理介面的「立即儲存學習資料」
     pub fn flush_all_counted(&mut self, now: u64) -> std::io::Result<(usize, u64)> {
-        self.flush_inner(now, true)
+        self.flush_inner(now, true, false)
     }
 
     /// 估計大小（磁碟上）
@@ -719,21 +727,27 @@ impl Persister {
         false
     }
 
-    fn flush_inner(&mut self, now: u64, force: bool) -> std::io::Result<(usize, u64)> {
+    fn flush_inner(&mut self, now: u64, force: bool, batch: bool) -> std::io::Result<(usize, u64)> {
         self.roll_day(now);
         let interval = effective_interval(&self.policy, self.mem);
         let critical = self.mem.pressure() == Pressure::Critical;
-        let mut names: Vec<(bool, String)> = self
+        let mut names: Vec<(bool, u64, String)> = self
             .entries
             .iter()
-            .filter_map(|(k, e)| e.pending.as_ref().map(|p| (!p.opts.after.is_empty(), k.clone())))
+            .filter_map(|(k, e)| {
+                let size = if batch { self.size_estimate(k, e) } else { 0 };
+                e.pending.as_ref().map(|p| (!p.opts.after.is_empty(), size, k.clone()))
+            })
             .collect();
-        // 有先後順序的（分片清單）放最後
+        // 有先後順序的（分片清單）放最後。關機時其他的小檔先寫：排程紀錄這類小檔不會排在幾百份 CDN 分片後面
+        // （平常照名稱，每日寫入額度的分配不變）
         names.sort();
+        // 批次模式（關機）：先寫暫存檔，最後一起落地、改名
+        let mut staged: Vec<Staged> = Vec::new();
         let (mut n, mut bytes) = (0, 0u64);
         // 一份寫失敗：放回待寫、繼續寫下一份（不讓後面的檔整輪都寫不到），最後回報第一個錯誤
         let mut first_err: Option<std::io::Error> = None;
-        for (_, name) in names {
+        for (_, _, name) in names {
             let (why, size, age) = {
                 let e = &self.entries[&name];
                 let Some(p) = e.pending.as_ref() else { continue };
@@ -774,9 +788,31 @@ impl Persister {
             let stored = self.stored(&name);
             let plain = self.path(&name);
             let pending = self.entries.get_mut(&name).unwrap().pending.take().unwrap();
-            let r = match &pending.data {
-                Data::Bytes(h, data) => write_file(&stored, compress, &mut |w| w.write_all(data)).map(|(_, disk)| (*h, disk)),
-                Data::Stream(f) => write_file(&stored, compress, &mut |w| f(w)),
+            let r = if batch {
+                let r = match &pending.data {
+                    Data::Bytes(h, data) => write_tmp(&stored, compress, &mut |w| w.write_all(data), false).map(|(t, _, d)| (t, *h, d)),
+                    Data::Stream(f) => write_tmp(&stored, compress, &mut |w| f(w), false),
+                };
+                r.map(|(tmp, h, disk)| {
+                    staged.push(Staged {
+                        tmp,
+                        path: stored.clone(),
+                        other: if compress { plain.clone() } else { statefile::zst_path(&plain) },
+                        retire: pending
+                            .opts
+                            .retire
+                            .iter()
+                            .filter(|r| *r != &name)
+                            .map(|r| self.dir.join(r))
+                            .collect(),
+                    });
+                    (h, disk)
+                })
+            } else {
+                match &pending.data {
+                    Data::Bytes(h, data) => write_file(&stored, compress, &mut |w| w.write_all(data)).map(|(_, disk)| (*h, disk)),
+                    Data::Stream(f) => write_file(&stored, compress, &mut |w| f(w)),
+                }
             };
             let (h, disk) = match r {
                 Ok(x) => x,
@@ -787,13 +823,17 @@ impl Persister {
                     continue;
                 }
             };
-            // 另一種格式的舊檔（例如壓縮前的一般 JSON）：只遷移一次
-            let other = if compress { plain } else { statefile::zst_path(&plain) };
-            if other.exists() {
-                let _ = std::fs::remove_file(&other);
+            // 另一種格式的舊檔（例如壓縮前的一般 JSON）：只遷移一次（批次模式在改名之後才刪）
+            if !batch {
+                let other = if compress { plain } else { statefile::zst_path(&plain) };
+                if other.exists() {
+                    let _ = std::fs::remove_file(&other);
+                }
             }
             for r in &pending.opts.retire {
-                statefile::remove(&self.dir.join(r));
+                if !batch {
+                    statefile::remove(&self.dir.join(r));
+                }
                 if r != &name {
                     self.entries.remove(r);
                 }
@@ -814,6 +854,32 @@ impl Persister {
             self.stats.writes_today += 1;
             n += 1;
             bytes += disk;
+        }
+        if !staged.is_empty() {
+            // 內容先落地，再依寫的順序改名（分片清單在分片之後），每個資料夾 fsync 一次
+            sync_filesystem(&self.dir);
+            let mut dirs: Vec<PathBuf> = Vec::new();
+            for s in staged {
+                if let Err(e) = commit(&s.tmp, &s.path) {
+                    warn!("改名 {} 失敗：{e}", s.path.display());
+                    first_err.get_or_insert(e);
+                    continue;
+                }
+                if s.other.exists() {
+                    let _ = std::fs::remove_file(&s.other);
+                }
+                for r in &s.retire {
+                    statefile::remove(r);
+                }
+                if let Some(d) = s.path.parent() {
+                    if !dirs.iter().any(|x| x == d) {
+                        dirs.push(d.to_path_buf());
+                    }
+                }
+            }
+            for d in dirs {
+                sync_dir(&d.join("x"));
+            }
         }
         match first_err {
             Some(e) => Err(e),
@@ -917,7 +983,30 @@ pub fn write_atomic_with(path: &Path, gen: &mut dyn FnMut(&mut dyn Write) -> std
 }
 
 /// 寫檔（`compress` = 邊寫邊 zstd 壓縮）。回傳（壓縮前內容的雜湊，磁碟上的大小）
+/// 批次寫入（關機）時寫好、還沒改名的一份
+struct Staged {
+    tmp: PathBuf,
+    path: PathBuf,
+    /// 另一種格式的舊檔：改名之後刪
+    other: PathBuf,
+    /// 這份取代的舊檔：改名之後刪
+    retire: Vec<PathBuf>,
+}
+
 fn write_file(path: &Path, compress: bool, gen: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<(u64, u64)> {
+    let (tmp, h, size) = write_tmp(path, compress, gen, true)?;
+    commit(&tmp, path)?;
+    sync_dir(path);
+    Ok((h, size))
+}
+
+/// 寫到暫存檔（`sync` = 寫完立刻 fsync）；失敗時暫存檔刪掉。回傳（暫存檔，內容雜湊，磁碟上的大小）
+fn write_tmp(
+    path: &Path,
+    compress: bool,
+    gen: &mut dyn FnMut(&mut dyn Write) -> std::io::Result<()>,
+    sync: bool,
+) -> std::io::Result<(PathBuf, u64, u64)> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -949,24 +1038,52 @@ fn write_file(path: &Path, compress: bool, gen: &mut dyn FnMut(&mut dyn Write) -
             (w.finish().0, w.inner)
         };
         let f = buf.into_inner().map_err(|e| e.into_error())?;
-        f.sync_all()?;
+        if sync {
+            f.sync_all()?;
+        }
         let size = f.metadata()?.len();
         Ok((h, size))
     })();
     match r {
-        Ok(out) => {
-            std::fs::rename(&tmp, path)?;
-            // 改名要寫進資料夾才算數：斷電時才不會回到舊檔（或兩個都沒有）
-            sync_dir(path);
-            // 設定目錄裡的檔案：排一次 KUROSHIO_ON_CONFIG_WRITE（沒設定時立刻回來）
-            crate::confhook::touched(path);
-            Ok(out)
-        }
+        Ok((h, size)) => Ok((tmp, h, size)),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
     }
+}
+
+/// 暫存檔改名成正式檔名（呼叫端負責之後 fsync 資料夾）；設定目錄裡的檔案排一次 KUROSHIO_ON_CONFIG_WRITE
+fn commit(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if let Err(e) = std::fs::rename(tmp, path) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    crate::confhook::touched(path);
+    Ok(())
+}
+
+/// 整個檔案系統的資料寫進儲存裝置（關機時一次做，取代每個檔案各自 fsync）。
+/// Linux 用 syncfs（只同步快照目錄所在的檔案系統），其他 Unix 用 sync；Windows 每個檔案已經各自 sync
+fn sync_filesystem(dir: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(d) = std::fs::File::open(dir) {
+            // SAFETY：d 在這段期間有效
+            if unsafe { libc::syncfs(d.as_raw_fd()) } == 0 {
+                return;
+            }
+        }
+        unsafe { libc::sync() };
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = dir;
+        unsafe { libc::sync() };
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// 寫入用的暫存檔名
@@ -1202,6 +1319,56 @@ mod tests {
         q.stage("cdn/pools.json", body.clone());
         assert_eq!(q.stats().pending, 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 3.4.2：關機的批次寫入。全部寫好、沒有留下暫存檔；舊格式與被取代的舊檔改名之後才刪；
+    /// 小檔排在大檔前面、分片清單在分片之後
+    #[test]
+    fn shutdown_batch_flush() {
+        let dir = tmpdir("batch");
+        std::fs::create_dir_all(dir.join("cdn")).unwrap();
+        std::fs::write(dir.join("old.json"), b"legacy").unwrap();
+        std::fs::write(dir.join("cdn/d1.json"), b"plain-old").unwrap();
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 1)); // 每天 1 KB：關機照樣全部寫
+        p.set_compress(|n| n.starts_with("cdn/"));
+        let t = 6_000 * 86400;
+        p.stage_with("cdn/d1.json", Snapshot::Bytes(vec![b'a'; 4000]), Opts::default(), t);
+        p.stage_with("cdn/d2.json", Snapshot::Bytes(vec![b'b'; 4000]), Opts::default(), t);
+        p.stage_with("jobs.json", Snapshot::Bytes(b"{}".to_vec()), Opts::default(), t);
+        let m = Opts {
+            after: vec!["cdn/d1.json".into(), "cdn/d2.json".into()],
+            retire: vec!["old.json".into()],
+            ..Opts::default()
+        };
+        p.stage_with("cdn/index.json", Snapshot::Bytes(b"i".to_vec()), m, t);
+        let (n, _) = p.flush_for_shutdown(t).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(std::fs::read(dir.join("jobs.json")).unwrap(), b"{}");
+        assert!(dir.join("cdn/d1.json.zst").exists() && dir.join("cdn/d2.json.zst").exists());
+        assert!(dir.join("cdn/index.json.zst").exists());
+        assert!(!dir.join("cdn/d1.json").exists(), "舊格式改名之後刪掉");
+        assert!(!dir.join("old.json").exists(), "被取代的舊檔改名之後刪掉");
+        let left: Vec<_> = walk(&dir).into_iter().filter(|f| f.to_string_lossy().ends_with(".tmp")).collect();
+        assert!(left.is_empty(), "沒有留下暫存檔：{left:?}");
+        assert_eq!(p.stats().pending, 0);
+        // 讀得回來
+        let mut q = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096));
+        q.set_compress(|n| n.starts_with("cdn/"));
+        assert_eq!(q.load("cdn/d2.json").unwrap(), vec![b'b'; 4000]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn walk(d: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 
     #[test]

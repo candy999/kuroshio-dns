@@ -292,6 +292,7 @@ impl Cdn {
                             .unwrap_or(std::cmp::Ordering::Equal),
                     )
                 });
+                keep_pop(&mut d.pool4, &bad, before.as_deref());
                 let after = st.pools.best_pop(name);
                 if after != before {
                     if let Some(top) = st.pools.p.get(name).and_then(|d| d.pool4.first()) {
@@ -381,5 +382,32 @@ impl Cdn {
             st.pools.dirty = true;
             info!("★ {} 發現台灣 IPv6 節點 {ip} ({pop} {ms}ms)，已加入節點池並永久保存", prov.label);
         });
+    }
+}
+
+/// 主要節點的遲滯（3.4.2）：新的第一名要比原本主要 POP 的最好節點好上 15% 再多 5 分才換。
+/// 只差一點點時把原本 POP 的節點放回第一位，不讓量測的雜訊（例如路由器自己很忙時）每 5 分鐘來回切換
+/// （padavan-tw 的 D3 壓測：45 分鐘切了 8 次，HKG→ICN→HKG→NRT→…）
+pub(crate) const POP_HYST_RATIO: f64 = 0.15;
+pub(crate) const POP_HYST_ABS: f64 = 5.0;
+
+pub(crate) fn keep_pop(pool: &mut Vec<pools::PoolNode>, bad: &std::collections::HashMap<IpAddr, Bad>, before: Option<&str>) {
+    let Some(before) = before else { return };
+    let Some(top) = pool.iter().position(|x| !bad.contains_key(&x.ip)) else {
+        return;
+    };
+    if pools::pop3_is(pool[top].pop_str(), before) {
+        return;
+    }
+    let Some(pos) = pool
+        .iter()
+        .position(|x| !bad.contains_key(&x.ip) && pools::pop3_is(x.pop_str(), before))
+    else {
+        return;
+    };
+    let (new, old) = (pool[top].score.or(999.0), pool[pos].score.or(999.0));
+    if old.is_finite() && old <= new * (1.0 + POP_HYST_RATIO) + POP_HYST_ABS {
+        let x = pool.remove(pos);
+        pool.insert(top, x);
     }
 }

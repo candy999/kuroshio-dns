@@ -1416,13 +1416,15 @@ impl Started {
         let _hand = HandOver(&self.state.cfg, &self.state.resolver);
         // 記下寫了幾份、多少、花多久：整合方可以依這個決定停止服務時要等多久
         let t0 = Instant::now();
-        match self.state.flush_counted() {
-            Ok((n, bytes)) => info!(
-                "關機前寫出 {n} 份快照，{} KB，{} ms",
-                bytes.div_ceil(1024),
-                t0.elapsed().as_millis()
-            ),
-            Err(e) => warn!("關機前寫出快照有失敗的：{e}（{} ms）", t0.elapsed().as_millis()),
+        stage_hot_names(&self.state.resolver, &self.state.persister, self.state.warm_names);
+        stage_sources(&self.state.persister, &self.state.snap_sources);
+        let r = self.state.persister.lock().unwrap().flush_for_shutdown(crate::persist::now_secs());
+        let ms = t0.elapsed().as_millis();
+        match r {
+            // 超過 5 秒時記成警告（只收警告的系統記錄也看得到；整合方停止服務時要等多久的依據）
+            Ok((n, bytes)) if ms >= 5000 => warn!("關機前寫出 {n} 份快照，{} KB，花了 {ms} ms", bytes.div_ceil(1024)),
+            Ok((n, bytes)) => info!("關機前寫出 {n} 份快照，{} KB，{ms} ms", bytes.div_ceil(1024)),
+            Err(e) => warn!("關機前寫出快照有失敗的：{e}（{ms} ms）"),
         }
     }
 }

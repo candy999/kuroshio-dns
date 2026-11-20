@@ -71,3 +71,40 @@ fn latency_probes_are_capped() {
         assert_eq!(c.deferred(), 200 - 64);
     });
 }
+
+/// 3.4.2：主要 POP 的遲滯。新的第一名只好一點點（15% + 5 分以內）不換；好很多才換；原本的 POP 壞掉就換
+#[test]
+fn main_pop_hysteresis() {
+    use crate::health::keep_pop;
+    use crate::pools::PoolNode;
+    use crate::util::Num;
+    use std::collections::HashMap;
+    let node = |ip: &str, pop: &str, score: f64| {
+        let mut n = PoolNode::new(ip.parse().unwrap());
+        n.pop = Some(crate::util::intern(pop));
+        n.score = Num::V(score);
+        n
+    };
+    let none = HashMap::new();
+    // 重新排序後 ICN 30 分排第一，原本的 HKG 33 分：差不到 15% + 5 → 放回 HKG
+    let mut p = vec![node("198.51.100.1", "ICN", 30.0), node("198.51.100.2", "HKG", 33.0)];
+    keep_pop(&mut p, &none, Some("HKG"));
+    assert_eq!(p[0].pop_str(), "HKG");
+    // HKG 50 分：差很多 → 換成 ICN
+    let mut p = vec![node("198.51.100.1", "ICN", 30.0), node("198.51.100.2", "HKG", 50.0)];
+    keep_pop(&mut p, &none, Some("HKG"));
+    assert_eq!(p[0].pop_str(), "ICN");
+    // HKG 被標成不能用：照新的排序
+    let mut p = vec![node("198.51.100.1", "ICN", 30.0), node("198.51.100.2", "HKG", 31.0)];
+    let mut bad = HashMap::new();
+    bad.insert(
+        "198.51.100.2".parse().unwrap(),
+        crate::pools::Bad {
+            at: 0,
+            reason: "品質檢查連不上".into(),
+            quality: true,
+        },
+    );
+    keep_pop(&mut p, &bad, Some("HKG"));
+    assert_eq!(p[0].pop_str(), "ICN");
+}

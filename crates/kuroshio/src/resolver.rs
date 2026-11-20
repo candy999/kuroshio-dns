@@ -930,6 +930,8 @@ impl Resolver {
         let mut window: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let mut hedge = Box::pin(tokio::time::sleep(p.hedge));
         let mut got_ok = false;
+        // 回 SERVFAIL 的上游：等這一輪結束才決定算不算失敗（3.4.2）
+        let mut servfails: Vec<(Arc<Up>, f64)> = Vec::new();
         loop {
             tokio::select! {
                 r = set.join_next() => {
@@ -945,7 +947,11 @@ impl Resolver {
                     match r.ok().and_then(|b| Message::parse(&b).ok()) {
                         Some(msg) => {
                             let class = logic::classify(&msg, qtype);
-                            up.record(answered_ok(&up, class), ms);
+                            if class == Class::ServFail && up.role != Role::Chain {
+                                servfails.push((up.clone(), ms));
+                            } else {
+                                up.record(answered_ok(&up, class), ms);
+                            }
                             let a = Arc::new(Answer { up, msg, class, ms });
                             on_each(&a);
                             if a.class == Class::Ok && window.is_none() {
@@ -972,6 +978,14 @@ impl Resolver {
             }
         }
         set.abort_all();
+        // SERVFAIL 只在「同一筆有別的上游正常回答」時才算那台失敗：大家都解析不到（剛註冊、權威伺服器壞掉的網域）
+        // 是網域的問題，不是上游的。以前照算，壓測新網域時自己的 DoH／DoT 一直被暫停 1→2→4 分鐘
+        // （padavan-tw 的 3.4.2 單獨運作測試，每段 35～38 次）
+        if out.iter().any(|a| a.class == Class::Ok) {
+            for (up, ms) in servfails {
+                up.record(false, ms);
+            }
+        }
         Asked {
             answers: out,
             unasked: rest.collect(),
