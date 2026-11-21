@@ -277,7 +277,7 @@ async fn independent_operators_are_not_suspects() {
         keys.iter().any(|k| k.contains("a.same-op")) && keys.iter().any(|k| k.contains("b.same-op")),
         "{keys:?}"
     );
-    // 3.5.0 起：連不上不是那幾台的錯，今天照用（倖存）；同一家的兩台照舊今天不用
+    // 3.4.2 起：連不上不是那幾台的錯，今天照用（倖存）；同一家的兩台照舊今天不用
     let elim = std::fs::read_to_string(root.join("persist/benchmark-last/eliminated.csv")).unwrap();
     for host in ["op-a", "op-b", "op-c"] {
         assert!(!elim.contains(host), "{host} 今天照用：{elim}");

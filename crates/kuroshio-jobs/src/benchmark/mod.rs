@@ -1160,7 +1160,7 @@ impl Benchmark {
                     }
                     // 多家 CDN 的網域、或 3 家以上互相獨立的 DNS 同樣回答：連不上是網站或這條路的問題，不是這台 DNS 的錯
                     // → 照常計分（跟「正常回答也無法驗證」一樣），不記可疑、今天也照用。
-                    // 3.4.x 以前是「今天不用」：padavan-tw 3.3.7 一個多家 CDN 的網域就讓 41 台正常的加密 DNS 整天出局
+                    // 3.4.1 以前是「今天不用」：padavan-tw 3.3.7 一個多家 CDN 的網域就讓 41 台正常的加密 DNS 整天出局
                     Some((SiteCheck::Unverified, why)) if multi_cdn || independent.contains(&k) => {
                         lenient += 1;
                         let basis = if independent.contains(&k) {
