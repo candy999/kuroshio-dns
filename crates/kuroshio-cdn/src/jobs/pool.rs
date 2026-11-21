@@ -6,7 +6,14 @@
 
 use super::{v4_lines, JobCtx, Rng};
 use crate::cdn::Cdn;
-use crate::health::map_limit;
+use crate::health::{map_limit, map_paced};
+
+/// 節點池階段 A（延遲／丟包）每秒最多開始量幾個位址（每個 3～4 次 TCP 連線 → 每秒約 400 條新連線）。
+/// 3.4.2 Windows 壓力測試：Cloudflare 1,538 個候選、並行 200，0.19 秒就打出約 6,000 條連線；現在約 15 秒。
+/// 同時量的少了，本機不塞車，量到的延遲也比較準
+const LATENCY_IPS_PER_SEC: u64 = 100;
+/// IPv6 候選（永久紀錄）每秒最多開始檢查幾個（每個 1 次 HTTP 探測＋4 次 TCP 連線 → 每秒約 200 條）：585 個約 15 秒
+const V6_IPS_PER_SEC: u64 = 40;
 use crate::pools::{qscore, weighted_qscore, PoolNode};
 use crate::providers::{self, is_tw_pop, Provider};
 use crate::util::{self, intern, now_ms, Num};
@@ -201,10 +208,15 @@ async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: 
     // 2. 粗篩延遲（3 次）
     ctx.checkpoint().await;
     let c2 = cdn.clone();
-    let lat = map_limit(cand.values().copied().collect(), jc.latency_concurrency, move |ip| {
-        let c = c2.clone();
-        async move { (ip, measure(&c, ip, 3).await) }
-    })
+    let lat = map_paced(
+        cand.values().copied().collect(),
+        jc.latency_concurrency,
+        LATENCY_IPS_PER_SEC,
+        move |ip| {
+            let c = c2.clone();
+            async move { (ip, measure(&c, ip, 3).await) }
+        },
+    )
     .await;
     let mut ok: Vec<(IpAddr, f64)> = lat
         .into_iter()
@@ -546,7 +558,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         // ---------- 階段 A：延遲 / 丟包 ----------
         ctx.checkpoint().await;
         let c = cdn.clone();
-        let lat = map_limit(cand.into_iter().collect(), jc.latency_concurrency, move |ip| {
+        let lat = map_paced(cand.into_iter().collect(), jc.latency_concurrency, LATENCY_IPS_PER_SEC, move |ip| {
             let c = c.clone();
             async move { (ip, measure(&c, ip, 4).await) }
         })
@@ -747,7 +759,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             );
             ctx.checkpoint().await;
             let c = cdn.clone();
-            let r6 = map_limit(list.into_iter().collect(), jc.probe_concurrency, move |ip| {
+            let r6 = map_paced(list.into_iter().collect(), jc.probe_concurrency, V6_IPS_PER_SEC, move |ip| {
                 let c = c.clone();
                 async move {
                     let r = c.net().http_probe(ip, host, path, Duration::from_millis(3000)).await;
