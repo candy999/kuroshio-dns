@@ -303,9 +303,9 @@ const MEM_OK = Object.assign({}, SCENE_DEFAULT.memory, { state: 'normal', stateL
     pollSec: 10, growth: true, floor: false, shed: [], freedBytes: 0, sizes: Object.assign({}, SCENE_DEFAULT.memory.sizes, { cacheEntries: 4210, cacheMax: 100000, cdnInRam: 4200, cdnOnDiskOnly: 0, filterListRules: 371204 }) });
 const LISTENERS_OK = [{ proto: 'dot', bind: '0.0.0.0', port: 853, ok: true, tls: true, error: null }, { proto: 'doh', bind: '0.0.0.0', port: 8443, ok: true, tls: true, error: null }];
 const FILTER_OK = { lists: 371204, custom: 12, domains: 352880, memoryBytes: 3400000, notice: null, unloaded: [] };
-const PATH_CHAIN = { enabled: true, policy: 'skip-plain', checkedAt: Date.now() - 40 * 60e3, summary: 'IPv6 不可用，一般 DNS 被路由器 192.168.1.1 上的黑潮（3.4.0）接走', warnings: [],
+const PATH_CHAIN = { enabled: true, policy: 'skip-plain', checkedAt: Date.now() - 40 * 60e3, summary: 'IPv6 不可用，一般 DNS 被閘道 192.168.1.1 或更上游的路由器上的黑潮（3.4.0）接走', warnings: [],
     interceptor: { kind: 'kuroshio', version: '3.4.0', chain: { supported: true, allowDownstream: true, nodeId: 'a1b2c3d4e5f60718', fingerprint: CHAIN_FP, caps: ['share', 'reg'], error: null } },
-    interceptorText: '路由器 192.168.1.1 上的黑潮（3.4.0）', gateway: '192.168.1.1', blocked: [], tlsIntercept: null, offline: false };
+    interceptorText: '閘道 192.168.1.1 或更上游的路由器上的黑潮（3.4.0）', gateway: '192.168.1.1', blocked: [], tlsIntercept: null, offline: false };
 const PATH_BLOCKED = { enabled: true, policy: 'skip-plain', checkedAt: Date.now() - 25 * 60e3,
     summary: 'IPv6 可用，一般 DNS 被路由器或業者的設備（不明）接走，DoT（853 埠） 被擋',
     warnings: ['一般 DNS 被路由器或業者的設備（不明）接走：評測不測一般 DNS，一般 DNS 只當最後備援', '這條網路擋了 DoT（853 埠）：先不用這種上游，恢復後自動加回'],

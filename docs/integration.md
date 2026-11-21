@@ -337,12 +337,12 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 ```json
 {
   "enabled": true, "policy": "skip-plain", "checkedAt": 1795000000000,
-  "summary": "IPv6 不可用，一般 DNS 被路由器 192.168.1.1 上的黑潮（3.3.6）接走",
-  "warnings": ["一般 DNS 被路由器 192.168.1.1 上的黑潮（3.3.6）接走：評測不測一般 DNS，一般 DNS 只當最後備援"],
+  "summary": "IPv6 不可用，一般 DNS 被閘道 192.168.1.1 或更上游的路由器上的黑潮（3.3.6）接走",
+  "warnings": ["一般 DNS 被閘道 192.168.1.1 或更上游的路由器上的黑潮（3.3.6）接走：評測不測一般 DNS，一般 DNS 只當最後備援"],
   "ipv6": { "mode": "auto", "route": "global" | "ula" | "none", "usable": false, "reason": "沒有 IPv6 路由（…）" },
   "plain": { "intercepted": true, "v4": { "udp": true, "tcp": true, "intercepted": true }, "v6": null },
   "interceptor": { "kind": "kuroshio" | "dns-software" | "unknown", "version": "3.3.6" },
-  "interceptorText": "路由器 192.168.1.1 上的黑潮（3.3.6）",
+  "interceptorText": "閘道 192.168.1.1 或更上游的路由器上的黑潮（3.3.6）",
   "gateway": "192.168.1.1",
   "nxRewrite": [], "nxVia": null, "tampered": [], "bootstrapViaDoh": false,
   "protocols": { "dot": { "ok": 3, "fail": 0, "certErrors": 0, "lastError": null }, "doh": { … }, "quic": { … } },
