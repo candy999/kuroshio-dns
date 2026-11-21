@@ -605,10 +605,14 @@ fn chain_answer(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
     (0, vec![a(name, 300, [198, 51, 100, 10])], 0)
 }
 
+/// 路徑檢查的結果是行程層級的狀態（一般 DNS 被接走時，明文上游不當備援）：改它、或依賴它的測試輪流跑
+static PATH_STATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 3.4.0 串接：一般 DNS 被接走時，經由攔截者的答案會被排到後面；串接上游（就是那台上游黑潮）不算，
 /// 它的答案不能被排除（固定上游是一般 DNS，路上有攔截者，它的答案才是被排到後面的那一個）
 #[tokio::test]
 async fn chain_upstream_answers_are_not_demoted() {
+    let _path = PATH_STATE.lock().await;
     let (pinned, _) = upstream(0, answer).await;
     let (chain, n_chain) = upstream(40, chain_answer).await;
     let c = cfg(&[pinned], json!({ "resolver": { "fastPath": false } }));
@@ -986,34 +990,59 @@ fn sinkhole(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
     (0, vec![a(name, 300, [0, 0, 0, 0])], 0)
 }
 
-/// 串接上游（上游黑潮）自己解析不到（SERVFAIL）、或用它的過濾擋掉（0.0.0.0）：下游照它的答案回，
-/// 不再問自己的加密上游；SERVFAIL 也不算串接失敗（以前連續 3 次就暫停串接 30 秒、全部改走自己的上游）
+/// 串接上游（上游黑潮）自己解析不到（SERVFAIL）：下游照它的答案回、不再問自己的加密上游，也不算串接失敗
+/// （以前連續 3 次就暫停串接 30 秒、全部改走自己的上游）。上游擋掉的（0.0.0.0）：下游的過濾沒擋，
+/// 就用自己的上游解析一次（下游自己決定），一樣不算串接失敗；自己的上游也沒有答案才照上游的擋
 #[tokio::test]
-async fn chain_servfail_and_blocked_are_final() {
-    for (answer, tag) in [
-        (servfail as fn(&str, u16) -> (u16, Vec<Record>, u32), "servfail"),
-        (sinkhole, "blocked"),
-    ] {
-        let (chain, n_chain) = upstream(0, answer).await;
-        let (own, n_own) = upstream(0, answer_ok_ip).await;
-        let mut c = cfg(&[], json!({}));
-        kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
-        let r = kuroshio::app::build_resolver(&c).unwrap();
-        r.upstreams
-            .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
-        for i in 0..5u16 {
-            let m = Message::parse(&r.handle(&q(i, &format!("{tag}{i}.example.com"), 1), &CTX).await.unwrap()).unwrap();
-            if tag == "servfail" {
-                assert_eq!(m.rcode, 2, "上游黑潮解析不到：照樣回 SERVFAIL");
-            } else {
-                assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(0, 0, 0, 0)), "上游黑潮擋掉的：照樣擋");
-            }
-        }
-        assert_eq!(n_chain.load(Ordering::SeqCst), 5, "{tag}");
-        assert_eq!(n_own.load(Ordering::SeqCst), 0, "{tag}：不問自己的上游");
-        assert!(!r.upstreams.chain_suspended(), "{tag}：連續 5 次也不暫停串接");
-        assert_eq!(r.upstreams.active()[0].role, kuroshio::upstreams::Role::Chain);
+async fn chain_servfail_is_final_blocked_falls_back_to_own() {
+    // 備援用的是明文上游：一般 DNS 沒有被接走時才會當備援（被接走時只用自己的加密上游繞過）
+    let _path = PATH_STATE.lock().await;
+    // 上游黑潮 SERVFAIL：照樣回 SERVFAIL，不問自己的上游
+    let (chain, n_chain) = upstream(0, servfail).await;
+    let (own, n_own) = upstream(0, answer_ok_ip).await;
+    let mut c = cfg(&[], json!({}));
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    for i in 0..5u16 {
+        let m = Message::parse(&r.handle(&q(i, &format!("servfail{i}.example.com"), 1), &CTX).await.unwrap()).unwrap();
+        assert_eq!(m.rcode, 2, "上游黑潮解析不到：照樣回 SERVFAIL");
     }
+    assert_eq!(n_chain.load(Ordering::SeqCst), 5);
+    assert_eq!(n_own.load(Ordering::SeqCst), 0, "SERVFAIL：不問自己的上游");
+    assert!(!r.upstreams.chain_suspended(), "連續 5 次也不暫停串接");
+
+    // 上游黑潮擋掉、下游的過濾沒擋：用自己的加密上游解析一次（下游自己決定），不算串接失敗
+    let (chain, n_chain) = upstream(0, sinkhole).await;
+    let (own, n_own) = upstream(0, answer_ok_ip).await;
+    let mut c = cfg(&[], json!({}));
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    for i in 0..5u16 {
+        let m = Message::parse(&r.handle(&q(i, &format!("blocked{i}.example.com"), 1), &CTX).await.unwrap()).unwrap();
+        assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 77)), "改用自己的上游");
+    }
+    // 同一個網域再問：快取命中，不再問任何上游（不會每次都繞一圈）
+    let m = Message::parse(&r.handle(&q(9, "blocked0.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 77)));
+    assert_eq!(n_chain.load(Ordering::SeqCst), 5);
+    assert_eq!(n_own.load(Ordering::SeqCst), 5);
+    assert!(!r.upstreams.chain_suspended(), "上游擋掉不算串接失敗");
+    assert_eq!(r.upstreams.active()[0].role, kuroshio::upstreams::Role::Chain);
+
+    // 自己的上游也沒有答案（失敗）：照上游黑潮的擋
+    let (chain, _) = upstream(0, sinkhole).await;
+    let (own, _) = upstream(0, servfail).await;
+    let mut c = cfg(&[], json!({}));
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    let m = Message::parse(&r.handle(&q(1, "both.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(0, 0, 0, 0)), "自己的上游失敗：照上游的擋");
 }
 
 fn answer_ok_ip(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {

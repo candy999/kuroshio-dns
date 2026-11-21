@@ -745,10 +745,18 @@ impl Resolver {
             // 全部失敗或都被上游擋：改問備援
             used_backup = true;
             let more = self.ask(&self.upstreams.backup(), &upq, qtype, false, |_| {}).await.answers;
-            decided = decide(&more, false, cdn.as_deref(), qtype).or_else(|| {
-                let all: Vec<Arc<Answer>> = results.iter().chain(&more).cloned().collect();
-                decide(&all, true, cdn.as_deref(), qtype)
-            });
+            decided = decide(&more, false, cdn.as_deref(), qtype)
+                .map(|mut d| {
+                    // 上游黑潮擋掉、下游用自己的上游解析的：來源標出來（狀態頁、日誌看得到是繞過上游的過濾）
+                    if results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::Blocked) {
+                        d.source = format!("{}(上游擋，改用自己的上游)", d.source);
+                    }
+                    d
+                })
+                .or_else(|| {
+                    let all: Vec<Arc<Answer>> = results.iter().chain(&more).cloned().collect();
+                    decide(&all, true, cdn.as_deref(), qtype)
+                });
         }
         if decided.is_none() {
             self.last_outage.store(self.now_ds().max(1), Ordering::Relaxed);
@@ -770,7 +778,13 @@ impl Resolver {
             ),
             Some(mut d) => {
                 let mut note = None;
-                if (qtype == rtype::A || qtype == rtype::AAAA) && !d.oks.is_empty() && self.params.rank_ips && !verbatim {
+                // 串接中（包括上游擋掉、改用自己的上游解析的）不做 TCP 443 測速排序：下游保持輕量（3.4.2）
+                if (qtype == rtype::A || qtype == rtype::AAAA)
+                    && !d.oks.is_empty()
+                    && self.params.rank_ips
+                    && !verbatim
+                    && !self.chain_active()
+                {
                     if let Some((msg, source, n)) = self.merge_rank(&d.oks, &qname, qtype).await {
                         d.msg = msg;
                         d.source = source;
@@ -1310,21 +1324,15 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
             chained: pick.up.role == Role::Chain,
         });
     }
-    // 串接上游（上游黑潮）已經用它自己的上游與過濾解析過：它擋掉的（過濾清單）、解析失敗的（SERVFAIL），
-    // 就是最後的答案，下游不再問自己的加密上游重做一次（3.4.2；以前會，重複使用網路，也繞過上游的過濾）
-    if let Some(c) = results
-        .iter()
-        .find(|r| r.up.role == Role::Chain && matches!(r.class, Class::Blocked | Class::ServFail))
-    {
-        let blocked = c.class == Class::Blocked;
+    // 串接上游（上游黑潮）解析失敗（SERVFAIL）：它已經問過自己的上游與備援，就是最後的答案，
+    // 下游不再問自己的加密上游重做一次（3.4.2：以前會，剛註冊的網域一多就重複使用網路、做 CDN 驗證）。
+    // 上游黑潮「擋掉」的不在這裡：下游的過濾沒有擋，就用自己的加密上游解析一次（下游自己決定要不要擋；
+    // 自己的上游也沒有答案時，才照上游的擋）
+    if let Some(c) = results.iter().find(|r| r.up.role == Role::Chain && r.class == Class::ServFail) {
         return Some(Decided {
             msg: c.msg.clone(),
-            class: if blocked { Class::Ok } else { Class::ServFail },
-            source: if blocked {
-                format!("{}(上游已擋)", c.up.up.id)
-            } else {
-                c.up.up.id.clone()
-            },
+            class: Class::ServFail,
+            source: c.up.up.id.clone(),
             oks: vec![],
             chained: true,
         });
