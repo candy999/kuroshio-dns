@@ -1,7 +1,7 @@
 //! 評測依路徑判斷調整（3.3.6）：
 //! - 一般 DNS 的答案完全一樣時只算一票（攔截者的幾百票不能變成「多數」）
 //! - 路徑檢查判斷一般 DNS 被接走、IPv6 不能用時，那些候選不測、不記可疑
-//! - 好幾家互相獨立的加密 DNS 都「網站無法驗證」時，今天不用但不記可疑天數
+//! - 好幾家互相獨立的加密 DNS 都「網站無法驗證」時，照常計分、今天照用，不記可疑天數
 
 use kuroshio_jobs::benchmark::probe::{AsnSource, NetProber, Prober, SiteCheck, StaticAsn};
 use kuroshio_jobs::benchmark::rules::AsnInfo;
@@ -226,8 +226,8 @@ async fn path_verdict_skips_candidates() {
     assert!(!suspects.contains("tcp://") && !suspects.contains("2001:db8"), "{suspects}");
 }
 
-/// 3 家互相獨立的加密 DNS 回答同一個業者、網站都無法驗證 → 今天不用，但不記可疑；
-/// 只有同一家的 2 台這樣回答 → 照常記可疑
+/// 3 家互相獨立的加密 DNS 回答同一個業者、網站都無法驗證 → 照常計分、今天照用，不記可疑；
+/// 只有同一家的 2 台這樣回答 → 照常記可疑、今天不用
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_operators_are_not_suspects() {
     let mut ids = Vec::new();
@@ -264,7 +264,9 @@ async fn independent_operators_are_not_suspects() {
     std::fs::write(p.list_dir.join("iplist.txt"), ids.join("\n")).unwrap();
     std::fs::write(p.list_dir.join("dohlist.txt"), doh.join("\n")).unwrap();
     std::fs::write(p.list_dir.join("web.txt"), "www.alpha.com\ncdn.beta.com\n").unwrap();
-    run(&root, Benchmark::with(p.clone(), Arc::new(Mapped(map)), asn()), &["udp", "doh"]).await;
+    let mut b = Benchmark::with(p.clone(), Arc::new(Mapped(map)), asn());
+    b.keep_last = Some(root.join("persist/benchmark-last"));
+    run(&root, b, &["udp", "doh"]).await;
     let suspects: Value = read(&root.join("state/blacklist-suspects.json"));
     let keys: Vec<&String> = suspects.as_object().unwrap().keys().collect();
     assert!(
@@ -275,13 +277,16 @@ async fn independent_operators_are_not_suspects() {
         keys.iter().any(|k| k.contains("a.same-op")) && keys.iter().any(|k| k.contains("b.same-op")),
         "{keys:?}"
     );
-    let up = read(&p.upstreams_file);
-    let picked = up["selected"].to_string();
-    assert!(!picked.contains("op-a") && !picked.contains("same-op"), "今天都不用：{picked}");
+    // 3.4.2 起：連不上不是那幾台的錯，今天照用（倖存）；同一家的兩台照舊今天不用
+    let elim = std::fs::read_to_string(root.join("persist/benchmark-last/eliminated.csv")).unwrap();
+    for host in ["op-a", "op-b", "op-c"] {
+        assert!(!elim.contains(host), "{host} 今天照用：{elim}");
+    }
+    assert!(elim.contains("a.same-op") && elim.contains("b.same-op"), "{elim}");
 }
 
 /// 多家 CDN 的網域（padavan-tw 3.3.6：cdn-mum.alibabachengdun.com）：規則外的回答裡已經有 2 個不同業者憑證有效，
-/// 同一家的 2 台回答第 3 個業者但連不上（TIMEOUT）→ 今天不用，但不記可疑
+/// 同一家的 2 台回答第 3 個業者但連不上（TIMEOUT）→ 照常計分、今天照用，不記可疑
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_cdn_domain_timeouts_are_not_suspects() {
     let mut ids = Vec::new();
@@ -317,7 +322,6 @@ async fn multi_cdn_domain_timeouts_are_not_suspects() {
     let suspects = std::fs::read_to_string(root.join("state/blacklist-suspects.json")).unwrap_or_default();
     assert!(!suspects.contains("same-op"), "多家 CDN 的網域連不上不記可疑：{suspects}");
     let log = std::fs::read_to_string(root.join("persist/benchmark-last/judge.log")).unwrap();
-    assert!(log.contains("多家 CDN") && log.contains("sea01.same-op"), "{log}");
-    let up = read(&p.upstreams_file);
-    assert!(!up["selected"].to_string().contains("same-op"), "今天不用：{up:#}");
+    assert!(log.contains("多家 CDN") && log.contains("[保留] https://sea01.same-op"), "{log}");
+    assert!(!log.contains("[今天不用] https://sea01.same-op"), "{log}");
 }
