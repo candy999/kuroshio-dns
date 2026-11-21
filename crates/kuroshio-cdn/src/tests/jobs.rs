@@ -339,3 +339,45 @@ async fn pool_job_quick_checks_after_ceiling() {
     let quick = net.calls("speed").iter().filter(|c| c.ends_with(" 1048576")).count();
     assert_eq!((full, quick), (4, 2), "{:?}", net.calls("speed"));
 }
+
+/// 3.4.2 Windows 壓力測試：前 4 個裡有連不上的（0 MB/s）時，不算進判斷瓶頸的那幾個，
+/// 湊滿 4 個真正量到的速度才判斷（以前 5.45、0、5.46、0 → 減量沒有啟動，17 個全部完整測）
+#[tokio::test]
+async fn pool_job_ceiling_ignores_failed_probes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (ctx, net, paths) = ctx_for(
+        json!({ "cloudflare": {"enabled": true} }),
+        json!({ "pool": { "candidatesPerProvider": 16, "poolSize": 8, "speedTop": 8 } }),
+    );
+    let subnets: String = (0..8).map(|i| format!("104.16.{i}.0/24\n")).collect();
+    write(&paths, "scan/cloudflare-ipv4-TW.txt", &subnets);
+    net.on_ping(|i| match i {
+        IpAddr::V4(_) => lat(2.0),
+        IpAddr::V6(_) => Latency {
+            ok: false,
+            ms: f64::INFINITY,
+        },
+    });
+    net.on_http(|_, _| resp(200, &[], "colo=TPE"));
+    let n = std::sync::Arc::new(AtomicUsize::new(0));
+    let k = n.clone();
+    // 第 2、4 個完整測速連不上
+    net.on_speed(move |_| match k.fetch_add(1, Ordering::SeqCst) {
+        1 | 3 => 0.0,
+        _ => 61.0,
+    });
+    net.on_quality(|_| Quality {
+        ms: 2.0,
+        jitter: 0.1,
+        loss: 0.0,
+        n: 5,
+    });
+    pool::run(&ctx).await.unwrap();
+    let full = net
+        .calls("speed")
+        .iter()
+        .filter(|c| c.ends_with(&kuroshio_net::probe::SPEED_MAX_BYTES.to_string()))
+        .count();
+    let quick = net.calls("speed").iter().filter(|c| c.ends_with(" 1048576")).count();
+    assert_eq!((full, quick), (6, 2), "{:?}", net.calls("speed"));
+}

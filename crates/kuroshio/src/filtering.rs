@@ -783,6 +783,23 @@ impl FilterService {
         crate::memgov::growth_allowed() && used + size <= HELD_MAX
     }
 
+    /// 下載到、但這時候存不了副本的清單能不能先留在記憶體：不看記憶體能不能長大（內容已經下載進來了，
+    /// 丟掉的話下一次重建又要整份下載），只看合計不超過 [`HELD_MAX`]；記憶體已經「不足」時不留（跟以前一樣）
+    fn held_room(&self, url: &str, size: u64) -> bool {
+        if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
+            return false;
+        }
+        let used: u64 = self
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(u, _)| *u != url)
+            .map(|(_, h)| h.z.len() as u64)
+            .sum();
+        used + size <= HELD_MAX
+    }
+
     /// 下游：從上游黑潮拿到、雜湊驗過、但這台存不下的副本：留在記憶體，重建時讀它（不從網路下載）
     pub fn hold_shared_copy(&self, url: &str, hash: u64, compressed: Vec<u8>, v: &Validators) {
         self.held.lock().unwrap().insert(
@@ -1197,7 +1214,12 @@ impl FilterService {
                 continue;
             }
             let estimate = copies.and_then(|c| c.meta(&s.url)).map_or(1 << 20, |m| m.bytes);
-            let mut sink = CopySink::new(copies.is_some_and(|c| c.wanted(estimate)));
+            // 存不了副本（記憶體還不能長大）時，下載到的內容先留在記憶體（合計最多 HELD_MAX）：
+            // 記憶體恢復時是一份一份清單重建，每次重建都會把「沒有副本」的清單整份再下載一次
+            // （3.4.2 Windows 壓力測試：恢復 7 份清單、每 30 秒一次，10 分鐘從網路收了 44.4 MB）
+            let persist = copies.is_some_and(|c| c.wanted(estimate));
+            let hold = copies.is_some() && !persist && self.held_room(&s.url, estimate);
+            let mut sink = CopySink::new(persist || hold);
             let r = fetch::get(&s.url, &Validators::default(), self.max_bytes, timeout, |c| {
                 w.feed(c);
                 sink.feed(c);
@@ -1222,7 +1244,21 @@ impl FilterService {
                     w.end();
                     if let Some(c) = copies {
                         let (h, z) = sink.finish();
-                        c.offer(&s.url, h, z, &v, crate::persist::now_secs(), rules);
+                        if persist {
+                            if c.offer(&s.url, h, z, &v, crate::persist::now_secs(), rules) {
+                                self.held.lock().unwrap().remove(&s.url);
+                            }
+                        } else if let Some(z) = z.filter(|z| hold && self.held_room(&s.url, z.len() as u64)) {
+                            // 估計值可能比實際小（沒存過副本的清單估 1 MiB）：用壓縮後的實際大小再檢查一次上限
+                            self.held.lock().unwrap().insert(
+                                s.url.clone(),
+                                Held {
+                                    hash: h,
+                                    z: Arc::new(z),
+                                    v: v.clone(),
+                                },
+                            );
+                        }
                     }
                     validators.push(v)
                 }

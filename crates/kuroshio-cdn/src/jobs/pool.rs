@@ -616,8 +616,12 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                 let s = match ceiling {
                     None => {
                         let s = cdn.net().download_speed(x.ip, url, ms, kuroshio_net::probe::SPEED_MAX_BYTES).await;
-                        first.push(s);
-                        if first.len() == SPEED_PROBE {
+                        // 0 MB/s 是連不上／回錯誤，不是速度：不算進判斷瓶頸的那幾個（3.4.2 Windows 壓力測試：
+                        // CloudFront 前 4 個是 5.45、0、5.46、0，其餘 13 個都在 5.3～5.7，減量因為兩個 0 沒有啟動）
+                        if s >= 1.0 {
+                            first.push(s);
+                        }
+                        if s >= 1.0 && first.len() == SPEED_PROBE {
                             ceiling = same_speed(&first);
                             if let Some(c) = ceiling {
                                 info!("  測速：前 {SPEED_PROBE} 個節點都約 {c} MB/s（線路或對方的上限），其餘節點只確認不慢");
