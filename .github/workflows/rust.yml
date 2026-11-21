@@ -627,7 +627,9 @@ jobs:
           cp art/kuroshio-windows-x86_64/*.zip dist/
           cp art/kuroshio-linux-*/*.tar.gz dist/
           # 單獨的執行檔 kuroshio-<target>：檔名不能改（下游韌體固定了檔名與雜湊）
-          for d in art/bin-*; do t=${d#art/bin-}; cp "$d/kuroshio" "dist/kuroshio-$t"; done
+          # mimalloc 實驗版（3.4.1 附過）3.4.2 起不放進 Release：MT7621 實機對照兩輪，512 MB 看不出好處、一開始多用約 22 MB，
+          # 128 MB 模擬下反而變「吃緊」。CI 照樣編（Actions 的 Artifacts 拿得到），之後要再對照時用
+          for d in art/bin-*; do t=${d#art/bin-}; case "$t" in *-mimalloc) continue ;; esac; cp "$d/kuroshio" "dist/kuroshio-$t"; done
           # 原始碼包（GPL-3.0 的對應原始碼）：這個標籤的原始碼 + 全部依賴套件（cargo vendor），可以完全離線編譯。
           # 由這次的 CI 產生、列進 SHA256SUMS；上傳後雜湊值就固定（GitHub 自動產生的壓縮檔不保證每次一樣）
           sh tools/source-package.sh "${GITHUB_REF_NAME#v}" dist

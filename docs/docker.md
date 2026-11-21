@@ -5,8 +5,8 @@
 | 標籤 | 內容 |
 |---|---|
 | `latest` | 最新的正式版（預覽版不會更新它） |
-| `3.3` | 3.3.x 的最新一版 |
-| `3.4.1` | 固定版本 |
+| `3.4` | 3.4.x 的最新一版 |
+| `3.4.2` | 固定版本 |
 
 映像檔裡只有一個靜態執行檔與唯讀資料（`FROM scratch`，沒有 shell），跟 Releases 的 `kuroshio-<target>` 是同一批 CI 編好、測過的執行檔。
 
@@ -117,7 +117,7 @@ docker exec kuroshio kuroshio url -c /config/config.json
 docker compose pull && docker compose up -d
 ```
 
-`/config` 不受影響。想固定在某個版本，把 `latest` 改成例如 `3.4.1`；只想收 3.4.x 的修正就用 `3.4`。
+`/config` 不受影響。想固定在某個版本，把 `latest` 改成例如 `3.4.2`；只想收 3.4.x 的修正就用 `3.4`。
 
 ### 試用還沒發布的修正版（Actions 的測試建置）
 
@@ -301,7 +301,7 @@ Releases 的檔案與映像檔都有 GitHub 的建置來源證明（build proven
 
 ```sh
 gh attestation verify kuroshio-linux-x86_64-unknown-linux-musl.tar.gz --repo candy999/kuroshio-dns
-gh attestation verify oci://ghcr.io/candy999/kuroshio-dns:3.4.1 --repo candy999/kuroshio-dns
+gh attestation verify oci://ghcr.io/candy999/kuroshio-dns:3.4.2 --repo candy999/kuroshio-dns
 ```
 
 ## 6. 自己建置映像檔
