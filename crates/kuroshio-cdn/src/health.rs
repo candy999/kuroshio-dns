@@ -52,11 +52,23 @@ where
     let t0 = tokio::time::Instant::now();
     let gap = Duration::from_micros(1_000_000 / per_sec.max(1));
     let f = Arc::new(f);
+    // 下一個可以開始的時間：拿到並行名額時才登記，每個至少隔 `gap`。
+    // 以前只排固定時間（第 i 個在 t0 + i × gap）：前面的量測卡住（名額被等逾時的佔滿）時，
+    // 後面排定時間已經過了的會在名額空出來時一起開始（Windows 3.4.2 驗證：健檢中途卡 10 秒，
+    // 之後 1 秒 600 條新連線、202 個位址）。現在卡住後照樣每秒最多 `per_sec` 個，不補回落後的
+    let next = Arc::new(std::sync::Mutex::new(t0));
     let items: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, x)| (i as u32, x)).collect();
     map_limit(items, limit, move |(i, x)| {
         let f = f.clone();
+        let next = next.clone();
         async move {
-            tokio::time::sleep_until(t0 + gap * i).await;
+            let at = {
+                let mut n = next.lock().unwrap();
+                let at = (t0 + gap * i).max(*n).max(tokio::time::Instant::now());
+                *n = at + gap;
+                at
+            };
+            tokio::time::sleep_until(at).await;
             f(x).await
         }
     })

@@ -84,3 +84,28 @@ async fn paced_map_spreads_start_times() {
     }
     assert!(out[5].1.as_millis() >= 240, "6 個在每秒 20 個的限制下至少 250 ms：{:?}", out[5].1);
 }
+
+/// 前面的量測卡住之後，落後的不會一起開始（Windows 3.4.2 驗證：健檢卡 10 秒後 1 秒 600 條新連線）
+#[tokio::test]
+async fn paced_map_does_not_burst_after_stall() {
+    let t0 = std::time::Instant::now();
+    // 並行 1、每秒 20 個：第 0 個卡 300 ms，之後的排定時間（50～250 ms）都已經過了
+    let out = crate::health::map_paced((0..6u32).collect(), 1, 20, move |i| async move {
+        let at = t0.elapsed();
+        if i == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        at
+    })
+    .await;
+    let at: Vec<std::time::Duration> = out.into_iter().flatten().collect();
+    assert_eq!(at.len(), 6);
+    let mut starts = at.clone();
+    starts.sort();
+    for w in starts.windows(2) {
+        assert!(
+            (w[1] - w[0]).as_millis() + 5 >= 50,
+            "卡住之後還是每 50 ms 最多開始 1 個：{starts:?}"
+        );
+    }
+}
