@@ -1464,6 +1464,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_types)] // 測試只在 64 位元的 CI 上跑；正式程式碼不能用（32 位元 MIPS 沒有 64 位元原子操作）
     fn low_space_deletes_rebuildable_and_skips_non_core() {
         use std::sync::atomic::{AtomicU64, Ordering};
         let dir = tmpdir("space");
@@ -1620,6 +1621,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_types)] // 測試只在 64 位元的 CI 上跑；正式程式碼不能用（32 位元 MIPS 沒有 64 位元原子操作）
     fn optional_kept_above_reserve_and_pruned_below_core_never() {
         use std::sync::atomic::{AtomicU64, Ordering};
         let dir = tmpdir("optional");

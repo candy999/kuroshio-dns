@@ -100,6 +100,8 @@ struct Day {
     backfill: u64,
     /// 背景補問的結果跟前面的不一致（一邊是正常回應、另一邊多數是 NXDOMAIN／NODATA）
     backfill_mismatch: u64,
+    /// 串接中：上游黑潮擋掉、下游自己的過濾沒擋，改用自己的加密上游解析的次數（3.4.2）
+    chain_bypass: u64,
     lat_hit: Histogram,
     lat_miss: Histogram,
     cdn_served: u64,
@@ -352,6 +354,8 @@ pub enum Kind {
     Backfill,
     /// 背景補問抽樣比對到不一致
     BackfillMismatch,
+    /// 上游黑潮擋、下游自己解析（3.4.2）
+    ChainBypass,
 }
 
 impl Default for Stats {
@@ -454,6 +458,7 @@ impl Day {
             "route": d.route_json(),
             "stale": d.stale, "prefetch": d.prefetch,
             "backfill": d.backfill, "backfillMismatch": d.backfill_mismatch,
+            "chainBypass": d.chain_bypass,
             "hitRate": if d.hit + d.miss > 0 { json!((d.hit as f64 * 1000.0 / (d.hit + d.miss) as f64).round() / 10.0) } else { Value::Null },
             "latency": { "hit": d.lat_hit.json(), "miss": d.lat_miss.json() }
         })
@@ -536,6 +541,7 @@ impl Day {
             prefetch: n("prefetch"),
             backfill: n("backfill"),
             backfill_mismatch: n("backfillMismatch"),
+            chain_bypass: n("chainBypass"),
             lat_hit: Histogram::from_json(v.get("latHit")),
             lat_miss: Histogram::from_json(v.get("latMiss")),
             cdn_served: n("cdnServed"),
@@ -566,6 +572,7 @@ impl Day {
         self.prefetch += o.prefetch;
         self.backfill += o.backfill;
         self.backfill_mismatch += o.backfill_mismatch;
+        self.chain_bypass += o.chain_bypass;
         for i in 0..12 {
             self.lat_hit.counts[i] += o.lat_hit.counts[i];
             self.lat_miss.counts[i] += o.lat_miss.counts[i];
@@ -765,6 +772,7 @@ impl Stats {
                 Kind::Prefetch => d.prefetch += 1,
                 Kind::Backfill => d.backfill += 1,
                 Kind::BackfillMismatch => d.backfill_mismatch += 1,
+                Kind::ChainBypass => d.chain_bypass += 1,
             }
             if let Kind::Query = k {
                 i.minute(Self::now_min()).q += 1;
@@ -1068,9 +1076,11 @@ mod tests {
         assert_eq!(v["today"]["backfill"], 0);
         s.count(Kind::Backfill);
         s.count(Kind::BackfillMismatch);
+        s.count(Kind::ChainBypass);
         let v = s.summary();
         assert_eq!(v["today"]["backfill"], 1);
         assert_eq!(v["today"]["backfillMismatch"], 1);
+        assert_eq!(v["today"]["chainBypass"], 1);
         assert!(v["today"].get("sites").is_none(), "LuCI 讀的 today 不帶網站排行");
         let rt = s.realtime();
         assert_eq!(rt.as_array().unwrap().len(), 60);

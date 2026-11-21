@@ -1548,12 +1548,23 @@ impl FilterService {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
-            // 串接中（或正在驗證上游黑潮）、還沒跟上游同步過清單副本：先等第一次同步（最多 10 分鐘），
-            // 不然沒有驗證資訊的清單會在同步前從網路整份下載（3.4.2：重新啟動後的串接壓測）
+            // 還不知道會不會串接（第一次路徑檢查還沒做完）、正在驗證上游黑潮、或已經串接但還沒跟上游同步過清單副本：
+            // 先等（合計最多 10 分鐘），不然存不下副本的清單會在同步前從網路整份下載
+            // （3.4.2：padavan-tw 串接中重新啟動，第 66～81 秒從網路收了 10.2 MB——那時路徑檢查還沒做完，
+            // 以前只看 share_pending，判斷成「不用等」）
+            // 沒有本機副本（第一次安裝）時不等串接確定：過濾還沒有任何清單，等下去這段時間就沒有保護；
+            // 這時只等「已經串接、在等第一次同步」（3.4.1 以前的條件）
+            let wait = || {
+                if built {
+                    crate::chain::filter_wait()
+                } else {
+                    crate::chain::share_pending()
+                }
+            };
             let t1 = std::time::Instant::now();
-            if crate::chain::share_pending() {
-                info!("過濾清單：等跟上游黑潮同步清單副本之後再檢查更新");
-                while crate::chain::share_pending() && t1.elapsed() < Duration::from_secs(600) {
+            if wait() {
+                info!("過濾清單：等串接確定、跟上游黑潮同步清單副本之後再檢查更新");
+                while wait() && t1.elapsed() < Duration::from_secs(600) {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
             }

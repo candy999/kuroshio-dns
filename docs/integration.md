@@ -567,7 +567,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `backfill` | `resolver.backfill` | `cdn` | `cdn`：上面的行為；`off`（或 `0` / `false`）：不補問（3.3.7 的行為） |
 | `backfill_sample` | `resolver.backfillSample` | `16` | 非 CDN 查詢每幾次抽一次；`0` ＝ 不抽樣 |
 
-`/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。
+`/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。
 
 ## 上游多樣性（3.4.0 起）
 
@@ -621,7 +621,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `resolver.cacheMax` | DNS 快取筆數上限（預設 100,000；記憶體控制另外會依可用記憶體收緊） |
 | `benchmark.concurrency` | 每日評測同時測幾個候選 |
 | `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
-| `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`（UCI 是 `config cdn` 的 `option lite '1'`／`'0'`）。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped` |
+| `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`（UCI 是 `config cdn` 的 `option lite '1'`／`'0'`）。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped`（都是次數：還沒驗證完的網域每查一次就再算一次，不是網域數） |
 | `system.oomScoreAdj` | 預設 -500；設 0 就跟一般程式一樣讓核心挑 |
 | `filter.lists` | 少開幾份訂閱清單（每份的大小在 `filter.sources`） |
 

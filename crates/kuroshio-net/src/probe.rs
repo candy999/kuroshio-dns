@@ -441,6 +441,7 @@ mod tests {
 
     /// 3.4.2：測速收滿上限就停（以前 30 MiB：網路快時每個節點都把整個測速檔收完）；收滿得很快也照算速度
     #[tokio::test]
+    #[allow(clippy::disallowed_types)] // 測試只在 64 位元的 CI 上跑；正式程式碼不能用（32 位元 MIPS 沒有 64 位元原子操作）
     async fn speed_test_stops_at_cap() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;

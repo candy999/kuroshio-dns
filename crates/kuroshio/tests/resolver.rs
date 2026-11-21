@@ -1032,6 +1032,7 @@ async fn chain_servfail_is_final_blocked_falls_back_to_own() {
     assert_eq!(n_own.load(Ordering::SeqCst), 5);
     assert!(!r.upstreams.chain_suspended(), "上游擋掉不算串接失敗");
     assert_eq!(r.upstreams.active()[0].role, kuroshio::upstreams::Role::Chain);
+    assert_eq!(r.stats.summary()["today"]["chainBypass"], 5, "狀態頁看得到次數；快取命中不算");
 
     // 自己的上游也沒有答案（失敗）：照上游黑潮的擋
     let (chain, _) = upstream(0, sinkhole).await;
@@ -1043,6 +1044,7 @@ async fn chain_servfail_is_final_blocked_falls_back_to_own() {
         .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
     let m = Message::parse(&r.handle(&q(1, "both.example.com", 1), &CTX).await.unwrap()).unwrap();
     assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(0, 0, 0, 0)), "自己的上游失敗：照上游的擋");
+    assert_eq!(r.stats.summary()["today"]["chainBypass"], 0, "沒有繞過成功：不算");
 }
 
 fn answer_ok_ip(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {

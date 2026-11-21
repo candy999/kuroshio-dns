@@ -1,0 +1,6 @@
+# 32 位元 MIPS（MT7621 等主要目標）沒有 64 位元原子操作：用了會在 mipsel／mips 編不過（3.4.2 的 df0c2bc 就是這樣）。
+# 在 clippy 就擋下來，不必等到交叉編譯。計數器用 AtomicU32；真的要 64 位元時用 Mutex<u64> 或拆成兩個 u32
+disallowed-types = [
+    { path = "std::sync::atomic::AtomicU64", reason = "32 位元 MIPS 沒有 64 位元原子操作，改用 AtomicU32 或 Mutex<u64>" },
+    { path = "std::sync::atomic::AtomicI64", reason = "32 位元 MIPS 沒有 64 位元原子操作，改用 AtomicI32 或 Mutex<i64>" },
+]
