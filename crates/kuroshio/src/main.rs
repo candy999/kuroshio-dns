@@ -432,7 +432,26 @@ fn default_log_directives(level: &str) -> String {
 }
 
 /// 記錄到檔案（Windows 服務用）：超過 5 MB 時改名成 .old 再重新開始
+/// 程式錯誤（panic）的原因也寫進日誌：Windows 的服務模式、被包裝器接走輸出時，標準錯誤看不到
+/// （3.4.2 Windows 壓力測試：三次在啟動途中無聲結束，查不到原因）。原本的處理照舊
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "（沒有訊息）".into());
+        let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let th = std::thread::current().name().unwrap_or("?").to_string();
+        tracing::error!("程式錯誤（panic，執行緒 {th}）：{msg}（{at}）");
+        prev(info);
+    }));
+}
+
 fn init_log_to(cfg: Option<&serde_json::Value>, file: Option<&std::path::Path>) {
+    install_panic_hook();
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     use tracing_subscriber::prelude::*;
     let level = cfg

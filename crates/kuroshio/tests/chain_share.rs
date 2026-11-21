@@ -1231,6 +1231,39 @@ async fn filter_copy_held_in_memory_when_no_room() {
     assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
 }
 
+/// 3.4.2 Windows 壓力測試：單獨運作、存不了副本（記憶體恢復途中、空間不夠）時，下載到的清單留在記憶體；
+/// 記憶體控制一份一份恢復清單時，每次重建都讀記憶體裡那份，不再整份重下載（以前 10 分鐘 26 次、44 MB）
+#[tokio::test]
+async fn downloaded_list_held_when_copy_not_stored() {
+    use kuroshio::resolver::FilterCheck;
+    let body: String = (0..3000).map(|i| format!("||ads{i}.example.net^\n")).collect();
+    let (srv, downloads) = list_server(body).await;
+    let url = format!("http://{srv}/a.txt");
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "A", "url": url, "category": "ads" }
+    ] } }));
+    let d = tmpdir("held-standalone");
+    let small = {
+        let mut p = kuroshio::persist::Persister::new(
+            d.0.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        p.set_free_probe(|_| Some(1 << 20));
+        Arc::new(Mutex::new(p))
+    };
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &d.0).unwrap();
+    f.set_copies(small);
+    assert!(f.update_lists(false).await.unwrap());
+    assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    assert!(f.copies().unwrap().meta(&url).is_none(), "存不下：沒有副本");
+    assert_eq!(f.stats()["heldCopies"]["count"], 1, "留在記憶體");
+    for _ in 0..2 {
+        f.rebuild_from_copies().await.unwrap();
+        assert!(f.check("ads2999.example.net", 1).unwrap().block);
+    }
+    assert_eq!(downloads.load(Ordering::SeqCst), 1, "重建讀記憶體裡那份，不再下載");
+}
+
 /// 正式的匯入端：評測結果寫到 `upstream.autoStateFile`、Manager 重讀（明文拿掉），`autoUpstreams.source` 是 chain；
 /// 種子資料的評測結果上游不分享
 #[tokio::test]
