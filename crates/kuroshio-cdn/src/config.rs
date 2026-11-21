@@ -36,6 +36,20 @@ pub struct CrossCfg {
     pub concurrency: usize,
 }
 
+/// `cdn.lite` 的值：true／false，或 UCI 的 "1"／"0"（"true"／"false"、"on"／"off"）；其他（"auto"、沒寫）是 None
+pub fn lite_value(v: Option<&Value>) -> Option<bool> {
+    match v? {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => Some(n.as_f64() != Some(0.0)),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// 小機器減量：驗證每分鐘最多幾個（3.4.2；padavan-tw 的 D3 單獨運作每秒 10 筆新網域時約每分鐘 150 個）
 pub const LITE_VERIFY_PER_MIN: u32 = 30;
 /// 小機器減量：節點池下載測速最多幾個節點（一般是 `pool.speedTop` 16）
@@ -130,7 +144,7 @@ impl CdnConfig {
         let resolvers = strs(kuroshio_config::get(c, "ecs.resolvers"));
         CdnConfig {
             enabled: c.get("enabled").and_then(Value::as_bool) != Some(false),
-            lite: c.get("lite").and_then(Value::as_bool) == Some(true),
+            lite: lite_value(c.get("lite")) == Some(true),
             trial_ttl: or(c, "trialTtl", 10.0) as u32,
             trial_original: c.get("trialMode").and_then(Value::as_str).unwrap_or("original") == "original",
             nearest_min_gain_ms: nn(c, "nearestMinGainMs", 8.0),

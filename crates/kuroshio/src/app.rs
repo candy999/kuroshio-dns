@@ -1105,7 +1105,7 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
     let paths = kuroshio_cdn::Paths::new(persist_dir(cfg), share_dir(cfg));
     let (mut c2, p2) = (cfg.clone(), persister.clone());
     // 小機器減量（3.4.2）：`cdn.lite` 是 "auto"（預設）時，實體記憶體小於 LITE_BELOW_MB 就減量（不是關掉）
-    if get(&c2, "cdn.lite").and_then(Value::as_bool).is_none() {
+    if kuroshio_cdn::config::lite_value(get(&c2, "cdn.lite")).is_none() {
         let small = crate::sysinfo::mem_bytes().0.is_some_and(|t| t < LITE_BELOW_MB * 1024 * 1024);
         if let Some(c) = c2.get_mut("cdn").and_then(Value::as_object_mut) {
             c.insert("lite".into(), Value::Bool(small));

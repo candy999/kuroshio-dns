@@ -788,3 +788,13 @@ fn catchup_window_option() {
     let c = load(&text, &env());
     assert_eq!(g(&c, "system.catchUpWindow"), &json!("01:00-06:00"));
 }
+
+/// 3.4.2：`cdn.lite` 預設是 "auto"；UCI 的 `option lite '1'` 照樣帶到設定（CDN 端接受 "1"／"0"）
+#[test]
+fn cdn_lite_from_uci() {
+    let c = load("config cdn 'cdn'\n\toption lite '1'\n", &env());
+    let v = g(&c, "cdn.lite");
+    assert!(v == &json!(1) || v == &json!("1") || v == &json!(true), "{v:?}");
+    let c = load("config cdn 'cdn'\n", &env());
+    assert_eq!(g(&c, "cdn.lite"), &json!("auto"));
+}

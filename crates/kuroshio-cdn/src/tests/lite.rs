@@ -48,3 +48,21 @@ fn lite_caps_verifies_per_minute() {
     assert!(got >= cap && got < n, "{got}");
     assert!(c.state().stats.lite_capped >= 1);
 }
+
+#[test]
+fn lite_value_accepts_uci_strings() {
+    use crate::config::lite_value;
+    for (v, want) in [
+        (json!(true), Some(true)),
+        (json!(false), Some(false)),
+        (json!("1"), Some(true)),
+        (json!("0"), Some(false)),
+        (json!("auto"), None),
+        (json!(1), Some(true)),
+    ] {
+        assert_eq!(lite_value(Some(&v)), want, "{v}");
+    }
+    assert_eq!(lite_value(None), None);
+    let (c, _) = setup(json!({ "lite": "1" }));
+    assert!(c.cfg.lite, "UCI 的 option lite '1'");
+}
