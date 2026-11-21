@@ -66,3 +66,21 @@ fn lite_value_accepts_uci_strings() {
     let (c, _) = setup(json!({ "lite": "1" }));
     assert!(c.cfg.lite, "UCI 的 option lite '1'");
 }
+
+/// 3.4.2 Windows 壓力測試（S6／S7）：健檢與節點池的量測攤開開始時間，每秒最多 `per_sec` 個；結果順序不變
+#[tokio::test]
+async fn paced_map_spreads_start_times() {
+    let t0 = std::time::Instant::now();
+    let out = crate::health::map_paced((0..6u32).collect(), 16, 20, move |i| async move { (i, t0.elapsed()) }).await;
+    let out: Vec<(u32, std::time::Duration)> = out.into_iter().flatten().collect();
+    assert_eq!(
+        out.iter().map(|x| x.0).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5],
+        "結果照輸入的順序"
+    );
+    for (i, at) in &out {
+        // 第 i 個最早在 i × 50 ms 才開始
+        assert!(at.as_millis() + 2 >= u128::from(*i) * 50, "{i} 太早開始：{at:?}");
+    }
+    assert!(out[5].1.as_millis() >= 240, "6 個在每秒 20 個的限制下至少 250 ms：{:?}", out[5].1);
+}

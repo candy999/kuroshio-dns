@@ -39,6 +39,35 @@ where
     out
 }
 
+/// 有上限的並行執行，而且開始時間攤開：第 i 個最早在 `i / per_sec` 秒後才開始。
+/// 到 CDN 只有幾 ms 時，光靠並行數擋不住「一秒幾千條新連線」（路由器的連線追蹤表、CPU 一次塞滿）；
+/// 做的事不變，只是每秒最多開始 `per_sec` 個
+pub async fn map_paced<T, R, F, Fut>(items: Vec<T>, limit: usize, per_sec: u64, f: F) -> Vec<Option<R>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = R> + Send + 'static,
+{
+    let t0 = tokio::time::Instant::now();
+    let gap = Duration::from_micros(1_000_000 / per_sec.max(1));
+    let f = Arc::new(f);
+    let items: Vec<(u32, T)> = items.into_iter().enumerate().map(|(i, x)| (i as u32, x)).collect();
+    map_limit(items, limit, move |(i, x)| {
+        let f = f.clone();
+        async move {
+            tokio::time::sleep_until(t0 + gap * i).await;
+            f(x).await
+        }
+    })
+    .await
+}
+
+/// 定時健檢每秒最多開始檢查幾個節點（每個節點 3 條連線 → 每秒約 60 條新連線）。
+/// 3.4.2 Windows 壓力測試：CloudFront 永久 IPv6 節點 585 個，並行 16 個一秒就做完、1 秒 1,976 條新連線；
+/// 現在約 30 秒做完，節點池一般 12 個左右時不到 1 秒
+pub const HEALTH_NODES_PER_SEC: u64 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HStatus {
     Tw,
@@ -73,7 +102,7 @@ impl Cdn {
                     continue;
                 }
                 let net = self.net.clone();
-                let results = map_limit(list, 16, move |(ip, old_pop): (IpAddr, String)| {
+                let results = map_paced(list, 16, HEALTH_NODES_PER_SEC, move |(ip, old_pop): (IpAddr, String)| {
                     let net = net.clone();
                     async move {
                         let r = net.http_probe(ip, host, path, Duration::from_millis(3000)).await;
