@@ -586,6 +586,7 @@ impl Cdn {
 | `jobs_skipped_only_when_fresh_and_chained` | `skip_job` 的每一格：新鮮＋串接、新鮮但解除、超過 36 小時、`chain` 關著、上游 `allow = false`（後三種都不略過） |
 | `share_cache_bounded_and_released` | 來源給 3 MiB 的資料 → `bytes() ≤ 1 MiB`；`sweep` 在 30 分鐘後釋放到 0 |
 | `filter_copy_only_when_wanted` | `wants_filter_copy` 回 `Err("no-room")` 的不抓（分段查詢數是 0）、`objects[].error == "no-room"` |
+| `filter_copy_held_in_memory_when_no_room`（3.4.2） | 下游存不下副本：從上游拿的副本留在記憶體、用它建過濾器，之後的更新與重建都不從網路下載；索引還記著但檔案已刪的副本不當成「一樣、不用傳」 |
 | `pressure_defers_sync` | `pressure_ok() == false` → 不發任何查詢 |
 
 `kuroshio-cdn`：`import_shared_drops_out_of_range_nodes`、`import_shared_keeps_pool_when_all_rejected`、`export_then_import_roundtrip`。
