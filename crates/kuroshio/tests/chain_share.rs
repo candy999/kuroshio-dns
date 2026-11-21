@@ -1314,6 +1314,48 @@ async fn downloaded_list_held_when_copy_not_stored() {
     assert_eq!(downloads.load(Ordering::SeqCst), 1, "重建讀記憶體裡那份，不再下載");
 }
 
+/// 3.4.2 Windows 最後一版驗證（F2）：留在記憶體的清單，空間夠、記憶體能長大之後存成本機副本；
+/// 以前要等到下一次清單更新（約 1 天後），中間重新啟動就整份再下載
+#[tokio::test]
+async fn held_list_persisted_when_room_returns() {
+    use kuroshio::resolver::FilterCheck;
+    use std::sync::atomic::AtomicUsize;
+    let body: String = (0..3000).map(|i| format!("||ads{i}.example.net^\n")).collect();
+    let (srv, downloads) = list_server(body).await;
+    let url = format!("http://{srv}/a.txt");
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "A", "url": url, "category": "ads" }
+    ] } }));
+    let d = tmpdir("held-persist");
+    // 一開始沒有空間，之後空出來
+    let free = Arc::new(AtomicUsize::new(1 << 20));
+    let pers = {
+        let mut p = kuroshio::persist::Persister::new(
+            d.0.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        let f = free.clone();
+        p.set_free_probe(move |_| Some(f.load(Ordering::SeqCst) as u64));
+        Arc::new(Mutex::new(p))
+    };
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &d.0).unwrap();
+    f.set_copies(pers.clone());
+    assert!(f.update_lists(false).await.unwrap());
+    assert_eq!(f.stats()["heldCopies"]["count"], 1);
+    assert_eq!(f.persist_held(), 0, "還是沒有空間：照舊留在記憶體，不白存");
+    assert_eq!(f.stats()["heldCopies"]["count"], 1);
+    free.store(1 << 34, Ordering::SeqCst);
+    assert_eq!(f.persist_held(), 1);
+    assert_eq!(f.stats()["heldCopies"]["count"], 0, "存成副本就從記憶體拿掉");
+    assert!(f.copies().unwrap().meta(&url).is_some());
+    pers.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    // 重新啟動：用本機副本建好，不再下載
+    let f2 = kuroshio::filtering::FilterService::from_cfg(&cfg, &d.0).unwrap();
+    f2.set_copies(pers.clone());
+    assert!(f2.build_from_copies().await);
+    assert_eq!(downloads.load(Ordering::SeqCst), 1, "重新啟動不再下載");
+}
+
 /// 正式的匯入端：評測結果寫到 `upstream.autoStateFile`、Manager 重讀（明文拿掉），`autoUpstreams.source` 是 chain；
 /// 種子資料的評測結果上游不分享
 #[tokio::test]
