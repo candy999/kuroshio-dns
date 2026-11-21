@@ -29,6 +29,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 // ---------------- 上游的假資料來源 ----------------
 
 #[derive(Default)]
+#[allow(clippy::disallowed_types)] // 測試只在 64 位元的 CI 上跑；正式程式碼不能用（32 位元 MIPS 沒有 64 位元原子操作）
 struct FakeSource {
     upstreams: Mutex<Option<Vec<u8>>>,
     cdn: Mutex<Option<kuroshio_cdn::SharedExport>>,
@@ -1031,10 +1032,16 @@ async fn filter_copy_only_when_wanted() {
     assert_eq!(o.etag, "\"v1\"");
     assert_eq!(o.hash.len(), 16);
     assert_eq!(sink.done.load(Ordering::SeqCst), 1);
-    // 雜湊沒變：不重抓
+    // 匯入之後這台有一樣的內容（正式的匯入端看本機副本或記憶體裡的）：不重抓
+    sink.current.store(true, Ordering::SeqCst);
     let rep = s.sync_once().await;
     assert_eq!(rep.chunks, 0);
     assert_eq!(sink.done.load(Ordering::SeqCst), 1);
+    // 內容不見了（例如只留在記憶體、重新啟動過）：雜湊一樣也照樣重抓（3.4.2）
+    sink.current.store(false, Ordering::SeqCst);
+    let rep = s.sync_once().await;
+    assert!(rep.chunks > 0, "{rep:?}");
+    assert_eq!(sink.done.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1228,6 +1235,49 @@ async fn filter_copy_held_in_memory_when_no_room() {
     assert!(!fd.update_lists(false).await.unwrap());
     fd.rebuild_from_copies().await.unwrap();
     assert!(fd.check("ads2999.example.com", 1).unwrap().block);
+    assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
+
+    // 再重新啟動一次：記憶體裡的副本不見了，但 chain-share.json 還記著同一個雜湊
+    // → 還是要跟上游拿（以前「雜湊沒變不重抓」，改從網路下載；padavan-tw 3.4.2 最後一輪：10.2 MB）
+    let saved = s.snapshot();
+    let small2 = {
+        let mut p = kuroshio::persist::Persister::new(
+            dd.0.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        p.set_free_probe(|_| Some(1 << 20));
+        Arc::new(Mutex::new(p))
+    };
+    let fr = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
+    fr.set_copies(small2);
+    assert_eq!(fr.stats()["heldCopies"]["count"], 0);
+    // 測試裡同一個上游短時間內不接受一直換身分、重複傳輸（防濫用）：換一個內容相同的上游（雜湊相同）
+    let (up2, addr2) = upstream(true, Arc::new(FakeSource::default()), false).await;
+    let cache2 = Arc::new(ShareCache::new(live(&ud.0, fu.clone())));
+    cache2.rebuild_now(now_ms());
+    up2.resp.set_share(cache2);
+    let d2 = down(true, addr2).await;
+    let s2 = Syncer::new(d2.client.clone(), live(&dd.0, fr.clone()), Some(&saved));
+    let rep = s2.sync_once().await;
+    assert_eq!(rep.error, None, "{rep:?}");
+    assert_eq!(
+        rep.imported,
+        vec![format!("filter-copy {url}")],
+        "重新啟動後記憶體裡沒有：照樣跟上游拿"
+    );
+    for _ in 0..200 {
+        if fr.check("ads2999.example.com", 1).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fr.check("ads2999.example.com", 1).unwrap().block);
+    assert_eq!(fr.stats()["heldCopies"]["count"], 1);
+    let sha = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap()["kinds"][format!("filter-copy {url}")]["sha"].clone();
+    assert_eq!(sha(&saved), sha(&s2.snapshot()), "雜湊跟重新啟動前記的一樣（以前會因此不重抓）");
+    // 同一次執行裡再同步：記憶體裡有一樣的，不再傳
+    let rep = s2.sync_once().await;
+    assert!(rep.imported.is_empty(), "{rep:?}");
     assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
 }
 

@@ -62,6 +62,11 @@ pub fn share_pending() -> bool {
     }
 }
 
+/// 過濾清單的第一次更新要不要先等：還不知道會不會串接（[`deciding`]），或在等第一次同步（[`share_pending`]）
+pub fn filter_wait() -> bool {
+    deciding() || share_pending()
+}
+
 /// 行程層級的共用結果同步（跨重新載入；同 [`CURRENT`]）
 static SYNCER: Mutex<Option<Arc<share::Syncer>>> = Mutex::new(None);
 

@@ -750,6 +750,8 @@ impl Resolver {
                     // 上游黑潮擋掉、下游用自己的上游解析的：來源標出來（狀態頁、日誌看得到是繞過上游的過濾）
                     if results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::Blocked) {
                         d.source = format!("{}(上游擋，改用自己的上游)", d.source);
+                        // 狀態頁看得到次數（D3 這類只收 WARN 日誌的機器，看不到來源標籤；3.4.2）
+                        self.stats.count(StatKind::ChainBypass);
                     }
                     d
                 })

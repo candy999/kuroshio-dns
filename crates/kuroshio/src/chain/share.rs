@@ -1203,8 +1203,10 @@ impl Syncer {
             );
             return Ok(Fetch::Done);
         }
-        // 雜湊沒變：不重抓
-        if self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex) {
+        // 雜湊沒變：不重抓。清單副本例外：上面已經確認過這台「真的有一樣的內容」（本機副本或記憶體裡的）；
+        // 走到這裡就是沒有——例如只留在記憶體的副本，重新啟動後就不見了，但 chain-share.json 還記著同一個雜湊
+        // （3.4.2：padavan-tw 串接中重新啟動，這些清單不再跟上游要、改從網路下載）。要不要拿照樣由 wants_filter_copy 決定
+        if !filter && self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex) {
             return Ok(Fetch::Done);
         }
         // 這台自己的評測結果比上游這份新：不蓋掉自己的（直系血親，規格 10 第 3.8 節）。記成看過這份，

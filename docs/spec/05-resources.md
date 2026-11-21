@@ -275,7 +275,7 @@ c = CPU 核心數（`available_parallelism`）：
 - 驗證每分鐘最多 30 個（排不進的跟排隊已滿一樣，下一次查詢再排）。
 - 節點池下載測速最多 4 個節點（一般 16 個）。
 - 依據：padavan-tw 的 128 MB 模擬，單獨運作時流量幾乎跟 CDN 驗證次數成正比（每次約 90 KB），CPU 也主要花在驗證的 TLS 握手。
-- 狀態：`cdn.lite`、`cdn.stats.liteWaited`（只問過一次、先不驗證）、`cdn.stats.liteCapped`（超過每分鐘上限）。
+- 狀態：`cdn.lite`、`cdn.stats.liteWaited`（只問過一次、先不驗證）、`cdn.stats.liteCapped`（超過每分鐘上限）。兩個都是**次數**，不是網域數：還沒驗證完的網域每查一次就再試著排一次，所以同一批網域被重複查得多（A＋AAAA、多個用戶端）時 `liteCapped` 會衝得很高，網域批次不同時差很多是正常的。
 
 其他以前依等級調整的欄位現在所有機器一樣（安全上限，或網路工作的規模）：
 
