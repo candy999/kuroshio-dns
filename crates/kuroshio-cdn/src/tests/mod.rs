@@ -3,6 +3,7 @@
 mod behaviors;
 mod bench;
 mod jobs;
+mod lite;
 mod parity;
 mod queue;
 mod selftest;

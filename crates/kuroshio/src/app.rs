@@ -871,6 +871,7 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
                 return Ok(());
             }
             let r = ranges::run(&cdn_job_ctx(ctx, c)).await?;
+            crate::chain::note_own_run("cdn-ranges");
             info!(
                 "CDN 官方範圍：{} 家，{}",
                 r.providers.len(),
@@ -888,6 +889,7 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
                 return Ok(());
             }
             let r = scan::run(&cdn_job_ctx(ctx, c)).await?;
+            crate::chain::note_own_run("cdn-scan");
             info!(
                 "CDN 網段分類：{} 家，{}",
                 r.providers.len(),
@@ -905,6 +907,7 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
                 return Ok(());
             }
             let r = pool::run(&cdn_job_ctx(ctx, c.clone())).await?;
+            crate::chain::note_own_run("cdn-pool");
             info!(
                 "台灣節點池更新：{} 家（IPv6 {}）",
                 r.providers.len(),
@@ -1089,6 +1092,10 @@ fn start_community(
 type BoxFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// CDN 台灣節點：讀狀態（經過快照寫入器，記下雜湊）、接上解析器、啟動定時檢查
+/// `cdn.lite` 是 "auto" 時，實體記憶體小於這個值（MB）就減量（3.4.2：padavan-tw 的 128 MB 模擬裡，
+/// CDN 驗證是主要負擔；512 MB 的 D3 不受影響）
+const LITE_BELOW_MB: u64 = 160;
+
 /// CDN 網域資料庫：在背景執行緒載入（大的分片要解壓、解析），DNS 監聽已經在回答查詢了
 async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<Persister>>) -> Option<Arc<kuroshio_cdn::Cdn>> {
     if !get(cfg, "cdn.enabled").and_then(Value::as_bool).unwrap_or(true) {
@@ -1096,7 +1103,17 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
     }
     let net: Arc<dyn kuroshio_cdn::Net> = Arc::new(kuroshio_cdn::RealNet::new(resolver.iprank.clone()));
     let paths = kuroshio_cdn::Paths::new(persist_dir(cfg), share_dir(cfg));
-    let (c2, p2) = (cfg.clone(), persister.clone());
+    let (mut c2, p2) = (cfg.clone(), persister.clone());
+    // 小機器減量（3.4.2）：`cdn.lite` 是 "auto"（預設）時，實體記憶體小於 LITE_BELOW_MB 就減量（不是關掉）
+    if get(&c2, "cdn.lite").and_then(Value::as_bool).is_none() {
+        let small = crate::sysinfo::mem_bytes().0.is_some_and(|t| t < LITE_BELOW_MB * 1024 * 1024);
+        if let Some(c) = c2.get_mut("cdn").and_then(Value::as_object_mut) {
+            c.insert("lite".into(), Value::Bool(small));
+        }
+        if small {
+            info!("CDN：記憶體小於 {LITE_BELOW_MB} MB，減量（只驗證問過 2 次以上的網域、每分鐘最多驗證 30 個、節點池測速 4 個節點）");
+        }
+    }
     let cdn = tokio::task::spawn_blocking(move || kuroshio_cdn::Cdn::load_with(&c2, paths, net, &|rel| p2.lock().unwrap().load(rel)))
         .await
         .ok()?;

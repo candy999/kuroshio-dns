@@ -576,7 +576,13 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
 
         // ---------- 階段 C：下載測速 ----------
         if let Some(url) = prov.speed_url {
-            for x in good.iter_mut().take(jc.speed_top) {
+            // 小機器減量（3.4.2）：最多測 LITE_SPEED_TOP 個節點
+            let top = if cdn.cfg.lite {
+                jc.speed_top.min(crate::config::LITE_SPEED_TOP)
+            } else {
+                jc.speed_top
+            };
+            for x in good.iter_mut().take(top) {
                 ctx.checkpoint().await;
                 x.speed = Some(cdn.net().download_speed(x.ip, url, jc.speed_seconds * 1000).await);
                 info!(

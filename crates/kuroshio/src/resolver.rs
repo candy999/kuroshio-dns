@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// 過濾判定（由過濾引擎提供）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,6 +798,10 @@ impl Resolver {
         self.notify(&key, &e, true);
         // 正常結束：notify 已經把鍵拿掉；之後同一個鍵可能已經有新的工作，不能再刪一次
         std::mem::forget(guard);
+        // 直系血親（3.4.2）：上游黑潮給的 CDN 答案抽樣查核（不改答案、有上限，見 chain::audit）
+        if e.chained && e.class == Class::Ok && (qtype == rtype::A || qtype == rtype::AAAA) && !verbatim {
+            self.maybe_audit(&qname, qtype, &e, &upq);
+        }
         // 背景補問（規格 10 第 5.2 節）：一定在 notify 之後，用戶端已經拿到回應。
         // 改問過備援的（主要上游都失敗）不補問；串接中只問上游黑潮（下游就是要省自己的加密上游），也不補問
         if used_backup || active.iter().any(|u| u.role == Role::Chain) {
@@ -813,6 +817,67 @@ impl Resolver {
             unasked,
             entry: e,
             cdn,
+        });
+    }
+
+    /// 抽查上游黑潮給的 CDN 答案：連到它給的 IP、用網域名稱做 TLS 握手檢查憑證；不符時用自己的加密上游
+    /// 解析一次、對自己拿到的 IP 做同樣的檢查，自己的正常才算可疑。1 小時內 3 次可疑 → 解除串接（規格 10 第 3.8 節）
+    fn maybe_audit(self: &Arc<Self>, qname: &str, qtype: u16, e: &Entry, upq: &[u8]) {
+        if !self.chain_active() || !crate::clock::synced() || crate::app::pressure() != crate::sysinfo::Pressure::Normal {
+            return;
+        }
+        let Some(cdn) = self.steer_cdn() else { return };
+        let msg = Message {
+            answers: e.answers.clone(),
+            ..Default::default()
+        };
+        if cdn.provider_of(&msg, qtype).is_none() {
+            return;
+        }
+        let Some(ip) = logic::ips_of(&msg, qtype).into_iter().next() else {
+            return;
+        };
+        let Some(slot) = crate::chain::audit::AUDIT.claim(crate::memgov::steady_secs()) else {
+            return;
+        };
+        let (me, name, upq) = (self.clone(), qname.to_string(), upq.to_vec());
+        tokio::spawn(async move {
+            let _slot = slot;
+            use crate::chain::audit::Outcome;
+            use kuroshio_net::probe::{verify_site, SiteCheck};
+            let t = Duration::from_secs(3);
+            let outcome = match verify_site(ip, &name, t).await.0 {
+                SiteCheck::Valid => Outcome::Valid,
+                SiteCheck::Unverified => Outcome::Unverified,
+                SiteCheck::Invalid => {
+                    // 自己的加密上游（不經攔截者）解析一次，看是網站本身的問題、還是上游給的答案不對
+                    let own = me.upstreams.backup();
+                    let asked = me.ask(&own, &upq, qtype, false, |_| {}).await;
+                    let mine = asked
+                        .answers
+                        .iter()
+                        .filter(|a| a.class == Class::Ok)
+                        .flat_map(|a| logic::ips_of(&a.msg, qtype))
+                        .find(|x| *x != ip);
+                    match mine {
+                        None => Outcome::Unverified,
+                        Some(m) => match verify_site(m, &name, t).await.0 {
+                            SiteCheck::Valid => Outcome::Suspicious,
+                            SiteCheck::Invalid => Outcome::SiteInvalid,
+                            SiteCheck::Unverified => Outcome::Unverified,
+                        },
+                    }
+                }
+            };
+            if outcome == Outcome::Suspicious {
+                warn!("抽查上游黑潮給的答案：{name} 的 {ip} 憑證不符，自己的上游給的位址正常");
+            }
+            if crate::chain::audit::AUDIT.record(outcome, &name, &ip.to_string(), crate::persist::now_secs() * 1000) {
+                warn!("抽查上游黑潮給的答案：1 小時內 3 次不通過，暫停串接、改用自己的加密上游");
+                if let Some(c) = crate::chain::current() {
+                    c.audit_failed();
+                }
+            }
         });
     }
 

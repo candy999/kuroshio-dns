@@ -10,6 +10,7 @@
 //! - [`share`]：共用結果（上游的 `ShareCache`、下游的匯入）
 //! - [`grants`]：上游給登記中下游的放行（存取控制、繞過防護清單）
 
+pub mod audit;
 pub mod client;
 pub mod grants;
 pub mod ident;
@@ -78,4 +79,11 @@ pub fn install_syncer(s: Arc<share::Syncer>) {
 /// 沒有串接、`chain` 關著、上游不提供資料、共用結果不新鮮 → false（照原本的排程跑，跟 3.3.7 一樣）
 pub fn share_skips(job: &str) -> bool {
     syncer().is_some_and(|s| s.skip_job(job))
+}
+
+/// 背景工作自己真的跑完（不是略過）時呼叫：記下時間，7 天內有自己跑過才會繼續用上游給的結果（3.4.2）
+pub fn note_own_run(job: &str) {
+    if let Some(s) = syncer() {
+        s.note_own_run(job);
+    }
 }

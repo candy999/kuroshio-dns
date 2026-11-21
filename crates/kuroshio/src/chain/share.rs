@@ -95,6 +95,11 @@ pub fn job_kind(job: &str) -> Option<&'static str> {
 /// 會被略過的工作（狀態的 `skippedJobs` 依這個順序）
 const JOBS: [&str; 4] = ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"];
 
+/// 下游自己多久至少照排程跑一次這些工作（上游給的資料再新鮮也一樣；規格 10 第 3.8 節，3.4.2）
+pub const OWN_REFRESH_MS: u64 = 7 * 24 * 3600 * 1000;
+/// 第一次串接、還沒有自己跑過的紀錄：當成這麼久以前跑過（24 小時後的排程時段才第一次自己跑）
+const OWN_FIRST_DELAY_MS: u64 = 24 * 3600 * 1000;
+
 fn sha_of(b: &[u8]) -> [u8; 32] {
     sha256(&[b])
 }
@@ -677,8 +682,10 @@ pub struct Imported {
     pub bytes: u64,
 }
 
-/// `chain-share.json`：`{ "v": 1, "kinds": { "<種類>": { "sha", "at", "importedAt", "bytes" } } }`
-fn saved_json(kinds: &BTreeMap<String, Imported>) -> Vec<u8> {
+/// `chain-share.json`：`{ "v": 1, "kinds": { "<種類>": { "sha", "at", "importedAt", "bytes" } }, "own": { "<工作>": 毫秒 }, "ownSince": 毫秒 }`。
+/// `own`（3.4.2）：這台自己真的跑完每個工作的時間（被略過的不算）；`ownSince`：第一次串接的時間（還沒有自己跑過的
+/// 工作從這時算 24 小時後才第一次自己跑）。舊版讀到會忽略
+fn saved_json(kinds: &BTreeMap<String, Imported>, own: &BTreeMap<String, u64>, own_since: Option<u64>) -> Vec<u8> {
     let m: serde_json::Map<String, Value> = kinds
         .iter()
         .map(|(k, i)| {
@@ -688,7 +695,24 @@ fn saved_json(kinds: &BTreeMap<String, Imported>) -> Vec<u8> {
             )
         })
         .collect();
-    serde_json::to_vec(&json!({ "v": 1, "kinds": m })).unwrap_or_default()
+    serde_json::to_vec(&json!({ "v": 1, "kinds": m, "own": own, "ownSince": own_since })).unwrap_or_default()
+}
+
+fn saved_own(b: &[u8]) -> (BTreeMap<String, u64>, Option<u64>) {
+    let Ok(v) = serde_json::from_slice::<Value>(b) else {
+        return (BTreeMap::new(), None);
+    };
+    let own = v
+        .get("own")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| JOBS.contains(&k.as_str()))
+                .filter_map(|(k, x)| Some((k.clone(), x.as_u64()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    (own, v.get("ownSince").and_then(Value::as_u64))
 }
 
 fn saved_parse(b: &[u8]) -> BTreeMap<String, Imported> {
@@ -733,6 +757,10 @@ struct SyncState {
     last_sync_at: Option<u64>,
     /// 這個行程有沒有成功同步過（清單驗過了）。上游還在建置回 REFUSED 的那次不算（3.4.2）
     synced_ok: bool,
+    /// 這台自己真的跑完各工作的時間（毫秒；`chain-share.json` 的 `own`）
+    own: BTreeMap<String, u64>,
+    /// 第一次串接的時間（`ownSince`）
+    own_since: Option<u64>,
     next_sync_at: Option<u64>,
     error: Option<String>,
 }
@@ -779,16 +807,21 @@ fn fatal(code: &str) -> Fatal {
 enum Fetch {
     Done,
     Stale,
+    /// 這台自己的資料比較新：不拿上游的蓋掉（3.4.2）
+    OwnNewer,
 }
 
 impl Syncer {
     pub fn new(client: Arc<Client>, sink: Arc<dyn ShareSink>, saved: Option<&[u8]>) -> Arc<Syncer> {
         let kinds = saved.map(saved_parse).unwrap_or_default();
+        let (own, own_since) = saved.map(saved_own).unwrap_or_default();
         let s = Arc::new(Syncer {
             client: client.clone(),
             sink: RwLock::new(sink),
             state: Mutex::new(SyncState {
                 kinds,
+                own,
+                own_since,
                 ..Default::default()
             }),
             persist: Mutex::new(None),
@@ -799,6 +832,10 @@ impl Syncer {
             run: tokio::sync::Mutex::new(()),
             generation: AtomicU32::new(0),
         });
+        // 建立時已經串接（重新載入、或狀態機先接上）：一樣補上「自己跑過」的初始紀錄
+        if client.is_chained() {
+            s.init_own();
+        }
         let w = Arc::downgrade(&s);
         client.on_state_change(Arc::new(move |from, to| {
             if let Some(s) = w.upgrade() {
@@ -832,6 +869,9 @@ impl Syncer {
     }
 
     fn state_changed(&self, from: State, to: State) {
+        if to == State::Chained {
+            self.init_own();
+        }
         if from == State::Chained && to != State::Chained {
             let at = self.state.lock().unwrap().kinds.get(KIND_UPSTREAMS).map(|i| i.imported_at);
             if let Some(at) = at.filter(|at| now_ms().saturating_sub(*at) > STALE_ON_RELEASE_MS) {
@@ -846,6 +886,26 @@ impl Syncer {
             }
         }
         self.wake.notify_one();
+    }
+
+    /// 第一次串接、還沒有自己跑過的紀錄：當成 6 天前跑過（24 小時後的排程時段才第一次自己跑，
+    /// 不在剛串接時把所有工作一起跑）
+    fn init_own(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.own_since.is_some() {
+            return;
+        }
+        st.own_since = Some(now_ms());
+        drop(st);
+        self.save();
+    }
+
+    /// 這個工作「當成最後一次自己跑」的時間：真的跑過用那個時間；還沒有就用第一次串接往前推 6 天
+    fn own_basis(st: &SyncState, job: &str) -> Option<u64> {
+        st.own
+            .get(job)
+            .copied()
+            .or_else(|| st.own_since.map(|t| t.saturating_sub(OWN_REFRESH_MS - OWN_FIRST_DELAY_MS)))
     }
 
     /// 這個種類新鮮（36 小時內匯入過，而且現在串接中；chain 關著一定是 false）
@@ -872,14 +932,41 @@ impl Syncer {
         !self.state.lock().unwrap().synced_ok
     }
 
+    /// 上游給的資料新鮮、而且這台自己 7 天內真的跑過 → 略過。自己太久沒跑 → 照排程自己跑一次
+    /// （直系血親：繼承但保有自己收集資料的能力，規格 10 第 3.8 節）
     pub fn skip_job(&self, job: &str) -> bool {
-        job_kind(job).is_some_and(|k| self.fresh(k))
+        job_kind(job).is_some_and(|k| self.fresh(k)) && self.own_recent(job)
+    }
+
+    fn own_recent(&self, job: &str) -> bool {
+        let now = now_ms();
+        let st = self.state.lock().unwrap();
+        // 時間在未來（時鐘倒退）不算
+        Self::own_basis(&st, job).is_some_and(|t| t <= now.saturating_add(60_000) && now.saturating_sub(t) < OWN_REFRESH_MS)
+    }
+
+    /// 這台自己真的跑完了這個工作（不是略過）：記下時間
+    pub fn note_own_run(&self, job: &str) {
+        if !JOBS.contains(&job) {
+            return;
+        }
+        self.state.lock().unwrap().own.insert(job.to_string(), now_ms());
+        self.save();
+    }
+
+    /// 這台自己的資料比上游這份新（評測結果：自己跑完的時間晚於上游資料的時間）
+    fn own_newer(&self, kind: &str, data_at: u64) -> bool {
+        let job = match kind {
+            KIND_UPSTREAMS => "dns-benchmark",
+            _ => return false,
+        };
+        self.state.lock().unwrap().own.get(job).is_some_and(|&t| t > data_at)
     }
 
     /// `chain-share.json` 的內容
     pub fn snapshot(&self) -> Vec<u8> {
-        let kinds = self.state.lock().unwrap().kinds.clone();
-        saved_json(&kinds)
+        let st = self.state.lock().unwrap();
+        saved_json(&st.kinds, &st.own, st.own_since)
     }
 
     /// 內容有變才交給快照寫入器
@@ -933,6 +1020,12 @@ impl Syncer {
             "error": st.error,
             "objects": objects,
             "skippedJobs": skipped,
+            // 這台自己真的跑完各工作的時間，與下一次最晚什麼時候自己跑（直系血親，3.4.2）
+            "ownRuns": JOBS.iter().map(|j| {
+                let at = st.own.get(*j).copied();
+                let due = Self::own_basis(&st, j).map(|t| t + OWN_REFRESH_MS);
+                (j.to_string(), json!({ "at": at, "dueAt": due }))
+            }).collect::<serde_json::Map<String, Value>>(),
         })
     }
 
@@ -1006,6 +1099,7 @@ impl Syncer {
                 }
                 match self.fetch_object(&mut conn, o, &m.kid, ask, &sink, rep).await {
                     Ok(Fetch::Done) => {}
+                    Ok(Fetch::OwnNewer) => s.error = Some("own-newer".into()),
                     Ok(Fetch::Stale) => {
                         stale = true;
                         s.error = Some("stale".into());
@@ -1112,6 +1206,20 @@ impl Syncer {
         // 雜湊沒變：不重抓
         if self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex) {
             return Ok(Fetch::Done);
+        }
+        // 這台自己的評測結果比上游這份新：不蓋掉自己的（直系血親，規格 10 第 3.8 節）。記成看過這份，
+        // 上游有更新的資料（雜湊變了、時間比自己的新）時才照常匯入
+        if self.own_newer(&o.k, o.at) {
+            self.state.lock().unwrap().kinds.insert(
+                key,
+                Imported {
+                    sha: sha_hex,
+                    at: o.at,
+                    imported_at: now_ms(),
+                    bytes: o.size,
+                },
+            );
+            return Ok(Fetch::OwnNewer);
         }
         let limit = raw_limit(&o.k);
         if filter {

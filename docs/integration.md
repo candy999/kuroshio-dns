@@ -473,8 +473,10 @@ UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: tr
       { "kind": "upstreams", "at": 1794990000000, "bytes": 6624, "importedAt": 1795000500000, "fresh": true, "error": null },
       { "kind": "filter-copy", "name": "https://filter.example.net/list.txt", "at": 1794980000000, "bytes": 412345, "importedAt": null, "fresh": false, "error": "no-room" }
     ],
-    "skippedJobs": ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"]
+    "skippedJobs": ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"],
+    "ownRuns": { "dns-benchmark": { "at": 1794500000000, "dueAt": 1795104800000 }, "cdn-pool": { "at": null, "dueAt": 1795086400000 } }
   },
+  "audit": { "sampled": 42, "valid": 40, "unverified": 2, "siteInvalid": 0, "suspicious": 0, "recentSuspicious": 0, "releases": 0, "last": null },
   "serving": {
     "allowDownstream": true,
     "text": "提供資料給下游黑潮：目前 1 台",
@@ -498,12 +500,13 @@ UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: tr
 |---|---|
 | `enabled` | 這台的 `chain` 開關 |
 | `state` | `none`（沒有偵測到）/ `detected`（偵測到，驗證中）/ `verifying`（做最後確認）/ `chained`（串接中）/ `released`（偵測到但沒有串接，原因在 `reason`） |
-| `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案） |
+| `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案）、`audit-failed`（3.4.2：抽查上游給的答案，1 小時內 3 次憑證不符、而自己的上游的答案正常；10～15 分鐘後重試） |
 | `text` | 給狀態頁直接顯示的一行白話，每一種情況都寫出原因與影響（例如「上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路」）。文字內容不是約定；請整句顯示，不要截斷或自己拼 |
 | `upstream` | 探測到的上游（沒探測過、或 `chain` 關著是 `null`）。`via`：`gateway`（上游就是預設閘道）/ `intercept`（經攔截，`address` 是被轉走的保留位址，`text` 寫閘道並加註「經攔截」）；`depth` 是含這台的層數；`viaNat`：上游看到的來源不是這台（中間隔了 NAT） |
 | `backupActive` | 串接上游暫時不能用，正在用自己的加密上游 |
 | `retryAt` | `released` 時下一次重試的時間 |
-| `shared` | 共用結果（沒有串接是 `null`）。`error` 與 `objects[].error` 是代碼，例如 `memory`（記憶體不夠，這次沒同步）、`no-room`（清單副本存不下、記憶體也留不下）、`not-subscribed`、`newer-format` |
+| `shared` | 共用結果（沒有串接是 `null`）。`error` 與 `objects[].error` 是代碼，例如 `memory`（記憶體不夠，這次沒同步）、`no-room`（清單副本存不下、記憶體也留不下）、`not-subscribed`、`newer-format`、`own-newer`（3.4.2：這台自己的評測結果比上游給的新，不拿來蓋掉；只是說明、不是失敗）。`ownRuns`（3.4.2）：這台自己真的跑完每個工作的時間（`at`，還沒跑過是 `null`）與最晚什麼時候會自己跑（`dueAt`）：上游給的資料再新鮮，自己超過 7 天沒跑就照排程自己跑一次 |
+| `audit` | 3.4.2：抽查上游給的 CDN 答案（每 16 筆抽 1、每 30 秒最多 1 個）。`valid` 憑證有效、`unverified` 連不上或不判斷、`siteInvalid` 網站本身憑證不符（自己的上游給的也不符）、`suspicious` 上游給的不符而自己的正常、`recentSuspicious` 1 小時內的可疑次數（到 3 就解除串接）、`releases` 因此解除的次數、`last` 最近一次可疑（名稱、IP、時間） |
 | `serving` | 上游角色（服務還沒啟動完成時是 `null`）。`text` 開著時是「提供資料給下游黑潮：目前 N 台」或「…目前沒有下游連上來」；關著時是「不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）」，24 小時內有下游來問過時接著寫「最近有下游黑潮來問過（…）」。`note` 只有開著時有。`probes` 是 `allow_downstream` 關著時收到的探測；`refused` 是拒絕的串接查詢（太頻繁、不是私有來源、沒有開放） |
 
 `chain` 關著而且服務還沒準備好上游角色時，`chain` 仍然是完整的物件（`enabled: false`、`state: "none"`、其他欄位 `null`）。
@@ -618,6 +621,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `resolver.cacheMax` | DNS 快取筆數上限（預設 100,000；記憶體控制另外會依可用記憶體收緊） |
 | `benchmark.concurrency` | 每日評測同時測幾個候選 |
 | `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
+| `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped` |
 | `system.oomScoreAdj` | 預設 -500；設 0 就跟一般程式一樣讓核心挑 |
 | `filter.lists` | 少開幾份訂閱清單（每份的大小在 `filter.sources`） |
 

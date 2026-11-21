@@ -120,10 +120,23 @@ impl Job for BenchJob {
                         "durationSec": t0.elapsed().as_secs(),
                         "processPeakRssBytes": (peak > 0).then_some(peak),
                     }));
+                    if r.is_ok() {
+                        // 自己真的跑完（不是略過）：串接中 7 天內有自己跑過才繼續用上游給的結果（3.4.2）
+                        crate::chain::note_own_run("dns-benchmark");
+                    }
                     r
                 })
             }
-            None => Job::run(&self.inner, ctx),
+            None => {
+                let f = Job::run(&self.inner, ctx);
+                Box::pin(async move {
+                    let r = f.await;
+                    if r.is_ok() {
+                        crate::chain::note_own_run("dns-benchmark");
+                    }
+                    r
+                })
+            }
         }
     }
 

@@ -246,6 +246,13 @@ impl Cdn {
             let mut st = self.state();
             let st = &mut *st;
             self.apply_locked(st, msg, &name, qtype, provider, via, &cname, &mut res, &mut tasks);
+            // 小機器減量（3.4.2）：只問過一次的網域先不驗證（剛註冊、只出現一次的網域不值得驗）。
+            // 答案照樣是原始結果、試用期 TTL 10 秒，真的有人在用的話很快會再問，那時才排驗證
+            if self.cfg.lite && st.db.get(&name).map_or(0, |e| e.hits) < 2 {
+                let before = tasks.len();
+                tasks.retain(|t| !matches!(t, Task::Verify { name: n, .. } if *n == name));
+                st.stats.lite_waited += (before - tasks.len()) as u32;
+            }
             if let Some(r) = res.rewritten {
                 st.db.set_best(
                     &name,

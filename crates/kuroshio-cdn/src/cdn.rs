@@ -84,6 +84,10 @@ pub trait Hints: Send + Sync {
 pub struct Stats {
     pub rewrites: u32,
     pub trials: u32,
+    /// 小機器減量：只問過一次、這次先不驗證的（3.4.2）
+    pub lite_waited: u32,
+    /// 小機器減量：超過每分鐘上限、這次先不驗證的（3.4.2）
+    pub lite_capped: u32,
     pub v6dropped: u32,
     pub ecs_rewrites: u32,
     pub cross_rewrites: u32,
@@ -237,6 +241,8 @@ pub struct Cdn {
     on_low_pool: RwLock<Option<LowPoolFn>>,
     /// 移出記憶體的冷資料筆數（`Db::evicted_count` 的副本）：0 時查詢路徑完全不必檢查
     evicted_n: AtomicU32,
+    /// 小機器減量：這一分鐘（Unix 分鐘）排了幾個驗證
+    lite_rate: Mutex<(u64, u32)>,
 }
 
 /// 冷資料移出 / 讀回的結果（記憶體控制，規格 09）
@@ -381,6 +387,7 @@ impl Cdn {
             cls_gen: AtomicU32::new(0),
             cls_id: NEXT_CLS_ID.fetch_add(1, Ordering::Relaxed),
             verify_sem: Arc::new(Semaphore::new(c.verify_concurrency.max(1))),
+            lite_rate: Mutex::new((0, 0)),
             ecs_sem: Arc::new(Semaphore::new(c.ecs.concurrency.max(1))),
             cross_sem: Arc::new(Semaphore::new(c.cross.concurrency.max(1))),
             state: Mutex::new(State {
@@ -815,6 +822,26 @@ impl Cdn {
 
     /// 排入背景（同一個網域同時只跑一個；沒有 tokio runtime 時略過）
     pub fn schedule(self: &Arc<Self>, t: Task) {
+        // 小機器減量（3.4.2）：驗證每分鐘最多 LITE_VERIFY_PER_MIN 個；排不進的跟排隊已滿一樣，下一次查詢再排
+        if self.cfg.lite && matches!(t, Task::Verify { .. }) {
+            let minute = now_ms() / 60_000;
+            let over = {
+                let mut r = self.lite_rate.lock().unwrap();
+                if r.0 != minute {
+                    *r = (minute, 0);
+                }
+                if r.1 >= crate::config::LITE_VERIFY_PER_MIN {
+                    true
+                } else {
+                    r.1 += 1;
+                    false
+                }
+            };
+            if over {
+                self.state().stats.lite_capped += 1;
+                return;
+            }
+        }
         let mut bg = self.bg.lock().unwrap();
         if let Some(r) = bg.record.as_mut() {
             if r.len() < 10_000 {
@@ -957,7 +984,7 @@ impl Cdn {
             let bg = self.bg.lock().unwrap();
             (bg.verify.len(), bg.ecs.len(), bg.cross.len(), bg.deferred)
         };
-        json!({ "enabled": self.cfg.enabled, "stats": st.stats, "domains": st.db.domains.len(),
+        json!({ "enabled": self.cfg.enabled, "lite": self.cfg.lite, "stats": st.stats, "domains": st.db.domains.len(),
                 "background": { "verify": verify, "ecs": ecs, "cross": cross, "deferred": deferred } })
     }
 

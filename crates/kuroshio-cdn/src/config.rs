@@ -36,9 +36,17 @@ pub struct CrossCfg {
     pub concurrency: usize,
 }
 
+/// 小機器減量：驗證每分鐘最多幾個（3.4.2；padavan-tw 的 D3 單獨運作每秒 10 筆新網域時約每分鐘 150 個）
+pub const LITE_VERIFY_PER_MIN: u32 = 30;
+/// 小機器減量：節點池下載測速最多幾個節點（一般是 `pool.speedTop` 16）
+pub const LITE_SPEED_TOP: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct CdnConfig {
     pub enabled: bool,
+    /// 小機器減量（3.4.2）：`cdn.lite` 是 true 時（`auto` 由主程式依實體記憶體換算），只驗證問過 2 次以上的網域、
+    /// 驗證每分鐘最多 [`LITE_VERIFY_PER_MIN`] 個、節點池測速最多 [`LITE_SPEED_TOP`] 個節點。不是關掉
+    pub lite: bool,
     pub trial_ttl: u32,
     /// `trialMode`：`original`（預設，未驗證先回原始）或其他（先換台灣 IP）
     pub trial_original: bool,
@@ -122,6 +130,7 @@ impl CdnConfig {
         let resolvers = strs(kuroshio_config::get(c, "ecs.resolvers"));
         CdnConfig {
             enabled: c.get("enabled").and_then(Value::as_bool) != Some(false),
+            lite: c.get("lite").and_then(Value::as_bool) == Some(true),
             trial_ttl: or(c, "trialTtl", 10.0) as u32,
             trial_original: c.get("trialMode").and_then(Value::as_str).unwrap_or("original") == "original",
             nearest_min_gain_ms: nn(c, "nearestMinGainMs", 8.0),

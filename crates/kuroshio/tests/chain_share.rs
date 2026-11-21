@@ -806,6 +806,71 @@ async fn jobs_skipped_only_when_fresh_and_chained() {
     assert!(JOBS.iter().all(|j| !na.skip_job(j)));
 }
 
+fn saved_own(at: u64, own: u64) -> Vec<u8> {
+    let mut v: serde_json::Value = serde_json::from_slice(&saved(at)).unwrap();
+    v["own"] = json!({ "dns-benchmark": own, "cdn-pool": own, "cdn-scan": own, "cdn-ranges": own });
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// 3.4.2 直系血親：上游的資料新鮮也不會永遠略過，這台自己 7 天內有真的跑過才略過；
+/// 第一次串接當成 6 天前跑過（24 小時後才第一次自己跑）；自己的紀錄存在 chain-share.json 的 `own`
+#[tokio::test]
+async fn own_jobs_still_run_every_7_days() {
+    const JOBS: [&str; 4] = ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"];
+    let (_up, addr) = upstream(true, src_basic(), true).await;
+    let d = down(true, addr).await;
+    let fresh = now_ms() - 3600 * 1000;
+    // 自己 8 天前跑過：上游的新鮮也照樣自己跑
+    let stale_own = Syncer::new(
+        d.client.clone(),
+        FakeSink::new(),
+        Some(&saved_own(fresh, now_ms() - 8 * 24 * 3600 * 1000)),
+    );
+    assert!(JOBS.iter().all(|j| !stale_own.skip_job(j)));
+    // 自己跑完一次：之後略過，紀錄寫進快照
+    stale_own.note_own_run("cdn-pool");
+    assert!(stale_own.skip_job("cdn-pool"));
+    assert!(!stale_own.skip_job("cdn-scan"));
+    let snap: serde_json::Value = serde_json::from_slice(&stale_own.snapshot()).unwrap();
+    assert!(snap["own"]["cdn-pool"].as_u64().unwrap() >= now_ms() - 60_000);
+    // 沒有紀錄（第一次串接）：當成 6 天前跑過 → 現在略過，24 小時後到期
+    let first = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved(fresh)));
+    assert!(JOBS.iter().all(|j| first.skip_job(j)));
+    let due = first.status_json()["ownRuns"]["dns-benchmark"]["dueAt"].as_u64().unwrap();
+    let day = 24 * 3600 * 1000;
+    assert!(due > now_ms() + day - 120_000 && due < now_ms() + day + 120_000, "{due}");
+    // 時間在未來（時鐘倒退）不算跑過
+    let future = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved_own(fresh, now_ms() + 3600 * 1000)));
+    assert!(JOBS.iter().all(|j| !future.skip_job(j)));
+}
+
+/// 3.4.2 直系血親：這台自己的評測結果比上游給的新，同步時不蓋掉自己的（`own-newer`）；
+/// 上游有更新的資料時照常匯入
+#[tokio::test]
+async fn own_newer_benchmark_not_overwritten() {
+    let (up, d, _s, _sink) = pair(src_basic()).await;
+    let sink = FakeSink::new();
+    let s = Syncer::new(d.client.clone(), sink.clone(), None);
+    let key = up.keypair();
+    let u = upstreams_json("own");
+    let mut o = obj(KIND_UPSTREAMS, u.len() as u64);
+    o.at = now_ms() - 3600 * 1000;
+    *up.custom.lock().unwrap() = Some(craft(&key, vec![(o, zstd(&u))]));
+    s.note_own_run("dns-benchmark");
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None);
+    assert!(sink.calls().is_empty(), "自己的比較新：不匯入");
+    assert_eq!(status_obj(&s, KIND_UPSTREAMS)["error"], "own-newer");
+    assert!(s.skip_job("dns-benchmark"), "看過上游這份、自己剛跑過：照樣略過");
+    // 上游有更新的一份（時間比自己的新、內容不同）：照常匯入
+    let u2 = upstreams_json("newer");
+    let mut o2 = obj(KIND_UPSTREAMS, u2.len() as u64);
+    o2.at = now_ms() + 1000;
+    *up.custom.lock().unwrap() = Some(craft(&key, vec![(o2, zstd(&u2))]));
+    s.sync_once().await;
+    assert_eq!(sink.calls(), vec!["upstreams"]);
+}
+
 async fn wait_ready(c: &ShareCache) {
     for _ in 0..500 {
         if c.ready() && !c.building() {

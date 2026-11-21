@@ -72,6 +72,8 @@ pub enum Reason {
     Loop,
     TooDeep,
     Tampered,
+    /// 抽查上游給的 CDN 答案：憑證不符、而自己的上游的答案正常，1 小時內 3 次（3.4.2，規格 10 第 3.8 節）
+    AuditFailed,
 }
 
 impl Reason {
@@ -87,6 +89,7 @@ impl Reason {
             Reason::Loop => "loop",
             Reason::TooDeep => "too-deep",
             Reason::Tampered => "tampered",
+            Reason::AuditFailed => "audit-failed",
         }
     }
 
@@ -103,6 +106,7 @@ impl Reason {
             Reason::Loop => "上游的串接鏈裡有這台（會形成迴圈）",
             Reason::TooDeep => "上游的串接已經有 4 層（超過上限）",
             Reason::Tampered => "攔截者竄改答案",
+            Reason::AuditFailed => "上游給的答案查核不通過（憑證不符，自己的上游的答案正常）",
         }
     }
 }
@@ -415,6 +419,8 @@ enum Event {
     WanChanged,
     /// chain 關掉（重新載入）
     Disabled,
+    /// 抽查上游給的答案不通過（3.4.2）
+    AuditFailed,
 }
 
 /// 狀態機要外層做的事
@@ -583,6 +589,14 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             i.remembered = None;
             i.last_addr = None;
             to_none(i, None)
+        }
+        // 抽查不通過：解除串接、改用自己的加密上游；10～15 分鐘後重試（同 loop，加亂數）
+        Event::AuditFailed => {
+            if i.state != State::Chained {
+                return Vec::new();
+            }
+            let retry = i.timing.retry_max.mul_f64(1.0 + 0.5 * now.rnd);
+            release(i, Reason::AuditFailed, Some(retry), now)
         }
         Event::WanChanged => {
             i.view = None;
@@ -1115,6 +1129,17 @@ impl Client {
         self.drive(Event::Report(v)).await;
     }
 
+    /// 抽查上游給的答案不通過（`chain::audit`）：解除串接，稍後重試
+    pub fn audit_failed(&self) {
+        let (io, before) = {
+            let mut i = self.inner.lock().unwrap();
+            let before = i.state;
+            (step(&mut i, Event::AuditFailed, &[], Now::get()), before)
+        };
+        self.exec_sync(io);
+        self.changed(before);
+    }
+
     pub fn on_wan_changed(&self) {
         let (io, before) = {
             let mut i = self.inner.lock().unwrap();
@@ -1224,6 +1249,9 @@ impl Client {
             (State::Released, Some(Reason::Loop)) => "不串接：上游的串接鏈裡有這台（會形成迴圈）".into(),
             (State::Released, Some(Reason::TooDeep)) => "不串接：上游的串接已經有 4 層（超過上限）".into(),
             (State::Released, Some(Reason::Tampered)) => "不串接：攔截者竄改答案，用自己的加密上游".into(),
+            (State::Released, Some(Reason::AuditFailed)) => {
+                "暫停串接：抽查上游給的答案不通過（憑證不符，自己的上游正常），先用自己的加密上游，稍後重試".into()
+            }
             _ => "沒有偵測到上游黑潮".into(),
         }
     }
@@ -1430,7 +1458,12 @@ pub fn upstream_hostnames(mgr: &Manager) -> Vec<String> {
 /// `/api/status` 的 `chain` 與 `GET /api/chain`：服務還沒建立狀態機時也是完整的物件（方便前端）
 pub fn api_json() -> Value {
     match crate::chain::current() {
-        Some(c) => c.status_json(),
+        Some(c) => {
+            let mut v = c.status_json();
+            // 抽查上游給的答案（直系血親，3.4.2）
+            v["audit"] = crate::chain::audit::AUDIT.status_json();
+            v
+        }
         None => json!({
             "enabled": false, "state": "none", "reason": null, "text": "已關閉串接（chain 關閉）",
             "upstream": null, "backupActive": false, "retryAt": null, "shared": null, "serving": null,
@@ -1749,6 +1782,24 @@ mod tests {
         let io = step(&mut i, Event::WanChanged, &[], now());
         assert_eq!(io, vec![Io::Unbind]);
         assert_eq!(i.state, State::None);
+    }
+
+    /// 3.4.2：抽查上游給的答案不通過 → 解除串接（audit-failed），10～15 分鐘後重試、重試時重新探測；
+    /// 沒有串接時不做任何事
+    #[test]
+    fn audit_failed_releases_and_retries() {
+        let mut i = inner(true);
+        assert!(step(&mut i, Event::AuditFailed, &[], now()).is_empty(), "沒有串接：不動");
+        chained(&mut i, [5; 32]);
+        let io = step(&mut i, Event::AuditFailed, &[], now());
+        assert!(io.contains(&Io::Unbind));
+        assert_eq!((i.state, i.reason), (State::Released, Some(Reason::AuditFailed)));
+        let wait = i.retry_at.unwrap().saturating_duration_since(now().at);
+        let max = i.timing.retry_max;
+        assert!(wait >= max.mul_f64(0.99) && wait <= max.mul_f64(1.51), "{wait:?}");
+        assert!(Client::text(&i, 0).contains("抽查上游給的答案不通過"));
+        let io = step(&mut i, Event::Retry, &[], now());
+        assert_eq!(io, vec![Io::Probe { addr: hit(), tcp: false }], "重試：重新探測");
     }
 
     #[test]
