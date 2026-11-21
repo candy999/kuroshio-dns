@@ -1092,6 +1092,80 @@ async fn filter_copy_end_to_end_with_live() {
     assert_eq!(status_obj(&s2, "filter-copy")["error"], "not-subscribed");
 }
 
+/// 3.4.2：下游存不下清單副本（D3 的狀態分割區只有 7.5 MB）時，從上游拿到的副本留在記憶體、用它建過濾器，
+/// 不從網路下載；本機索引還記著、但檔案已經被刪掉的副本，不能當成「跟上游一樣、不用傳」
+#[tokio::test]
+async fn filter_copy_held_in_memory_when_no_room() {
+    use kuroshio::resolver::FilterCheck;
+    let body: String = (0..3000).map(|i| format!("||ads{i}.example.com^\n")).collect();
+    let (srv, downloads) = list_server(body).await;
+    let url = format!("http://{srv}/a.txt");
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "A", "url": url, "category": "ads" }
+    ] } }));
+    let ud = tmpdir("held-up");
+    let up_p = persister(&ud.0);
+    let fu = kuroshio::filtering::FilterService::from_cfg(&cfg, &ud.0).unwrap();
+    fu.set_copies(up_p.clone());
+    assert!(fu.update_lists(false).await.unwrap());
+    up_p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    let (_up, addr) = upstream(true, Arc::new(FakeSource::default()), false).await;
+    let cache = Arc::new(ShareCache::new(live(&ud.0, fu.clone())));
+    cache.rebuild_now(now_ms());
+    _up.resp.set_share(cache);
+
+    // 下游：以前存過同一份副本（索引還在），但檔案被刪了，而且現在空間不夠
+    let dd = tmpdir("held-down");
+    let dp = persister(&dd.0);
+    let fd0 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
+    fd0.set_copies(dp.clone());
+    let s0 = Syncer::new(down(true, addr).await.client.clone(), live(&dd.0, fd0.clone()), None);
+    assert_eq!(s0.sync_once().await.error, None);
+    // 背景的重建（用剛拿到的副本）做完，再模擬副本檔被刪
+    for _ in 0..200 {
+        if fd0.check("ads2999.example.com", 1).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fd0.check("ads2999.example.com", 1).is_some());
+    dp.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    let file = fd0.copies().unwrap().meta(&url).unwrap().file;
+    std::fs::remove_file(dp.lock().unwrap().file_path(&file)).unwrap();
+    let small = {
+        let mut p = kuroshio::persist::Persister::new(
+            dd.0.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        p.set_free_probe(|_| Some(1 << 20));
+        Arc::new(Mutex::new(p))
+    };
+    // 重新啟動
+    let fd = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
+    fd.set_copies(small);
+    assert!(fd.copies().unwrap().meta(&url).is_some(), "索引還記著");
+    assert!(!fd.build_from_copies().await, "檔案不在：沒有副本可建");
+    let d = down(true, addr).await;
+    let s = Syncer::new(d.client.clone(), live(&dd.0, fd.clone()), None);
+    let rep = s.sync_once().await;
+    assert_eq!(rep.error, None, "{rep:?}");
+    assert_eq!(rep.imported, vec![format!("filter-copy {url}")], "檔案不在：照樣跟上游拿");
+    for _ in 0..200 {
+        if fd.check("ads2999.example.com", 1).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fd.check("ads2999.example.com", 1).unwrap().block, "用記憶體裡的副本建好");
+    assert_eq!(fd.stats()["heldCopies"]["count"], 1);
+    // 之後的定時更新與重建：都不從網路下載
+    assert!(!fd.update_lists(false).await.unwrap());
+    fd.rebuild_from_copies().await.unwrap();
+    assert!(fd.check("ads2999.example.com", 1).unwrap().block);
+    assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
+}
+
 /// 正式的匯入端：評測結果寫到 `upstream.autoStateFile`、Manager 重讀（明文拿掉），`autoUpstreams.source` 是 chain；
 /// 種子資料的評測結果上游不分享
 #[tokio::test]

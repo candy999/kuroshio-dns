@@ -173,9 +173,64 @@ pub enum CopyChunk {
     End(bool),
 }
 
-/// 把副本邊收邊交給清單的寫入端（每一段之間讓出執行緒）。回傳有沒有完整讀到
-async fn feed_copy(c: &ListCopies, url: &str, w: &mut kuroshio_filter::SourceWriter<'_>) -> bool {
-    let Some(mut rx) = c.stream(url) else { return false };
+/// zstd 壓縮的清單內容：解壓縮在 blocking 執行緒做，內容一段一段（64 KB）從 channel 送回來，最後核對內容雜湊。
+/// `open` 在 blocking 執行緒裡呼叫（打開檔案、或包一份記憶體裡的內容）
+fn stream_zstd<R, F>(open: F, hash: u64) -> tokio::sync::mpsc::Receiver<CopyChunk>
+where
+    R: Read,
+    F: FnOnce() -> Option<R> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tokio::task::spawn_blocking(move || {
+        let ok = (|| {
+            let mut dec = zstd::stream::read::Decoder::new(open()?).ok()?;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut n = 0u64;
+            loop {
+                let mut buf = vec![0u8; 64 * 1024];
+                match dec.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(k) => {
+                        buf.truncate(k);
+                        h.write(&buf);
+                        n += k as u64;
+                        // 收的那一端不要了（重建取消）：停下來
+                        tx.blocking_send(CopyChunk::Data(buf)).ok()?;
+                    }
+                    Err(_) => return None,
+                }
+            }
+            h.write_u64(n);
+            Some(h.finish() == hash)
+        })()
+        .unwrap_or(false);
+        let _ = tx.blocking_send(CopyChunk::End(ok));
+    });
+    rx
+}
+
+/// 串接中從上游黑潮拿到、但這台存不下的清單副本（zstd）：留在記憶體，重建時讀它，不從網路下載（3.4.2：
+/// D3 的狀態分割區只有 7.5 MB，10 份清單只有 5 份存得下，每次重新啟動另外 5 份就從網路整份下載約 9 MB）。
+/// 不存檔：重新啟動後再跟上游拿一次（區網）
+#[derive(Clone)]
+struct Held {
+    hash: u64,
+    z: Arc<Vec<u8>>,
+    v: Validators,
+}
+
+/// 記憶體裡最多留多少（壓縮後合計）
+const HELD_MAX: u64 = 8 << 20;
+
+struct HeldBytes(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for HeldBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+async fn feed_stream(mut rx: tokio::sync::mpsc::Receiver<CopyChunk>, w: &mut kuroshio_filter::SourceWriter<'_>) -> bool {
     while let Some(m) = rx.recv().await {
         match m {
             CopyChunk::Data(d) => w.feed(&d),
@@ -183,6 +238,12 @@ async fn feed_copy(c: &ListCopies, url: &str, w: &mut kuroshio_filter::SourceWri
         }
     }
     false
+}
+
+/// 把副本邊收邊交給清單的寫入端（每一段之間讓出執行緒）。回傳有沒有完整讀到
+async fn feed_copy(c: &ListCopies, url: &str, w: &mut kuroshio_filter::SourceWriter<'_>) -> bool {
+    let Some(rx) = c.stream(url) else { return false };
+    feed_stream(rx, w).await
 }
 
 /// 過濾清單的本機副本（可省略的資料：空間大方時才留）
@@ -283,39 +344,18 @@ impl ListCopies {
         p.is_pending(&m.file) || p.file_path(&m.file).exists()
     }
 
+    /// 有這份清單的副本、內容雜湊是 `hash`，而且檔案還在（3.4.2：空間不夠時副本檔會被刪掉、索引還留著；
+    /// 以前只比索引裡的雜湊，串接同步就當成「一樣、不用傳」，重建時沒有檔案又從網路下載）
+    pub fn available_same(&self, url: &str, hash: u64) -> bool {
+        self.meta(url).is_some_and(|m| m.hash == hash) && self.available(url)
+    }
+
     /// 讀副本，但解壓縮在 blocking 執行緒做，內容一段一段（64 KB）從 channel 送回來：
     /// 呼叫端在 async 裡邊收邊解析，每一段之間會讓出執行緒，重建大清單時 DNS 照常回答。沒有副本回傳 None
     pub fn stream(&self, url: &str) -> Option<tokio::sync::mpsc::Receiver<CopyChunk>> {
         let m = self.meta(url)?;
         let path = self.persister.lock().unwrap().file_path(&m.file);
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tokio::task::spawn_blocking(move || {
-            let ok = (|| {
-                let f = std::fs::File::open(&path).ok()?;
-                let mut dec = zstd::stream::read::Decoder::new(f).ok()?;
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                let mut n = 0u64;
-                loop {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    match dec.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(k) => {
-                            buf.truncate(k);
-                            h.write(&buf);
-                            n += k as u64;
-                            // 收的那一端不要了（重建取消）：停下來
-                            tx.blocking_send(CopyChunk::Data(buf)).ok()?;
-                        }
-                        Err(_) => return None,
-                    }
-                }
-                h.write_u64(n);
-                Some(h.finish() == m.hash)
-            })()
-            .unwrap_or(false);
-            let _ = tx.blocking_send(CopyChunk::End(ok));
-        });
-        Some(rx)
+        Some(stream_zstd(move || std::fs::File::open(&path).ok(), m.hash))
     }
 
     /// 讀副本（解壓後一段一段交給 `feed`）。回傳有沒有讀到
@@ -485,6 +525,8 @@ pub struct FilterService {
     update_done: tokio::sync::watch::Sender<u64>,
     /// 串接模式（3.4.0）：從上游黑潮拿到副本的清單（網址 → Unix 秒）；6 小時內的這一輪不下載（當成 304）
     shared_at: Mutex<HashMap<String, u64>>,
+    /// 串接中從上游拿到、這台存不下的副本（網址 → 內容），見 [`Held`]
+    held: Mutex<HashMap<String, Held>>,
 }
 
 /// 從上游黑潮拿到的副本多久內不再自己下載（規格 10 第 3.4 節）
@@ -588,6 +630,7 @@ impl FilterService {
             update_run: Mutex::new(UpdateRun::default()),
             update_done: tokio::sync::watch::channel(0).0,
             shared_at: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -719,16 +762,51 @@ impl FilterService {
         let Some(c) = self.copies.get() else { return false };
         let now = crate::persist::now_secs();
         let staged = c.offer(url, hash, Some(compressed), v, now, rules);
-        if staged || c.meta(url).is_some_and(|m| m.hash == hash) {
+        if staged || c.available_same(url, hash) {
             self.shared_at.lock().unwrap().insert(url.to_string(), now);
+            // 存得下了：記憶體裡那份不再需要
+            self.held.lock().unwrap().remove(url);
         }
         staged
+    }
+
+    /// 下游：存不下的副本能不能先留在記憶體（記憶體還能長大、合計不超過 [`HELD_MAX`]）
+    pub fn can_hold(&self, url: &str, size: u64) -> bool {
+        let used: u64 = self
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(u, _)| *u != url)
+            .map(|(_, h)| h.z.len() as u64)
+            .sum();
+        crate::memgov::growth_allowed() && used + size <= HELD_MAX
+    }
+
+    /// 下游：從上游黑潮拿到、雜湊驗過、但這台存不下的副本：留在記憶體，重建時讀它（不從網路下載）
+    pub fn hold_shared_copy(&self, url: &str, hash: u64, compressed: Vec<u8>, v: &Validators) {
+        self.held.lock().unwrap().insert(
+            url.to_string(),
+            Held {
+                hash,
+                z: Arc::new(compressed),
+                v: v.clone(),
+            },
+        );
+        self.shared_at.lock().unwrap().insert(url.to_string(), crate::persist::now_secs());
+    }
+
+    /// 留在記憶體的副本份數與大小（狀態頁）
+    pub fn held_stats(&self) -> (usize, u64) {
+        let h = self.held.lock().unwrap();
+        (h.len(), h.values().map(|x| x.z.len() as u64).sum())
     }
 
     /// 下游：上游黑潮的副本跟這台的本機副本內容一樣（雜湊相同）→ 標成剛從上游確認過，回傳 true（3.4.2）
     pub fn mark_shared_if_same(&self, url: &str, hash: u64) -> bool {
         let Some(c) = self.copies.get() else { return false };
-        if !c.meta(url).is_some_and(|m| m.hash == hash) {
+        let held = self.held.lock().unwrap().get(url).is_some_and(|h| h.hash == hash);
+        if !held && !c.available_same(url, hash) {
             return false;
         }
         self.shared_at.lock().unwrap().insert(url.to_string(), crate::persist::now_secs());
@@ -940,7 +1018,16 @@ impl FilterService {
     /// 而且還沒到更新間隔才有值（重新啟動、重新載入不再一分鐘後就把清單全部問一次、有變的整份重新下載）
     pub fn first_check_delay(&self, now: u64) -> Option<Duration> {
         let c = self.copies.get()?;
-        if !self.missing.lock().unwrap().is_empty() || !self.unloaded.lock().unwrap().is_empty() {
+        // 沒有本機副本的清單：串接中從上游拿到、留在記憶體的不算（重建時讀它）
+        let missing_unheld = {
+            let held = self.held.lock().unwrap();
+            self.missing
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&i| !held.contains_key(&self.sources[i].url))
+        };
+        if missing_unheld || !self.unloaded.lock().unwrap().is_empty() {
             return None;
         }
         let ex = self.excluded();
@@ -1069,6 +1156,19 @@ impl FilterService {
                 Source::PreferCopy | Source::CopiesOnly => true,
             };
             if use_copy {
+                let held = self.held.lock().unwrap().get(&s.url).cloned();
+                if let Some(h) = held {
+                    let z = h.z.clone();
+                    let rx = stream_zstd(move || Some(std::io::Cursor::new(HeldBytes(z))), h.hash);
+                    if feed_stream(rx, &mut w).await {
+                        w.end();
+                        validators.push(h.v);
+                        continue;
+                    }
+                    // 壞掉（不該發生：收的時候驗過雜湊）：丟掉，改用本機副本或下載
+                    self.held.lock().unwrap().remove(&s.url);
+                    w.reset();
+                }
                 if let Some(c) = copies.filter(|c| c.available(&s.url)) {
                     if feed_copy(c, &s.url, &mut w).await {
                         // 舊版（3.3.2 以前）寫的副本沒有記規則數：讀到時補記（記憶體規劃、截斷檢查要用）
@@ -1573,6 +1673,8 @@ impl FilterCheck for FilterService {
             "unindexed": cs.unindexed + ls.unindexed, "maxUnindexed": self.opts.max_unindexed,
             "unindexedDropped": ls.unindexed_dropped,
             "domains": c.domain_count() + l.domain_count(),
+            // 串接中從上游拿到、這台存不下而留在記憶體的清單副本（3.4.2）
+            "heldCopies": { "count": self.held_stats().0, "bytes": self.held_stats().1 },
             "memoryBytes": c.memory_bytes() + l.memory_bytes(),
             "maxDomains": self.opts.max_domains,
             "sources": sources,

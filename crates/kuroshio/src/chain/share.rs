@@ -1482,7 +1482,8 @@ impl ShareSink for Live {
         if !ShareSink::pressure_ok(self) || !f.build_room_ok(o.rules) {
             return Err("memory");
         }
-        if !f.copy_wanted(o.size) {
+        // 存不下：先留在記憶體（重建時讀它，不從網路下載；3.4.2）
+        if !f.copy_wanted(o.size) && !f.can_hold(&o.name, o.size) {
             return Err("no-room");
         }
         Ok(())
@@ -1496,7 +1497,11 @@ impl ShareSink for Live {
             etag: some(&o.etag),
             last_modified: some(&o.last_modified),
         };
-        f.import_shared_copy(&o.name, hash, compressed, &v, o.rules);
+        if f.copy_wanted(o.size) {
+            f.import_shared_copy(&o.name, hash, compressed, &v, o.rules);
+        } else {
+            f.hold_shared_copy(&o.name, hash, compressed, &v);
+        }
         Ok(())
     }
 
