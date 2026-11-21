@@ -9,7 +9,7 @@
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// 抽樣：每 16 筆可以抽查的答案抽 1 筆
@@ -51,8 +51,8 @@ struct State {
 pub struct Audit {
     tick: AtomicU32,
     busy: AtomicBool,
-    /// 上一次開始抽查（單調時鐘秒；0 = 還沒有）
-    last_start: AtomicU64,
+    /// 上一次開始抽查（單調時鐘秒；0 = 還沒有）。32 位元：MIPS 沒有 64 位元原子操作
+    last_start: AtomicU32,
     st: Mutex<State>,
 }
 
@@ -73,7 +73,7 @@ impl Audit {
         Audit {
             tick: AtomicU32::new(0),
             busy: AtomicBool::new(false),
-            last_start: AtomicU64::new(0),
+            last_start: AtomicU32::new(0),
             st: Mutex::new(State {
                 sampled: 0,
                 valid: 0,
@@ -92,8 +92,9 @@ impl Audit {
         if self.tick.fetch_add(1, Ordering::Relaxed) % SAMPLE != 0 {
             return None;
         }
+        let now_s = now_s.min(u32::MAX as u64) as u32;
         let last = self.last_start.load(Ordering::Relaxed);
-        if last != 0 && now_s < last + MIN_GAP_SECS {
+        if last != 0 && (now_s as u64) < last as u64 + MIN_GAP_SECS {
             return None;
         }
         if self.busy.swap(true, Ordering::AcqRel) {
