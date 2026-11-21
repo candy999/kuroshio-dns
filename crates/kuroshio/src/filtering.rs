@@ -819,6 +819,46 @@ impl FilterService {
         (h.len(), h.values().map(|x| x.z.len() as u64).sum())
     }
 
+    /// 記憶體又能長大時：留在記憶體的清單內容存成本機副本，存得下的從記憶體拿掉（Windows 3.4.2 驗證：
+    /// 吃緊時下載、留在記憶體的 10 份清單，恢復、能長大之後一直沒有寫出，重新啟動時又整份下載 12 MB）。
+    /// 只在本機登記寫出，不連網路；空間不夠（`offer` 不收）的照舊留在記憶體。回傳存成副本的份數
+    pub fn persist_held(&self) -> usize {
+        let Some(c) = self.copies.get() else { return 0 };
+        if !crate::memgov::growth_allowed() {
+            return 0;
+        }
+        // 先看空間存不存得下，存得下的才拿出來（D3 這種小 Flash 一直存不下：不要每次恢復都把最多 8 MB 白複製一次）
+        let items: Vec<(String, Held)> = self
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| c.wanted(h.z.len() as u64))
+            .map(|(u, h)| (u.clone(), h.clone()))
+            .collect();
+        if items.is_empty() {
+            return 0;
+        }
+        let now = crate::persist::now_secs();
+        let mut n = 0;
+        for (url, h) in items {
+            let rules = self
+                .sources
+                .iter()
+                .position(|s| s.url == url)
+                .map_or(0, |i| self.sizes.lock().unwrap()[i].1);
+            let staged = c.offer(&url, h.hash, Some(h.z.as_ref().clone()), &h.v, now, rules);
+            if staged || c.available_same(&url, h.hash) {
+                self.held.lock().unwrap().remove(&url);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            info!("記憶體恢復：{n} 份留在記憶體的清單存成本機副本");
+        }
+        n
+    }
+
     /// 下游：上游黑潮的副本跟這台的本機副本內容一樣（雜湊相同）→ 標成剛從上游確認過，回傳 true（3.4.2）
     pub fn mark_shared_if_same(&self, url: &str, hash: u64) -> bool {
         let Some(c) = self.copies.get() else { return false };
@@ -1245,7 +1285,7 @@ impl FilterService {
                     if let Some(c) = copies {
                         let (h, z) = sink.finish();
                         if persist {
-                            if c.offer(&s.url, h, z, &v, crate::persist::now_secs(), rules) {
+                            if c.offer(&s.url, h, z, &v, crate::persist::now_secs(), rules) || c.available_same(&s.url, h) {
                                 self.held.lock().unwrap().remove(&s.url);
                             }
                         } else if let Some(z) = z.filter(|z| hold && self.held_room(&s.url, z.len() as u64)) {
@@ -1584,8 +1624,14 @@ impl FilterService {
             loop {
                 // 記憶體吃緊時延後（重建時新舊兩份會同時存在）
                 let wait = if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
-                    warn!("記憶體不足，延後更新過濾清單");
-                    Duration::from_secs(1800)
+                    // 記憶體一恢復就更新（每 30 秒看一次記憶體狀態，不連網路），最多等 30 分鐘。
+                    // 以前固定睡 30 分鐘：開機就記憶體不足時，恢復之後清單還要等到 30 分鐘才載入（Windows 3.4.2 驗證）
+                    warn!("記憶體不足，延後更新過濾清單（恢復後再更新，最多 30 分鐘）");
+                    let t = std::time::Instant::now();
+                    while crate::app::pressure() == crate::sysinfo::Pressure::Critical && t.elapsed() < Duration::from_secs(1800) {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    Duration::ZERO
                 } else {
                     let r = me.update_lists(false).await;
                     let partial = me.status.lock().unwrap()["errors"].as_array().is_some_and(|a| !a.is_empty())

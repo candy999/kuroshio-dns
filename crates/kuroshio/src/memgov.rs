@@ -741,7 +741,8 @@ impl Governor {
                 let i = &mut *g;
                 match res {
                     Ok(o) => {
-                        info!("記憶體恢復：{}{}", s.label(), o.detail);
+                        // 步驟名稱是「讓出」的動作（例如「暫時停用過濾清單」），恢復時寫成取消它，不然看起來像又停用了一次
+                        info!("記憶體恢復：取消「{}」{}", s.label(), o.detail);
                         i.restore_fails = 0;
                         i.last_restore_at = Some(now);
                         i.next_restore_at = now + ((self.gap * 6) << i.flap).min(MAX_BACKOFF);
@@ -750,13 +751,13 @@ impl Governor {
                         } else if let Some(p) = i.shed.iter().rposition(|x| x.key == s.key()) {
                             i.shed.remove(p);
                         }
-                        Self::event(i, now, format!("恢復：{}{}", s.label(), o.detail));
+                        Self::event(i, now, format!("恢復：取消「{}」{}", s.label(), o.detail));
                     }
                     Err(e) => {
                         i.restore_fails = (i.restore_fails + 1).min(16);
                         let wait = (300u64 << (i.restore_fails - 1).min(10)).min(MAX_BACKOFF);
                         i.next_restore_at = now + wait;
-                        warn!("記憶體恢復：{}失敗（{e:#}），{} 分鐘後重試", s.label(), wait / 60);
+                        warn!("記憶體恢復：取消「{}」失敗（{e:#}），{} 分鐘後重試", s.label(), wait / 60);
                         Self::event(i, now, format!("恢復{}失敗：{e:#}（{} 分鐘後重試）", s.label(), wait / 60));
                     }
                 }
@@ -1177,6 +1178,12 @@ impl Step for FilterStep {
     fn key(&self) -> &'static str {
         "filter"
     }
+    /// 記憶體又能長大：留在記憶體的清單內容存成本機副本（只在本機寫出）
+    fn set_growth(&self, allowed: bool) {
+        if allowed {
+            self.filter.persist_held();
+        }
+    }
     fn label(&self) -> &'static str {
         "暫時停用過濾清單"
     }
@@ -1223,10 +1230,13 @@ impl Step for FilterStep {
     fn restore(&self) -> BoxFut<'_, anyhow::Result<Outcome>> {
         Box::pin(async move {
             match self.filter.restore_one().await? {
-                Some(u) => Ok(Outcome {
-                    bytes: u.bytes,
-                    detail: format!("：{} 清單", u.name),
-                }),
+                Some(u) => {
+                    self.filter.persist_held();
+                    Ok(Outcome {
+                        bytes: u.bytes,
+                        detail: format!("：{} 清單", u.name),
+                    })
+                }
                 None => Ok(Outcome::default()),
             }
         })
