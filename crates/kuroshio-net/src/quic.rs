@@ -210,6 +210,18 @@ impl Doq {
 
 // ---------------- DoH3 ----------------
 
+/// DoH3 的 POST 請求。跟 HTTP/2、HTTP/1.1 的 DoH 一樣帶 `content-length`：
+/// h3 不會自己補，沒帶時部分伺服器回 400／405（padavan-tw 3.3.7：Cloudflare 的 h3 端點全部資格賽失敗，h2 正常）
+fn doh3_request(authority: &str, path: &str, len: usize) -> Result<http::Request<()>> {
+    Ok(http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{authority}{path}"))
+        .header("content-type", "application/dns-message")
+        .header("accept", "application/dns-message")
+        .header("content-length", len)
+        .body(())?)
+}
+
 type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 #[derive(Default)]
@@ -257,12 +269,7 @@ impl Doh3 {
         for attempt in 0..2 {
             let mut send = self.get(host, port, timeout, attempt > 0).await?;
             let r = tokio::time::timeout(timeout, async {
-                let req = http::Request::builder()
-                    .method("POST")
-                    .uri(format!("https://{authority}{path}"))
-                    .header("content-type", "application/dns-message")
-                    .header("accept", "application/dns-message")
-                    .body(())?;
+                let req = doh3_request(&authority, path, body.len())?;
                 let mut stream = send.send_request(req).await?;
                 stream.send_data(body.clone()).await?;
                 stream.finish().await?;
@@ -298,5 +305,22 @@ impl Doh3 {
             }
         }
         Err(last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::doh3_request;
+
+    #[test]
+    fn doh3_request_has_content_length() {
+        let r = doh3_request("doh.example.com", "/dns-query", 33).unwrap();
+        assert_eq!(r.method(), "POST");
+        assert_eq!(r.uri().to_string(), "https://doh.example.com/dns-query");
+        assert_eq!(r.headers()["content-type"], "application/dns-message");
+        assert_eq!(r.headers()["accept"], "application/dns-message");
+        assert_eq!(r.headers()["content-length"], "33");
+        let r = doh3_request("doh.example.com:8443", "/q", 12).unwrap();
+        assert_eq!(r.uri().authority().unwrap().as_str(), "doh.example.com:8443");
     }
 }

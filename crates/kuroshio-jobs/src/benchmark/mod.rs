@@ -742,9 +742,9 @@ fn append_blacklist(file: &Path, lines: &[String]) {
 
 /// 網站「無法驗證」幾天（不同日期）才列入永久黑名單
 const SUSPECT_DAYS: usize = 3;
-/// 同一個業者群組有幾家互相獨立（不同經營者）的加密 DNS 都「網站無法驗證」時，不記可疑天數
+/// 同一個業者群組有幾家互相獨立（不同經營者）的加密 DNS 都「網站無法驗證」時，照常計分、不記可疑天數
 const INDEPENDENT_OPERATORS: usize = 3;
-/// 規則外但憑證有效的回答來自幾個以上不同業者時，這個網域算「多家 CDN」：連不上不記可疑天數
+/// 規則外但憑證有效的回答來自幾個以上不同業者時，這個網域算「多家 CDN」：連不上照常計分、不記可疑天數
 const MULTI_CDN_GROUPS: usize = 2;
 /// 「憑證不符」幾天（不同日期）才列入永久黑名單。當天一律淘汰不用；隔天以後再犯才永久排除——
 /// 正常的 DNS 也可能有一天回了舊位址（網站剛搬家、快取還沒過期），那個位址上的憑證就不是這個網站的。
@@ -1086,7 +1086,7 @@ impl Benchmark {
                 }
             }
             // 「網站無法驗證」的可疑回答：同一個業者群組有好幾家互相獨立的加密 DNS 都這樣回答，
-            // 比較可能是網站或這條路連不上那些位址，不是這些 DNS 一起竄改 → 今天不用，但不記可疑天數
+            // 比較可能是網站或這條路連不上那些位址，不是這些 DNS 一起竄改 → 照常計分，不記可疑天數
             let independent: HashSet<usize> = {
                 let unverified: Vec<usize> = verdict
                     .iter()
@@ -1108,7 +1108,7 @@ impl Benchmark {
                 out
             };
             // 多家 CDN 的網域：規則外的回答裡，已經有 2 個以上不同業者的回答憑證有效（真的在服務這個網站），
-            // 這種網域本來就由很多業者提供，「連不上」不能當成竄改的證據 → 今天不用，但不記可疑天數
+            // 這種網域本來就由很多業者提供，「連不上」不能當成竄改的證據 → 照常計分，不記可疑天數
             // （padavan-tw 3.3.6：cdn-mum.alibabachengdun.com 有 39 個規則外但憑證有效的回答，dnscry.pt 兩台卻因為 TIMEOUT 被記可疑）
             let multi_cdn = {
                 let mut seen: Vec<&AsnInfo> = Vec::new();
@@ -1120,7 +1120,7 @@ impl Benchmark {
                 }
                 seen.len() >= MULTI_CDN_GROUPS
             };
-            let (mut polluted, mut suspicious, mut rescued) = (0usize, 0usize, 0usize);
+            let (mut polluted, mut suspicious, mut rescued, mut lenient) = (0usize, 0usize, 0usize, 0usize);
             let mut newly_bl: Vec<String> = Vec::new();
             for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {
                 let s = &mut all[*i];
@@ -1158,31 +1158,23 @@ impl Benchmark {
                             );
                         }
                     }
-                    Some((SiteCheck::Unverified, why)) if multi_cdn && !independent.contains(&k) => {
-                        s.kill(format!(
-                            "可疑 {domain} (判定為 {}，網站無法驗證 {why}；多家 CDN 的網域，不記可疑)",
+                    // 多家 CDN 的網域、或 3 家以上互相獨立的 DNS 同樣回答：連不上是網站或這條路的問題，不是這台 DNS 的錯
+                    // → 照常計分（跟「正常回答也無法驗證」一樣），不記可疑、今天也照用。
+                    // 3.4.x 以前是「今天不用」：padavan-tw 3.3.7 一個多家 CDN 的網域就讓 41 台正常的加密 DNS 整天出局
+                    Some((SiteCheck::Unverified, why)) if multi_cdn || independent.contains(&k) => {
+                        lenient += 1;
+                        let basis = if independent.contains(&k) {
+                            format!("有 {INDEPENDENT_OPERATORS} 家以上獨立的 DNS 同樣回答")
+                        } else {
+                            format!("這個網域有 {MULTI_CDN_GROUPS} 家以上業者的回答憑證有效（多家 CDN）")
+                        };
+                        jinfo!(
+                            journal,
+                            "   [保留] {} -> {}：{domain} 網站無法驗證（{why}），但{basis}，判為網站或路徑問題，照常計分、不記可疑",
+                            s.id,
                             info.label()
-                        ));
-                        suspicious += 1;
-                        if !s.pinned {
-                            jinfo!(journal,
-                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但這個網域有 {MULTI_CDN_GROUPS} 家以上業者的回答憑證有效（多家 CDN），連不上不當成竄改，不記可疑",
-                                s.id, info.label()
-                            );
-                        }
-                    }
-                    Some((SiteCheck::Unverified, why)) if independent.contains(&k) => {
-                        s.kill(format!(
-                            "可疑 {domain} (判定為 {}，網站無法驗證 {why}；多家獨立 DNS 相同，不記可疑)",
-                            info.label()
-                        ));
-                        suspicious += 1;
-                        if !s.pinned {
-                            jinfo!(journal,
-                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但有 {INDEPENDENT_OPERATORS} 家以上獨立的 DNS 同樣回答，判為網站或路徑問題，不記可疑",
-                                s.id, info.label()
-                            );
-                        }
+                        );
+                        s.record(dix, *ms, ips);
                     }
                     Some((SiteCheck::Unverified, why)) => {
                         s.kill(format!("可疑 {domain} (判定為 {}，網站無法驗證 {why})", info.label()));
@@ -1214,7 +1206,7 @@ impl Benchmark {
             }
             jinfo!(
                 journal,
-                "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、逾時 {errors}",
+                "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、連不上但照用 {lenient}、逾時 {errors}",
                 groups.first().map(|g| g.rep.label()).unwrap_or_else(|| "無法判定".into()),
                 ok.len() - polluted - suspicious,
                 blocked.len()
