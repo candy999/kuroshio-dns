@@ -400,12 +400,13 @@ mod tests {
     #[test]
     fn merges_writes_and_ignores_state_dir() {
         let d = tmp("merge");
-        let h = setup(&d, 300);
+        // 合併等待 1 秒：CI 機器忙的時候五次寫入之間可能超過 300 ms，被拆成兩次執行（3.4.2 CI 偶發失敗）
+        let h = setup(&d, 1000);
         for f in ["conf/a.txt", "conf/b.txt", "conf/a.txt", "state/snap.json", "elsewhere.txt"] {
             std::fs::write(d.join(f), "x").unwrap();
             h.touch(&d.join(f));
         }
-        std::thread::sleep(Duration::from_millis(1200));
+        std::thread::sleep(Duration::from_millis(3000));
         let r = runs(&d);
         assert_eq!(r.len(), 1, "連續寫入只執行一次：{r:?}");
         assert!(r[0].contains("a.txt") && r[0].contains("b.txt"), "{r:?}");
