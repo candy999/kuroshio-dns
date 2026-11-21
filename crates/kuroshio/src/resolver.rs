@@ -987,7 +987,9 @@ impl Resolver {
                             // 已經有兩台回否定答案、還沒有正常回應：多數決已經定了，不再等其他上游
                             // （正常回應一拿到就先回給用戶端，否定答案以前要等每一台；只有 IPv4 的網站的 AAAA
                             // 在上游 A 實測中位 424 ms、32% 卡 1.5 秒，有 AAAA 的只要 53 ms）
-                            if !got_ok && out.iter().filter(|x| matches!(x.class, Class::NoData | Class::NxDomain)).count() >= 2 {
+                            // 兩台回「同一種」否定答案才算定了：一台 NODATA、一台 NXDOMAIN 是意見不一，照樣等 window
+                            let same = |c: Class| out.iter().filter(|x| x.class == c).count() >= 2;
+                            if !got_ok && (same(Class::NoData) || same(Class::NxDomain)) {
                                 break;
                             }
                         }

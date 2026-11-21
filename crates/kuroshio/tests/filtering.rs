@@ -616,7 +616,8 @@ async fn restart_waits_for_next_check() {
     assert!(f2.build_from_copies().await);
     let w = f2.first_check_delay(now + 600).expect("剛檢查過：要等");
     let day = 24 * 3600;
-    assert!(w.as_secs() <= day - 600 && w.as_secs() >= day - 700, "{w:?}");
+    // 上次檢查的時間可能比 `now` 晚一兩秒記下（秒數剛好進位）
+    assert!(w.as_secs() <= day - 600 + 5 && w.as_secs() >= day - 700, "{w:?}");
     // 過了更新間隔、或時間倒退（還沒對時）：馬上檢查
     assert_eq!(f2.first_check_delay(now + day + 1), None);
     assert_eq!(f2.first_check_delay(now.saturating_sub(3600)), None);

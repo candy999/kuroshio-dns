@@ -459,7 +459,7 @@ pub async fn connect_ip_with(
 // 依序試、每個位址等滿逾時，但查詢通常 0.3～0.6 秒就由別的上游回答、這邊被取消，永遠輪不到第二個位址；
 // 被取消的不算失敗，上游也不會被暫停，於是每筆查詢都白送一次 SYN（單獨運作每秒 10 筆時 13 分鐘 885 次）
 
-/// 主機 →（上次連上的位址，上次沒連上的位址）
+/// 主機:埠 →（上次連上的位址，上次沒連上的位址）
 type AddrMemo = Mutex<HashMap<String, (Option<IpAddr>, Option<IpAddr>)>>;
 const ADDR_MEMO_MAX: usize = 512;
 
@@ -482,33 +482,46 @@ fn order_addrs(host: &str, ips: &mut Vec<IpAddr>) {
     }
 }
 
-fn note_addr(host: &str, ip: IpAddr, ok: bool) {
+/// `ok = false` 時 `failed` 分兩種：真的失敗（錯誤、逾時）會清掉「上次連上」；只是被取消就不清
+/// （同一個位址上次連上、這次排在別的上游後面被取消，不代表它壞了）
+fn note_addr(key: &str, ip: IpAddr, ok: bool) {
+    note_addr_with(key, ip, ok, true)
+}
+
+fn note_addr_with(key: &str, ip: IpAddr, ok: bool, failed: bool) {
     let mut m = addr_memo().lock().unwrap();
-    if m.len() >= ADDR_MEMO_MAX && !m.contains_key(host) {
+    if m.len() >= ADDR_MEMO_MAX && !m.contains_key(key) {
         m.clear();
     }
-    let e = m.entry(host.to_string()).or_insert((None, None));
+    let e = m.entry(key.to_string()).or_insert((None, None));
     if ok {
         *e = (Some(ip), None);
     } else {
         e.1 = Some(ip);
-        if e.0 == Some(ip) {
+        if failed && e.0 == Some(ip) {
             e.0 = None;
         }
     }
 }
 
-/// 正在試的位址：沒有成功就結束（失敗、逾時、或整個查詢被取消）都記成「沒連上」
+/// 紀錄的鍵：主機＋埠（同一台主機的 853 連不上、443 連得上時，DoT 與 DoH 的紀錄不互相蓋掉）
+fn memo_key(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
+}
+
+/// 正在試的位址：TCP 還沒連上就結束（失敗、逾時、或整個查詢被取消）記成「沒連上」。
+/// TCP 已經連上、TLS 握手途中被取消不算這個位址的問題（多半是別的上游先回答了）
 struct Trying<'a> {
-    host: &'a str,
+    key: &'a str,
     ip: IpAddr,
     done: bool,
+    tcp_ok: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Trying<'_> {
     fn drop(&mut self) {
-        if !self.done {
-            note_addr(self.host, self.ip, false);
+        if !self.done && !self.tcp_ok.load(std::sync::atomic::Ordering::Relaxed) {
+            note_addr_with(self.key, self.ip, false, false);
         }
     }
 }
@@ -525,7 +538,8 @@ async fn connect_with(
     if let Some(b) = from {
         ips.retain(|ip| ip.is_ipv4() == b.ip.is_ipv4());
     }
-    order_addrs(host, &mut ips);
+    let key = memo_key(host, port);
+    order_addrs(&key, &mut ips);
     let name = match host.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
         Err(_) => ServerName::try_from(host.to_string()).context("主機名稱格式錯誤")?,
@@ -533,23 +547,36 @@ async fn connect_with(
     let connector = tokio_rustls::TlsConnector::from(cfg);
     let mut last = anyhow!("沒有可用的位址");
     for ip in ips {
-        let mut trying = Trying { host, ip, done: false };
+        let mut trying = Trying {
+            key: &key,
+            ip,
+            done: false,
+            tcp_ok: std::sync::atomic::AtomicBool::new(false),
+        };
+        let tcp_ok = &trying.tcp_ok;
         let r = tokio::time::timeout(timeout, async {
             let tcp = tcp_connect(SocketAddr::new(ip, port), from)
                 .await
                 .inspect_err(|e| crate::path::note_conn_error(ip, e))?;
+            tcp_ok.store(true, std::sync::atomic::Ordering::Relaxed);
             tcp.set_nodelay(true)?;
             Ok::<_, anyhow::Error>(connector.connect(name.clone(), tcp).await?)
         })
         .await;
+        trying.done = true;
         match r {
             Ok(Ok(s)) => {
-                trying.done = true;
-                note_addr(host, ip, true);
+                note_addr(&key, ip, true);
                 return Ok(s);
             }
-            Ok(Err(e)) => last = e,
-            Err(_) => last = anyhow!("連線逾時 {ip}:{port}"),
+            Ok(Err(e)) => {
+                note_addr(&key, ip, false);
+                last = e;
+            }
+            Err(_) => {
+                note_addr(&key, ip, false);
+                last = anyhow!("連線逾時 {ip}:{port}");
+            }
         }
     }
     Err(last)
@@ -894,14 +921,49 @@ mod tests {
             order_addrs(host, &mut v);
             v
         };
+        let trying = |ip, tcp| Trying {
+            key: host,
+            ip,
+            done: false,
+            tcp_ok: std::sync::atomic::AtomicBool::new(tcp),
+        };
         assert_eq!(order(), vec![a, b], "沒有紀錄：照解析的順序");
-        // 試 a 的途中被取消（guard 沒標成功就丟掉）
-        drop(Trying { host, ip: a, done: false });
+        // 試 a 的途中（TCP 還沒連上）被取消（guard 沒標成功就丟掉）
+        drop(trying(a, false));
         assert_eq!(order(), vec![b, a]);
         note_addr(host, b, true);
         assert_eq!(order(), vec![b, a], "b 連上了：之後先試 b");
+        // b 的 TCP 已經連上、TLS 握手途中被取消（別的上游先回答）：不算 b 壞了
+        drop(trying(b, true));
+        assert_eq!(order(), vec![b, a], "TLS 途中被取消不換順序");
         note_addr(host, b, false);
-        assert_eq!(order(), vec![a, b], "b 也壞了：換回 a");
+        assert_eq!(order(), vec![a, b], "b 真的失敗：換回 a");
+    }
+
+    /// 被取消不清掉「上次連上」；紀錄依主機＋埠分開
+    #[test]
+    fn connect_order_cancel_keeps_good_and_ports_are_separate() {
+        let a: IpAddr = "192.0.2.30".parse().unwrap();
+        let b: IpAddr = "192.0.2.40".parse().unwrap();
+        let dot = memo_key("port-test.example", 853);
+        let doh = memo_key("port-test.example", 443);
+        let order = |k: &str| {
+            let mut v = vec![a, b];
+            order_addrs(k, &mut v);
+            v
+        };
+        note_addr(&dot, b, true);
+        drop(Trying {
+            key: &dot,
+            ip: b,
+            done: false,
+            tcp_ok: std::sync::atomic::AtomicBool::new(false),
+        });
+        // b 同時是「上次連上」與「這次被取消」：order_addrs 只把 b 放最後
+        assert_eq!(order(&dot), vec![a, b]);
+        note_addr(&dot, a, false);
+        assert_eq!(order(&dot), vec![b, a], "a 真的失敗後，b 的「上次連上」還在");
+        assert_eq!(order(&doh), vec![a, b], "443 沒有紀錄，不受 853 影響");
     }
 
     #[test]

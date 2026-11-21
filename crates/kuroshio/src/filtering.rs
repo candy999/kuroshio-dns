@@ -1027,7 +1027,11 @@ impl FilterService {
                 .iter()
                 .any(|&i| !held.contains_key(&self.sources[i].url))
         };
-        if missing_unheld || !self.unloaded.lock().unwrap().is_empty() {
+        // 記憶體控制暫時停用的清單（reason = "memory"）本機副本都還在，恢復時由 `restore_one` 用副本重建，
+        // 不算「缺清單」：以前這種情況會跳過更新間隔、立刻整份檢查，記憶體正吃緊時反而從網路下載
+        // （3.4.2 Windows 實測：重新啟動 11 分鐘後、系統可用記憶體接近 0 時從網路收了 4.97 MB）
+        let budget_unloaded = self.unloaded.lock().unwrap().iter().any(|u| u.reason != "memory");
+        if missing_unheld || budget_unloaded {
             return None;
         }
         let ex = self.excluded();

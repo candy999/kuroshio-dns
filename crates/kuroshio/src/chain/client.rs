@@ -1169,7 +1169,8 @@ impl Client {
         match &i.bound {
             Some(b) if b.via == Via::Gateway => format!("上游 {}", b.addr.ip()),
             _ => match i.view.as_ref().and_then(|v| v.gateway_ip) {
-                Some(g) => format!("上游 {g}（經攔截）"),
+                // 經攔截時接走查詢的不一定是閘道本身（兩層 NAT），不要寫成「上游 <閘道>」
+                Some(g) => format!("上游黑潮（經攔截，閘道 {g} 或更上游）"),
                 None => "上游黑潮".to_string(),
             },
         }

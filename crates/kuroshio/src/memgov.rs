@@ -616,8 +616,11 @@ impl Governor {
             if step_state(&mut i.hyst, &r, &self.reserve, self.dwell, now) {
                 let to = i.hyst.state;
                 i.last_change = Some((now, from, to));
+                // 往回降（不足 → 吃緊）時寫明是「回升」：以前同一句「記憶體吃緊（系統可用 29 GB…）」
+                // 看起來像又不夠了（3.4.2 Windows 實測）
                 let msg = format!(
-                    "記憶體{}（系統可用 {} KB，保留 {} KB）",
+                    "記憶體{}{}（系統可用 {} KB，保留 {} KB）",
+                    if to < from { "回升，目前" } else { "" },
                     to.label(),
                     r.avail.map(|x| x / 1024).unwrap_or(0),
                     self.reserve.bytes / 1024

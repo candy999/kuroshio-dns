@@ -502,9 +502,11 @@ impl Report {
     /// 攔截者的白話說明
     pub fn interceptor_text(&self) -> String {
         match &self.interceptor {
-            // 有閘道位址：「路由器 192.168.1.1 上的黑潮」；沒有：「路由器上的黑潮」（不留多的空格）
+            // 有閘道位址：「閘道 192.168.1.1 或更上游的路由器上的黑潮」；沒有：「路由器上的黑潮」（不留多的空格）
+            // 攔截的不一定是閘道本身：兩層 NAT 時查詢經閘道轉出去、被更上游的黑潮接走（3.4.2 Windows 實測：
+            // 預設路由改走 D3 時，接走的是上游 A，文字卻寫成「路由器 192.168.1.1 上的黑潮」）
             Some(Interceptor::Kuroshio(v)) => match self.gateway {
-                Some(g) => format!("路由器 {g} 上的黑潮（{v}）"),
+                Some(g) => format!("閘道 {g} 或更上游的路由器上的黑潮（{v}）"),
                 None => format!("路由器上的黑潮（{v}）"),
             },
             Some(Interceptor::Software(v)) => format!("路由器或業者的 DNS 軟體（{v}）"),
@@ -1026,9 +1028,13 @@ pub async fn check(t: &Targets) -> Report {
             vec![(Proto::Dot, a), (Proto::Doh, b), (Proto::Quic, c)]
         })
     };
-    // Windows 要執行 ROUTE.EXE：不佔非同步的執行緒
+    // Windows 要執行 ROUTE.EXE：不佔非同步的執行緒；最多等 5 秒（卡住時當成沒有閘道，路徑檢查照常做完）
     let gateway = if t.read_gateway {
-        tokio::task::spawn_blocking(default_gateway).await.ok().flatten()
+        tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(default_gateway))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten()
     } else {
         None
     };
@@ -1156,7 +1162,7 @@ mod tests {
         };
         assert_eq!(r.interceptor_text(), "路由器上的黑潮（3.4.1）", "沒有閘道位址：不留多的空格");
         r.gateway = Some("192.168.1.1".parse().unwrap());
-        assert_eq!(r.interceptor_text(), "路由器 192.168.1.1 上的黑潮（3.4.1）");
+        assert_eq!(r.interceptor_text(), "閘道 192.168.1.1 或更上游的路由器上的黑潮（3.4.1）");
     }
 
     #[test]
