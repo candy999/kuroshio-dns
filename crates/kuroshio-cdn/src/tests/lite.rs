@@ -102,10 +102,14 @@ async fn paced_map_does_not_burst_after_stall() {
     assert_eq!(at.len(), 6);
     let mut starts = at.clone();
     starts.sort();
+    // 計時器的精度：Windows 約 15.6 ms，醒來可能晚一點，相鄰兩個的間隔會量成 36 ms 這種（CI 實測）。
+    // 舊的寫法會讓卡住之後的 5 個幾乎同時開始（間隔接近 0），容許 20 ms 的誤差照樣抓得到
     for w in starts.windows(2) {
         assert!(
-            (w[1] - w[0]).as_millis() + 5 >= 50,
+            (w[1] - w[0]).as_millis() + 20 >= 50,
             "卡住之後還是每 50 ms 最多開始 1 個：{starts:?}"
         );
     }
+    // 卡住之後的 5 個（第 1～5 個）合計至少攤開 4 個間隔
+    assert!((starts[5] - starts[1]).as_millis() + 20 >= 200, "卡住之後一起開始了：{starts:?}");
 }
