@@ -138,6 +138,26 @@ impl Scored {
 }
 
 /// 沒有台灣 POP 的 CDN（Fastly）：掃過官方所有 /24，找出各鄰近 POP（香港 / 東京 / 大阪 / 新加坡…），
+/// 節點池測速先完整測幾個節點（判斷是不是量到瓶頸）
+pub(crate) const SPEED_PROBE: usize = 4;
+/// 量到瓶頸之後，其餘節點只收這麼多確認不慢
+pub(crate) const SPEED_QUICK_BYTES: u64 = 1024 * 1024;
+
+/// 前幾個節點的速度幾乎一樣（都在 1 MB/s 以上、最快與最慢差 5% 以內）：量到的是瓶頸，回中位數
+pub(crate) fn same_speed(v: &[f64]) -> Option<f64> {
+    if v.is_empty() || v.iter().any(|s| !s.is_finite() || *s < 1.0) {
+        return None;
+    }
+    let max = v.iter().copied().fold(f64::MIN, f64::max);
+    let min = v.iter().copied().fold(f64::MAX, f64::min);
+    if (max - min) / max > 0.05 {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(s[s.len() / 2])
+}
+
 /// 每個 POP 挑最好的幾個網段，用「延遲 + 抖動 + 掉包 + 下載速度」評分，留前幾個 POP 當主力與備援。
 /// 回傳（節點池，每個 POP 的所有網段）
 async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: &mut Rng) -> (Vec<PoolNode>, IndexMap<String, Vec<u32>>) {
@@ -305,7 +325,11 @@ async fn build_nearest(ctx: &JobCtx, prov: &'static Provider, prev: &Prev, rng: 
                     } else {
                         util::ip_of(p24(scored[i].ip).unwrap(), s_octet.unwrap())
                     };
-                    scored[i].speed = Some(cdn.net().download_speed(target, url, jc.speed_seconds * 1000).await);
+                    scored[i].speed = Some(
+                        cdn.net()
+                            .download_speed(target, url, jc.speed_seconds * 1000, kuroshio_net::probe::SPEED_MAX_BYTES)
+                            .await,
+                    );
                 }
             }
         }
@@ -582,9 +606,35 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             } else {
                 jc.speed_top
             };
+            // 先測 SPEED_PROBE 個：速度幾乎一樣（差 5% 以內）就是量到瓶頸（這台的線路、或 CDN 每條連線的限速），
+            // 不是節點的差別；其餘節點只收 1 MiB 確認不慢，速度記成同一個值（排序改由丟包、延遲決定）。3.4.2
+            let mut first: Vec<f64> = Vec::new();
+            let mut ceiling: Option<f64> = None;
             for x in good.iter_mut().take(top) {
                 ctx.checkpoint().await;
-                x.speed = Some(cdn.net().download_speed(x.ip, url, jc.speed_seconds * 1000).await);
+                let ms = jc.speed_seconds * 1000;
+                let s = match ceiling {
+                    None => {
+                        let s = cdn.net().download_speed(x.ip, url, ms, kuroshio_net::probe::SPEED_MAX_BYTES).await;
+                        first.push(s);
+                        if first.len() == SPEED_PROBE {
+                            ceiling = same_speed(&first);
+                            if let Some(c) = ceiling {
+                                info!("  測速：前 {SPEED_PROBE} 個節點都約 {c} MB/s（線路或對方的上限），其餘節點只確認不慢");
+                            }
+                        }
+                        s
+                    }
+                    Some(c) => {
+                        let q = cdn.net().download_speed(x.ip, url, ms, SPEED_QUICK_BYTES).await;
+                        if q >= 1.0 {
+                            c
+                        } else {
+                            q
+                        }
+                    }
+                };
+                x.speed = Some(s);
                 info!(
                     "  測速 {:<16} {}  {:.1}ms  {} MB/s",
                     x.ip.to_string(),

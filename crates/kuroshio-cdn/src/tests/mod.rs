@@ -128,8 +128,8 @@ impl Net for MockNet {
         let r = (self.http.lock().unwrap())((ip, host.to_string()));
         Box::pin(async move { r })
     }
-    fn download_speed<'a>(&'a self, ip: IpAddr, _url: &'a str, _max: u64) -> BoxFut<'a, f64> {
-        self.note(format!("speed {ip}"));
+    fn download_speed<'a>(&'a self, ip: IpAddr, _url: &'a str, _max: u64, max_bytes: u64) -> BoxFut<'a, f64> {
+        self.note(format!("speed {ip} {max_bytes}"));
         let r = (self.speed.lock().unwrap())(ip);
         Box::pin(async move { r })
     }

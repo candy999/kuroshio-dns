@@ -1,7 +1,7 @@
 //! 記憶體規劃（`kuroshio memory-plan`，3.3.3 起）：用跟執行時同一套規則，推算某個記憶體大小的機器會怎樣運作
 //!
 //! 規則（跟程式裡的判斷一樣）：
-//! - 保留量：[`crate::memgov::auto_reserve`]（Linux：max(16 MB, 實體記憶體 5%, min_free_kbytes × 3)）
+//! - 保留量：[`crate::memgov::auto_reserve`]（Linux：max(16 MB, min(實體記憶體 5%, 1 GB), min_free_kbytes × 3)）
 //! - 記憶體壓力：可用 < 保留量 / 2 → 不足；< 保留量 + 遲滯（max(保留量 / 2, 8 MB)）→ 偏低；其餘正常
 //! - 背景工作（每日評測、CDN）只在「正常」時啟動，執行中變成偏低就在檢查點暫停
 //! - 過濾清單：建好每條約 [`crate::filtering::BYTES_PER_DOMAIN`] bytes；重建時建置中每條另外約

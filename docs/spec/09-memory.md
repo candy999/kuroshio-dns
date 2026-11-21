@@ -207,7 +207,7 @@
 | `enabled` | 有沒有開記憶體控制（沒開時只有量測與保留量） |
 | `state` / `stateLabel` / `since` | `comfortable` / `tight` / `critical`（寬裕 / 吃緊 / 不足），進入時間 |
 | `totalKB`、`availKB`、`rssKB` | 上次量到的實體記憶體、系統可用記憶體、本程式 RSS |
-| `reserveKB`、`reserveAuto`、`reserveHow` | 保留量、是不是自動、怎麼算的（例如「自動：max(16 MB, 實體記憶體 5%, min_free_kbytes 1024 KB × 3)」） |
+| `reserveKB`、`reserveAuto`、`reserveHow` | 保留量、是不是自動、怎麼算的（例如「自動：max(16 MB, min(實體記憶體 5%, 1 GB), min_free_kbytes 1024 KB × 3)」） |
 | `marginKB`、`headroomKB` | 遲滯、保留量以上還有多少 |
 | `psi` | `{ someAvg10, fullAvg10 }`（沒有 PSI 時 null） |
 | `pollSec` | 目前的量測間隔 |

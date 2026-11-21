@@ -30,7 +30,8 @@ pub trait Net: Send + Sync {
     /// 純 HTTP 探測（80 埠）
     fn http_probe<'a>(&'a self, ip: IpAddr, host: &'a str, path: &'a str, timeout: Duration) -> BoxFut<'a, ProbeResult>;
     /// 下載測速（MB/s）
-    fn download_speed<'a>(&'a self, ip: IpAddr, url: &'a str, max_ms: u64) -> BoxFut<'a, f64>;
+    /// 下載測速（MB/s）：`max_ms` 時間上限、`max_bytes` 收多少就停
+    fn download_speed<'a>(&'a self, ip: IpAddr, url: &'a str, max_ms: u64, max_bytes: u64) -> BoxFut<'a, f64>;
     /// TCP 443 連線延遲（取 `samples` 次最好的，不經過快取）
     fn tcp_ping(&self, ip: IpAddr, timeout: Duration, samples: u32) -> BoxFut<'_, Latency>;
     /// 連線品質（中位數延遲、抖動、掉包）
@@ -128,14 +129,14 @@ impl Net for RealNet {
         Box::pin(async move { probe::http_probe(SocketAddr::new(ip, self.http_port), host, path, timeout).await })
     }
 
-    fn download_speed<'a>(&'a self, ip: IpAddr, url: &'a str, max_ms: u64) -> BoxFut<'a, f64> {
+    fn download_speed<'a>(&'a self, ip: IpAddr, url: &'a str, max_ms: u64, max_bytes: u64) -> BoxFut<'a, f64> {
         Box::pin(async move {
             let port = if url.starts_with("http://") {
                 self.http_port
             } else {
                 self.https_port
             };
-            probe::download_speed(ip, Some(port), url, max_ms, probe::SPEED_MAX_BYTES).await
+            probe::download_speed(ip, Some(port), url, max_ms, max_bytes).await
         })
     }
 

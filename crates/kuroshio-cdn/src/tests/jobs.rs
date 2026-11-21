@@ -295,3 +295,47 @@ async fn scan_pauses_between_batches_without_probes_in_flight() {
     assert_eq!(net.calls("http").len(), 32);
     assert_eq!(calls.load(Ordering::SeqCst), 8);
 }
+
+/// 3.4.2：測速前 4 個節點速度幾乎一樣（量到的是線路或對方的上限）→ 其餘只收 1 MiB 確認不慢，速度記成同一個值
+#[test]
+fn speed_ceiling_detection() {
+    use crate::jobs::pool::same_speed;
+    assert_eq!(same_speed(&[61.2, 61.4, 60.9, 61.3]), Some(61.3));
+    assert_eq!(same_speed(&[5.5, 5.4, 5.6, 5.5]), Some(5.5));
+    assert_eq!(same_speed(&[61.2, 46.4, 61.3, 61.0]), None, "有一個明顯慢：照常每個都測");
+    assert_eq!(same_speed(&[0.8, 0.8, 0.8, 0.8]), None, "都很慢（1 MB/s 以下）：不當成瓶頸");
+    assert_eq!(same_speed(&[0.0, 0.0, 0.0, 0.0]), None, "量不到");
+}
+
+#[tokio::test]
+async fn pool_job_quick_checks_after_ceiling() {
+    let (ctx, net, paths) = ctx_for(
+        json!({ "cloudflare": {"enabled": true} }),
+        json!({ "pool": { "candidatesPerProvider": 12, "poolSize": 6, "speedTop": 6 } }),
+    );
+    let subnets: String = (0..6).map(|i| format!("104.16.{i}.0/24\n")).collect();
+    write(&paths, "scan/cloudflare-ipv4-TW.txt", &subnets);
+    net.on_ping(|i| match i {
+        IpAddr::V4(_) => lat(2.0),
+        IpAddr::V6(_) => Latency {
+            ok: false,
+            ms: f64::INFINITY,
+        },
+    });
+    net.on_http(|_, _| resp(200, &[], "colo=TPE"));
+    net.on_speed(|_| 61.0);
+    net.on_quality(|_| Quality {
+        ms: 2.0,
+        jitter: 0.1,
+        loss: 0.0,
+        n: 5,
+    });
+    pool::run(&ctx).await.unwrap();
+    let full = net
+        .calls("speed")
+        .iter()
+        .filter(|c| c.ends_with(&kuroshio_net::probe::SPEED_MAX_BYTES.to_string()))
+        .count();
+    let quick = net.calls("speed").iter().filter(|c| c.ends_with(" 1048576")).count();
+    assert_eq!((full, quick), (4, 2), "{:?}", net.calls("speed"));
+}

@@ -197,7 +197,7 @@ impl Reserve {
 ///   程式本身（OpenWrt 的 squashfs 上的執行檔與函式庫），全部回收就會一直重讀 Flash（thrashing）。
 ///   所以再留一段：至少 16 MB（128 MB 路由器上約 12%，夠 dnsmasq、hostapd、netifd 這類常駐程式的工作集），
 ///   大機器 5%；`min_free_kbytes` × 3 讓保留量一定高過核心開始直接回收（min 水位）與 kswapd 喚醒（low 水位）。
-/// - Windows：max(512 MB, 實體記憶體 10%（最多 4 GB）)。`ullAvailPhys` 包含待命清單（standby，可以回收的快取），
+/// - Windows：max(512 MB, min(實體記憶體 10%, 4 GB))。`ullAvailPhys` 包含待命清單（standby，可以回收的快取），
 ///   Windows 會很積極地修剪工作集、把記憶體換到分頁檔；系統預設在可用約 32 MB / 4 GB（最多 64 MB）時才發
 ///   「記憶體不足」通知，那時桌面早就卡了，所以留多一點。
 /// - 一律不超過實體記憶體的一半。
@@ -205,7 +205,7 @@ pub fn auto_reserve(total: Option<u64>, platform: Platform, min_free_kb: Option<
     let (bytes, how) = match platform {
         Platform::Windows => {
             let pct = total.map(|t| (t / 10).min(4096 * MB)).unwrap_or(0);
-            (pct.max(512 * MB), "自動：max(512 MB, 實體記憶體 10%)".to_string())
+            (pct.max(512 * MB), "自動：max(512 MB, min(實體記憶體 10%, 4 GB))".to_string())
         }
         Platform::Linux | Platform::Other => {
             let pct = total.map(|t| (t / 20).min(1024 * MB)).unwrap_or(0);
@@ -213,7 +213,7 @@ pub fn auto_reserve(total: Option<u64>, platform: Platform, min_free_kb: Option<
             (
                 (16 * MB).max(pct).max(wm),
                 format!(
-                    "自動：max(16 MB, 實體記憶體 5%, min_free_kbytes {} KB × 3)",
+                    "自動：max(16 MB, min(實體記憶體 5%, 1 GB), min_free_kbytes {} KB × 3)",
                     min_free_kb.map_or("?".into(), |k| k.to_string())
                 ),
             )
