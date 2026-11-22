@@ -567,6 +567,11 @@ pub struct FilterService {
     /// 各清單命中次數（跟 `sources` 同順序；32 位元平台沒有 64 位元原子操作）
     hits: Vec<AtomicU32>,
     hits_dirty: AtomicBool,
+    /// 通訊類網域（推播）不被清單誤擋（`filter.protectComm`，預設開；自訂規則照樣優先，3.5.0）
+    protect_comm: bool,
+    /// 清單本來要擋、因為是通訊類而放行的次數；上一次記 INFO 的日數（每天第一次記一行）
+    comm_spared: AtomicU32,
+    comm_logged_day: AtomicU32,
     /// 各清單上次載入時量到的大小（bytes；沒載入過是 0）與規則數
     sizes: Mutex<Vec<(u64, u64)>>,
     /// 暫時停用的清單（依停用順序）
@@ -720,6 +725,9 @@ impl FilterService {
             max_bytes: 64 << 20,
             hits: (0..n).map(|_| AtomicU32::new(0)).collect(),
             hits_dirty: AtomicBool::new(false),
+            protect_comm: g("protectComm").and_then(Value::as_bool) != Some(false),
+            comm_spared: AtomicU32::new(0),
+            comm_logged_day: AtomicU32::new(0),
             sizes: Mutex::new(vec![(0, 0); n]),
             unloaded: Mutex::new(Vec::new()),
             rebuild_lock: tokio::sync::Mutex::new(()),
@@ -1876,6 +1884,22 @@ impl FilterCheck for FilterService {
         }
         let lists = self.lists.read().unwrap().clone();
         let v = lists.check(name, qtype)?;
+        // 通訊類網域（推播）：清單要擋也放行（漏接通知比多一個連線嚴重）；自訂規則在上面，照樣優先（3.5.0）
+        if v.is_block() && self.protect_comm && kuroshio_net::comm::is_comm(name) {
+            self.comm_spared.fetch_add(1, Ordering::Relaxed);
+            let day = (crate::backup::now_ms() / 86_400_000) as u32;
+            if self.comm_logged_day.swap(day, Ordering::Relaxed) != day {
+                let list = v.list.and_then(|i| self.sources.get(i)).map(|s| s.name.as_str()).unwrap_or("?");
+                info!("過濾：清單「{list}」擋到通訊類網域 {name}，照樣放行（filter.protectComm；可以回報給清單維護者）");
+            }
+            return Some(Verdict {
+                block: false,
+                allow: true,
+                category: v.category.as_str(),
+                rule: "builtin-comm".into(),
+                bypass: false,
+            });
+        }
         // 清單層的來源編號就是 sources 的位置（停用中的清單也佔一個位置）
         if let Some(h) = v.list.and_then(|i| self.hits.get(i)) {
             h.fetch_add(1, Ordering::Relaxed);
@@ -1940,6 +1964,9 @@ impl FilterCheck for FilterService {
             "domains": c.domain_count() + l.domain_count(),
             // 串接中從上游拿到、這台存不下而留在記憶體的清單副本（3.4.2）
             "heldCopies": { "count": self.held_stats().0, "bytes": self.held_stats().1 },
+            // 通訊類網域（3.5.0）：清單本來要擋、照樣放行的次數
+            "commSpared": self.comm_spared.load(Ordering::Relaxed),
+            "protectComm": self.protect_comm,
             "memoryBytes": c.memory_bytes() + l.memory_bytes(),
             "maxDomains": self.opts.max_domains,
             "sources": sources,

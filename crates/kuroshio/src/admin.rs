@@ -738,6 +738,11 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "perf": crate::resolver::perf::json(),
                 // 查詢紀錄只放狀態（開著嗎、到幾點），內容要另外用 /api/querylog 讀
                 "queryLog": r.querylog.status(crate::querylog::now()),
+                // 通訊類網域（3.5.0）：內建與自己加的後綴數、預取中的數量（被清單擋到又放行的次數在 filter.commSpared）
+                "comm": {
+                    "builtin": kuroshio_net::comm::COMM_SUFFIXES.len(), "user": kuroshio_net::comm::user_count(),
+                    "prefetching": r.comm_prefetching(),
+                },
             }))
         }
         // 來源 IP 存取控制（規格 08）；?ip= 說明這個 IP 的判斷結果

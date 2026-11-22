@@ -441,6 +441,11 @@ impl Cdn {
         if !self.cfg.cross.enabled || (qtype != rtype::A && qtype != rtype::AAAA) {
             return false;
         }
+        // 通訊類網域（推播，3.5.0）：不換到別家 CDN（長連線重連的代價高，換節點照常）。
+        // 只有可能走跨 CDN 的網域才比對（幾個後綴的字串比較，不配置）
+        if kuroshio_net::comm::is_comm(name) {
+            return false;
+        }
         let now = now_ms();
         let Some(entry) = st.db.get(name) else { return false };
         let s = Self::cross_state(Some(entry), now);

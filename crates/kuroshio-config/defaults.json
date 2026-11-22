@@ -151,6 +151,7 @@
     "allowDownstream": true
   },
   "resolver": {
+    "keepNames": [],
     "timeoutMs": 1500,
     "collectWindowMs": 600,
     "fastPath": true,
@@ -188,6 +189,7 @@
   },
   "filter": {
     "enabled": true,
+    "protectComm": true,
     "customRules": [
       "./custom-rules.txt"
     ],

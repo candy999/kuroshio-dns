@@ -40,6 +40,9 @@ pub struct Entry {
     pub hits: AtomicU32,
 }
 
+/// 記憶體控制縮快取時，通訊類網域加的分數（比任何單調時間都大：一定排在最後才淘汰）
+const COMM_KEEP_BONUS: u64 = 1 << 40;
+
 /// 記憶體控制縮快取時，查詢次數每多一倍加的分數（0.1 秒為單位：5 分鐘）
 const HOT_BONUS_DS: u64 = 3000;
 
@@ -246,7 +249,13 @@ impl Cache {
             let hits = e.hits.load(Ordering::Relaxed);
             u64::from(e.last_access.load(Ordering::Relaxed)) + HOT_BONUS_DS * u64::from(32 - hits.leading_zeros())
         };
-        let mut v: Vec<(u64, &String)> = self.map.iter().map(|(k, e)| (score(e), k)).collect();
+        // 通訊類網域（推播，3.5.0）優先留下：分數加一個比任何時間都大的值（記憶體控制縮快取時才算，不在查詢路徑上）
+        let comm = |k: &str| kuroshio_net::comm::is_comm(k.rsplit('|').next().unwrap_or(k));
+        let mut v: Vec<(u64, &String)> = self
+            .map
+            .iter()
+            .map(|(k, e)| (score(e) + if comm(k) { COMM_KEEP_BONUS } else { 0 }, k))
+            .collect();
         let n = v.len() - target;
         v.select_nth_unstable_by_key(n - 1, |x| x.0);
         let drop: Vec<String> = v[..n].iter().map(|x| x.1.clone()).collect();
@@ -295,6 +304,24 @@ mod tests {
             fast,
             None,
         )
+    }
+
+    /// 3.5.0 B6：記憶體控制縮快取時，通訊類網域（推播）優先留下
+    #[test]
+    fn shed_keeps_comm_entries_first() {
+        let now = Instant::now();
+        let mut c = Cache::new(100);
+        let comm = format!("1|gw.{}", kuroshio_net::comm::COMM_SUFFIXES[0].0);
+        c.insert(comm.clone(), entry(300, false), now);
+        for i in 0..20 {
+            let k = format!("1|n{i}.example.com");
+            let e = c.insert(k, entry(300, false), now);
+            // 其他的都比較熱門、比較晚用到
+            e.hits.store(100, Ordering::Relaxed);
+        }
+        c.shed_to(1);
+        assert_eq!(c.len(), 1);
+        assert!(c.peek(&comm).is_some(), "通訊類網域留下");
     }
 
     #[test]

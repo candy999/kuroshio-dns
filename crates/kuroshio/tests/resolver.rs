@@ -1297,3 +1297,29 @@ async fn diag_step_frees_query_log() {
     step.restore().await.unwrap();
     assert!(!r.querylog.enabled(), "恢復時不自動再開");
 }
+
+fn short_ttl(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (0, vec![a(name, 6, [198, 51, 100, 9])], 0)
+}
+
+/// 3.5.0 B6：通訊類網域（推播）快到期就預取，不要求最近問過或很熱門；一般網域照舊
+#[tokio::test]
+async fn comm_prefetched_without_recent_hit() {
+    let (up, n) = upstream(0, short_ttl).await;
+    let c = cfg(
+        &[up],
+        json!({ "resolver": { "prefetchRecentSec": 1, "fastPath": false, "rankIps": false } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let comm = format!("gw.{}", kuroshio_net::comm::COMM_SUFFIXES[0].0);
+    for (name, want) in [(comm.as_str(), 2usize), ("plain.example.test", 1)] {
+        let before = n.load(Ordering::SeqCst);
+        r.handle(&q(1, name, 1), &CTX).await.unwrap();
+        // 超過「最近問過」的 1 秒，剩下的 TTL（約 4.8 秒）小於預取門檻 5 秒
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        r.handle(&q(2, name, 1), &CTX).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(n.load(Ordering::SeqCst) - before, want, "{name}");
+    }
+    assert_eq!(r.comm_prefetching(), 0, "預取完成後歸零");
+}

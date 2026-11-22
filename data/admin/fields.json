@@ -238,6 +238,7 @@
             { "key": "resolver.serveStaleSec", "type": "int", "label": "過期後仍可先回舊資料（秒）", "min": 0 },
             { "key": "resolver.prefetchThresholdSec", "type": "int", "label": "剩餘 TTL 低於幾秒就預取", "min": 0 },
             { "key": "resolver.prefetchRecentSec", "type": "int", "label": "最近幾秒內有人查才預取", "min": 0 },
+            { "key": "resolver.keepNames", "type": "list", "label": "通訊類網域（自己加）", "help": "推播、通訊服務的網域後綴（一行一個，最多 64 個），跟內建的 Apple 推播、Firebase 雲端訊息一樣：不被過濾清單誤擋、快到期就預取、記憶體吃緊時優先留在快取、不換到別家 CDN。" },
             { "key": "resolver.cacheMax", "type": "int", "label": "快取筆數上限", "min": 0 },
             { "key": "resolver.sendEcs", "type": "bool", "label": "對上游附帶 ECS（本機對外 IP 的 /24）" },
             { "key": "resolver.stripEch", "type": "bool", "label": "移除 HTTPS 記錄的 ECH", "help": "某些網路環境下 ECH 會讓網站連不上時再打開。" },
@@ -273,6 +274,7 @@
           "title": "過濾",
           "fields": [
             { "key": "filter.enabled", "type": "bool", "label": "啟用過濾" },
+            { "key": "filter.protectComm", "type": "bool", "label": "通訊類網域不被清單誤擋", "help": "推播（Apple 推播、Firebase 雲端訊息與自己加的通訊類網域）就算被訂閱清單擋到也放行，漏接通知比多一個連線嚴重。自訂規則照樣優先：自己明確要擋的照擋。" },
             { "key": "filter.updateIntervalHours", "type": "int", "label": "清單更新間隔（小時）", "pro": true, "min": 1 },
             { "key": "filter.relaxedModifiers", "type": "bool", "label": "寬鬆套用瀏覽器規則", "help": "EasyList 這類瀏覽器清單有很多帶 $third-party、$script 修飾詞的規則。關閉（預設，同 AdGuard Home）= 略過這些規則；打開 = 整個網域封鎖，擋得更多但可能誤殺。", "pro": true },
             { "key": "filter.customRules", "type": "list", "label": "自訂規則檔", "help": "一行一個檔案（相對路徑以設定資料夾為準）。用記事本編輯即可，例：||ads.example.com^ 封鎖、@@||good.example.com^ 白名單、! 或 # 開頭是註解。存檔後 3 秒內生效，不用重啟。", "pro": true }

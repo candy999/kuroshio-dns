@@ -67,6 +67,8 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
             private_ptr: lf.get("privatePtr").and_then(Value::as_bool).unwrap_or(true),
         })
     });
+    // 通訊類網域（3.5.0）：使用者自己加的後綴（最多 64 個）
+    kuroshio_net::comm::set_user(&strings(get(cfg, "resolver.keepNames")));
     let r = Resolver::new(Params::from_cfg(cfg), ups, cache_max, iprank, local);
     adopt_cache(cfg, &r);
     // 查詢紀錄（3.5.0）：筆數上限依設定與實體記憶體；`log.queryLog` 是常開，否則預設關閉、從管理介面暫時開啟

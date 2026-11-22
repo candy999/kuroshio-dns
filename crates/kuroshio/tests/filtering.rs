@@ -914,3 +914,44 @@ async fn missing_fetch_failure_backs_off() {
     assert!(f.check("aa1.example", 1).unwrap().block, "A 的副本照用");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 3.5.0 B6：通訊類網域（推播）不被清單誤擋，自訂規則照樣優先；`filter.protectComm` 關掉就照清單擋
+#[tokio::test]
+async fn comm_not_blocked_by_list_but_blocked_by_custom_rule() {
+    use kuroshio::resolver::FilterCheck;
+    // 用內建表的第一組（不在測試裡寫真的網域）
+    let suffix = kuroshio_net::comm::COMM_SUFFIXES[0].0;
+    let comm = format!("gateway.{suffix}");
+    let custom_comm = format!("blocked.{suffix}");
+    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let srv = lists_by_path(vec![("ads.txt", format!("||{suffix}^\n||ads.example.net^\n"))], down).await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-filter-comm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("custom.txt"), format!("||{custom_comm}^\n")).unwrap();
+    let make = |protect: bool| {
+        kuroshio_config::with_overrides(&json!({
+            "filter": {
+                "protectComm": protect,
+                "customRules": ["./custom.txt"],
+                "lists": [{ "name": "廣告", "url": format!("http://{srv}/ads.txt"), "category": "ads" }]
+            }
+        }))
+    };
+    let f = kuroshio::filtering::FilterService::from_cfg(&make(true), &dir).unwrap();
+    f.reload_custom(true);
+    f.update_lists(true).await.unwrap();
+    let v = f.check(&comm, 1).unwrap();
+    assert!(
+        !v.block && v.allow && v.rule == "builtin-comm",
+        "清單要擋的通訊類網域照樣放行：{v:?}"
+    );
+    assert!(f.check("ads.example.net", 1).unwrap().block, "其他網域照擋");
+    assert!(f.check(&custom_comm, 1).unwrap().block, "自訂規則照樣優先");
+    assert_eq!(f.stats()["commSpared"], 1);
+    // 關掉保護：照清單擋
+    let f = kuroshio::filtering::FilterService::from_cfg(&make(false), &dir).unwrap();
+    f.update_lists(true).await.unwrap();
+    assert!(f.check(&comm, 1).unwrap().block, "protectComm 關掉：照清單擋");
+    let _ = std::fs::remove_dir_all(&dir);
+}

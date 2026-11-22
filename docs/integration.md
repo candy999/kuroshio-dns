@@ -712,4 +712,5 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   | `not-cdn`／`unknown` | 不是認得的 CDN／還沒人查過 |
 
   OpenWrt 的 rpcd 開放 `/api/cdn/explain`（唯讀）。
+- **通訊類網域**（3.5.0）：推播服務的網域（內建 Apple 推播、Firebase 雲端訊息；`resolver.keepNames` 自己加，最多 64 個後綴）不被訂閱清單誤擋（`filter.protectComm`，預設開；自訂規則照樣優先，`/api/filter/check` 的 `rule` 是 `builtin-comm`）、快到期就預取（同時最多 16 個）、記憶體控制縮快取時優先留下、不換到別家 CDN。`/api/status` 的 `comm` 有內建與自己加的數量、預取中的數量；`filter.commSpared` 是清單本來要擋、照樣放行的次數（每天第一次會記一行 INFO，寫明是哪份清單，方便回報給清單維護者）。
 

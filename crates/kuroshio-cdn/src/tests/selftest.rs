@@ -955,3 +955,39 @@ fn fastly_pop_view_cache_follows_changes() {
         assert_eq!(crate::pools::pop3_is(a, b), crate::pools::pop3(a) == b, "{a} {b}");
     }
 }
+
+/// 3.5.0 B6：通訊類網域（推播）不換到別家 CDN：已經有跨 CDN 結果也不用、不排跨 CDN 探索
+#[test]
+fn comm_never_cross_explored() {
+    let (opt, _) = setup(json!({}));
+    // 用內建表的第一組（不在測試裡寫真的網域）
+    let host = format!("gw.{}", kuroshio_net::comm::COMM_SUFFIXES[0].0);
+    let host = host.as_str();
+    opt.with_state(|st| {
+        st.db.touch(host, "fastly", "ip", &ips(&["151.101.1.140"]), &[], None);
+        st.db.set_cross(
+            host,
+            Cross {
+                verdict: Some(intern("ok")),
+                from: Some(intern("fastly")),
+                to: Some(intern("cloudflare")),
+                ips: Some(ips(&["104.16.161.36"])),
+                ms: Num::V(4.0),
+                orig_ms: Num::V(62.0),
+                until: Some(now_ms() + 86_400_000),
+                recheck_at: Some(now_ms() - 1),
+                ..Default::default()
+            },
+        );
+    });
+    opt.take_tasks();
+    let mut m = msg(host, 1, &["151.101.1.140"], vec![]);
+    let r = opt.apply(&mut m, host, 1);
+    assert_eq!(answer_ips(&m, 1), ["151.101.1.140"], "不換到別家 CDN");
+    assert_ne!(r.rewritten, Some(Rewrite::Cross));
+    assert_eq!(
+        opt.take_tasks().into_iter().filter(|t| matches!(t, Task::Cross { .. })).count(),
+        0,
+        "不排跨 CDN 探索"
+    );
+}

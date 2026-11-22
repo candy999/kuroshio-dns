@@ -196,6 +196,8 @@ pub struct Resolver {
     pub ecs_subnet: RwLock<Option<(IpAddr, u8)>>,
     /// 查詢紀錄（3.5.0）：只在記憶體、預設關閉、有上限；只給管理 API
     pub querylog: crate::querylog::QueryLog,
+    /// 通訊類網域預取中的數量（3.5.0）
+    comm_prefetching: AtomicU32,
     inflight: Mutex<HashMap<String, Waiters>>,
     /// 最近一次「所有上游都失敗」的時間（0.1 秒，相對 `base`）；0 = 沒發生過
     last_outage: AtomicU32,
@@ -275,6 +277,7 @@ impl Resolver {
             chain: std::sync::OnceLock::new(),
             ecs_subnet: RwLock::new(None),
             querylog: Default::default(),
+            comm_prefetching: AtomicU32::new(0),
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
             picks: AtomicU32::new(0),
@@ -550,6 +553,9 @@ impl Resolver {
                 let threshold = p.prefetch_threshold.max(e.ttl as f64 * 0.1);
                 if stale || (remain <= threshold && (recent || popular)) {
                     self.refresh(key.clone(), query.clone());
+                } else if remain <= threshold && kuroshio_net::comm::is_comm(&qname) {
+                    // 通訊類網域（推播，3.5.0）：快到期就預取，不要求最近問過或很熱門（同時最多 COMM_PREFETCH_MAX 個）
+                    self.refresh_comm(key.clone(), query.clone());
                 }
                 if stale {
                     self.stats.count(StatKind::Stale);
@@ -674,6 +680,25 @@ impl Resolver {
     /// 串接之前存下的、或重新啟動時讀回來的快取也一樣，到期後由上游重新回答）
     pub fn chain_active(&self) -> bool {
         self.upstreams.chain().is_some_and(|c| c.role == Role::Chain) && !self.upstreams.chain_suspended()
+    }
+
+    /// 通訊類網域的預取：同時最多 [`COMM_PREFETCH_MAX`] 個
+    fn refresh_comm(self: &Arc<Self>, key: String, query: Message) {
+        if self.comm_prefetching.load(Ordering::Relaxed) >= COMM_PREFETCH_MAX || self.inflight.lock().unwrap().contains_key(&key) {
+            return;
+        }
+        self.comm_prefetching.fetch_add(1, Ordering::Relaxed);
+        self.stats.count(StatKind::Prefetch);
+        let me = self.clone();
+        tokio::spawn(async move {
+            me.fetch(key, query).await;
+            me.comm_prefetching.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    /// 通訊類網域預取中的數量（狀態頁）
+    pub fn comm_prefetching(&self) -> u32 {
+        self.comm_prefetching.load(Ordering::Relaxed)
     }
 
     fn refresh(self: &Arc<Self>, key: String, query: Message) {
@@ -1406,6 +1431,9 @@ fn answered_ok(up: &Up, class: Class) -> bool {
         _ => true,
     }
 }
+
+/// 通訊類網域（推播）同時最多預取幾個（3.5.0）
+pub const COMM_PREFETCH_MAX: u32 = 16;
 
 /// 效能計數器（3.5.0，規格 11 C12）：每次詢問（ask）實際送出幾個上游查詢、背景補問送出幾個。
 /// 只在 ask() 結束時加一次（`AtomicU32`，沒有鎖）；32 位元機器沒有 64 位元原子操作，溢位就從 0 重來
