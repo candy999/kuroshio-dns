@@ -95,7 +95,10 @@ impl ChainSettings {
 
     /// 這個指紋符不符合 `chainPin`（沒設定時一律符合）
     pub fn pin_ok(&self, fingerprint: &str) -> bool {
-        self.pin.as_deref().is_none_or(|p| normalize_fp(fingerprint) == p)
+        match self.pin.as_deref() {
+            Some(p) => normalize_fp(fingerprint) == p,
+            None => true,
+        }
     }
 
     /// 下游角色實際上有沒有啟用：chain && path_check
@@ -106,7 +109,10 @@ impl ChainSettings {
 
 /// 指紋的比對形式：只留英數字、轉小寫
 pub fn normalize_fp(s: &str) -> String {
-    s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// 背景補問（規格 5.2，`resolver.backfill`）

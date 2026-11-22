@@ -1757,7 +1757,10 @@ mod tests {
         );
         let st = g.status_json();
         assert_eq!(st["state"], "critical");
-        assert!(["normal", "low", "critical"].contains(&st["pressure"].as_str().unwrap()), "當下的量測另外列（3.4.3）");
+        assert!(
+            ["normal", "low", "critical"].contains(&st["pressure"].as_str().unwrap()),
+            "當下的量測另外列（3.4.3）"
+        );
         assert_eq!(st["reserveKB"], 100 * 1024);
         assert_eq!(st["pollSec"], 2);
         // 再來一輪：沒有可以做的了（停在最低限度，不會更低）

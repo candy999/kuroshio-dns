@@ -1319,9 +1319,11 @@ fn timeout_for(p: &Params, up: &Up) -> Duration {
 
 /// 查詢帶著黑潮的「不要換 CDN 節點」選項（下游黑潮自己關掉了 CDN 置換；3.4.3）
 fn wants_no_cdn(q: &Message) -> bool {
-    q.opt
-        .as_ref()
-        .is_some_and(|o| o.options.iter().any(|(c, _)| *c == kuroshio_proto::message::opt_code::KUROSHIO_NO_CDN))
+    q.opt.as_ref().is_some_and(|o| {
+        o.options
+            .iter()
+            .any(|(c, _)| *c == kuroshio_proto::message::opt_code::KUROSHIO_NO_CDN)
+    })
 }
 
 /// 在查詢加上「不要換 CDN 節點」選項（沒有 OPT 就加一個）；解析不了 → None（照原樣送）

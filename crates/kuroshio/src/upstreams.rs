@@ -339,6 +339,11 @@ impl Manager {
         m
     }
 
+    /// 這台有沒有用自動上游（`autoTypes` 有設、`autoMax` 不是 0）。沒有用時評測結果只是記下來，不必檢查夠不夠用
+    pub fn uses_auto(&self) -> bool {
+        !self.auto_types.is_empty() && self.auto_max > 0
+    }
+
     /// 一份評測結果（`upstreams.json` 的內容）照這台自己的設定（`autoTypes`、`autoMax`、固定上游、這個版本支援的類型）
     /// 能用幾台。串接拿到上游的評測結果時先看這個，不夠就不匯入（3.4.3）
     pub fn usable_auto(&self, st: &Value) -> usize {

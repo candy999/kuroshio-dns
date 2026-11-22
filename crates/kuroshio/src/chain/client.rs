@@ -614,7 +614,11 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             // 同一把金鑰一再不通過：重試間隔 6、12、24 小時（最多 24 小時；以前固定 10～15 分鐘就重試，
             // 說謊的上游會讓下游無限次「串接、解除」）。換了金鑰重新算（3.4.3）
             let key = i.bound.as_ref().map(|b| b.public);
-            i.audit_strikes = if key.is_some() && key == i.audit_key { i.audit_strikes + 1 } else { 1 };
+            i.audit_strikes = if key.is_some() && key == i.audit_key {
+                i.audit_strikes + 1
+            } else {
+                1
+            };
             i.audit_key = key;
             let retry = AUDIT_RETRY.saturating_mul(1 << (i.audit_strikes - 1).min(2)).min(AUDIT_RETRY_MAX);
             release(i, Reason::AuditFailed, Some(retry.mul_f64(1.0 + 0.1 * now.rnd)), now)

@@ -459,7 +459,11 @@ async fn manifest_signed_and_objects_verify() {
     assert!(d.client.last_probe().unwrap().caps.contains(&"share".to_string()));
     let rep = s.sync_once().await;
     assert_eq!(rep.error, None, "{rep:?}");
-    assert_eq!(sink.calls(), vec!["upstreams", "cdn-pools", "cdn-ranges"], "照規格的順序（3.4.3 起節點池在官方範圍之前）");
+    assert_eq!(
+        sink.calls(),
+        vec!["upstreams", "cdn-pools", "cdn-ranges"],
+        "照規格的順序（3.4.3 起節點池在官方範圍之前）"
+    );
     // 節點池原封不動
     assert_eq!(sink.pools.lock().unwrap().as_deref(), Some(&pools_json()[..]));
     assert_eq!(
@@ -764,7 +768,11 @@ async fn jobs_skipped_only_when_fresh_and_chained() {
     let (up2, addr2) = upstream(true, src_basic(), true).await;
     let d2 = down(true, addr2).await;
     let kid = kid_hex(&d2.client);
-    let old = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved_kid(now_ms() - 37 * 3600 * 1000, &kid)));
+    let old = Syncer::new(
+        d2.client.clone(),
+        FakeSink::new(),
+        Some(&saved_kid(now_ms() - 37 * 3600 * 1000, &kid)),
+    );
     assert!(JOBS.iter().all(|j| !old.skip_job(j)));
     let recent = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved_kid(now_ms() - 3600 * 1000, &kid)));
     assert!(JOBS.iter().all(|j| recent.skip_job(j)));
@@ -822,7 +830,11 @@ async fn own_jobs_still_run_every_7_days() {
     let day = 24 * 3600 * 1000;
     assert!(due > now_ms() + day - 120_000 && due < now_ms() + day + 120_000, "{due}");
     // 時間在未來（時鐘倒退）不算跑過
-    let future = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved_own(fresh, now_ms() + 3600 * 1000, &kid)));
+    let future = Syncer::new(
+        d.client.clone(),
+        FakeSink::new(),
+        Some(&saved_own(fresh, now_ms() + 3600 * 1000, &kid)),
+    );
     assert!(JOBS.iter().all(|j| !future.skip_job(j)));
 }
 

@@ -136,8 +136,15 @@ fn import_shared_merges_and_keeps_bad_marks() {
     });
     c.import_shared(Some(&pools_json(&["104.16.1.1", "104.16.2.2"], &[])), None, 48)
         .unwrap();
-    assert_eq!(pool4(&c, "cloudflare"), vec!["104.16.2.2", "104.16.9.9"], "上游的在前、自己的留著、壞的不放進來");
-    assert!(c.state().pools.p["cloudflare"].bad.contains_key(&ip("104.16.1.1")), "壞節點紀錄還在");
+    assert_eq!(
+        pool4(&c, "cloudflare"),
+        vec!["104.16.2.2", "104.16.9.9"],
+        "上游的在前、自己的留著、壞的不放進來"
+    );
+    assert!(
+        c.state().pools.p["cloudflare"].bad.contains_key(&ip("104.16.1.1")),
+        "壞節點紀錄還在"
+    );
 }
 
 /// 3.4.3：上游給的官方範圍跟這台現有的重疊多少（串接匯入範圍前檢查）

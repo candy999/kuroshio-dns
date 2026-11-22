@@ -796,9 +796,7 @@ impl Syncer {
             .kinds
             .get(key)
             // 時間在未來（時鐘倒退）不算
-            .is_some_and(|i| {
-                i.kid == cur && i.imported_at <= now.saturating_add(60_000) && now.saturating_sub(i.imported_at) < FRESH_MS
-            })
+            .is_some_and(|i| i.kid == cur && i.imported_at <= now.saturating_add(60_000) && now.saturating_sub(i.imported_at) < FRESH_MS)
     }
 
     /// 這個工作要不要略過（規格 3.5 的對照）
@@ -839,7 +837,11 @@ impl Syncer {
         };
         // 上游宣稱的時間比現在晚（超過 10 分鐘的時鐘誤差）：不採信，當成最舊的。不然宣稱一個未來的時間，
         // 這台自己的評測結果就永遠被蓋掉（3.4.3）
-        let data_at = if data_at > now_ms().saturating_add(10 * 60_000) { 0 } else { data_at };
+        let data_at = if data_at > now_ms().saturating_add(10 * 60_000) {
+            0
+        } else {
+            data_at
+        };
         self.state.lock().unwrap().own.get(job).is_some_and(|&t| t > data_at)
     }
 
@@ -1062,7 +1064,14 @@ impl Syncer {
         let key = kind_key(&o.k, &o.name);
         let sha_hex = hex(&sha);
         // 雜湊沒變、也是同一台上游給的：不重抓
-        if self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex && i.kid == hex(upstream_kid)) {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .kinds
+            .get(&key)
+            .is_some_and(|i| i.sha == sha_hex && i.kid == hex(upstream_kid))
+        {
             return Ok(Fetch::Done);
         }
         // 這台自己的評測結果比上游這份新：不蓋掉自己的（直系血親，規格 10 第 3.8 節）。記成看過這份，
@@ -1326,11 +1335,11 @@ impl ShareSource for Live {
 impl ShareSink for Live {
     fn import_upstreams(&self, json: Vec<u8>) -> Result<()> {
         // 照這台自己的設定篩完不夠用：不匯入、不算新鮮，自己的評測照排程跑（3.4.3；以前照樣算匯入成功，
-        // 最多 7 天不自己評測，手上卻沒有可用的自動上游）
+        // 最多 7 天不自己評測，手上卻沒有可用的自動上游）。這台沒開自動上游時不檢查（自己評測也用不到）
         let v: Value = serde_json::from_slice(&json)?;
         let n = self.mgr.usable_auto(&v);
         let need = self.min_auto.clamp(1, 2);
-        if n < need {
+        if self.mgr.uses_auto() && n < need {
             bail!("照這台的設定（類型、台數）只有 {n} 台能用（至少要 {need} 台），不匯入（not-usable）");
         }
         crate::persist::write_atomic(self.mgr.state_file(), &json)?;
