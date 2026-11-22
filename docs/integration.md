@@ -181,7 +181,7 @@ kuroshio notify simulate-memory --avail-mb MB [--minutes 分鐘] | --off [-c 設
 
 `runId` 是開始時間（毫秒），同一次執行的程式裡只會變大；服務重新啟動後 `filter.update` 從 `idle`、`runId: null` 開始。
 
-其他會等一下的動作：`POST /api/jobs/run`（排進佇列就回）、`POST /api/acme/issue`（背景申請）、`kuroshio notify wan-changed` 立刻回來；`POST /api/ddns/update`（每個請求逾時 8 秒，記錄很多時會久一點）、`POST /api/cdn/verify`、`POST /api/cdn/ecs`（一個網域的幾次連線）會等到完成才回。進度都可以從 `/api/status`、`/api/ddns`、`/api/jobs` 查。
+其他會等一下的動作：`POST /api/jobs/run`（排進佇列就回；3.5.0 起排在佇列最前面，見[手動執行的工作優先](#手動執行的工作優先)）、`POST /api/acme/issue`（背景申請）、`kuroshio notify wan-changed` 立刻回來；`POST /api/ddns/update`（每個請求逾時 8 秒，記錄很多時會久一點）、`POST /api/cdn/verify`、`POST /api/cdn/ecs`（一個網域的幾次連線）會等到完成才回。進度都可以從 `/api/status`、`/api/ddns`、`/api/jobs` 查。
 
 ### 其他常用指令
 
@@ -437,7 +437,7 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 
 - 「新鮮」＝ 36 小時內成功匯入過，而且現在是串接中。略過時日誌寫「由上游黑潮提供，略過」（`dns-benchmark` 在 `/api/jobs` 的 `detail.dns-benchmark.last.skipped` 也有）。
 - 不新鮮（上游沒資料、驗證失敗、36 小時沒同步成功、串接解除、`chain` 關著）時，工作照原本的排程自己跑，跟 3.3.7 一樣。匯入的資料不刪，解除後繼續用，直到自己的工作算出新的。
-- 狀態記在快照目錄的 `chain-share.json`（幾百 bytes）。`/api/status` 的 `autoUpstreams.source` 是 `"chain"`（上游給的）或 `"benchmark"`（自己評測的）。
+- 狀態記在快照目錄的 `chain-share.json`（幾百 bytes）。`/api/status` 的 `autoUpstreams.source` 是 `"chain"`（上游給的）或 `"benchmark"`（自己評測的）；3.5.0 起還沒評測、來自預設名單的是 `"default-list"`。
 
 ### 上游放行下游
 
@@ -586,6 +586,44 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 - `upstreams.json` 的 `selected[]` 每筆多 `region` 與 `near`；`final_dns_smart.csv` 最後多 `Region`、`Near` 兩欄（舊的欄位順序不變）。
 - `/api/status` 的 `upstreams[]` 多 `region`（沒有是 `null`）。狀態頁顯示在選上原因的旁邊，例如「自動（覆蓋 · JP）」。
+
+## 每日評測與預設名單（3.5.0 起）
+
+### 名單標記
+
+評測名單每一筆可以帶「整理名單時的資料」：`dohlist.txt`、`dotlist.txt`、`doqlist.txt`、`protected.txt` 寫在同一行的 `#` 後面（`tier=A op=Example_Net ms=3.1 ecs=1 carrier=1 filter=ads`，不認識的 key 忽略）；`iplist.txt` 同一行不能加註解，寫在位址的上一行（`# A Example_Net（AS64500）TW 3.9 ms ECS`）。分段行 `# ---- A 級 ----`／`# ---- B 級 ----` 是那一段沒寫分級的預設。
+
+- 使用者自己的名單（`benchmark.dir` 跟程式附帶的名單不同時）裡沒寫標記的是 `user`；同一個上游兩邊都有、使用者沒寫標記時用預設名單的標記。社群好友給的候選一律是 `B`，`h3://` 沿用它的 `https://` 那一筆。
+- 標記只是起點與排序依據，**不跳過任何檢查**（資格賽、汙染、封殺、憑證）；`ms` 是整理名單那天、那條線路量的，不當成今天的延遲。3.5.0 第 1 批只把標記帶到輸出，不影響選擇。
+- 舊格式（沒有標記）照常可用。
+
+輸出（只新增欄位，舊版不認得就不顯示）：
+
+- `upstreams.json`（`/api/benchmark`）的 `selected[]` 每筆多 `tier`（`"A"`／`"B"`／`"user"`；沒標記的算 `"B"`）與 `op`（經營者，最長 64 bytes；沒有是空字串），`counts` 多 `byTier`（候選依分級的台數，固定上游與對照組不算）。
+- `final_dns_smart.csv` 最後多 `Tier` 一欄。
+
+### 首次啟動的初始上游
+
+全新的 state 第一次啟動時，`state/upstreams.json` 由預設名單的 A 級產生（不再用種子裡的評測結果）：
+
+- `generatedAt` 是 `null`、`source` 是 `"default-list"`；`selected[]` 的 `reason` 是 `"預設名單"`、`tier` 是 `"A"`、另外有 `listMs`（名單裡的延遲，只是排序依據）；`spares[]` 是候補（格式同 `selected[]`，最多 3 台）。
+- `/api/status` 的 `autoUpstreams` 是 `{ "generatedAt": null, "count": 5, "source": "default-list" }`（以前沒有評測結果時是 `null`）。狀態頁顯示「自動上游來自預設名單（還沒評測）」。
+- 第一次評測完成就被評測結果取代；串接時不分享給下游。
+
+### 一直沒成功的自動上游與候補
+
+- 自動上游上線以來一次都沒成功、第 3 次暫停時（合計失敗 15 筆，而且 10 分鐘內有別的上游成功過，不是整台斷網）先不用：每 6 小時只放 1 筆試探，成功就恢復。成功過的照舊 1 → 2 → 4 分鐘。固定上游、串接上游不受影響。
+- `/api/upstreams`（與 `/api/status` 的 `upstreams[]`）每台多 `benched`（`true` = 先不用；這段時間 `paused` 也是 `true`）；候補多 `spare: true`，排在自動上游後面。`/api/status` 的 `autoUpstreams` 多 `spares`（候補台數）。
+- `upstreams.json` 多 `spares[]`（評測沒選上、但合格的前 3 台，依速度；格式同 `selected[]`，`reason` 是 `"候補"`）。可用的自動上游（沒暫停、沒先不用、路徑沒擋）少於 `min(upstream.autoMax, benchmark.minAuto)` 時依序補上。舊的 `upstreams.json` 沒有 `spares` 就是沒有候補（跟 3.4.4 一樣）；舊版下游忽略這個欄位。
+- 先不用的上游登記到評測學習檔（`state/benchmark-learn.json.zst` 的 `neverOk`，最多 32 筆）：下一次評測照測、但不選、也不當候補（`judge.log`：「執行時上線以來從未成功，今天照測、不選」），連續 3 次評測之後忘掉重來。學習檔讀不到、格式不對當成空的；不進備份的分享檔、不傳給下游與好友。
+- 可用的連候補都不夠時提早評測（原因「自動上游不足」，12 小時內跑過就不排）；串接中由上游提供評測結果時不排。
+
+### 手動執行的工作優先
+
+- `POST /api/jobs/run?name=…`（設定頁、LuCI 的「立即執行」）排到佇列**最前面**；已經在佇列裡的移到最前面（不會重複）。排程與補跑照舊排在後面。仍然一次只跑一個：正在跑的不中斷，回 `{"ok": false, "error": "執行中"}`。
+- `/api/jobs` 的 `queue[]` 每筆多 `priority`（`true` = 手動、排在最前面的）。
+- 正在跑 `cdn-scan`（網段分類，一跑十幾分鐘）時，有手動的工作在等，它在「一家 CDN 掃完」的時候讓出：掃完的那幾家照寫，5 分鐘後續跑（原因「續跑（讓給手動執行的工作）」），續跑時跳過 6 小時內已經掃完的那幾家；一家掃到一半不讓出，最多讓出 3 次，之後跑到完。手動的工作最多等一家 CDN 的時間。
+- 補跑的先後：自動上游還沒評測過（`upstreams.json` 沒有 `generatedAt`，例如剛安裝、來自預設名單）時，`dns-benchmark` 的補跑排在 `cdn-scan` 前面（`cdn-scan` 的補跑延到評測之後 1 秒排入；`startDelaySec` 的預設值不變）。
 
 ## 重新載入不斷線（3.4.0 起）
 

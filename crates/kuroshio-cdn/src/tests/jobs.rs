@@ -381,3 +381,91 @@ async fn pool_job_ceiling_ignores_failed_probes() {
     let quick = net.calls("speed").iter().filter(|c| c.ends_with(" 1048576")).count();
     assert_eq!((full, quick), (6, 2), "{:?}", net.calls("speed"));
 }
+
+/// 3.5.0 A9：有手動的工作在等時，一家 CDN 掃完就讓出；續跑跳過已經掃完的那幾家，不重複掃同一批網段
+#[tokio::test]
+async fn scan_yields_between_providers_and_resumes_skipping_done() {
+    let (ctx, net, paths) = ctx_for(
+        json!({ "cloudflare": {"enabled": true}, "cloudfront": {"enabled": true}, "fastly": {"enabled": true} }),
+        json!({ "scan": { "samplesPerSubnet": 1, "concurrency": 2 } }),
+    );
+    write(&paths, "ranges/cloudflare-ipv4.txt", "104.16.0.0/23\n");
+    write(&paths, "ranges/cloudfront-ipv4.txt", "13.32.0.0/23\n");
+    write(&paths, "ranges/fastly-ipv4.txt", "151.101.0.0/23\n");
+    net.on_http(|_, _| {
+        resp(
+            200,
+            &[("x-amz-cf-pop", "TPE52-P1"), ("x-served-by", "cache-tpe8000-TPE")],
+            "colo=TPE\n",
+        )
+    });
+    let waiting = Arc::new(AtomicUsize::new(1));
+    let w = waiting.clone();
+    let ctx = ctx.with_yield_check(Arc::new(move || w.load(Ordering::SeqCst) > 0));
+    let mut resume = scan::Resume::default();
+    let t0 = std::time::Instant::now();
+    // 第一次：掃完 cloudflare 就讓出（一家掃到一半不讓出；至少掃完一家才讓）
+    let r = scan::run(&ctx).await.unwrap();
+    assert!(r.yielded);
+    assert_eq!(r.done, ["cloudflare"]);
+    assert_eq!(
+        read(&paths, "scan/cloudflare-ipv4-TW.txt"),
+        "104.16.0.0/24\n104.16.1.0/24\n",
+        "掃完的照寫"
+    );
+    assert!(!paths.state_dir.join("cdn/scan/cloudfront-ipv4-TW.txt").exists());
+    assert_eq!(net.calls("http").len(), 2);
+    resume.finish(&r, t0);
+    // 續跑：跳過 cloudflare，掃完 cloudfront 又讓出
+    let (skip, may_yield) = resume.prepare(t0 + Duration::from_secs(300));
+    assert_eq!((skip.clone(), may_yield), (vec!["cloudflare".to_string()], true));
+    let mut c2 = ctx;
+    c2.scan_skip = skip;
+    let r = scan::run(&c2).await.unwrap();
+    assert!(r.yielded);
+    assert_eq!(r.done, ["cloudfront"]);
+    assert_eq!(net.calls("http").len(), 4, "cloudflare 沒有重掃");
+    resume.finish(&r, t0 + Duration::from_secs(300));
+    // 沒有優先的工作在等：跑到完，狀態歸零
+    waiting.store(0, Ordering::SeqCst);
+    let (skip, _) = resume.prepare(t0 + Duration::from_secs(600));
+    assert_eq!(skip, ["cloudflare", "cloudfront"]);
+    c2.scan_skip = skip;
+    let r = scan::run(&c2).await.unwrap();
+    assert!(!r.yielded);
+    assert_eq!(r.done, ["fastly"]);
+    assert_eq!(net.calls("http").len(), 6, "每個 /24 只掃一次");
+    resume.finish(&r, t0 + Duration::from_secs(600));
+    assert_eq!(resume.prepare(t0 + Duration::from_secs(900)), (vec![], true));
+    // 掃完的超過 6 小時：續跑時不再跳過（那份結果已經舊了）
+    let mut old = scan::Resume::default();
+    old.finish(
+        &scan::Report {
+            yielded: true,
+            done: vec!["cloudflare".into()],
+            ..Default::default()
+        },
+        t0,
+    );
+    assert!(old.prepare(t0 + scan::RESUME_SKIP + Duration::from_secs(1)).0.is_empty());
+}
+
+#[test]
+fn scan_yield_capped_at_three() {
+    let t0 = std::time::Instant::now();
+    let mut r = scan::Resume::default();
+    let yielded = scan::Report {
+        yielded: true,
+        done: vec!["cloudflare".into()],
+        ..Default::default()
+    };
+    for i in 0..scan::MAX_YIELDS {
+        assert!(r.prepare(t0).1, "第 {} 次可以讓出", i + 1);
+        r.finish(&yielded, t0);
+    }
+    assert_eq!(r.yields(), 3);
+    assert!(!r.prepare(t0).1, "讓出 3 次之後跑到完");
+    // 跑到完：歸零，下一輪又可以讓出
+    r.finish(&scan::Report::default(), t0);
+    assert_eq!(r.prepare(t0), (vec![], true));
+}

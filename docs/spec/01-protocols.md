@@ -77,6 +77,8 @@
   | `web.txt`、`blacklist.txt` | 檢查用網站、永久黑名單 | ✅ |
   | `protected.txt` | 對照組：有過濾的大型 DNS（任何類型），後面 `filter=` 是預期會擋的類型；照常測、照常判，永遠不選、不算覆蓋、不參加多數決、不記可疑、不看也不進永久黑名單；最多 64 台；結果在 `upstreams.json` 的 `protected`（`detected` 判出過濾、`passed` 沒判出、`untested` 沒測到）與報表的 `protected.csv` | 🆕 3.4.2 |
 
+  名單標記（3.5.0）：行內 `# tier=A op=… ms=… ecs=1`（`iplist.txt` 寫在位址的上一行：`# A <經營者>（AS…）… 3.9 ms ECS`），分段行 `# ---- A 級 ----` 是那一段的預設分級。解析在 `kuroshio-jobs/src/benchmark/tags.rs`，候選帶著標記走完評測（只輸出，不跳過任何檢查）；欄位見 [整合文件](../integration.md#每日評測與預設名單350-起)。
+
 ## 2. 自動發現
 
 | 標準 | RFC | 狀態 | 行為 |

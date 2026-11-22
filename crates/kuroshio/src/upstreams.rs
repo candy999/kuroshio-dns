@@ -4,10 +4,15 @@
 //! 3.4.0 串接模式（規格 10 的 1.6）：串接上游（`Role::Chain`）由串接模組用 [`Manager::set_chain`] 設定，
 //! 不寫進設定檔。串接中只問串接上游＋固定上游；串接上游連續失敗 3 次暫停 30 秒，期間跟沒串接一樣。
 //! 沒有串接上游時，所有行為跟 3.3.7 完全一樣。
+//!
+//! 3.5.0（規格 11 的 A7）：自動上游「上線以來從未成功」、第 3 次暫停時（同一段時間別的上游有成功，
+//! 不是整台斷網）先不用（`benched`）：每 6 小時只放 1 筆試探，成功就恢復；登記給下一次評測（`neverOk`）。
+//! 可用的自動上游不夠時，依序補上評測結果裡的候補（`spares`）；連候補都沒有就提早評測（12 小時內最多一次）。
 
 use crate::upstream::{Kind, Upstream};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, warn};
@@ -64,7 +69,97 @@ struct Stats {
     consec_fail: u32,
     trips: u32,
     open_until: Option<Instant>,
+    /// 上線以來從未成功、先不用（3.5.0）：`open_until` 到了只放 1 筆試探
+    benched: bool,
 }
+
+/// 從未成功的自動上游第幾次暫停時先不用（前兩次是 1、2 分鐘，合計已經失敗 15 筆）
+pub const BENCH_TRIPS: u32 = 3;
+/// 先不用的上游多久放 1 筆試探
+pub const BENCH_PAUSE: Duration = Duration::from_secs(6 * 3600);
+/// 放出試探之後，這麼久之內不再放第二筆（試探的那筆沒被問到時，這段時間過了再放）
+const PROBE_HOLD: Duration = Duration::from_secs(30);
+/// 「同一段時間別的上游有成功」：這麼久以內有任何上游成功過。整台斷網時所有上游都失敗，不算從未成功
+pub const PEER_OK_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// 一個 Manager 的上游共用：最近一次任何上游（串接上游除外）成功的時間、先不用時的通知
+pub struct Pulse {
+    base: Instant,
+    /// 距 `base` 的秒數 + 1（0 = 還沒有）；32 位元原子（MT7621 沒有 64 位元原子操作）
+    last_ok: AtomicU32,
+    on_benched: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for Pulse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pulse")
+    }
+}
+
+impl Pulse {
+    fn new() -> Arc<Pulse> {
+        Arc::new(Pulse {
+            base: Instant::now(),
+            last_ok: AtomicU32::new(0),
+            on_benched: RwLock::new(None),
+        })
+    }
+
+    fn secs(&self, now: Instant) -> u32 {
+        now.saturating_duration_since(self.base).as_secs().min(u32::MAX as u64 - 1) as u32 + 1
+    }
+
+    /// 有上游成功：一秒內只寫一次（先讀再寫，每筆查詢不必每次都寫同一個快取線）
+    fn mark_ok(&self, now: Instant) {
+        let t = self.secs(now);
+        if self.last_ok.load(Ordering::Relaxed) != t {
+            self.last_ok.store(t, Ordering::Relaxed);
+        }
+    }
+
+    /// `window` 以內有任何上游成功過
+    fn ok_within(&self, now: Instant, window: Duration) -> bool {
+        let t = self.last_ok.load(Ordering::Relaxed);
+        t != 0 && self.secs(now).saturating_sub(t) as u64 <= window.as_secs()
+    }
+}
+
+/// 執行時上線以來從未成功、先不用的自動上游（正規化的 id）：下一次評測開始前寫進學習檔的 `neverOk`
+/// （規格 11 第 0.3 節）。行程層級（重新載入設定不會不見），最多 [`kuroshio_jobs::benchmark::learn::MAX_NEVER_OK`] 筆
+static NEVER_OK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn note_never_ok(id: &str) {
+    let mut v = NEVER_OK.lock().unwrap();
+    if !v.iter().any(|x| x == id) {
+        if v.len() >= kuroshio_jobs::benchmark::learn::MAX_NEVER_OK {
+            v.remove(0);
+        }
+        v.push(id.to_string());
+    }
+}
+
+/// 取走登記的從未成功的上游（評測開始前寫進學習檔）
+pub fn take_never_ok() -> Vec<String> {
+    std::mem::take(&mut *NEVER_OK.lock().unwrap())
+}
+
+/// 寫檔失敗時放回去，下一次再寫
+pub fn restore_never_ok(ids: Vec<String>) {
+    for id in ids {
+        note_never_ok(&id);
+    }
+}
+
+/// `select()` 看一個自動上游：可以用、先不用但這筆放出試探、暫停中（包括先不用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Avail {
+    Ok,
+    Probe,
+    Off,
+}
+
+/// `upstreams.json` 的 `source`：還沒評測、初始上游來自預設名單（3.5.0，見 `kuroshio_jobs::seed::initial_upstreams`）
+pub const DEFAULT_LIST: &str = "default-list";
 
 /// 暫停過的自動上游，暫停結束後要穩定這麼久才把暫停次數歸零（暫停時間重新從 1 分鐘算）
 const TRIP_RESET: Duration = Duration::from_secs(10 * 60);
@@ -80,10 +175,17 @@ pub struct Up {
     region: Mutex<Option<String>>,
     /// 只有串接上游：連續失敗時通知誰
     trouble: Option<Arc<Trouble>>,
+    /// Manager 共用的狀態（3.5.0）：沒有時不會「先不用」（判斷不了是不是整台斷網）
+    pulse: Option<Arc<Pulse>>,
 }
 
 impl Up {
+    #[cfg(test)]
     fn new(up: Upstream, role: Role) -> Arc<Up> {
+        Up::with_pulse(up, role, None)
+    }
+
+    fn with_pulse(up: Upstream, role: Role, pulse: Option<Arc<Pulse>>) -> Arc<Up> {
         Arc::new(Up {
             up,
             role,
@@ -91,6 +193,7 @@ impl Up {
             reason: Mutex::new(None),
             region: Mutex::new(None),
             trouble: None,
+            pulse,
         })
     }
 
@@ -102,7 +205,34 @@ impl Up {
             reason: Mutex::new(None),
             region: Mutex::new(None),
             trouble: Some(trouble),
+            pulse: None,
         })
+    }
+
+    /// `select()` 用（一次上鎖）：暫停中（含先不用）是 Off；先不用、時間到了就放 1 筆試探，
+    /// 之後 [`PROBE_HOLD`] 內不再放（那筆沒被問到的話，時間過了再放）
+    fn avail(&self, now: Instant) -> Avail {
+        let mut s = self.stats.lock().unwrap();
+        let open = s.open_until.is_some_and(|t| t > now);
+        if open {
+            return Avail::Off;
+        }
+        if s.benched {
+            s.open_until = Some(now + PROBE_HOLD);
+            return Avail::Probe;
+        }
+        Avail::Ok
+    }
+
+    /// 現在能不能正常用（不放試探、不改狀態）：沒暫停、沒先不用、路徑沒擋
+    fn usable_now(&self, now: Instant) -> bool {
+        let s = self.stats.lock().unwrap();
+        !s.benched && !s.open_until.is_some_and(|t| t > now) && !self.path_blocked()
+    }
+
+    /// 上線以來從未成功、先不用中（3.5.0）
+    pub fn benched(&self) -> bool {
+        self.stats.lock().unwrap().benched
     }
 
     /// 路徑檢查（3.3.6）判斷現在不能用：協定整條被擋、IPv6 位址但這台沒有 IPv6
@@ -142,40 +272,77 @@ impl Up {
     }
 
     pub fn record(&self, ok: bool, ms: f64) {
+        self.record_at(ok, ms, Instant::now());
+    }
+
+    fn record_at(&self, ok: bool, ms: f64, now: Instant) {
         let mut notify = None;
-        self.record_inner(ok, ms, &mut notify);
+        let mut benched = false;
+        self.record_inner(ok, ms, now, &mut notify, &mut benched);
+        if ok && self.role != Role::Chain {
+            if let Some(p) = &self.pulse {
+                p.mark_ok(now);
+            }
+        }
         // 放掉 stats 的鎖之後才通知（回呼可能會讀這個上游的狀態）
         if let Some(f) = notify {
             f(0);
         }
+        if benched {
+            note_never_ok(&self.up.id);
+            let f = self.pulse.as_ref().and_then(|p| p.on_benched.read().unwrap().clone());
+            if let Some(f) = f {
+                f();
+            }
+        }
     }
 
-    fn record_inner(&self, ok: bool, ms: f64, notify: &mut Option<TroubleFn>) {
+    fn record_inner(&self, ok: bool, ms: f64, now: Instant, notify: &mut Option<TroubleFn>, benched: &mut bool) {
         let mut s = self.stats.lock().unwrap();
         if ok {
             s.ok += 1;
             s.consec_fail = 0;
+            if s.benched {
+                // 試探成功：恢復，照常使用
+                s.benched = false;
+                s.open_until = None;
+                s.trips = 0;
+                info!("{} 試探成功，恢復使用", self.up.id);
+            }
             // 暫停結束後成功一筆就歸零的話，「時好時壞」的上游（3.4.2 Windows 實測：tls://ordns.he.net 每次接回後
             // 先答幾十筆、再連續逾時）永遠是「暫停 1 分鐘」，每 70 秒重來一輪，暫停時間不會拉長。
             // 改成暫停結束後穩定 10 分鐘才歸零
-            if s.open_until.map_or(true, |t| t + TRIP_RESET <= Instant::now()) {
+            if s.open_until.map_or(true, |t| t + TRIP_RESET <= now) {
                 s.trips = 0;
             }
             s.ewma = Some(s.ewma.map(|e| e * 0.8 + ms * 0.2).unwrap_or(ms));
         } else {
             s.fail += 1;
             s.consec_fail += 1;
-            let now = Instant::now();
-            if self.role == Role::Auto && s.consec_fail >= 5 && s.open_until.map(|t| t < now).unwrap_or(true) {
-                s.trips += 1;
-                let min = 30u64.min(1 << (s.trips - 1).min(5));
-                s.open_until = Some(now + Duration::from_secs(min * 60));
+            if self.role == Role::Auto && s.benched {
+                // 試探失敗：再等 6 小時（不必再累積 5 筆）
                 s.consec_fail = 0;
-                warn!(
-                    "{} 連續失敗，暫停 {min} 分鐘{}",
-                    self.up.id,
-                    if s.ok > 0 { "" } else { "（上線以來從未成功）" }
-                );
+                s.open_until = Some(now + BENCH_PAUSE);
+                tracing::debug!("{} 試探失敗，6 小時後再試", self.up.id);
+            } else if self.role == Role::Auto && s.consec_fail >= 5 && s.open_until.map(|t| t < now).unwrap_or(true) {
+                s.trips += 1;
+                s.consec_fail = 0;
+                // 上線以來從未成功、第 3 次暫停，而且同一段時間別的上游有成功（不是整台斷網）：先不用（3.5.0）
+                let peers_ok = self.pulse.as_ref().is_some_and(|p| p.ok_within(now, PEER_OK_WINDOW));
+                if s.ok == 0 && s.trips >= BENCH_TRIPS && peers_ok {
+                    s.benched = true;
+                    s.open_until = Some(now + BENCH_PAUSE);
+                    *benched = true;
+                    warn!("{} 上線以來從未成功，先不用，下一次評測再決定（每 6 小時試一次）", self.up.id);
+                } else {
+                    let min = 30u64.min(1 << (s.trips - 1).min(5));
+                    s.open_until = Some(now + Duration::from_secs(min * 60));
+                    warn!(
+                        "{} 連續失敗，暫停 {min} 分鐘{}",
+                        self.up.id,
+                        if s.ok > 0 { "" } else { "（上線以來從未成功）" }
+                    );
+                }
             }
             if self.role == Role::Chain && s.consec_fail >= CHAIN_FAIL_LIMIT {
                 s.trips += 1;
@@ -208,6 +375,8 @@ impl Up {
             "region": self.region.lock().unwrap().clone(),
             "pathBlocked": self.path_blocked(),
             "via": if self.via_interceptor() { Value::from("interceptor") } else { Value::Null },
+            // 3.5.0：上線以來從未成功、先不用（每 6 小時試一次）
+            "benched": s.benched,
         })
     }
 }
@@ -280,11 +449,16 @@ pub fn select_active(list: Vec<Arc<Up>>, fallback: &[Arc<Up>], last_resort: &[Ar
     Vec::new()
 }
 
+#[cfg(test)]
 fn build(specs: &[String], role: Role) -> Vec<Arc<Up>> {
+    build_with(specs, role, None)
+}
+
+fn build_with(specs: &[String], role: Role, pulse: Option<&Arc<Pulse>>) -> Vec<Arc<Up>> {
     let mut out = Vec::new();
     for s in specs {
         match Upstream::parse(s) {
-            Ok(u) if u.supported() => out.push(Up::new(u, role)),
+            Ok(u) if u.supported() => out.push(Up::with_pulse(u, role, pulse.cloned())),
             Ok(u) => warn!("這個版本還不支援 {}，略過", u.id),
             Err(e) => warn!("無法解析上游 {s}：{e}"),
         }
@@ -292,9 +466,16 @@ fn build(specs: &[String], role: Role) -> Vec<Arc<Up>> {
     out
 }
 
+/// 評測結果最多讀幾台候補
+pub const MAX_SPARES: usize = 3;
+
 struct Auto {
     list: Vec<Arc<Up>>,
+    /// 候補（3.5.0）：可用的自動上游不夠時依序補上
+    spares: Vec<Arc<Up>>,
     generated_at: Option<String>,
+    /// `upstreams.json` 的 `source` 是字串時（3.5.0：`"default-list"` = 還沒評測、來自預設名單）
+    source: Option<String>,
     mtime: Option<SystemTime>,
 }
 
@@ -306,6 +487,9 @@ pub struct Manager {
     state_file: PathBuf,
     auto_types: Vec<String>,
     auto_max: usize,
+    /// 可用的自動上游少於這個數就補候補（`min(autoMax, benchmark.minAuto)`，3.5.0）
+    auto_need: usize,
+    pulse: Arc<Pulse>,
     /// 串接上游（3.4.0）：由串接模組設定，不寫進設定檔
     chain: RwLock<Option<Arc<Up>>>,
     chain_trouble: Arc<Trouble>,
@@ -320,18 +504,25 @@ fn strings(v: Option<&Value>) -> Vec<String> {
 impl Manager {
     pub fn new(cfg: &Value, state_file: PathBuf) -> Manager {
         let g = |k| kuroshio_config::get(cfg, k);
+        let pulse = Pulse::new();
+        let auto_max = g("upstream.autoMax").and_then(Value::as_u64).unwrap_or(6) as usize;
+        let min_auto = g("benchmark.minAuto").and_then(Value::as_u64).unwrap_or(3) as usize;
         let m = Manager {
-            pinned: build(&strings(g("upstream.pinned")), Role::Pinned),
-            fallback: build(&strings(g("upstream.fallback")), Role::Fallback),
-            last_resort: build(&strings(g("resolver.lastResort")), Role::LastResort),
+            pinned: build_with(&strings(g("upstream.pinned")), Role::Pinned, Some(&pulse)),
+            fallback: build_with(&strings(g("upstream.fallback")), Role::Fallback, Some(&pulse)),
+            last_resort: build_with(&strings(g("resolver.lastResort")), Role::LastResort, Some(&pulse)),
             auto: RwLock::new(Auto {
                 list: Vec::new(),
+                spares: Vec::new(),
                 generated_at: None,
+                source: None,
                 mtime: None,
             }),
             state_file,
             auto_types: strings(g("upstream.autoTypes")),
-            auto_max: g("upstream.autoMax").and_then(Value::as_u64).unwrap_or(6) as usize,
+            auto_max,
+            auto_need: auto_max.min(min_auto),
+            pulse,
             chain: RwLock::new(None),
             chain_trouble: Arc::new(Trouble::default()),
         };
@@ -379,12 +570,55 @@ impl Manager {
             a.mtime = mtime;
             return;
         };
+        let old: Vec<Arc<Up>> = {
+            let a = self.auto.read().unwrap();
+            a.list.iter().chain(&a.spares).cloned().collect()
+        };
+        let list = self.load_ups(st["selected"].as_array().unwrap(), self.auto_max, &old, &[]);
+        // 候補（3.5.0）：autoMax = 0（沒用自動上游）時也不載入；舊的檔沒有 spares 就是沒有候補
+        let spares = match st.get("spares").and_then(Value::as_array) {
+            Some(a) if self.auto_max > 0 => self.load_ups(a, MAX_SPARES, &old, &list),
+            _ => Vec::new(),
+        };
+        let generated_at = st.get("generatedAt").and_then(Value::as_str).map(str::to_string);
+        let source = st.get("source").and_then(Value::as_str).map(str::to_string);
+        info!(
+            "自動上游已載入（{}）：{}",
+            generated_at.as_deref().unwrap_or(if source.as_deref() == Some(DEFAULT_LIST) {
+                "預設名單，還沒評測"
+            } else {
+                "?"
+            }),
+            if list.is_empty() {
+                "無".to_string()
+            } else {
+                list.iter().map(|u| u.up.id.clone()).collect::<Vec<_>>().join(", ")
+            }
+        );
+        if !spares.is_empty() {
+            info!(
+                "候補 {} 台（可用的自動上游不夠時補上）：{}",
+                spares.len(),
+                spares.iter().map(|u| u.up.id.clone()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        *self.auto.write().unwrap() = Auto {
+            list,
+            spares,
+            generated_at,
+            source,
+            mtime,
+        };
+    }
+
+    /// `selected[]`／`spares[]` → 上游（類型要在 `autoTypes`、不跟固定上游與 `skip` 重複、這個版本支援），最多 `max` 台；
+    /// 原本就有的沿用（統計、暫停狀態不歸零）
+    fn load_ups(&self, items: &[Value], max: usize, old: &[Arc<Up>], skip: &[Arc<Up>]) -> Vec<Arc<Up>> {
         let pinned: Vec<&str> = self.pinned.iter().map(|p| p.up.id.as_str()).collect();
-        let old: Vec<Arc<Up>> = self.auto.read().unwrap().list.clone();
-        let mut list = Vec::new();
-        for s in st["selected"].as_array().unwrap() {
+        let mut list: Vec<Arc<Up>> = Vec::new();
+        for s in items {
             // 先檢查上限：autoMax = 0 時一台都不載入（以前先 push 才檢查，0 也會載入 1 台）
-            if list.len() >= self.auto_max {
+            if list.len() >= max {
                 break;
             }
             let (Some(id), ty) = (
@@ -400,11 +634,14 @@ impl Manager {
             if pinned.contains(&u.id.as_str()) || !u.supported() {
                 continue;
             }
+            if skip.iter().chain(&list).any(|x| x.up.id == u.id) {
+                continue;
+            }
             let up = old
                 .iter()
                 .find(|o| o.up.id == u.id)
                 .cloned()
-                .unwrap_or_else(|| Up::new(u, Role::Auto));
+                .unwrap_or_else(|| Up::with_pulse(u, Role::Auto, Some(self.pulse.clone())));
             *up.reason.lock().unwrap() = s.get("reason").and_then(Value::as_str).map(str::to_string);
             // 上游多樣性（3.4.0）：評測判斷的所在地區
             *up.region.lock().unwrap() = s
@@ -414,17 +651,7 @@ impl Manager {
                 .map(str::to_string);
             list.push(up);
         }
-        let generated_at = st.get("generatedAt").and_then(Value::as_str).map(str::to_string);
-        info!(
-            "自動上游已載入（{}）：{}",
-            generated_at.as_deref().unwrap_or("?"),
-            if list.is_empty() {
-                "無".to_string()
-            } else {
-                list.iter().map(|u| u.up.id.clone()).collect::<Vec<_>>().join(", ")
-            }
-        );
-        *self.auto.write().unwrap() = Auto { list, generated_at, mtime };
+        list
     }
 
     /// 這次查詢要用的上游：固定上游一律參與、暫停中的自動上游跳過；都沒有就用備援。
@@ -445,16 +672,41 @@ impl Manager {
 
     fn select(&self) -> (Vec<Arc<Up>>, Vec<Arc<Up>>) {
         let now = Instant::now();
-        // 路徑檢查判斷不能用的（協定被擋、沒有 IPv6）先不用；路恢復了（下一次檢查）自動加回
-        let auto: Vec<Arc<Up>> = self
-            .auto
-            .read()
-            .unwrap()
-            .list
-            .iter()
-            .filter(|u| !u.paused(now) && !u.path_blocked())
-            .cloned()
-            .collect();
+        // 路徑檢查判斷不能用的（協定被擋、沒有 IPv6）先不用；路恢復了（下一次檢查）自動加回。
+        // 暫停中、先不用的跳過（先不用的時間到了放 1 筆試探）
+        let a = self.auto.read().unwrap();
+        let mut auto: Vec<Arc<Up>> = Vec::with_capacity(a.list.len());
+        let mut usable = 0usize;
+        // 加進這次的名單；回傳是不是正常可用（試探的不算）
+        let take = |u: &Arc<Up>, auto: &mut Vec<Arc<Up>>| -> bool {
+            if u.path_blocked() {
+                return false;
+            }
+            match u.avail(now) {
+                Avail::Ok => {
+                    auto.push(u.clone());
+                    true
+                }
+                Avail::Probe => {
+                    auto.push(u.clone());
+                    false
+                }
+                Avail::Off => false,
+            }
+        };
+        for u in &a.list {
+            usable += take(u, &mut auto) as usize;
+        }
+        // 可用的不夠（3.5.0）：依序補上候補。只在不夠時才看候補（平常不多做事）
+        if usable < self.auto_need {
+            for u in &a.spares {
+                usable += take(u, &mut auto) as usize;
+                if usable >= self.auto_need {
+                    break;
+                }
+            }
+        }
+        drop(a);
         let chain = self.chain();
         let suspended = chain.as_ref().is_some_and(|c| c.role == Role::Chain && c.paused(now));
         select_chain(chain.as_ref(), suspended, &self.pinned, auto, &self.fallback, &self.last_resort)
@@ -496,15 +748,38 @@ impl Manager {
         let auto = self.auto.read().unwrap();
         // 串接上游排第一個（跟固定上游相同的那種已經在固定上游裡，不重複列）
         let chain = self.chain().filter(|c| c.role == Role::Chain);
+        // 候補（3.5.0）排在自動上游後面，多 "spare": true
+        let spares = auto.spares.iter().map(|u| {
+            let mut j = u.json();
+            j["spare"] = json!(true);
+            j
+        });
         Value::Array(
             chain
                 .iter()
                 .chain(&self.pinned)
                 .chain(&auto.list)
-                .chain(&self.fallback)
                 .map(|u| u.json())
+                .chain(spares)
+                .chain(self.fallback.iter().map(|u| u.json()))
                 .collect(),
         )
+    }
+
+    /// 可用的自動上游（含候補）少於 `min(autoMax, benchmark.minAuto)`（3.5.0）：先不用的、暫停中、路徑不通的不算。
+    /// 沒用自動上游時一律 false
+    pub fn auto_short(&self) -> bool {
+        if !self.uses_auto() || self.auto_need == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let a = self.auto.read().unwrap();
+        a.list.iter().chain(&a.spares).filter(|u| u.usable_now(now)).count() < self.auto_need
+    }
+
+    /// 有自動上游先不用時呼叫（3.5.0；`app` 用它在可用的不夠時提早評測）
+    pub fn on_auto_benched(&self, f: Arc<dyn Fn() + Send + Sync>) {
+        *self.pulse.on_benched.write().unwrap() = Some(f);
     }
 
     /// 社群分享用：每日評測選出、而且實際用過有成功的上游（網址、協議、平均毫秒、成功率）
@@ -530,12 +805,23 @@ impl Manager {
             .collect()
     }
 
+    /// `/api/status` 的 `autoUpstreams`：評測結果的時間與台數；還沒評測、初始上游來自預設名單時（3.5.0）
+    /// 是 `{ "generatedAt": null, "count", "source": "default-list" }`；都沒有是 null
     pub fn auto_info(&self) -> Value {
         let a = self.auto.read().unwrap();
-        match &a.generated_at {
-            Some(g) => json!({ "generatedAt": g, "count": a.list.len() }),
-            None => Value::Null,
+        match (&a.generated_at, a.source.as_deref()) {
+            (Some(g), _) => json!({ "generatedAt": g, "count": a.list.len(), "spares": a.spares.len() }),
+            (None, Some(DEFAULT_LIST)) => {
+                json!({ "generatedAt": null, "count": a.list.len(), "spares": a.spares.len(), "source": DEFAULT_LIST })
+            }
+            _ => Value::Null,
         }
+    }
+
+    /// 自動上游還沒評測過（來自預設名單，3.5.0）
+    pub fn auto_from_default_list(&self) -> bool {
+        let a = self.auto.read().unwrap();
+        a.generated_at.is_none() && a.source.as_deref() == Some(DEFAULT_LIST)
     }
 
     pub fn state_file(&self) -> &Path {
@@ -812,5 +1098,237 @@ mod tests {
         let tcp = chain_up("tcp://192.168.1.1:53");
         let (a, _) = select_chain(Some(&tcp), false, &pinned, vec![], &[], &[]);
         assert_eq!(select_active(a, &[], &[], false)[0].role, Role::Chain);
+    }
+
+    // ---------------- 3.5.0 A7：一直沒成功的自動上游 ----------------
+
+    fn manager_with(name: &str, body: &str, extra: Value) -> (PathBuf, Manager) {
+        let dir = std::env::temp_dir().join(format!("kuroshio-a7-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("upstreams.json");
+        std::fs::write(&f, body).unwrap();
+        let mut c = kuroshio_config::with_overrides(&json!({
+            "upstream": { "pinned": [], "fallback": ["udp://198.51.100.53"], "autoTypes": ["udp", "doh", "dot"], "autoMax": 3 },
+            "benchmark": { "minAuto": 3 }
+        }));
+        kuroshio_config::merge(&mut c, &extra);
+        (dir, Manager::new(&c, f))
+    }
+
+    fn auto_by(m: &Manager, id: &str) -> Arc<Up> {
+        let a = m.auto.read().unwrap();
+        a.list.iter().chain(&a.spares).find(|u| u.up.id == id).cloned().unwrap()
+    }
+
+    /// 連續失敗 5 筆（同一個時間點）
+    fn fail5_at(u: &Up, t: Instant) {
+        (0..5).for_each(|_| u.record_at(false, 0.0, t));
+    }
+
+    /// 三次暫停：1 分鐘、2 分鐘、第三次（回傳第三次的時間）。`peer` 是別的上游，`peer_ok` 時在每一輪之前成功一次
+    fn three_trips(u: &Up, peer: &Up, peer_ok: bool, t0: Instant) -> Instant {
+        let mut t = t0;
+        for step in [61, 121, 0] {
+            if peer_ok {
+                peer.record_at(true, 5.0, t);
+            }
+            fail5_at(u, t);
+            if step > 0 {
+                t += Duration::from_secs(step);
+            }
+        }
+        t
+    }
+
+    const TWO: &str = r#"{"generatedAt":"2026-11-10T04:00:00Z","selected":[
+        {"id":"tls://never.example.com","type":"dot"},{"id":"tls://good.example.net","type":"dot"}]}"#;
+
+    #[test]
+    fn never_ok_auto_is_benched_after_three_trips() {
+        let (dir, m) = manager_with("bench", TWO, json!({}));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        m.on_auto_benched(Arc::new(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }));
+        let (bad, good) = (
+            auto_by(&m, "tls://never.example.com:853"),
+            auto_by(&m, "tls://good.example.net:853"),
+        );
+        let t0 = Instant::now();
+        // 前兩次照舊 1 → 2 分鐘（從未成功也一樣），第三次才先不用
+        good.record_at(true, 5.0, t0);
+        fail5_at(&bad, t0);
+        assert!(!bad.benched());
+        assert!(pause_left_at(&bad, t0) <= Duration::from_secs(60));
+        let t1 = t0 + Duration::from_secs(61);
+        good.record_at(true, 5.0, t1);
+        fail5_at(&bad, t1);
+        assert!(!bad.benched());
+        assert!(pause_left_at(&bad, t1) <= Duration::from_secs(120));
+        let t2 = t1 + Duration::from_secs(121);
+        good.record_at(true, 5.0, t2);
+        fail5_at(&bad, t2);
+        assert!(bad.benched(), "上線以來從未成功、第 3 次暫停、別的上游有成功");
+        assert!(pause_left_at(&bad, t2) > Duration::from_secs(6 * 3600 - 5));
+        assert_eq!(bad.json()["benched"], true);
+        assert_eq!(bad.json()["paused"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "通知一次");
+        assert!(
+            take_never_ok().contains(&"tls://never.example.com:853".to_string()),
+            "登記給下一次評測"
+        );
+        // 成功過的上游照舊 1 → 2 → 4 分鐘（時好時壞，不先不用）
+        let t3 = t2 + Duration::from_secs(1);
+        fail5_at(&good, t3);
+        fail5_at(&good, t3 + Duration::from_secs(61));
+        fail5_at(&good, t3 + Duration::from_secs(182));
+        assert!(!good.benched());
+        assert!(pause_left_at(&good, t3 + Duration::from_secs(182)) <= Duration::from_secs(240));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn pause_left_at(u: &Up, t: Instant) -> Duration {
+        u.stats
+            .lock()
+            .unwrap()
+            .open_until
+            .map_or(Duration::ZERO, |x| x.saturating_duration_since(t))
+    }
+
+    #[test]
+    fn benched_probe_every_six_hours_and_recovers() {
+        let (dir, m) = manager_with("probe", TWO, json!({}));
+        let (bad, good) = (
+            auto_by(&m, "tls://never.example.com:853"),
+            auto_by(&m, "tls://good.example.net:853"),
+        );
+        let t0 = Instant::now();
+        let t = three_trips(&bad, &good, true, t0);
+        assert!(bad.benched());
+        assert_eq!(bad.avail(t + Duration::from_secs(3600)), Avail::Off, "6 小時內不問");
+        // 6 小時到了：只放 1 筆試探
+        let p1 = t + BENCH_PAUSE + Duration::from_secs(1);
+        assert_eq!(bad.avail(p1), Avail::Probe);
+        assert_eq!(bad.avail(p1), Avail::Off, "同一段時間只放 1 筆");
+        assert_eq!(
+            bad.avail(p1 + PROBE_HOLD + Duration::from_secs(1)),
+            Avail::Probe,
+            "那筆沒被問到：過一下再放"
+        );
+        // 試探失敗：再等 6 小時（不必再累積 5 筆）
+        bad.record_at(false, 0.0, p1 + PROBE_HOLD + Duration::from_secs(2));
+        assert!(bad.benched());
+        assert!(pause_left_at(&bad, p1 + PROBE_HOLD + Duration::from_secs(2)) > BENCH_PAUSE - Duration::from_secs(5));
+        // 下一次試探成功：恢復，照常使用
+        let p2 = p1 + PROBE_HOLD + BENCH_PAUSE + Duration::from_secs(3);
+        assert_eq!(bad.avail(p2), Avail::Probe);
+        bad.record_at(true, 8.0, p2);
+        assert!(!bad.benched());
+        assert_eq!(bad.avail(p2), Avail::Ok);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn not_benched_when_no_upstream_succeeds() {
+        // 全部都失敗（整台斷網）：照舊 1 → 2 → 4 分鐘，不先不用
+        let (dir, m) = manager_with("offline", TWO, json!({}));
+        let (bad, other) = (
+            auto_by(&m, "tls://never.example.com:853"),
+            auto_by(&m, "tls://good.example.net:853"),
+        );
+        let t = three_trips(&bad, &other, false, Instant::now());
+        assert!(!bad.benched());
+        assert!(pause_left_at(&bad, t) <= Duration::from_secs(240) && pause_left_at(&bad, t) > Duration::from_secs(200));
+        // 別的上游很久以前成功過（超過 10 分鐘）：也不算
+        let (dir2, m2) = manager_with("offline-old", TWO, json!({}));
+        let (bad, other) = (
+            auto_by(&m2, "tls://never.example.com:853"),
+            auto_by(&m2, "tls://good.example.net:853"),
+        );
+        let t0 = Instant::now();
+        other.record_at(true, 5.0, t0);
+        three_trips(&bad, &other, false, t0 + PEER_OK_WINDOW + Duration::from_secs(1));
+        assert!(!bad.benched());
+        // 固定上游、備援成功也算「網路是通的」
+        let (dir3, m3) = manager_with("offline-fb", TWO, json!({}));
+        let bad = auto_by(&m3, "tls://never.example.com:853");
+        let t0 = Instant::now();
+        m3.fallback[0].record_at(true, 5.0, t0);
+        fail5_at(&bad, t0);
+        fail5_at(&bad, t0 + Duration::from_secs(61));
+        m3.fallback[0].record_at(true, 5.0, t0 + Duration::from_secs(182));
+        fail5_at(&bad, t0 + Duration::from_secs(182));
+        assert!(bad.benched());
+        for d in [dir, dir2, dir3] {
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+    }
+
+    const WITH_SPARES: &str = r#"{"generatedAt":"2026-11-10T04:00:00Z","selected":[
+        {"id":"udp://192.0.2.1","type":"udp"},{"id":"udp://192.0.2.2","type":"udp"},{"id":"udp://192.0.2.3","type":"udp"}],
+        "spares":[{"id":"udp://192.0.2.2","type":"udp"},{"id":"quic://dns.example.com","type":"doq"},
+        {"id":"udp://198.51.100.4","type":"udp","reason":"候補"},{"id":"udp://198.51.100.5","type":"udp"},
+        {"id":"udp://198.51.100.6","type":"udp"},{"id":"udp://198.51.100.7","type":"udp"}]}"#;
+
+    #[test]
+    fn spares_fill_when_usable_below_min() {
+        let (dir, m) = manager_with("spares", WITH_SPARES, json!({}));
+        // 候補：跟 selected 重複的、類型不允許的不算，最多 3 台
+        let sp: Vec<String> = m.auto.read().unwrap().spares.iter().map(|u| u.up.id.clone()).collect();
+        assert_eq!(sp, ["udp://198.51.100.4:53", "udp://198.51.100.5:53", "udp://198.51.100.6:53"]);
+        assert_eq!(m.auto_info()["spares"], 3);
+        let list = m.list_json();
+        let spare = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["id"] == "udp://198.51.100.4:53")
+            .unwrap()
+            .clone();
+        assert_eq!((spare["spare"].clone(), spare["reason"].clone()), (json!(true), json!("候補")));
+        // 夠用：不問候補
+        assert_eq!(ids(&m.active()), ["udp://192.0.2.1:53", "udp://192.0.2.2:53", "udp://192.0.2.3:53"]);
+        assert!(!m.auto_short());
+        // 一台暫停：依序補上第一台候補
+        let a = auto_by(&m, "udp://192.0.2.1:53");
+        (0..5).for_each(|_| a.record(false, 0.0));
+        assert_eq!(
+            ids(&m.active()),
+            ["udp://192.0.2.2:53", "udp://192.0.2.3:53", "udp://198.51.100.4:53"]
+        );
+        // 候補也暫停：再補下一台
+        let s1 = auto_by(&m, "udp://198.51.100.4:53");
+        (0..5).for_each(|_| s1.record(false, 0.0));
+        assert_eq!(
+            ids(&m.active()),
+            ["udp://192.0.2.2:53", "udp://192.0.2.3:53", "udp://198.51.100.5:53"]
+        );
+        assert!(!m.auto_short(), "還有候補");
+        for id in ["udp://192.0.2.2:53", "udp://198.51.100.5:53", "udp://198.51.100.6:53"] {
+            let u = auto_by(&m, id);
+            (0..5).for_each(|_| u.record(false, 0.0));
+        }
+        assert!(m.auto_short(), "連候補都不夠");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_state_without_spares_unchanged() {
+        let body = r#"{"generatedAt":"2026-11-10T04:00:00Z","selected":[
+            {"id":"udp://192.0.2.1","type":"udp"},{"id":"udp://192.0.2.2","type":"udp"},{"id":"udp://192.0.2.3","type":"udp"}]}"#;
+        let (dir, m) = manager_with("nospares", body, json!({}));
+        assert_eq!(m.auto_info()["spares"], 0);
+        let a = auto_by(&m, "udp://192.0.2.1:53");
+        (0..5).for_each(|_| a.record(false, 0.0));
+        assert_eq!(ids(&m.active()), ["udp://192.0.2.2:53", "udp://192.0.2.3:53"], "跟 3.4.4 一樣");
+        assert!(m.auto_short());
+        assert!(m.list_json().as_array().unwrap().iter().all(|u| u.get("spare").is_none()));
+        // autoMax = 0：候補也不載入
+        let (dir2, m2) = manager_with("nospares0", WITH_SPARES, json!({ "upstream": { "autoMax": 0 } }));
+        assert!(m2.auto.read().unwrap().spares.is_empty());
+        assert!(!m2.auto_short(), "沒用自動上游");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir2).unwrap();
     }
 }

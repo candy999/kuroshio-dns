@@ -1271,10 +1271,11 @@ pub fn shared_json() -> Value {
 /// `autoUpstreams.source` 用：（檔案時間，來源）
 static AUTO_SOURCE: Mutex<Option<(SystemTime, &'static str)>> = Mutex::new(None);
 
-/// `autoUpstreams`（現有欄位）加上 `source`：`"chain"`（上游黑潮給的）或 `"benchmark"`（自己評測的）
+/// `autoUpstreams`（現有欄位）加上 `source`：`"chain"`（上游黑潮給的）或 `"benchmark"`（自己評測的）；
+/// 還沒評測、來自預設名單的（3.5.0）已經是 `"default-list"`，不改
 pub fn auto_info(mgr: &crate::upstreams::Manager) -> Value {
     let mut v = mgr.auto_info();
-    if let Some(o) = v.as_object_mut() {
+    if let Some(o) = v.as_object_mut().filter(|o| !o.contains_key("source")) {
         let path = mgr.state_file();
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         let cached = AUTO_SOURCE.lock().unwrap().filter(|(t, _)| Some(*t) == mtime).map(|(_, s)| s);
@@ -1330,6 +1331,9 @@ impl Live {
     }
 }
 
+/// 3.4.x 附帶的種子評測結果（`data/seed/upstreams.json`，3.5.0 移除）的 `generatedAt`
+const RETIRED_SEED_GENERATED_AT: [&str; 2] = ["2026-11-10T20:13:34.970Z", "2026-10-26T20:15:48.644Z"];
+
 fn generated_at(b: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(b)
         .ok()?
@@ -1346,8 +1350,11 @@ impl ShareSource for Live {
         if !v.get("selected").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
             return None;
         }
-        // 種子資料（還沒評測過）：下游自己也有
-        if std::fs::read(&self.seed_upstreams).ok().and_then(|s| generated_at(&s)).as_deref() == Some(g) {
+        // 種子資料（還沒評測過）：下游自己也有。3.5.0 起不再附帶種子評測結果（初始上游來自預設名單，
+        // 沒有 generatedAt，上面就不分享），但升級前帶入的種子還留在 state 裡：認得以前的種子時間
+        if RETIRED_SEED_GENERATED_AT.contains(&g)
+            || std::fs::read(&self.seed_upstreams).ok().and_then(|s| generated_at(&s)).as_deref() == Some(g)
+        {
             return None;
         }
         // 從別的黑潮拿來的（三層）照樣往下傳

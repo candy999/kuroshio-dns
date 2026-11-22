@@ -153,6 +153,7 @@ fn paths(root: &Path) -> BenchPaths {
         community_candidates: None,
         blacklist_file: Some(root.join("state/blacklist.txt")),
         default_list_dir: None,
+        learn_file: Some(root.join("state/benchmark-learn.json")),
     }
 }
 
@@ -255,11 +256,11 @@ async fn upstreams_json_has_region() {
     let mut lines = csv.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near"
+        "\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near,Tier"
     );
     let row = |id: &str| csv.lines().find(|l| l.split(',').nth(1) == Some(id)).unwrap().to_string();
-    assert!(row(&ids[1]).ends_with(",,TW,Y"), "{csv}");
-    assert!(row(&ids[3]).ends_with(",,US,"), "{csv}");
+    assert!(row(&ids[1]).ends_with(",,TW,Y,B"), "{csv}");
+    assert!(row(&ids[3]).ends_with(",,US,,B"), "{csv}");
     let log = std::fs::read_to_string(out.join("judge.log")).unwrap();
     assert!(log.contains("覆蓋：鄰近 2 台、其他 2 台"), "{log}");
     // 快取：新查到的有 cc，答案的 /16（只在汙染判斷用到）不補查
@@ -311,5 +312,65 @@ async fn ip_api_offline_still_selects() {
     assert_eq!((get(&ids[1]).1.as_str(), get(&ids[1]).2), ("TW", true));
     assert_eq!((get(&ids[2]).1.as_str(), get(&ids[2]).2), ("", false), "查不到國別、延遲超過 60 ms");
     assert_eq!((get(&ids[3]).1.as_str(), get(&ids[3]).2), ("", false));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 3.5.0 A7：主程式登記「執行時上線以來從未成功」的上游（學習檔的 neverOk）：照測、連續 3 次評測不選、
+/// 也不當候補，之後忘掉重來。結果多 `spares`（沒選上、合格的，依速度）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn never_ok_excluded_from_selection_for_three_runs() {
+    use kuroshio_jobs::benchmark::learn::{day_of, Learn};
+    use kuroshio_jobs::Clock;
+    let (root, p, ids) = setup("never-ok").await;
+    let mut c = cfg("any");
+    c["upstream"]["autoMax"] = json!(2);
+    let clock = Arc::new(kuroshio_jobs::ManualClock::new(1_794_300_000_000));
+    let learn_file = p.learn_file.clone().unwrap();
+    let bad = format!("udp://{}", ids[0]);
+    assert!(kuroshio_jobs::benchmark::learn::merge_never_ok(
+        &learn_file,
+        std::slice::from_ref(&bad),
+        clock.now_ms()
+    ));
+    let ids_of = |state: &Value, k: &str| -> Vec<String> {
+        state[k]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let mut runs = Vec::new();
+    for _ in 0..4 {
+        let (api, _) = fake_ip_api().await;
+        let ip_api = IpApi::new("127.0.0.1", api.port(), Duration::from_millis(10));
+        let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(c.clone())).with_clock(clock.clone());
+        let b = Benchmark::with(p.clone(), Arc::new(LocalOnly), Arc::new(ip_api)).with_tw(tw());
+        let state = b.run(&ctx).await.unwrap();
+        let log = std::fs::read_to_string(p.out_root.clone().unwrap().join(state["date"].as_str().unwrap()).join("judge.log")).unwrap();
+        let n = Learn::load(&learn_file).never_ok.get(&bad).map(|e| e.n);
+        runs.push((
+            ids_of(&state, "selected"),
+            ids_of(&state, "spares"),
+            log.contains("執行時上線以來從未成功"),
+            n,
+        ));
+        clock.advance(24 * 3600 * 1000);
+    }
+    for (i, (sel, spares, logged, n)) in runs.iter().take(3).enumerate() {
+        assert_eq!(sel.len(), 2, "第 {} 次：{sel:?}", i + 1);
+        assert!(!sel.contains(&ids[0]) && !spares.contains(&ids[0]), "第 {} 次不選、不當候補", i + 1);
+        assert!(*logged, "judge.log 寫原因");
+        assert_eq!(*n, Some(i as u32 + 1));
+        assert!(!spares.is_empty() && spares.len() <= 3, "{spares:?}");
+        assert!(spares.iter().all(|s| !sel.contains(s)), "候補是沒選上的");
+    }
+    // 第 4 次：忘掉重來（它可能修好了），照常可以選（s1 最快）
+    let (sel, _, logged, n) = &runs[3];
+    assert!(sel.contains(&ids[0]), "{sel:?}");
+    assert!(!logged);
+    assert_eq!(*n, None);
+    let l = Learn::load(&learn_file);
+    assert_eq!(l.day, day_of(clock.now_ms() - 24 * 3600 * 1000));
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -94,7 +94,7 @@ fn tick_fires_once_per_slot() {
     assert!(s.tick().is_empty());
     let st = s.status();
     assert_eq!(st["state"]["a"]["lastSlot"], "2026-11-10 04:10");
-    assert_eq!(st["queue"], json!([{ "name": "a", "reason": "排程" }]));
+    assert_eq!(st["queue"], json!([{ "name": "a", "reason": "排程", "priority": false }]));
     assert_eq!(st["nextRun"]["a"], json!(tpe(2026, 11, 11, 4, 10)));
     assert_eq!(st["nextRun"]["b"], Value::Null);
     // 排程檢查被延誤幾分鐘還是會跑；超過寬限就算錯過（交給補跑）
@@ -316,7 +316,10 @@ async fn one_at_a_time_and_manual_requests() {
     let st = s.status();
     assert_eq!(st["running"]["name"], "a");
     assert_eq!(st["running"]["pid"], std::process::id());
-    assert_eq!(st["queue"], json!([{ "name": "b", "reason": "手動 (管理介面)" }]));
+    assert_eq!(
+        st["queue"],
+        json!([{ "name": "b", "reason": "手動 (管理介面)", "priority": false }])
+    );
     assert_eq!(st["config"], json!({ "a": { "at": "04:10", "catchUp": false } }));
     assert_eq!(*order.lock().unwrap(), vec!["a 開始"], "a 還沒結束，b 不能開始");
     clock.advance(90_000);
@@ -761,4 +764,140 @@ async fn catch_up_without_window_runs_immediately() {
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(s.status()["catchUpWindow"], Value::Null);
     h.abort();
+}
+
+// ---------------- 3.5.0 A9：手動觸發的工作優先 ----------------
+
+/// 長工作 `long` 一直跑到放行；a、b、c 只記下執行順序。回傳（排程器、放行、順序、長工作看到的 priority_waiting）
+type Log<T> = Arc<Mutex<Vec<T>>>;
+
+fn priority_fixture(clock: &Arc<ManualClock>) -> (Scheduler, Arc<Notify>, Log<String>, Log<bool>) {
+    let cfg = json!({ "jobs": {
+        "long": { "at": "04:10", "catchUp": false },
+        "a": { "at": "04:10", "catchUp": false },
+        "b": { "at": "04:10", "catchUp": false },
+        "c": { "at": "04:10", "catchUp": false },
+    }});
+    let s = sched(cfg, None, clock);
+    let gate = Arc::new(Notify::new());
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (g, o, w) = (gate.clone(), order.clone(), seen.clone());
+    s.register("long", move |ctx: JobCtx| {
+        let (g, o, w) = (g.clone(), o.clone(), w.clone());
+        async move {
+            o.lock().unwrap().push("long".to_string());
+            g.notified().await;
+            w.lock().unwrap().push(ctx.priority_waiting());
+            Ok(())
+        }
+    });
+    for n in ["a", "b", "c"] {
+        let o = order.clone();
+        s.register(n, move |ctx: JobCtx| {
+            let o = o.clone();
+            async move {
+                o.lock().unwrap().push(format!("{}({})", ctx.name, ctx.reason));
+                Ok(())
+            }
+        });
+    }
+    (s, gate, order, seen)
+}
+
+#[tokio::test(start_paused = true)]
+async fn manual_request_jumps_queue() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let (s, gate, order, seen) = priority_fixture(&clock);
+    let h = s.start();
+    assert_eq!(s.request("long", "補跑"), json!({ "ok": true }));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(s.request("a", "補跑"), json!({ "ok": true }));
+    assert_eq!(s.request("b", "排程"), json!({ "ok": true }));
+    assert_eq!(s.request_priority("c", "手動 (管理介面)"), json!({ "ok": true }));
+    let q = s.status()["queue"].clone();
+    assert_eq!(
+        q,
+        json!([
+            { "name": "c", "reason": "手動 (管理介面)", "priority": true },
+            { "name": "a", "reason": "補跑", "priority": false },
+            { "name": "b", "reason": "排程", "priority": false },
+        ])
+    );
+    // 正在跑的不中斷（一次只跑一個）；手動的不能重複排、正在跑的也不能
+    assert_eq!(s.request_priority("long", "手動"), json!({ "ok": false, "error": "執行中" }));
+    assert_eq!(s.request_priority("nope", "手動"), json!({ "ok": false, "error": "未知的工作" }));
+    gate.notify_one();
+    idle(&s).await;
+    h.abort();
+    assert_eq!(*order.lock().unwrap(), vec!["long", "c(手動 (管理介面))", "a(補跑)", "b(排程)"]);
+    assert_eq!(*seen.lock().unwrap(), vec![true], "長工作看得到有優先的工作在等");
+}
+
+#[tokio::test(start_paused = true)]
+async fn manual_request_moves_existing_entry_to_front() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let (s, gate, order, seen) = priority_fixture(&clock);
+    let h = s.start();
+    s.request("long", "補跑");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    s.request("a", "補跑");
+    s.request("b", "補跑");
+    // 一般的排入：已在佇列就不動；手動的：移到最前面，原因改成手動
+    assert_eq!(s.request("b", "手動"), json!({ "ok": false, "error": "已在佇列" }));
+    assert_eq!(s.request_priority("b", "手動 (管理介面)"), json!({ "ok": true }));
+    let names: Vec<String> = s.status()["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["b", "a"], "沒有重複");
+    gate.notify_one();
+    idle(&s).await;
+    h.abort();
+    assert_eq!(*order.lock().unwrap(), vec!["long", "b(手動 (管理介面))", "a(補跑)"]);
+    assert_eq!(*seen.lock().unwrap(), vec![true]);
+    // 只有一般的工作在等：不算優先（長工作不讓出）
+    let (s, gate, _, seen) = priority_fixture(&clock);
+    let h = s.start();
+    s.request("long", "補跑");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    s.request("a", "排程");
+    gate.notify_one();
+    idle(&s).await;
+    h.abort();
+    assert_eq!(*seen.lock().unwrap(), vec![false]);
+}
+
+#[test]
+fn catch_up_puts_benchmark_before_scan_when_upstreams_not_benchmarked() {
+    let now = tpe(2026, 11, 10, 12, 0);
+    let clock = Arc::new(ManualClock::new(now));
+    let cfg = json!({ "jobs": {
+        "dns-benchmark": { "at": "04:10", "startDelaySec": 300 },
+        "cdn-ranges": { "at": "03:10", "weekdays": [0], "startDelaySec": 30 },
+        "cdn-scan": { "at": "03:20", "weekdays": [0], "startDelaySec": 60 },
+        "cdn-pool": { "at": "05:30", "startDelaySec": 120 },
+    }});
+    let plan = |benchmarked: bool| {
+        let mut o = opts(&clock);
+        o.catch_up_first = Some(Arc::new(move |n: &str| n == "dns-benchmark" && !benchmarked));
+        let s = Scheduler::new(cfg.clone(), None, o);
+        for n in ["dns-benchmark", "cdn-ranges", "cdn-scan", "cdn-pool"] {
+            s.register(n, noop);
+        }
+        s.catch_up_plan().into_iter().map(|(n, d, _)| (n, d)).collect::<Vec<_>>()
+    };
+    let p = |v: &[(&str, u64)]| v.iter().map(|(n, d)| (n.to_string(), *d)).collect::<Vec<_>>();
+    // 自動上游還沒評測過（預設名單）：cdn-scan 排到評測後面；評測與其他工作的延遲不變
+    assert_eq!(
+        plan(false),
+        p(&[("cdn-ranges", 30), ("cdn-pool", 120), ("dns-benchmark", 300), ("cdn-scan", 301)])
+    );
+    // 評測過了：跟 3.4.4 一樣
+    assert_eq!(
+        plan(true),
+        p(&[("cdn-ranges", 30), ("cdn-scan", 60), ("cdn-pool", 120), ("dns-benchmark", 300)])
+    );
 }

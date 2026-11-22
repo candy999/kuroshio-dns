@@ -3,7 +3,7 @@
 //! - `scheduler`：排程器。工作在核心裡以 tokio task 執行（2.x 是子程序），同一時間只跑一個。
 //!   其他 crate（例如 `kuroshio-cdn` 的 cdn-ranges / cdn-scan / cdn-pool）的工作也註冊進同一個排程器。
 //! - `benchmark`：每日上游評測，結果寫 `state/upstreams.json`（格式同 2.x，伺服器照讀）。
-//! - `seed`：第一次啟動時帶入種子資料。
+//! - `seed`：第一次啟動時帶入種子資料（CDN 節點池、IPv6 節點、網域紀錄），以及預設名單 A 級的初始上游（3.5.0）。
 //! - `twip`：台灣 IP 清單 `tw-ip.json` 的產生（指令列 `tw-ip` 與每月排程工作 `tw-ip` 共用，規格 08）。
 //!
 //! 32 位元 MIPS 沒有 64 位元原子操作，這個 crate 不用 `AtomicU64` / `AtomicI64`。
@@ -11,6 +11,7 @@
 //! 整合方式（核心）：
 //! ```ignore
 //! kuroshio_jobs::apply_seeds(&state_dir, &seed_dir);                 // 啟動時、建立上游管理之前
+//! kuroshio_jobs::apply_initial_upstreams(&bench_paths, &cfg);        // 還沒有評測結果時：預設名單的 A 級
 //! let mut o = kuroshio_jobs::Options::new(&state_dir, &base_dir);
 //! o.should_defer = Some(Arc::new(|| app::pressure() != Pressure::Normal));
 //! o.lock_dir = Some("/tmp/kuroshio/locks".into());
@@ -20,7 +21,7 @@
 //! sched.register("dns-benchmark", Benchmark::new(BenchPaths::from_config(&cfg, &state_dir, &base_dir)));
 //! sched.register("cdn-pool", |ctx: JobCtx| async move { /* kuroshio-cdn 的工作 */ Ok(()) });
 //! sched.start();
-//! // /api/jobs → sched.status()；/api/jobs/run → sched.request(name, "手動 (管理介面)")
+//! // /api/jobs → sched.status()；/api/jobs/run → sched.request_priority(name, "手動 (管理介面)")
 //! // 評測寫完 upstreams.json 後，上游管理的 reload_auto() 會依修改時間重新載入
 //! ```
 
@@ -35,6 +36,6 @@ pub mod util;
 
 pub use benchmark::{BenchPaths, Benchmark};
 pub use scheduler::{resolve_path, state_file_exists, Job, JobCtx, Options, Scheduler, JOBS_STATE_FILE};
-pub use seed::{apply_seeds, apply_seeds_with, SeedSpec, SEEDS};
+pub use seed::{apply_initial_upstreams, apply_seeds, apply_seeds_with, initial_upstreams, SeedSpec, SEEDS};
 pub use time::{Clock, ManualClock, SystemClock};
 pub use twip::TwIpJob;

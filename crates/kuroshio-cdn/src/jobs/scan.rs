@@ -4,6 +4,10 @@
 //! 同時數 `scan.concurrency`（預設依 CPU 核心數），用固定數量的工作者輪流取網段（不會一次開幾萬個 task）。
 //! 網段分批跑，批與批之間過檢查點（系統吃緊時暫停，暫停時沒有進行中的探測）。
 //! 結果依網段排序後寫檔（2.x 是完成順序），內容沒變就不寫。
+//!
+//! 3.5.0：有手動觸發的工作在等（`JobCtx::yield_check`）時，在「一家 CDN 掃完」的邊界讓出（`Report::yielded`）：
+//! 已經掃完的那幾家照寫，由外層稍後續跑，續跑時跳過那幾家（`JobCtx::scan_skip`）。一家掃到一半不讓出
+//! （中途的結果不能用，重掃才是浪費）；讓出幾次由外層決定上限。
 
 use super::{v4_lines, JobCtx};
 use crate::net::Net;
@@ -62,6 +66,49 @@ pub struct ProviderScan {
 pub struct Report {
     pub providers: Vec<ProviderScan>,
     pub changed: bool,
+    /// 有優先的工作在等，掃完一家之後先讓出（還有沒掃的）
+    pub yielded: bool,
+    /// 這次掃完（照寫或因為安全檢查沒覆蓋）的 CDN
+    pub done: Vec<String>,
+}
+
+/// 讓出最多幾次（之後跑到完）：手動的工作最多等一家 CDN 的時間，又不會一直讓出、一直續跑
+pub const MAX_YIELDS: u32 = 3;
+/// 續跑時，這麼久以內掃完的那幾家跳過（不重複掃同一批網段）
+pub const RESUME_SKIP: Duration = Duration::from_secs(6 * 3600);
+
+/// 讓出與續跑的狀態（外層保存，跨兩次執行；只在記憶體，重新啟動就從頭掃）
+#[derive(Debug, Default)]
+pub struct Resume {
+    done: Vec<(String, std::time::Instant)>,
+    yields: u32,
+}
+
+impl Resume {
+    /// 這次執行：（要跳過的 CDN，可不可以讓出）
+    pub fn prepare(&self, now: std::time::Instant) -> (Vec<String>, bool) {
+        let skip = self
+            .done
+            .iter()
+            .filter(|(_, t)| now.saturating_duration_since(*t) < RESUME_SKIP)
+            .map(|(n, _)| n.clone())
+            .collect();
+        (skip, self.yields < MAX_YIELDS)
+    }
+
+    /// 這次執行的結果：讓出了就記下掃完的那幾家；跑到完就歸零
+    pub fn finish(&mut self, r: &Report, now: std::time::Instant) {
+        if r.yielded {
+            self.yields += 1;
+            self.done.extend(r.done.iter().map(|n| (n.clone(), now)));
+        } else {
+            *self = Resume::default();
+        }
+    }
+
+    pub fn yields(&self) -> u32 {
+        self.yields
+    }
 }
 
 const TW: u8 = 1;
@@ -198,10 +245,23 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             continue;
         }
         let Some((host, path)) = prov.probe else { continue };
+        if ctx.scan_skip.iter().any(|s| s == name) {
+            info!("[{name}] 讓出前已經掃完，這次跳過（續跑）");
+            continue;
+        }
         let cidrs = v4_lines(ctx.cdn.paths.read_cdn_text(&format!("ranges/{name}-ipv4.txt")));
         if cidrs.is_empty() {
             info!("[{name}] 沒有 IP 範圍，跳過（先執行 cdn-ranges）");
             continue;
+        }
+        // 一家 CDN 掃完的邊界：有優先的工作在等就先讓出（這次至少掃完一家才讓，一定有進度）
+        if !report.done.is_empty() && ctx.should_yield() {
+            info!(
+                "有手動執行的工作在等，網段分類先讓出（已掃完 {}），稍後續跑",
+                report.done.join("、")
+            );
+            report.yielded = true;
+            break;
         }
         let mut seen = HashSet::new();
         let tasks: Arc<Vec<u32>> = Arc::new(cidrs.iter().flat_map(|c| expand_to_24(c)).filter(|p| seen.insert(*p)).collect());
@@ -271,6 +331,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             info!("[{name}] {msg}");
             ps.note = Some(msg);
             report.providers.push(ps);
+            report.done.push(name.to_string());
             continue;
         }
         // 安全檢查：若幾乎全部 Dead，多半是本機網路問題，不覆蓋舊結果
@@ -279,6 +340,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             info!("[{name}] {msg}");
             ps.note = Some(msg);
             report.providers.push(ps);
+            report.done.push(name.to_string());
             continue;
         }
         for (k, label) in [(0, "TW"), (1, "Global"), (2, "Dead")] {
@@ -298,6 +360,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             top.iter().map(|(p, c)| format!("{p}:{c}")).collect::<Vec<_>>().join(" ")
         );
         report.providers.push(ps);
+        report.done.push(name.to_string());
     }
     let done = out_dir.join(".done");
     if report.changed || !done.exists() {

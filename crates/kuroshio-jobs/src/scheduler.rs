@@ -11,6 +11,7 @@
 //! - 每月（`monthDays`，1–31）與每台裝置錯開（`jitterDays` / `jitterMin`：依這台裝置的亂數種子往後挪，
 //!   種子存在 `jobs.json` 裡，重開機後不變）：大家不會在同一時間去打同一個公開資料來源。
 //! - 很久的工作可以分段跑：`JobCtx::request_later` 讓自己稍後再排進佇列，`others_waiting` 看有沒有別的工作在等。
+//! - 手動觸發的工作（3.5.0）用 `request_priority` 排到佇列最前面；長工作用 `JobCtx::priority_waiting` 決定要不要讓出。
 
 use crate::lock::JobLock;
 use crate::time::{self, Clock, SystemClock, DAY_MS, MIN_MS};
@@ -109,6 +110,18 @@ impl JobCtx {
             .unwrap_or(false)
     }
 
+    /// 佇列裡有優先的工作（手動觸發的，[`Scheduler::request_priority`]）在等（3.5.0）
+    pub fn priority_waiting(&self) -> bool {
+        self.sched
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|i| {
+                let st = i.st.lock().unwrap();
+                st.queue.iter().any(|(n, _)| st.priority.contains(n))
+            })
+            .unwrap_or(false)
+    }
+
     /// `delay` 之後把這個工作再排進佇列（原因 `reason`）。不是排程器啟動的就什麼都不做
     pub fn request_later(&self, delay: Duration, reason: &str) {
         let Some(w) = self.sched.clone() else { return };
@@ -199,7 +212,13 @@ pub struct Options {
     /// 還不知道結果會不會由別處提供（串接中、還沒跟上游黑潮同步過，3.4.2）：補跑先等，最多 [`PROVIDED_WAIT_MS`]。
     /// 以前第一次同步（串接後 30 秒，上游還在建置時再晚 30 秒）之前，cdn-ranges（30 秒）與 cdn-scan（60 秒）的補跑就開跑了
     pub provided_pending: Option<DeferFn>,
+    /// 這個工作要補跑時排在 [`CATCH_UP_YIELDS`] 這些長工作前面（3.5.0：自動上游還沒評測過時的 dns-benchmark——
+    /// 初始上游的品質影響每一筆查詢，網段掃描晚幾分鐘沒差）。只改補跑的先後，不改 `startDelaySec`
+    pub catch_up_first: Option<ProvidedFn>,
 }
+
+/// 補跑時讓 [`Options::catch_up_first`] 的工作先跑的長工作
+pub const CATCH_UP_YIELDS: [&str; 1] = ["cdn-scan"];
 
 /// 補跑等「是不是由別處提供」的上限（跟過濾清單等第一次同步一樣是 10 分鐘）
 pub const PROVIDED_WAIT_MS: u64 = 10 * MIN_MS;
@@ -218,6 +237,7 @@ impl Options {
             slot_grace_ms: 5 * MIN_MS,
             provided: None,
             provided_pending: None,
+            catch_up_first: None,
         }
     }
 }
@@ -437,6 +457,8 @@ struct St {
     waiting: HashSet<String>,
     /// 要補跑、但結果現在由上游黑潮提供而暫不補跑的工作（`catchUpProvided`，3.4.2）
     provided: HashSet<String>,
+    /// 佇列裡優先的工作（手動觸發的，3.5.0）：開始執行時拿掉
+    priority: HashSet<String>,
 }
 
 struct Inner {
@@ -476,6 +498,7 @@ impl Scheduler {
                     last_tick: None,
                     waiting: HashSet::new(),
                     provided: HashSet::new(),
+                    priority: HashSet::new(),
                 }),
                 notify: Notify::new(),
             }),
@@ -645,6 +668,19 @@ impl Scheduler {
             };
             out.push((name.clone(), start_delay_sec(c), why));
         }
+        // 補跑的先後（3.5.0）：要排前面的工作（自動上游還沒評測過的 dns-benchmark）比 cdn-scan 早的話，
+        // cdn-scan 的補跑延到它之後 1 秒（各自計時，延遲就是先後）
+        if let Some(first) = &self.inner.opts.catch_up_first {
+            if let Some(d) = out.iter().filter(|(n, _, _)| first(n)).map(|(_, d, _)| *d).max() {
+                for e in out.iter_mut() {
+                    if CATCH_UP_YIELDS.contains(&e.0.as_str()) && !first(&e.0) && e.1 <= d {
+                        info!("補跑：{} 排在要先跑的工作之後（{} 秒 → {} 秒）", e.0, e.1, d + 1);
+                        e.1 = d + 1;
+                    }
+                }
+                out.sort_by_key(|(_, d, _)| *d);
+            }
+        }
         out
     }
 
@@ -758,6 +794,38 @@ impl Scheduler {
         json!({ "ok": true })
     }
 
+    /// 手動觸發（管理介面、指令列）的工作：排到佇列最前面（已經在佇列裡的移到最前面），不必等補跑的長工作。
+    /// 仍然一次只跑一個：正在跑的不會被中斷（cdn-scan 會在一家 CDN 掃完時讓出，見 [`JobCtx::priority_waiting`]）。
+    /// 排程、補跑照舊用 [`request`](Self::request) 排在後面（3.5.0）
+    pub fn request_priority(&self, name: &str, reason: &str) -> Value {
+        if !self.is_registered(name) {
+            return json!({ "ok": false, "error": "未知的工作" });
+        }
+        let moved = {
+            let mut st = self.inner.st.lock().unwrap();
+            if st.running.as_ref().map(|r| r.name == name).unwrap_or(false) {
+                return json!({ "ok": false, "error": "執行中" });
+            }
+            let moved = match st.queue.iter().position(|(n, _)| n == name) {
+                Some(i) => {
+                    st.queue.remove(i);
+                    true
+                }
+                None => false,
+            };
+            st.queue.push_front((name.to_string(), reason.to_string()));
+            st.priority.insert(name.to_string());
+            moved
+        };
+        if moved {
+            info!("排入工作 {name}（{reason}），已在佇列，移到最前面");
+        } else {
+            info!("排入工作 {name}（{reason}），排在最前面");
+        }
+        self.inner.notify.notify_one();
+        json!({ "ok": true })
+    }
+
     /// 佇列裡有工作、目前沒在跑、系統不吃緊 → 啟動下一個。回傳有沒有啟動。
     pub fn try_start_next(&self) -> bool {
         let defer = self.inner.opts.should_defer.as_ref().map(|f| f()).unwrap_or(false);
@@ -776,6 +844,7 @@ impl Scheduler {
             st.defer_logged = false;
             let mut picked = None;
             while let Some((name, reason)) = st.queue.pop_front() {
+                st.priority.remove(&name);
                 let Some(job) = self.inner.jobs.lock().unwrap().get(&name).cloned() else {
                     continue;
                 };
@@ -907,7 +976,8 @@ impl Scheduler {
             "running": st.running.as_ref().map(|r| json!({
                 "name": r.name, "pid": std::process::id(), "startedAt": r.started_at, "reason": r.reason
             })),
-            "queue": st.queue.iter().map(|(n, r)| json!({ "name": n, "reason": r })).collect::<Vec<_>>(),
+            // 3.5.0：priority = 手動觸發、排在最前面的
+            "queue": st.queue.iter().map(|(n, r)| json!({ "name": n, "reason": r, "priority": st.priority.contains(n) })).collect::<Vec<_>>(),
             "state": Value::Object(st.state.clone()),
             "config": Value::Object(cfg),
             "nextRun": Value::Object(next),

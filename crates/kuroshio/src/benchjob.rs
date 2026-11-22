@@ -28,8 +28,9 @@ use tracing::{debug, error, info, warn};
 /// 子程序的隱藏指令
 pub const CHILD_CMD: &str = "__job-dns-benchmark";
 
-/// 依設定建一個評測（主程式與子程序共用，路徑一模一樣）
-pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchmark {
+/// 評測用到的檔案位置：使用者的名單（`benchmark.dir`）不存在就用程式附帶的；兩邊不同時合併。
+/// 評測與首次啟動的初始上游（3.5.0）共用
+pub fn bench_paths(cfg: &Value, state_dir: &Path, base_dir: &Path) -> BenchPaths {
     let mut paths = BenchPaths::from_config(cfg, state_dir, base_dir);
     let shipped = share_dir(cfg).join("benchmark");
     if !paths.list_dir.is_dir() {
@@ -38,6 +39,12 @@ pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchma
     if shipped.is_dir() && shipped != paths.list_dir {
         paths.default_list_dir = Some(shipped);
     }
+    paths
+}
+
+/// 依設定建一個評測（主程式與子程序共用，路徑一模一樣）
+pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchmark {
+    let mut paths = bench_paths(cfg, state_dir, base_dir);
     // 評測報表放記憶體：Flash 上不寫每天的報表；
     // 最近一次的摘要（judge.log、eliminated.csv、upstreams.json，各 128 KB 以內）另存到學習資料區，重開機後還查得到
     let mut keep_last = None;
@@ -107,6 +114,21 @@ impl Job for BenchJob {
                 "skipped": "由上游黑潮提供，略過",
             }));
             return Box::pin(async { Ok(()) });
+        }
+        // 執行時上線以來從未成功、先不用的自動上游（3.5.0 A7）：寫進學習檔的 neverOk，這次評測照測、不選
+        let never_ok = crate::upstreams::take_never_ok();
+        if !never_ok.is_empty() {
+            let ok = self
+                .inner
+                .paths
+                .learn_file
+                .as_ref()
+                .is_some_and(|p| kuroshio_jobs::benchmark::learn::merge_never_ok(p, &never_ok, ctx.now_ms()));
+            if ok {
+                info!("評測：執行時從未成功的自動上游 {} 台，這次照測、不選", never_ok.len());
+            } else {
+                crate::upstreams::restore_never_ok(never_ok);
+            }
         }
         match self.child.clone() {
             Some((exe, state, base)) => {

@@ -783,6 +783,17 @@ fn start_scheduler(
     o.provided = Some(Arc::new(crate::chain::share_skips));
     // 正在驗證上游黑潮、或串接了還沒同步過：先等第一次同步，再決定要不要補跑（最多 10 分鐘）
     o.provided_pending = Some(Arc::new(crate::chain::share_pending));
+    // 自動上游還沒評測過（來自預設名單、或舊版的種子：upstreams.json 沒有 generatedAt）：
+    // 每日評測的補跑排在 cdn-scan 前面（3.5.0）
+    let up_file = state_path(
+        cfg,
+        get(cfg, "upstream.autoStateFile")
+            .and_then(Value::as_str)
+            .unwrap_or("./state/upstreams.json"),
+    );
+    o.catch_up_first = Some(Arc::new(move |name: &str| {
+        name == "dns-benchmark" && !upstreams_benchmarked(&up_file)
+    }));
     let slot: Arc<std::sync::OnceLock<std::sync::Weak<Scheduler>>> = Arc::new(std::sync::OnceLock::new());
     let (s2, p2) = (slot.clone(), persister.clone());
     o.on_state_change = Some(Arc::new(move || {
@@ -816,6 +827,14 @@ fn start_scheduler(
         s2.start();
     });
     sched
+}
+
+/// `upstreams.json` 是不是評測過的結果（有 `generatedAt`）。預設名單產生的初始上游、讀不到的都不算
+fn upstreams_benchmarked(path: &std::path::Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .is_some_and(|v| v.get("generatedAt").is_some_and(Value::is_string))
 }
 
 /// 背景工作用的記憶體檢查：吃緊時回傳原因。記憶體控制改版時只要改這裡
@@ -886,14 +905,28 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
         }
     });
     let c = cdn.clone();
+    // 有手動執行的工作在等時，在一家 CDN 掃完的邊界讓出、5 分鐘後續跑（跳過已經掃完的那幾家），最多讓出 3 次（3.5.0）
+    let resume: Arc<Mutex<scan::Resume>> = Default::default();
     sched.register("cdn-scan", move |ctx: kuroshio_jobs::JobCtx| {
-        let c = c.clone();
+        let (c, resume) = (c.clone(), resume.clone());
         async move {
             if crate::chain::share_skips("cdn-scan") {
                 info!("cdn-scan：由上游黑潮提供，略過");
                 return Ok(());
             }
-            let r = scan::run(&cdn_job_ctx(ctx, c)).await?;
+            let (skip, may_yield) = resume.lock().unwrap().prepare(Instant::now());
+            let mut cctx = cdn_job_ctx(ctx.clone(), c);
+            cctx.scan_skip = skip;
+            if may_yield && ctx.can_requeue() {
+                let ctx2 = ctx.clone();
+                cctx = cctx.with_yield_check(Arc::new(move || ctx2.priority_waiting()));
+            }
+            let r = scan::run(&cctx).await?;
+            resume.lock().unwrap().finish(&r, Instant::now());
+            if r.yielded {
+                ctx.request_later(Duration::from_secs(300), "續跑（讓給手動執行的工作）");
+                return Ok(());
+            }
             crate::chain::note_own_run("cdn-scan");
             info!(
                 "CDN 網段分類：{} 家，{}",
@@ -1907,9 +1940,16 @@ pub async fn start(cfg: &Value) -> Result<Started> {
             );
         }
     }
-    // 第一次啟動：state 還是空的就帶入種子資料（評測結果、節點池、網站驗證紀錄）
+    // 第一次啟動：state 還是空的就帶入種子資料（節點池、IPv6 節點、網站驗證紀錄）
     // （apply_seeds 自己會記錄帶入了哪些）
     let _ = kuroshio_jobs::apply_seeds(&persist_dir(cfg), &share_dir(cfg).join("seed"));
+    // 還沒有評測結果：初始上游用預設名單的 A 級（3.5.0；以前用種子裡別條線路的評測結果）。
+    // 只讀名單、不查詢任何伺服器；評測完成就被取代
+    {
+        let state_dir = persist_dir(cfg);
+        let base = state_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state_dir.clone());
+        let _ = kuroshio_jobs::apply_initial_upstreams(&crate::benchjob::bench_paths(cfg, &state_dir, &base), cfg);
+    }
     let resolver = build_resolver(cfg)?;
     // 來源 IP 存取控制（規格 08）：在任何監聽啟動之前
     let access = {
@@ -2043,6 +2083,20 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     }
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));
+    // 有自動上游「上線以來從未成功」先不用、可用的（含候補）又不夠時：提早評測，12 小時內最多一次（3.5.0 A7）。
+    // 串接中由上游提供評測結果時不排
+    if let Some(s) = &scheduler {
+        let (m, s) = (Arc::downgrade(&resolver.upstreams), Arc::downgrade(s));
+        resolver.upstreams.on_auto_benched(Arc::new(move || {
+            let (Some(m), Some(s)) = (m.upgrade(), s.upgrade()) else { return };
+            if m.auto_short() && !crate::chain::share_skips("dns-benchmark") {
+                let r = s.request_with_gap("dns-benchmark", "自動上游不足", 720.0);
+                if r["ok"] == json!(true) {
+                    info!("可用的自動上游不夠（連候補都沒有），提早評測");
+                }
+            }
+        }));
+    }
     // 串接的共用結果（3.4.0，規格 10 第 3 節）：CDN、過濾、排程器都啟動之後。上游接上 ShareCache、
     // 下游建立／接回同步（工作開頭的 share_skips 只在共用結果新鮮、而且串接中時略過）
     crate::chain::share::start(cfg, &resolver, cdn.clone(), &persister, scheduler.as_ref());
