@@ -171,6 +171,7 @@
 - 保留量：自動（Linux / Windows 各種大小）、百分比、絕對值、兩個都填取大的、百分比上限、不超過一半（`reserve_derivation`）。
 - 量測間隔：低於保留量 2 秒、兩倍以內 3 秒、遠 30 秒、PSI 有等待 3 秒（`poll_interval_follows_distance_and_psi`）。
 - 遲滯：吃緊 → 寬裕要回到保留量 + 遲滯而且持續 180 秒；不足一次只放鬆一級（`hysteresis_and_dwell`）。
+- 狀態（`/api/status` 的 `memory.state`）是放鬆前要穩定的那一個；當下的量測另外放在 `memory.pressure`（`normal`／`low`／`critical`，3.4.3）。日誌的「記憶體回到保留量以上」看的是當下的量測，`state` 會晚幾分鐘才變回寬裕，這是刻意的（避免來回切換）。
 - 可用只剩保留量的 30%：同一輪做完整個階梯到「只轉送」，下一輪沒有可以做的；差額小時補足就停（`far_below_reserve_escalates_several_steps_in_one_tick`）。
 - 接近保留量（保留 + 遲滯以內）：不釋出、停止長大；回到寬裕恢復長大（`growth_stops_near_reserve_and_resumes_when_comfortable`）。
 - 恢復依相反順序、等空間 × 1.3、失敗指數退避（`near_reserve_one_step_per_tick_then_restore_in_reverse`、`restore_waits_for_headroom_and_backs_off`、`restore_failure_backs_off`）。

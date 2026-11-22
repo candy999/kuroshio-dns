@@ -1614,7 +1614,9 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             if p != last {
                 let (a, res) = (r.avail.unwrap_or(0) >> 20, reserve.bytes >> 20);
                 match p {
-                    Pressure::Normal => info!("記憶體恢復正常（可用 {a} MB，保留 {res} MB）"),
+                    // 這是「當下」的量測；記憶體控制的狀態（`memory.state`）要穩定一段時間才放鬆（遲滯，預設 3 分鐘），
+                    // 兩者會差幾分鐘（3.4.3：日誌寫「恢復正常」、狀態頁卻還是吃緊，看起來像錯誤）
+                    Pressure::Normal => info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆"),
                     Pressure::Low => info!("記憶體接近保留量（可用 {a} MB，保留 {res} MB）：背景工作延後、記憶體結構不再長大"),
                     Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }
