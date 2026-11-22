@@ -1,7 +1,7 @@
 'use strict';
 // CI：介面共用邏輯 data/shared/ui-core.js 的測試向量（data/shared/ui-core.tests.json）逐一檢查，不需要瀏覽器、不需要安裝套件
 //   node tools/ui-core-test.js
-// 另外用同一組 fmtTime 向量檢查共用儀表板 data/dashboard/dashboard.js 的 KuroshioDashboard.fmtTime（兩份規則必須一致）
+// 另外用同一組 fmtTime、regionLabel 向量檢查共用儀表板 data/dashboard/dashboard.js 的 KuroshioDashboard.fmtTime（兩份規則必須一致）
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
@@ -39,6 +39,10 @@ for (const fn of Object.keys(vectors)) {
         try { got = norm(core[fn].apply(null, args)); } catch (e) { check(false, `${label}：${e.message}`); return; }
         const ok = JSON.stringify(got) === JSON.stringify(c.expect);
         check(ok, `${label}\n     參數 ${JSON.stringify(c.args)}\n     預期 ${JSON.stringify(c.expect)}\n     實際 ${JSON.stringify(got)}`);
+        if (fn === 'regionLabel' && typeof c.args[1] !== 'string') {
+            const d = dash.KuroshioDashboard.regionLabel.apply(null, args);
+            check(d === c.expect, `${label}：dashboard.js 的 regionLabel 結果不同（${JSON.stringify(d)}，預期 ${JSON.stringify(c.expect)}）`);
+        }
         if (fn === 'fmtTime' && args.length < 3) {
             const d = dash.KuroshioDashboard.fmtTime.apply(null, args);
             check(d === c.expect, `${label}：dashboard.js 的 fmtTime 結果不同（${JSON.stringify(d)}，預期 ${JSON.stringify(c.expect)}）`);

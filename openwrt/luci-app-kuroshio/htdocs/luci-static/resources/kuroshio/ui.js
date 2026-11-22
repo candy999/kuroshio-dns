@@ -265,6 +265,13 @@ return baseclass.extend({
 		return x && typeof x.controlSummary === 'function' ? x.controlSummary(list, function(s) { return _(s); }) : null;
 	},
 
+	/** 上游的地區 → 「台灣」「鄰近（註冊地 GB）」「註冊地 GB」（ui-core.js 的 regionLabel）；ui-core.js 是舊的時照舊顯示國別 */
+	regionLabel: function(u) {
+		var x = core();
+		if (x && typeof x.regionLabel === 'function') return x.regionLabel(u, function(s) { return _(s); });
+		return (u && u.region) || '';
+	},
+
 	/** 小標籤（狀態用）：kind = ok / warn / err / off */
 	badge: function(text, kind) {
 		return T('span', { 'class': 'kuroshio-badge', 'data-kind': kind || 'off',

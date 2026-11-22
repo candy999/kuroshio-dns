@@ -261,6 +261,12 @@ async fn upstreams_json_has_region() {
     let row = |id: &str| csv.lines().find(|l| l.split(',').nth(1) == Some(id)).unwrap().to_string();
     assert!(row(&ids[1]).ends_with(",,TW,Y,B,"), "{csv}");
     assert!(row(&ids[3]).ends_with(",,US,,B,"), "{csv}");
+    // 地區的依據（3.5.0 B9）：台灣網段是 tw-net，其他（ip-api 的國別、查不到）是 registered（註冊地）
+    let src = |id: &str| state["selected"].as_array().unwrap().iter().find(|x| x["id"] == id).unwrap()["regionSource"].clone();
+    assert_eq!(src(&ids[1]), "tw-net");
+    for i in [0, 2, 3, 4] {
+        assert_eq!(src(&ids[i]), "registered", "{}", ids[i]);
+    }
     // 台灣率（3.5.0 B5）：只有 2 個網域，樣本太少 → null；ecs 來自名單標記（沒寫是 false）
     for x in state["selected"].as_array().unwrap() {
         assert_eq!(x["twRate"], Value::Null, "{x}");

@@ -28,6 +28,9 @@ pub struct Scored {
     pub region: String,
     /// 鄰近（台灣、日本、香港、新加坡且延遲合理，或延遲本身就夠低）：`coverage_region = near` 時優先挑
     pub near: bool,
+    /// `region` 的依據（3.5.0 B9）：`"tw-net"`（位址在台灣網段，可信）或 `"registered"`（ip-api 的國別是 IP 的註冊地，
+    /// 任播的公共 DNS 在東京的節點也會標成別國）。只影響顯示
+    pub region_source: &'static str,
     /// 名單的分級（3.5.0）："A"／"B"／"user"；只輸出，不影響選擇
     pub tier: &'static str,
     /// 名單標記的經營者（3.5.0）
@@ -79,9 +82,19 @@ pub const NEAR_REGIONS: [&str; 4] = ["TW", "JP", "HK", "SG"];
 ///
 /// `min == 0` 是沒有成功紀錄，一律不算鄰近
 pub fn classify_region(in_tw: bool, cc: &str, min_ms: f64, near_max_ms: f64) -> (String, bool) {
+    // 註：`region` 不改值（串接的下游、auto_shared() 都在讀）；依據另外放在 `region_source`（見 [`region_source`]）
     let region = if in_tw { "TW".to_string() } else { cc.trim().to_ascii_uppercase() };
     let near = min_ms > 0.0 && (min_ms <= near_max_ms || (NEAR_REGIONS.contains(&region.as_str()) && min_ms <= near_max_ms * 2.0));
     (region, near)
+}
+
+/// `region` 的依據（3.5.0 B9）：位址在台灣網段是 `"tw-net"`，其他（ip-api 的國別、或查不到）是 `"registered"`
+pub fn region_source(in_tw: bool) -> &'static str {
+    if in_tw {
+        "tw-net"
+    } else {
+        "registered"
+    }
 }
 
 /// 2.x 的 `ext`

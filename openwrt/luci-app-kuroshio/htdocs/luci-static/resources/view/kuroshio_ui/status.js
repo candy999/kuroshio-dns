@@ -243,8 +243,8 @@ return view.extend({
 
 		var ups = (api.upstreams || []).map(function(u) {
 			var role = { pinned: _('固定'), auto: _('自動'), fallback: _('備援'), chain: _('串接') }[u.role] || u.role;
-			// 選上的原因；上游所在地區（3.4.0，評測判斷的國別）放在原因旁邊
-			var why = [u.reason, u.region].filter(function(x) { return !!x; }).join(' · ');
+			// 選上的原因；上游所在地區放在原因旁邊（3.5.0：國別是 IP 的註冊地，標成「註冊地 GB」「鄰近（註冊地 GB）」）
+			var why = [u.reason, common.regionLabel(u)].filter(function(x) { return !!x; }).join(' · ');
 			if (why) role += '（' + why + '）';
 			var note = [];
 			if (u.benched) note.push(_('從未成功，先不用'));

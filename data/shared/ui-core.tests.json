@@ -124,5 +124,16 @@
     {"name":"舊版沒有這個欄位","args":[null],"expect":null},
     {"name":"判出、沒判出、沒測到、回歸","args":[[{"id":"tls://dns.example.com","result":"detected","regress":false},{"id":"192.0.2.1","result":"detected"},{"id":"https://filter.example.net/dns-query","result":"passed","regress":true},{"id":"quic://dns.example.com","result":"untested","regress":false}]],"expect":"對照組 4 台：判出 2、沒判出 1、沒測到 1；回歸 1"},
     {"name":"翻譯函式","args":[[{"result":"passed"}],"bracket"],"expect":"[對照組 1 台：判出 0、沒判出 1、沒測到 0；回歸 0]"}
+  ],
+  "regionLabel": [
+    {"name":"台灣網段","args":[{"region":"TW","regionSource":"tw-net","near":true}],"expect":"台灣"},
+    {"name":"註冊地、鄰近（任播）","args":[{"region":"GB","regionSource":"registered","near":true}],"expect":"鄰近（註冊地 GB）"},
+    {"name":"註冊地、不鄰近","args":[{"region":"US","regionSource":"registered","near":false}],"expect":"註冊地 US"},
+    {"name":"沒有國別、鄰近","args":[{"region":null,"regionSource":"registered","near":true}],"expect":"鄰近"},
+    {"name":"沒有國別、不鄰近","args":[{"region":"","regionSource":"registered","near":false}],"expect":""},
+    {"name":"舊版沒有 regionSource：當註冊地","args":[{"region":"TW"}],"expect":"註冊地 TW"},
+    {"name":"固定上游（沒有評測的地區）","args":[{"region":null,"regionSource":null,"near":null}],"expect":""},
+    {"name":"沒有資料","args":[null],"expect":""},
+    {"name":"翻譯函式","args":[{"region":"JP","regionSource":"registered","near":true},"bracket"],"expect":"[鄰近（註冊地 JP）]"}
   ]
 }

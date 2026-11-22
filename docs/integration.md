@@ -586,6 +586,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 - `upstreams.json` 的 `selected[]` 每筆多 `region` 與 `near`；`final_dns_smart.csv` 最後多 `Region`、`Near` 兩欄（舊的欄位順序不變）。
 - `/api/status` 的 `upstreams[]` 多 `region`（沒有是 `null`）。狀態頁顯示在選上原因的旁邊，例如「自動（覆蓋 · JP）」。
+- 3.5.0：`selected[]`／`spares[]` 多 `regionSource`（`"tw-net"` 位址在台灣網段；`"registered"` ip-api 的國別，也就是 IP 的註冊地）。`/api/upstreams`、`/api/status` 的 `upstreams[]` 多 `regionSource` 與 `near`（以前 `near` 只在 `upstreams.json`）；舊的 `upstreams.json` 沒有 `regionSource` 一律是 `"registered"`；固定上游、備援、串接上游三個欄位都是 `null`。`region` 的值不變。顯示規則在 ui-core.js 的 `regionLabel(u)`：`tw-net` →「台灣」、註冊地而且 `near` →「鄰近（註冊地 GB）」、註冊地 →「註冊地 GB」、沒有國別而且 `near` →「鄰近」，其他不顯示。
 
 ## 每日評測與預設名單（3.5.0 起）
 

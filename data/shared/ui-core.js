@@ -10,6 +10,7 @@
  *   restoreSummary(changes, tr)     「恢復預設清單」的變更清單（文字，畫面由各介面自己組）
  *   chainView(chain, tr, now)       /api/status 的 chain（串接模式）→ 狀態頁顯示用的資料（下游與上游兩種角色）
  *   controlSummary(list, tr)        /api/benchmark 的 protected[]（對照組）→ 一行摘要
+ *   regionLabel(u, tr)              上游的地區（region、regionSource、near）→「台灣」「鄰近（註冊地 GB）」「註冊地 GB」「鄰近」
  *   format(template, args)          %s / %d 代換
  * 每個函式的輸入與預期輸出在 data/shared/ui-core.tests.json（CI 用 tools/ui-core-test.js 檢查）。
  *
@@ -291,6 +292,23 @@
 		return format(t('對照組 %d 台：判出 %d、沒判出 %d、沒測到 %d；回歸 %d'), [list.length, n.detected, n.passed, n.untested, reg]);
 	}
 
+	/**
+	 * 上游的地區（/api/upstreams、/api/status 的 upstreams[]，或 upstreams.json 的 selected[]；3.5.0）→ 顯示文字。
+	 * 評測用 ip-api 查到的國別是 IP 的「註冊地」，任播的公共 DNS 在東京的節點也會標成 GB、AU，所以不寫成實際位置：
+	 *   regionSource = 'tw-net'（位址在台灣網段）：「台灣」
+	 *   註冊地、near：「鄰近（註冊地 GB）」；註冊地、不 near：「註冊地 GB」
+	 *   沒有國別：near 是「鄰近」，否則 ''（不顯示）
+	 * 沒有 regionSource（舊版）一律當註冊地。跟 data/dashboard/dashboard.js 的 KuroshioDashboard.regionLabel 同一份規則
+	 */
+	function regionLabel(u, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!u) return '';
+		var region = u.region ? String(u.region) : '', near = u.near === true;
+		if (region && u.regionSource === 'tw-net') return t('台灣');
+		if (region) return format(t(near ? '鄰近（註冊地 %s）' : '註冊地 %s'), [region]);
+		return near ? t('鄰近') : '';
+	}
+
 	var core = {
 		fmtTime: fmtTime,
 		fmtBytes: fmtBytes,
@@ -299,7 +317,8 @@
 		restorePlan: restorePlan,
 		restoreSummary: restoreSummary,
 		chainView: chainView,
-		controlSummary: controlSummary
+		controlSummary: controlSummary,
+		regionLabel: regionLabel
 	};
 
 	if (root) root.KuroshioUiCore = core;

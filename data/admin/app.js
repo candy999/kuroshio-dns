@@ -691,8 +691,9 @@
 			else if (rate >= 0.9) h = badge('正常 ' + Math.round(rate * 100) + '%', 'ok');
 			else if (rate >= 0.5) h = badge('不穩 ' + Math.round(rate * 100) + '%', 'warn');
 			else h = badge('異常 ' + Math.round(rate * 100) + '%', 'err');
-			// 選上的原因；上游所在地區（3.4.0，評測判斷的國別）放在原因旁邊
-			var why = [u.reason, u.region].filter(function (x) { return !!x; }).join(' · ');
+			// 選上的原因；上游所在地區放在原因旁邊（3.5.0：國別是 IP 的註冊地，標成「註冊地 GB」「鄰近（註冊地 GB）」，ui-core.js 的 regionLabel）
+			var place = typeof core.regionLabel === 'function' ? core.regionLabel(u) : u.region;
+			var why = [u.reason, place].filter(function (x) { return !!x; }).join(' · ');
 			var role = (ROLE[u.role] || u.role) + (why ? '（' + why + '）' : '') + (u.via === 'interceptor' ? ' · 經由攔截者' : '');
 			return [{ text: u.id, cls: 'mono' }, role, { text: fmtNum(u.ok), cls: 'num' }, { text: fmtNum(u.fail), cls: 'num' }, { text: u.avgMs != null ? u.avgMs + ' ms' : '-', cls: 'num' }, h];
 		}), 6);

@@ -569,6 +569,18 @@
   const verdictTag = v => !v ? tag('—') : v.verdict === 'ok' ? tag('可置換', 'ok') : v.verdict === 'fail' ? tag('不可', 'bad') : tag('未判定', 'warn');
   Object.assign(KD, { table, tag, verdictTag });
 
+  /**
+   * 上游的地區（3.5.0）：國別是 IP 的「註冊地」（任播的公共 DNS 在東京的節點也會標成 GB），不寫成實際位置。
+   * 跟 data/shared/ui-core.js 的 regionLabel 同一份規則（tools/ui-core-test.js 用同一組向量檢查）
+   */
+  KD.regionLabel = u => {
+    if (!u) return '';
+    const region = u.region ? String(u.region) : '', near = u.near === true;
+    if (region && u.regionSource === 'tw-net') return '台灣';
+    if (region) return (near ? '鄰近（註冊地 ' : '註冊地 ') + region + (near ? '）' : '');
+    return near ? '鄰近' : '';
+  };
+
   // =====================================================================================
   // 轉接器：資料從哪裡來
   // =====================================================================================
@@ -842,7 +854,8 @@
             { h: '上游', v: u => u.id, cls: 'mono' },
             { h: '角色', v: u => tag(u.role === 'pinned' ? '固定' : u.role === 'auto' ? '自動' : u.role === 'fallback' ? '備援' : u.role, u.paused ? 'bad' : '') },
             { h: '成功', v: u => nf.format(u.ok), num: 1 }, { h: '失敗', v: u => nf.format(u.fail), num: 1 },
-            { h: '平均 ms', v: u => u.avgMs ?? '—', num: 1 }
+            { h: '平均 ms', v: u => u.avgMs ?? '—', num: 1 },
+            { h: '地區', v: u => KD.regionLabel(u) || '—' }
           ]);
           const er = s.errors || { count: 0, recent: [] };
           const eb = sec.errBox; eb.textContent = er.count ? `處理例外 ${nf.format(er.count)} 次（已回 SERVFAIL，沒有讓裝置乾等）· 最近：${er.recent.slice(0, 3).map(x => ago(x.at) + ' ' + x.msg.slice(0, 120)).join('；')}` : '處理例外 0 次';
@@ -883,6 +896,7 @@
         table(t, [...b.selected.map(x => ({ ...x, role: '自動' })), ...b.pinned.map(x => ({ ...x, role: '固定', type: '', newItems: x.coverageItems, reason: x.issues.length ? x.issues.length + ' 個問題' : '' }))], [
           { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 },
           // 台灣率（3.5.0）：CDN 網域的答案本來就是台灣節點的比例（只在覆蓋差不多時當決勝條件）；ECS＝名單標記會帶 ECS
+          { h: '地區', v: r => KD.regionLabel(r) || '—' },
           { h: '台灣率', v: r => (r.twRate == null ? '—' : pct1(r.twRate)) + (r.ecs ? ' · ECS' : ''), num: 1 },
           { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
         ]);

@@ -673,6 +673,7 @@ impl Srv {
             // Phase 2 查完業者之後才填（classify_region）
             region: String::new(),
             near: false,
+            region_source: "registered",
             tier: self.tag.tier.name(),
             op: self.tag.op.clone(),
             excluded: self.never_ok,
@@ -1540,6 +1541,7 @@ impl Benchmark {
                 let in_tw = matches!((&tw_nets, ip), (Some(n), Some(ip)) if n.contains(*ip));
                 let cc = info.map(|x| x.cc.as_str()).unwrap_or("");
                 (s.region, s.near) = select::classify_region(in_tw, cc, s.min, cfg.near_max_ms);
+                s.region_source = select::region_source(in_tw);
                 s
             })
             .collect();
@@ -1674,7 +1676,7 @@ impl Benchmark {
             .iter()
             .map(|p| {
                 let s = &calc.finals[p.idx];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "regionSource": s.region_source, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
             })
             .collect();
         // 候補（3.5.0 A7）：沒選上、但合格的前幾台（依速度）；執行時可用的自動上游不夠時依序補上
@@ -1683,7 +1685,7 @@ impl Benchmark {
             .iter()
             .map(|&i| {
                 let s = &calc.finals[i];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": 0, "reason": "候補", "region": s.region, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": 0, "reason": "候補", "region": s.region, "regionSource": s.region_source, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
             })
             .collect();
         let pinned: Vec<Value> = calc
