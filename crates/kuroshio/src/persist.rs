@@ -479,6 +479,15 @@ impl Persister {
         self.entries.get(name).is_some_and(|e| e.pending.is_some())
     }
 
+    /// 還在等寫出的內容（`stage` 登記的；串流的快照回傳 None）。讀的人不必等下一輪寫出：
+    /// 過濾清單的副本登記之後最多 5 分鐘（Flash 上可能好幾小時）才寫到磁碟，這段時間重建要讀得到
+    pub fn pending_bytes(&self, name: &str) -> Option<Vec<u8>> {
+        match &self.entries.get(name)?.pending.as_ref()?.data {
+            Data::Bytes(_, d) => Some(d.clone()),
+            Data::Stream(_) => None,
+        }
+    }
+
     /// 登記最新內容（還不寫）；內容跟已寫入的一樣就什麼都不做
     pub fn stage(&mut self, name: &str, data: Vec<u8>) {
         self.stage_with(name, Snapshot::Bytes(data), Opts::default(), now_secs());
