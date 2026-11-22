@@ -1,0 +1,39 @@
+# 對照組：有過濾的大型 DNS，每日評測照常測、照常判，用來確認評測判得出過濾（3.4.2）
+# 永遠不選來用、不算覆蓋、不參加多數決、不記可疑、不進永久黑名單（也不看永久黑名單）
+# 結果在 upstreams.json 的 protected 與報表的 protected.csv：detected＝判出過濾、passed＝沒判出、untested＝沒測到
+#   3.4.2 的評測網域有成人網站與追蹤網域，還沒有惡意網站：只擋惡意網站的（malware）判不出來是預期的，3.5.0 補上
+# 格式：一行一個上游（一般 DNS 的位址或 https://、tls://、quic://），後面 filter= 是預期會擋的類型；最多 64 台
+# 2026-11-22 整理：老毛子 D3 直連實測有過濾、或官方文件寫明有過濾的；官方沒寫的 Quad9 名稱保守列入
+
+https://dns.adguard-dns.com/dns-query  # filter=ads 依據：老毛子 D3 實測擋廣告 checked=2026-11-22
+https://family.adguard-dns.com/dns-query  # filter=ads,adult 依據：老毛子 D3 實測；AdGuard 家庭版 checked=2026-11-22
+https://security.cloudflare-dns.com/dns-query  # filter=malware 依據：老毛子 D3 實測；Cloudflare 1.1.1.2 checked=2026-11-22
+https://family.cloudflare-dns.com/dns-query  # filter=adult,malware 依據：老毛子 D3 實測；Cloudflare 1.1.1.3 checked=2026-11-22
+https://doh.cleanbrowsing.org/doh/security-filter  # filter=malware 依據：CleanBrowsing 官方：Security 過濾 checked=2026-11-22
+https://doh.safesurfer.io/dns-query  # filter=adult,malware 依據：老毛子 D3 實測 checked=2026-11-22
+tls://dns.quad9.net  # filter=malware 依據：Quad9 官方：9.9.9.9 擋惡意網站 checked=2026-11-22
+tls://dns9.quad9.net  # filter=malware 依據：9.9.9.9 的反解名稱 checked=2026-11-22
+tls://dns11.quad9.net  # filter=malware 依據：Quad9 官方：9.9.9.11 擋惡意網站、帶 ECS checked=2026-11-22
+tls://dns13.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+tls://alpha-dns.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+tls://doh-mullvad.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+tls://protective.joindns4.eu  # filter=malware 依據：DNS4EU 官方：Protective checked=2026-11-22
+tls://child.joindns4.eu  # filter=adult,malware 依據：DNS4EU 官方：Child checked=2026-11-22
+tls://noads.joindns4.eu  # filter=ads,malware 依據：DNS4EU 官方：No ads；老毛子 D3 實測 checked=2026-11-22
+tls://child-noads.joindns4.eu  # filter=ads,adult,malware 依據：DNS4EU 官方；老毛子 D3 實測 checked=2026-11-22
+quic://dns.adguard-dns.com  # filter=ads 依據：老毛子 D3 實測 checked=2026-11-22
+quic://family.adguard-dns.com  # filter=ads,adult 依據：老毛子 D3 實測 checked=2026-11-22
+quic://dns.quad9.net  # filter=malware 依據：Quad9 官方 checked=2026-11-22
+quic://dns9.quad9.net  # filter=malware 依據：9.9.9.9 的反解名稱 checked=2026-11-22
+quic://dns11.quad9.net  # filter=malware 依據：Quad9 官方 checked=2026-11-22
+quic://dns13.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+quic://alpha-dns.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+quic://doh-mullvad.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+94.140.14.14  # filter=ads 依據：AdGuard 預設；老毛子 D3 實測 checked=2026-11-22
+2a10:50c0::ad1:ff  # filter=ads 依據：AdGuard 預設；老毛子 D3 實測 checked=2026-11-22
+1.1.1.2  # filter=malware 依據：Cloudflare security；老毛子 D3 實測 checked=2026-11-22
+2606:4700:4700::1112  # filter=malware 依據：Cloudflare security；老毛子 D3 實測 checked=2026-11-22
+76.76.2.2  # filter=ads 依據：ControlD；老毛子 D3 實測擋廣告 checked=2026-11-22
+9.9.9.9  # filter=malware 依據：Quad9 官方 checked=2026-11-22
+149.112.112.9  # filter=malware 依據：dns9.quad9.net checked=2026-11-22
+2620:fe::fe:9  # filter=malware 依據：dns9.quad9.net checked=2026-11-22

@@ -3,9 +3,9 @@
 # 2026-11-22 重新整理（3.4.2）：在沒有攔截的線路上（台灣 HiNet PPPoE 直接撥號）重測黑潮原本的名單與 HaGeZi 的 DoH 清單，
 #   3 輪都通過、答案正確、「不存在」沒被改寫、不擋廣告／成人／惡意網站的才收。
 #   tier=A：經營者明確（知名的公共 DNS）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
-#   有過濾的大型 DNS（保護組）、連不上的、有改寫的不在這裡；保護組在 3.5.0 另外列。
+#   連不上的、有改寫的不在這裡；有過濾的大型 DNS 是對照組，另外列在 protected.txt（照常評測、永遠不選）。
 #   op＝AS 名稱（租機房的經營者會是機房的名字）；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
-# 共 200 筆：A 100、B 100
+# 共 192 筆：A 92、B 100
 
 # ---- A 級 ----
 tls://dns.nextdns.io  # tier=A op=Misaka_Network ms=3.2 src=kuroshio-default checked=2026-11-22
@@ -22,20 +22,14 @@ tls://dns2.nordvpn.com  # tier=A op=PacketHub_S.A. ms=34.7 src=hagezi checked=20
 tls://public.dns.iij.jp  # tier=A op=Internet_Initiative_Japan_Inc. ms=35.2 src=kuroshio-default checked=2026-11-22
 tls://jp-to.foxyfy.net  # tier=A op=xTom_Japan_Corporation ms=35.4 src=hagezi checked=2026-11-22
 tls://han01.dnscry.pt  # tier=A op=365_Online_technology_joint_stock_compan ms=46.9 src=kuroshio-default checked=2026-11-22
-tls://dns.quad9.net  # tier=A op=Quad9 ms=48.9 src=hagezi checked=2026-11-22
-tls://doh-mullvad.quad9.net  # tier=A op=Quad9 ms=49.0 src=hagezi checked=2026-11-22
-tls://dns13.quad9.net  # tier=A op=Quad9 ms=50.3 src=hagezi checked=2026-11-22
 tls://dns-nosec.quad9.net  # tier=A op=Quad9 ms=50.5 src=hagezi checked=2026-11-22
 tls://tyo02.dnscry.pt  # tier=A op=WebHorizon_Internet_Services ms=51.7 src=kuroshio-default checked=2026-11-22
 tls://tyo03.dnscry.pt  # tier=A op=Host_Universal_Pty_Ltd ms=55.7 src=kuroshio-default checked=2026-11-22
 tls://dns10.quad9.net  # tier=A op=Quad9 ms=58.2 src=kuroshio-default checked=2026-11-22
-tls://dns11.quad9.net  # tier=A op=Quad9 ms=58.8 ecs=1 src=hagezi checked=2026-11-22
-tls://alpha-dns.quad9.net  # tier=A op=Quad9 ms=59.0 src=hagezi checked=2026-11-22
 tls://dns12.quad9.net  # tier=A op=Quad9 ms=59.1 ecs=1 src=kuroshio-default checked=2026-11-22
 tls://sgn01.dnscry.pt  # tier=A op=HYPERCORE_TECHNOLOGY_JOINT_STOCK_COMPANY ms=62.8 src=kuroshio-default checked=2026-11-22
 tls://sel02.dnscry.pt  # tier=A op=HostHatch_Korea ms=63.1 src=kuroshio-default checked=2026-11-22
 tls://jhb01.dnscry.pt  # tier=A op=Terabix ms=65.2 src=kuroshio-default checked=2026-11-22
-tls://dns9.quad9.net  # tier=A op=Quad9 ms=68.8 src=hagezi checked=2026-11-22
 tls://sin02.dnscry.pt  # tier=A op=WebHorizon_Internet_Services ms=68.9 src=kuroshio-default checked=2026-11-22
 tls://jkt01.dnscry.pt  # tier=A op=PT_Industri_Kreatif_Digital ms=78.7 src=kuroshio-default checked=2026-11-22
 tls://doh.mullvad.net  # tier=A op=LOCIX_LIMITED ms=84.0 src=hagezi checked=2026-11-22
@@ -90,9 +84,7 @@ tls://unfiltered.joindns4.eu  # tier=A op=Whalebone ms=271.1 src=kuroshio-defaul
 tls://per01.dnscry.pt  # tier=A op=Mammoth_Media_Pty_Ltd ms=279.9 src=kuroshio-default checked=2026-11-22
 tls://fra01.dnscry.pt  # tier=A op=Oliver_Horscht_trading_as__SYNLINQ_ ms=281.5 src=hagezi checked=2026-11-22
 tls://bre01.dnscry.pt  # tier=A op=LWLcom_GmbH ms=281.9 src=hagezi checked=2026-11-22
-tls://protective.joindns4.eu  # tier=A op=Whalebone ms=282.6 src=hagezi checked=2026-11-22
 tls://mrs01.dnscry.pt  # tier=A op=Ouiheberg_SARL ms=285.4 src=hagezi checked=2026-11-22
-tls://child.joindns4.eu  # tier=A op=Whalebone ms=287.2 src=hagezi checked=2026-11-22
 tls://iev02.dnscry.pt  # tier=A op=South_Park_Networks_LLC ms=295.3 src=hagezi checked=2026-11-22
 tls://omr01.dnscry.pt  # tier=A op=Andrei_Tiberiu_Holt ms=298.7 src=hagezi checked=2026-11-22
 tls://cpt01.dnscry.pt  # tier=A op=Atomic_(Pty)_Ltd ms=299.5 src=hagezi checked=2026-11-22

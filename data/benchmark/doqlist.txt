@@ -3,21 +3,15 @@
 # 2026-11-22 重新整理（3.4.2）：在沒有攔截的線路上（台灣 HiNet PPPoE 直接撥號）重測黑潮原本的名單與 HaGeZi 的 DoH 清單，
 #   3 輪都通過、答案正確、「不存在」沒被改寫、不擋廣告／成人／惡意網站的才收。
 #   tier=A：經營者明確（知名的公共 DNS）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
-#   有過濾的大型 DNS（保護組）、連不上的、有改寫的不在這裡；保護組在 3.5.0 另外列。
+#   連不上的、有改寫的不在這裡；有過濾的大型 DNS 是對照組，另外列在 protected.txt（照常評測、永遠不選）。
 #   op＝AS 名稱（租機房的經營者會是機房的名字）；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
-# 共 39 筆：A 10、B 29
+# 共 33 筆：A 4、B 29
 
 # ---- A 級 ----
 quic://unfiltered.adguard-dns.com  # tier=A op=AdGuard_Software_Limited ms=21.4 ecs=1 src=kuroshio-default checked=2026-11-22
-quic://dns13.quad9.net  # tier=A op=Quad9 ms=48.9 src=hagezi checked=2026-11-22
 quic://dns-nosec.quad9.net  # tier=A op=Quad9 ms=50.1 src=hagezi checked=2026-11-22
-quic://dns.quad9.net  # tier=A op=Quad9 ms=52.2 src=hagezi checked=2026-11-22
-quic://alpha-dns.quad9.net  # tier=A op=Quad9 ms=52.7 src=hagezi checked=2026-11-22
-quic://dns9.quad9.net  # tier=A op=Quad9 ms=53.0 src=hagezi checked=2026-11-22
 quic://dns12.quad9.net  # tier=A op=Quad9 ms=57.0 ecs=1 src=kuroshio-default checked=2026-11-22
-quic://dns11.quad9.net  # tier=A op=Quad9 ms=57.2 ecs=1 src=hagezi checked=2026-11-22
 quic://dns10.quad9.net  # tier=A op=Quad9 ms=57.8 src=kuroshio-default checked=2026-11-22
-quic://doh-mullvad.quad9.net  # tier=A op=Quad9 ms=60.9 src=hagezi checked=2026-11-22
 
 # ---- B 級 ----
 quic://dns.alidns.com  # tier=B op=Alibaba_(US)_Technology_Co. ms=26.1 ecs=1 src=kuroshio-default checked=2026-11-22
