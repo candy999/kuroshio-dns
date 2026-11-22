@@ -5,9 +5,9 @@
 #   3 輪測試（固定答案、「不存在」沒被改寫、不擋廣告／成人／惡意、不審查、DNSSEC、EDNS、TCP、丟包、延遲）。
 #   用戶線路上的開放解析器（家用路由器之類）不收。
 #   A：經營者明確，每個 ASN 最多 4 台、同一個名稱 IPv4／IPv6 各最多 2 台（anycast 業者有幾百個位址，全收會對同一家打幾百台）；
-#   B：品質都過、經營者看不出來，每個 ASN 最多 1 台，取延遲最低的 250 台。
+#   B：品質都過、經營者看不出來，每個 ASN 最多 1 台（同一家的位址只留一台，不對同一家打幾百台）。
 #   另外保留舊名單裡、同一天 D3 直連評測倖存的位址（不在 public-dns.info 的有效名單、或被收集腳本誤判的）。
-# 共 470 筆：A 38、B 250、舊名單保留 182
+# 共 784 筆：A 38、B 566、舊名單保留 180
 
 # ---- A 級 ----
 # A NextDNS（AS34939）US dns1.nextdns.io 3.9 ms
@@ -588,6 +588,638 @@
 125.19.19.84
 # B Serverius_Holding_B.V.（AS50673）NL server16.totallyvps.nl 373.6 ms
 46.249.36.55
+# B Kurdistan_Net_Company_for_Computer_and_I（AS206206）IQ email.crystalcargo.net 471.5 ms ECS
+212.237.127.127
+# B R-KOM_Regensburger_Telekommunikationsges（AS12611）DE dns.csa-rz.de 266.2 ms
+81.27.162.100
+# B COLT_Technology_Services_Group_Limited（AS8220）DE ns2.superdns.de 210.7 ms ECS
+217.111.114.4
+# B A1_Hrvatska_d.o.o.（AS35549）HR mail.get-nekretnine.hr 284.4 ms ECS
+212.92.200.165
+# B Nihon_Network_Service_Co（AS17530）JP rns.nns.ne.jp 65.8 ms
+61.193.129.2
+# B Mauritanian_Telecommunication_Company（AS29544）MR bow.mauritel.mr 350.4 ms
+82.151.90.1
+# B GlobalConnect_A/S（AS31027）DK ns.sni.dk 253.7 ms ECS
+91.230.68.158
+# B Charter_Communications_Inc（AS12271）US syn-024-039-107-174.biz.spectrum.com 273.2 ms ECS
+24.39.107.174
+# B HOSTING.CL（AS265839）CL vps10770.intelcam.cl 336.6 ms ECS
+201.148.107.70
+# B Banco_de_Poupança_e_Crédito_S.A（AS328283）AO ns3.bpc.ao 378.7 ms
+192.12.111.30
+# B INVITE_Systems_SRL（AS44679）RO ptp5.bandingoo.club 242.4 ms ECS
+84.239.39.125
+# B Layer3_Limited（AS37125）NG ns1.layer3.ng 298.8 ms
+41.217.204.165
+# B Jordanian_Universities_Network_L.L.C.（AS35656）JO dns2.bau.edu.jo 357.7 ms ECS
+87.236.233.117
+# B CMPak_Limited（AS59257）PK pub-dns01.zongcloud.com.pk 309.9 ms ECS
+209.150.154.1
+# B SIA_RixHost（AS52048）LV ip-220-64.dataclub.info 405.1 ms ECS
+46.183.220.64
+# B Globalconnect_As（AS2116）NO cD769584D.static.as2116.net 469.4 ms
+77.88.105.215
+# B Telefonica_De_Espana_S.a.u.（AS3352）ES \@arvitec.es 329.8 ms ECS
+81.45.43.133
+# B Informatica_y_Telecomunicaciones_S.A.（AS27879）AR static.193.168.itcsa.net 353.9 ms
+190.15.193.168
+# B Unit_802_Orient_Square_Building（AS23665）PH dns2.77globalservices.com 72.2 ms
+203.158.9.5
+# B Globe_Telecoms（AS4775）PH hari-realm.hyundai-asia.com 78.8 ms
+222.127.25.226
+# B Exatel_S.A.（AS20804）PL ftp.energint.net 244.9 ms ECS
+88.220.66.252
+# B Cyprus_Telecommunications_Authority（AS6866）CY buscust62-130.static.cytanet.com.cy 471.2 ms ECS
+81.4.128.130
+# B GlobalConnect_A/S（AS42525）DK ns7.pharmakon.dk 258.4 ms
+81.27.217.7
+# B ALGAR_TELECOM_S/A（AS16735）BR 201-016-253-025.static.ctbctelecom.com.br 503.9 ms
+201.16.253.25
+# B Fastweb（AS12874）IT mail.faelluce.com 698.3 ms ECS
+93.56.53.218
+# B TELEKOM_SRBIJA_a.d.（AS8400）RS mail.mind.rs 289.0 ms ECS
+212.200.115.156
+# B CLARO_S.A.（AS4230）BR business.org.br 536.4 ms ECS
+200.248.178.54
+# B UnionCOM_Ltd（AS197520）UA unallocated.unioncom.net.ua 512.5 ms ECS
+93.170.114.62
+# B Cloudflare（AS13335）? 5.2 ms
+172.64.36.244
+# B 19_Chun_Wang_Street（AS135581）HK 33.7 ms ECS
+103.142.147.14
+# B CTG_Server_Limited（AS152194）SG 33.7 ms ECS
+27.124.6.225
+# B Akari_Networks（AS38136）SG 58.8 ms
+103.190.178.190
+# B Daniel_Cid（AS205157）US 59.2 ms
+2a0d:2a00:2::2
+# B SingNet（AS3758）SG 55.1 ms ECS
+118.201.56.26
+# B PT_Acces_Prima_Nusantara（AS140448）ID 66.8 ms
+103.152.238.212
+# B HongKong_Commercial_Internet_Exchange（AS7540）HK 33.0 ms
+202.181.233.243
+# B HANWHA_Corp._Information_Service_div.（AS9684）KR 55.9 ms
+218.146.34.200
+# B PT_Anugerah_Cimanuk_Raya（AS141127）ID 90.7 ms
+103.148.130.112
+# B Quang_Trung_Software_City_Development_Co（AS24085）VN 88.4 ms
+202.78.224.129
+# B PT._ARTHA_LINTAS_DATA_MANDIRI（AS137329）ID 90.0 ms
+103.106.219.121
+# B Daejeon_Institute_of_Science_and_Technol（AS18331）KR 73.5 ms
+203.232.148.3
+# B DINAS_KOMUNIKASI_DAN_INFORMATIKA_KABUPAT（AS140425）ID 106.5 ms
+103.151.155.21
+# B SimplerCloud_Pte_Ltd（AS132816）SG 73.7 ms ECS
+103.25.202.2
+# B LG_POWERCOMM（AS17858）KR 76.3 ms
+182.211.210.55
+# B PT._Jinom_Network_Indonesia（AS138064）ID 89.8 ms
+103.122.65.97
+# B Bigband_Sdn_Bhd（AS132111）MY 73.8 ms ECS
+103.26.170.103
+# B Skyview_Online_Ltd（AS134806）BD 116.5 ms
+103.89.27.28
+# B Microsoft_Corporation（AS8075）SG 50.0 ms
+20.44.201.37
+# B So-net_Corporation（AS9600）JP 68.5 ms
+210.172.1.251
+# B Shinbiro（AS4670）KR 70.8 ms
+58.180.176.3
+# B Macau_University_of_Science_and_Technolo（AS138164）CN 34.9 ms ECS
+240c::6644
+# B IPTELECOM_ASIA（AS55799）HK 30.1 ms ECS
+43.251.159.2
+# B Exa_Bytes_Network_Sdn.Bhd.（AS55405）MY 69.7 ms
+103.13.123.16
+# B Spark_Systems_Ltd.（AS59353）BD 144.8 ms ECS
+103.230.182.56
+# B Atlantic.net（AS6364）US 141.6 ms ECS
+45.58.38.166
+# B Hoseo_University（AS9949）KR 77.6 ms
+134.75.122.2
+# B VDC_Powerbase_Hong_Kong_Data_Centers_Lim（AS9925）HK 45.0 ms
+202.153.110.47
+# B KCTV_JEJU_BROADCASTING（AS9946）KR 92.2 ms
+112.133.114.222
+# B Viettel_Group（AS7552）VN 113.0 ms ECS
+115.73.220.183
+# B PCCW_IMS_Ltd_(PCCW_Business_Internet_Acc（AS4515）HK 73.8 ms
+210.176.210.4
+# B PT_Aneka_Siak_Nusantara（AS141122）ID 80.8 ms
+103.157.193.17
+# B Lao_Telecom_Communication（AS9873）LA 90.2 ms
+115.84.91.78
+# B Digicom_LLC（AS4850）MN 79.0 ms
+203.169.48.8
+# B Sky_Fiber_Internet（AS32212）US 152.2 ms ECS
+162.210.104.17
+# B Inet_Hosting（AS17881）KR 51.8 ms ECS
+203.231.233.131
+# B Vercara（AS12008）US 64.0 ms
+156.154.71.26
+# B TIME_dotCom_Berhad_No._14（AS9930）MY 75.2 ms ECS
+202.184.80.21
+# B Apyl_Inc（AS53628）US 179.9 ms
+199.127.219.254
+# B PacketHub_S.A.（AS136787）SG 34.0 ms
+103.86.99.100
+# B G-Core_Labs_S.A.（AS199524）LU 35.4 ms ECS
+95.85.95.85
+# B Adsota_Corporation（AS135942）VN 84.7 ms
+103.109.39.79
+# B SAKURA_Internet_Inc.（AS7684）JP 73.4 ms ECS
+153.120.88.148
+# B JSC_Kazakhtelecom（AS9198）KZ 106.3 ms
+178.88.161.200
+# B MCNC（AS81）US 195.8 ms ECS
+204.85.36.31
+# B Verizon_Business（AS701）US 202.1 ms
+65.244.0.14
+# B PT_Citra_Jelajah_Informatika（AS131717）ID 86.8 ms ECS
+103.110.8.142
+# B Thammasat_University_in_thailand（AS37992）TH 77.2 ms
+203.131.211.181
+# B Sekolah_Tinggi_Agama_Islam_Negeri_(STAIN（AS63884）ID 79.7 ms ECS
+103.35.140.43
+# B abcle（AS38661）KR 71.7 ms
+211.63.64.11
+# B CS_LOXINFO_PUBLIC_COMPANY_LIMITED（AS4750）TH 83.2 ms
+210.1.43.99
+# B Gyeong_Sang_Buk-Do_Office_of_Education（AS9871）KR 83.4 ms
+203.190.27.234
+# B UNINET-TH（AS4621）TH 200.1 ms
+202.29.220.46
+# B Paradise_Technologies_Limited（AS134186）BD 154.3 ms ECS
+45.117.60.137
+# B Livecom_Limited（AS131189）HK 28.4 ms
+103.198.19.2
+# B Emirates_Integrated_Telecommunications_C（AS15802）AE 163.7 ms
+94.205.52.106
+# B Vietnam_National_Coaland_Mineral_Industr（AS131417）VN 112.5 ms
+103.239.32.81
+# B Hossain_Ahmed_Masum_T/A_Alicon_Network（AS134798）BD 164.6 ms ECS
+49.0.6.43
+# B PT_Terra_Sigma_Solusi（AS141887）ID 182.1 ms ECS
+103.105.115.110
+# B Vlan24（AS14821）US 145.8 ms
+45.58.11.132
+# B Telemach_Hrvatska_d.o.o.（AS34594）HR 219.1 ms
+85.114.45.74
+# B LLC_Eksintech（AS3255）UA 228.3 ms
+194.44.139.88
+# B WIRAC.NET_d.o.o.（AS59847）BA 225.9 ms
+5.149.91.17
+# B AmberIT_Limited（AS23956）BD 140.6 ms
+118.179.84.158
+# B Telekomunikacije_Republike_Srpske_akcion（AS25144）BA 212.1 ms
+81.93.71.254
+# B Mango_Teleservices_Limited_(ISP)（AS132608）BD 111.1 ms ECS
+114.130.5.5
+# B Countrylink_Communiction_Pvt_Ltd（AS138315）IN 155.7 ms ECS
+103.134.44.222
+# B HostingBazis_Beteti_Tarsasag（AS215904）HU 246.7 ms ECS
+87.229.85.250
+# B CyberCloud_Professionals_LLC（AS19969）US 199.6 ms ECS
+69.195.132.6
+# B Sumofiber（AS4226）US 161.4 ms
+162.246.127.108
+# B PT._Megarap_Mitra_Solusi（AS138112）ID 102.8 ms
+103.126.173.30
+# B Level_3_Parent（AS1）US 203.9 ms ECS
+63.215.98.144
+# B Sia_Nano_IT（AS43513）LV 234.2 ms
+89.248.84.76
+# B Jaringan_Lintas_Utara（AS45317）ID 89.2 ms
+203.190.43.107
+# B MAYA_SOFT（AS140906）BD 171.8 ms ECS
+103.153.48.37
+# B ODS_Joint_Stock_Company（AS45538）VN 237.3 ms ECS
+112.78.1.53
+# B Artmotion_Sh.p.k.（AS33983）XK 233.9 ms
+84.22.43.190
+# B EGIHosting（AS18779）US 142.2 ms ECS
+50.117.0.170
+# B Telecom_International_Myanmar_Co.（AS136255）MM 150.2 ms ECS
+65.18.112.106
+# B WINK_NETWORK（AS138197）BD 153.9 ms ECS
+103.129.211.101
+# B E-JOGAJOG（AS132008）BD 142.1 ms ECS
+103.178.73.224
+# B Orange_Communication（AS135341）BD 148.4 ms ECS
+45.117.63.42
+# B Envia_Tel_GmbH（AS21413）DE 259.9 ms
+31.187.77.9
+# B Hotwire_Communications（AS23089）US 248.8 ms ECS
+8.25.184.107
+# B Leaseweb_Deutschland_GmbH（AS28753）DE 218.4 ms
+91.109.21.163
+# B Centre_For_Cellular_And_Molecular_Platfo（AS134003）IN 120.4 ms ECS
+103.120.111.2
+# B Nine_Communications_Company_Limited（AS132167）MM 164.9 ms ECS
+74.50.211.90
+# B Greenlight_Networks（AS31775）US 208.9 ms
+64.201.233.59
+# B Sustainable_Development_Networking_Progr（AS9825）BD 162.6 ms ECS
+103.74.230.32
+# B Sanjoy_Saha_t/a_Zip_Cyber_Cafe_&_Technol（AS136573）BD 157.4 ms ECS
+103.92.204.128
+# B Fiberaccessbolaget_i_Sverige_AB（AS202395）SE 276.4 ms
+192.165.252.20
+# B Universum_bit_Ltd.（AS48822）RU 274.2 ms
+95.171.21.182
+# B Virgo_Communication_Ltd（AS58945）BD 130.6 ms ECS
+144.48.115.72
+# B Super_Fast_Connectivity（AS141178）BD 168.3 ms ECS
+103.155.174.87
+# B PT._Putra_Lebak_Banten（AS139972）ID 76.4 ms
+103.147.247.13
+# B Partner_Communications_Ltd.（AS12400）IL 266.0 ms
+80.179.255.238
+# B Kielce_University_of_Technology（AS24848）PL 284.1 ms ECS
+81.26.23.193
+# B Windstream_Communication_Limited（AS139009）BD 164.3 ms ECS
+103.153.66.34
+# B Telemach_Hrvatska_d.o.o.（AS205714）HR 217.1 ms
+86.32.120.134
+# B Digi_Jadoo_Broadband_Ltd（AS131464）BD 140.2 ms ECS
+103.147.191.94
+# B STAR_COMMUNICATION（AS139841）BD 178.0 ms ECS
+103.146.16.130
+# B Md._Moniruzzaman_(Rocky)_trading_as_Jhen（AS136815）BD 138.8 ms ECS
+103.97.160.60
+# B RL_CAFE_NET（AS139004）BD 163.1 ms ECS
+103.138.121.112
+# B dominet_LLC（AS41467）UA 277.0 ms
+176.121.9.144
+# B COMUNICACION_CELULAR_S.A._COMCEL_S.A.（AS26611）CO 261.0 ms ECS
+190.127.251.5
+# B Agentia_de_Administrare_a_Retelei_Nation（AS2614）RO 282.6 ms
+141.85.161.17
+# B AC_Skyways（AS395855）US 228.4 ms
+185.171.208.153
+# B Hi-Tec_Enterprise（AS139850）BD 146.9 ms ECS
+103.146.54.156
+# B SS_Online（AS136014）BD 172.4 ms ECS
+103.80.1.193
+# B Odido_Netherlands_B.V.（AS13127）NL 261.7 ms ECS
+87.213.68.86
+# B 453_Ladplacout_Jorakhaebua（AS56067）TH 198.4 ms
+119.59.117.3
+# B Orange_Espagne_SA（AS12479）ES 300.5 ms
+85.62.5.74
+# B Cheiljedang.Co.Inc.（AS9578）KR 56.9 ms
+154.10.6.11
+# B MetTel（AS16524）US 275.9 ms
+216.194.29.204
+# B Republican_Unitary_Telecommunication_Ent（AS6697）BY 259.1 ms
+178.124.148.226
+# B IceWarp_Technologies_Pvt._Ltd.（AS137488）IN 117.9 ms
+103.161.42.2
+# B Aire_Networks_Del_Mediterraneo_Sl_Uniper（AS29119）ES 308.4 ms
+84.236.142.130
+# B Smart_Link（AS139642）BD 157.2 ms ECS
+103.141.200.98
+# B Orange_Romania_S.A.（AS9050）RO 293.1 ms
+92.84.56.1
+# B F.n.s._Holdings_Limited（AS206164）NL 35.9 ms
+85.203.37.1
+# B I.T.T._Tehnologiya_LLC（AS44352）UA 269.1 ms ECS
+91.199.93.119
+# B ISN（AS9832）BD 106.2 ms
+203.188.242.211
+# B National_Telecom_Public_Company_Limited（AS9931）TH 274.4 ms ECS
+61.19.40.246
+# B Etihad_Etisalat（AS29255）SA 321.7 ms ECS
+85.194.70.174
+# B RADIUS_TELECOMS（AS55821）PH 78.5 ms
+27.126.155.1
+# B GTT_Communications_Inc.（AS3257）IT 324.3 ms
+154.14.16.251
+# B Octatech_IT（AS140674）BD 196.6 ms ECS
+103.185.225.49
+# B Telmex_Colombia_S.A.（AS14080）CO 267.4 ms
+181.48.200.174
+# B SamsungSDS_Inc.（AS6619）GB 300.4 ms
+194.88.93.22
+# B Oracle_Corporation（AS31898）DE 216.8 ms
+130.61.69.123
+# B Administradora_de_Servicios_de_Internet_（AS28539）MX 229.2 ms ECS
+192.100.159.34
+# B Maximum-Net_LLC（AS43139）UA 289.8 ms
+178.158.234.89
+# B Orange_Romania_S.A.（AS8953）RO 309.7 ms
+93.122.174.54
+# B Rockenstein_AG（AS12610）DE 221.4 ms ECS
+213.214.30.78
+# B Vorboss_Limited（AS25160）GB 220.2 ms ECS
+82.163.117.181
+# B WhiteSky_Communications（AS62887）US 211.4 ms
+69.1.192.70
+# B National_Telecom_Public_Company_Limited（AS131090）TH 215.4 ms
+110.77.140.161
+# B Tata_Teleservices_ISP_AS（AS45820）IN 203.3 ms ECS
+182.156.93.102
+# B Metro_Internet_Sp._z_o.o.（AS8819）PL 220.8 ms
+91.189.27.242
+# B Exponential-E_Ltd.（AS25180）GB 305.7 ms
+83.244.182.72
+# B Reliance_Jio_Infocomm_Limited（AS55836）IN 266.9 ms
+115.243.102.142
+# B Kerala_Vision_Broad_Band_Private_Limited（AS138754）IN 133.4 ms
+103.175.2.235
+# B Master_IT（AS150708）BD 176.2 ms ECS
+103.65.227.102
+# B UNIDATA_S.p.A.（AS5394）IT 337.7 ms ECS
+77.39.233.134
+# B Central_Utah_Telephone（AS36103）US 185.5 ms ECS
+64.72.212.20
+# B Metronet_LLC（AS39397）AZ 312.4 ms
+89.147.203.186
+# B wr_net_informatica_e_telecomunicacoes_lt（AS263344）BR 352.4 ms
+191.36.233.100
+# B meerfarbig_GmbH_&_Co._KG（AS34549）DE 243.1 ms
+89.47.58.30
+# B Discovery_24_Online（AS141220）BD 156.5 ms ECS
+103.180.55.6
+# B TRD_Net_Kabel（AS39766）MK 338.4 ms ECS
+89.185.217.38
+# B DISTROKOM_S_DE_RL_DE_CV（AS28424）MX 259.8 ms ECS
+45.231.221.1
+# B netplus.ch_SA（AS15547）CH 211.3 ms
+78.155.23.144
+# B Orange_Communication（AS137453）BD 187.2 ms ECS
+49.0.5.15
+# B CMB（AS38133）KR 115.8 ms
+122.252.222.157
+# B PT_Uliz_Netmedia_Solusindo（AS147122）ID 92.9 ms ECS
+103.175.238.154
+# B 1515_ROUNDTABLE_DR_PROPERTY（AS393398）US 177.8 ms ECS
+38.135.49.152
+# B MTN_NIGERIA_Communication_limited（AS29465）NG 302.8 ms
+83.143.8.249
+# B Login（AS22772）US 202.1 ms ECS
+204.17.57.97
+# B Vodafone_Libertel_B.V.（AS33915）NL 363.3 ms
+85.146.233.162
+# B BitCommand_LLC（AS212552）AU 247.4 ms ECS
+202.133.89.46
+# B Base_IP_B.V.（AS34305）US 209.9 ms
+85.12.32.49
+# B Geo_BG_Net_SPLtd.（AS34295）BG 260.5 ms
+77.76.174.200
+# B O.m.c._Computers_&_Communications_Ltd（AS44709）IL 262.6 ms
+5.100.249.231
+# B Telefonica_del_Sur_S.A.（AS14117）CL 364.2 ms
+216.155.91.251
+# B Alma_Telephone_Company（AS397780）US 266.0 ms
+64.45.190.98
+# B Telehouse_AD（AS57344）BG 240.9 ms ECS
+79.124.50.245
+# B Maa_Internet_Service_Provider（AS140850）BD 174.3 ms ECS
+103.152.143.244
+# B TOT_Public_Company_Limited（AS23969）TH 213.6 ms ECS
+1.1.188.104
+# B D-NET_SERVICE（AS135615）BD 166.8 ms ECS
+103.174.151.208
+# B H_M_COMMUNICATION（AS133770）BD 175.6 ms ECS
+103.156.239.235
+# B Alestra（AS11172）MX 215.1 ms
+200.94.26.115
+# B Handy_Networks（AS30475）US 212.6 ms
+23.239.215.98
+# B Bulgarian_Academy_of_Sciences（AS8745）BG 258.9 ms ECS
+213.191.222.21
+# B Telesmart_Telekom_Doo（AS34547）MK 216.2 ms
+95.128.184.40
+# B Office_National_des_Postes_et_Telecommun（AS6713）MA 320.8 ms
+102.50.253.95
+# B AG_Communication（AS142595）BD 177.4 ms ECS
+103.170.173.101
+# B vXtream_Ltd（AS29668）GB 275.4 ms
+81.19.62.62
+# B AO_Countrycom（AS25189）RU 282.3 ms
+213.251.245.15
+# B Lennart_Seitz（AS215163）DE 274.2 ms
+2a00:f826:8:2::195
+# B Prime_Network_Pvt.ltd（AS137880）NP 286.1 ms ECS
+103.137.10.193
+# B Vodacom_Business_(Ghana)_Limited（AS29674）GH 352.4 ms
+212.96.1.70
+# B Vcg_Technology_Services_Limited（AS50023）GB 278.2 ms
+109.68.14.61
+# B Rauma_Energi_As（AS203033）NO 384.7 ms ECS
+78.31.85.18
+# B Gardamor（AS136920）TL 292.8 ms ECS
+103.99.26.110
+# B Move_AS（AS200163）NO 266.9 ms
+193.19.64.88
+# B Inri_Communications_Pvt_Ltd（AS141266）IN 266.1 ms ECS
+103.159.32.231
+# B WIIT_AG（AS24961）DE 273.7 ms
+2001:4ba0:ffa4:3f7::
+# B IDHosting_Sp._z_o._o.（AS61154）PL 325.2 ms ECS
+185.55.65.48
+# B SFR_SA（AS15557）FR 374.6 ms
+84.96.26.129
+# B Company_for_communications_services_A1_M（AS16333）MK 291.1 ms
+217.16.79.246
+# B Galatasaray_Universitesi（AS15843）TR 258.0 ms ECS
+194.27.192.6
+# B Voxility_LLP（AS3223）RO 282.6 ms ECS
+109.163.232.228
+# B City_Stars（AS31619）EG 373.2 ms
+84.205.98.130
+# B Gtd_Internet_S.A.（AS14259）CL 286.2 ms ECS
+201.238.243.245
+# B Olvera_Ca.t.v.（AS204396）ES 361.6 ms ECS
+194.48.151.130
+# B MEDITELECOM（AS36925）MA 305.0 ms
+41.87.158.170
+# B Victory_media_d.o.o（AS43277）RS 299.8 ms ECS
+78.109.105.49
+# B Mbsm_Enterprise（AS132490）BD 176.0 ms ECS
+103.183.141.12
+# B Kalaam_Telecom_Bahrain_B.S.C.（AS39273）BH 314.8 ms
+81.22.26.6
+# B Extra-Lan_Technologies_Co.（AS18429）TW 298.0 ms
+27.147.48.26
+# B Ophos_System_Sarl（AS48490）FR 249.3 ms ECS
+91.209.174.71
+# B aamra_networks_limited（AS24323）BD 295.6 ms ECS
+203.202.248.5
+# B Anticlockwise_Pty_Ltd（AS45838）AU 240.5 ms ECS
+202.138.73.149
+# B university_network（AS45847）TH 215.4 ms ECS
+202.29.33.51
+# B Hawaiian_Telcom_Services_Company（AS36149）US 276.7 ms
+72.234.100.183
+# B COLUMBUS_NETWORKS_DOMINICANA（AS52471）DO 291.4 ms
+168.228.232.251
+# B Aichgati_Online（AS149854）BD 173.8 ms ECS
+103.188.232.71
+# B Professional_Link_S.r.l.（AS59862）IT 404.7 ms
+85.204.172.66
+# B Tele2_SWIPnet（AS1257）SE 323.4 ms ECS
+217.119.160.99
+# B AAPT_Limited（AS2764）AU 252.0 ms ECS
+210.8.28.194
+# B ALCONN_SRL（AS60530）IT 426.7 ms
+185.30.45.241
+# B CHT_Compamy_Ltd（AS38731）VN 74.3 ms
+125.212.237.1
+# B Black_Fiber_Solutions_Corporation（AS59322）PH 69.2 ms
+103.225.36.226
+# B Subisu_Cablenet_(Pvt)_Ltd（AS4007）NP 309.8 ms
+182.93.84.123
+# B MOVILMAX_TELECOM_S.A.（AS271861）PE 292.9 ms ECS
+131.255.136.11
+# B AFGHANTELECOM_GOVERNMENT_COMMUNICATION_N（AS55330）AF 219.0 ms
+180.94.94.194
+# B America_Movil_Peru_S.A.C.（AS12252）PE 320.4 ms
+190.223.55.37
+# B Teleradiocompany_Discovery_Ltd.（AS47702）UA 236.2 ms
+93.175.204.4
+# B Telecommunication_Infrastructure_Company（AS49666）IR 306.9 ms ECS
+2.189.1.1
+# B Airdesign_Broadcast_Media_Pvt_Ltd（AS134326）IN 251.2 ms ECS
+45.249.122.82
+# B MAZOWIECKI_SZPITAL_WOJEWODZKI_IM._SW._JA（AS201180）PL 358.4 ms ECS
+185.56.191.2
+# B Quality_Net_General_Trading_&_Contractin（AS9155）KW 436.8 ms ECS
+62.150.77.106
+# B Qnet_LLC（AS204584）UA 241.1 ms ECS
+93.171.214.135
+# B Obehosting_AB（AS42675）SE 331.1 ms
+46.227.67.134
+# B Khulna_Online（AS150811）BD 184.0 ms ECS
+103.65.240.147
+# B Universitas_Islam_Negeri_Raden_Fatah_Pal（AS64316）ID 418.2 ms
+103.84.119.230
+# B Bjare_Kraft_ekonomisk_forening（AS57084）SE 348.1 ms ECS
+195.216.58.16
+# B Bhaluka_Broadband_Internet_Service（AS147053）BD 170.6 ms ECS
+103.173.173.173
+# B E-life_Paraguay_S.A.（AS27669）PY 341.5 ms ECS
+200.108.131.206
+# B As_Informatica_LTDA（AS52631）BR 385.1 ms
+177.128.24.188
+# B Thai_Name_Server_Co.（AS141362）TH 114.2 ms
+2405:3340:e000::77:77
+# B Bharari.net（AS139611）BD 123.4 ms
+103.180.54.133
+# B PORTALMAIL_INFORMATICA_LTDA（AS262653）BR 338.7 ms ECS
+177.105.208.17
+# B UAB_Bite_Lietuva（AS13194）LT 297.8 ms ECS
+84.15.104.40
+# B T-Mobile_Polska_S.A.（AS12912）PL 318.9 ms
+89.174.39.102
+# B Orange（AS3215）FR 308.6 ms ECS
+217.109.45.177
+# B AT&T_Enterprises（AS20057）US 354.4 ms
+107.241.236.106
+# B BUSAN_EDUCATION_RESEARCH_&_INFORMATION_I（AS9706）KR 31.1 ms
+211.182.233.3
+# B BH_Telecom_d.d._Sarajevo（AS9146）BA 393.1 ms
+80.65.80.230
+# B ALMI_SERVICOS_ACESSO_AS_REDES_COMUNICACA（AS268955）BR 337.2 ms ECS
+45.176.227.244
+# B VAK_Ltd.（AS39762）UA 240.8 ms ECS
+195.60.71.123
+# B SOLUTION_LAN_S.A（AS266725）AR 393.0 ms ECS
+45.65.225.202
+# B IMPLANTAR_TELECOM_SOCIEDADE_LIMITADA（AS268568）BR 344.2 ms ECS
+45.163.147.122
+# B SBN-ISP/AWN-ISP_and_SBN-NIX/AWN-NIX（AS45458）TH 407.3 ms ECS
+110.49.95.45
+# B Vodafone_Idea_Ltd（AS55410）IN 287.4 ms
+122.15.192.21
+# B PT._DEWATA_TELEMATIKA（AS58396）ID 96.2 ms ECS
+27.54.117.113
+# B Florida_Technology_Managed_Services（AS46121）US 242.2 ms
+74.113.101.251
+# B DAG_s.c._Agnieszka_Salska-Oskroba（AS41796）PL 293.6 ms ECS
+193.39.71.3
+# B INTERNEXA_S.A._E.S.P（AS18678）CO 288.1 ms
+179.1.133.89
+# B Caspian_Telecom_LLC（AS201167）AZ 381.8 ms ECS
+85.132.8.70
+# B TeleSur（AS27775）SR 344.4 ms ECS
+186.179.241.146
+# B ZORRILLA_SOLEDISPA_JUAN_JOBINO_(JJ_COMP)（AS266681）EC 352.9 ms ECS
+45.228.181.252
+# B Xefi_Lyon_SAS（AS198330）FR 591.6 ms
+134.90.140.29
+# B LLC_Telecom_MPK（AS44927）RU 422.4 ms
+91.203.82.231
+# B Entity_Data_Pty_Limited（AS56057）AU 246.9 ms ECS
+111.118.223.243
+# B Margonet_S.C._Przemyslaw_Parzyjagla_i_Ma（AS199341）PL 253.6 ms ECS
+185.93.240.188
+# B Eltele_AS（AS206557）NO 363.9 ms
+81.93.99.230
+# B RDS_TECNOLOGIA-ME（AS270350）BR 458.3 ms ECS
+190.89.22.77
+# B Safaricom_Limited（AS37061）KE 268.0 ms ECS
+41.139.226.83
+# B Vodafone_Net_Iletisim_Hizmetler_AS（AS15924）TR 422.6 ms ECS
+31.206.52.78
+# B JOSE_GUILLERMO_LACALLE（AS263818）AR 478.8 ms
+138.186.155.1
+# B UIH（AS38794）TH 192.3 ms
+115.31.133.178
+# B Sil-miro_Com_Srl（AS44682）RO 353.9 ms ECS
+89.42.28.193
+# B IDEAS_GLORIS_SOCIEDAD_ANONIMA（AS266665）CR 263.8 ms
+190.171.26.34
+# B RailTel_Corporation_of_India_Ltd（AS24186）IN 283.5 ms ECS
+122.252.241.166
+# B Citytelecom_LLC（AS29076）RU 639.9 ms ECS
+91.236.112.226
+# B MEDINA_VARGAS_JOSE_ALEJANDRO_(LIRYC)（AS271985）AR 493.6 ms
+177.37.38.225
+# B Firma_Sotrudnik_Plus_Ltd.（AS47370）RU 336.2 ms
+93.157.46.181
+# B Gliga_Comimpex_Srl（AS214530）RO 541.8 ms ECS
+89.38.139.180
+# B T-Mobile_Czech_Republic_a.s.（AS13036）CZ 304.4 ms
+212.47.12.21
+# B Vodafone_Spain（AS12430）ES 332.6 ms ECS
+77.230.19.121
+# B LLC_smartcom（AS51357）UA 331.2 ms ECS
+195.225.48.17
+# B Netcar_Internet_Telec_Info_e_Tecnologia_（AS52923）BR 356.6 ms
+177.184.176.5
+# B Sistem_Network_Company_Ltd.（AS60896）GB 401.6 ms ECS
+185.24.81.66
+# B JP_HT_d.d._Mostar（AS20875）BA 499.2 ms
+212.39.106.154
+# B PP_Merezha（AS48437）UA 534.5 ms
+178.54.198.71
+# B AMERICATEL_PERU_S.A.（AS19180）PE 409.6 ms ECS
+190.187.200.243
+# B Uplink_LLC（AS8200）KZ 647.1 ms ECS
+109.248.157.46
+# B JASCO_CONVERGED_SOLUTIONS_(Pty)_Ltd（AS37334）ZA 454.3 ms
+41.76.101.174
+# B Aire_Networks_Del_Mediterraneo_Sl_Uniper（AS56882）ES 450.9 ms ECS
+188.227.135.6
+# B Lcom_s.r.l.s.（AS207715）IT 426.0 ms
+185.229.100.191
+# B MHNET_TELECOM（AS28146）BR 745.0 ms ECS
+177.234.132.8
+# B Branch_Enterprise_Netgroup-Service（AS35004）UA 582.5 ms ECS
+194.126.183.208
+# B Ministry_of_Science_and_Technology_Devel（AS43752）BA 609.8 ms
+78.28.158.220
+# B Kabelnet_Ltd（AS205352）BG 672.2 ms
+109.160.96.238
+# B TelKos_L.L.C（AS206262）XK 1201.3 ms ECS
+87.238.210.155
+# B National_Telecommunication_Corporation_H（AS23888）PK 1343.9 ms ECS
+202.83.175.187
 
 # ---- 舊名單保留（同一天 D3 直連評測倖存）----
 # 舊名單 不在 public-dns.info 的有效名單
@@ -625,8 +1257,6 @@
 # 舊名單 public-dns.info 判 C（丟包或不是每一輪都過）
 103.86.96.100
 # 舊名單 public-dns.info 判 B（丟包或不是每一輪都過）
-103.86.99.100
-# 舊名單 public-dns.info 判 B（丟包或不是每一輪都過）
 223.5.5.5
 # 舊名單 public-dns.info 判 B（丟包或不是每一輪都過）
 185.228.168.9
@@ -634,8 +1264,6 @@
 185.228.169.9
 # 舊名單 不在 public-dns.info 的有效名單
 1.0.0.1
-# 舊名單 public-dns.info 判 B（丟包或不是每一輪都過）
-95.85.95.85
 # 舊名單 public-dns.info 判 B（丟包或不是每一輪都過）
 2.56.220.2
 # 舊名單 public-dns.info 判 A（丟包或不是每一輪都過）
