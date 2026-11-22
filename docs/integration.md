@@ -651,3 +651,24 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   - 隱私：查詢紀錄含裝置位址與網域，是最敏感的資料：**只在記憶體**（不寫磁碟、不進備份、不給公開頁、不傳給上游／下游／好友），預設關閉，`/api/status` 的 `queryLog` 只顯示開著與否、到幾點、幾筆。串接中，上游放行的下游黑潮的查詢也會出現在上游的紀錄裡。
   - 上限：筆數（環狀，`system.queryLogRing`，實體記憶體 160 MB 以下最多 1,000、512 MB 以下最多 5,000）、時間（暫時開啟最長 60 分鐘）。查詢不等紀錄的鎖：拿不到就丟掉那一筆（`dropped`）。
   - OpenWrt 的 rpcd 開放 `/api/querylog`（唯讀）與 `/api/querylog/enable`（動作）。
+- **為什麼沒換到台灣**（3.5.0）：`GET /api/cdn/explain?name=example.com` 回這個網域哪家 CDN、換或不換台灣節點、為什麼，以及驗證結果（`steps`：`v4`、`v6`、`ecs`、`cross`）。只讀：不增加查詢次數、不排驗證、不連網路（要重新驗證用 `POST /api/cdn/verify`）。CDN 沒開時也回答（`cdn-disabled`）。`decision` 的代碼（介面依代碼顯示；`text` 是核心給的白話）：
+
+  | 代碼 | 意思 |
+  |---|---|
+  | `rewritten` | 已經換成驗證過的台灣節點 |
+  | `already-tw` | 原本的答案就是台灣節點 |
+  | `trial` | 台灣節點還在驗證中（先回原本的答案，TTL 10 秒） |
+  | `lite-waiting` | 小記憶體減量：問過 2 次以上才驗證 |
+  | `verify-failed` | 台灣節點驗證沒通過（到期後重新驗證） |
+  | `no-tw-node` | 找不到可用的台灣節點，跨 CDN 也沒有 |
+  | `no-pool` | 這家 CDN 的台灣節點池還沒建好 |
+  | `cross` | 換成同一個網站在別家 CDN 的台灣節點 |
+  | `ecs` | 帶台灣網段問到台灣節點（依查詢來源分流的 CDN） |
+  | `policy-never`／`policy-always` | 手動設成不換／一定換 |
+  | `chained` | 串接中：上游黑潮換好，這台不處理 |
+  | `memory-floor` | 記憶體控制的最低限度：暫停 CDN 調整 |
+  | `cdn-disabled` | 這台沒開 CDN 台灣節點 |
+  | `not-cdn`／`unknown` | 不是認得的 CDN／還沒人查過 |
+
+  OpenWrt 的 rpcd 開放 `/api/cdn/explain`（唯讀）。
+

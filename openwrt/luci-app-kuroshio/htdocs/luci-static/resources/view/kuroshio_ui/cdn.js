@@ -189,6 +189,7 @@ return view.extend({
 				E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap;align-items:center' }, [
 					nameIn,
 					btn(_('追蹤'), function() { var n = name(); if (n) return common.api('/api/trace', { name: n, type: 'A' }).then(show); }, 'cbi-button-action'),
+					btn(_('為什麼沒換到台灣'), function() { var n = name(); if (n) return common.api('/api/cdn/explain', { name: n }).then(show); }),
 					btn(_('重新驗證'), function() { var n = name(); if (n) return common.action('/api/cdn/verify', { name: n, family: 4 }).then(show); }),
 					btn(_('ECS 突破'), function() { var n = name(); if (n) return common.action('/api/cdn/ecs', { name: n }).then(show); }),
 					policy,

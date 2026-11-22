@@ -914,6 +914,22 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             1,
             crate::site::ADMIN_TOP,
         )),
+        // 「為什麼沒換到台灣」（3.5.0）：只讀；CDN 沒開時也回答（說明沒開）
+        "/api/cdn/explain" => {
+            let Some(n) = q.get("name").map(|n| normalize(n)).filter(|n| !n.is_empty()) else {
+                return bad("需要 name", 400);
+            };
+            let ctx = kuroshio_cdn::explain::Context {
+                chained: r.chain_active(),
+                suspended: r.cdn_suspended.load(std::sync::atomic::Ordering::Relaxed),
+            };
+            match r.cdn() {
+                Some(c) => ok(c.explain(&n, ctx)),
+                None => {
+                    ok(json!({ "name": n, "decision": "cdn-disabled", "text": kuroshio_cdn::explain::text_of("cdn-disabled", "", "") }))
+                }
+            }
+        }
         p if p.starts_with("/api/cdn/") => match r.cdn() {
             None => bad("CDN 台灣節點沒有啟用", 404),
             Some(c) => cdn_route(&c, p, q).await,
@@ -1182,6 +1198,7 @@ mod tests {
             "/api/status",
             "/api/chain",
             "/api/querylog",
+            "/api/cdn/explain",
             "/api/trace",
             "/api/filter/check",
             "/api/cdn/domains",

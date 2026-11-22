@@ -672,7 +672,7 @@ impl Resolver {
 
     /// 串接中（有串接上游、沒有暫停）：CDN 節點由上游處理，下游不改寫也不驗證（3.4.2：
     /// 串接之前存下的、或重新啟動時讀回來的快取也一樣，到期後由上游重新回答）
-    fn chain_active(&self) -> bool {
+    pub fn chain_active(&self) -> bool {
         self.upstreams.chain().is_some_and(|c| c.role == Role::Chain) && !self.upstreams.chain_suspended()
     }
 

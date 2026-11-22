@@ -13,6 +13,7 @@ pub mod config;
 pub mod cross;
 pub mod db;
 pub mod ecs;
+pub mod explain;
 mod health;
 pub mod jobs;
 pub mod net;

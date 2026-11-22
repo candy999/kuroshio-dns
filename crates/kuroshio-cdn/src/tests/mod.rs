@@ -2,6 +2,7 @@
 
 mod behaviors;
 mod bench;
+mod explain;
 mod jobs;
 mod lite;
 mod parity;

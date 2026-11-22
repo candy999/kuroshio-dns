@@ -2057,7 +2057,16 @@
 			});
 		};
 		tn.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') doTrace(); });
-		append(tc.body, [tn, tt, actBtn('追蹤', 'primary', doTrace)]);
+		// 為什麼沒換到台灣（3.5.0）：只讀，說明這個網域換或不換台灣節點、原因與驗證結果
+		var doExplain = function () {
+			var n = tn.value.trim();
+			if (!n) { tc.show('請輸入網域', 'warn'); return; }
+			return api('/api/cdn/explain?' + qs({ name: n })).then(function (r) {
+				if (!r.ok) return tc.show('失敗：' + errText(r), 'err');
+				tc.show((r.data && r.data.text) || '-', 'ok', r.data);
+			});
+		};
+		append(tc.body, [tn, tt, actBtn('追蹤', 'primary', doTrace), actBtn('為什麼沒換到台灣', '', doExplain)]);
 		box.appendChild(tc);
 
 		// 排程工作
