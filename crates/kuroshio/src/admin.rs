@@ -1066,6 +1066,36 @@ fn rdata_text(d: &kuroshio_proto::RData) -> String {
 mod tests {
     use super::*;
 
+    /// LuCI 的 API 白名單（openwrt/kuroshio/files/rpcd.sh）：唯讀那一段（`api`）的路徑都不能是會改變狀態的，
+    /// 動作那一段（`action`，用 POST）都要是會改變狀態的（3.5.0，規格 11 C13）
+    #[test]
+    fn rpcd_whitelists_match_actions() {
+        let sh = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../openwrt/kuroshio/files/rpcd.sh")).unwrap();
+        let section = |name: &str| -> Vec<String> {
+            let start = sh.find(&format!("\t{name})\n")).unwrap_or_else(|| panic!("rpcd.sh 沒有 {name})"));
+            let body = &sh[start..];
+            let end = body.find("*) echo").unwrap();
+            body[..end]
+                .lines()
+                .filter_map(|l| l.trim().strip_suffix(") ;;"))
+                .flat_map(|l| l.split('|').map(str::to_string).collect::<Vec<_>>())
+                .filter(|p| p.starts_with("/api/"))
+                .collect()
+        };
+        let q: HashMap<String, String> = [("channel".to_string(), "x".to_string())].into_iter().collect();
+        let empty = HashMap::new();
+        let read = section("api");
+        let act = section("action");
+        assert!(read.iter().any(|p| p == "/api/chain"), "LuCI 讀得到串接狀態");
+        assert!(act.iter().any(|p| p == "/api/chain/recheck"), "LuCI 可以重新檢查串接");
+        for p in &read {
+            assert!(!is_action(p, &empty), "{p} 會改變狀態，不能放在唯讀白名單");
+        }
+        for p in &act {
+            assert!(is_action(p, &q), "{p} 不會改變狀態，不必放在動作白名單（要用 POST 的才放）");
+        }
+    }
+
     #[test]
     fn query_and_host() {
         let q = parse_query("name=www.example.com&type=AAAA&x=a%20b+c&flag");

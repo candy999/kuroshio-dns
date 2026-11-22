@@ -238,7 +238,16 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
                 /上游角色/.test(c) && /提供資料給下游黑潮：目前 2 台/.test(c) && /有啟用「繞過防護」清單時建議關閉 allow_downstream/.test(c)
                     && /9C01-55E2-0A7B-31D4-8F6C-2E90-B135-7A42/.test(c) && /192\.168\.1\.2/.test(c) && /7E44-0C19-D2A8-6B53-1F07-94CE-38A1-E560/.test(c) && /經 NAT/.test(c)
                     ? ok('狀態頁：串接（上游角色：自己的指紋、連上來的下游、經 NAT）') : bad(`狀態頁：串接的上游角色不對\n     ${c.slice(0, 900)}`);
-                (await chainButtons()) === 0 ? ok('狀態頁：串接區塊沒有任何按鈕') : bad('狀態頁：串接區塊有按鈕');
+                // 3.5.0：只有「重新檢查上游黑潮」一個按鈕（沒有同意、核准這類按鈕），按了送出 /api/chain/recheck
+                const btnText = (await page.locator('#kuroshio-chain button').allInnerTexts()).join(',');
+                (await chainButtons()) === 1 && btnText === '重新檢查上游黑潮' ? ok('狀態頁：串接區塊只有「重新檢查上游黑潮」') : bad(`狀態頁：串接區塊的按鈕不對：${btnText}`);
+                try {
+                    const before = JSON.parse(await mockGet('/__mock/calls?since=0')).length;
+                    await page.click('#kuroshio-chain-recheck');
+                    let got = [];
+                    for (let i = 0; i < 50 && !got.length; i++) { await page.waitForTimeout(100); got = JSON.parse(await mockGet('/__mock/calls?since=' + before)); }
+                    got.length === 1 && got[0].path === '/api/chain/recheck' ? ok('狀態頁：重新檢查 → /api/chain/recheck') : bad(`狀態頁：重新檢查應該送出 /api/chain/recheck，實際 ${JSON.stringify(got)}`);
+                } catch (e) { bad(`狀態頁：重新檢查操作中斷：${e.message.split('\n')[0]}`); }
                 await mockGet('/__mock/chain?mode=released');
                 await page.reload();
                 await page.waitForSelector('#kuroshio-chain', { timeout: 15000 }).catch(() => {});

@@ -637,3 +637,13 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - **設定放在記憶體**（要另外存進 Flash）的韌體：設定 `KUROSHIO_ON_CONFIG_WRITE`。
 - **容器**：把設定檔與快照目錄放在掛載的磁碟區（例如 `/config/config.json`、`system.persistDir: "/config/state"`），用 `KUROSHIO_INIT_CONFIG` 提供第一次啟動的預設設定，`KUROSHIO_SHARE` 指向映像裡的 data/。
 - 管理 API 預設只聽本機（`127.0.0.1`）。`Host` 只接受本機名稱、IP 位址與 `admin.allowedHosts` 裡的名稱（防 DNS rebinding；3.4.2 起接受 IP 位址與 `allowedHosts`，以前只接受本機名稱）。聽在其他位址（`admin.host`，例如 Docker 的 `0.0.0.0`）時請開啟登入（`admin.auth`）；經過反向代理時，把代理用的名稱加到 `allowedHosts`。
+- **自己的介面經過白名單轉呼叫管理 API 時**（例如 OpenWrt 的 rpcd、padavan 的 `kuroshio.sh api`）：唯讀的路徑與會改變狀態的路徑要分開，後者一律用 POST。下表是 OpenWrt 的 `rpcd.sh` 在 3.5.0 開放的串接與 CDN 路徑，整合方可以照著開：
+
+  | 路徑 | 種類 | 從哪一版 | LuCI 用到 |
+  |---|---|---|---|
+  | `/api/chain` | 唯讀 | 3.4.0（rpcd 3.5.0 才開放） | 狀態頁從 `/api/status` 的 `chain` 讀，這條給直接查詢用 |
+  | `/api/chain/recheck` | 動作（POST） | 3.4.0（rpcd 3.5.0 才開放） | 狀態頁「重新檢查上游黑潮」 |
+  | `/api/cdn/domain` | 唯讀 | 3.0 | 沒有（給查詢用） |
+  | `/api/cdn/cross` | 唯讀 | 3.0 | 沒有（給查詢用） |
+
+  `kuroshio` 套件裡有一個測試確認 rpcd 的唯讀白名單沒有會改變狀態的路徑、動作白名單都是會改變狀態的路徑。

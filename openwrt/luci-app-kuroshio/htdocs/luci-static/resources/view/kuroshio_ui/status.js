@@ -197,7 +197,8 @@ return view.extend({
 		]), { 'id': 'kuroshio-path' }) : '';
 
 		// 串接模式（3.4.0）：下游角色（這台向上游黑潮拿資料）與上游角色（提供資料給下游）兩個區塊都一定顯示。
-		// 主要的句子直接用 API 給的 text / serving.text / serving.note；沒有任何要按的按鈕（沒有同意、沒有核准）
+		// 主要的句子直接用 API 給的 text / serving.text / serving.note；沒有同意、核准這類按鈕。
+		// 只有「重新檢查」（3.5.0）：立刻重新偵測上游黑潮（跟路徑檢查後的重新偵測一樣），不改任何設定
 		var chain = api.chain || null, cv = chain ? common.chainView(chain) : null;
 		var kvTable = function(rows) { return rows.length ? table([_('項目'), _('內容')], rows.map(function(r) { return [r.label, r.value]; })) : ''; };
 		var say = function(text, warn) { return E('div', { 'class': warn ? 'alert-message warning' : 'cbi-section-descr', 'style': 'white-space:normal' }, text); };
@@ -207,7 +208,10 @@ return view.extend({
 				say(cv.down.text, cv.down.warn),
 				kvTable(cv.down.rows),
 				cv.down.objects.length ? table([_('共用結果'), _('上游產生'), _('匯入'), _('狀態')], cv.down.objects.map(function(o) { return [o.name, o.at, o.imported, o.state]; })) : '',
-				cv.down.skipped ? E('p', { 'style': 'margin-top:.6em' }, _('略過的工作（由上游黑潮提供）：') + (cv.down.skipped.length ? cv.down.skipped.join('、') : _('沒有，照排程自己做'))) : ''
+				cv.down.skipped ? E('p', { 'style': 'margin-top:.6em' }, _('略過的工作（由上游黑潮提供）：') + (cv.down.skipped.length ? cv.down.skipped.join('、') : _('沒有，照排程自己做'))) : '',
+				E('p', { 'style': 'margin-top:.6em' }, E('button', { 'class': 'btn cbi-button', 'id': 'kuroshio-chain-recheck', 'click': ui.createHandlerFn(self, function() {
+					return common.action('/api/chain/recheck').then(function(r) { common.notify(r, _('已重新檢查上游黑潮，幾秒後重新整理就看得到結果')); });
+				}) }, _('重新檢查上游黑潮')))
 			]),
 			E('div', { 'id': 'kuroshio-chain-up' }, [
 				E('h4', {}, [_('上游角色：提供資料給下游黑潮'), ' ', common.badge(cv.up.badge.text, cv.up.badge.kind)]),
