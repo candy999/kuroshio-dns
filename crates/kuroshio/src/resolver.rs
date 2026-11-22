@@ -601,7 +601,8 @@ impl Resolver {
         let mut r = Message::response_to(query, e.rcode);
         r.answers = e.answers.iter().map(|a| Record { ttl, ..a.clone() }).collect();
         // CDN 調整會改寫答案：要 DNSSEC 記錄或類別不是 IN 的查詢不動（同 job() 的 verbatim）
-        let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1;
+        // 下游黑潮自己關掉了 CDN 置換（查詢帶著私有選項）：照原樣回答，不幫它換台灣節點（3.4.3：每台黑潮自己決定）
+        let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1 || wants_no_cdn(query);
         if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim && (e.chained || self.chain_active())) {
             // 串接上游（上游黑潮）給的答案：CDN 節點上游已經驗證、換好（3.4.1）。
             // 下游不再改寫、不排背景驗證（MIPS 上的 TLS 驗證很吃 CPU），只記哪家 CDN（統計用，唯讀快照）
@@ -993,8 +994,13 @@ impl Resolver {
         }
         let list = &ordered[..];
         let mut set = JoinSet::new();
+        // 這台自己沒開 CDN 置換：問上游黑潮時請它照原樣回答（3.4.3）
+        let no_cdn = self.steer_cdn().is_none().then(|| with_no_cdn(q)).flatten();
         let spawn = |set: &mut JoinSet<_>, up: Arc<Up>| {
-            let q = q.to_vec();
+            let q = match &no_cdn {
+                Some(nq) if up.role == Role::Chain => nq.clone(),
+                _ => q.to_vec(),
+            };
             let t = timeout_for(p, &up);
             set.spawn(async move {
                 let t0 = Instant::now();
@@ -1311,6 +1317,24 @@ fn timeout_for(p: &Params, up: &Up) -> Duration {
     }
 }
 
+/// 查詢帶著黑潮的「不要換 CDN 節點」選項（下游黑潮自己關掉了 CDN 置換；3.4.3）
+fn wants_no_cdn(q: &Message) -> bool {
+    q.opt
+        .as_ref()
+        .is_some_and(|o| o.options.iter().any(|(c, _)| *c == kuroshio_proto::message::opt_code::KUROSHIO_NO_CDN))
+}
+
+/// 在查詢加上「不要換 CDN 節點」選項（沒有 OPT 就加一個）；解析不了 → None（照原樣送）
+fn with_no_cdn(q: &[u8]) -> Option<Vec<u8>> {
+    let mut m = Message::parse(q).ok()?;
+    let o = m.opt.get_or_insert_with(|| kuroshio_proto::message::Opt {
+        udp_size: 1232,
+        ..Default::default()
+    });
+    o.options.push((kuroshio_proto::message::opt_code::KUROSHIO_NO_CDN, Vec::new()));
+    Some(m.encode())
+}
+
 /// 回應帶著 EDE 15（被擋）或 17（被過濾）：上游的過濾擋掉的（RFC 8914）
 fn blocked_by_ede(msg: &Message) -> bool {
     msg.opt.as_ref().is_some_and(|o| {
@@ -1443,6 +1467,18 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.4.3：下游黑潮自己關掉 CDN 置換時，問上游黑潮的查詢帶著私有選項；上游看到就照原樣回答
+    #[test]
+    fn no_cdn_option_roundtrip() {
+        let q = kuroshio_proto::build_query(7, "www.example.com", 1);
+        assert!(!wants_no_cdn(&Message::parse(&q).unwrap()));
+        let nq = with_no_cdn(&q).unwrap();
+        let m = Message::parse(&nq).unwrap();
+        assert!(wants_no_cdn(&m));
+        assert_eq!(m.questions[0].name, "www.example.com");
+        assert!(with_no_cdn(b"bad").is_none());
+    }
 
     #[test]
     fn local_forward_names() {

@@ -29,6 +29,9 @@ pub mod opt_code {
     pub const COOKIE: u16 = 10;
     pub const PADDING: u16 = 12;
     pub const EDE: u16 = 15;
+    /// 黑潮的私有選項（RFC 6891 的本地／實驗用範圍）：下游黑潮自己關掉 CDN 置換時帶著，
+    /// 請上游黑潮照原樣回答、不換台灣節點（3.4.3）。其他 DNS 伺服器會忽略
+    pub const KUROSHIO_NO_CDN: u16 = 65431;
 }
 
 pub const FLAG_QR: u16 = 0x8000;
