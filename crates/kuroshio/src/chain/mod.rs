@@ -50,7 +50,7 @@ pub fn deciding() -> bool {
 }
 
 /// 正在等第一次跟上游黑潮同步共用結果：正在驗證上游黑潮，或已經串接（上游有提供共用結果）但還沒同步完成過。
-/// 過濾清單在這段期間不從網路下載（3.4.2）
+/// 排程器在這段期間先不跑會被共用結果取代的工作（評測、CDN 掃描）；過濾清單不等（3.4.3 起一律自己下載）
 pub fn share_pending() -> bool {
     let Some(c) = current() else { return false };
     match c.state().0 {
@@ -60,11 +60,6 @@ pub fn share_pending() -> bool {
         }
         _ => false,
     }
-}
-
-/// 過濾清單的第一次更新要不要先等：還不知道會不會串接（[`deciding`]），或在等第一次同步（[`share_pending`]）
-pub fn filter_wait() -> bool {
-    deciding() || share_pending()
 }
 
 /// 行程層級的共用結果同步（跨重新載入；同 [`CURRENT`]）

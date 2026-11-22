@@ -1946,7 +1946,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));
     // 串接的共用結果（3.4.0，規格 10 第 3 節）：CDN、過濾、排程器都啟動之後。上游接上 ShareCache、
     // 下游建立／接回同步（工作開頭的 share_skips 只在共用結果新鮮、而且串接中時略過）
-    crate::chain::share::start(cfg, &resolver, cdn.clone(), filter.clone(), &persister, scheduler.as_ref());
+    crate::chain::share::start(cfg, &resolver, cdn.clone(), &persister, scheduler.as_ref());
     let ddns = crate::ddns::Config::from_cfg(cfg).map(crate::ddns::Ddns::new);
     if let Some(d) = &ddns {
         d.spawn();
