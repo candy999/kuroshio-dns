@@ -33,6 +33,7 @@ pub mod netif;
 pub mod pathcheck;
 pub mod persist;
 pub mod presence;
+pub mod querylog;
 pub mod resolver;
 pub mod server;
 pub mod site;

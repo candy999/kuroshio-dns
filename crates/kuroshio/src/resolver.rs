@@ -194,6 +194,8 @@ pub struct Resolver {
     pub chain: std::sync::OnceLock<Arc<crate::chain::responder::Responder>>,
     /// 本機對外 IP 的 /24（啟動後偵測）
     pub ecs_subnet: RwLock<Option<(IpAddr, u8)>>,
+    /// 查詢紀錄（3.5.0）：只在記憶體、預設關閉、有上限；只給管理 API
+    pub querylog: crate::querylog::QueryLog,
     inflight: Mutex<HashMap<String, Waiters>>,
     /// 最近一次「所有上游都失敗」的時間（0.1 秒，相對 `base`）；0 = 沒發生過
     last_outage: AtomicU32,
@@ -272,6 +274,7 @@ impl Resolver {
             access: std::sync::OnceLock::new(),
             chain: std::sync::OnceLock::new(),
             ecs_subnet: RwLock::new(None),
+            querylog: Default::default(),
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
             picks: AtomicU32::new(0),
@@ -512,7 +515,9 @@ impl Resolver {
                 self.stats.blocked_name(&qname, ctx.client, v.category);
                 let code = if v.category == "malware" { ede::BLOCKED } else { ede::FILTERED };
                 debug!("{} {qname} 攔截（{}）{}", ctx.proto, v.category, v.rule);
-                return msg(logic::blocked_response(&query, code, &format!("{}：{}", v.category, v.rule)));
+                let out = logic::blocked_response(&query, code, &format!("{}：{}", v.category, v.rule));
+                self.qlog(&qname, qtype, ctx, crate::querylog::Kind::Blocked, &out, t0, v.category);
+                return msg(out);
             }
         }
 
@@ -555,6 +560,12 @@ impl Resolver {
                 }
                 let out = self.serve(&query, &e, if stale { Some(10) } else { None }, Some(ctx.client));
                 self.stats.hit(t0.elapsed().as_secs_f64() * 1000.0);
+                let k = if stale {
+                    crate::querylog::Kind::Stale
+                } else {
+                    crate::querylog::Kind::Hit
+                };
+                self.qlog(&qname, qtype, ctx, k, &out, t0, &e.source);
                 return msg(out);
             }
         }
@@ -576,7 +587,24 @@ impl Resolver {
         }
         let out = self.serve(&query, &e, stale.then_some(10), Some(ctx.client));
         self.stats.latency(false, t0.elapsed().as_secs_f64() * 1000.0);
+        let k = if stale {
+            crate::querylog::Kind::Stale
+        } else {
+            crate::querylog::Kind::Miss
+        };
+        self.qlog(&qname, qtype, ctx, k, &out, t0, &e.source);
         msg(out)
+    }
+
+    /// 記一筆查詢紀錄（關閉時只有一次原子讀取；開著時拿不到鎖就丟掉，不等）
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn qlog(&self, qname: &str, qtype: u16, ctx: &Ctx, kind: crate::querylog::Kind, out: &Message, t0: Instant, source: &str) {
+        if self.querylog.enabled() {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            self.querylog
+                .push(crate::querylog::now(), qname, qtype, ctx.client, kind, out.rcode as u8, ms, source);
+        }
     }
 
     /// 由快取項目產生回應：答案 TTL 統一成剩餘秒數（過期回舊資料時用 10 秒）。

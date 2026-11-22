@@ -69,6 +69,11 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
     });
     let r = Resolver::new(Params::from_cfg(cfg), ups, cache_max, iprank, local);
     adopt_cache(cfg, &r);
+    // 查詢紀錄（3.5.0）：筆數上限依設定與實體記憶體；`log.queryLog` 是常開，否則預設關閉、從管理介面暫時開啟
+    let ring = get(cfg, "system.queryLogRing").and_then(Value::as_u64).unwrap_or(20_000);
+    let permanent = get(cfg, "log.queryLog").and_then(Value::as_bool).unwrap_or(false);
+    r.querylog
+        .configure(crate::querylog::capacity_for(ring, crate::sysinfo::mem_bytes().0), permanent);
     Ok(r)
 }
 

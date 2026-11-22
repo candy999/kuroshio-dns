@@ -155,7 +155,8 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         | "/api/cdn/policy"
         | "/api/cdn/ecs"
         | "/api/notify/wan-changed"
-        | "/api/chain/recheck" => true,
+        | "/api/chain/recheck"
+        | "/api/querylog/enable" => true,
         p => match p.strip_prefix("/api/community/") {
             Some("status" | "peers" | "events" | "scores" | "invite") => false,
             // 不帶 channel 是查詢，帶了是指定管道
@@ -695,6 +696,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "access": access,
                 // 效能計數器（3.5.0）：加密上游的握手（完整／續用、AES／ChaCha）、每次詢問送出幾個上游查詢
                 "perf": crate::resolver::perf::json(),
+                // 查詢紀錄只放狀態（開著嗎、到幾點），內容要另外用 /api/querylog 讀
+                "queryLog": r.querylog.status(crate::querylog::now()),
             }))
         }
         // 來源 IP 存取控制（規格 08）；?ip= 說明這個 IP 的判斷結果
@@ -709,6 +712,21 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
         "/api/upstreams" => ok(r.upstreams.list_json()),
         // 串接模式（3.4.0）：同 /api/status 的 chain；recheck = 立刻做一次路徑檢查與探測（背景進行）
         "/api/chain" => ok(crate::chain::client::api_json()),
+        // 查詢紀錄（3.5.0）：只在記憶體、預設關閉；`limit` 最多 1,000，`name`（包含這段）、`client`、`since`（毫秒）可以篩選
+        "/api/querylog" => {
+            let now = crate::querylog::now();
+            let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200);
+            let client = q.get("client").and_then(|v| v.parse().ok());
+            let since = q.get("since").and_then(|v| v.parse::<u64>().ok()).map(|ms| (ms / 1000) as u32);
+            ok(r.querylog.read(now, limit, q.get("name").map(String::as_str), client, since))
+        }
+        // 暫時開啟 minutes 分鐘（1～60，預設 10）；minutes=0 關閉暫時開啟
+        "/api/querylog/enable" => {
+            let now = crate::querylog::now();
+            let m = q.get("minutes").and_then(|v| v.parse().ok()).unwrap_or(10);
+            r.querylog.enable_for(m, now);
+            ok(r.querylog.status(now))
+        }
         "/api/chain/recheck" => {
             if !crate::pathcheck::enabled() {
                 return bad("路徑檢查關閉（upstream.pathCheck）：串接沒有偵測來源", 400);
@@ -1147,6 +1165,7 @@ mod tests {
             "/api/cdn/ecs",
             "/api/notify/wan-changed",
             "/api/chain/recheck",
+            "/api/querylog/enable",
             "/api/community/add",
             "/api/community/accept",
             "/api/community/delete",
@@ -1162,6 +1181,7 @@ mod tests {
         for p in [
             "/api/status",
             "/api/chain",
+            "/api/querylog",
             "/api/trace",
             "/api/filter/check",
             "/api/cdn/domains",

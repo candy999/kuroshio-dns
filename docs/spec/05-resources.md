@@ -290,7 +290,7 @@ c = CPU 核心數（`available_parallelism`）：
 | `scan.samplesPerSubnet`、`pool.candidatesPerProvider` / `speedTop` / `speedSeconds` / `nearestProbeTop` | 6、1,500 / 16 / 5 / 1,500 | 依等級調低 | 工作規模；接近保留量時整個工作延後 |
 | `jobs.cdn-scan.enabled` | true | tiny 停用 | 接近保留量時延後 |
 | `filter.maxDomains` / `maxComplex` | 1,000 萬 / 2 萬 | 40 萬… / 2,000… | 09：載入前依空間估計 |
-| `system.queryLogRing` | 20,000 | 200 / 1,000 / 5,000 | 安全上限 |
+| `system.queryLogRing` | 20,000 | 實體記憶體 160 MB 以下最多 1,000、512 MB 以下最多 5,000（3.5.0） | 查詢紀錄的筆數上限；每筆固定約 160 bytes，只在開啟時配置（預設關閉） |
 | `community.maxBundleMB` / `maxFriends` | 32 / 50 | 4 / 8、10 / 20 | 好友資料另受保留量以上空間的 1/4 限制；好友數是防濫用上限 |
 
 網域資料庫的分片是要寫的時候才邊序列化邊寫進檔案（邊寫邊壓縮），整份 JSON 不會放在記憶體裡。

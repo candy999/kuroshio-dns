@@ -647,3 +647,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   | `/api/cdn/cross` | 唯讀 | 3.0 | 沒有（給查詢用） |
 
   `kuroshio` 套件裡有一個測試確認 rpcd 的唯讀白名單沒有會改變狀態的路徑、動作白名單都是會改變狀態的路徑。
+- **查詢紀錄**（3.5.0）：`GET /api/querylog?limit=200&name=&client=&since=` 讀最近的查詢（新的在前，`limit` 最多 1,000；`name` 是「包含這段文字」，`client` 是來源 IP，`since` 是毫秒時間戳）；`POST /api/querylog/enable?minutes=10` 暫時開啟（1～60 分鐘，到時間自動關閉並釋放；`minutes=0` 關閉）。`log.queryLog: true` 是常開。每一筆是 `{at, name, type, client, result（hit／miss／blocked／stale）, rcode, ms, source}`。
+  - 隱私：查詢紀錄含裝置位址與網域，是最敏感的資料：**只在記憶體**（不寫磁碟、不進備份、不給公開頁、不傳給上游／下游／好友），預設關閉，`/api/status` 的 `queryLog` 只顯示開著與否、到幾點、幾筆。串接中，上游放行的下游黑潮的查詢也會出現在上游的紀錄裡。
+  - 上限：筆數（環狀，`system.queryLogRing`，實體記憶體 160 MB 以下最多 1,000、512 MB 以下最多 5,000）、時間（暫時開啟最長 60 分鐘）。查詢不等紀錄的鎖：拿不到就丟掉那一筆（`dropped`）。
+  - OpenWrt 的 rpcd 開放 `/api/querylog`（唯讀）與 `/api/querylog/enable`（動作）。

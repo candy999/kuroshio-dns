@@ -299,6 +299,27 @@ async fn admin_api() {
     let (_, st) = http_get(admin, "/api/status", "localhost").await;
     assert_eq!(st["cacheEntries"], 0);
 
+    // 查詢紀錄（3.5.0）：預設關閉；只能用 POST 暫時開啟；開啟後記下查詢；狀態頁只顯示開著與否
+    let (_, ql) = http_get(admin, "/api/querylog", "localhost").await;
+    assert_eq!((ql["enabled"].clone(), ql["entries"].as_array().unwrap().len()), (json!(false), 0));
+    let (code, _) = http_get(admin, "/api/querylog/enable?minutes=5", "localhost").await;
+    assert_eq!(code, 405, "開啟要用 POST");
+    let (_, en) = http_req(admin, "POST", "/api/querylog/enable?minutes=5", "localhost").await;
+    assert_eq!(en["enabled"], true, "{en}");
+    started.resolver.handle(&q(5, "logged.example.test", 1), &CTX).await.unwrap();
+    let (_, ql) = http_get(admin, "/api/querylog?name=logged", "localhost").await;
+    let e = ql["entries"].as_array().unwrap();
+    assert_eq!(e.len(), 1, "{ql}");
+    assert_eq!(
+        (e[0]["name"].clone(), e[0]["result"].clone()),
+        (json!("logged.example.test"), json!("miss"))
+    );
+    let (_, st) = http_get(admin, "/api/status", "localhost").await;
+    assert_eq!(st["queryLog"]["enabled"], true);
+    assert!(st["queryLog"].get("entries").is_none(), "狀態頁不放內容");
+    let (_, off) = http_req(admin, "POST", "/api/querylog/enable?minutes=0", "localhost").await;
+    assert_eq!(off["enabled"], false);
+
     // 一般 DNS 被接走：追蹤結果標出來（回答的其實是攔截者）
     let mut rep = kuroshio_net::path::Report::default();
     rep.plain_v4.udp = true;
