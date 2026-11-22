@@ -141,6 +141,50 @@ pub const BUILD_BYTES_PER_RULE: u64 = 16;
 const DROP_CHECK_MIN_RULES: u64 = 1000;
 /// 第一次載入（或更新）有清單下載失敗時的重試間隔：1、2、5 分鐘，之後每 30 分鐘
 const RETRY_BACKOFF: [u64; 4] = [60, 120, 300, 1800];
+/// 開機用本機副本建好、而且每份清單都有副本：1 分鐘後再問有沒有更新（之後照上次檢查的時間等到更新間隔）
+pub const ALL_COPIES_WAIT: Duration = Duration::from_secs(60);
+/// 開機用本機副本建好、但有清單沒有副本：這麼久（再加 0～[`MISSING_FETCH_JITTER_MS`] 亂數）之後只下載缺的那幾份
+/// （3.5.0 C6；以前跟「全部都有副本」一樣等 60 秒，缺的清單開機後約 63 秒規則都不在）。
+/// 這 10 秒讓開機的路徑檢查、bootstrap、對時先跑，下載不跟它們搶記憶體與網路：不再縮短
+pub const MISSING_FETCH_WAIT: Duration = Duration::from_secs(10);
+/// 缺副本清單下載前的亂數（毫秒，上限）：很多台同時重新開機（停電後）不會同一秒去問同一個清單伺服器
+pub const MISSING_FETCH_JITTER_MS: u64 = 5_000;
+/// 開機時等對時、等記憶體的每次間隔
+const BOOT_POLL: Duration = Duration::from_secs(5);
+/// 等對時最多這麼多次（[`BOOT_POLL`] × 120 = 10 分鐘，同以前）
+const BOOT_CLOCK_POLLS: u32 = 120;
+/// 補缺的清單前，記憶體「偏低」最多等這麼多次（× 5 秒 = 50 秒：最晚跟以前的 63 秒差不多時開始，偏低不是不下載）
+const BOOT_LOW_POLLS: u32 = 10;
+/// 記憶體「不足」最多等這麼多次（× 5 秒 = 30 分鐘，同定時更新）；還是不足就交給定時更新的迴圈（它照樣等）
+const BOOT_CRITICAL_POLLS: u32 = 360;
+
+/// 開機排程用的等待函式回傳的 future
+pub type SleepFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// 開機排程（[`FilterService::boot`]）用到的時鐘、對時與記憶體狀態：正式執行用 [`BootHooks::real`]，
+/// 測試注入假的（不必真的等、可以控制對時與記憶體狀態）
+pub struct BootHooks {
+    pub sleep: Box<dyn Fn(Duration) -> SleepFut + Send + Sync>,
+    pub synced: Box<dyn Fn() -> bool + Send + Sync>,
+    pub pressure: Box<dyn Fn() -> crate::sysinfo::Pressure + Send + Sync>,
+    /// 補缺的清單前多等的亂數（毫秒，最多 [`MISSING_FETCH_JITTER_MS`]）
+    pub jitter_ms: u64,
+}
+
+impl BootHooks {
+    pub fn real() -> BootHooks {
+        let jitter_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as u64)
+            % (MISSING_FETCH_JITTER_MS + 1);
+        BootHooks {
+            sleep: Box::new(|d| Box::pin(tokio::time::sleep(d))),
+            synced: Box::new(crate::clock::synced),
+            pressure: Box::new(crate::app::pressure),
+            jitter_ms,
+        }
+    }
+}
 
 /// 新下載的規則數比上次少一大半：多半是連線中途斷掉、沒有長度資訊的回應被當成完整（回傳說明）
 fn suspicious_drop(prev: u64, now: u64) -> Option<String> {
@@ -840,7 +884,7 @@ impl FilterService {
                 }
                 let missing = self.missing.lock().unwrap().len();
                 if missing > 0 {
-                    info!("過濾清單：用本機副本先建好，{missing} 份沒有副本的稍後下載");
+                    info!("過濾清單：用本機副本先建好，{missing} 份沒有副本");
                 } else {
                     info!("過濾清單：用本機副本建好（不必等下載），稍後檢查有沒有更新");
                 }
@@ -985,16 +1029,15 @@ impl FilterService {
     /// 開機用副本建好之後，離下一次該檢查更新還有多久：全部清單都有副本、都記過上次檢查時間，
     /// 而且還沒到更新間隔才有值（重新啟動、重新載入不再一分鐘後就把清單全部問一次、有變的整份重新下載）
     pub fn first_check_delay(&self, now: u64) -> Option<Duration> {
+        self.check_delay(now, &[])
+    }
+
+    /// 同 [`first_check_delay`](Self::first_check_delay)，但 `fresh` 這幾份是剛剛才下載的（開機補缺的清單，3.5.0 C6）：
+    /// 不算「缺」，也不看它們的上次檢查時間（存不了副本的清單沒有索引，否則永遠是「馬上全部檢查」）
+    fn check_delay(&self, now: u64, fresh: &[usize]) -> Option<Duration> {
         let c = self.copies.get()?;
-        // 沒有本機副本的清單：串接中從上游拿到、留在記憶體的不算（重建時讀它）
-        let missing_unheld = {
-            let held = self.held.lock().unwrap();
-            self.missing
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|&i| !held.contains_key(&self.sources[i].url))
-        };
+        // 沒有本機副本的清單：留在記憶體的不算（重建時讀它）
+        let missing_unheld = self.missing_unheld().iter().any(|i| !fresh.contains(i));
         // 記憶體控制暫時停用的清單（reason = "memory"）本機副本都還在，恢復時由 `restore_one` 用副本重建，
         // 不算「缺清單」：以前這種情況會跳過更新間隔、立刻整份檢查，記憶體正吃緊時反而從網路下載
         // （3.4.2 Windows 實測：重新啟動 11 分鐘後、系統可用記憶體接近 0 時從網路收了 4.97 MB）
@@ -1004,7 +1047,7 @@ impl FilterService {
         }
         let ex = self.excluded();
         let urls: Vec<&str> = (0..self.sources.len())
-            .filter(|&i| !ex[i])
+            .filter(|&i| !ex[i] && !fresh.contains(&i))
             .map(|i| self.sources[i].url.as_str())
             .collect();
         if urls.is_empty() {
@@ -1017,6 +1060,148 @@ impl FilterService {
         }
         let next = last.saturating_add(self.interval.as_secs());
         (next > now).then(|| Duration::from_secs(next - now))
+    }
+
+    /// 開機只用副本建的時候沒有副本、這次沒載入，而且也沒有留在記憶體的清單（依清單順序）
+    fn missing_unheld(&self) -> Vec<usize> {
+        let held = self.held.lock().unwrap();
+        self.missing
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&i| !held.contains_key(&self.sources[i].url))
+            .collect()
+    }
+
+    /// 只補開機時沒有副本的清單（3.5.0 C6）：缺的下載，有副本的照讀副本、**不發請求**（不在開機時把每份清單都問一遍）。
+    /// 回傳這次下載成功、載入的清單。下載失敗的記在狀態的 `errors`（由定時更新照既有的退避重試）
+    pub async fn update_missing(&self) -> anyhow::Result<Vec<usize>> {
+        let _g = self.rebuild_lock.lock().await;
+        if self.all_suspended() || self.sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let want = self.missing_unheld();
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fit_allowance();
+        let reuse: Vec<bool> = (0..self.sources.len()).map(|i| !want.contains(&i)).collect();
+        self.rebuild_mode(Source::Download, &reuse).await?;
+        let ex = self.excluded();
+        let lists = self.lists.read().unwrap().clone();
+        let st = lists.stats();
+        let done: Vec<usize> = want
+            .into_iter()
+            .filter(|&i| !ex[i] && st.sources.get(i).is_some_and(|s| s.status == SourceStatus::Loaded))
+            .collect();
+        // 剛下載的就是剛檢查過（存成副本的才有索引可以記）
+        self.note_checked(&done);
+        Ok(done)
+    }
+
+    /// 開機時等對時（下載要 TLS；路由器開機時常是 1970），最多 10 分鐘
+    async fn boot_wait_clock(&self, h: &BootHooks) {
+        if (h.synced)() {
+            return;
+        }
+        info!("系統時間還沒對時：過濾清單等對時後再下載");
+        for _ in 0..BOOT_CLOCK_POLLS {
+            (h.sleep)(BOOT_POLL).await;
+            if (h.synced)() {
+                return;
+            }
+        }
+    }
+
+    /// 開機補缺的清單前看記憶體：不足時等（最多 30 分鐘）、偏低時最多等 50 秒（重建時新舊兩份同時在記憶體裡）。
+    /// 回傳現在可不可以下載（還是不足就交給定時更新的迴圈）
+    async fn boot_wait_memory(&self, h: &BootHooks) -> bool {
+        use crate::sysinfo::Pressure;
+        let (mut low, mut critical) = (0u32, 0u32);
+        loop {
+            match (h.pressure)() {
+                Pressure::Normal => return true,
+                Pressure::Low if low >= BOOT_LOW_POLLS => return true,
+                Pressure::Critical if critical >= BOOT_CRITICAL_POLLS => return false,
+                Pressure::Low => {
+                    if low == 0 {
+                        info!(
+                            "記憶體偏低：沒有副本的過濾清單稍等再下載（最多 {} 秒）",
+                            BOOT_POLL.as_secs() * BOOT_LOW_POLLS as u64
+                        );
+                    }
+                    low += 1;
+                }
+                Pressure::Critical => {
+                    if critical == 0 {
+                        warn!("記憶體不足，延後下載沒有副本的過濾清單（恢復後再下載，最多 30 分鐘）");
+                    }
+                    critical += 1;
+                }
+            }
+            (h.sleep)(BOOT_POLL).await;
+        }
+    }
+
+    /// 開機到進入定時更新迴圈之前的排程（3.5.0 C6）：
+    ///
+    /// 1. 有本機副本的清單先用副本建好過濾器（不必等下載、對時）。
+    /// 2. 每份都有副本：1 分鐘後（照舊）；有清單沒有副本：10～15 秒後、對時了、記憶體不是不足，**只下載缺的**。
+    /// 3. 上次檢查還沒過更新間隔：等到該檢查的時候（剛補上的清單算剛檢查過）。
+    ///
+    /// 回傳定時更新迴圈的重試次數起點（補缺的清單下載失敗時已經照退避等過第一次）
+    pub async fn boot(&self, h: &BootHooks) -> usize {
+        let built = self.build_from_copies().await;
+        let mut fresh: Vec<usize> = Vec::new();
+        if built {
+            let missing = self.missing_unheld();
+            if missing.is_empty() {
+                (h.sleep)(ALL_COPIES_WAIT).await;
+            } else {
+                let wait = MISSING_FETCH_WAIT + Duration::from_millis(h.jitter_ms.min(MISSING_FETCH_JITTER_MS));
+                let names: Vec<&str> = missing.iter().take(5).map(|&i| self.sources[i].name.as_str()).collect();
+                info!(
+                    "過濾清單：{} 份沒有副本的 {} 秒後下載（{}{}）",
+                    missing.len(),
+                    wait.as_secs(),
+                    names.join("、"),
+                    if missing.len() > 5 { "……" } else { "" }
+                );
+                (h.sleep)(wait).await;
+                self.boot_wait_clock(h).await;
+                if !self.boot_wait_memory(h).await {
+                    // 還是不足：交給定時更新的迴圈（它照樣先等記憶體）
+                    return 0;
+                }
+                match self.update_missing().await {
+                    Ok(done) => fresh = done,
+                    Err(e) => warn!("下載沒有副本的過濾清單失敗：{e:#}"),
+                }
+                let failed =
+                    self.status.lock().unwrap()["errors"].as_array().is_some_and(|a| !a.is_empty()) || !self.missing_unheld().is_empty();
+                if failed {
+                    let w = Duration::from_secs(RETRY_BACKOFF[0]);
+                    warn!("有清單還沒載入（下載失敗）：{} 秒後重試", w.as_secs());
+                    (h.sleep)(w).await;
+                    return 1;
+                }
+            }
+        }
+        self.boot_wait_clock(h).await;
+        // 3.4.3 起清單一律自己跟清單網址下載（不跟上游黑潮拿副本），不必等串接確定
+        // 上次檢查還沒過更新間隔（重新啟動、重新載入、換版）：等到該檢查的時候，不必一開機就全部問一次
+        if built {
+            if let Some(w) = self.check_delay(crate::persist::now_secs(), &fresh) {
+                info!(
+                    "過濾清單：{} 分鐘前檢查過更新，{} 分鐘後再檢查",
+                    (self.interval.saturating_sub(w)).as_secs() / 60,
+                    w.as_secs() / 60
+                );
+                (h.sleep)(w).await;
+            }
+        }
+        0
     }
 
     /// 依記憶體預算（記憶體控制提供）先排除會放不下的清單：只用量過的大小估，依停用順序（保護清單絕不排除；
@@ -1487,33 +1672,8 @@ impl FilterService {
         let me = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            // 有本機副本：先用副本建好，1 分鐘後再問上游有沒有更新（大多是 304，不必重建）
-            let built = me.build_from_copies().await;
-            if built {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-            // 下載要 TLS：系統時間還沒對時（路由器開機時常是 1970）先等，最多 10 分鐘
-            let t0 = std::time::Instant::now();
-            if !crate::clock::synced() {
-                info!("系統時間還沒對時：過濾清單等對時後再下載");
-                while !crate::clock::synced() && t0.elapsed() < Duration::from_secs(600) {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            }
-            // 3.4.3 起清單一律自己跟清單網址下載（不跟上游黑潮拿副本），不必等串接確定
-            // 上次檢查還沒過更新間隔（重新啟動、重新載入、換版）：等到該檢查的時候，不必一開機就全部問一次
-            if built {
-                if let Some(w) = me.first_check_delay(crate::persist::now_secs()) {
-                    info!(
-                        "過濾清單：{} 分鐘前檢查過更新，{} 分鐘後再檢查",
-                        (me.interval.saturating_sub(w)).as_secs() / 60,
-                        w.as_secs() / 60
-                    );
-                    tokio::time::sleep(w).await;
-                }
-            }
+            let mut tries = me.boot(&BootHooks::real()).await;
             // 有清單下載失敗（或還有沒載入的）時短間隔重試：1、2、5 分鐘，之後每 30 分鐘；全部成功就回到正常間隔
-            let mut tries = 0usize;
             loop {
                 // 記憶體吃緊時延後（重建時新舊兩份會同時存在）
                 let wait = if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
