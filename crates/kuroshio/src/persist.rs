@@ -324,7 +324,12 @@ pub struct Persister {
     deleted: Vec<(u64, String, u64)>,
     /// 關機批次寫入中、還沒改名的暫存檔（空間不夠時不能刪）
     staged_tmp: Vec<PathBuf>,
+    /// 關機寫快照開始後過了多久（測試注入；正常是真的時鐘）
+    elapsed_probe: Option<ElapsedProbe>,
 }
+
+/// 關機寫快照開始後過了多久（呼叫一次量一次）
+type ElapsedProbe = Box<dyn Fn() -> std::time::Duration + Send>;
 
 /// 內容雜湊：分段餵進去跟整份一次餵結果相同（串流寫入時邊寫邊算）
 struct HashWriter<W> {
@@ -388,6 +393,7 @@ impl Persister {
             mem: Mem::UNKNOWN,
             compress: Box::new(|_| false),
             free_probe: Box::new(space::free_bytes),
+            elapsed_probe: None,
             fs_total: None,
             extra_files: Vec::new(),
             deleted: Vec::new(),
@@ -416,6 +422,11 @@ impl Persister {
     }
 
     /// 測試用：換掉可用空間的查法
+    /// 換掉「關機寫快照開始後過了多久」的量法（測試用：不必真的等）
+    pub fn set_elapsed_probe(&mut self, f: impl Fn() -> std::time::Duration + Send + 'static) {
+        self.elapsed_probe = Some(Box::new(f));
+    }
+
     pub fn set_free_probe(&mut self, f: impl Fn(&Path) -> Option<u64> + Send + 'static) {
         self.free_probe = Box::new(f);
     }
@@ -537,12 +548,12 @@ impl Persister {
 
     /// 定時呼叫：到了間隔、而且今天的寫入量還沒超過節奏目標的才寫；到了最久未存上限的一定寫
     pub fn flush(&mut self, now: u64) -> std::io::Result<usize> {
-        self.flush_inner(now, false, false, false).map(|x| x.0)
+        self.flush_inner(now, false, false, None).map(|x| x.0)
     }
 
     /// 關機時：有變動的全部寫出
     pub fn flush_all(&mut self, now: u64) -> std::io::Result<usize> {
-        self.flush_inner(now, true, false, false).map(|x| x.0)
+        self.flush_inner(now, true, false, None).map(|x| x.0)
     }
 
     /// 關機：有變動的全部寫出，回傳（寫了幾份, 磁碟上一共幾 bytes）。
@@ -550,14 +561,20 @@ impl Persister {
     /// 斷電時的保證跟一份一份寫一樣（內容落地之後才改名），但 fsync 次數從「每份兩次」變成幾次（3.4.2：
     /// D3 的 USB 隨身碟上幾百份 CDN 分片一份一份寫，30 秒內寫不完被強制停止，排程紀錄也沒寫到）
     pub fn flush_for_shutdown(&mut self, now: u64) -> std::io::Result<(usize, u64)> {
+        self.flush_for_shutdown_within(now, SHUTDOWN_BUDGET)
+    }
+
+    /// 同 [`flush_for_shutdown`](Self::flush_for_shutdown)，時間上限是 `budget`（3.5.0 C1：Windows 主控台關閉／登出／關機時
+    /// 系統大約 5 秒後就強制結束行程，用 [`CONSOLE_SHUTDOWN_BUDGET`]）。小檔先寫；寫不完的下次啟動用上一次存的
+    pub fn flush_for_shutdown_within(&mut self, now: u64, budget: std::time::Duration) -> std::io::Result<(usize, u64)> {
         // 先寫暫存檔、最後一起落地（batch）只在 Unix：Windows 沒有 syncfs，暫存檔要各自 FlushFileBuffers。
-        // 小檔先寫與 10 秒的上限兩邊都要（3.4.2 Windows 實測：以前只有 Unix 有，Windows 照名稱一份一份寫、沒有上限）
-        self.flush_inner(now, true, cfg!(unix), true)
+        // 小檔先寫與時間上限兩邊都要（3.4.2 Windows 實測：以前只有 Unix 有，Windows 照名稱一份一份寫、沒有上限）
+        self.flush_inner(now, true, cfg!(unix), Some(budget))
     }
 
     /// 有變動的全部寫出，回傳（寫了幾份, 磁碟上一共幾 bytes）：管理介面的「立即儲存學習資料」
     pub fn flush_all_counted(&mut self, now: u64) -> std::io::Result<(usize, u64)> {
-        self.flush_inner(now, true, false, false)
+        self.flush_inner(now, true, false, None)
     }
 
     /// 估計大小（磁碟上）
@@ -745,7 +762,8 @@ impl Persister {
         false
     }
 
-    fn flush_inner(&mut self, now: u64, force: bool, batch: bool, shutdown: bool) -> std::io::Result<(usize, u64)> {
+    /// `shutdown` = 關機（小檔先寫，寫到這個時間上限就停）
+    fn flush_inner(&mut self, now: u64, force: bool, batch: bool, shutdown: Option<std::time::Duration>) -> std::io::Result<(usize, u64)> {
         self.roll_day(now);
         let interval = effective_interval(&self.policy, self.mem);
         let critical = self.mem.pressure() == Pressure::Critical;
@@ -753,7 +771,7 @@ impl Persister {
             .entries
             .iter()
             .filter_map(|(k, e)| {
-                let size = if shutdown { self.size_estimate(k, e) } else { 0 };
+                let size = if shutdown.is_some() { self.size_estimate(k, e) } else { 0 };
                 e.pending.as_ref().map(|p| (!p.opts.after.is_empty(), size, k.clone()))
             })
             .collect();
@@ -770,7 +788,11 @@ impl Persister {
         for (_, _, name) in names {
             // 關機有時間限制（整合方通常等 15～30 秒就強制結束）：寫到 SHUTDOWN_BUDGET 就停，剩下的（排在後面的大檔，
             // 通常是 CDN 分片）下次啟動用上一次存的。小檔先寫，排程紀錄這類小檔一定寫得到（3.4.2）
-            if shutdown && t0.elapsed() >= SHUTDOWN_BUDGET {
+            let elapsed = match &self.elapsed_probe {
+                Some(f) if shutdown.is_some() => f(),
+                _ => t0.elapsed(),
+            };
+            if shutdown.is_some_and(|b| elapsed >= b) {
                 skipped_for_time += 1;
                 continue;
             }
@@ -886,8 +908,8 @@ impl Persister {
         self.staged_tmp.clear();
         if skipped_for_time > 0 {
             warn!(
-                "關機時間有限（{} 秒）：還有 {skipped_for_time} 份快照沒寫，下次啟動用上一次存的",
-                SHUTDOWN_BUDGET.as_secs()
+                "關機時間有限（{:.1} 秒）：還有 {skipped_for_time} 份快照沒寫，下次啟動用上一次存的",
+                shutdown.unwrap_or(SHUTDOWN_BUDGET).as_secs_f32()
             );
         }
         if !staged.is_empty() {
@@ -1029,6 +1051,9 @@ fn fmt_age(secs: u64) -> String {
 /// 寫檔（`compress` = 邊寫邊 zstd 壓縮）。回傳（壓縮前內容的雜湊，磁碟上的大小）
 /// 關機時寫快照最多花這麼久（之後的不寫）：padavan 等 30 秒、Docker 預設等 10 秒（文件建議 15 秒）就強制結束
 pub const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// Windows 主控台關閉視窗／登出／關機時（3.5.0 C1）：系統在事件發生後大約 5 秒就強制結束行程，
+/// 寫快照最多 3 秒（其他準備與結束各留 1 秒）
+pub const CONSOLE_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 批次寫入（關機）時寫好、還沒改名的一份
 struct Staged {
@@ -1410,6 +1435,36 @@ mod tests {
         q.set_compress(|n| n.starts_with("cdn/"));
         assert_eq!(q.load("cdn/d2.json").unwrap(), vec![b'b'; 4000]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 3.5.0 C1：關機寫快照的時間上限可以指定（注入的時鐘：每量一次過 1 秒）。小檔先寫；
+    /// 3 秒的上限寫 3 份就停，剩下的留在記憶體；10 秒的上限全部寫完
+    #[test]
+    fn flush_for_shutdown_respects_custom_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        let stage = |p: &mut Persister, t: u64| {
+            for (i, n) in ["e.json", "d.json", "c.json", "b.json", "a.json"].iter().enumerate() {
+                // e 最小、a 最大：小檔先寫
+                p.stage_with(n, Snapshot::Bytes(vec![b'x'; 100 * (i + 1)]), Opts::default(), t);
+            }
+        };
+        let t = 6_000 * 86400;
+        for (budget, want) in [(Duration::from_secs(3), 3usize), (Duration::from_secs(10), 5)] {
+            let dir = tmpdir(&format!("budget{}", budget.as_secs()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut p = Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096));
+            let ticks = std::sync::Arc::new(AtomicU32::new(0));
+            let t2 = ticks.clone();
+            p.set_elapsed_probe(move || Duration::from_secs(t2.fetch_add(1, Ordering::Relaxed) as u64));
+            stage(&mut p, t);
+            let (n, _) = p.flush_for_shutdown_within(t, budget).unwrap();
+            assert_eq!(n, want, "{budget:?}");
+            assert_eq!(p.stats().pending, 5 - want, "寫不完的留著（下次啟動用上一次存的）");
+            assert!(dir.join("e.json").exists() && dir.join("d.json").exists(), "小檔先寫");
+            assert_eq!(dir.join("a.json").exists(), want == 5, "大檔排最後");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// 3.4.2：關機批次寫入時空間吃緊，「先刪可刪的檔」不能刪到前面已寫好、還沒改名的暫存檔

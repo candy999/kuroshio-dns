@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -135,15 +135,162 @@ pub struct Reading {
 }
 
 impl Reading {
-    /// 量這台機器（Linux：/proc/meminfo、/proc/pressure/memory；Windows：GlobalMemoryStatusEx）
+    /// 量這台機器（Linux：/proc/meminfo、/proc/pressure/memory；Windows：GlobalMemoryStatusEx）。
+    /// 測試開關（[`simulate`]，3.5.0 C9）開著時，系統可用記憶體換成 min(真實值, 模擬值)：
+    /// 所有直接呼叫這裡的地方（記憶體控制、壓力訊號、評測的空間）看到的都一樣。只在背景的監看與工作裡呼叫，不在查詢路徑上
     pub fn now() -> Reading {
         let (total, avail) = sysinfo::mem_bytes();
-        Reading {
+        let r = Reading {
             rss: sysinfo::rss_bytes(),
             total,
             avail,
             psi: std::fs::read_to_string("/proc/pressure/memory").ok().as_deref().and_then(parse_psi),
+        };
+        apply_simulation(r, simulation(steady_secs()))
+    }
+}
+
+// ------------------------------------------------------------ 測試開關：模擬記憶體不足（3.5.0 C9）
+//
+// 讓測試者在記憶體很多的機器（512 MB 的 D3、Windows）上觸發「吃緊／不足」的整套流程（停用清單、只轉送、恢復）。
+// 兩道保險：設定 `system.testHooks: true`（預設 false，不放進 LuCI、設定頁、UCI 範例）才接受，
+// 每次都有時間上限（最長 [`SIM_MAX_MINUTES`] 分鐘），到期自動恢復；只放在記憶體裡，重新啟動後不保留。
+// 只會讓讀數變小（模擬不足），不能模擬成比真實更寬裕。
+
+/// 一次最長幾分鐘
+pub const SIM_MAX_MINUTES: u64 = 30;
+/// 沒給 `minutes` 時幾分鐘
+pub const SIM_DEFAULT_MINUTES: u64 = 5;
+/// 模擬值上限（MB）：只是防呆，反正只會取比較小的
+const SIM_MAX_MB: u64 = 1 << 20;
+/// [`steady_secs`] 的起點（時間換成 u32 存）
+const STEADY_BASE: u64 = 1_000_000_000;
+
+/// 生效中的模擬
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Simulation {
+    pub avail_mb: u32,
+    /// 到期時間（[`steady_secs`]）
+    pub until: u64,
+}
+
+fn to_rel(t: u64) -> u32 {
+    t.saturating_sub(STEADY_BASE).clamp(1, u32::MAX as u64) as u32
+}
+
+/// 模擬的狀態（行程裡一份 [`SIM`]；測試自己造一份，不影響同一個行程裡的其他測試）。
+/// 32 位元平台沒有 64 位元原子操作：時間存成「[`steady_secs`] 減掉起點」的 u32 秒
+pub struct SimState {
+    mb: AtomicU32,
+    /// 到期時間；0 = 沒有開
+    until: AtomicU32,
+    /// 上次寫提醒的時間；0 = 還沒寫過
+    warned: AtomicU32,
+}
+
+/// 行程裡的模擬狀態（只在記憶體裡：重新啟動後不保留）
+pub static SIM: SimState = SimState::new();
+
+impl SimState {
+    pub const fn new() -> SimState {
+        SimState {
+            mb: AtomicU32::new(0),
+            until: AtomicU32::new(0),
+            warned: AtomicU32::new(0),
         }
+    }
+
+    /// 開始模擬（覆蓋前一次）：`minutes` 限制在 1～30。回傳生效的模擬
+    pub fn start(&self, avail_mb: u64, minutes: u64, now: u64) -> Simulation {
+        let minutes = minutes.clamp(1, SIM_MAX_MINUTES);
+        let mb = avail_mb.min(SIM_MAX_MB) as u32;
+        let until = now + minutes * 60;
+        // 先寫值再寫到期時間：讀的人看到到期時間就一定看得到這次的值
+        self.mb.store(mb, Ordering::Release);
+        self.until.store(to_rel(until), Ordering::Release);
+        self.warned.store(0, Ordering::Relaxed);
+        Simulation { avail_mb: mb, until }
+    }
+
+    /// 立刻取消。回傳原本有沒有開
+    pub fn stop(&self) -> bool {
+        self.until.swap(0, Ordering::AcqRel) != 0
+    }
+
+    /// 目前生效的模擬（到期了就是 None）
+    pub fn get(&self, now: u64) -> Option<Simulation> {
+        let until = self.until.load(Ordering::Acquire);
+        if until == 0 {
+            return None;
+        }
+        let until = until as u64 + STEADY_BASE;
+        (now < until).then(|| Simulation {
+            avail_mb: self.mb.load(Ordering::Acquire),
+            until,
+        })
+    }
+
+    /// 記憶體監看每一輪呼叫：生效期間每分鐘回傳一行提醒，到期那一輪回傳「結束」一次（之後都是 None）
+    pub fn notice(&self, now: u64) -> Option<String> {
+        match self.get(now) {
+            Some(s) => {
+                let last = self.warned.load(Ordering::Relaxed);
+                if last != 0 && now < last as u64 + STEADY_BASE + 60 {
+                    return None;
+                }
+                self.warned.store(to_rel(now), Ordering::Relaxed);
+                let left = s.until.saturating_sub(now);
+                Some(format!(
+                    "測試模式：模擬可用記憶體 {} MB，還有 {} 分鐘（system.testHooks；到期自動恢復，POST /api/memory/simulate?off=1 立刻取消）",
+                    s.avail_mb,
+                    left.div_ceil(60)
+                ))
+            }
+            None => {
+                let until = self.until.load(Ordering::Acquire);
+                if until != 0 && self.until.compare_exchange(until, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    return Some("測試模式結束：記憶體模擬到期，回到真實的量測（之後由記憶體控制照常恢復）".into());
+                }
+                None
+            }
+        }
+    }
+}
+
+impl Default for SimState {
+    fn default() -> Self {
+        SimState::new()
+    }
+}
+
+/// 目前行程裡生效的模擬
+pub fn simulation(now: u64) -> Option<Simulation> {
+    SIM.get(now)
+}
+
+/// 設定的 `system.testHooks`（預設 false）：測試用的開關要它開著才接受（3.5.0 C9）
+pub fn test_hooks(cfg: &Value) -> bool {
+    kuroshio_config::get(cfg, "system.testHooks").and_then(Value::as_bool) == Some(true)
+}
+
+/// 純函式：把模擬套到一次量測上（可用記憶體 = min(真實值, 模擬值)；量不到時就是模擬值）
+pub fn apply_simulation(mut r: Reading, sim: Option<Simulation>) -> Reading {
+    if let Some(s) = sim {
+        let cap = s.avail_mb as u64 * (1 << 20);
+        r.avail = Some(r.avail.map_or(cap, |a| a.min(cap)));
+    }
+    r
+}
+
+/// `/api/status.memory.simulated`：`{ availMB, until（Unix 毫秒）, remainingSec }`，沒開時 null
+pub fn simulation_json(sim: Option<Simulation>, now: u64) -> Value {
+    match sim {
+        Some(s) => json!({
+            "availMB": s.avail_mb,
+            "until": steady_to_wall_ms(s.until),
+            "remainingSec": s.until.saturating_sub(now),
+        }),
+        None => Value::Null,
     }
 }
 
@@ -476,6 +623,16 @@ pub trait Step: Send + Sync {
     fn sizes(&self, _out: &mut serde_json::Map<String, Value>) {}
     fn shed<'a>(&'a self, r: &'a Reading) -> BoxFut<'a, anyhow::Result<Outcome>>;
     fn restore(&self) -> BoxFut<'_, anyhow::Result<Outcome>>;
+    /// 釋出，`short` = 這一輪還缺多少（bytes；離保留量遠時由 [`Governor::tick`] 算：缺口 − 這一輪前面步驟已經釋出的；
+    /// 0 = 只做一個單位）。預設照 [`shed`](Self::shed)；過濾清單依它一次停用幾份、只重建一次（3.5.0 C3）
+    fn shed_for<'a>(&'a self, r: &'a Reading, _short: u64) -> BoxFut<'a, anyhow::Result<Outcome>> {
+        self.shed(r)
+    }
+    /// 恢復，`room` = 可以拿來恢復的空間（[`restore_room`]）。預設照 [`restore`](Self::restore)；
+    /// 過濾清單依它一次恢復幾份、只重建一次（3.5.0 C3）
+    fn restore_for(&self, _room: u64) -> BoxFut<'_, anyhow::Result<Outcome>> {
+        self.restore()
+    }
 }
 
 /// 釋出中的項目（狀態頁用）
@@ -605,7 +762,7 @@ impl Governor {
     pub async fn tick(&self, r: Reading, now: u64) -> Option<String> {
         enum Plan {
             Shed { far: bool, deficit: u64 },
-            Restore(usize),
+            Restore(usize, u64),
         }
         let (plan, growth_change) = {
             let mut g = self.inner.lock().unwrap();
@@ -664,7 +821,7 @@ impl Governor {
                         let need = self.steps[k].restore_need();
                         let room = restore_room(&r, &self.reserve);
                         if room as u128 >= need as u128 * 13 / 10 {
-                            Some(Plan::Restore(k))
+                            Some(Plan::Restore(k, room))
                         } else {
                             i.waiting = Some(format!(
                                 "等待空間恢復{}：需要約 {} KB × 1.3，目前約 {} KB",
@@ -702,7 +859,9 @@ impl Governor {
                     };
                     let Some(k) = k else { break };
                     let s = &self.steps[k];
-                    let res = s.shed(&r).await;
+                    // 離保留量遠：告訴這一步還缺多少（過濾清單依它一次停用幾份、只重建一次）；不遠：一次一個單位
+                    let short = if far { deficit.saturating_sub(freed) } else { 0 };
+                    let res = s.shed_for(&r, short).await;
                     // 把釋出的記憶體還給系統（glibc 不會自己還；musl 大塊會直接還）
                     sysinfo::trim_heap();
                     let mut g = self.inner.lock().unwrap();
@@ -744,9 +903,9 @@ impl Governor {
                 }
                 (!done.is_empty()).then(|| done.join(","))
             }
-            Plan::Restore(k) => {
+            Plan::Restore(k, room) => {
                 let s = &self.steps[k];
-                let res = s.restore().await;
+                let res = s.restore_for(room).await;
                 let mut g = self.inner.lock().unwrap();
                 let i = &mut *g;
                 match res {
@@ -898,6 +1057,8 @@ impl Governor {
             "waiting": i.waiting,
             "nextRestoreAt": (i.next_restore_at > 0 && !i.shed.is_empty()).then(|| steady_to_wall_ms(i.next_restore_at)),
             "events": i.events.iter().rev().map(|e| json!({ "at": steady_to_wall_ms(e.at), "msg": e.msg })).collect::<Vec<_>>(),
+            // 測試開關（3.5.0 C9）：模擬可用記憶體中（null = 沒開）
+            "simulated": simulation_json(simulation(steady_secs()), steady_secs()),
         })
     }
 }
@@ -1181,9 +1342,33 @@ fn genuinely_short(r: &Reading, res: &Reserve) -> bool {
     r.avail.is_some_and(|a| a < res.bytes / 2)
 }
 
-/// 第 4 步：過濾清單（系統真的不足時）：一次停用一份優先順序最低的清單；保護清單不在這一步
+/// 第 4 步：過濾清單（系統真的不足時）：停用優先順序最低的清單；保護清單不在這一步。
+/// 離保留量遠時依「還缺多少 × 1.3」一次停用幾份、只重建一次（3.5.0 C3）；恢復時依可用空間一次恢復幾份、也只重建一次
 pub struct FilterStep {
     pub filter: Arc<crate::filtering::FilterService>,
+}
+
+/// 一次停用的目標：還缺的 × 1.3（估計值偏差、讓出後配置器不一定全部還給系統）；0 = 一份
+fn shed_target(short: u64) -> u64 {
+    (short as u128 * 13 / 10).min(u64::MAX as u128) as u64
+}
+
+/// 停用 / 恢復的說明：「：2 份清單（A、B，共 300 條規則）」；一份時同以前「：A 清單（300 條規則）」
+fn lists_detail(v: &[crate::filtering::Unloaded], with_rules: bool) -> String {
+    let rules: u64 = v.iter().map(|u| u.rules).sum();
+    match v {
+        [u] if with_rules => format!("：{} 清單（{} 條規則）", u.name, u.rules),
+        [u] => format!("：{} 清單", u.name),
+        _ => {
+            let line = v.iter().take(5).map(|u| u.name.as_str()).collect::<Vec<_>>().join("、");
+            let more = if v.len() > 5 { "……" } else { "" };
+            if with_rules {
+                format!("：{} 份清單（{line}{more}，共 {rules} 條規則）", v.len())
+            } else {
+                format!("：{} 份清單（{line}{more}）", v.len())
+            }
+        }
+    }
 }
 
 impl Step for FilterStep {
@@ -1221,36 +1406,35 @@ impl Step for FilterStep {
         out.insert("filterListsUnloaded".into(), json!(self.filter.unloaded().len()));
     }
     fn shed<'a>(&'a self, r: &'a Reading) -> BoxFut<'a, anyhow::Result<Outcome>> {
+        self.shed_for(r, 0)
+    }
+    fn shed_for<'a>(&'a self, r: &'a Reading, short: u64) -> BoxFut<'a, anyhow::Result<Outcome>> {
         Box::pin(async move {
-            // 重建時新舊兩份同時存在：新的一份放不進可用記憶體的一半就不做（不能為了省記憶體反而用光）
-            let lists = self.filter.lists_bytes();
-            let freed = self.filter.next_shed_bytes().unwrap_or(0);
-            if let Some(av) = r.avail {
-                if lists.saturating_sub(freed) > av / 2 {
-                    anyhow::bail!("可用記憶體不足以安全重建過濾器（需要約 {} KB）", lists.saturating_sub(freed) / 1024);
-                }
+            // 重建時新舊兩份同時存在：停用這幾份之後的新的一份放不進可用記憶體的一半就不做（不能為了省記憶體反而用光）
+            let v = self.filter.unload_many(shed_target(short), r.avail.map(|av| av / 2)).await?;
+            if v.is_empty() {
+                anyhow::bail!("沒有可以停用的清單（其他都是保護清單）");
             }
-            match self.filter.unload_one().await? {
-                Some(u) => Ok(Outcome {
-                    bytes: u.bytes,
-                    detail: format!("：{} 清單（{} 條規則）", u.name, u.rules),
-                }),
-                None => anyhow::bail!("沒有可以停用的清單（其他都是保護清單）"),
-            }
+            Ok(Outcome {
+                bytes: v.iter().map(|u| u.bytes).sum(),
+                detail: lists_detail(&v, true),
+            })
         })
     }
     fn restore(&self) -> BoxFut<'_, anyhow::Result<Outcome>> {
+        self.restore_for(0)
+    }
+    fn restore_for(&self, room: u64) -> BoxFut<'_, anyhow::Result<Outcome>> {
         Box::pin(async move {
-            match self.filter.restore_one().await? {
-                Some(u) => {
-                    self.filter.persist_held();
-                    Ok(Outcome {
-                        bytes: u.bytes,
-                        detail: format!("：{} 清單", u.name),
-                    })
-                }
-                None => Ok(Outcome::default()),
+            let v = self.filter.restore_many(room).await?;
+            if v.is_empty() {
+                return Ok(Outcome::default());
             }
+            self.filter.persist_held();
+            Ok(Outcome {
+                bytes: v.iter().map(|u| u.bytes).sum(),
+                detail: lists_detail(&v, false),
+            })
         })
     }
 }
@@ -1616,6 +1800,9 @@ mod tests {
         fail_restore: AtomicBool,
         fail_shed: AtomicBool,
         grow: Arc<Mutex<Vec<bool>>>,
+        /// 每次釋出時 `tick` 傳下來的「還缺多少」、每次恢復時的可用空間（3.5.0 C3）
+        shorts: Arc<Mutex<Vec<u64>>>,
+        rooms: Arc<Mutex<Vec<u64>>>,
     }
 
     impl Fake {
@@ -1631,6 +1818,8 @@ mod tests {
                 fail_restore: AtomicBool::new(false),
                 fail_shed: AtomicBool::new(false),
                 grow: Default::default(),
+                shorts: Default::default(),
+                rooms: Default::default(),
             })
         }
     }
@@ -1674,6 +1863,14 @@ mod tests {
                     detail: String::new(),
                 })
             })
+        }
+        fn shed_for<'a>(&'a self, r: &'a Reading, short: u64) -> BoxFut<'a, anyhow::Result<Outcome>> {
+            self.shorts.lock().unwrap().push(short);
+            self.shed(r)
+        }
+        fn restore_for(&self, room: u64) -> BoxFut<'_, anyhow::Result<Outcome>> {
+            self.rooms.lock().unwrap().push(room);
+            self.restore()
         }
         fn restore(&self) -> BoxFut<'_, anyhow::Result<Outcome>> {
             Box::pin(async move {
@@ -1804,6 +2001,133 @@ mod tests {
         // 可用 70 MB（差 30 MB，離保留量遠）：一步就補足
         assert_eq!(g.tick(rd(70), 1000).await.unwrap(), "shed:diagnostics");
         assert_eq!(g.tick(rd(40), 1010).await.unwrap(), "shed:cache,shed:cdn", "差 60 MB：兩步");
+    }
+
+    /// 3.5.0 C3：離保留量遠時，每一步拿到「還缺多少」＝缺口 − 這一輪前面步驟已經釋出的；不遠時是 0（一個單位）；
+    /// 恢復時拿到可用空間（可用 − 保留量 − 遲滯）
+    #[tokio::test]
+    async fn tick_passes_shortfall_and_room_to_steps() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mk = |key, min, bytes| {
+            Box::new(Fake {
+                bytes,
+                ..*Fake::new(key, min, 1, 0, &log)
+            })
+        };
+        let (a, b, f) = (
+            mk("cache", State::Tight, 10 * MB),
+            mk("cdn", State::Tight, 5 * MB),
+            mk("filter", State::Critical, MB),
+        );
+        let (sa, sb, sf, rf) = (a.shorts.clone(), b.shorts.clone(), f.shorts.clone(), f.rooms.clone());
+        let g = Governor::new(res100(), vec![a, b, f], 0);
+        // 可用 30 MB：缺 70 MB。快取拿到 70、CDN 拿到 60、清單拿到 55
+        g.tick(rd(30), 1000).await.unwrap();
+        assert_eq!(*sa.lock().unwrap(), [70 * MB]);
+        assert_eq!(*sb.lock().unwrap(), [60 * MB]);
+        assert_eq!(*sf.lock().unwrap(), [55 * MB]);
+        // 恢復：寬裕而且停留夠久；空間 = 可用 − 保留 − 遲滯
+        let mut now = 1000;
+        while rf.lock().unwrap().is_empty() && now < 3000 {
+            now += 5;
+            g.tick(rd(400), now).await;
+        }
+        assert_eq!(*rf.lock().unwrap(), [250 * MB]);
+        // 不遠（稍微低於保留量）：一次一個單位
+        let log2 = Arc::new(Mutex::new(Vec::new()));
+        let c = Fake::new("cache", State::Tight, 1, 0, &log2);
+        let sc = c.shorts.clone();
+        let g = Governor::new(res100(), vec![c], 0);
+        g.tick(rd(90), 1000).await.unwrap();
+        assert_eq!(*sc.lock().unwrap(), [0]);
+    }
+
+    #[test]
+    fn shed_target_is_shortfall_times_1_3() {
+        assert_eq!(shed_target(0), 0, "一份");
+        assert_eq!(shed_target(10 * MB), 13 * MB);
+        assert_eq!(shed_target(u64::MAX), u64::MAX, "不溢位");
+    }
+
+    /// 3.5.0 C9：模擬只會讓可用記憶體變小，不會比真實寬裕
+    #[test]
+    fn simulate_only_lowers_reading() {
+        let s = Some(Simulation {
+            avail_mb: 20,
+            until: u64::MAX,
+        });
+        assert_eq!(apply_simulation(rd(600), s).avail, Some(20 * MB));
+        assert_eq!(apply_simulation(rd(10), s).avail, Some(10 * MB), "真實的比較少：照真實的");
+        assert_eq!(apply_simulation(Reading::default(), s).avail, Some(20 * MB), "量不到：用模擬值");
+        assert_eq!(apply_simulation(rd(600), None), rd(600), "沒開：不動");
+        let r = apply_simulation(rd(600), s);
+        assert_eq!((r.total, r.rss, r.psi), (rd(600).total, rd(600).rss, None), "其他欄位不動");
+    }
+
+    #[test]
+    fn simulate_capped_at_30_minutes() {
+        let sim = SimState::new();
+        let now = 2_000_000_000;
+        assert_eq!(sim.start(20, 999, now).until, now + 30 * 60);
+        assert_eq!(sim.start(20, 0, now).until, now + 60, "最短 1 分鐘");
+        assert_eq!(sim.start(u64::MAX, 5, now).avail_mb, 1 << 20, "防呆上限");
+        assert!(sim.get(now + 5 * 60 - 1).is_some());
+        assert!(sim.get(now + 5 * 60).is_none(), "到期");
+        assert!(sim.stop());
+        assert!(!sim.stop());
+    }
+
+    /// 到期自動恢復（注入時鐘）：模擬期間記憶體控制照「不足」讓出；到期後讀回真實值，照常放鬆、恢復。
+    /// 提醒每分鐘一行，到期那一輪記一行「結束」
+    #[tokio::test]
+    async fn simulate_expires_and_restores() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let g = Governor::new(res100(), ladder(&log, 2 * MB), 0);
+        let sim = Arc::new(SimState::new());
+        // 注入的時鐘：t0 起算的秒數（32 位元平台沒有 AtomicU64）
+        let t0: u64 = 2_000_000_000;
+        let clock = Arc::new(AtomicU32::new(0));
+        let (s2, c2) = (sim.clone(), clock.clone());
+        // 真實的可用記憶體一直是 600 MB（寬裕）
+        g.set_reader(move || apply_simulation(rd(600), s2.get(t0 + c2.load(Ordering::Relaxed) as u64)));
+        sim.start(20, 5, t0);
+        let mut notices = Vec::new();
+        let mut now = t0;
+        while now < t0 + 40 * 60 {
+            clock.store((now - t0) as u32, Ordering::Relaxed);
+            if let Some(m) = sim.notice(now) {
+                notices.push((now - t0, m));
+            }
+            let r = g.read();
+            g.tick(r, now).await;
+            now += 5;
+        }
+        let l = log.lock().unwrap().clone();
+        assert!(
+            l.contains(&"shed:filter".to_string()) && l.contains(&"shed:floor".to_string()),
+            "模擬期間照「不足」讓出：{l:?}"
+        );
+        assert!(
+            l.contains(&"restore:floor".to_string()) && l.contains(&"restore:diagnostics".to_string()),
+            "到期後自己恢復：{l:?}"
+        );
+        assert_eq!(g.state(), State::Comfortable);
+        // 提醒：0、60、120、180、240 秒各一行，300 秒到期記「結束」，之後不再記
+        let at: Vec<u64> = notices.iter().map(|n| n.0).collect();
+        assert_eq!(at, [0, 60, 120, 180, 240, 300], "{notices:?}");
+        assert!(notices[0].1.contains("20 MB") && notices[0].1.contains("還有 5 分鐘"));
+        assert!(notices[5].1.contains("結束"));
+        assert!(sim.get(now).is_none());
+        // 狀態頁的欄位
+        assert_eq!(simulation_json(None, now), Value::Null);
+        let j = simulation_json(
+            Some(Simulation {
+                avail_mb: 20,
+                until: now + 90,
+            }),
+            now,
+        );
+        assert_eq!((j["availMB"].clone(), j["remainingSec"].clone()), (json!(20), json!(90)));
     }
 
     #[tokio::test]

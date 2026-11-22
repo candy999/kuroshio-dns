@@ -141,6 +141,50 @@ pub const BUILD_BYTES_PER_RULE: u64 = 16;
 const DROP_CHECK_MIN_RULES: u64 = 1000;
 /// 第一次載入（或更新）有清單下載失敗時的重試間隔：1、2、5 分鐘，之後每 30 分鐘
 const RETRY_BACKOFF: [u64; 4] = [60, 120, 300, 1800];
+/// 開機用本機副本建好、而且每份清單都有副本：1 分鐘後再問有沒有更新（之後照上次檢查的時間等到更新間隔）
+pub const ALL_COPIES_WAIT: Duration = Duration::from_secs(60);
+/// 開機用本機副本建好、但有清單沒有副本：這麼久（再加 0～[`MISSING_FETCH_JITTER_MS`] 亂數）之後只下載缺的那幾份
+/// （3.5.0 C6；以前跟「全部都有副本」一樣等 60 秒，缺的清單開機後約 63 秒規則都不在）。
+/// 這 10 秒讓開機的路徑檢查、bootstrap、對時先跑，下載不跟它們搶記憶體與網路：不再縮短
+pub const MISSING_FETCH_WAIT: Duration = Duration::from_secs(10);
+/// 缺副本清單下載前的亂數（毫秒，上限）：很多台同時重新開機（停電後）不會同一秒去問同一個清單伺服器
+pub const MISSING_FETCH_JITTER_MS: u64 = 5_000;
+/// 開機時等對時、等記憶體的每次間隔
+const BOOT_POLL: Duration = Duration::from_secs(5);
+/// 等對時最多這麼多次（[`BOOT_POLL`] × 120 = 10 分鐘，同以前）
+const BOOT_CLOCK_POLLS: u32 = 120;
+/// 補缺的清單前，記憶體「偏低」最多等這麼多次（× 5 秒 = 50 秒：最晚跟以前的 63 秒差不多時開始，偏低不是不下載）
+const BOOT_LOW_POLLS: u32 = 10;
+/// 記憶體「不足」最多等這麼多次（× 5 秒 = 30 分鐘，同定時更新）；還是不足就交給定時更新的迴圈（它照樣等）
+const BOOT_CRITICAL_POLLS: u32 = 360;
+
+/// 開機排程用的等待函式回傳的 future
+pub type SleepFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// 開機排程（[`FilterService::boot`]）用到的時鐘、對時與記憶體狀態：正式執行用 [`BootHooks::real`]，
+/// 測試注入假的（不必真的等、可以控制對時與記憶體狀態）
+pub struct BootHooks {
+    pub sleep: Box<dyn Fn(Duration) -> SleepFut + Send + Sync>,
+    pub synced: Box<dyn Fn() -> bool + Send + Sync>,
+    pub pressure: Box<dyn Fn() -> crate::sysinfo::Pressure + Send + Sync>,
+    /// 補缺的清單前多等的亂數（毫秒，最多 [`MISSING_FETCH_JITTER_MS`]）
+    pub jitter_ms: u64,
+}
+
+impl BootHooks {
+    pub fn real() -> BootHooks {
+        let jitter_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as u64)
+            % (MISSING_FETCH_JITTER_MS + 1);
+        BootHooks {
+            sleep: Box::new(|d| Box::pin(tokio::time::sleep(d))),
+            synced: Box::new(crate::clock::synced),
+            pressure: Box::new(crate::app::pressure),
+            jitter_ms,
+        }
+    }
+}
 
 /// 新下載的規則數比上次少一大半：多半是連線中途斷掉、沒有長度資訊的回應被當成完整（回傳說明）
 fn suspicious_drop(prev: u64, now: u64) -> Option<String> {
@@ -544,6 +588,8 @@ pub struct FilterService {
     update_run: Mutex<UpdateRun>,
     /// 每次更新結束時送出那一次的 runId（`?wait=1` 等結果用）
     update_done: tokio::sync::watch::Sender<u64>,
+    /// 清單層重建了幾次（測試與狀態用；32 位元平台沒有 64 位元原子操作）
+    rebuilds: AtomicU32,
     /// 下載到、但這台這時候存不了副本的清單（網址 → 內容），見 [`Held`]
     held: Mutex<HashMap<String, Held>>,
 }
@@ -584,6 +630,46 @@ impl UpdateRun {
             "error": self.error,
         })
     }
+}
+
+/// 一次要停用哪幾份（3.5.0 C3）：依停用順序（`order`，保護清單本來就不在裡面）累加估計大小，取到合計 ≥ `target` 為止；
+/// 至少 1 份（`target` = 0 就是只停用一份，同以前）
+pub fn pick_shed(order: &[usize], sizes: &[u64], target: u64) -> Vec<usize> {
+    let mut acc = 0u64;
+    let mut out = Vec::new();
+    for &i in order {
+        if !out.is_empty() && acc >= target {
+            break;
+        }
+        acc = acc.saturating_add(sizes.get(i).copied().unwrap_or(0));
+        out.push(i);
+    }
+    out
+}
+
+/// 一次要恢復幾份（3.5.0 C3）：從最後停用的開始（`bytes` 是停用順序），取到合計 × 1.3 ≤ `room` 為止；
+/// 至少 1 份（記憶體控制已經確認最後一份放得下；同以前一次一份的條件）。回傳份數（從尾端算）
+pub fn pick_restore(bytes: &[u64], room: u64) -> usize {
+    let mut acc: u128 = 0;
+    let mut n = 0;
+    for &b in bytes.iter().rev() {
+        let next = acc + b as u128;
+        if n > 0 && next * 13 / 10 > room as u128 {
+            break;
+        }
+        acc = next;
+        n += 1;
+    }
+    n
+}
+
+/// 清單名稱列一行（最多 5 個，其他寫「等 N 份」）
+fn names_line(names: &[&str]) -> String {
+    let mut s = names.iter().take(5).copied().collect::<Vec<_>>().join("、");
+    if names.len() > 5 {
+        s.push_str(&format!(" 等 {} 份", names.len()));
+    }
+    s
 }
 
 /// 清單的停用順序（純函式，方便測試）：保護清單、已經停用的不算；
@@ -645,6 +731,7 @@ impl FilterService {
             missing: Mutex::new(Vec::new()),
             update_run: Mutex::new(UpdateRun::default()),
             update_done: tokio::sync::watch::channel(0).0,
+            rebuilds: AtomicU32::new(0),
             held: Mutex::new(HashMap::new()),
         }))
     }
@@ -840,7 +927,7 @@ impl FilterService {
                 }
                 let missing = self.missing.lock().unwrap().len();
                 if missing > 0 {
-                    info!("過濾清單：用本機副本先建好，{missing} 份沒有副本的稍後下載");
+                    info!("過濾清單：用本機副本先建好，{missing} 份沒有副本");
                 } else {
                     info!("過濾清單：用本機副本建好（不必等下載），稍後檢查有沒有更新");
                 }
@@ -985,16 +1072,15 @@ impl FilterService {
     /// 開機用副本建好之後，離下一次該檢查更新還有多久：全部清單都有副本、都記過上次檢查時間，
     /// 而且還沒到更新間隔才有值（重新啟動、重新載入不再一分鐘後就把清單全部問一次、有變的整份重新下載）
     pub fn first_check_delay(&self, now: u64) -> Option<Duration> {
+        self.check_delay(now, &[])
+    }
+
+    /// 同 [`first_check_delay`](Self::first_check_delay)，但 `fresh` 這幾份是剛剛才下載的（開機補缺的清單，3.5.0 C6）：
+    /// 不算「缺」，也不看它們的上次檢查時間（存不了副本的清單沒有索引，否則永遠是「馬上全部檢查」）
+    fn check_delay(&self, now: u64, fresh: &[usize]) -> Option<Duration> {
         let c = self.copies.get()?;
-        // 沒有本機副本的清單：串接中從上游拿到、留在記憶體的不算（重建時讀它）
-        let missing_unheld = {
-            let held = self.held.lock().unwrap();
-            self.missing
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|&i| !held.contains_key(&self.sources[i].url))
-        };
+        // 沒有本機副本的清單：留在記憶體的不算（重建時讀它）
+        let missing_unheld = self.missing_unheld().iter().any(|i| !fresh.contains(i));
         // 記憶體控制暫時停用的清單（reason = "memory"）本機副本都還在，恢復時由 `restore_one` 用副本重建，
         // 不算「缺清單」：以前這種情況會跳過更新間隔、立刻整份檢查，記憶體正吃緊時反而從網路下載
         // （3.4.2 Windows 實測：重新啟動 11 分鐘後、系統可用記憶體接近 0 時從網路收了 4.97 MB）
@@ -1004,7 +1090,7 @@ impl FilterService {
         }
         let ex = self.excluded();
         let urls: Vec<&str> = (0..self.sources.len())
-            .filter(|&i| !ex[i])
+            .filter(|&i| !ex[i] && !fresh.contains(&i))
             .map(|i| self.sources[i].url.as_str())
             .collect();
         if urls.is_empty() {
@@ -1017,6 +1103,148 @@ impl FilterService {
         }
         let next = last.saturating_add(self.interval.as_secs());
         (next > now).then(|| Duration::from_secs(next - now))
+    }
+
+    /// 開機只用副本建的時候沒有副本、這次沒載入，而且也沒有留在記憶體的清單（依清單順序）
+    fn missing_unheld(&self) -> Vec<usize> {
+        let held = self.held.lock().unwrap();
+        self.missing
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&i| !held.contains_key(&self.sources[i].url))
+            .collect()
+    }
+
+    /// 只補開機時沒有副本的清單（3.5.0 C6）：缺的下載，有副本的照讀副本、**不發請求**（不在開機時把每份清單都問一遍）。
+    /// 回傳這次下載成功、載入的清單。下載失敗的記在狀態的 `errors`（由定時更新照既有的退避重試）
+    pub async fn update_missing(&self) -> anyhow::Result<Vec<usize>> {
+        let _g = self.rebuild_lock.lock().await;
+        if self.all_suspended() || self.sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let want = self.missing_unheld();
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fit_allowance();
+        let reuse: Vec<bool> = (0..self.sources.len()).map(|i| !want.contains(&i)).collect();
+        self.rebuild_mode(Source::Download, &reuse).await?;
+        let ex = self.excluded();
+        let lists = self.lists.read().unwrap().clone();
+        let st = lists.stats();
+        let done: Vec<usize> = want
+            .into_iter()
+            .filter(|&i| !ex[i] && st.sources.get(i).is_some_and(|s| s.status == SourceStatus::Loaded))
+            .collect();
+        // 剛下載的就是剛檢查過（存成副本的才有索引可以記）
+        self.note_checked(&done);
+        Ok(done)
+    }
+
+    /// 開機時等對時（下載要 TLS；路由器開機時常是 1970），最多 10 分鐘
+    async fn boot_wait_clock(&self, h: &BootHooks) {
+        if (h.synced)() {
+            return;
+        }
+        info!("系統時間還沒對時：過濾清單等對時後再下載");
+        for _ in 0..BOOT_CLOCK_POLLS {
+            (h.sleep)(BOOT_POLL).await;
+            if (h.synced)() {
+                return;
+            }
+        }
+    }
+
+    /// 開機補缺的清單前看記憶體：不足時等（最多 30 分鐘）、偏低時最多等 50 秒（重建時新舊兩份同時在記憶體裡）。
+    /// 回傳現在可不可以下載（還是不足就交給定時更新的迴圈）
+    async fn boot_wait_memory(&self, h: &BootHooks) -> bool {
+        use crate::sysinfo::Pressure;
+        let (mut low, mut critical) = (0u32, 0u32);
+        loop {
+            match (h.pressure)() {
+                Pressure::Normal => return true,
+                Pressure::Low if low >= BOOT_LOW_POLLS => return true,
+                Pressure::Critical if critical >= BOOT_CRITICAL_POLLS => return false,
+                Pressure::Low => {
+                    if low == 0 {
+                        info!(
+                            "記憶體偏低：沒有副本的過濾清單稍等再下載（最多 {} 秒）",
+                            BOOT_POLL.as_secs() * BOOT_LOW_POLLS as u64
+                        );
+                    }
+                    low += 1;
+                }
+                Pressure::Critical => {
+                    if critical == 0 {
+                        warn!("記憶體不足，延後下載沒有副本的過濾清單（恢復後再下載，最多 30 分鐘）");
+                    }
+                    critical += 1;
+                }
+            }
+            (h.sleep)(BOOT_POLL).await;
+        }
+    }
+
+    /// 開機到進入定時更新迴圈之前的排程（3.5.0 C6）：
+    ///
+    /// 1. 有本機副本的清單先用副本建好過濾器（不必等下載、對時）。
+    /// 2. 每份都有副本：1 分鐘後（照舊）；有清單沒有副本：10～15 秒後、對時了、記憶體不是不足，**只下載缺的**。
+    /// 3. 上次檢查還沒過更新間隔：等到該檢查的時候（剛補上的清單算剛檢查過）。
+    ///
+    /// 回傳定時更新迴圈的重試次數起點（補缺的清單下載失敗時已經照退避等過第一次）
+    pub async fn boot(&self, h: &BootHooks) -> usize {
+        let built = self.build_from_copies().await;
+        let mut fresh: Vec<usize> = Vec::new();
+        if built {
+            let missing = self.missing_unheld();
+            if missing.is_empty() {
+                (h.sleep)(ALL_COPIES_WAIT).await;
+            } else {
+                let wait = MISSING_FETCH_WAIT + Duration::from_millis(h.jitter_ms.min(MISSING_FETCH_JITTER_MS));
+                let names: Vec<&str> = missing.iter().take(5).map(|&i| self.sources[i].name.as_str()).collect();
+                info!(
+                    "過濾清單：{} 份沒有副本的 {} 秒後下載（{}{}）",
+                    missing.len(),
+                    wait.as_secs(),
+                    names.join("、"),
+                    if missing.len() > 5 { "……" } else { "" }
+                );
+                (h.sleep)(wait).await;
+                self.boot_wait_clock(h).await;
+                if !self.boot_wait_memory(h).await {
+                    // 還是不足：交給定時更新的迴圈（它照樣先等記憶體）
+                    return 0;
+                }
+                match self.update_missing().await {
+                    Ok(done) => fresh = done,
+                    Err(e) => warn!("下載沒有副本的過濾清單失敗：{e:#}"),
+                }
+                let failed =
+                    self.status.lock().unwrap()["errors"].as_array().is_some_and(|a| !a.is_empty()) || !self.missing_unheld().is_empty();
+                if failed {
+                    let w = Duration::from_secs(RETRY_BACKOFF[0]);
+                    warn!("有清單還沒載入（下載失敗）：{} 秒後重試", w.as_secs());
+                    (h.sleep)(w).await;
+                    return 1;
+                }
+            }
+        }
+        self.boot_wait_clock(h).await;
+        // 3.4.3 起清單一律自己跟清單網址下載（不跟上游黑潮拿副本），不必等串接確定
+        // 上次檢查還沒過更新間隔（重新啟動、重新載入、換版）：等到該檢查的時候，不必一開機就全部問一次
+        if built {
+            if let Some(w) = self.check_delay(crate::persist::now_secs(), &fresh) {
+                info!(
+                    "過濾清單：{} 分鐘前檢查過更新，{} 分鐘後再檢查",
+                    (self.interval.saturating_sub(w)).as_secs() / 60,
+                    w.as_secs() / 60
+                );
+                (h.sleep)(w).await;
+            }
+        }
+        0
     }
 
     /// 依記憶體預算（記憶體控制提供）先排除會放不下的清單：只用量過的大小估，依停用順序（保護清單絕不排除；
@@ -1080,6 +1308,7 @@ impl FilterService {
     /// 依目前的停用名單重新下載、建一份清單層（下載失敗而且原本有清單時保留舊的）。回傳（重建前，重建後）的大小
     /// 重建清單層。`mode` 見 [`Source`]；`reuse[i]` = 剛問過沒變（有副本就讀副本，不重新下載）
     async fn rebuild_mode(&self, mode: Source, reuse: &[bool]) -> anyhow::Result<(u64, u64)> {
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
         let timeout = Duration::from_secs(30);
         let current = self.lists.read().unwrap().clone();
         let have = current.stats().lists > 0;
@@ -1380,67 +1609,138 @@ impl FilterService {
         self.unloaded.lock().unwrap().last().map(|u| u.bytes)
     }
 
-    /// 記憶體控制：停用下一份清單（重建一份不含它的過濾器；重建期間舊的照常使用）。
-    /// 有本機副本的清單讀副本，沒有的才下載（記憶體控制在自己的工作裡跑，下載期間記憶體監看照常更新）。
-    /// 沒有可以停用的回傳 Ok(None)；下載失敗時保留舊的、清單不算停用
+    /// 清單層重建了幾次（開機以來）
+    pub fn rebuild_count(&self) -> u32 {
+        self.rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// 記憶體控制：停用下一份清單（同 [`unload_many`](Self::unload_many) 的 `target` = 0；測試與手動路徑用）
     pub async fn unload_one(&self) -> anyhow::Result<Option<Unloaded>> {
+        Ok(self.unload_many(0, None).await?.into_iter().next())
+    }
+
+    /// 記憶體控制（3.5.0 C3）：依停用順序取到估計合計 ≥ `target` bytes 的幾份清單（至少 1 份；保護清單不在候選裡），
+    /// **一次**登記停用、**只重建一次**（以前一份一份停用，缺口大時連續重建 N 次，每次新舊兩份同時在記憶體裡）。
+    /// 重建期間舊的過濾器照常使用；有本機副本的清單讀副本，沒有的才下載。
+    ///
+    /// `max_after`：停用這幾份之後的清單層估計大小超過它就不做（重建時新舊兩份並存：新的一份放不進可用記憶體的一半就不做）。
+    /// 一次停用多份時新的一份比較小，重建的尖峰（舊的 + 新的）比一次一份的第一次還低。
+    ///
+    /// 沒有可以停用的回傳空的；重建失敗（下載失敗而且原本有清單）時這次登記的全部撤回、清單不算停用
+    pub async fn unload_many(&self, target: u64, max_after: Option<u64>) -> anyhow::Result<Vec<Unloaded>> {
         let _g = self.rebuild_lock.lock().await;
-        let Some(&i) = self.shed_candidates().first() else {
-            return Ok(None);
-        };
-        let rules = self.sizes.lock().unwrap()[i].1;
-        let u = Unloaded {
-            idx: i,
-            name: self.sources[i].name.clone(),
-            rules,
-            bytes: 0,
-            reason: "memory",
-            at: crate::persist::now_secs() * 1000,
-        };
-        self.unloaded.lock().unwrap().push(u.clone());
+        let order = self.shed_candidates();
+        if order.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sz: Vec<(u64, u64)> = self.sizes.lock().unwrap().clone();
+        let est: Vec<u64> = sz.iter().map(|s| s.0).collect();
+        let pick = pick_shed(&order, &est, target);
+        let est_total: u64 = pick.iter().map(|&i| est[i]).sum();
+        if let Some(max) = max_after {
+            let after = self.lists_bytes().saturating_sub(est_total);
+            if after > max {
+                anyhow::bail!("可用記憶體不足以安全重建過濾器（需要約 {} KB）", after / 1024);
+            }
+        }
+        let at = crate::persist::now_secs() * 1000;
+        let batch: Vec<Unloaded> = pick
+            .iter()
+            .map(|&i| Unloaded {
+                idx: i,
+                name: self.sources[i].name.clone(),
+                rules: sz[i].1,
+                bytes: 0,
+                reason: "memory",
+                at,
+            })
+            .collect();
+        self.unloaded.lock().unwrap().extend(batch.iter().cloned());
         match self.rebuild_mode(Source::PreferCopy, &[]).await {
             Ok((before, after)) => {
-                let bytes = before.saturating_sub(after).max(self.sizes.lock().unwrap()[i].0);
+                // 實測的差額依估計大小分給各份（恢復時要有這麼多空間的 1.3 倍）；實測比估計小時用估計（保守）
+                let measured = before.saturating_sub(after).max(est_total);
+                let n = pick.len() as u64;
+                let share = |i: usize| -> u64 {
+                    if est_total == 0 {
+                        measured / n
+                    } else {
+                        (est[i] as u128 * measured as u128 / est_total as u128) as u64
+                    }
+                };
                 let mut list = self.unloaded.lock().unwrap();
-                if let Some(x) = list.iter_mut().find(|x| x.idx == i) {
-                    x.bytes = bytes;
+                let mut out = Vec::with_capacity(pick.len());
+                for &i in &pick {
+                    if let Some(x) = list.iter_mut().find(|x| x.idx == i && x.reason == "memory") {
+                        x.bytes = share(i);
+                        out.push(x.clone());
+                    }
                 }
+                drop(list);
+                let rules: u64 = out.iter().map(|u| u.rules).sum();
+                let names: Vec<&str> = out.iter().map(|u| u.name.as_str()).collect();
                 warn!(
-                    "記憶體不足，暫時停用：{} 清單（{rules} 條規則，釋出約 {} KB）",
-                    u.name,
-                    bytes / 1024
+                    "記憶體不足，暫時停用 {} 份清單：{}（{rules} 條規則，釋出約 {} KB，重建 1 次）",
+                    out.len(),
+                    names_line(&names),
+                    measured / 1024
                 );
-                Ok(list.iter().find(|x| x.idx == i).cloned())
+                Ok(out)
             }
             Err(e) => {
-                self.unloaded.lock().unwrap().retain(|x| x.idx != i);
+                self.unloaded.lock().unwrap().retain(|x| !pick.contains(&x.idx));
                 Err(e)
             }
         }
     }
 
-    /// 記憶體控制：恢復最後停用的清單（重新下載）。下載失敗時維持停用，由呼叫端退避重試
+    /// 記憶體控制：恢復最後停用的清單（同 [`restore_many`](Self::restore_many) 只恢復一份；測試與手動路徑用）
     pub async fn restore_one(&self) -> anyhow::Result<Option<Unloaded>> {
+        Ok(self.restore_many(0).await?.into_iter().next())
+    }
+
+    /// 記憶體控制（3.5.0 C3）：從最後停用的開始，取到合計 × 1.3 ≤ `room` 的幾份（至少 1 份），**重建一次**一起恢復
+    /// （以前一份一份恢復、每份重建一次：3.4.2 Windows 實測恢復 7 份重建 7 次）。有本機副本的讀副本；沒有的下載
+    /// （留在記憶體的副本讓每份最多下載一次）。下載失敗時這幾份維持停用，由呼叫端退避重試；
+    /// 放不下（超過預算）的維持停用，其他照樣恢復
+    pub async fn restore_many(&self, room: u64) -> anyhow::Result<Vec<Unloaded>> {
         let _g = self.rebuild_lock.lock().await;
         if self.all_suspended() {
             anyhow::bail!("全部清單暫停中，先恢復全部清單");
         }
-        let Some(u) = self.unloaded.lock().unwrap().pop() else {
-            return Ok(None);
+        let batch: Vec<Unloaded> = {
+            let mut list = self.unloaded.lock().unwrap();
+            let bytes: Vec<u64> = list.iter().map(|u| u.bytes).collect();
+            let n = pick_restore(&bytes, room);
+            let at = list.len() - n;
+            list.split_off(at)
         };
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
         match self.rebuild_mode(Source::PreferCopy, &[]).await {
             Ok(_) => {
-                let loaded = self.lists.read().unwrap().stats().sources.get(u.idx).map(|s| s.status) == Some(SourceStatus::Loaded);
-                if !loaded {
-                    // 超過 maxDomains / 預算：還是載不進來，維持停用
-                    self.unloaded.lock().unwrap().push(u.clone());
-                    anyhow::bail!("清單「{}」還是放不下（超過預算），維持停用", u.name);
+                let lists = self.lists.read().unwrap().clone();
+                let st = lists.stats();
+                let (ok, still): (Vec<Unloaded>, Vec<Unloaded>) = batch
+                    .into_iter()
+                    .partition(|u| st.sources.get(u.idx).map(|s| s.status) == Some(SourceStatus::Loaded));
+                if !still.is_empty() {
+                    // 超過 maxDomains / 預算：還是載不進來，維持停用（順序不變）
+                    let names: Vec<&str> = still.iter().map(|u| u.name.as_str()).collect();
+                    let line = names_line(&names);
+                    self.unloaded.lock().unwrap().extend(still);
+                    if ok.is_empty() {
+                        anyhow::bail!("清單「{line}」還是放不下（超過預算），維持停用");
+                    }
+                    warn!("清單「{line}」還是放不下（超過預算），維持停用");
                 }
-                info!("記憶體恢復，重新啟用：{} 清單", u.name);
-                Ok(Some(u))
+                let names: Vec<&str> = ok.iter().map(|u| u.name.as_str()).collect();
+                info!("記憶體恢復，重新啟用 {} 份清單：{}（重建 1 次）", ok.len(), names_line(&names));
+                Ok(ok)
             }
             Err(e) => {
-                self.unloaded.lock().unwrap().push(u);
+                self.unloaded.lock().unwrap().extend(batch);
                 Err(e)
             }
         }
@@ -1487,33 +1787,8 @@ impl FilterService {
         let me = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            // 有本機副本：先用副本建好，1 分鐘後再問上游有沒有更新（大多是 304，不必重建）
-            let built = me.build_from_copies().await;
-            if built {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-            // 下載要 TLS：系統時間還沒對時（路由器開機時常是 1970）先等，最多 10 分鐘
-            let t0 = std::time::Instant::now();
-            if !crate::clock::synced() {
-                info!("系統時間還沒對時：過濾清單等對時後再下載");
-                while !crate::clock::synced() && t0.elapsed() < Duration::from_secs(600) {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            }
-            // 3.4.3 起清單一律自己跟清單網址下載（不跟上游黑潮拿副本），不必等串接確定
-            // 上次檢查還沒過更新間隔（重新啟動、重新載入、換版）：等到該檢查的時候，不必一開機就全部問一次
-            if built {
-                if let Some(w) = me.first_check_delay(crate::persist::now_secs()) {
-                    info!(
-                        "過濾清單：{} 分鐘前檢查過更新，{} 分鐘後再檢查",
-                        (me.interval.saturating_sub(w)).as_secs() / 60,
-                        w.as_secs() / 60
-                    );
-                    tokio::time::sleep(w).await;
-                }
-            }
+            let mut tries = me.boot(&BootHooks::real()).await;
             // 有清單下載失敗（或還有沒載入的）時短間隔重試：1、2、5 分鐘，之後每 30 分鐘；全部成功就回到正常間隔
-            let mut tries = 0usize;
             loop {
                 // 記憶體吃緊時延後（重建時新舊兩份會同時存在）
                 let wait = if crate::app::pressure() == crate::sysinfo::Pressure::Critical {
@@ -1834,5 +2109,26 @@ mod tests {
             })
             .collect();
         assert!(shed_order(&all, &hits, &sizes, &loaded).is_empty());
+    }
+
+    /// 3.5.0 C3：一次停用取到合計 ≥ 目標（至少 1 份）；一次恢復從尾端取到合計 × 1.3 ≤ 空間（至少 1 份）
+    #[test]
+    fn pick_shed_and_restore_bounds() {
+        let sizes = [100, 50, 30, 20];
+        let order = [0, 1, 2, 3];
+        assert_eq!(pick_shed(&order, &sizes, 0), [0], "0 = 一份");
+        assert_eq!(pick_shed(&order, &sizes, 100), [0]);
+        assert_eq!(pick_shed(&order, &sizes, 101), [0, 1]);
+        assert_eq!(pick_shed(&order, &sizes, u64::MAX), order, "不夠就全部（只有候選）");
+        assert_eq!(pick_shed(&[2, 3], &sizes, 25), [2], "照給的順序");
+        assert!(pick_shed(&[], &sizes, 10).is_empty());
+        // 恢復：最後停用的先
+        let b = [100, 50, 30, 20];
+        assert_eq!(pick_restore(&b, 0), 1, "至少 1 份");
+        assert_eq!(pick_restore(&b, 65), 2, "(20 + 30) × 1.3 = 65");
+        assert_eq!(pick_restore(&b, 64), 1);
+        assert_eq!(pick_restore(&b, u64::MAX), 4);
+        assert_eq!(pick_restore(&[], 100), 0);
+        assert_eq!(pick_restore(&[u64::MAX, u64::MAX], u64::MAX), 1, "不溢位");
     }
 }

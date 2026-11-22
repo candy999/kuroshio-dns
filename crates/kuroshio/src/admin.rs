@@ -151,6 +151,7 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         | "/api/filter/reset-rules"
         | "/api/persist/flush"
         | "/api/memory/trim"
+        | "/api/memory/simulate"
         | "/api/cdn/verify"
         | "/api/cdn/policy"
         | "/api/cdn/ecs"
@@ -165,6 +166,45 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
             None => false,
         },
     }
+}
+
+/// `POST /api/memory/simulate?availMB=N&minutes=M`（`M` 1～30，預設 5）／`?off=1`（3.5.0 C9）：
+/// 到期前記憶體控制讀到的系統可用記憶體 = min(真實值, N MB)。沒開 `system.testHooks` 時 403
+fn memory_simulate(cfg: &Value, q: &HashMap<String, String>, sim: &crate::memgov::SimState, now: u64) -> Response {
+    if !crate::memgov::test_hooks(cfg) {
+        return bad(
+            "測試開關沒有開：記憶體模擬只給測試用，要在設定檔把 system.testHooks 設成 true（見 docs/spec/09-memory.md 第 11 節）",
+            403,
+        );
+    }
+    if q.get("off").is_some_and(|v| v != "0") {
+        let was = sim.stop();
+        if was {
+            warn!("測試模式：記憶體模擬已取消，回到真實的量測");
+        }
+        return ok(json!({ "ok": true, "wasOn": was, "simulated": Value::Null }));
+    }
+    let Some(mb) = q.get("availMB").and_then(|v| v.trim().parse::<u64>().ok()) else {
+        return bad("要給 availMB（模擬的系統可用記憶體，MB）", 400);
+    };
+    let minutes = match q.get("minutes") {
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(m) => m,
+            Err(_) => return bad("minutes 要是 1～30 的整數", 400),
+        },
+        None => crate::memgov::SIM_DEFAULT_MINUTES,
+    };
+    let s = sim.start(mb, minutes, now);
+    let minutes = (s.until - now) / 60;
+    warn!(
+        "測試模式：模擬可用記憶體 {} MB，{minutes} 分鐘後自動恢復（system.testHooks；只影響黑潮自己的判斷）",
+        s.avail_mb
+    );
+    ok(json!({
+        "ok": true,
+        "minutes": minutes,
+        "simulated": crate::memgov::simulation_json(Some(s), now),
+    }))
 }
 
 /// 下載檔名只留英數與 `._-`（檔名的一部分來自查詢參數，不能讓它帶換行塞進回應標頭）
@@ -862,6 +902,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 }
             }
         }
+        // 測試開關（3.5.0 C9）：模擬記憶體不足。要設定 `system.testHooks: true` 才接受，最長 30 分鐘、到期自動恢復
+        "/api/memory/simulate" => memory_simulate(&st.cfg, q, &crate::memgov::SIM, crate::memgov::steady_secs()),
         // 立即儲存學習資料：有變動的快照全部寫進快照目錄（Windows 沒有 SIGUSR1，就靠這個或 `kuroshio notify save`）
         "/api/persist/flush" => {
             let s2 = st.clone();
@@ -1164,6 +1206,45 @@ mod tests {
         assert_eq!(qtype_num("nope"), None);
     }
 
+    /// 3.5.0 C9：沒開 `system.testHooks` 時 403、不改任何狀態；開了才接受
+    #[test]
+    fn simulate_requires_test_hooks() {
+        let sim = crate::memgov::SimState::new();
+        let now = 2_000_000_000;
+        let off = kuroshio_config::with_overrides(&json!({}));
+        let on = kuroshio_config::with_overrides(&json!({ "system": { "testHooks": true } }));
+        let q = parse_query("availMB=20&minutes=5");
+        let r = memory_simulate(&off, &q, &sim, now);
+        assert_eq!(r.code, 403);
+        assert!(r.body["error"].as_str().unwrap().contains("system.testHooks"));
+        assert!(sim.get(now).is_none(), "沒開：不生效");
+        // 字串 "true" 不算（只認布林）
+        let s = kuroshio_config::with_overrides(&json!({ "system": { "testHooks": "true" } }));
+        assert_eq!(memory_simulate(&s, &q, &sim, now).code, 403);
+        // 開了：生效
+        let r = memory_simulate(&on, &q, &sim, now);
+        assert_eq!(r.code, 200);
+        assert_eq!(r.body["minutes"], 5);
+        assert_eq!(r.body["simulated"]["availMB"], 20);
+        assert_eq!(sim.get(now).unwrap().avail_mb, 20);
+        // 參數錯
+        assert_eq!(memory_simulate(&on, &parse_query("minutes=5"), &sim, now).code, 400);
+        assert_eq!(memory_simulate(&on, &parse_query("availMB=20&minutes=x"), &sim, now).code, 400);
+        // 最長 30 分鐘、最短 1 分鐘
+        let r = memory_simulate(&on, &parse_query("availMB=20&minutes=999"), &sim, now);
+        assert_eq!(r.body["minutes"], 30);
+        assert_eq!(
+            memory_simulate(&on, &parse_query("availMB=20&minutes=0"), &sim, now).body["minutes"],
+            1
+        );
+        // 取消（沒開 testHooks 也不能取消：同一道保險；到期本來就會自己恢復）
+        assert_eq!(memory_simulate(&off, &parse_query("off=1"), &sim, now).code, 403);
+        let r = memory_simulate(&on, &parse_query("off=1"), &sim, now);
+        assert_eq!((r.code, r.body["wasOn"].clone()), (200, json!(true)));
+        assert!(sim.get(now).is_none());
+        assert_eq!(memory_simulate(&on, &parse_query("off=1"), &sim, now).body["wasOn"], false);
+    }
+
     #[test]
     fn actions_are_post_only_and_filenames_are_clean() {
         let none = HashMap::new();
@@ -1176,6 +1257,7 @@ mod tests {
             "/api/filter/reset-rules",
             "/api/persist/flush",
             "/api/memory/trim",
+            "/api/memory/simulate",
             "/api/cdn/verify",
             "/api/cdn/policy",
             "/api/cdn/ecs",

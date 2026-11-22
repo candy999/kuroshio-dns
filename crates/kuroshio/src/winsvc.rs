@@ -92,6 +92,7 @@ mod imp {
         let rt = crate::build_runtime(1)?;
         let r = rt.block_on(crate::serve(config.clone(), false, threads, Some(log_path(&config)), async {
             let _ = rx.await;
+            kuroshio::app::StopReason::Service
         }));
         h.set_service_status(status(ServiceState::Stopped, if r.is_ok() { 0 } else { 1 }))?;
         r

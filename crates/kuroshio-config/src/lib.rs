@@ -593,6 +593,7 @@ mod tests {
         }
         assert_eq!(get(&d, "ddns.ipv4"), Some(&json!(true)));
         assert_eq!(get(&d, "ddns.ipv6"), Some(&json!(false)), "中華電信常擋 IPv6 連入：AAAA 預設不發布");
+        assert_eq!(get(&d, "system.testHooks"), Some(&json!(false)), "測試開關預設關（3.5.0 C9）");
     }
 
     #[test]

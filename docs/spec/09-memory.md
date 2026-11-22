@@ -88,7 +88,7 @@
 | 1. 診斷緩衝 | 吃緊 | 設定頁日誌 500 → 50 行；熱門網域 / 被擋網域 / 用戶端排行只留前 200 名 | 上限恢復，自然長回來 |
 | 2. DNS 快取 | 吃緊 | 縮到目前上限的 1/4（至少 256 筆），留下熱門的 | 上限恢復 |
 | 3. CDN 冷資料 | 吃緊 | 先寫進磁碟，再把一小時沒出現的網域移出記憶體（磁碟保留，查到時讀回） | 全部讀回 |
-| 4. 過濾清單 | 不足，而且可用 < 保留量的一半 | 一次停用一份優先順序最低的清單（廣告 → 遙測 → 惡意、命中少的先、大的先）；保護清單不在這一步 | 一次一份，用本機副本或重新下載 |
+| 4. 過濾清單 | 不足，而且可用 < 保留量的一半 | 依優先順序（廣告 → 遙測 → 惡意、命中少的先、大的先）停用清單：離保留量遠時**一次**取到估計合計 ≥ 還缺的 × 1.3（至少 1 份）、**只重建一次**（3.5.0）；保護清單不在這一步 | 從最後停用的開始，取到合計 × 1.3 ≤ 可用空間（至少 1 份），重建一次；用本機副本或重新下載 |
 | 5. **只轉送** | 同上 | 暫停 CDN 調整（答案照上游原樣）、整個 CDN 資料庫寫進磁碟移出記憶體、快取只留 64 筆 | 恢復 CDN 調整與快取上限 |
 | 6. 保護清單 | 已經只轉送，而且可用 < 保留量的 1/4（一份清單都還沒有時不做，3.4.2） | 暫停全部清單（含惡意 / 反詐騙），只剩自訂規則 | 重新載入全部清單 |
 
@@ -100,7 +100,14 @@
   - 快取的熱門分數 = 上次使用時間 + 每多一倍的查詢次數加 5 分鐘。縮的時候在一次掃描裡選出要留的，鎖住的時間是一次 O(n)。
   - CDN 冷資料：先在「登記鎖」底下把變動登記並寫出，只移出已經在磁碟上、之後沒變動的分片裡的網域；記憶體裡只留 32 位元雜湊。
     查到時從分片逐筆解析、只撈那一筆；判定跟移出前完全一樣。分片之後要重寫時從磁碟接回去，磁碟上不會少。
-  - 過濾清單：重建時新舊兩份並存，新的一份放不進可用記憶體的一半就不做。保護清單（`filter.lists[].protect`；惡意類預設是）
+  - 過濾清單：重建時新舊兩份並存，新的一份（停用這幾份之後的大小）放不進可用記憶體的一半就不做。
+    **一次停用多份、只重建一次**（3.5.0 C3）：以前缺口大時一份一份停用、每份重建一次，N 份就有 N 次「新舊兩份並存」的尖峰，
+    而且都在最缺的時候。現在 `Governor::tick` 把「還缺多少」（缺口 − 同一輪前面步驟估計已經釋出的）傳給這一步
+    （`Step::shed_for`），`FilterService::unload_many` 依停用順序取到估計合計 ≥ 還缺的 × 1.3、一次登記、重建一次；失敗時這次登記的全部撤回。
+    尖峰估算：舊的清單層 L、停用的合計 S，一次一份的第一次重建尖峰約 L + (L − 第一份)，一次多份約 L + (L − S)，
+    只會更低，次數從 N 次變 1 次。恢復也一樣（`restore_many`）：從最後停用的開始、取到合計 × 1.3 ≤ 可用空間，尖峰約 L + (L + 恢復的合計)，
+    跟一份一份恢復到同一個量時最後那一次的尖峰差不多，但只重建一次；恢復後 10 分鐘內又吃緊，下次恢復的間隔照樣加倍。
+    「系統真的不足」（可用 < 保留量的一半）時缺口一定大於可用記憶體，實際上幾乎都是一次停用全部非保護清單——跟以前同一輪連續停用的結果一樣，只是重建 1 次。保護清單（`filter.lists[].protect`；惡意類預設是）
     在第 4 步絕不停用——「從來沒命中」不代表沒用，詐騙網域大多是第一次出現。
 
 ## 5. 長大之前先看空間
@@ -149,7 +156,7 @@
   被挑中的程式由它自己的 procd / 服務設定重啟。保留量越大，緩衝越多。
 - **配置器不一定把記憶體還給系統**：glibc 釋出後呼叫 `malloc_trim`；musl 釋放大塊時直接還，小塊可能留在行程裡。
   RSS 沒降下來時系統可用記憶體也不會回升，狀態會停在吃緊或不足——已釋出的項目維持釋出，不會更糟，也不會自己長回來。
-- **停用清單期間保護變少**：第 4 步一次一份、從廣告類開始；第 6 步只在連轉送都快保不住時。狀態頁都有明顯提示。
+- **停用清單期間保護變少**：第 4 步從廣告類開始、取到還缺的 × 1.3 為止（不多停）；第 6 步只在連轉送都快保不住時。狀態頁都有明顯提示。
 - **CDN 冷資料第一次被查到要讀一次磁碟**（一個分片解壓、逐筆解析）。32 位元雜湊碰撞時最多多讀一次磁碟，不會讓判定出錯。
 - **估計值偏保守**（快取、CDN 的估計比實際少 30–40%，見第 8 節），用在恢復的空間判斷不會高估；
   但「離得遠時一輪做到補足差額」會因此多做一兩步——寧可多讓。
@@ -175,6 +182,11 @@
 - 可用只剩保留量的 30%：同一輪做完整個階梯到「只轉送」，下一輪沒有可以做的；差額小時補足就停（`far_below_reserve_escalates_several_steps_in_one_tick`）。
 - 接近保留量（保留 + 遲滯以內）：不釋出、停止長大；回到寬裕恢復長大（`growth_stops_near_reserve_and_resumes_when_comfortable`）。
 - 恢復依相反順序、等空間 × 1.3、失敗指數退避（`near_reserve_one_step_per_tick_then_restore_in_reverse`、`restore_waits_for_headroom_and_backs_off`、`restore_failure_backs_off`）。
+- 一次停用多份、只重建一次（3.5.0 C3）：`tick` 傳給每一步的「還缺多少」（`tick_passes_shortfall_and_room_to_steps`）；
+  缺口大時一輪就停用全部非保護清單、重建 1 次（`tests/memgov_lists.rs` 的 `far_deficit_unloads_several_lists_with_one_rebuild`）；
+  沒說缺多少時一次一份（`near_deficit_still_unloads_one`）；保護清單不在裡面、停用後放不進可用的一半就不做（`unload_many_never_includes_protected`）；
+  失敗全部撤回（`unload_many_rolls_back_on_failure`）；恢復取到空間為止、重建一次（`restore_many_fits_room_and_rebuilds_once`）；
+  恢復後又不足時的退避（`restore_then_pressure_again_backs_off`）；挑選的上下限（`filtering.rs` 的 `pick_shed_and_restore_bounds`）。
 - 使用者明確設定的 `cacheMax` 仍是上限；快取停止長大、1/4、最低限度三者合併（`explicit_user_cache_max_is_still_a_cap`、`cache_cap_combines_growth_shed_and_floor`）。
 - `oom_score_adj` 寫進注入的路徑、限制範圍（`oom_score_adj_written_to_injected_path`）。
 - **最深的狀態仍轉送**：真的啟動程式、載入兩份清單後注入「可用 4 MB、保留 64 MB」，跑到只轉送 + 保護清單暫停，
@@ -219,5 +231,51 @@
 | `freedBytes` / `freedTotalBytes` | 目前釋出中合計 / 啟動以來合計 |
 | `lastChange`、`waiting`、`nextRestoreAt`、`events[]` | 最近一次狀態變化、在等什麼、下次可以恢復的時間、最近 20 筆事件 |
 
+| `simulated` | 測試開關（3.5.0，第 11 節）：`{ availMB, until, remainingSec }`，沒開是 null |
+
 `/api/status.filter`：`unloaded[]`（`name`、`rules`、`bytes`、`reason`：`memory` / `budget`、`at`）、`notice`、`suspended`（全部暫停中）、
 `sources[].protect`、`sources[].hits`。
+
+## 11. 測試：模擬記憶體不足（3.5.0）
+
+讓測試者在記憶體很多的機器（512 MB 的 D3、Windows）上觸發「吃緊／不足」的整套流程（停用清單、只轉送、保護清單暫停與恢復），
+不必真的把記憶體吃掉。**正式使用不能誤開**，所以有兩道保險：
+
+1. 設定 `system.testHooks: true`（預設 false；UCI 是 `config system 'system'` 的 `option test_hooks '1'`）。**不放進** LuCI、Windows 設定頁、
+   UCI 範例設定，只寫在這裡。沒開時 API 回 HTTP 403 與說明；重新載入設定時關掉了，進行中的模擬一起取消。
+2. 每次都有時間上限：`minutes` 1～30（預設 5），到期自動恢復；模擬只放在記憶體裡，重新啟動後不保留。
+
+用法：
+
+```
+kuroshio notify simulate-memory --avail-mb 20 --minutes 5     # 或 POST /api/memory/simulate?availMB=20&minutes=5
+kuroshio notify simulate-memory --off                        # 或 POST /api/memory/simulate?off=1
+```
+
+- 生效期間，`memgov::Reading::now()` 讀到的系統可用記憶體 = min(真實值, N MB)：記憶體控制、整個程式的壓力訊號（`app::pressure()`）、
+  每日評測的空間（`benchjob.rs`）、清單載入前的預算都看到同一個值。**只會讓讀數變小**，不能模擬成比真實寬裕；量不到可用記憶體的平台直接用 N。
+  `Reading::now()` 只在背景的監看與工作裡呼叫，不在查詢路徑上；模擬值是兩個 `AtomicU32`（MB、到期的相對秒數）。
+- 不影響系統層的東西（核心的 OOM、評測子程序的 OOM 設定），只影響黑潮自己的判斷。真正的記憶體是夠的，所以所有讓出的動作都安全；
+  到期後由既有的流程自己恢復（剛好也測到恢復路徑：放鬆要穩定 180 秒、恢復要空間 × 1.3）。
+- 看得出來：開著 `testHooks` 時啟動與 `kuroshio check-config` 各提醒一行；生效期間每分鐘一行 WARN「測試模式：模擬可用記憶體 N MB，還有 X 分鐘」，
+  到期記一行「測試模式結束」；`/api/status` 的 `memory.simulated`；Windows 設定頁與 LuCI 狀態頁的記憶體控制區塊顯示黃色橫幅。
+- 不走環境變數：環境變數會留在服務設定裡被忘記；設定 + API + 到期時間比較不會誤留。
+- `testHooks` 3.5.0 只有這一個用途；以後的新用途也要走同樣的兩道保險。
+
+### 11.1 在 D3（512 MB、padavan）上觸發 3.4.2 的 G1／G2 路徑
+
+D3 的自動保留量約 25.6 MB（`kuroshio sysinfo` 的 `reserve`）。「不足」是可用 < 保留量的一半，保護清單暫停（第 6 步）要可用 < 保留量的 1/4。
+
+1. 設定檔（padavan 是 JSON）加 `"system": { "testHooks": true }`，重新載入；日誌有一行「設定開了 system.testHooks」。
+2. **G1（一份清單都還沒有時不暫停全部）**：先讓這台一份清單都沒有——停止服務、把狀態目錄的 `filter-lists/` 移到別處（沒有本機副本），
+   設定裡的清單網址暫時改成連不到的（例如 `http://192.0.2.1/x.txt`）——啟動後立刻
+   `kuroshio notify simulate-memory --avail-mb 4 --minutes 5`（4 MB < 25.6 MB 的 1/4）。預期：做到「只轉送」，
+   但 `/api/status` 的 `memory.protectedSuspended` 是 false（沒有清單可以暫停）；到期、記憶體回升後第一次更新就把清單載入，
+   不必等記憶體控制恢復第 6 步（測完把清單網址與 `filter-lists/` 改回來）。
+3. **G2（待寫的副本讀得到）**：清單都載入後 `--avail-mb 10 --minutes 3`（10 MB < 一半）：日誌「暫時停用 N 份清單：…（重建 1 次）」（C3）。
+   到期後恢復時看日誌：恢復的清單讀本機副本或待寫的內容（`Persister::pending_bytes`），**不應該**有「下載清單」或從網路收大量資料；
+   `/api/status` 的 `filter.heldCopies` 與流量計數對照。
+4. 保護清單暫停：`--avail-mb 4`、清單都載入時，預期一路到 `protectedSuspended: true`，到期後 `resume_all` 重新載入。
+5. 每一項看：一次停用幾份、重建幾次（「訂閱清單已載入」出現幾次）、到期後多久恢復、有沒有反覆停用／恢復（恢復後 10 分鐘內又吃緊會加倍間隔）。
+6. 測完把 `testHooks` 拿掉（或設 false）、重新載入。
+

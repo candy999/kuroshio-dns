@@ -461,6 +461,8 @@ struct EtagLists {
     lists: std::collections::HashMap<String, (String, String)>,
     down: std::collections::HashSet<String>,
     full: std::collections::HashMap<String, usize>,
+    /// 每份清單收到幾次請求（含 304 與 503）
+    reqs: std::collections::HashMap<String, usize>,
 }
 
 async fn etag_server(st: std::sync::Arc<std::sync::Mutex<EtagLists>>) -> SocketAddr {
@@ -482,6 +484,7 @@ async fn etag_server(st: std::sync::Arc<std::sync::Mutex<EtagLists>>) -> SocketA
                 });
                 let resp = {
                     let mut g = st.lock().unwrap();
+                    *g.reqs.entry(path.clone()).or_default() += 1;
                     match g.lists.get(&path).cloned() {
                         Some(_) if g.down.contains(&path) => "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n".to_string(),
                         Some((etag, _)) if inm.as_deref() == Some(etag.as_str()) => {
@@ -688,5 +691,226 @@ async fn bypass_flag_reaches_verdict() {
     }));
     let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
     assert_eq!(f.sources().iter().map(|s| s.bypass).collect::<Vec<_>>(), vec![true, false]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- 3.5.0 C6：開機後缺副本的清單 10～15 秒後只補缺的 ----
+
+use kuroshio::resolver::FilterCheck as _;
+
+/// 開機排程的假環境：等待不真的等，記下每次等多久、當時 c.txt 收過幾次請求；對時與記憶體狀態依呼叫次數決定
+struct FakeBoot {
+    sleeps: std::sync::Arc<std::sync::Mutex<Vec<(Duration, usize)>>>,
+}
+
+fn fake_boot(
+    st: std::sync::Arc<std::sync::Mutex<EtagLists>>,
+    jitter_ms: u64,
+    unsynced_calls: usize,
+    pressure: impl Fn(usize) -> kuroshio::sysinfo::Pressure + Send + Sync + 'static,
+) -> (kuroshio::filtering::BootHooks, FakeBoot) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let sleeps = Arc::new(Mutex::new(Vec::new()));
+    let rec = sleeps.clone();
+    let synced_n = Arc::new(AtomicUsize::new(0));
+    let pressure_n = Arc::new(AtomicUsize::new(0));
+    let hooks = kuroshio::filtering::BootHooks {
+        sleep: Box::new(move |d| {
+            let c = st.lock().unwrap().reqs.get("c.txt").copied().unwrap_or(0);
+            rec.lock().unwrap().push((d, c));
+            Box::pin(async {})
+        }),
+        synced: Box::new(move || synced_n.fetch_add(1, Ordering::Relaxed) >= unsynced_calls),
+        pressure: Box::new(move || pressure(pressure_n.fetch_add(1, Ordering::Relaxed))),
+        jitter_ms,
+    };
+    (hooks, FakeBoot { sleeps })
+}
+
+/// A、B 先下載一次（存成本機副本、記下檢查時間）；回傳清單伺服器狀態、狀態目錄、
+/// 「A、B、C」的設定（C 沒有副本）與「A、B」的設定
+async fn boot_setup(
+    tag: &str,
+) -> (
+    std::sync::Arc<std::sync::Mutex<EtagLists>>,
+    std::path::PathBuf,
+    serde_json::Value,
+    serde_json::Value,
+) {
+    use std::sync::{Arc, Mutex};
+    let st = Arc::new(Mutex::new(EtagLists::default()));
+    {
+        let mut g = st.lock().unwrap();
+        g.lists.insert("a.txt".into(), ("\"a1\"".into(), many("aa", 200)));
+        g.lists.insert("b.txt".into(), ("\"b1\"".into(), many("bb", 200)));
+        g.lists.insert("c.txt".into(), ("\"c1\"".into(), many("cc", 200)));
+    }
+    let srv = etag_server(st.clone()).await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-boot-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let ab = json!([
+        { "name": "A", "url": format!("http://{srv}/a.txt"), "category": "ads" },
+        { "name": "B", "url": format!("http://{srv}/b.txt"), "category": "ads" },
+    ]);
+    let mut abc = ab.as_array().unwrap().clone();
+    abc.push(json!({ "name": "C", "url": format!("http://{srv}/c.txt"), "category": "ads" }));
+    let cfg_ab = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": ab } }));
+    let cfg_abc = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": abc } }));
+    let p = boot_persister(&dir);
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg_ab, &dir).unwrap();
+    f.set_copies(p.clone());
+    assert!(f.update_lists(false).await.unwrap());
+    p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    assert_eq!(st.lock().unwrap().reqs.get("a.txt"), Some(&1));
+    (st, dir, cfg_abc, cfg_ab)
+}
+
+fn boot_persister(dir: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<kuroshio::persist::Persister>> {
+    let mut p = kuroshio::persist::Persister::new(
+        dir.join("state"),
+        kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+    );
+    p.set_free_probe(|_| Some(10 << 30));
+    std::sync::Arc::new(std::sync::Mutex::new(p))
+}
+
+fn normal(_: usize) -> kuroshio::sysinfo::Pressure {
+    kuroshio::sysinfo::Pressure::Normal
+}
+
+const DAY: Duration = Duration::from_secs(24 * 3600);
+
+/// 以前：用副本建好後固定等 60 秒才下載缺的清單（開機約 63 秒才有）。現在 10 秒 + 0～5 秒亂數
+#[tokio::test]
+async fn missing_lists_fetched_within_15s_after_copy_build() {
+    let (st, dir, cfg, _) = boot_setup("within15").await;
+    for jitter in [0u64, 5_000, 99_999] {
+        let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+        f.set_copies(boot_persister(&dir));
+        let before = st.lock().unwrap().reqs.get("c.txt").copied().unwrap_or(0);
+        let (h, fake) = fake_boot(st.clone(), jitter, 0, normal);
+        assert_eq!(f.boot(&h).await, 0);
+        let sleeps = fake.sleeps.lock().unwrap().clone();
+        // 第一次等待：10～15 秒（亂數有上限），那時候 C 還沒被請求
+        let (first, c_then) = sleeps[0];
+        assert!(first >= Duration::from_secs(10) && first <= Duration::from_secs(15), "{first:?}");
+        assert_eq!(first, Duration::from_millis(10_000 + jitter.min(5_000)));
+        assert_eq!(c_then, before, "等待之前不下載");
+        // 之後 C 已經下載、生效；接著等到 A、B 的更新間隔（剛檢查過），不是馬上再全部問一次
+        assert_eq!(sleeps.len(), 2, "{sleeps:?}");
+        assert_eq!(sleeps[1].1, before + 1, "C 下載了一次");
+        assert!(sleeps[1].0 > DAY - Duration::from_secs(3600), "{:?}", sleeps[1]);
+        assert!(f.check("cc1.example", 1).unwrap().block, "C 的規則生效");
+        assert!(f.check("aa1.example", 1).unwrap().block, "A 的副本照用");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 只補缺的：有副本的 A、B 一次請求都沒有（連 304 都不問）
+#[tokio::test]
+async fn only_missing_lists_requested() {
+    let (st, dir, cfg, _) = boot_setup("only").await;
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(boot_persister(&dir));
+    let (h, _fake) = fake_boot(st.clone(), 1_000, 0, normal);
+    assert_eq!(f.boot(&h).await, 0);
+    let g = st.lock().unwrap();
+    assert_eq!(g.reqs.get("a.txt"), Some(&1), "A 只有第一次下載");
+    assert_eq!(g.reqs.get("b.txt"), Some(&1), "B 只有第一次下載");
+    assert_eq!(g.reqs.get("c.txt"), Some(&1), "C 補下載一次");
+    assert_eq!(f.stats()["errors"], json!([]));
+    drop(g);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 全部都有副本：照舊 60 秒，之後等到更新間隔（不發請求）
+#[tokio::test]
+async fn all_copies_present_keeps_60s_then_interval() {
+    let (st, dir, _, cfg_ab) = boot_setup("allcopies").await;
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg_ab, &dir).unwrap();
+    f.set_copies(boot_persister(&dir));
+    let (h, fake) = fake_boot(st.clone(), 5_000, 0, normal);
+    assert_eq!(f.boot(&h).await, 0);
+    let sleeps = fake.sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.len(), 2, "{sleeps:?}");
+    assert_eq!(sleeps[0].0, kuroshio::filtering::ALL_COPIES_WAIT);
+    assert_eq!(sleeps[0].0, Duration::from_secs(60));
+    assert!(
+        sleeps[1].0 > DAY - Duration::from_secs(3600) && sleeps[1].0 <= DAY,
+        "{:?}",
+        sleeps[1]
+    );
+    assert_eq!(st.lock().unwrap().reqs.get("a.txt"), Some(&1), "沒有再問");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 還沒對時：10 秒之後照樣等對時（每 5 秒看一次）才下載
+#[tokio::test]
+async fn missing_fetch_waits_for_clock_sync() {
+    let (st, dir, cfg, _) = boot_setup("clock").await;
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(boot_persister(&dir));
+    let (h, fake) = fake_boot(st.clone(), 0, 3, normal);
+    assert_eq!(f.boot(&h).await, 0);
+    let sleeps = fake.sleeps.lock().unwrap().clone();
+    let five = Duration::from_secs(5);
+    let waits: Vec<Duration> = sleeps.iter().map(|s| s.0).collect();
+    assert_eq!(&waits[..4], &[Duration::from_secs(10), five, five, five], "{sleeps:?}");
+    assert!(sleeps[..4].iter().all(|s| s.1 == 0), "對時前不下載：{sleeps:?}");
+    assert_eq!(sleeps[4].1, 1, "對時後下載");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 記憶體：不足時等（恢復就下載）、偏低最多等 50 秒、一直不足就不下載（交給定時更新的迴圈）
+#[tokio::test]
+async fn missing_fetch_waits_for_memory() {
+    use kuroshio::sysinfo::Pressure;
+    let (st, dir, cfg, _) = boot_setup("memory").await;
+    let five = Duration::from_secs(5);
+    // 不足 2 次後恢復
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(boot_persister(&dir));
+    let (h, fake) = fake_boot(st.clone(), 0, 0, |n| if n < 2 { Pressure::Critical } else { Pressure::Normal });
+    assert_eq!(f.boot(&h).await, 0);
+    let sleeps = fake.sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps[1..3].iter().map(|s| s.0).collect::<Vec<_>>(), vec![five, five], "{sleeps:?}");
+    assert!(sleeps[..3].iter().all(|s| s.1 == 0), "不足時不下載");
+    assert_eq!(sleeps[3].1, 1, "恢復後下載");
+    // 一直偏低：最多等 10 次（50 秒）就下載
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(boot_persister(&dir));
+    let (h, fake) = fake_boot(st.clone(), 0, 0, |_| Pressure::Low);
+    assert_eq!(f.boot(&h).await, 0);
+    let sleeps = fake.sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.iter().filter(|s| s.0 == five).count(), 10, "{sleeps:?}");
+    assert_eq!(sleeps.last().unwrap().1, 2, "偏低等完照樣下載");
+    // 一直不足：等 30 分鐘後不下載，交給定時更新的迴圈（它照樣先等記憶體）
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(boot_persister(&dir));
+    let (h, fake) = fake_boot(st.clone(), 0, 0, |_| Pressure::Critical);
+    assert_eq!(f.boot(&h).await, 0);
+    let sleeps = fake.sleeps.lock().unwrap().clone();
+    let total: Duration = sleeps.iter().map(|s| s.0).sum();
+    assert_eq!(total, Duration::from_secs(10 + 30 * 60), "{}", sleeps.len());
+    assert_eq!(st.lock().unwrap().reqs.get("c.txt"), Some(&2), "一直不足：沒有下載");
+    assert!(f.check("cc1.example", 1).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 補缺的清單下載失敗：照退避等 60 秒、交給定時更新（重試次數從 1 開始）；有副本的還是沒被請求
+#[tokio::test]
+async fn missing_fetch_failure_backs_off() {
+    let (st, dir, cfg, _) = boot_setup("fail").await;
+    st.lock().unwrap().down.insert("c.txt".into());
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(boot_persister(&dir));
+    let (h, fake) = fake_boot(st.clone(), 0, 0, normal);
+    assert_eq!(f.boot(&h).await, 1);
+    let sleeps = fake.sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.last().unwrap().0, Duration::from_secs(60), "{sleeps:?}");
+    assert_eq!(f.stats()["errors"][0]["name"], "C");
+    assert_eq!(st.lock().unwrap().reqs.get("a.txt"), Some(&1));
+    assert!(f.check("aa1.example", 1).unwrap().block, "A 的副本照用");
     let _ = std::fs::remove_dir_all(&dir);
 }

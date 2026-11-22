@@ -1385,6 +1385,7 @@ impl AppState {
                     "reserveAuto": self.reserve.auto,
                     "reserveHow": self.reserve.how,
                     "headroomKB": crate::memgov::headroom(&r, &self.reserve).map(|b| b / 1024),
+                    "simulated": crate::memgov::simulation_json(crate::memgov::simulation(crate::memgov::steady_secs()), crate::memgov::steady_secs()),
                 })
             }
         }
@@ -1434,9 +1435,83 @@ impl AppState {
     }
 }
 
+/// 為什麼停止（3.5.0 C1）：決定日誌怎麼寫、關機寫快照的時間上限
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// SIGTERM（Unix）
+    Terminate,
+    /// Ctrl+C
+    CtrlC,
+    /// Ctrl+Break（Windows 主控台）
+    CtrlBreak,
+    /// 按主控台視窗的關閉鈕（Windows `CTRL_CLOSE_EVENT`）
+    ConsoleClose,
+    /// 登出（Windows `CTRL_LOGOFF_EVENT`）
+    Logoff,
+    /// 關機（Windows `CTRL_SHUTDOWN_EVENT`）
+    SystemShutdown,
+    /// Windows 服務的「停止」或系統關機（服務模式）
+    Service,
+    /// 主控台輸入 `quit`
+    Quit,
+}
+
+impl StopReason {
+    /// 日誌裡的說法：「收到 {label}，正常停止」
+    pub fn label(self) -> &'static str {
+        match self {
+            StopReason::Terminate => "SIGTERM",
+            StopReason::CtrlC => "Ctrl+C",
+            StopReason::CtrlBreak => "Ctrl+Break",
+            StopReason::ConsoleClose => "主控台關閉",
+            StopReason::Logoff => "登出",
+            StopReason::SystemShutdown => "關機",
+            StopReason::Service => "服務停止",
+            StopReason::Quit => "quit 指令",
+        }
+    }
+
+    /// 系統只給幾秒就強制結束行程的事件（Windows 主控台的關閉、登出、關機：大約 5 秒）
+    pub fn time_limited(self) -> bool {
+        matches!(self, StopReason::ConsoleClose | StopReason::Logoff | StopReason::SystemShutdown)
+    }
+
+    /// 關機寫快照的時間上限：主控台關閉／登出／關機 3 秒，其他照舊 10 秒
+    pub fn flush_budget(self) -> std::time::Duration {
+        if self.time_limited() {
+            crate::persist::CONSOLE_SHUTDOWN_BUDGET
+        } else {
+            crate::persist::SHUTDOWN_BUDGET
+        }
+    }
+
+    /// 收到時記的那一行
+    pub fn log_line(self) -> String {
+        if self.time_limited() {
+            format!(
+                "收到{}，正常停止（系統大約 5 秒後強制結束，快照最多寫 {} 秒，小檔先寫）",
+                self.label(),
+                self.flush_budget().as_secs()
+            )
+        } else {
+            format!("收到 {}，正常停止", self.label())
+        }
+    }
+}
+
 impl Started {
-    /// 關機：把有變動的快照全部寫出（規格 05 第 5.3 節）
+    /// 關機：把有變動的快照全部寫出（規格 05 第 5.3 節），最多 10 秒
     pub fn shutdown(&self) {
+        self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
+    }
+
+    /// 關機，時間上限依停止的原因（[`StopReason::flush_budget`]）
+    pub fn shutdown_for(&self, why: StopReason) {
+        self.shutdown_within(why.flush_budget())
+    }
+
+    /// 關機，寫快照（含準備快照內容）最多 `budget`；小檔先寫，寫不完的下次啟動用上一次存的
+    pub fn shutdown_within(&self, budget: std::time::Duration) {
         // 模式 B：先移除 HTTP.sys 的網址（重新載入時新的一輪要重新登記）
         if let Some(h) = &self.encrypted.httpsys {
             h.stop();
@@ -1447,7 +1522,14 @@ impl Started {
         let t0 = Instant::now();
         stage_hot_names(&self.state.resolver, &self.state.persister, self.state.warm_names);
         stage_sources(&self.state.persister, &self.state.snap_sources);
-        let r = self.state.persister.lock().unwrap().flush_for_shutdown(crate::persist::now_secs());
+        // 準備快照內容（序列化）花掉的時間也算在上限裡
+        let left = budget.saturating_sub(t0.elapsed());
+        let r = self
+            .state
+            .persister
+            .lock()
+            .unwrap()
+            .flush_for_shutdown_within(crate::persist::now_secs(), left);
         let ms = t0.elapsed().as_millis();
         match r {
             // 超過 5 秒時記成警告（只收警告的系統記錄也看得到；整合方停止服務時要等多久的依據）
@@ -1626,6 +1708,10 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                     Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }
                 last = p;
+            }
+            // 測試開關（3.5.0 C9）：模擬生效中每分鐘提醒一次、到期記一行（正式使用時一眼看得出來）
+            if let Some(msg) = crate::memgov::SIM.notice(crate::memgov::steady_secs()) {
+                warn!("{msg}");
             }
             if gov.is_some() {
                 tx.send_replace(Some(r));
@@ -1946,6 +2032,12 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     }
     spawn_persist_loop(persister.clone(), snap_sources.clone(), reserve.clone());
     let memgov = governor_on.then(|| start_governor(reserve.clone(), &resolver, &persister, &snap_sources, cdn.as_ref(), filter.as_ref()));
+    // 測試開關（3.5.0 C9）：開著時明顯提醒；重新載入設定時關掉了就連進行中的模擬一起取消
+    if crate::memgov::test_hooks(cfg) {
+        warn!("設定開了 system.testHooks（只給測試用）：可以用 POST /api/memory/simulate 模擬記憶體不足；正式使用請關掉");
+    } else if crate::memgov::SIM.stop() {
+        warn!("system.testHooks 關掉了：取消進行中的記憶體模擬");
+    }
     if governor_on || get(cfg, "system.memoryWatchdog").and_then(Value::as_bool).unwrap_or(true) {
         spawn_monitor(reserve.clone(), memgov.clone());
     }
@@ -2014,6 +2106,29 @@ pub async fn start(cfg: &Value) -> Result<Started> {
 
 #[cfg(test)]
 mod tests {
+    /// 3.5.0 C1：停止原因的日誌文字、主控台關閉／登出／關機時寫快照只給 3 秒
+    #[test]
+    fn stop_reason_labels() {
+        use super::StopReason::*;
+        assert_eq!(
+            ConsoleClose.log_line(),
+            "收到主控台關閉，正常停止（系統大約 5 秒後強制結束，快照最多寫 3 秒，小檔先寫）"
+        );
+        assert!(Logoff.log_line().starts_with("收到登出，正常停止"));
+        assert!(SystemShutdown.log_line().starts_with("收到關機，正常停止"));
+        assert_eq!(CtrlC.log_line(), "收到 Ctrl+C，正常停止");
+        assert_eq!(CtrlBreak.log_line(), "收到 Ctrl+Break，正常停止");
+        assert_eq!(Terminate.log_line(), "收到 SIGTERM，正常停止");
+        for r in [ConsoleClose, Logoff, SystemShutdown] {
+            assert!(r.time_limited());
+            assert_eq!(r.flush_budget(), crate::persist::CONSOLE_SHUTDOWN_BUDGET);
+        }
+        for r in [Terminate, CtrlC, CtrlBreak, Service, Quit] {
+            assert!(!r.time_limited(), "{r:?}");
+            assert_eq!(r.flush_budget(), crate::persist::SHUTDOWN_BUDGET, "服務停止、Ctrl+C 照舊 10 秒");
+        }
+    }
+
     /// 串接的設定（3.4.0）：`upstream.chain` 改了不沿用快取；清單的 `bypass`、`upstream.allowDownstream` 改了算過濾設定變了
     #[test]
     fn fingerprints_change_with_chain_settings() {

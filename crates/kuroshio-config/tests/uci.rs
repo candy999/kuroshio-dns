@@ -252,6 +252,13 @@ fn old_tier_keys_ignored_and_user_wins() {
     assert_eq!(g(&mg, "system.storageReserveMB"), &json!(3));
     assert_eq!(g(&mg, "system.storageReservePercent"), &json!(12));
     assert_eq!(g(&mg, "system.memoryGovernor"), &json!(false));
+    assert!(get(&mg, "system.testHooks").is_none(), "沒寫就不帶（預設 false）");
+    // 測試開關（3.5.0 C9）：UCI 也能開（只寫在測試文件裡，不放進範例設定）
+    let th = overrides(
+        &parse_text(&(default_text() + "\nconfig system 'system'\n\toption test_hooks '1'\n")).unwrap(),
+        &env(),
+    );
+    assert_eq!(g(&th, "system.testHooks"), &json!(true));
     let lists = g(&mg, "filter.lists").as_array().unwrap();
     let a = lists.iter().find(|l| l["url"] == "https://lists.example.com/a.txt").unwrap();
     assert_eq!(a["protect"], json!(true));

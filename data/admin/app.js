@@ -582,10 +582,13 @@
 		var shed = mem.shed || [], mb = $('st-mem');
 		if (mb) {
 			clear(mb);
-			mb.hidden = !(shed.length || (f && f.notice) || mem.floor);
+			var sim = mem.simulated;
+			mb.hidden = !(shed.length || (f && f.notice) || mem.floor || sim);
 			if (!mb.hidden) {
 				append(mb, [
 					el('h3', { text: '記憶體控制' }),
+					// 測試開關（3.5.0，system.testHooks）：模擬記憶體不足中，正式使用時一眼看得出來
+					sim ? el('p', { class: 'msg warn', text: '測試模式：模擬系統可用記憶體只剩 ' + sim.availMB + ' MB（還有 ' + Math.ceil((sim.remainingSec || 0) / 60) + ' 分鐘，到期自動恢復）。不是測試的話請把設定的 system.testHooks 關掉。' }) : null,
 					mem.protectedSuspended ? el('p', { class: 'msg err', text: '記憶體嚴重不足：連保護清單（惡意 / 反詐騙）都暫停了，只剩自訂規則；DNS 照常轉送。記憶體回來後自動恢復。' }) :
 						mem.floor ? el('p', { class: 'msg err', text: '記憶體不足：只轉送 DNS（暫停 CDN 調整、快取最小）。記憶體回來後自動恢復。' }) : null,
 					f && f.notice ? el('p', { class: 'msg warn', text: f.notice }) : null,

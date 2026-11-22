@@ -25,7 +25,8 @@
     "memoryReserveMB": 0,
     "memoryReservePercent": 0,
     "oomScoreAdj": -500,
-    "catchUpWindow": ""
+    "catchUpWindow": "",
+    "testHooks": false
   },
   "listen": {
     "doh": {
