@@ -840,7 +840,8 @@
         if (sec.upTable) {
           table(sec.upTable, s.upstreams, [
             { h: '上游', v: u => u.id, cls: 'mono' },
-            { h: '角色', v: u => tag(u.role === 'pinned' ? '固定' : u.role === 'auto' ? '自動' : u.role === 'fallback' ? '備援' : u.role, u.paused ? 'bad' : '') },
+            // 3.5.0：從未成功、先不用的自動上游（benched）與候補（spare）標出來
+            { h: '角色', v: u => tag(u.benched ? '從未成功，先不用' : u.spare ? '候補' : u.role === 'pinned' ? '固定' : u.role === 'auto' ? '自動' : u.role === 'fallback' ? '備援' : u.role === 'chain' ? '串接' : u.role, u.paused || u.benched ? 'bad' : '') },
             { h: '成功', v: u => nf.format(u.ok), num: 1 }, { h: '失敗', v: u => nf.format(u.fail), num: 1 },
             { h: '平均 ms', v: u => u.avgMs ?? '—', num: 1 }
           ]);
