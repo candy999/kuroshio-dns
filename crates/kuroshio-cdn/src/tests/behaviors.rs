@@ -133,7 +133,7 @@ impl Hints for TestHints {
             from: "friend".into(),
         }]
     }
-    fn hint_result(&self, from: &str, ok: bool) {
+    fn hint_result(&self, from: &str, _kind: crate::cdn::HintKind, ok: bool) {
         self.results.lock().unwrap().push((from.into(), ok));
     }
     fn cross_hint(&self, _n: &str) -> Option<CrossHint> {
@@ -176,7 +176,7 @@ impl Hints for ListHints {
             })
             .collect()
     }
-    fn hint_result(&self, from: &str, ok: bool) {
+    fn hint_result(&self, from: &str, _kind: crate::cdn::HintKind, ok: bool) {
         self.results.lock().unwrap().push((from.into(), ok));
     }
     fn cross_hint(&self, _n: &str) -> Option<CrossHint> {
@@ -754,4 +754,67 @@ async fn reverify_failure_drops_rewrite_immediately() {
     assert_eq!(r.rewritten, None, "{:?}", r.tags);
     assert!(r.tags.iter().any(|t| t.contains("驗證失敗→原始")), "{:?}", r.tags);
     assert_eq!(a(&m), ips(&["104.21.0.5"]));
+}
+
+#[test]
+fn friend_nodes_become_harvest_candidates_only() {
+    // 好友給的台灣節點：官方範圍內、我的節點池沒有的才放進候選名單；不直接進節點池
+    let (c, _net) = setup(json!({}));
+    let nodes = [
+        ("cloudflare", "104.16.50.1"),
+        ("cloudflare", "104.16.161.36"), // 已經在我的節點池
+        ("cloudflare", "203.0.113.9"),   // 不在官方範圍
+        ("cloudflare", "2606:4700::9"),  // IPv6 放 IPv6 的候選
+        ("cloudflare", "::ffff:104.16.50.3"),
+        ("nosuchcdn", "104.16.50.2"),
+    ];
+    let n = c.add_friend_nodes(nodes.iter().map(|(p, i)| (*p, ip(i))));
+    assert_eq!(n, 3);
+    let st = c.state();
+    assert_eq!(st.db.harvest_of("cloudflare", false), ips(&["104.16.50.1", "104.16.50.3"]));
+    assert_eq!(st.db.harvest_of("cloudflare", true), ips(&["2606:4700::9"]));
+    assert_eq!(st.pools.pool_size("cloudflare", 4), 2, "節點池不動");
+    drop(st);
+    // 同一個不重複放
+    assert_eq!(c.add_friend_nodes([("cloudflare", ip("104.16.50.1"))]), 0);
+
+    // 一次最多 500 個
+    let (c, _net) = setup(json!({}));
+    let many: Vec<IpAddr> = (0..600u32)
+        .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x6811_0000 + i * 7)))
+        .collect();
+    assert_eq!(
+        c.add_friend_nodes(many.iter().map(|i| ("cloudflare", *i))),
+        crate::cdn::FRIEND_MAX_NODES
+    );
+
+    // 候選名單滿了：不擠掉自己流量收集到的
+    let (c, _net) = setup(json!({}));
+    c.with_state(|st| {
+        for i in 0..crate::db::HARVEST_MAX as u32 {
+            st.db
+                .add_harvest("cloudflare", IpAddr::V4(std::net::Ipv4Addr::from(0x6812_0000 + i)));
+        }
+    });
+    assert_eq!(c.add_friend_nodes([("cloudflare", ip("104.16.50.1"))]), 0);
+    let h = c.state().db.harvest_of("cloudflare", false);
+    assert_eq!(h.len(), crate::db::HARVEST_MAX);
+    assert!(!h.contains(&ip("104.16.50.1")));
+}
+
+#[test]
+fn imported_never_queried_domains_are_not_rechecked() {
+    // 分享檔匯入的網域（lastSeen = 0、已過期的通過）：每小時的複驗不去驗證，等這台有人查到才驗證
+    let (c, _net) = setup(json!({ "reverifyRatio": 0 }));
+    let file = |last: u64| {
+        serde_json::to_vec(&json!({ "domains": [
+            { "name": "imported.example.com", "provider": "cloudflare", "firstSeen": now_ms(), "lastSeen": last,
+              "v4": { "verdict": "ok", "until": 0 } }
+        ] }))
+        .unwrap()
+    };
+    c.with_state(|st| st.db.load_domains(&file(0), false).unwrap());
+    assert_eq!(c.recheck(), 0, "沒人查過的不驗證");
+    c.with_state(|st| st.db.load_domains(&file(now_ms()), false).unwrap());
+    assert_eq!(c.recheck(), 1, "最近有人查過的照常複驗");
 }

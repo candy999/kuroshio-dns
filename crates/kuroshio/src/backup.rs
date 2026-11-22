@@ -4,8 +4,9 @@
 //! `{ format: "kuroshio-backup", version: 1, kind: "full" | "share", exportedAt, core, files: { 相對路徑: {json} | {text} | {b64} } }`
 //!
 //! - `full`（換路由器）：狀態目錄裡學到的全部資料、自訂規則、社群身分與好友。含私鑰，只給自己用。
-//! - `share`（分享給朋友）：CDN 網域驗證紀錄（去掉次數、時間、手動設定）、台灣節點池、永久 IPv6 節點、
-//!   上游評測結果、汙染 DNS 黑名單。沒有身分、金鑰、統計、自訂規則。
+//! - `share`（分享給朋友）：CDN 網域驗證紀錄（去掉次數、時間、手動設定）、台灣節點池、永久 IPv6 節點。
+//!   沒有身分、金鑰、統計、自訂規則，也沒有上游評測結果與汙染 DNS 黑名單（這兩項由每台機器自己判定；
+//!   舊版的分享檔還會帶，匯入時略過）。
 //!
 //! 匯入一律「合併」，不直接覆蓋：本機已有的資料比較新就留著。
 //! 服務執行中時，記憶體裡的狀態在關機時會寫回檔案、蓋掉合併結果，所以管理 API 只把檔案放到
@@ -871,6 +872,9 @@ fn host_ok(n: &str) -> bool {
 /// 分享檔的一個網域 → 候選：只留名稱、業者，以及「哪個家族曾經通過」。
 /// `until: 0` = 已過期，改寫答案前本機一定會重新驗證（`Cdn::vstate` 只認還沒過期的結果）；
 /// 不帶 IP，所以驗證通過前不會回任何分享檔指定的位址。
+/// `lastSeen: 0` = 這台還沒有人查過：每小時的複驗只處理最近 3 天有人查過的網域，所以匯入的網域
+/// 不會在背景被一口氣驗證（最多 5000 個 × 2 個家族），等區網真的有人查到時才驗證
+/// （查到時 `lastSeen` 會更新成當時）。`firstSeen` 記匯入的時間
 fn share_candidate(d: &Value, now: u64) -> Option<Value> {
     let name = d.get("name")?.as_str()?.trim_end_matches('.').to_ascii_lowercase();
     if !host_ok(&name) {
@@ -891,7 +895,7 @@ fn share_candidate(d: &Value, now: u64) -> Option<Value> {
     o.insert("name".into(), json!(name));
     o.insert("provider".into(), json!(provider));
     o.insert("firstSeen".into(), json!(now));
-    o.insert("lastSeen".into(), json!(now));
+    o.insert("lastSeen".into(), json!(0));
     Some(Value::Object(o))
 }
 
@@ -1874,12 +1878,14 @@ mod tests {
         assert_eq!(std::fs::read(dst.join("community/share.cbor")).unwrap(), vec![0xa0, 0xff, 0x00]);
         assert!(dst.join(HARVEST).exists() && dst.join(STATS).exists());
 
-        // 分享檔匯入空的機器：網域沒有時間 → 設成現在；沒有私人檔案
+        // 分享檔匯入空的機器：匯入時間記在 firstSeen；lastSeen = 0（這台還沒有人查過，
+        // 每小時的複驗不會去驗證它，等有人查到才驗證）；沒有私人檔案
         let dst3 = tmp("dst3");
         let r = merge(&Locations::in_dir(&dst3), &export(&sloc, Kind::Share));
         assert_eq!(r["kind"], "share");
         let doms = read_json(&dst3.join(DOMAINS)).unwrap();
-        assert!(doms["domains"][0]["lastSeen"].as_u64().unwrap() > 1_000_000_000_000);
+        assert!(doms["domains"][0]["firstSeen"].as_u64().unwrap() > 1_000_000_000_000);
+        assert_eq!(doms["domains"][0]["lastSeen"].as_u64(), Some(0));
         assert!(doms["domains"][0].get("hits").is_none());
         assert!(!dst3.join(STATS).exists() && !dst3.join("community").exists() && !dst3.join(CUSTOM).exists());
         // 分享檔的節點池、上游、黑名單不會直接變成本機的

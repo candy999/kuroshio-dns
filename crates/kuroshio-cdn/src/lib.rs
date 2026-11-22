@@ -28,7 +28,7 @@ pub mod verifier;
 #[cfg(test)]
 mod tests;
 
-pub use cdn::{Cdn, CrossHint, HintIp, Hints, Paths, SharedExport, Stats, Task};
+pub use cdn::{Cdn, CrossHint, HintIp, HintKind, Hints, Paths, SharedExport, Stats, Task};
 pub use config::CdnConfig;
 pub use net::{Net, RealNet};
 pub use optimizer::{ApplyResult, Baseline, Rewrite};

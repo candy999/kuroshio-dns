@@ -1213,6 +1213,7 @@ impl Community {
     /// 要寫回 state 的檔案（相對 state 根目錄的路徑, 內容）；寫入時機由整合端決定（暫存檔 + 改名、內容沒變不寫）
     pub fn snapshots(&self) -> Vec<(String, Vec<u8>)> {
         let now = now_ms();
+        let use_upstreams = self.cfg.read().unwrap().use_upstreams;
         let st = self.lock();
         let mut v = vec![
             ("community/peers.json".to_string(), save_peers(&st.store.peers, now)),
@@ -1223,7 +1224,7 @@ impl Community {
             ("community/share.cbor".to_string(), st.share.snapshot()),
             ("community/received.cbor.zst".to_string(), remote_snapshot(&st.remote)),
         ];
-        let ids = crate::client::upstream_ids(&st);
+        let ids = crate::client::upstream_ids(&st, use_upstreams);
         v.push((
             "community/upstream-candidates.json".to_string(),
             serde_json::to_vec(&json!({ "updatedAt": now, "ids": ids })).unwrap_or_default(),

@@ -515,11 +515,13 @@
             { "key": "community.enabled", "type": "bool", "label": "啟用社群模式" },
             { "key": "community.shareDomains", "type": "bool", "label": "分享網站驗證結果", "help": "只分享網域雜湊，不公開網站名稱。" },
             { "key": "community.shareUpstreams", "type": "bool", "label": "分享上游 DNS", "help": "好友收到後只當每日評測的候選。" },
+            { "key": "community.useHints", "type": "bool", "label": "使用好友的 CDN 資料", "help": "好友給的網站驗證結果、跨 CDN 結果、台灣節點只當候選，本機驗證通過才使用。關掉 = 只靠自己找。" },
+            { "key": "community.useUpstreams", "type": "bool", "label": "使用好友的上游 DNS", "help": "好友給的上游只當每日評測的候選（合計最多 100 個），照常經過汙染、封殺、速度檢查。" },
             { "key": "community.staleDays", "type": "int", "label": "好友幾天連不上就自動刪除", "min": 1 },
             { "key": "community.rejectDays", "type": "int", "label": "拒絕後幾天才能再請求", "pro": true, "min": 0 },
             { "key": "community.syncIntervalMin", "type": "int", "label": "多久向好友拉一次資料（分鐘）", "pro": true, "min": 1 },
             { "key": "community.maxFriends", "type": "int", "label": "好友數上限", "help": "達到上限後，自動同意的請求改成人工審核。", "pro": true, "min": 0 },
-            { "key": "community.minHitRate", "type": "float", "label": "命中率下限", "help": "好友給的資料在我這邊驗證成功的比例（0～1）。0 = 不檢查。", "pro": true, "min": 0, "max": 1 },
+            { "key": "community.minHitRate", "type": "float", "label": "命中率下限", "help": "好友給的資料在我這邊驗證成功的比例（0～1），試過 20 次以上還低於下限就暫停採用那一種資料，每 3 天重試一小批。預設 0.3；0 = 不檢查。", "pro": true, "min": 0, "max": 1 },
             { "key": "community.autoDeleteLowHitRate", "type": "bool", "label": "命中率太低時自動刪除好友", "help": "試過 20 次以上還低於命中率下限就自動刪除。", "pro": true },
             { "key": "community.powBits", "type": "int", "label": "好友請求的工作量證明難度", "help": "越高越難灌請求，但對方送請求也越久。", "pro": true, "min": 0 }
           ]

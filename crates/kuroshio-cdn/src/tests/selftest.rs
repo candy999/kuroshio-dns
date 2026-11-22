@@ -595,6 +595,200 @@ async fn cross_cdn_explore() {
     assert_eq!(rec.reason.as_deref(), Some("其他 CDN 都沒有這個網站"));
 }
 
+/// 好友的跨 CDN 提示（固定換到 `to`，帶幾個 IP）；記下回報的命中率
+struct CrossHints {
+    to: &'static str,
+    list: Vec<(&'static str, &'static str)>,
+    results: Mutex<Vec<(String, crate::cdn::HintKind, bool)>>,
+}
+
+impl crate::cdn::Hints for CrossHints {
+    fn domain_hint(&self, _n: &str, _p: &str, _f: u8) -> Vec<crate::cdn::HintIp> {
+        vec![]
+    }
+    fn hint_result(&self, from: &str, kind: crate::cdn::HintKind, ok: bool) {
+        self.results.lock().unwrap().push((from.into(), kind, ok));
+    }
+    fn cross_hint(&self, _n: &str) -> Option<crate::cdn::CrossHint> {
+        Some(crate::cdn::CrossHint {
+            to: self.to.into(),
+            ips: self
+                .list
+                .iter()
+                .map(|(i, f)| crate::cdn::HintIp {
+                    ip: ip(i),
+                    from: f.to_string(),
+                })
+                .collect(),
+        })
+    }
+}
+
+fn cross_hints(to: &'static str, list: Vec<(&'static str, &'static str)>) -> Arc<CrossHints> {
+    Arc::new(CrossHints {
+        to,
+        list,
+        results: Mutex::new(vec![]),
+    })
+}
+
+fn sorted_results(h: &CrossHints) -> Vec<(String, bool)> {
+    let mut r: Vec<(String, bool)> = h
+        .results
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(f, k, ok)| {
+            assert_eq!(*k, crate::cdn::HintKind::Cross, "跨 CDN 提示記在跨 CDN 的分數");
+            (f.clone(), *ok)
+        })
+        .collect();
+    r.sort();
+    r
+}
+
+#[tokio::test]
+async fn cross_hint_only_reorders_verified_own_candidates() {
+    // 好友的跨 CDN 提示：IPv6、官方範圍外的一定是錯的（不試、算沒命中）；在範圍內但不在我節點池的不試、不計分；
+    // 在我節點池的排最前面先試。自己的候選一個都不拿掉
+    let (cx, net) = cross_setup();
+    let h = cross_hints(
+        "cloudflare",
+        vec![
+            ("2606:4700::1", "v6"),
+            ("203.0.113.9", "outside"),
+            ("104.16.9.9", "notpool"),
+            ("104.16.1.1", "good"),
+        ],
+    );
+    cx.set_hints(Some(h.clone()));
+    cx.with_state(|st| {
+        st.db.touch("x.com", "fastly", "ip", &ips(&["151.101.1.1"]), &[], None);
+    });
+    assert_eq!(cx.cross_explore("x.com", "fastly", ip("151.101.1.1")).await, "ok");
+    for bad in ["2606:4700::1", "203.0.113.9", "104.16.9.9"] {
+        assert!(net.calls(&format!("https {bad} ")).is_empty(), "{bad} 不能試");
+    }
+    let rec = cx.state().db.get("x.com").unwrap().cross4.clone().unwrap();
+    assert_eq!(rec.to.as_deref(), Some("cloudflare"));
+    assert_eq!(rec.ips, Some(ips(&["104.16.1.1"])), "只存自己節點池的 IP");
+    assert_eq!(
+        sorted_results(&h),
+        [
+            ("good".to_string(), true),
+            ("outside".to_string(), false),
+            ("v6".to_string(), false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cross_hint_without_own_candidates_is_never_ok() {
+    // 我的節點池沒有這家的節點：好友給的 IP 再多也不試，不能記成「可用」（不然會擋住自己的探索 ~24 小時）
+    let (cx, net) = cross_setup();
+    cx.with_state(|st| {
+        st.pools.p.get_mut("cloudflare").unwrap().pool4.clear();
+        st.db.touch("x.com", "fastly", "ip", &ips(&["151.101.1.1"]), &[], None);
+    });
+    let h = cross_hints("cloudflare", vec![("104.16.9.9", "friend"), ("104.16.9.10", "friend")]);
+    cx.set_hints(Some(h.clone()));
+    assert_eq!(cx.cross_explore("x.com", "fastly", ip("151.101.1.1")).await, "fail");
+    assert!(net.calls("https 104.16.9.").is_empty());
+    let rec = cx.state().db.get("x.com").unwrap().cross4.clone().unwrap();
+    assert!(rec.is("fail"));
+    assert!(h.results.lock().unwrap().is_empty(), "本機沒辦法確認的不計分");
+
+    // 沒有 Akamai 設定（解析不到 edgekey / edgesuite）：好友說換到 Akamai 也不試
+    let (cx, net) = cross_setup();
+    cx.with_state(|st| {
+        st.db.touch("y.example", "fastly", "ip", &ips(&["151.101.1.1"]), &[], None);
+    });
+    let h = cross_hints("akamai", vec![("192.0.2.10", "friend")]);
+    cx.set_hints(Some(h.clone()));
+    assert_eq!(cx.cross_explore("y.example", "fastly", ip("151.101.1.1")).await, "fail");
+    assert!(net.calls("https 192.0.2.10").is_empty());
+    let rec = cx.state().db.get("y.example").unwrap().cross4.clone().unwrap();
+    assert!(rec
+        .tried
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|x| &*x.to == "akamai" && x.reason.as_deref() == Some("沒有 Akamai 設定")));
+}
+
+#[tokio::test]
+async fn cross_hint_akamai_must_be_own_ecs_answer() {
+    // Akamai：好友給的 IP 一定要是這台自己帶台灣網段解析到的節點，其他的不試
+    let (cx, net) = cross_setup();
+    net.on_dns(|_, name, qtype, _| {
+        let mut m = msg(name, qtype, &[], vec![]);
+        if qtype == kuroshio_proto::message::rtype::A && name == "y.example.edgekey.net" {
+            m.answers.push(Record::a(name, 60, "192.0.2.10".parse().unwrap()));
+            m.answers.push(Record::a(name, 60, "192.0.2.11".parse().unwrap()));
+        }
+        Some(m)
+    });
+    net.set_cached("192.0.2.10", 5.0);
+    net.set_cached("192.0.2.11", 6.0);
+    let html = |t: &str| {
+        resp(
+            200,
+            &[("content-type", "text/html")],
+            &format!("<html><head><title>{t}</title></head></html>"),
+        )
+    };
+    net.on_https(move |i, _| match i.to_string().as_str() {
+        "151.101.1.1" | "192.0.2.10" | "192.0.2.11" => html("Y"),
+        _ => html("Other"),
+    });
+    cx.with_state(|st| {
+        st.db.touch("y.example", "fastly", "ip", &ips(&["151.101.1.1"]), &[], None);
+    });
+    let h = cross_hints("akamai", vec![("198.51.100.7", "stranger"), ("192.0.2.11", "friend")]);
+    cx.set_hints(Some(h.clone()));
+    assert_eq!(cx.cross_explore("y.example", "fastly", ip("151.101.1.1")).await, "ok");
+    assert!(net.calls("https 198.51.100.7").is_empty(), "不是自己解析到的 Akamai 節點不試");
+    let https = net.calls("https 192.0.2.");
+    assert_eq!(
+        https.first().map(String::as_str),
+        Some("https 192.0.2.11 y.example"),
+        "好友提示的排最前面"
+    );
+    let rec = cx.state().db.get("y.example").unwrap().cross4.clone().unwrap();
+    assert_eq!(rec.to.as_deref(), Some("akamai"));
+    assert_eq!(rec.ips, Some(ips(&["192.0.2.11", "192.0.2.10"])), "自己的候選也在");
+    assert_eq!(sorted_results(&h), [("friend".to_string(), true)]);
+}
+
+#[test]
+fn cross_serve_ips_only_ipv4() {
+    // 跨 CDN 只驗證 IPv4：記錄裡就算有 IPv6（舊版收了好友的提示）也不回，A 記錄不會被換成空的
+    let (opt, _net) = setup(json!({}));
+    let host = "v6cross.example";
+    opt.with_state(|st| {
+        st.db.touch(host, "fastly", "ip", &ips(&["151.101.1.140"]), &[], None);
+        st.db.set_cross(
+            host,
+            Cross {
+                verdict: Some(intern("ok")),
+                from: Some(intern("fastly")),
+                to: Some(intern("akamai")),
+                ips: Some(ips(&["2001:db8::10"])),
+                until: Some(now_ms() + 86_400_000),
+                recheck_at: Some(now_ms() + 3_600_000),
+                ..Default::default()
+            },
+        );
+    });
+    let mut m = msg(host, 1, &["151.101.1.140"], vec![]);
+    let r = opt.apply(&mut m, host, 1);
+    assert_eq!(answer_ips(&m, 1), ["151.101.1.140"], "原本的 A 記錄還在");
+    assert_ne!(r.rewritten, Some(Rewrite::Cross));
+    let st = opt.state();
+    let e = st.db.get(host).unwrap();
+    assert!(Cdn::cross_serve_ips(&st.pools, e).is_empty());
+}
+
 #[test]
 fn cross_cdn_rewrite() {
     // 已驗證跨 CDN 可用：Fastly 的 A 換成 Cloudflare 台北節點、AAAA 拿掉

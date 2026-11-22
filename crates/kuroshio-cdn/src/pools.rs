@@ -310,7 +310,7 @@ impl ProviderPools {
     }
 }
 
-fn unmap(ip: IpAddr) -> IpAddr {
+pub(crate) fn unmap(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         _ => ip,
