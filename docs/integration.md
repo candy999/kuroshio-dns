@@ -607,6 +607,14 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - `/api/status` 的 `autoUpstreams` 是 `{ "generatedAt": null, "count": 5, "source": "default-list" }`（以前沒有評測結果時是 `null`）。狀態頁顯示「自動上游來自預設名單（還沒評測）」。
 - 第一次評測完成就被評測結果取代；串接時不分享給下游。
 
+### 一直沒成功的自動上游與候補
+
+- 自動上游上線以來一次都沒成功、第 3 次暫停時（合計失敗 15 筆，而且 10 分鐘內有別的上游成功過，不是整台斷網）先不用：每 6 小時只放 1 筆試探，成功就恢復。成功過的照舊 1 → 2 → 4 分鐘。固定上游、串接上游不受影響。
+- `/api/upstreams`（與 `/api/status` 的 `upstreams[]`）每台多 `benched`（`true` = 先不用；這段時間 `paused` 也是 `true`）；候補多 `spare: true`，排在自動上游後面。`/api/status` 的 `autoUpstreams` 多 `spares`（候補台數）。
+- `upstreams.json` 多 `spares[]`（評測沒選上、但合格的前 3 台，依速度；格式同 `selected[]`，`reason` 是 `"候補"`）。可用的自動上游（沒暫停、沒先不用、路徑沒擋）少於 `min(upstream.autoMax, benchmark.minAuto)` 時依序補上。舊的 `upstreams.json` 沒有 `spares` 就是沒有候補（跟 3.4.4 一樣）；舊版下游忽略這個欄位。
+- 先不用的上游登記到評測學習檔（`state/benchmark-learn.json.zst` 的 `neverOk`，最多 32 筆）：下一次評測照測、但不選、也不當候補（`judge.log`：「執行時上線以來從未成功，今天照測、不選」），連續 3 次評測之後忘掉重來。學習檔讀不到、格式不對當成空的；不進備份的分享檔、不傳給下游與好友。
+- 可用的連候補都不夠時提早評測（原因「自動上游不足」，12 小時內跑過就不排）；串接中由上游提供評測結果時不排。
+
 ### 手動執行的工作優先
 
 - `POST /api/jobs/run?name=…`（設定頁、LuCI 的「立即執行」）排到佇列**最前面**；已經在佇列裡的移到最前面（不會重複）。排程與補跑照舊排在後面。仍然一次只跑一個：正在跑的不中斷，回 `{"ok": false, "error": "執行中"}`。

@@ -661,7 +661,8 @@
 			(au.source === 'chain' ? '，是串接的共用結果。' : '。') : '還沒有每日評測結果，暫時使用固定上游與備援。';
 		tableRows($('st-up').tBodies[0], (st.upstreams || []).map(function (u) {
 			var n = (u.ok || 0) + (u.fail || 0), rate = n ? u.ok / n : null, h;
-			if (u.paused) h = badge('暫停中', 'warn');
+			if (u.benched) h = badge('從未成功，先不用', 'warn');
+			else if (u.paused) h = badge('暫停中', 'warn');
 			else if (u.pathBlocked) h = badge('路徑不通，先不用', 'warn');
 			else if (rate == null) h = badge('尚無查詢', 'off');
 			else if (rate >= 0.9) h = badge('正常 ' + Math.round(rate * 100) + '%', 'ok');

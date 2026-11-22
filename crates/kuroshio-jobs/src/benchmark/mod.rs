@@ -29,6 +29,7 @@
 //! 3.4.0 的差異（上游多樣性，規格 10 第 6 節）：Phase 2 判斷每台上游的所在地（台灣網段、ip-api 的國別、
 //! 量到的最低延遲），`benchmark.coverageRegion = near`（預設）時「覆蓋」階段先挑鄰近的（台灣、日本、香港、新加坡）。
 
+pub mod learn;
 pub mod probe;
 pub mod rules;
 pub mod select;
@@ -87,6 +88,8 @@ pub struct BenchPaths {
     /// 自己評測學到的永久黑名單（`state/blacklist.txt`）；程式附帶的 `list_dir/blacklist.txt` 是唯讀的基本名單，
     /// 學到的寫在 state，升級套件不會被蓋掉
     pub blacklist_file: Option<PathBuf>,
+    /// 評測學習資料（`state/benchmark-learn.json`，寫成 `.zst`；3.5.0，見 [`learn`]）；None 就不讀不寫
+    pub learn_file: Option<PathBuf>,
 }
 
 impl BenchPaths {
@@ -160,6 +163,7 @@ impl BenchPaths {
             community_candidates: Some(r("./state/community/upstream-candidates.json")),
             blacklist_file: Some(r("./state/blacklist.txt")),
             default_list_dir: None,
+            learn_file: Some(r("./state/benchmark-learn.json")),
         }
     }
 }
@@ -564,6 +568,8 @@ struct Srv {
     protected: Option<String>,
     /// 名單的標記（3.5.0）：只當起點與排序依據，不跳過任何檢查
     tag: Tag,
+    /// 執行時上線以來從未成功（主程式登記的 `neverOk`，3.5.0 A7）：照測，但今天不選
+    never_ok: bool,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -584,6 +590,7 @@ impl Srv {
             pinned,
             protected: None,
             tag,
+            never_ok: false,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -665,6 +672,7 @@ impl Srv {
             near: false,
             tier: self.tag.tier.name(),
             op: self.tag.op.clone(),
+            excluded: self.never_ok,
         }
     }
 }
@@ -963,6 +971,10 @@ impl Benchmark {
         blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
         let protected = protected_ids(&self.paths);
+        // 學習資料（3.5.0）：執行時上線以來從未成功的（主程式登記的）今天照測、不選；排除 3 次之後忘掉重來
+        let mut learned = self.paths.learn_file.as_ref().map(|p| learn::Learn::load(p));
+        let (never_ok, learn_changed) = learned.as_mut().map(|l| l.take_never_ok_round()).unwrap_or_default();
+        let never_ok: HashSet<String> = never_ok.into_iter().collect();
         // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
         let mut journal = Journal::default();
         // 路徑檢查：一般 DNS 被接走、IPv6 不能用、協定被擋時，那些候選今天不測（測了也只會冤枉它們）
@@ -1025,6 +1037,7 @@ impl Benchmark {
             }
             let mut s = Srv::new(spec.clone(), up, pinned, tag.clone());
             s.protected = expect.cloned();
+            s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
             all.push(s);
         }
         if !path_skipped.is_empty() {
@@ -1042,6 +1055,9 @@ impl Benchmark {
             .collect();
         if !unsupported.is_empty() {
             jinfo!(journal, "這個版本還不支援的類型先略過（之後版本加入）：{}", unsupported.join("、"));
+        }
+        for s in all.iter().filter(|s| s.never_ok) {
+            jinfo!(journal, "  {}：執行時上線以來從未成功，今天照測、不選", s.id);
         }
         jinfo!(
             journal,
@@ -1484,6 +1500,15 @@ impl Benchmark {
                 json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near, "tier": s.tier, "op": s.op })
             })
             .collect();
+        // 候補（3.5.0 A7）：沒選上、但合格的前幾台（依速度）；執行時可用的自動上游不夠時依序補上
+        let spares: Vec<Value> = calc
+            .spares
+            .iter()
+            .map(|&i| {
+                let s = &calc.finals[i];
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": 0, "reason": "候補", "region": s.region, "near": s.near, "tier": s.tier, "op": s.op })
+            })
+            .collect();
         let pinned: Vec<Value> = calc
             .finals
             .iter()
@@ -1496,6 +1521,7 @@ impl Benchmark {
             "universe": total,
             "coverage": if total > 0 { fixed_num(calc.selection.covered as f64 / total as f64, 4) } else { json!(0) },
             "selected": selected,
+            "spares": spares,
             "pinned": pinned,
             "counts": counts,
             "blocked": blocked_report,
@@ -1535,6 +1561,14 @@ impl Benchmark {
             }
         );
         write_json(&self.paths.upstreams_file, &state)?;
+        // 學習資料：有變動才寫（每天最多一次）；系統時間倒退時不寫
+        if let (Some(l), Some(p), true) = (learned.as_mut(), self.paths.learn_file.as_ref(), learn_changed) {
+            if l.advance(learn::day_of(now)) {
+                if let Err(e) = l.save(p) {
+                    warn!("寫入評測學習資料失敗：{e}");
+                }
+            }
+        }
         if let Some(d) = &out_dir {
             for (name, body) in &calc.reports {
                 report(&d.join(name), body.as_bytes());
@@ -1882,6 +1916,8 @@ struct Calc {
     /// 依延遲排序
     finals: Vec<Scored>,
     selection: select::Selection,
+    /// 候補（`finals` 的位置）
+    spares: Vec<usize>,
     reports: Vec<(&'static str, String)>,
 }
 
@@ -1899,6 +1935,7 @@ fn compute(
     let asn_best = select::best_per_asn(&refs);
     info!("ASN 過濾：{} → {}", finals.len(), asn_best.len());
     let selection = select::select(&refs, &asn_best, total, opts);
+    let spares = select::spares(&refs, &asn_best, &selection, opts, select::SPARES);
     let mut reports = Vec::new();
     if want_reports {
         let asn_refs: Vec<&Scored> = asn_best.iter().map(|i| refs[*i]).collect();
@@ -1925,6 +1962,7 @@ fn compute(
     Calc {
         finals,
         selection,
+        spares,
         reports,
     }
 }
@@ -2277,6 +2315,7 @@ mod shared_tests {
             community_candidates: Some(f),
             default_list_dir: None,
             blacklist_file: None,
+            learn_file: None,
         };
         let (_, n) = candidate_ids(&paths);
         assert_eq!(n, MAX_SHARED, "好友的上游候選最多 100 個");

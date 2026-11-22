@@ -226,7 +226,8 @@ return view.extend({
 			var why = [u.reason, u.region].filter(function(x) { return !!x; }).join(' · ');
 			if (why) role += '（' + why + '）';
 			var note = [];
-			if (u.paused) note.push(_('暫停中'));
+			if (u.benched) note.push(_('從未成功，先不用'));
+			else if (u.paused) note.push(_('暫停中'));
 			if (u.pathBlocked) note.push(_('路徑不通，先不用'));
 			if (u.via === 'interceptor') note.push(_('經由攔截者'));
 			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', note.join(' · ')];

@@ -1986,6 +1986,20 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     }
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));
+    // 有自動上游「上線以來從未成功」先不用、可用的（含候補）又不夠時：提早評測，12 小時內最多一次（3.5.0 A7）。
+    // 串接中由上游提供評測結果時不排
+    if let Some(s) = &scheduler {
+        let (m, s) = (Arc::downgrade(&resolver.upstreams), Arc::downgrade(s));
+        resolver.upstreams.on_auto_benched(Arc::new(move || {
+            let (Some(m), Some(s)) = (m.upgrade(), s.upgrade()) else { return };
+            if m.auto_short() && !crate::chain::share_skips("dns-benchmark") {
+                let r = s.request_with_gap("dns-benchmark", "自動上游不足", 720.0);
+                if r["ok"] == json!(true) {
+                    info!("可用的自動上游不夠（連候補都沒有），提早評測");
+                }
+            }
+        }));
+    }
     // 串接的共用結果（3.4.0，規格 10 第 3 節）：CDN、過濾、排程器都啟動之後。上游接上 ShareCache、
     // 下游建立／接回同步（工作開頭的 share_skips 只在共用結果新鮮、而且串接中時略過）
     crate::chain::share::start(cfg, &resolver, cdn.clone(), &persister, scheduler.as_ref());

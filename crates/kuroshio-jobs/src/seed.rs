@@ -250,7 +250,10 @@ pub fn initial_upstreams(paths: &BenchPaths, cfg: &Value) -> Option<Value> {
     if picked.is_empty() {
         return None;
     }
-    let spares = picked.split_off(picked.len().min(auto_max));
+    let mut spares = picked.split_off(picked.len().min(auto_max));
+    for x in &mut spares {
+        x["reason"] = json!("候補（預設名單）");
+    }
     Some(json!({
         "generatedAt": null,
         "source": SOURCE_DEFAULT_LIST,

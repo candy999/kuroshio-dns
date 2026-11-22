@@ -44,12 +44,14 @@ pub fn tier_of(rel: &str) -> Tier {
     if base.starts_with("filter-lists/") {
         return Tier::Optional;
     }
-    const REBUILDABLE: [&str; 5] = [
+    const REBUILDABLE: [&str; 6] = [
         "cdn/harvest.json",
         "cdn/ip-zone.json",
         "stats.json",
         "hot-names.json",
         "import-last.json",
+        // 評測學習資料（3.5.0）：丟了只是重新學
+        "benchmark-learn.json",
     ];
     const REBUILDABLE_DIRS: [&str; 3] = ["benchmark/", "cdn/ranges/", "cdn/scan/"];
     if REBUILDABLE.contains(&base) || REBUILDABLE_DIRS.iter().any(|d| base.starts_with(d)) {
@@ -242,6 +244,8 @@ mod tests {
         assert_eq!(tier_of("cdn/ip-zone.json"), Tier::Rebuildable);
         assert_eq!(tier_of("stats.json"), Tier::Rebuildable);
         assert_eq!(tier_of("benchmark/2026-11-11/report.json"), Tier::Rebuildable);
+        assert_eq!(tier_of("benchmark-learn.json.zst"), Tier::Rebuildable);
+        assert_eq!(tier_of("benchmark-learn.json"), Tier::Rebuildable);
         for core in [
             "cdn-domains.json",
             "cdn/domains/16-003.json.zst",

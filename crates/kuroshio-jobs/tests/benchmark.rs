@@ -134,6 +134,7 @@ fn paths(root: &Path) -> BenchPaths {
         community_candidates: Some(root.join("state/community/upstream-candidates.json")),
         blacklist_file: Some(root.join("state/blacklist.txt")),
         default_list_dir: None,
+        learn_file: Some(root.join("state/benchmark-learn.json")),
     }
 }
 

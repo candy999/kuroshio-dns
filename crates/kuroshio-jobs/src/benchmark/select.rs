@@ -32,6 +32,8 @@ pub struct Scored {
     pub tier: &'static str,
     /// 名單標記的經營者（3.5.0）
     pub op: String,
+    /// 今天不選（3.5.0 A7：執行時上線以來從未成功）：照測、照算覆蓋，只是不選、也不當候補
+    pub excluded: bool,
 }
 
 /// 鄰近的四地
@@ -233,18 +235,32 @@ pub struct Selection {
     pub covered: usize,
 }
 
+/// 能不能被選來用（固定上游另外算；3.5.0 起「今天不選」的也不行）
+fn eligible(s: &Scored, o: &SelectOpts) -> bool {
+    !s.pinned && !s.excluded && o.auto_types.contains(&s.kind) && s.avg <= o.max_avg && s.ext.success_rate >= 0.9
+}
+
+/// 候補最多幾台（3.5.0 A7）
+pub const SPARES: usize = 3;
+
+/// 候補（3.5.0 A7）：跟 [`select`] 一樣合格（每個 ASN 最快的一台、類型、延遲、成功率）、但沒選上的，依速度取前 `n` 台。
+/// 執行時可用的自動上游不夠時依序補上
+pub fn spares(finals: &[&Scored], asn_best: &[usize], sel: &Selection, o: &SelectOpts, n: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = asn_best
+        .iter()
+        .copied()
+        .filter(|&i| eligible(finals[i], o) && !sel.selected.iter().any(|p| p.idx == i))
+        .collect();
+    v.sort_by(|a, b| finals[*a].avg.partial_cmp(&finals[*b].avg).unwrap_or(std::cmp::Ordering::Equal));
+    v.truncate(n);
+    v
+}
+
 /// Phase 3：選出執行期上游。`finals` 依延遲排序，`asn_best` 是 `best_per_asn(finals)`。
 /// 先取最快的一台，再依「新增覆蓋最多」貪婪挑選，直到台數上限或覆蓋率達標；不足 minAuto 台時依速度補備援。
 pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOpts) -> Selection {
     let mut covered: HashSet<u64> = finals.iter().filter(|s| s.pinned).flat_map(|s| s.items()).collect();
-    let eligible: Vec<usize> = asn_best
-        .iter()
-        .copied()
-        .filter(|&i| {
-            let s = finals[i];
-            !s.pinned && o.auto_types.contains(&s.kind) && s.avg <= o.max_avg && s.ext.success_rate >= 0.9
-        })
-        .collect();
+    let eligible: Vec<usize> = asn_best.iter().copied().filter(|&i| eligible(finals[i], o)).collect();
     let mut by_speed = eligible.clone();
     by_speed.sort_by(|a, b| finals[*a].avg.partial_cmp(&finals[*b].avg).unwrap_or(std::cmp::Ordering::Equal));
     let mut selected = Vec::new();

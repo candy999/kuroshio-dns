@@ -115,6 +115,21 @@ impl Job for BenchJob {
             }));
             return Box::pin(async { Ok(()) });
         }
+        // 執行時上線以來從未成功、先不用的自動上游（3.5.0 A7）：寫進學習檔的 neverOk，這次評測照測、不選
+        let never_ok = crate::upstreams::take_never_ok();
+        if !never_ok.is_empty() {
+            let ok = self
+                .inner
+                .paths
+                .learn_file
+                .as_ref()
+                .is_some_and(|p| kuroshio_jobs::benchmark::learn::merge_never_ok(p, &never_ok, ctx.now_ms()));
+            if ok {
+                info!("評測：執行時從未成功的自動上游 {} 台，這次照測、不選", never_ok.len());
+            } else {
+                crate::upstreams::restore_never_ok(never_ok);
+            }
+        }
         match self.child.clone() {
             Some((exe, state, base)) => {
                 let (progress, last) = (self.progress.clone(), self.last.clone());
