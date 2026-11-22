@@ -8,6 +8,8 @@
 //!  Phase 2  統計延遲、獨有 IP、覆蓋率；輸出與 2.x 相同的 CSV 報表
 //!  Phase 3  選出執行期上游：先取最快的一台，再依「新增覆蓋最多」貪婪挑選 → state/upstreams.json
 //!  固定上游（upstream.pinned）會一起測、一起算覆蓋，但永遠不會被淘汰。
+//!  對照組（`protected.txt`，有過濾的大型 DNS）：照常測、照常判，用來確認評測判得出過濾；
+//!  永遠不選、不算覆蓋、不參加多數決、不記可疑、不進永久黑名單（3.4.2）。
 //!
 //! 3.0 的差異：
 //! - 支援的類型由 `Prober::supports` 決定（目前 udp / tcp / dot / doh）；doq、doh3、dnscrypt 先略過，
@@ -63,6 +65,8 @@ pub const PREFLIGHT_EXPECTED: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Ad
 const MAX_BLOCKED_REPORT: usize = 500;
 /// 固定上游的問題紀錄上限
 const MAX_ISSUES: usize = 500;
+/// 對照組最多幾台（多的不測）：只是用來確認判斷正常，不需要多
+pub const MAX_PROTECTED: usize = 64;
 
 /// 評測用到的檔案位置
 #[derive(Debug, Clone)]
@@ -516,6 +520,8 @@ struct Srv {
     up: Upstream,
     kind: &'static str,
     pinned: bool,
+    /// 對照組：預期會擋的類型（`filter=` 標記，例如 `ads,adult`）
+    protected: Option<String>,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -534,6 +540,7 @@ impl Srv {
             kind: kind_name(up.kind),
             up,
             pinned,
+            protected: None,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -544,6 +551,16 @@ impl Srv {
             history: Vec::new(),
             issues: Vec::new(),
         }
+    }
+
+    /// 會不會被選來用（固定上游另外處理，對照組永遠不選）
+    fn selectable(&self) -> bool {
+        !self.pinned && self.protected.is_none()
+    }
+
+    /// 評測結果會不會記下來（可疑天數、永久黑名單）：固定上游與對照組都不記
+    fn learns(&self) -> bool {
+        self.selectable()
     }
 
     fn kill(&mut self, reason: String) {
@@ -610,6 +627,39 @@ impl Srv {
 /// 名單的一行：有多個欄位時取指定開頭的那一個（同 2.x）
 fn pick_token(line: &str, prefix: &str) -> String {
     line.split_whitespace().find(|p| p.starts_with(prefix)).unwrap_or(line).to_string()
+}
+
+/// 對照組（`protected.txt`）：一行一個上游（一般 DNS 的位址或 `https://`、`tls://`、`quic://`、`sdns://`），
+/// 後面的 `filter=ads,adult,malware` 是預期會擋的類型；最多 [`MAX_PROTECTED`] 台
+fn protected_ids(paths: &BenchPaths) -> Vec<(String, String)> {
+    let lines = paths.read_lists("protected.txt");
+    if lines.len() > MAX_PROTECTED {
+        warn!("對照組 {} 台，超過上限 {MAX_PROTECTED}，多的不測", lines.len());
+    }
+    lines
+        .iter()
+        .take(MAX_PROTECTED)
+        .filter_map(|l| {
+            let spec = l.split_whitespace().next()?.to_string();
+            let expect = l
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("filter="))
+                .unwrap_or("?")
+                .to_string();
+            Some((spec, expect))
+        })
+        .collect()
+}
+
+/// 對照組的結果：判出過濾（封殺、汙染、可疑）、沒判出（倖存）、沒測到（連不上、資格賽失敗）
+fn protected_result(s: &Srv) -> &'static str {
+    if s.alive {
+        "passed"
+    } else if ["封殺", "汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p)) {
+        "detected"
+    } else {
+        "untested"
+    }
 }
 
 /// 依 2.x 的順序組出候選清單：udp、doh（含社群提供的加密上游）、doq，再加上 3.0 新增的 dot、doh3、dnscrypt
@@ -826,6 +876,7 @@ impl Benchmark {
         }
         blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
+        let protected = protected_ids(&self.paths);
         // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
         let mut journal = Journal::default();
         // 路徑檢查：一般 DNS 被接走、IPv6 不能用、協定被擋時，那些候選今天不測（測了也只會冤枉它們）
@@ -843,8 +894,17 @@ impl Benchmark {
         let mut seen: HashSet<String> = HashSet::new();
         let mut all: Vec<Srv> = Vec::new();
         let mut skipped: BTreeMap<&'static str, usize> = BTreeMap::new();
-        for (spec, pinned) in cfg.pinned.iter().map(|p| (p, true)).chain(ids.iter().map(|i| (i, false))) {
-            if !pinned && blacklist.contains(spec.as_str()) {
+        // 順序：固定上游、對照組、一般候選（同一個上游出現在兩邊時，以前面的為準）
+        let roles = cfg
+            .pinned
+            .iter()
+            .map(|p| (p, true, None))
+            .chain(protected.iter().map(|(p, e)| (p, false, Some(e))))
+            .chain(ids.iter().map(|i| (i, false, None)));
+        for (spec, pinned, expect) in roles {
+            // 對照組不看永久黑名單：用來確認判斷正常，不能被永久封殺
+            let pinned_or_control = pinned || expect.is_some();
+            if !pinned_or_control && blacklist.contains(spec.as_str()) {
                 *skipped.entry("blacklist").or_default() += 1;
                 continue;
             }
@@ -855,7 +915,7 @@ impl Benchmark {
                     continue;
                 }
             };
-            if !pinned && blacklist.contains(&up.id) {
+            if !pinned_or_control && blacklist.contains(&up.id) {
                 *skipped.entry("blacklist").or_default() += 1;
                 continue;
             }
@@ -872,7 +932,9 @@ impl Benchmark {
                     continue;
                 }
             }
-            all.push(Srv::new(spec.clone(), up, pinned));
+            let mut s = Srv::new(spec.clone(), up, pinned);
+            s.protected = expect.cloned();
+            all.push(s);
         }
         if !path_skipped.is_empty() {
             let parts: Vec<String> = path_skipped.iter().map(|(k, n)| format!("{} {n}", path_skip_label(k))).collect();
@@ -892,9 +954,10 @@ impl Benchmark {
         }
         jinfo!(
             journal,
-            "候選 {} 個（固定上游 {}，永久黑名單略過 {}）",
+            "候選 {} 個（固定上游 {}，對照組 {}，永久黑名單略過 {}）",
             all.len(),
             all.iter().filter(|s| s.pinned).count(),
+            all.iter().filter(|s| s.protected.is_some()).count(),
             skipped.get("blacklist").copied().unwrap_or(0)
         );
 
@@ -910,7 +973,7 @@ impl Benchmark {
         }
         let verified: Vec<usize> = (0..all.len()).filter(|i| all[*i].alive).collect();
         jinfo!(journal, "資格賽結束：通過 {} / 淘汰 {}", verified.len(), all.len() - verified.len());
-        if !verified.iter().any(|i| !all[*i].pinned) {
+        if !verified.iter().any(|i| all[*i].selectable()) {
             bail!("沒有任何 DNS 通過資格賽（本機網路可能異常），保留昨天的結果");
         }
         if let Some(d) = &out_dir {
@@ -969,15 +1032,13 @@ impl Benchmark {
                     }
                 }
             }
-            let answered = ok.len() + blocked.len();
+            // 對照組不參加多數決（它們本來就會擋）
+            let ok_n = ok.iter().filter(|(i, _, _)| all[*i].protected.is_none()).count();
+            let blocked_n = blocked.iter().filter(|(i, _)| all[*i].protected.is_none()).count();
+            let answered = ok_n + blocked_n;
             // 多數 DNS 都解析不到 → 網域本身有問題（下線 / 只在特定地區），本題不計分
-            if answered == 0 || (ok.len() as f64 / answered as f64) < 0.3 {
-                jinfo!(
-                    journal,
-                    "   -> 多數 DNS 都解析不到（成功 {} / 封鎖 {}），此網域略過",
-                    ok.len(),
-                    blocked.len()
-                );
+            if answered == 0 || (ok_n as f64 / answered as f64) < 0.3 {
+                jinfo!(journal, "   -> 多數 DNS 都解析不到（成功 {ok_n} / 封鎖 {blocked_n}），此網域略過");
                 continue;
             }
             scored += 1;
@@ -986,9 +1047,13 @@ impl Benchmark {
                 let s = &mut all[*i];
                 s.kill(format!("封殺 {domain} ({reason})"));
                 if blocked_report.len() < MAX_BLOCKED_REPORT {
-                    blocked_report.push(json!({ "dns": s.id, "domain": domain, "reason": reason, "pinned": s.pinned }));
+                    blocked_report.push(
+                        json!({ "dns": s.id, "domain": domain, "reason": reason, "pinned": s.pinned, "protected": s.protected.is_some() }),
+                    );
                 }
-                if !s.pinned {
+                if s.protected.is_some() {
+                    jinfo!(journal, "   [對照組] {} -> 判出過濾：封殺 ({reason})", s.id);
+                } else if !s.pinned {
                     jinfo!(journal, "   [淘汰] {} -> 封殺 ({reason})", s.id);
                 }
             }
@@ -996,7 +1061,7 @@ impl Benchmark {
             // 污染判斷（v16.1 邏輯）
             let all_ips: Vec<IpAddr> = ok.iter().flat_map(|(_, ips, _)| ips.iter().map(|i| IpAddr::V4(*i))).collect();
             let ip_info = cache.lookup(&*self.asn, &all_ips, false).await;
-            for (_, ips, _) in &ok {
+            for (_, ips, _) in ok.iter().filter(|(i, _, _)| all[*i].protected.is_none()) {
                 universe.extend(ips.iter().map(|ip| select::item(dix, u32::from(*ip))));
             }
             let infos: Vec<AsnInfo> = ok
@@ -1015,6 +1080,9 @@ impl Benchmark {
             // 其實都是同一個攔截者給的，不能讓它們變成「多數」（padavan-tw 11-19：306 台一般 DNS 全是上游黑潮在回答）
             let mut plain_seen: HashSet<Vec<Ipv4Addr>> = HashSet::new();
             for ((i, ips, _), info) in ok.iter().zip(&infos).filter(|(_, i)| !i.is_unknown()) {
+                if all[*i].protected.is_some() {
+                    continue;
+                }
                 let mut w = rules::calculate_weight(Some(info), domain);
                 if is_plain(all[*i].kind) {
                     let mut key = ips.clone();
@@ -1092,7 +1160,7 @@ impl Benchmark {
                     .iter()
                     .filter(|(_, (c, _))| *c == SiteCheck::Unverified)
                     .map(|(k, _)| *k)
-                    .filter(|k| !is_plain(all[ok[*k].0].kind))
+                    .filter(|k| !is_plain(all[ok[*k].0].kind) && all[ok[*k].0].protected.is_none())
                     .collect();
                 let mut out = HashSet::new();
                 for &k in &unverified {
@@ -1138,8 +1206,12 @@ impl Benchmark {
                     }
                     Some((SiteCheck::Invalid, why)) => {
                         s.kill(format!("汙染 {domain} (判定為 {}，憑證不符 {why})", info.label()));
+                        if s.protected.is_some() {
+                            jinfo!(journal, "   [對照組] {} -> 判出過濾：汙染 {}（憑證不符 {why}）", s.id, info.label());
+                            continue;
+                        }
                         polluted += 1;
-                        if !s.pinned && strikes.add(&cert_key(&s.id), &today) >= CERT_DAYS {
+                        if s.learns() && strikes.add(&cert_key(&s.id), &today) >= CERT_DAYS {
                             jinfo!(
                                 journal,
                                 "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
@@ -1178,8 +1250,17 @@ impl Benchmark {
                     }
                     Some((SiteCheck::Unverified, why)) => {
                         s.kill(format!("可疑 {domain} (判定為 {}，網站無法驗證 {why})", info.label()));
+                        if s.protected.is_some() {
+                            jinfo!(
+                                journal,
+                                "   [對照組] {} -> 判出過濾：可疑 {}（網站無法驗證 {why}）",
+                                s.id,
+                                info.label()
+                            );
+                            continue;
+                        }
                         suspicious += 1;
-                        if !s.pinned && strikes.add(&s.id, &today) >= SUSPECT_DAYS && blacklist.insert(s.id.clone()) {
+                        if s.learns() && strikes.add(&s.id, &today) >= SUSPECT_DAYS && blacklist.insert(s.id.clone()) {
                             jinfo!(
                                 journal,
                                 "   [淘汰] {} -> 連續 {SUSPECT_DAYS} 天回答無法驗證的位址（加入永久黑名單）",
@@ -1208,14 +1289,18 @@ impl Benchmark {
                 journal,
                 "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、連不上但照用 {lenient}、逾時 {errors}",
                 groups.first().map(|g| g.rep.label()).unwrap_or_else(|| "無法判定".into()),
-                ok.len() - polluted - suspicious,
-                blocked.len()
+                ok_n - polluted - suspicious,
+                blocked_n
             );
         }
 
         drop(raw);
         strikes.save();
-        let finals: Vec<usize> = verified.iter().copied().filter(|i| all[*i].alive).collect();
+        let finals: Vec<usize> = verified
+            .iter()
+            .copied()
+            .filter(|i| all[*i].alive && all[*i].protected.is_none())
+            .collect();
         if !finals.iter().any(|i| !all[*i].pinned) {
             bail!("沒有倖存的 DNS，保留昨天的結果");
         }
@@ -1250,13 +1335,40 @@ impl Benchmark {
             })
             .collect();
         drop(tw_nets);
+        // 對照組：判出過濾、沒判出、沒測到（不算淘汰，另外列）
+        let control: Vec<Value> = all
+            .iter()
+            .filter_map(|s| {
+                let expect = s.protected.as_ref()?;
+                Some(json!({ "id": s.id, "type": s.kind, "expect": expect, "result": protected_result(s), "reason": s.fail_reason }))
+            })
+            .collect();
+        if !control.is_empty() {
+            let n = |r: &str| control.iter().filter(|c| c["result"] == r).count();
+            jinfo!(
+                journal,
+                "[對照組] {} 台：判出過濾 {}、沒判出 {}、沒測到 {}（永遠不選、不記可疑、不進黑名單）",
+                control.len(),
+                n("detected"),
+                n("passed"),
+                n("untested")
+            );
+            for c in control.iter().filter(|c| c["result"] == "passed") {
+                jinfo!(
+                    journal,
+                    "   沒判出：{}（預期會擋 {}）",
+                    c["id"].as_str().unwrap_or(""),
+                    c["expect"].as_str().unwrap_or("")
+                );
+            }
+        }
         let eliminated: Vec<(String, &'static str, String)> = all
             .iter()
-            .filter(|s| !s.alive)
+            .filter(|s| !s.alive && s.protected.is_none())
             .map(|s| (s.id.clone(), s.kind, s.fail_reason.clone()))
             .collect();
         let issues: HashMap<String, Vec<String>> = all.iter().filter(|s| s.pinned).map(|s| (s.id.clone(), s.issues.clone())).collect();
-        let counts = json!({ "total": all.len(), "verified": verified.len(), "survivors": finals.len(), "eliminated": eliminated.len() });
+        let counts = json!({ "total": all.len(), "verified": verified.len(), "survivors": finals.len(), "eliminated": eliminated.len(), "protected": control.len() });
         drop(all);
         ctx.checkpoint().await;
 
@@ -1291,6 +1403,7 @@ impl Benchmark {
             "pinned": pinned,
             "counts": counts,
             "blocked": blocked_report,
+            "protected": control,
             "skippedTypes": skipped.iter().filter(|(k, _)| **k != "blacklist").map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "pathSkipped": path_skipped.iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "path": path.as_ref().map(|r| { let mut j = r.to_json(); j["policy"] = json!(policy); j }),
@@ -1331,6 +1444,21 @@ impl Benchmark {
                 report(&d.join(name), body.as_bytes());
             }
             report(&d.join("upstreams.json"), &serde_json::to_vec_pretty(&state).unwrap_or_default());
+            if let Some(c) = state["protected"].as_array().filter(|c| !c.is_empty()) {
+                let mut csv = String::from("dns,type,expect,result,reason\n");
+                for x in c {
+                    let f = |k: &str| x[k].as_str().unwrap_or("").replace([',', '\n'], " ");
+                    csv.push_str(&format!(
+                        "{},{},{},{},{}\n",
+                        f("id"),
+                        f("type"),
+                        f("expect"),
+                        f("result"),
+                        f("reason")
+                    ));
+                }
+                report(&d.join("protected.csv"), csv.as_bytes());
+            }
             report(&d.join("judge.log"), journal.text().as_bytes());
         }
         jinfo!(journal, "=== 今日選出的上游 ===");
@@ -1764,7 +1892,7 @@ fn keep_last_report(out_dir: &Path, keep: &Path, journal: &Journal) {
         return;
     }
     report(&keep.join("judge.log"), &cut(journal.text().into_bytes()));
-    for name in ["eliminated.csv", "upstreams.json"] {
+    for name in ["eliminated.csv", "upstreams.json", "protected.csv"] {
         if let Ok(b) = std::fs::read(out_dir.join(name)) {
             report(&keep.join(name), &cut(b));
         }

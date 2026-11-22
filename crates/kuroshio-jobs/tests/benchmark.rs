@@ -253,10 +253,13 @@ async fn end_to_end_with_mock_servers() {
     assert_eq!(up["date"], "2026-11-10");
     assert_eq!(up["universe"], 7);
     assert_eq!(up["coverage"], json!(0.8571));
-    assert_eq!(up["counts"], json!({ "total": 9, "verified": 7, "survivors": 4, "eliminated": 5 }));
+    assert_eq!(
+        up["counts"],
+        json!({ "total": 9, "verified": 7, "survivors": 4, "eliminated": 5, "protected": 0 })
+    );
     assert_eq!(
         up["blocked"],
-        json!([{ "dns": s4.to_string(), "domain": "cdn.beta.com", "reason": "導向 0.0.0.0", "pinned": false }])
+        json!([{ "dns": s4.to_string(), "domain": "cdn.beta.com", "reason": "導向 0.0.0.0", "pinned": false, "protected": false }])
     );
     assert_eq!(up["pinned"][0]["id"], pinned_id);
     assert_eq!(up["pinned"][0]["coverageItems"], 2);

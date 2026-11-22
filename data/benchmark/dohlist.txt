@@ -3,9 +3,9 @@
 # 2026-11-22 重新整理（3.4.2）：在沒有攔截的線路上（台灣 HiNet PPPoE 直接撥號）重測黑潮原本的名單與 HaGeZi 的 DoH 清單，
 #   3 輪都通過、答案正確、「不存在」沒被改寫、不擋廣告／成人／惡意網站的才收。
 #   tier=A：經營者明確（知名的公共 DNS）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
-#   有過濾的大型 DNS（保護組）、連不上的、有改寫的不在這裡；保護組在 3.5.0 另外列。
+#   連不上的、有改寫的不在這裡；有過濾的大型 DNS 是對照組，另外列在 protected.txt（照常評測、永遠不選）。
 #   op＝AS 名稱（租機房的經營者會是機房的名字）；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
-# 共 374 筆：A 156、B 218
+# 共 373 筆：A 155、B 218
 
 # ---- A 級 ----
 https://dns.hinet.net/dns-query  # tier=A op=Data_Communication_Business_Group ms=3.1 src=kuroshio-default checked=2026-11-22
@@ -47,7 +47,6 @@ https://public-dns-a.dns.sb/dns-query  # tier=A op=SB_Professional_Services ms=4
 https://tyo02.dnscry.pt/dns-query  # tier=A op=WebHorizon_Internet_Services ms=52.4 src=kuroshio-default checked=2026-11-22
 https://doh.dns.sb/dns-query  # tier=A op=xTom_Japan_Corporation ms=53.2 src=kuroshio-default checked=2026-11-22
 https://dns.gamban.com/dns-query  # tier=A op=Cloudflare ms=53.3 src=kuroshio-default checked=2026-11-22
-https://doh.cleanbrowsing.org/doh/security-filter  # tier=A op=Daniel_Cid ms=55.7 src=kuroshio-default checked=2026-11-22
 https://basic.rethinkdns.com/dns-query  # tier=A op=Cloudflare ms=58.6 src=kuroshio-default checked=2026-11-22
 https://sky.rethinkdns.com/dns-query  # tier=A op=Cloudflare ms=59.8 src=kuroshio-default checked=2026-11-22
 https://sel02.dnscry.pt/dns-query  # tier=A op=HostHatch_Korea ms=63.6 src=kuroshio-default checked=2026-11-22

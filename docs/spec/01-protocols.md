@@ -75,6 +75,7 @@
   | `dotlist.txt` | DoT 主機 | 🆕 |
   | `stamps.txt` | `sdns://` stamp（DNSCrypt 等） | 🆕 |
   | `web.txt`、`blacklist.txt` | 檢查用網站、永久黑名單 | ✅ |
+  | `protected.txt` | 對照組：有過濾的大型 DNS（任何類型），後面 `filter=` 是預期會擋的類型；照常測、照常判，永遠不選、不算覆蓋、不參加多數決、不記可疑、不看也不進永久黑名單；最多 64 台；結果在 `upstreams.json` 的 `protected`（`detected` 判出過濾、`passed` 沒判出、`untested` 沒測到）與報表的 `protected.csv` | 🆕 3.4.2 |
 
 ## 2. 自動發現
 
