@@ -32,6 +32,13 @@ Rust 版對齊前，在真實路由器上**同時跑兩個版本**：
   - 讀設定裡的 CDN 範圍與節點池分辨「同一家 CDN 的台灣節點」；分類：same / pool（允許）、rcode、filter、cdn、ips、error
   - 結束代碼 0 = 達標（未解釋差異 < 0.1%），報表列出最多 2,000 筆差異樣本
 
+### 1.2.1 記憶體不足路徑的實機測試（3.5.0）
+
+記憶體控制的「吃緊／不足」路徑在 CI 用注入的量測值測（`memgov.rs`、`tests/memgov_lists.rs`、`tests/filtering.rs`）。
+實機（記憶體很多的 D3、Windows）上用測試開關模擬：設定 `system.testHooks: true` 後
+`kuroshio notify simulate-memory --avail-mb 20 --minutes 5`，最長 30 分鐘、到期自動恢復；步驟與要看的日誌見 [09-memory.md 第 11 節](09-memory.md#11-測試模擬記憶體不足350)。
+正式使用不要開 `testHooks`（不放進 LuCI、設定頁、UCI 範例）。
+
 ### 1.3 效能目標
 
 | 項目 | 目標 |

@@ -183,6 +183,19 @@ pub fn trim_text(v: &Value) -> String {
     )
 }
 
+/// `POST /api/memory/simulate` 的回應 → `kuroshio notify simulate-memory` 印出的一行（3.5.0 C9）
+pub fn simulate_text(v: &Value) -> String {
+    match v.get("simulated").filter(|s| !s.is_null()) {
+        Some(s) => format!(
+            "測試模式：模擬系統可用記憶體 {} MB，{} 分鐘後自動恢復（`kuroshio notify simulate-memory --off` 立刻取消）",
+            s["availMB"].as_u64().unwrap_or(0),
+            v["minutes"].as_u64().unwrap_or(0)
+        ),
+        None if v["wasOn"] == true => "已取消記憶體模擬，回到真實的量測".into(),
+        None => "記憶體模擬本來就沒有開".into(),
+    }
+}
+
 /// `/api/status` → `kuroshio status --json` 的穩定格式（欄位見本模組說明）
 pub fn summarize_status(api: &Value) -> Value {
     let today = &api["stats"]["today"];

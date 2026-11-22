@@ -154,7 +154,10 @@ return view.extend({
 
 		// 記憶體控制（規格 09）：釋出中的項目、停用中的過濾清單（停用期間少了這些保護，要明顯）
 		var shed = mem.shed || [], fl = api.filter || {};
-		var memSec = (shed.length || fl.notice || mem.floor) ? common.section(_('記憶體控制'), [
+		var sim = mem.simulated;
+		var memSec = (shed.length || fl.notice || mem.floor || sim) ? common.section(_('記憶體控制'), [
+			// 測試開關（3.5.0，system.testHooks）：模擬記憶體不足中
+			sim ? E('div', { 'class': 'alert-message warning' }, _('測試模式：模擬系統可用記憶體只剩 %s MB（還有 %s 分鐘，到期自動恢復）。不是測試的話請把設定的 system.testHooks 關掉。').format(sim.availMB, Math.ceil((sim.remainingSec || 0) / 60))) : '',
 			mem.protectedSuspended ? E('div', { 'class': 'alert-message danger' }, _('記憶體嚴重不足：連保護清單（惡意 / 反詐騙）都暫停了，只剩自訂規則；DNS 照常轉送。記憶體回來後自動恢復。'))
 				: (mem.floor ? E('div', { 'class': 'alert-message danger' }, _('記憶體不足：只轉送 DNS（暫停 CDN 調整、快取最小）。記憶體回來後自動恢復。')) : ''),
 			fl.notice ? E('div', { 'class': 'alert-message warning' }, fl.notice) : '',

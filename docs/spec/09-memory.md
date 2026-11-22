@@ -231,5 +231,51 @@
 | `freedBytes` / `freedTotalBytes` | 目前釋出中合計 / 啟動以來合計 |
 | `lastChange`、`waiting`、`nextRestoreAt`、`events[]` | 最近一次狀態變化、在等什麼、下次可以恢復的時間、最近 20 筆事件 |
 
+| `simulated` | 測試開關（3.5.0，第 11 節）：`{ availMB, until, remainingSec }`，沒開是 null |
+
 `/api/status.filter`：`unloaded[]`（`name`、`rules`、`bytes`、`reason`：`memory` / `budget`、`at`）、`notice`、`suspended`（全部暫停中）、
 `sources[].protect`、`sources[].hits`。
+
+## 11. 測試：模擬記憶體不足（3.5.0）
+
+讓測試者在記憶體很多的機器（512 MB 的 D3、Windows）上觸發「吃緊／不足」的整套流程（停用清單、只轉送、保護清單暫停與恢復），
+不必真的把記憶體吃掉。**正式使用不能誤開**，所以有兩道保險：
+
+1. 設定 `system.testHooks: true`（預設 false；UCI 是 `config system 'system'` 的 `option test_hooks '1'`）。**不放進** LuCI、Windows 設定頁、
+   UCI 範例設定，只寫在這裡。沒開時 API 回 HTTP 403 與說明；重新載入設定時關掉了，進行中的模擬一起取消。
+2. 每次都有時間上限：`minutes` 1～30（預設 5），到期自動恢復；模擬只放在記憶體裡，重新啟動後不保留。
+
+用法：
+
+```
+kuroshio notify simulate-memory --avail-mb 20 --minutes 5     # 或 POST /api/memory/simulate?availMB=20&minutes=5
+kuroshio notify simulate-memory --off                        # 或 POST /api/memory/simulate?off=1
+```
+
+- 生效期間，`memgov::Reading::now()` 讀到的系統可用記憶體 = min(真實值, N MB)：記憶體控制、整個程式的壓力訊號（`app::pressure()`）、
+  每日評測的空間（`benchjob.rs`）、清單載入前的預算都看到同一個值。**只會讓讀數變小**，不能模擬成比真實寬裕；量不到可用記憶體的平台直接用 N。
+  `Reading::now()` 只在背景的監看與工作裡呼叫，不在查詢路徑上；模擬值是兩個 `AtomicU32`（MB、到期的相對秒數）。
+- 不影響系統層的東西（核心的 OOM、評測子程序的 OOM 設定），只影響黑潮自己的判斷。真正的記憶體是夠的，所以所有讓出的動作都安全；
+  到期後由既有的流程自己恢復（剛好也測到恢復路徑：放鬆要穩定 180 秒、恢復要空間 × 1.3）。
+- 看得出來：開著 `testHooks` 時啟動與 `kuroshio check-config` 各提醒一行；生效期間每分鐘一行 WARN「測試模式：模擬可用記憶體 N MB，還有 X 分鐘」，
+  到期記一行「測試模式結束」；`/api/status` 的 `memory.simulated`；Windows 設定頁與 LuCI 狀態頁的記憶體控制區塊顯示黃色橫幅。
+- 不走環境變數：環境變數會留在服務設定裡被忘記；設定 + API + 到期時間比較不會誤留。
+- `testHooks` 3.5.0 只有這一個用途；以後的新用途也要走同樣的兩道保險。
+
+### 11.1 在 D3（512 MB、padavan）上觸發 3.4.2 的 G1／G2 路徑
+
+D3 的自動保留量約 25.6 MB（`kuroshio sysinfo` 的 `reserve`）。「不足」是可用 < 保留量的一半，保護清單暫停（第 6 步）要可用 < 保留量的 1/4。
+
+1. 設定檔（padavan 是 JSON）加 `"system": { "testHooks": true }`，重新載入；日誌有一行「設定開了 system.testHooks」。
+2. **G1（一份清單都還沒有時不暫停全部）**：先讓這台一份清單都沒有——停止服務、把狀態目錄的 `filter-lists/` 移到別處（沒有本機副本），
+   設定裡的清單網址暫時改成連不到的（例如 `http://192.0.2.1/x.txt`）——啟動後立刻
+   `kuroshio notify simulate-memory --avail-mb 4 --minutes 5`（4 MB < 25.6 MB 的 1/4）。預期：做到「只轉送」，
+   但 `/api/status` 的 `memory.protectedSuspended` 是 false（沒有清單可以暫停）；到期、記憶體回升後第一次更新就把清單載入，
+   不必等記憶體控制恢復第 6 步（測完把清單網址與 `filter-lists/` 改回來）。
+3. **G2（待寫的副本讀得到）**：清單都載入後 `--avail-mb 10 --minutes 3`（10 MB < 一半）：日誌「暫時停用 N 份清單：…（重建 1 次）」（C3）。
+   到期後恢復時看日誌：恢復的清單讀本機副本或待寫的內容（`Persister::pending_bytes`），**不應該**有「下載清單」或從網路收大量資料；
+   `/api/status` 的 `filter.heldCopies` 與流量計數對照。
+4. 保護清單暫停：`--avail-mb 4`、清單都載入時，預期一路到 `protectedSuspended: true`，到期後 `resume_all` 重新載入。
+5. 每一項看：一次停用幾份、重建幾次（「訂閱清單已載入」出現幾次）、到期後多久恢復、有沒有反覆停用／恢復（恢復後 10 分鐘內又吃緊會加倍間隔）。
+6. 測完把 `testHooks` 拿掉（或設 false）、重新載入。
+

@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -135,15 +135,162 @@ pub struct Reading {
 }
 
 impl Reading {
-    /// 量這台機器（Linux：/proc/meminfo、/proc/pressure/memory；Windows：GlobalMemoryStatusEx）
+    /// 量這台機器（Linux：/proc/meminfo、/proc/pressure/memory；Windows：GlobalMemoryStatusEx）。
+    /// 測試開關（[`simulate`]，3.5.0 C9）開著時，系統可用記憶體換成 min(真實值, 模擬值)：
+    /// 所有直接呼叫這裡的地方（記憶體控制、壓力訊號、評測的空間）看到的都一樣。只在背景的監看與工作裡呼叫，不在查詢路徑上
     pub fn now() -> Reading {
         let (total, avail) = sysinfo::mem_bytes();
-        Reading {
+        let r = Reading {
             rss: sysinfo::rss_bytes(),
             total,
             avail,
             psi: std::fs::read_to_string("/proc/pressure/memory").ok().as_deref().and_then(parse_psi),
+        };
+        apply_simulation(r, simulation(steady_secs()))
+    }
+}
+
+// ------------------------------------------------------------ 測試開關：模擬記憶體不足（3.5.0 C9）
+//
+// 讓測試者在記憶體很多的機器（512 MB 的 D3、Windows）上觸發「吃緊／不足」的整套流程（停用清單、只轉送、恢復）。
+// 兩道保險：設定 `system.testHooks: true`（預設 false，不放進 LuCI、設定頁、UCI 範例）才接受，
+// 每次都有時間上限（最長 [`SIM_MAX_MINUTES`] 分鐘），到期自動恢復；只放在記憶體裡，重新啟動後不保留。
+// 只會讓讀數變小（模擬不足），不能模擬成比真實更寬裕。
+
+/// 一次最長幾分鐘
+pub const SIM_MAX_MINUTES: u64 = 30;
+/// 沒給 `minutes` 時幾分鐘
+pub const SIM_DEFAULT_MINUTES: u64 = 5;
+/// 模擬值上限（MB）：只是防呆，反正只會取比較小的
+const SIM_MAX_MB: u64 = 1 << 20;
+/// [`steady_secs`] 的起點（時間換成 u32 存）
+const STEADY_BASE: u64 = 1_000_000_000;
+
+/// 生效中的模擬
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Simulation {
+    pub avail_mb: u32,
+    /// 到期時間（[`steady_secs`]）
+    pub until: u64,
+}
+
+fn to_rel(t: u64) -> u32 {
+    t.saturating_sub(STEADY_BASE).clamp(1, u32::MAX as u64) as u32
+}
+
+/// 模擬的狀態（行程裡一份 [`SIM`]；測試自己造一份，不影響同一個行程裡的其他測試）。
+/// 32 位元平台沒有 64 位元原子操作：時間存成「[`steady_secs`] 減掉起點」的 u32 秒
+pub struct SimState {
+    mb: AtomicU32,
+    /// 到期時間；0 = 沒有開
+    until: AtomicU32,
+    /// 上次寫提醒的時間；0 = 還沒寫過
+    warned: AtomicU32,
+}
+
+/// 行程裡的模擬狀態（只在記憶體裡：重新啟動後不保留）
+pub static SIM: SimState = SimState::new();
+
+impl SimState {
+    pub const fn new() -> SimState {
+        SimState {
+            mb: AtomicU32::new(0),
+            until: AtomicU32::new(0),
+            warned: AtomicU32::new(0),
         }
+    }
+
+    /// 開始模擬（覆蓋前一次）：`minutes` 限制在 1～30。回傳生效的模擬
+    pub fn start(&self, avail_mb: u64, minutes: u64, now: u64) -> Simulation {
+        let minutes = minutes.clamp(1, SIM_MAX_MINUTES);
+        let mb = avail_mb.min(SIM_MAX_MB) as u32;
+        let until = now + minutes * 60;
+        // 先寫值再寫到期時間：讀的人看到到期時間就一定看得到這次的值
+        self.mb.store(mb, Ordering::Release);
+        self.until.store(to_rel(until), Ordering::Release);
+        self.warned.store(0, Ordering::Relaxed);
+        Simulation { avail_mb: mb, until }
+    }
+
+    /// 立刻取消。回傳原本有沒有開
+    pub fn stop(&self) -> bool {
+        self.until.swap(0, Ordering::AcqRel) != 0
+    }
+
+    /// 目前生效的模擬（到期了就是 None）
+    pub fn get(&self, now: u64) -> Option<Simulation> {
+        let until = self.until.load(Ordering::Acquire);
+        if until == 0 {
+            return None;
+        }
+        let until = until as u64 + STEADY_BASE;
+        (now < until).then(|| Simulation {
+            avail_mb: self.mb.load(Ordering::Acquire),
+            until,
+        })
+    }
+
+    /// 記憶體監看每一輪呼叫：生效期間每分鐘回傳一行提醒，到期那一輪回傳「結束」一次（之後都是 None）
+    pub fn notice(&self, now: u64) -> Option<String> {
+        match self.get(now) {
+            Some(s) => {
+                let last = self.warned.load(Ordering::Relaxed);
+                if last != 0 && now < last as u64 + STEADY_BASE + 60 {
+                    return None;
+                }
+                self.warned.store(to_rel(now), Ordering::Relaxed);
+                let left = s.until.saturating_sub(now);
+                Some(format!(
+                    "測試模式：模擬可用記憶體 {} MB，還有 {} 分鐘（system.testHooks；到期自動恢復，POST /api/memory/simulate?off=1 立刻取消）",
+                    s.avail_mb,
+                    left.div_ceil(60)
+                ))
+            }
+            None => {
+                let until = self.until.load(Ordering::Acquire);
+                if until != 0 && self.until.compare_exchange(until, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    return Some("測試模式結束：記憶體模擬到期，回到真實的量測（之後由記憶體控制照常恢復）".into());
+                }
+                None
+            }
+        }
+    }
+}
+
+impl Default for SimState {
+    fn default() -> Self {
+        SimState::new()
+    }
+}
+
+/// 目前行程裡生效的模擬
+pub fn simulation(now: u64) -> Option<Simulation> {
+    SIM.get(now)
+}
+
+/// 設定的 `system.testHooks`（預設 false）：測試用的開關要它開著才接受（3.5.0 C9）
+pub fn test_hooks(cfg: &Value) -> bool {
+    kuroshio_config::get(cfg, "system.testHooks").and_then(Value::as_bool) == Some(true)
+}
+
+/// 純函式：把模擬套到一次量測上（可用記憶體 = min(真實值, 模擬值)；量不到時就是模擬值）
+pub fn apply_simulation(mut r: Reading, sim: Option<Simulation>) -> Reading {
+    if let Some(s) = sim {
+        let cap = s.avail_mb as u64 * (1 << 20);
+        r.avail = Some(r.avail.map_or(cap, |a| a.min(cap)));
+    }
+    r
+}
+
+/// `/api/status.memory.simulated`：`{ availMB, until（Unix 毫秒）, remainingSec }`，沒開時 null
+pub fn simulation_json(sim: Option<Simulation>, now: u64) -> Value {
+    match sim {
+        Some(s) => json!({
+            "availMB": s.avail_mb,
+            "until": steady_to_wall_ms(s.until),
+            "remainingSec": s.until.saturating_sub(now),
+        }),
+        None => Value::Null,
     }
 }
 
@@ -910,6 +1057,8 @@ impl Governor {
             "waiting": i.waiting,
             "nextRestoreAt": (i.next_restore_at > 0 && !i.shed.is_empty()).then(|| steady_to_wall_ms(i.next_restore_at)),
             "events": i.events.iter().rev().map(|e| json!({ "at": steady_to_wall_ms(e.at), "msg": e.msg })).collect::<Vec<_>>(),
+            // 測試開關（3.5.0 C9）：模擬可用記憶體中（null = 沒開）
+            "simulated": simulation_json(simulation(steady_secs()), steady_secs()),
         })
     }
 }
@@ -1898,6 +2047,87 @@ mod tests {
         assert_eq!(shed_target(0), 0, "一份");
         assert_eq!(shed_target(10 * MB), 13 * MB);
         assert_eq!(shed_target(u64::MAX), u64::MAX, "不溢位");
+    }
+
+    /// 3.5.0 C9：模擬只會讓可用記憶體變小，不會比真實寬裕
+    #[test]
+    fn simulate_only_lowers_reading() {
+        let s = Some(Simulation {
+            avail_mb: 20,
+            until: u64::MAX,
+        });
+        assert_eq!(apply_simulation(rd(600), s).avail, Some(20 * MB));
+        assert_eq!(apply_simulation(rd(10), s).avail, Some(10 * MB), "真實的比較少：照真實的");
+        assert_eq!(apply_simulation(Reading::default(), s).avail, Some(20 * MB), "量不到：用模擬值");
+        assert_eq!(apply_simulation(rd(600), None), rd(600), "沒開：不動");
+        let r = apply_simulation(rd(600), s);
+        assert_eq!((r.total, r.rss, r.psi), (rd(600).total, rd(600).rss, None), "其他欄位不動");
+    }
+
+    #[test]
+    fn simulate_capped_at_30_minutes() {
+        let sim = SimState::new();
+        let now = 2_000_000_000;
+        assert_eq!(sim.start(20, 999, now).until, now + 30 * 60);
+        assert_eq!(sim.start(20, 0, now).until, now + 60, "最短 1 分鐘");
+        assert_eq!(sim.start(u64::MAX, 5, now).avail_mb, 1 << 20, "防呆上限");
+        assert!(sim.get(now + 5 * 60 - 1).is_some());
+        assert!(sim.get(now + 5 * 60).is_none(), "到期");
+        assert!(sim.stop());
+        assert!(!sim.stop());
+    }
+
+    /// 到期自動恢復（注入時鐘）：模擬期間記憶體控制照「不足」讓出；到期後讀回真實值，照常放鬆、恢復。
+    /// 提醒每分鐘一行，到期那一輪記一行「結束」
+    #[tokio::test]
+    async fn simulate_expires_and_restores() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let g = Governor::new(res100(), ladder(&log, 2 * MB), 0);
+        let sim = Arc::new(SimState::new());
+        // 注入的時鐘：t0 起算的秒數（32 位元平台沒有 AtomicU64）
+        let t0: u64 = 2_000_000_000;
+        let clock = Arc::new(AtomicU32::new(0));
+        let (s2, c2) = (sim.clone(), clock.clone());
+        // 真實的可用記憶體一直是 600 MB（寬裕）
+        g.set_reader(move || apply_simulation(rd(600), s2.get(t0 + c2.load(Ordering::Relaxed) as u64)));
+        sim.start(20, 5, t0);
+        let mut notices = Vec::new();
+        let mut now = t0;
+        while now < t0 + 40 * 60 {
+            clock.store((now - t0) as u32, Ordering::Relaxed);
+            if let Some(m) = sim.notice(now) {
+                notices.push((now - t0, m));
+            }
+            let r = g.read();
+            g.tick(r, now).await;
+            now += 5;
+        }
+        let l = log.lock().unwrap().clone();
+        assert!(
+            l.contains(&"shed:filter".to_string()) && l.contains(&"shed:floor".to_string()),
+            "模擬期間照「不足」讓出：{l:?}"
+        );
+        assert!(
+            l.contains(&"restore:floor".to_string()) && l.contains(&"restore:diagnostics".to_string()),
+            "到期後自己恢復：{l:?}"
+        );
+        assert_eq!(g.state(), State::Comfortable);
+        // 提醒：0、60、120、180、240 秒各一行，300 秒到期記「結束」，之後不再記
+        let at: Vec<u64> = notices.iter().map(|n| n.0).collect();
+        assert_eq!(at, [0, 60, 120, 180, 240, 300], "{notices:?}");
+        assert!(notices[0].1.contains("20 MB") && notices[0].1.contains("還有 5 分鐘"));
+        assert!(notices[5].1.contains("結束"));
+        assert!(sim.get(now).is_none());
+        // 狀態頁的欄位
+        assert_eq!(simulation_json(None, now), Value::Null);
+        let j = simulation_json(
+            Some(Simulation {
+                avail_mb: 20,
+                until: now + 90,
+            }),
+            now,
+        );
+        assert_eq!((j["availMB"].clone(), j["remainingSec"].clone()), (json!(20), json!(90)));
     }
 
     #[tokio::test]

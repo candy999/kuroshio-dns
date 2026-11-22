@@ -1380,6 +1380,7 @@ impl AppState {
                     "reserveAuto": self.reserve.auto,
                     "reserveHow": self.reserve.how,
                     "headroomKB": crate::memgov::headroom(&r, &self.reserve).map(|b| b / 1024),
+                    "simulated": crate::memgov::simulation_json(crate::memgov::simulation(crate::memgov::steady_secs()), crate::memgov::steady_secs()),
                 })
             }
         }
@@ -1621,6 +1622,10 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                     Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }
                 last = p;
+            }
+            // 測試開關（3.5.0 C9）：模擬生效中每分鐘提醒一次、到期記一行（正式使用時一眼看得出來）
+            if let Some(msg) = crate::memgov::SIM.notice(crate::memgov::steady_secs()) {
+                warn!("{msg}");
             }
             if gov.is_some() {
                 tx.send_replace(Some(r));
@@ -1941,6 +1946,12 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     }
     spawn_persist_loop(persister.clone(), snap_sources.clone(), reserve.clone());
     let memgov = governor_on.then(|| start_governor(reserve.clone(), &resolver, &persister, &snap_sources, cdn.as_ref(), filter.as_ref()));
+    // 測試開關（3.5.0 C9）：開著時明顯提醒；重新載入設定時關掉了就連進行中的模擬一起取消
+    if crate::memgov::test_hooks(cfg) {
+        warn!("設定開了 system.testHooks（只給測試用）：可以用 POST /api/memory/simulate 模擬記憶體不足；正式使用請關掉");
+    } else if crate::memgov::SIM.stop() {
+        warn!("system.testHooks 關掉了：取消進行中的記憶體模擬");
+    }
     if governor_on || get(cfg, "system.memoryWatchdog").and_then(Value::as_bool).unwrap_or(true) {
         spawn_monitor(reserve.clone(), memgov.clone());
     }

@@ -134,6 +134,7 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 kuroshio notify wan-changed [-c 設定檔] [--uci]
 kuroshio notify save [-c 設定檔] [--uci]
 kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
+kuroshio notify simulate-memory --avail-mb MB [--minutes 分鐘] | --off [-c 設定檔] [--uci]
 ```
 
 通知執行中的服務發生了某件事。目前的事件：
@@ -143,6 +144,7 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 | `wan-changed` | WAN 變了（重新撥號、換 IP、換線路）：DDNS 立即檢查並更新（等同設定頁的「立即更新」）、重新偵測對外 IP（問上游時帶的 ECS 子網路）、重新做路徑檢查（3.3.6 起，見下面「路徑檢查」）。都在背景進行，指令立刻回來 |
 | `save` | 立刻把所有還沒寫出的學習資料（快照）寫進快照目錄，不結束；寫完才回來（同 `SIGUSR1`、LuCI 狀態頁與設定頁的「立即儲存學習資料」）。**Windows 沒有訊號，要強制存檔就用這個**（例如關機、更新程式、UPS 通知之前） |
 | `trim` | 先讓出記憶體：立刻做記憶體「吃緊」時會做的釋出（診斷緩衝縮小、DNS 快取縮到 1/4、CDN 冷資料移出記憶體；**不停用過濾清單**），並在 `--hold` 秒內（預設 300，最多 3600）不讓記憶體結構長大、也不恢復。韌體要做很佔記憶體的事之前呼叫，例如把韌體映像檔寫進 tmpfs、解壓縮大檔案。做完才回來（CDN 冷資料移出前要先寫出快照，最多幾秒） |
+| `simulate-memory` | **只給測試用**（3.5.0）：模擬系統可用記憶體只剩 `--avail-mb` MB，`--minutes` 分鐘（1～30，預設 5）後自動恢復，`--off` 立刻取消。要在設定檔把 `system.testHooks` 設成 `true` 才接受，沒開時服務回 403（結束碼 1）。見 [09-memory.md 第 11 節](spec/09-memory.md#11-測試模擬記憶體不足350) |
 
 適合放在 WAN 撥號成功後會執行的腳本，例如 Padavan 的 `/etc/storage/post_wan_script.sh`、Asuswrt-Merlin 的 `/jffs/scripts/wan-event`、OpenWrt 的 hotplug（`/etc/hotplug.d/iface/`）、`ppp` 的 `ip-up`。
 
@@ -157,6 +159,7 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 - `wan-changed`：`POST /api/notify/wan-changed`，回應 `{"ok":true,"ddns":"started"|"disabled","ecs":"started","pathCheck":"started","clockSynced":bool}`（`pathCheck` 3.3.6 起）。
 - `save`：`POST /api/persist/flush`，回應 `{"ok":true,"files":寫了幾份,"bytes":磁碟上一共幾 bytes,"at":完成時間（Unix 毫秒）,"dir":"快照目錄"}`；沒有新的變動時 `files` 是 `0`。寫入失敗回 HTTP 500 與 `{"error":"..."}`。
 - `trim`：`POST /api/memory/trim?holdSec=秒`，回應 `{"ok":true,"steps":[{"step","label","freedBytes","detail"} 或 {"step","label","skipped"}],"freedBytes":估計釋出的 bytes,"holdSec":實際的秒數,"availBeforeKB","availKB"}`。記憶體控制關掉（`system.memoryGovernor: false`）時回 `{"ok":true,"enabled":false,...}`。暫停期間 `/api/status` 的 `memory.holdUntil` 是結束時間（Unix 毫秒）。
+- `simulate-memory`（3.5.0，測試用）：`POST /api/memory/simulate?availMB=N&minutes=M`，回應 `{"ok":true,"minutes":實際的分鐘數,"simulated":{"availMB","until":到期時間（Unix 毫秒）,"remainingSec"}}`；`?off=1` 回 `{"ok":true,"wasOn":bool,"simulated":null}`。沒開 `system.testHooks` 回 HTTP 403，少了 `availMB` 回 400。生效期間 `/api/status` 的 `memory.simulated` 是同樣的物件（沒開是 `null`）。LuCI 不需要這個路徑（`rpcd.sh` 不加）。
 
 ### 管理 API 版本
 

@@ -352,6 +352,23 @@ enum NotifyEvent {
         #[arg(long)]
         uci: bool,
     },
+    /// 測試用（3.5.0）：模擬系統可用記憶體只剩 --avail-mb MB，觸發記憶體「吃緊／不足」的整套流程，--minutes 分鐘後自動恢復。
+    /// 要在設定檔把 system.testHooks 設成 true 才會接受（正式使用不要開）；--off 立刻取消
+    SimulateMemory {
+        /// 模擬的系統可用記憶體（MB；只會比真實的少）
+        #[arg(long, required_unless_present = "off")]
+        avail_mb: Option<u64>,
+        /// 幾分鐘後自動恢復（1～30）
+        #[arg(long, default_value_t = 5)]
+        minutes: u64,
+        /// 立刻取消模擬
+        #[arg(long)]
+        off: bool,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long)]
+        uci: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1118,6 +1135,9 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
         }
         Cmd::CheckConfig { file, uci } => {
             let (cfg, ..) = effective(&file.unwrap_or_else(default_config_path), uci)?;
+            if kuroshio::memgov::test_hooks(&cfg) {
+                eprintln!("提醒：system.testHooks 開著（只給測試用：可以模擬記憶體不足）；正式使用請關掉");
+            }
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
         Cmd::Sysinfo { config, uci } => sysinfo_report(&config, uci)?,
@@ -2171,6 +2191,19 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
         NotifyEvent::Save { config, uci } => (config, uci, "/api/persist/flush".to_string(), 120),
         // CDN 冷資料移出前要先寫出快照
         NotifyEvent::Trim { hold, config, uci } => (config, uci, format!("/api/memory/trim?holdSec={hold}"), 60),
+        NotifyEvent::SimulateMemory {
+            avail_mb,
+            minutes,
+            off,
+            config,
+            uci,
+        } => {
+            let path = match (off, avail_mb) {
+                (false, Some(mb)) => format!("/api/memory/simulate?availMB={mb}&minutes={minutes}"),
+                _ => "/api/memory/simulate?off=1".to_string(),
+            };
+            (config, uci, path, 10)
+        }
     };
     let path = path.as_str();
     // 讀不到設定也試一次預設的管理埠（127.0.0.1:8054，不帶 token）：通知送得到就好，不必知道其他設定。
@@ -2200,6 +2233,10 @@ async fn notify_cmd(event: NotifyEvent) -> i32 {
             }
             if path.starts_with("/api/memory/trim") {
                 println!("{}", kuroshio::integration::trim_text(&v));
+                return 0;
+            }
+            if path.starts_with("/api/memory/simulate") {
+                println!("{}", kuroshio::integration::simulate_text(&v));
                 return 0;
             }
             println!(
