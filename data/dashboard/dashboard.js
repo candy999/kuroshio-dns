@@ -884,6 +884,27 @@
           { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 }, { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
         ]);
         if (b.blocked && b.blocked.length) box.appendChild(el('div', 'muted', `封殺紀錄 ${b.blocked.length} 筆（例：${b.blocked.slice(0, 3).map(x => x.dns + ' → ' + x.domain).join('、')}）`));
+        // 對照組（3.5.0）：有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選。摺疊起來，點開才看每一台
+        const ctl = b.protected || [];
+        if (ctl.length) {
+          const n = r => ctl.filter(x => x.result === r).length;
+          const reg = ctl.filter(x => x.regress === true).length;
+          const RES = { detected: ['判出', 'ok'], passed: ['沒判出', 'warn'], untested: ['沒測到', ''] };
+          const CAT = { ads: '廣告', adult: '成人', malware: '惡意', tracking: '追蹤', telemetry: '追蹤' };
+          const d = el('details', 'table kd-mt8');
+          d.appendChild(el('summary', '', `對照組 ${ctl.length} 台：判出 ${n('detected')}、沒判出 ${n('passed')}、沒測到 ${n('untested')}；回歸 ${reg}`));
+          const t2 = el('table'); const w2 = el('div', 'tbl'); w2.appendChild(t2); d.appendChild(w2); box.appendChild(d);
+          table(t2, ctl, [
+            { h: '上游', v: r => r.id, cls: 'mono' },
+            { h: '預期會擋', v: r => String(r.expect || '').split(',').map(x => CAT[x] || x).join('、') },
+            { h: '今天', v: r => { const x = RES[r.result] || [r.result, '']; return tag(x[0] + (r.result === 'detected' && r.stage === 'preflight' ? '（資格賽）' : ''), x[1]); } },
+            { h: '近 7 天', v: r => r.recent || '—', cls: 'mono' },
+            { h: '預期', v: r => r.expectMet === true ? '符合' : r.expectMet === false ? tag('不符', 'warn') : '—' },
+            { h: '回歸', v: r => r.regress ? tag('回歸', 'bad') : '—' },
+            { h: '說明', v: r => r.reason || '' }
+          ]);
+          d.appendChild(el('p', 'muted', '近 7 天：最左邊是今天；d＝判出、p＝沒判出、u＝沒測到、-＝那天沒跑。回歸＝以前判得出、今天沒判出（只報告，不影響選上游）。'));
+        }
       }, e => fail(sec.bench, e));
     }
 

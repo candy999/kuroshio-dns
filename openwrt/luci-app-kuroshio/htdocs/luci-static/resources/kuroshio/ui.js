@@ -259,6 +259,12 @@ return baseclass.extend({
 		return x && typeof x.chainView === 'function' ? x.chainView(c, function(s) { return _(s); }) : null;
 	},
 
+	/** 每日評測的對照組（/api/benchmark 的 protected[]）→ 一行摘要（ui-core.js 的 controlSummary）；沒有對照組或 ui-core.js 是舊的回 null */
+	controlSummary: function(list) {
+		var x = core();
+		return x && typeof x.controlSummary === 'function' ? x.controlSummary(list, function(s) { return _(s); }) : null;
+	},
+
 	/** 小標籤（狀態用）：kind = ok / warn / err / off */
 	badge: function(text, kind) {
 		return T('span', { 'class': 'kuroshio-badge', 'data-kind': kind || 'off',

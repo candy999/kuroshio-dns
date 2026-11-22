@@ -22,6 +22,8 @@ let pass = 0, fail = 0;
 const norm = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 const check = (ok, msg) => { if (ok) pass++; else { fail++; console.log(`  ✘ ${msg}`); } };
 const TR = { bracket: s => '[' + s + ']' };
+// 參數 "bracket" 換成翻譯函式的函式
+const TAKES_TR = ['restoreSummary', 'controlSummary', 'regionLabel'];
 
 check(win.KuroshioUiCore && typeof win.KuroshioUiCore.restorePlan === 'function', '以一般 <script> 載入時有全域的 KuroshioUiCore');
 const fns = Object.keys(core);
@@ -31,7 +33,7 @@ for (const fn of Object.keys(vectors)) {
     if (!Array.isArray(vectors[fn])) continue;
     if (typeof core[fn] !== 'function') { check(false, `ui-core.js 沒有 ${fn}`); continue; }
     vectors[fn].forEach((c, i) => {
-        const args = c.args.map(a => (typeof a === 'string' && TR[a] && fn === 'restoreSummary') ? TR[a] : a);
+        const args = c.args.map(a => (typeof a === 'string' && TR[a] && TAKES_TR.indexOf(fn) >= 0) ? TR[a] : a);
         const label = `${fn} #${i + 1}${c.name ? '（' + c.name + '）' : ''}`;
         let got;
         try { got = norm(core[fn].apply(null, args)); } catch (e) { check(false, `${label}：${e.message}`); return; }

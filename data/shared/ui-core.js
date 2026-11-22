@@ -9,6 +9,7 @@
  *   restorePlan(cur, defs, removeOwn)  「恢復預設清單」的比對結果
  *   restoreSummary(changes, tr)     「恢復預設清單」的變更清單（文字，畫面由各介面自己組）
  *   chainView(chain, tr, now)       /api/status 的 chain（串接模式）→ 狀態頁顯示用的資料（下游與上游兩種角色）
+ *   controlSummary(list, tr)        /api/benchmark 的 protected[]（對照組）→ 一行摘要
  *   format(template, args)          %s / %d 代換
  * 每個函式的輸入與預期輸出在 data/shared/ui-core.tests.json（CI 用 tools/ui-core-test.js 檢查）。
  *
@@ -274,6 +275,22 @@
 		return { down: down, up: up };
 	}
 
+	/**
+	 * 每日評測的對照組（/api/benchmark 的 protected[]，3.5.0）→ 一行摘要：
+	 * 「對照組 44 台：判出 30、沒判出 2、沒測到 12；回歸 0」。沒有對照組（空的、舊版沒有這個欄位）回 null。
+	 * result：detected（判出過濾）、passed（沒判出）、untested（沒測到）；regress = true 是以前判得出、今天沒判出
+	 */
+	function controlSummary(list, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!list || !list.length) return null;
+		var n = { detected: 0, passed: 0, untested: 0 }, reg = 0;
+		list.forEach(function (c) {
+			if (c && n.hasOwnProperty(c.result)) n[c.result]++;
+			if (c && c.regress === true) reg++;
+		});
+		return format(t('對照組 %d 台：判出 %d、沒判出 %d、沒測到 %d；回歸 %d'), [list.length, n.detected, n.passed, n.untested, reg]);
+	}
+
 	var core = {
 		fmtTime: fmtTime,
 		fmtBytes: fmtBytes,
@@ -281,7 +298,8 @@
 		format: format,
 		restorePlan: restorePlan,
 		restoreSummary: restoreSummary,
-		chainView: chainView
+		chainView: chainView,
+		controlSummary: controlSummary
 	};
 
 	if (root) root.KuroshioUiCore = core;

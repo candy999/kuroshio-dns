@@ -92,6 +92,20 @@ return view.extend({
 		return common.action('/api/jobs/run', { name: name }).then(function(r) { common.notify(r, _('已排入背景執行')); });
 	},
 
+	/**
+	 * 對照組的一行摘要（3.5.0）：讀 /api/benchmark（評測結果原樣），只在評測時間變了才重讀（狀態每 10 秒更新，評測一天一次）
+	 */
+	controlLine: function(st) {
+		var self = this, api = st && st.api && st.api.ok ? st.api.result : null;
+		var at = api && api.autoUpstreams ? api.autoUpstreams.generatedAt || '' : '';
+		if (this._ctlAt === at) return Promise.resolve(this._ctl || null);
+		return L.resolveDefault(common.fetch('/api/benchmark'), null).then(function(b) {
+			self._ctlAt = at;
+			self._ctl = b ? common.controlSummary(b.protected) : null;
+			return self._ctl;
+		});
+	},
+
 	renderBody: function(st, acme) {
 		var self = this;
 		var enabled = uci.get('kuroshio', 'main', 'enabled') === '1';
@@ -245,7 +259,8 @@ return view.extend({
 				: api.autoUpstreams ? (api.autoUpstreams.source === 'chain'
 				? _('自動上游來自上游黑潮 %s 的評測（串接的共用結果；最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)
 				: _('自動上游來自 %s 的評測（最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
-			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups, [2, 3, 4])
+			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups, [2, 3, 4]),
+			this._ctl ? E('p', { 'class': 'cbi-section-descr', 'id': 'kuroshio-control' }, this._ctl + _('（有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選）')) : ''
 		]);
 
 		var jobs = api.jobs || {};
@@ -293,9 +308,11 @@ return view.extend({
 	render: function(data) {
 		var self = this, acme = data[2];
 		var box = E('div', {}, this.renderBody(data[1], acme));
+		// 對照組的摘要另外讀（/api/benchmark），讀到之後再畫一次
+		this.controlLine(data[1]).then(function(t) { if (t) box.replaceChildren(self.renderBody(data[1], acme)); });
 		poll.add(function() {
 			return L.resolveDefault(callStatus(), {}).then(function(st) {
-				box.replaceChildren(self.renderBody(st, acme));
+				return self.controlLine(st).then(function() { box.replaceChildren(self.renderBody(st, acme)); });
 			});
 		}, 10);
 		return E([], [E('h2', {}, _('黑潮 DNS · 狀態')), box, common.footer({ open: true })]);

@@ -570,6 +570,8 @@ struct Srv {
     tag: Tag,
     /// 執行時上線以來從未成功（主程式登記的 `neverOk`，3.5.0 A7）：照測，但今天不選
     never_ok: bool,
+    /// 對照組的資格賽網域被擋（3.5.0 A2）：記為判出過濾（`stage = preflight`），照樣測網域
+    preflight: Option<String>,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -591,6 +593,7 @@ impl Srv {
             protected: None,
             tag,
             never_ok: false,
+            preflight: None,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -702,15 +705,51 @@ fn protected_ids(paths: &BenchPaths) -> Vec<(String, String, Tag)> {
         .collect()
 }
 
-/// 對照組的結果：判出過濾（封殺、汙染、可疑）、沒判出（倖存）、沒測到（連不上、資格賽失敗）
-fn protected_result(s: &Srv) -> &'static str {
-    if s.alive {
-        "passed"
-    } else if ["封殺", "汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p)) {
-        "detected"
-    } else {
-        "untested"
+/// 對照組的結果（result, stage, reason）：
+/// - `detected`：網域判斷判出過濾（封殺、汙染、可疑，`stage = domain`）；或網域都沒判出、但資格賽網域被擋（`stage = preflight`，3.5.0）
+/// - `passed`：網域都沒判出（`stage = domain`）
+/// - `untested`：連不上、逾時（資格賽就連不上是 `preflight`，測網域時才連不上是 `domain`）
+///
+/// A5（惡意網站探測）之後會多 `stage = probe`
+fn protected_outcome(s: &Srv) -> (&'static str, &'static str, String) {
+    let judged = ["封殺", "汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p));
+    if !s.alive && judged {
+        return ("detected", "domain", s.fail_reason.clone());
     }
+    if let Some(pf) = &s.preflight {
+        return ("detected", "preflight", pf.clone());
+    }
+    if s.alive {
+        return ("passed", "domain", String::new());
+    }
+    let stage = if s.fail_reason.starts_with("資格賽") {
+        "preflight"
+    } else {
+        "domain"
+    };
+    ("untested", stage, s.fail_reason.clone())
+}
+
+/// 這個過濾類型今天有沒有對應的判斷（給 `expectMet`）：Some(true)＝有而且正常、Some(false)＝有但今天失效、None＝沒有。
+/// 評測網域（`web.txt`）有廣告追蹤與成人網站；惡意網站要等 A5 的探測（自我檢查通過才算），在那之前是 None
+fn category_checked(cat: &str) -> Option<bool> {
+    match cat {
+        "ads" | "adult" | "tracking" | "telemetry" => Some(true),
+        _ => None,
+    }
+}
+
+/// 對照組的預期值（`expectMet`）：`filter=` 裡至少有一種類型今天有判斷 → 判出了沒有（資格賽網域被擋不算，那不是這些類型）；
+/// 都沒有判斷（例如只擋惡意網站、A5 之前）或今天沒測到 → None
+fn expect_met(expect: &str, result: &str, stage: &str) -> Option<bool> {
+    if result == "untested" {
+        return None;
+    }
+    let types: Vec<Option<bool>> = expect.split(',').map(|t| category_checked(t.trim())).collect();
+    if !types.contains(&Some(true)) {
+        return None;
+    }
+    Some(result == "detected" && stage != "preflight")
 }
 
 /// 社群好友提供的上游候選最多收幾個（社群模組已經先合併、排序、限制成 100 個；這裡再擋一次，
@@ -1104,6 +1143,23 @@ impl Benchmark {
                 _ => Preflight::Answered,
             });
             if !pass {
+                // 對照組（3.5.0 A2）：有回答、只是資格賽網域被擋（NXDOMAIN、封鎖位址、導到封鎖頁）——
+                // 家庭／兒童類的過濾 DNS 常把其他公共 DNS 的主機名稱也擋掉（防止繞過）。這也是判出過濾，
+                // 而且伺服器是正常的：照樣測網域（對照組本來每天就要測一輪），看評測判不判得出它擋的類型。
+                // 連線失敗、逾時照舊是沒測到
+                if all[i].protected.is_some() && !matches!(r.outcome, Outcome::Error(_)) {
+                    let what = match &r.outcome {
+                        Outcome::Ok(ips) => format!("導向 {}", ips.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")),
+                        _ => reason_of(&r),
+                    };
+                    jinfo!(
+                        journal,
+                        "   [對照組] {} -> 資格賽網域被擋（{what}）：記為判出過濾，照樣測網域",
+                        all[i].id
+                    );
+                    all[i].preflight = Some(format!("封殺 {pf_domain}（資格賽：{what}）"));
+                    continue;
+                }
                 all[i].kill(format!("資格賽失敗 ({})", reason_of(&r)));
             }
         }
@@ -1486,23 +1542,88 @@ impl Benchmark {
             .collect();
         drop(tw_nets);
         // 對照組：判出過濾、沒判出、沒測到（不算淘汰，另外列）
-        let control: Vec<Value> = all
+        let outcomes: Vec<(&Srv, (&'static str, &'static str, String))> = all
             .iter()
-            .filter_map(|s| {
-                let expect = s.protected.as_ref()?;
-                Some(json!({ "id": s.id, "type": s.kind, "expect": expect, "result": protected_result(s), "reason": s.fail_reason }))
+            .filter(|s| s.protected.is_some())
+            .map(|s| (s, protected_outcome(s)))
+            .collect();
+        // 跨天回歸（3.5.0 A2）：學習檔的 control 記每台最近 30 天；名單裡有、今天沒測（路徑檢查略過、不支援）的記 u
+        if let Some(l) = learned.as_mut() {
+            let tested: HashMap<&str, char> = outcomes.iter().map(|(s, (r, _, _))| (s.id.as_str(), day_char(r))).collect();
+            let results: Vec<(String, char)> = protected
+                .iter()
+                .map(|(spec, _, _)| (spec.clone(), tested.get(spec.as_str()).copied().unwrap_or('u')))
+                .fold(Vec::new(), |mut v, x| {
+                    if !v.iter().any(|(k, _): &(String, char)| *k == x.0) {
+                        v.push(x);
+                    }
+                    v
+                });
+            learn_dirty |= l.control_record(today_n, &results);
+        }
+        let hist_of = |id: &str, r: &str| -> String {
+            match learned
+                .as_ref()
+                .filter(|l| l.control_day == today_n)
+                .and_then(|l| l.control.get(id))
+            {
+                Some(h) => h.clone(),
+                None => day_char(r).to_string(),
+            }
+        };
+        let control: Vec<Value> = outcomes
+            .iter()
+            .map(|(s, (result, stage, reason))| {
+                let expect = s.protected.as_deref().unwrap_or("?");
+                let hist = hist_of(&s.id, result);
+                let recent: String = hist.chars().take(learn::CONTROL_RECENT).collect();
+                json!({
+                    "id": s.id, "type": s.kind, "expect": expect, "result": result, "reason": reason,
+                    "stage": stage, "preflight": s.preflight, "recent": recent,
+                    "regress": learn::control_regress(&hist), "expectMet": expect_met(expect, result, stage),
+                })
             })
             .collect();
+        drop(outcomes);
         if !control.is_empty() {
             let n = |r: &str| control.iter().filter(|c| c["result"] == r).count();
+            let regress: Vec<&str> = control
+                .iter()
+                .filter(|c| c["regress"] == true)
+                .filter_map(|c| c["id"].as_str())
+                .collect();
             jinfo!(
                 journal,
-                "[對照組] {} 台：判出過濾 {}、沒判出 {}、沒測到 {}（永遠不選、不記可疑、不進黑名單）",
+                "[對照組] {} 台：判出過濾 {}（資格賽網域被擋 {}）、沒判出 {}、沒測到 {}、回歸 {}（永遠不選、不記可疑、不進黑名單）",
                 control.len(),
                 n("detected"),
+                control
+                    .iter()
+                    .filter(|c| c["stage"] == "preflight" && c["result"] == "detected")
+                    .count(),
                 n("passed"),
-                n("untested")
+                n("untested"),
+                regress.len()
             );
+            // 只報告，不改變今天選出來的上游
+            for id in &regress {
+                let line = format!("[對照組] {id} 以前判得出過濾，今天沒判出：評測可能判不出這一類了");
+                warn!("{line}");
+                journal.push(line);
+            }
+            if let Some((t, m)) = learned
+                .as_ref()
+                .filter(|l| l.control_day == today_n)
+                .and_then(|l| learn::control_overall_drop(l.control.values().map(String::as_str)))
+            {
+                let line = format!(
+                    "[對照組] 今天判出過濾的比例 {}% 比過去 7 天的中位數 {}% 少一半以上：評測網域檔或判斷規則可能改壞了",
+                    to_fixed(t * 100.0, 0),
+                    to_fixed(m * 100.0, 0)
+                );
+                warn!("{line}");
+                journal.push(line);
+            }
             for c in control.iter().filter(|c| c["result"] == "passed") {
                 jinfo!(
                     journal,
@@ -1618,16 +1739,26 @@ impl Benchmark {
             }
             report(&d.join("upstreams.json"), &serde_json::to_vec_pretty(&state).unwrap_or_default());
             if let Some(c) = state["protected"].as_array().filter(|c| !c.is_empty()) {
-                let mut csv = String::from("dns,type,expect,result,reason\n");
+                // 3.5.0 在最後加 stage、preflight、recent、regress、expectMet（舊的欄位順序不變）
+                let mut csv = String::from("dns,type,expect,result,reason,stage,preflight,recent,regress,expectMet\n");
                 for x in c {
-                    let f = |k: &str| x[k].as_str().unwrap_or("").replace([',', '\n'], " ");
+                    let f = |k: &str| match &x[k] {
+                        Value::String(v) => v.replace([',', '\n'], " "),
+                        Value::Bool(b) => if *b { "Y" } else { "N" }.to_string(),
+                        _ => String::new(),
+                    };
                     csv.push_str(&format!(
-                        "{},{},{},{},{}\n",
+                        "{},{},{},{},{},{},{},{},{},{}\n",
                         f("id"),
                         f("type"),
                         f("expect"),
                         f("result"),
-                        f("reason")
+                        f("reason"),
+                        f("stage"),
+                        f("preflight"),
+                        f("recent"),
+                        f("regress"),
+                        f("expectMet")
                     ));
                 }
                 report(&d.join("protected.csv"), csv.as_bytes());
@@ -1872,6 +2003,15 @@ impl Benchmark {
                 ))
             })
             .collect()
+    }
+}
+
+/// 對照組一天的結果字元（學習檔的 `control`）
+fn day_char(result: &str) -> char {
+    match result {
+        "detected" => 'd',
+        "passed" => 'p',
+        _ => 'u',
     }
 }
 

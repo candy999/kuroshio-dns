@@ -3,13 +3,14 @@
 //!
 //! ```json
 //! { "v": 1, "day": 20781,
+//!   "control": { "<id>": "ddddpd-u…" }, "controlDay": 20781,
 //!   "h3skip":  { "<h3:// 的 id>": { "f": 3, "n": 1, "until": 20790, "last": 20783 } },
 //!   "neverOk": { "<id>": { "since": 20780, "n": 2 } } }
 //! ```
 //!
 //! - 丟了只是重新學，不影響正確性（`space.rs` 歸 `Rebuildable`）；不進備份的分享檔、不傳給下游與好友。
 //! - 讀不到、格式不對、`v` 不認識、太大：當成空的，不失敗。
-//! - 用到的區段：`neverOk`（A7）、`h3skip`（A6）；不認得的區段（之後的 `hist`）原樣保留，不會被這裡蓋掉。
+//! - 用到的區段：`neverOk`（A7）、`h3skip`（A6）、`control`／`controlDay`（A2）；不認得的區段（之後的 `hist`）原樣保留，不會被這裡蓋掉。
 //! - `day` 是台北的日數（Unix 毫秒換算，`u32`）；系統時間倒退（還沒對時）時不寫。
 
 use crate::time::{DAY_MS, TPE_OFFSET_MS};
@@ -29,6 +30,62 @@ pub const MAX_RAW: u64 = 256 * 1024;
 pub const MAX_NEVER_OK: usize = 32;
 /// 連續幾次評測都排除後忘掉重來（它可能修好了）
 pub const NEVER_OK_RUNS: u32 = 3;
+/// `control` 最多幾筆（同對照組的上限 `MAX_PROTECTED`）
+pub const MAX_CONTROL: usize = 64;
+/// 對照組每台記最近幾天的結果
+pub const CONTROL_DAYS: usize = 30;
+/// 回歸判斷看前幾天（不含今天）
+pub const CONTROL_RECENT: usize = 7;
+/// 過去 [`CONTROL_RECENT`] 天裡幾天判出過，今天沒判出才算回歸
+pub const CONTROL_REGRESS_DAYS: usize = 3;
+/// 整體回歸：今天至少測到幾台才判斷
+pub const CONTROL_MIN_TESTED: usize = 8;
+
+/// 對照組一天的結果字元：`d`＝判出、`p`＝沒判出、`u`＝沒測到、`-`＝那天沒跑
+fn control_char_ok(c: char) -> bool {
+    matches!(c, 'd' | 'p' | 'u' | '-')
+}
+
+/// 對照組的回歸（A2）：今天 `p`（沒判出），過去 7 天（不含今天）裡有 3 天以上 `d`。
+/// 字串第一個字元是今天；`u`、`-` 不算（路徑檢查略過一類協定不會誤報）
+pub fn control_regress(hist: &str) -> bool {
+    let mut it = hist.chars();
+    it.next() == Some('p') && it.take(CONTROL_RECENT).filter(|c| *c == 'd').count() >= CONTROL_REGRESS_DAYS
+}
+
+/// 整體回歸（A2）：今天「判出」的比例比過去 7 天的中位數少一半以上（而且今天測到 8 台以上）。
+/// 每一天只算那天測到（`d` 或 `p`）8 台以上的；過去沒有這種天數時不判斷。
+/// 回傳（今天的比例, 過去的中位數），沒有回歸是 None
+pub fn control_overall_drop<'a>(hists: impl Iterator<Item = &'a str> + Clone) -> Option<(f64, f64)> {
+    let ratio = |k: usize| -> Option<f64> {
+        let (mut d, mut n) = (0usize, 0usize);
+        for h in hists.clone() {
+            match h.chars().nth(k) {
+                Some('d') => {
+                    d += 1;
+                    n += 1;
+                }
+                Some('p') => n += 1,
+                _ => {}
+            }
+        }
+        (n >= CONTROL_MIN_TESTED).then(|| d as f64 / n as f64)
+    };
+    let today = ratio(0)?;
+    let mut past: Vec<f64> = (1..=CONTROL_RECENT).filter_map(ratio).collect();
+    if past.is_empty() {
+        return None;
+    }
+    past.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let m = past.len();
+    let median = if m % 2 == 1 {
+        past[m / 2]
+    } else {
+        (past[m / 2 - 1] + past[m / 2]) / 2.0
+    };
+    (today < median / 2.0).then_some((today, median))
+}
+
 /// `h3skip` 最多幾筆（不支援 HTTP/3 的 DoH，A6）
 pub const MAX_H3_SKIP: usize = 512;
 /// `h3://` 連續幾天（不同日期）QUIC 連不上、`https://` 正常，才開始跳過
@@ -111,6 +168,10 @@ pub struct Learn {
     pub never_ok: BTreeMap<String, NeverOk>,
     /// 不支援 HTTP/3 的 DoH（A6），以 `h3://` 的 id 為鍵
     pub h3skip: BTreeMap<String, H3Skip>,
+    /// 對照組最近 30 天的結果（A2）：第一個字元是 `control_day` 那天
+    pub control: BTreeMap<String, String>,
+    /// `control` 最後記錄的日數（跟檔案的 `day` 分開：主程式登記 `neverOk` 時也會更新 `day`）
+    pub control_day: u32,
     /// 這一版不認得的區段：原樣保留
     rest: Map<String, Value>,
 }
@@ -178,10 +239,24 @@ impl Learn {
                 }
             }
         }
+        let mut control = BTreeMap::new();
+        if let Some(Value::Object(m)) = o.remove("control") {
+            for (id, e) in m {
+                if let Some(h) = e.as_str() {
+                    let h: String = h.chars().filter(|c| control_char_ok(*c)).take(CONTROL_DAYS).collect();
+                    if !h.is_empty() {
+                        control.insert(id, h);
+                    }
+                }
+            }
+        }
+        let control_day = o.remove("controlDay").and_then(|d| d.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
         let mut l = Learn {
             day,
             never_ok,
             h3skip,
+            control,
+            control_day,
             rest: o,
         };
         l.cap();
@@ -197,6 +272,18 @@ impl Learn {
             self.never_ok.remove(&oldest);
         }
         self.cap_h3();
+        // control：超過上限時丟「最後一次有結果」最久以前的
+        while self.control.len() > MAX_CONTROL {
+            let Some(k) = self
+                .control
+                .iter()
+                .max_by_key(|(_, h)| h.chars().position(|c| c != '-').unwrap_or(usize::MAX))
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.control.remove(&k);
+        }
     }
 
     /// `h3skip` 超過上限時丟 `last` 最舊的（名單裡已經沒有的由 [`h3_prune`](Self::h3_prune) 先丟）
@@ -228,6 +315,9 @@ impl Learn {
             .map(|(k, e)| (k.clone(), json!({ "f": e.f, "n": e.n, "until": e.until, "last": e.last })))
             .collect();
         o.insert("h3skip".into(), Value::Object(h));
+        let c: Map<String, Value> = self.control.iter().map(|(k, h)| (k.clone(), json!(h))).collect();
+        o.insert("control".into(), Value::Object(c));
+        o.insert("controlDay".into(), json!(self.control_day));
         Value::Object(o)
     }
 
@@ -339,6 +429,36 @@ impl Learn {
         let before = self.h3skip.len();
         self.h3skip.retain(|k, _| keep(k));
         before - self.h3skip.len()
+    }
+
+    /// 記下對照組今天的結果（A2）：`results` 是名單裡每一台（id, `d`／`p`／`u`）；名單裡已經沒有的刪掉。
+    /// 跨天時依日數差往右移，中間沒跑的那幾天補 `-`；同一天再跑一次就換掉今天那一格。最多 30 天。
+    /// 系統時間倒退（今天比上次記錄的舊）時不改，回 false
+    pub fn control_record(&mut self, today: u32, results: &[(String, char)]) -> bool {
+        if today < self.control_day {
+            return false;
+        }
+        let gap = if self.control_day == 0 {
+            1
+        } else {
+            (today - self.control_day) as usize
+        };
+        let mut out = BTreeMap::new();
+        for (id, c) in results.iter().take(MAX_CONTROL) {
+            let old = self.control.get(id).map(String::as_str).unwrap_or("");
+            let mut h = String::with_capacity(CONTROL_DAYS);
+            h.push(*c);
+            if gap == 0 {
+                h.extend(old.chars().skip(1));
+            } else if !old.is_empty() {
+                h.extend(std::iter::repeat('-').take((gap - 1).min(CONTROL_DAYS)));
+                h.push_str(old);
+            }
+            out.insert(id.clone(), h.chars().take(CONTROL_DAYS).collect::<String>());
+        }
+        self.control = out;
+        self.control_day = today;
+        true
     }
 
     /// 今天在跳過期間的筆數
@@ -579,5 +699,79 @@ mod tests {
         assert_eq!(l.h3skip.len(), MAX_H3_SKIP);
         assert!(l.h3skip.values().all(|e| e.n <= H3_MAX_ROUND));
         assert!(!l.h3skip.contains_key("h3://x0.example.net/q"));
+    }
+
+    #[test]
+    fn control_history_capped_and_shifted() {
+        let mut l = Learn::default();
+        let r = |c: char| vec![("tls://a.example.com".to_string(), c), ("192.0.2.9".to_string(), 'u')];
+        assert!(l.control_record(100, &r('d')));
+        assert_eq!(l.control["tls://a.example.com"], "d");
+        // 同一天再跑一次：換掉今天那一格
+        l.control_record(100, &r('p'));
+        assert_eq!(l.control["tls://a.example.com"], "p");
+        l.control_record(101, &r('d'));
+        assert_eq!(l.control["tls://a.example.com"], "dp");
+        // 跳過幾天沒跑：補 -
+        l.control_record(104, &r('d'));
+        assert_eq!(l.control["tls://a.example.com"], "d--dp");
+        assert_eq!(l.control["192.0.2.9"], "u--uu");
+        // 31 天後長度還是 30
+        for d in 105..140 {
+            l.control_record(d, &r('p'));
+        }
+        assert_eq!(l.control["tls://a.example.com"].len(), CONTROL_DAYS);
+        assert!(l.control["tls://a.example.com"].chars().all(|c| c == 'p'));
+        // 很久沒跑：全部是 -，還是 30 天
+        l.control_record(1000, &r('d'));
+        assert_eq!(l.control["tls://a.example.com"], format!("d{}", "-".repeat(29)));
+        // 系統時間倒退：不改
+        assert!(!l.control_record(999, &r('p')));
+        assert_eq!(l.control_day, 1000);
+        // 名單裡已經沒有的刪掉；上限 64
+        let many: Vec<(String, char)> = (0..80).map(|i| (format!("192.0.2.{i}"), 'p')).collect();
+        l.control_record(1001, &many);
+        assert_eq!(l.control.len(), MAX_CONTROL);
+        assert!(!l.control.contains_key("tls://a.example.com"));
+        // 存檔再讀回來一樣；壞掉的字元丟掉
+        let p = tmp("control");
+        l.save(&p).unwrap();
+        let back = Learn::load(&p);
+        assert_eq!((back.control.clone(), back.control_day), (l.control.clone(), 1001));
+        std::fs::write(&p, br#"{"v":1,"day":3,"control":{"a":"dXp-","b":"","c":5}}"#).unwrap();
+        let _ = std::fs::remove_file(zst_path(&p));
+        let back = Learn::load(&p);
+        assert_eq!(back.control.len(), 1);
+        assert_eq!(back.control["a"], "dp-");
+    }
+
+    #[test]
+    fn control_regression_rules() {
+        assert!(control_regress("pddd"));
+        assert!(control_regress("pdpdpdp"));
+        assert!(!control_regress("pdd"), "只有 2 天");
+        assert!(!control_regress("dddd"), "今天判出");
+        assert!(!control_regress("uddd"), "今天沒測到不算");
+        assert!(!control_regress("p-------ddd"), "超過 7 天的不算");
+        assert!(control_regress("pd-d-d"), "沒跑的天數跳過");
+        // 整體：10 台，過去每天 8 台判出，今天只剩 2 台
+        let past = |today: char, n_d: usize| -> Vec<String> {
+            (0..10)
+                .map(|i| format!("{}{}", if i < n_d { 'd' } else { today }, if i < 8 { "ddddddd" } else { "ppppppp" }))
+                .collect()
+        };
+        let h = past('p', 2);
+        let got = control_overall_drop(h.iter().map(String::as_str)).unwrap();
+        assert!((got.0 - 0.2).abs() < 1e-9 && (got.1 - 0.8).abs() < 1e-9, "{got:?}");
+        assert!(
+            control_overall_drop(past('p', 5).iter().map(String::as_str)).is_none(),
+            "少不到一半"
+        );
+        // 今天測到的不到 8 台：不判斷
+        let few: Vec<String> = (0..10).map(|i| format!("{}ddddddd", if i < 7 { 'u' } else { 'p' })).collect();
+        assert!(control_overall_drop(few.iter().map(String::as_str)).is_none());
+        // 沒有過去的資料：不判斷
+        let fresh: Vec<String> = (0..10).map(|_| "p".to_string()).collect();
+        assert!(control_overall_drop(fresh.iter().map(String::as_str)).is_none());
     }
 }
