@@ -588,6 +588,8 @@ pub struct FilterService {
     update_run: Mutex<UpdateRun>,
     /// 每次更新結束時送出那一次的 runId（`?wait=1` 等結果用）
     update_done: tokio::sync::watch::Sender<u64>,
+    /// 清單層重建了幾次（測試與狀態用；32 位元平台沒有 64 位元原子操作）
+    rebuilds: AtomicU32,
     /// 下載到、但這台這時候存不了副本的清單（網址 → 內容），見 [`Held`]
     held: Mutex<HashMap<String, Held>>,
 }
@@ -628,6 +630,46 @@ impl UpdateRun {
             "error": self.error,
         })
     }
+}
+
+/// 一次要停用哪幾份（3.5.0 C3）：依停用順序（`order`，保護清單本來就不在裡面）累加估計大小，取到合計 ≥ `target` 為止；
+/// 至少 1 份（`target` = 0 就是只停用一份，同以前）
+pub fn pick_shed(order: &[usize], sizes: &[u64], target: u64) -> Vec<usize> {
+    let mut acc = 0u64;
+    let mut out = Vec::new();
+    for &i in order {
+        if !out.is_empty() && acc >= target {
+            break;
+        }
+        acc = acc.saturating_add(sizes.get(i).copied().unwrap_or(0));
+        out.push(i);
+    }
+    out
+}
+
+/// 一次要恢復幾份（3.5.0 C3）：從最後停用的開始（`bytes` 是停用順序），取到合計 × 1.3 ≤ `room` 為止；
+/// 至少 1 份（記憶體控制已經確認最後一份放得下；同以前一次一份的條件）。回傳份數（從尾端算）
+pub fn pick_restore(bytes: &[u64], room: u64) -> usize {
+    let mut acc: u128 = 0;
+    let mut n = 0;
+    for &b in bytes.iter().rev() {
+        let next = acc + b as u128;
+        if n > 0 && next * 13 / 10 > room as u128 {
+            break;
+        }
+        acc = next;
+        n += 1;
+    }
+    n
+}
+
+/// 清單名稱列一行（最多 5 個，其他寫「等 N 份」）
+fn names_line(names: &[&str]) -> String {
+    let mut s = names.iter().take(5).copied().collect::<Vec<_>>().join("、");
+    if names.len() > 5 {
+        s.push_str(&format!(" 等 {} 份", names.len()));
+    }
+    s
 }
 
 /// 清單的停用順序（純函式，方便測試）：保護清單、已經停用的不算；
@@ -689,6 +731,7 @@ impl FilterService {
             missing: Mutex::new(Vec::new()),
             update_run: Mutex::new(UpdateRun::default()),
             update_done: tokio::sync::watch::channel(0).0,
+            rebuilds: AtomicU32::new(0),
             held: Mutex::new(HashMap::new()),
         }))
     }
@@ -1265,6 +1308,7 @@ impl FilterService {
     /// 依目前的停用名單重新下載、建一份清單層（下載失敗而且原本有清單時保留舊的）。回傳（重建前，重建後）的大小
     /// 重建清單層。`mode` 見 [`Source`]；`reuse[i]` = 剛問過沒變（有副本就讀副本，不重新下載）
     async fn rebuild_mode(&self, mode: Source, reuse: &[bool]) -> anyhow::Result<(u64, u64)> {
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
         let timeout = Duration::from_secs(30);
         let current = self.lists.read().unwrap().clone();
         let have = current.stats().lists > 0;
@@ -1565,67 +1609,138 @@ impl FilterService {
         self.unloaded.lock().unwrap().last().map(|u| u.bytes)
     }
 
-    /// 記憶體控制：停用下一份清單（重建一份不含它的過濾器；重建期間舊的照常使用）。
-    /// 有本機副本的清單讀副本，沒有的才下載（記憶體控制在自己的工作裡跑，下載期間記憶體監看照常更新）。
-    /// 沒有可以停用的回傳 Ok(None)；下載失敗時保留舊的、清單不算停用
+    /// 清單層重建了幾次（開機以來）
+    pub fn rebuild_count(&self) -> u32 {
+        self.rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// 記憶體控制：停用下一份清單（同 [`unload_many`](Self::unload_many) 的 `target` = 0；測試與手動路徑用）
     pub async fn unload_one(&self) -> anyhow::Result<Option<Unloaded>> {
+        Ok(self.unload_many(0, None).await?.into_iter().next())
+    }
+
+    /// 記憶體控制（3.5.0 C3）：依停用順序取到估計合計 ≥ `target` bytes 的幾份清單（至少 1 份；保護清單不在候選裡），
+    /// **一次**登記停用、**只重建一次**（以前一份一份停用，缺口大時連續重建 N 次，每次新舊兩份同時在記憶體裡）。
+    /// 重建期間舊的過濾器照常使用；有本機副本的清單讀副本，沒有的才下載。
+    ///
+    /// `max_after`：停用這幾份之後的清單層估計大小超過它就不做（重建時新舊兩份並存：新的一份放不進可用記憶體的一半就不做）。
+    /// 一次停用多份時新的一份比較小，重建的尖峰（舊的 + 新的）比一次一份的第一次還低。
+    ///
+    /// 沒有可以停用的回傳空的；重建失敗（下載失敗而且原本有清單）時這次登記的全部撤回、清單不算停用
+    pub async fn unload_many(&self, target: u64, max_after: Option<u64>) -> anyhow::Result<Vec<Unloaded>> {
         let _g = self.rebuild_lock.lock().await;
-        let Some(&i) = self.shed_candidates().first() else {
-            return Ok(None);
-        };
-        let rules = self.sizes.lock().unwrap()[i].1;
-        let u = Unloaded {
-            idx: i,
-            name: self.sources[i].name.clone(),
-            rules,
-            bytes: 0,
-            reason: "memory",
-            at: crate::persist::now_secs() * 1000,
-        };
-        self.unloaded.lock().unwrap().push(u.clone());
+        let order = self.shed_candidates();
+        if order.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sz: Vec<(u64, u64)> = self.sizes.lock().unwrap().clone();
+        let est: Vec<u64> = sz.iter().map(|s| s.0).collect();
+        let pick = pick_shed(&order, &est, target);
+        let est_total: u64 = pick.iter().map(|&i| est[i]).sum();
+        if let Some(max) = max_after {
+            let after = self.lists_bytes().saturating_sub(est_total);
+            if after > max {
+                anyhow::bail!("可用記憶體不足以安全重建過濾器（需要約 {} KB）", after / 1024);
+            }
+        }
+        let at = crate::persist::now_secs() * 1000;
+        let batch: Vec<Unloaded> = pick
+            .iter()
+            .map(|&i| Unloaded {
+                idx: i,
+                name: self.sources[i].name.clone(),
+                rules: sz[i].1,
+                bytes: 0,
+                reason: "memory",
+                at,
+            })
+            .collect();
+        self.unloaded.lock().unwrap().extend(batch.iter().cloned());
         match self.rebuild_mode(Source::PreferCopy, &[]).await {
             Ok((before, after)) => {
-                let bytes = before.saturating_sub(after).max(self.sizes.lock().unwrap()[i].0);
+                // 實測的差額依估計大小分給各份（恢復時要有這麼多空間的 1.3 倍）；實測比估計小時用估計（保守）
+                let measured = before.saturating_sub(after).max(est_total);
+                let n = pick.len() as u64;
+                let share = |i: usize| -> u64 {
+                    if est_total == 0 {
+                        measured / n
+                    } else {
+                        (est[i] as u128 * measured as u128 / est_total as u128) as u64
+                    }
+                };
                 let mut list = self.unloaded.lock().unwrap();
-                if let Some(x) = list.iter_mut().find(|x| x.idx == i) {
-                    x.bytes = bytes;
+                let mut out = Vec::with_capacity(pick.len());
+                for &i in &pick {
+                    if let Some(x) = list.iter_mut().find(|x| x.idx == i && x.reason == "memory") {
+                        x.bytes = share(i);
+                        out.push(x.clone());
+                    }
                 }
+                drop(list);
+                let rules: u64 = out.iter().map(|u| u.rules).sum();
+                let names: Vec<&str> = out.iter().map(|u| u.name.as_str()).collect();
                 warn!(
-                    "記憶體不足，暫時停用：{} 清單（{rules} 條規則，釋出約 {} KB）",
-                    u.name,
-                    bytes / 1024
+                    "記憶體不足，暫時停用 {} 份清單：{}（{rules} 條規則，釋出約 {} KB，重建 1 次）",
+                    out.len(),
+                    names_line(&names),
+                    measured / 1024
                 );
-                Ok(list.iter().find(|x| x.idx == i).cloned())
+                Ok(out)
             }
             Err(e) => {
-                self.unloaded.lock().unwrap().retain(|x| x.idx != i);
+                self.unloaded.lock().unwrap().retain(|x| !pick.contains(&x.idx));
                 Err(e)
             }
         }
     }
 
-    /// 記憶體控制：恢復最後停用的清單（重新下載）。下載失敗時維持停用，由呼叫端退避重試
+    /// 記憶體控制：恢復最後停用的清單（同 [`restore_many`](Self::restore_many) 只恢復一份；測試與手動路徑用）
     pub async fn restore_one(&self) -> anyhow::Result<Option<Unloaded>> {
+        Ok(self.restore_many(0).await?.into_iter().next())
+    }
+
+    /// 記憶體控制（3.5.0 C3）：從最後停用的開始，取到合計 × 1.3 ≤ `room` 的幾份（至少 1 份），**重建一次**一起恢復
+    /// （以前一份一份恢復、每份重建一次：3.4.2 Windows 實測恢復 7 份重建 7 次）。有本機副本的讀副本；沒有的下載
+    /// （留在記憶體的副本讓每份最多下載一次）。下載失敗時這幾份維持停用，由呼叫端退避重試；
+    /// 放不下（超過預算）的維持停用，其他照樣恢復
+    pub async fn restore_many(&self, room: u64) -> anyhow::Result<Vec<Unloaded>> {
         let _g = self.rebuild_lock.lock().await;
         if self.all_suspended() {
             anyhow::bail!("全部清單暫停中，先恢復全部清單");
         }
-        let Some(u) = self.unloaded.lock().unwrap().pop() else {
-            return Ok(None);
+        let batch: Vec<Unloaded> = {
+            let mut list = self.unloaded.lock().unwrap();
+            let bytes: Vec<u64> = list.iter().map(|u| u.bytes).collect();
+            let n = pick_restore(&bytes, room);
+            let at = list.len() - n;
+            list.split_off(at)
         };
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
         match self.rebuild_mode(Source::PreferCopy, &[]).await {
             Ok(_) => {
-                let loaded = self.lists.read().unwrap().stats().sources.get(u.idx).map(|s| s.status) == Some(SourceStatus::Loaded);
-                if !loaded {
-                    // 超過 maxDomains / 預算：還是載不進來，維持停用
-                    self.unloaded.lock().unwrap().push(u.clone());
-                    anyhow::bail!("清單「{}」還是放不下（超過預算），維持停用", u.name);
+                let lists = self.lists.read().unwrap().clone();
+                let st = lists.stats();
+                let (ok, still): (Vec<Unloaded>, Vec<Unloaded>) = batch
+                    .into_iter()
+                    .partition(|u| st.sources.get(u.idx).map(|s| s.status) == Some(SourceStatus::Loaded));
+                if !still.is_empty() {
+                    // 超過 maxDomains / 預算：還是載不進來，維持停用（順序不變）
+                    let names: Vec<&str> = still.iter().map(|u| u.name.as_str()).collect();
+                    let line = names_line(&names);
+                    self.unloaded.lock().unwrap().extend(still);
+                    if ok.is_empty() {
+                        anyhow::bail!("清單「{line}」還是放不下（超過預算），維持停用");
+                    }
+                    warn!("清單「{line}」還是放不下（超過預算），維持停用");
                 }
-                info!("記憶體恢復，重新啟用：{} 清單", u.name);
-                Ok(Some(u))
+                let names: Vec<&str> = ok.iter().map(|u| u.name.as_str()).collect();
+                info!("記憶體恢復，重新啟用 {} 份清單：{}（重建 1 次）", ok.len(), names_line(&names));
+                Ok(ok)
             }
             Err(e) => {
-                self.unloaded.lock().unwrap().push(u);
+                self.unloaded.lock().unwrap().extend(batch);
                 Err(e)
             }
         }
@@ -1994,5 +2109,26 @@ mod tests {
             })
             .collect();
         assert!(shed_order(&all, &hits, &sizes, &loaded).is_empty());
+    }
+
+    /// 3.5.0 C3：一次停用取到合計 ≥ 目標（至少 1 份）；一次恢復從尾端取到合計 × 1.3 ≤ 空間（至少 1 份）
+    #[test]
+    fn pick_shed_and_restore_bounds() {
+        let sizes = [100, 50, 30, 20];
+        let order = [0, 1, 2, 3];
+        assert_eq!(pick_shed(&order, &sizes, 0), [0], "0 = 一份");
+        assert_eq!(pick_shed(&order, &sizes, 100), [0]);
+        assert_eq!(pick_shed(&order, &sizes, 101), [0, 1]);
+        assert_eq!(pick_shed(&order, &sizes, u64::MAX), order, "不夠就全部（只有候選）");
+        assert_eq!(pick_shed(&[2, 3], &sizes, 25), [2], "照給的順序");
+        assert!(pick_shed(&[], &sizes, 10).is_empty());
+        // 恢復：最後停用的先
+        let b = [100, 50, 30, 20];
+        assert_eq!(pick_restore(&b, 0), 1, "至少 1 份");
+        assert_eq!(pick_restore(&b, 65), 2, "(20 + 30) × 1.3 = 65");
+        assert_eq!(pick_restore(&b, 64), 1);
+        assert_eq!(pick_restore(&b, u64::MAX), 4);
+        assert_eq!(pick_restore(&[], 100), 0);
+        assert_eq!(pick_restore(&[u64::MAX, u64::MAX], u64::MAX), 1, "不溢位");
     }
 }
