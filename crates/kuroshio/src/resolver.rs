@@ -717,7 +717,7 @@ impl Resolver {
 
         let active = self.upstreams.active();
         let Asked { answers: results, unasked } = self
-            .ask(&active, &upq, qtype, false, |a| {
+            .ask(&active, &upq, qtype, false, false, |a| {
                 if fast_sent || !self.params.fast_path || a.class != Class::Ok {
                     return;
                 }
@@ -745,8 +745,17 @@ impl Resolver {
         if decided.is_none() {
             // 全部失敗或都被上游擋：改問備援
             used_backup = true;
-            let more = self.ask(&self.upstreams.backup(), &upq, qtype, false, |_| {}).await.answers;
-            decided = decide(&more, false, cdn.as_deref(), qtype)
+            // 上游黑潮解析不到（SERVFAIL）才改問自己的上游時，多半是網域本身壞了：自己的上游沒回應也先不算失敗，
+            // 同一輪有別的上游正常回答才算（跟 SERVFAIL 一樣）。不然串接中自己的上游只收到這些壞網域，
+            // 連續失敗一直累積，被暫停 1→2→4 分鐘（3.4.4，3.4.3 複驗 G6）
+            let chain_servfail = results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::ServFail);
+            let backup = self.upstreams.backup();
+            let more = self.ask(&backup, &upq, qtype, false, chain_servfail, |_| {}).await.answers;
+            let first = decide(&more, false, cdn.as_deref(), qtype);
+            // 上游黑潮解析不到、自己的上游裡只有一台回否定答案（其他都沒回應或也解析不到）：不採用，照上游的 SERVFAIL。
+            // 權威伺服器掛掉的網域，偶爾有一台上游回空答案，裝置就以為「網域存在、沒有這種記錄」（3.4.4，3.4.3 複驗 G7）
+            let lone = chain_servfail && first.as_ref().is_some_and(|d| lone_negative(d, &more, backup.len()));
+            decided = (if lone { None } else { first })
                 .map(|mut d| {
                     // 上游黑潮擋掉、下游用自己的上游解析的：來源標出來（狀態頁、日誌看得到是繞過上游的過濾）
                     if results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::Blocked) {
@@ -760,7 +769,11 @@ impl Resolver {
                     d
                 })
                 .or_else(|| {
-                    let all: Vec<Arc<Answer>> = results.iter().chain(&more).cloned().collect();
+                    let all: Vec<Arc<Answer>> = results
+                        .iter()
+                        .chain(more.iter().filter(|a| !(lone && is_negative(a.class))))
+                        .cloned()
+                        .collect();
                     decide(&all, true, cdn.as_deref(), qtype)
                 });
         }
@@ -856,7 +869,7 @@ impl Resolver {
                 SiteCheck::Invalid => {
                     // 自己的加密上游（不經攔截者）解析一次，看是網站本身的問題、還是上游給的答案不對
                     let own = me.upstreams.backup();
-                    let asked = me.ask(&own, &upq, qtype, false, |_| {}).await;
+                    let asked = me.ask(&own, &upq, qtype, false, false, |_| {}).await;
                     let mine = asked
                         .answers
                         .iter()
@@ -931,7 +944,7 @@ impl Resolver {
                 cdn,
                 ..
             } = b;
-            let more = me.ask(&unasked, &upq, qtype, true, |_| {}).await.answers;
+            let more = me.ask(&unasked, &upq, qtype, true, false, |_| {}).await.answers;
             if backfill_mismatch(&first, &more) {
                 me.stats.count(StatKind::BackfillMismatch);
                 debug!(
@@ -965,7 +978,8 @@ impl Resolver {
     /// 並行詢問一組上游：全部回來，或第一個正常回應後再等 window；
     /// `parallel` > 0 時先問前幾個，失敗或每隔 hedge 沒有正常回應再加問下一個。
     /// `all`：不套 `parallel`，全部一起問（背景補問用）。回傳收到的回答與這次沒有問到的上游
-    async fn ask(&self, list: &[Arc<Up>], q: &[u8], qtype: u16, all: bool, mut on_each: impl FnMut(&Answer)) -> Asked {
+    /// `defer_silent`：沒有回應的上游跟 SERVFAIL 一樣，同一輪有別的上游正常回答才算失敗（串接上游 SERVFAIL 後的重問用）
+    async fn ask(&self, list: &[Arc<Up>], q: &[u8], qtype: u16, all: bool, defer_silent: bool, mut on_each: impl FnMut(&Answer)) -> Asked {
         let mut out = Vec::new();
         if list.is_empty() {
             return Asked::default();
@@ -1073,7 +1087,11 @@ impl Resolver {
                             }
                         }
                         None => {
-                            up.record(false, ms);
+                            if defer_silent && up.role != Role::Chain {
+                                servfails.push((up.clone(), ms));
+                            } else {
+                                up.record(false, ms);
+                            }
                             if let Some(u) = rest.next() { spawn(&mut set, u); }
                         }
                     }
@@ -1357,6 +1375,15 @@ fn answered_ok(up: &Up, class: Class) -> bool {
         Class::Refused => up.role != Role::Chain,
         _ => true,
     }
+}
+
+fn is_negative(c: Class) -> bool {
+    matches!(c, Class::NoData | Class::NxDomain)
+}
+
+/// 決定的否定答案只有一台給、而且問了兩台以上：其他上游都沒有同樣的否定答案
+fn lone_negative(d: &Decided, answers: &[Arc<Answer>], asked: usize) -> bool {
+    is_negative(d.class) && asked >= 2 && answers.iter().filter(|a| a.class == d.class).count() < 2
 }
 
 fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_cdn::Cdn>, qtype: u16) -> Option<Decided> {

@@ -499,7 +499,7 @@ UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: tr
 |---|---|
 | `enabled` | 這台的 `chain` 開關 |
 | `state` | `none`（沒有偵測到）/ `detected`（偵測到，驗證中）/ `verifying`（做最後確認）/ `chained`（串接中）/ `released`（偵測到但沒有串接，原因在 `reason`） |
-| `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案）、`audit-failed`（3.4.2：抽查上游給的答案，1 小時內 3 次憑證不符、而自己的上游的答案正常；10～15 分鐘後重試） |
+| `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`pin-mismatch`（3.4.4：上游的指紋跟 `upstream.chainPin` 不符）、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案）、`audit-failed`（3.4.2：抽查上游給的答案，1 小時內 3 次憑證不符、而自己的上游的答案正常；10～15 分鐘後重試） |
 | `text` | 給狀態頁直接顯示的一行白話，每一種情況都寫出原因與影響（例如「上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路」）。文字內容不是約定；請整句顯示，不要截斷或自己拼 |
 | `upstream` | 探測到的上游（沒探測過、或 `chain` 關著是 `null`）。`via`：`gateway`（上游就是預設閘道）/ `intercept`（經攔截，`address` 是被轉走的保留位址，`text` 寫閘道並加註「經攔截」）；`depth` 是含這台的層數；`viaNat`：上游看到的來源不是這台（中間隔了 NAT） |
 | `backupActive` | 串接上游暫時不能用，正在用自己的加密上游 |

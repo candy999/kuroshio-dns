@@ -74,6 +74,8 @@ pub enum Reason {
     Tampered,
     /// 抽查上游給的 CDN 答案：憑證不符、而自己的上游的答案正常，1 小時內 3 次（3.4.2，規格 10 第 3.8 節）
     AuditFailed,
+    /// 上游的指紋跟設定的 `chainPin` 不符（3.4.4；3.4.3 算成 `VerifyFailed`，狀態頁寫「簽章不對」）
+    PinMismatch,
 }
 
 impl Reason {
@@ -90,6 +92,7 @@ impl Reason {
             Reason::TooDeep => "too-deep",
             Reason::Tampered => "tampered",
             Reason::AuditFailed => "audit-failed",
+            Reason::PinMismatch => "pin-mismatch",
         }
     }
 
@@ -107,6 +110,7 @@ impl Reason {
             Reason::TooDeep => "上游的串接已經有 4 層（超過上限）",
             Reason::Tampered => "攔截者竄改答案",
             Reason::AuditFailed => "上游給的答案查核不通過（憑證不符，自己的上游的答案正常）",
+            Reason::PinMismatch => "上游的指紋跟設定的 chainPin 不符",
         }
     }
 }
@@ -500,6 +504,11 @@ fn short_fp(p: &[u8; 32]) -> String {
     fingerprint(p)
 }
 
+/// 登記的對象符不符合 `chainPin`（沒設定時一律符合；探測沒有公鑰時不符合）
+fn reg_pin_ok(i: &Inner, p: &Probe) -> bool {
+    p.public.is_some_and(|k| i.settings.pin_ok(&short_fp(&k)))
+}
+
 fn set_state(i: &mut Inner, st: State, reason: Option<Reason>) {
     if i.state != st || i.reason != reason {
         match (st, reason) {
@@ -573,7 +582,7 @@ fn reject(i: &mut Inner, r: Reason, now: Now) -> Vec<Io> {
             i.unsupported_retried = true;
             Some(i.timing.retry_max)
         }
-        Reason::VerifyFailed | Reason::NoResponse => Some(next_backoff(i)),
+        Reason::VerifyFailed | Reason::NoResponse | Reason::PinMismatch => Some(next_backoff(i)),
         // 上游關了 allow_downstream：每 10 分鐘（加 0～20% 亂數）探測一次，上游重新開放後自動接回（3.4.2；
         // 以前要等下一次路徑檢查，最久 6 小時）。探測只是一筆 CH TXT 查詢
         Reason::NotAllowed => Some(i.timing.retry_max.mul_f64(1.0 + 0.2 * now.rnd)),
@@ -697,7 +706,7 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             // 限定了上游的指紋（`chainPin`）：不符就不串接（3.4.3）
             if !i.settings.pin_ok(&short_fp(&public)) {
                 warn!("串接：上游的指紋 {} 跟設定的 chainPin 不符，不串接", short_fp(&public));
-                return reject(i, Reason::VerifyFailed, now);
+                return reject(i, Reason::PinMismatch, now);
             }
             let Some((hit, tcp)) = i.view.as_ref().and_then(View::usable_hit) else {
                 return to_none(i, None);
@@ -1032,6 +1041,10 @@ impl Client {
             if p.error.is_some() || !p.allow || !p.caps.iter().any(|c| c == "reg") || p.public.is_none() || p.kid.is_none() {
                 return None;
             }
+            // 設了 `chainPin`、上游的指紋不符：不登記（主機名稱只給鎖定的那一台；3.4.4，3.4.3 複驗 G5）
+            if !reg_pin_ok(&i, &p) {
+                return None;
+            }
             // 綁定中用綁定的位址；還沒綁定（或中斷）用攔截命中的保留位址。TCP 可用就走 TCP（登記封包比較大）
             let (addr, tcp) = match &i.bound {
                 Some(b) => (b.addr, b.tcp || b.tcp_ok),
@@ -1302,6 +1315,9 @@ impl Client {
                 format!("上游黑潮 {ver} 沒有回應串接查詢：不串接，自己做評測")
             }
             (State::Released, Some(Reason::VerifyFailed)) => "上游黑潮的身分驗證失敗（簽章不對）：不串接，用自己的上游".into(),
+            (State::Released, Some(Reason::PinMismatch)) => {
+                "不串接：上游黑潮的指紋跟設定的 chainPin 不符（設定鎖定的是別台），用自己的上游".into()
+            }
             (State::Released, Some(Reason::UpstreamChanged)) => "上游節點的金鑰換了：重新驗證中".into(),
             (State::Released, Some(Reason::Loop)) => "不串接：上游的串接鏈裡有這台（會形成迴圈）".into(),
             (State::Released, Some(Reason::TooDeep)) => "不串接：上游的串接已經有 4 層（超過上限）".into(),
@@ -1901,9 +1917,22 @@ mod tests {
         );
         assert!(!io.iter().any(|x| matches!(x, Io::Bind { .. })), "{io:?}");
         assert_ne!(i.state, State::Chained);
+        // 原因是 pin-mismatch（3.4.4；以前算 verify-failed，狀態頁寫「簽章不對」）
+        assert_eq!(i.reason, Some(Reason::PinMismatch));
+        assert_eq!(Reason::PinMismatch.code(), "pin-mismatch");
         let mut j = inner(true);
         j.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[5u8; 32])));
         chained(&mut j, [5; 32]);
+    }
+
+    /// 3.4.4（3.4.3 複驗 G5）：`chainPin` 不符的上游不登記主機名稱；符合或沒設定時照常登記
+    #[test]
+    fn chain_pin_blocks_registration() {
+        let mut i = inner(true);
+        assert!(reg_pin_ok(&i, &ok_probe([5; 32], vec![])), "沒設定 chainPin：照常登記");
+        i.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[9u8; 32])));
+        assert!(!reg_pin_ok(&i, &ok_probe([5; 32], vec![])), "指紋不符：不登記");
+        assert!(reg_pin_ok(&i, &ok_probe([9; 32], vec![])), "指紋符合：照常登記");
     }
 
     /// 3.4.3：上游的查詢一直失敗（暫停 5 次）、心跳卻正常 → 解除串接（no-response），照退避重試

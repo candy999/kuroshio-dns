@@ -1084,6 +1084,89 @@ async fn chain_timeout_still_falls_back() {
     drop(dead);
 }
 
+/// 3.4.4（3.4.3 複驗 G6）：上游黑潮 SERVFAIL、改問自己的上游時，自己的上游沒回應先不算失敗（多半是網域壞了）；
+/// 同一輪有別的上游正常回答時才算
+#[tokio::test]
+async fn chain_servfail_retry_does_not_count_silent_own() {
+    let _path = PATH_STATE.lock().await;
+    let fail_of = |r: &kuroshio::resolver::Resolver, id: &str| -> u64 {
+        r.upstreams.list_json().as_array().unwrap().iter().find(|u| u["id"] == id).unwrap()["fail"]
+            .as_u64()
+            .unwrap()
+    };
+    let (chain, _) = upstream(0, servfail).await;
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap(); // 收了不回
+    let silent = dead.local_addr().unwrap();
+    let mut c = cfg(&[], json!({ "resolver": { "timeoutMs": 200 } }));
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{silent}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    for i in 0..6u16 {
+        let m = Message::parse(&r.handle(&q(i, &format!("broken{i}.example.com"), 1), &CTX).await.unwrap()).unwrap();
+        assert_eq!(m.rcode, 2);
+    }
+    assert_eq!(fail_of(&r, &format!("udp://{silent}")), 0, "大家都解析不到：自己的上游不算失敗");
+    // 另一台自己的上游正常回答：沒回應的那台照算失敗
+    let (ok, _) = upstream(0, answer_ok_ip).await;
+    let mut c = cfg(
+        &[],
+        json!({ "resolver": { "timeoutMs": 200, "parallel": 0, "collectWindowMs": 600 } }),
+    );
+    kuroshio_config::merge(
+        &mut c,
+        &json!({ "upstream": { "fallback": [format!("udp://{silent}"), format!("udp://{ok}")] } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    let m = Message::parse(&r.handle(&q(9, "mixed.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 77)));
+    assert_eq!(fail_of(&r, &format!("udp://{silent}")), 1, "別台有答案：沒回應的算失敗");
+    drop(dead);
+}
+
+fn nodata(_name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (0, vec![], 300)
+}
+
+/// 3.4.4（3.4.3 複驗 G7）：上游黑潮 SERVFAIL、改問自己的上游時，只有一台回否定答案（其他沒回應）不採用，照上游的 SERVFAIL；
+/// 兩台都回同樣的否定答案才採用。自己的上游只有一台時照用它的答案
+#[tokio::test]
+async fn chain_servfail_retry_needs_two_negatives() {
+    let _path = PATH_STATE.lock().await;
+    let (chain, _) = upstream(0, servfail).await;
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap(); // 收了不回
+    let silent = dead.local_addr().unwrap();
+    let (empty, _) = upstream(0, nodata).await;
+    let (empty2, _) = upstream(0, nodata).await;
+    let build = |own: Vec<String>| {
+        let mut c = cfg(
+            &[],
+            json!({ "resolver": { "timeoutMs": 200, "parallel": 0, "collectWindowMs": 300 } }),
+        );
+        kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": own } }));
+        let r = kuroshio::app::build_resolver(&c).unwrap();
+        r.upstreams
+            .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+        r
+    };
+    // 一台空答案、一台沒回應：照上游的 SERVFAIL
+    let r = build(vec![format!("udp://{silent}"), format!("udp://{empty}")]);
+    let m = Message::parse(&r.handle(&q(1, "lone.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 2, "只有一台的空答案：不採用");
+    // 兩台都回空答案：採用
+    let r = build(vec![format!("udp://{empty}"), format!("udp://{empty2}")]);
+    let m = Message::parse(&r.handle(&q(2, "agreed.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 0, "兩台一致：採用");
+    assert!(m.answers.is_empty());
+    // 自己的上游只有一台：照用它的答案（沒有別台可以比）
+    let r = build(vec![format!("udp://{empty}")]);
+    let m = Message::parse(&r.handle(&q(3, "single.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 0);
+    drop(dead);
+}
+
 /// 3.4.2：SERVFAIL 只在同一筆有別的上游正常回答時才算那台失敗（大家都解析不到是網域的問題）
 #[tokio::test]
 async fn servfail_counts_only_when_others_answer() {

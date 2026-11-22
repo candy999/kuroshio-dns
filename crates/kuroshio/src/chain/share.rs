@@ -738,7 +738,7 @@ impl Syncer {
             // 照用，請排程器補跑這些工作（排程器的最小間隔照舊；3.4.3。以前只在評測結果超過 48 小時時補跑評測）
             let distrust = matches!(
                 self.client.state().1,
-                Some(Reason::AuditFailed | Reason::Tampered | Reason::UpstreamChanged | Reason::VerifyFailed)
+                Some(Reason::AuditFailed | Reason::Tampered | Reason::UpstreamChanged | Reason::VerifyFailed | Reason::PinMismatch)
             );
             let at = self.state.lock().unwrap().kinds.get(KIND_UPSTREAMS).map(|i| i.imported_at);
             if distrust {
@@ -1145,7 +1145,10 @@ impl Syncer {
                 kid: hex(upstream_kid),
             },
         );
-        rep.imported.push(key);
+        // 上游在同步中途換了清單、重拿一次時，同一種可能再匯入一次：日誌只列一次（3.4.4，3.4.3 複驗 G4）
+        if !rep.imported.contains(&key) {
+            rep.imported.push(key);
+        }
         Ok(Fetch::Done)
     }
 
