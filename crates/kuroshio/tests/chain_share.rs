@@ -1348,6 +1348,18 @@ async fn held_list_persisted_when_room_returns() {
     assert_eq!(f.persist_held(), 1);
     assert_eq!(f.stats()["heldCopies"]["count"], 0, "存成副本就從記憶體拿掉");
     assert!(f.copies().unwrap().meta(&url).is_some());
+    // 還沒寫到磁碟（等下一輪快照）就重建：讀待寫的內容，不重新下載（3.4.2 Windows 複驗 G2）
+    assert!(!pers
+        .lock()
+        .unwrap()
+        .file_path(&f.copies().unwrap().meta(&url).unwrap().file)
+        .exists());
+    // 記憶體控制停用、再恢復這份清單（restore_one 不會先寫出待寫的內容；rebuild_from_copies 會，測不到）
+    assert!(f.unload_one().await.unwrap().is_some());
+    assert!(f.check("ads2999.example.net", 1).is_none());
+    assert!(f.restore_one().await.unwrap().is_some());
+    assert!(f.check("ads2999.example.net", 1).unwrap().block);
+    assert_eq!(downloads.load(Ordering::SeqCst), 1, "副本還在待寫時恢復：不重新下載");
     pers.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
     // 重新啟動：用本機副本建好，不再下載
     let f2 = kuroshio::filtering::FilterService::from_cfg(&cfg, &d.0).unwrap();
@@ -1479,4 +1491,19 @@ async fn current_filter_copy_marked_without_transfer() {
     s.sync_once().await;
     assert_eq!(sink.calls(), vec!["copy-current", "copy-current"]);
     assert!(!s.never_synced());
+}
+
+/// 3.4.2 Windows 複驗 G1：一份清單都還沒有（開機就記憶體不足、清單延後）時，記憶體控制不做「暫停全部清單」：
+/// 省不到記憶體，卻會讓記憶體恢復後的第一次更新什麼都不做（以前要等記憶體控制恢復這一步，9 分鐘才有清單）
+#[tokio::test]
+async fn protected_step_not_shed_without_lists() {
+    use kuroshio::memgov::Step;
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "A", "url": "http://192.0.2.1:9/a.txt", "category": "ads" }
+    ] } }));
+    let d = tmpdir("protected-empty");
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &d.0).unwrap();
+    assert_eq!(f.list_rules(), 0);
+    let step = kuroshio::memgov::ProtectedStep { filter: f.clone() };
+    assert!(!step.can_shed(), "沒有清單：不暫停");
 }

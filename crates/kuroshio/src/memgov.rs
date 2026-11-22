@@ -1352,7 +1352,9 @@ impl Step for ProtectedStep {
         State::Critical
     }
     fn can_shed(&self) -> bool {
-        !self.filter.all_suspended() && self.filter.lists_bytes() > 0
+        // 還沒有任何清單（開機就記憶體不足、清單延後更新）時不暫停：省不到記憶體，卻會讓記憶體恢復後的
+        // 第一次更新什麼都不做、等到記憶體控制恢復這一步才載入（3.4.2 Windows 複驗：恢復後 9 分鐘才有清單）
+        !self.filter.all_suspended() && self.filter.list_rules() > 0
     }
     fn wanted(&self, r: &Reading, res: &Reserve) -> bool {
         r.avail.is_some_and(|a| a < res.bytes / 4)
