@@ -586,6 +586,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 - `upstreams.json` 的 `selected[]` 每筆多 `region` 與 `near`；`final_dns_smart.csv` 最後多 `Region`、`Near` 兩欄（舊的欄位順序不變）。
 - `/api/status` 的 `upstreams[]` 多 `region`（沒有是 `null`）。狀態頁顯示在選上原因的旁邊，例如「自動（覆蓋 · JP）」。
+- 3.5.0：`selected[]`／`spares[]` 多 `regionSource`（`"tw-net"` 位址在台灣網段；`"registered"` ip-api 的國別，也就是 IP 的註冊地）。`/api/upstreams`、`/api/status` 的 `upstreams[]` 多 `regionSource` 與 `near`（以前 `near` 只在 `upstreams.json`）；舊的 `upstreams.json` 沒有 `regionSource` 一律是 `"registered"`；固定上游、備援、串接上游三個欄位都是 `null`。`region` 的值不變。顯示規則在 ui-core.js 的 `regionLabel(u)`：`tw-net` →「台灣」、註冊地而且 `near` →「鄰近（註冊地 GB）」、註冊地 →「註冊地 GB」、沒有國別而且 `near` →「鄰近」，其他不顯示。
 
 ## 每日評測與預設名單（3.5.0 起）
 
@@ -617,6 +618,34 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - `upstreams.json` 多 `spares[]`（評測沒選上、但合格的前 3 台，依速度；格式同 `selected[]`，`reason` 是 `"候補"`）。可用的自動上游（沒暫停、沒先不用、路徑沒擋）少於 `min(upstream.autoMax, benchmark.minAuto)` 時依序補上。舊的 `upstreams.json` 沒有 `spares` 就是沒有候補（跟 3.4.4 一樣）；舊版下游忽略這個欄位。
 - 先不用的上游登記到評測學習檔（`state/benchmark-learn.json.zst` 的 `neverOk`，最多 32 筆）：下一次評測照測、但不選、也不當候補（`judge.log`：「執行時上線以來從未成功，今天照測、不選」），連續 3 次評測之後忘掉重來。學習檔讀不到、格式不對當成空的；不進備份的分享檔、不傳給下游與好友。
 - 可用的連候補都不夠時提早評測（原因「自動上游不足」，12 小時內跑過就不排）；串接中由上游提供評測結果時不排。
+
+### 不支援 HTTP/3 的 DoH
+
+- 每一筆 DoH 另外用 HTTP/3（`h3://`）測。`https://` 通過資格賽、`h3://` 連續 3 天（不同日期）連線錯誤的，跳過 7 → 14 → 28 天（加 0～3 天亂數，最多 30 天）不產生這個 `h3://` 候選；到期再測成功就忘掉，失敗 1 次進下一輪。`https://` 照常每天測。
+- 不記：`https://` 自己也失敗、路徑檢查判斷 QUIC 被擋、當天沒有任何 `h3://` 連得上。
+- 紀錄在評測學習檔的 `h3skip`（`{ "<h3:// id>": { "f": 連續失敗天數, "n": 已跳過幾輪, "until": 跳到哪一天, "last": 最後記錄的日數 } }`，日數是台北日期的 Unix 日數，最多 512 筆）。`judge.log`：「HTTP/3 先不測 N 個」。
+
+### 上游的台灣率
+
+- 評測 Phase 2 之後，每台倖存者算 `twRate`：答案裡有台灣網段 IP（`tw-ip.json`）的網域數 ÷ 至少有一台倖存者回過台灣 IP 的網域數（在台灣根本沒有節點的網站不算進分母）；分母不到 10 是 `null`，台灣網段讀不到時全部是 `null`。
+- 只影響排序：選「覆蓋」上游時，貪婪的每一步新增覆蓋差在 10% 以內的候選裡取台灣率高的；差距更大時照舊。「最快」、「備援」、候補、台數上限、覆蓋率目標、`near` 的分輪都不變。不淘汰任何上游，執行時的查詢不用它。
+- 輸出：`upstreams.json` 的 `selected[]`、`spares[]` 每筆多 `twRate`（0～1，小數 3 位，或 `null`）與 `ecs`（名單標記 `ecs=1`，評測自己不探測）；`final_dns_smart.csv` 最後多 `TW_Rate` 一欄（`62.5%`，沒有是空的）。`judge.log`：「台灣率：N 個網域至少有一台回過台灣節點」。
+
+### 對照組
+
+`protected.txt` 的對照組（有過濾的大型 DNS）照舊永遠不選、不算覆蓋、不參加多數決、不記可疑、不進永久黑名單。3.5.0 起：
+
+- **資格賽網域被擋**（NXDOMAIN、封鎖位址、導到封鎖頁這種「有回答但不是預期的位址」）的對照組算「判出過濾」（`stage` = `preflight`），而且照樣測評測網域；連線失敗、逾時照舊是 `untested`。以前這些一律是 `untested`、後面的網域也不測。
+- `upstreams.json`（`/api/benchmark`）的 `protected[]` 每台多：
+  - `stage`：結果在哪個階段決定（`preflight` 資格賽、`domain` 評測網域；A5 之後多 `probe`）。
+  - `preflight`：資格賽網域被擋的說明（例如 `封殺 one.one.one.one（資格賽：NXDOMAIN）`），沒有是 `null`。網域判斷也判出時 `result`／`reason` 用網域判斷的，這個欄位照樣留著。
+  - `recent`：近 7 天的結果（7 個字元以內，最左邊是今天；`d` 判出、`p` 沒判出、`u` 沒測到、`-` 那天沒跑）。
+  - `regress`：`true` = 過去 7 天（不含今天）裡有 3 天以上判出、今天沒判出（`u`、`-` 不算）。
+  - `expectMet`：`filter=` 的類型裡至少有一種今天有對應的判斷時，是否在評測網域判出（`true`／`false`；資格賽網域被擋不算）；都沒有對應判斷（例如只擋惡意網站——惡意網站的探測是之後的 A5）或沒測到是 `null`。
+- 回歸只報告，不改變選出來的上游：`judge.log` 與日誌各一行 WARN（「對照組 X 以前判得出過濾，今天沒判出」）。今天判出的比例比過去 7 天的中位數少一半以上（今天測到 8 台以上、過去有測到 8 台以上的天數）時另外一行 WARN（評測網域檔或判斷規則可能改壞了）。
+- 報表的 `protected.csv` 最後多 `stage,preflight,recent,regress,expectMet`（舊的欄位順序不變）。
+- 跨天的紀錄在評測學習檔的 `control`（每台最近 30 天，字串第一個字元是 `controlDay` 那天；最多 64 台，名單裡沒有的刪掉）。
+- 介面：共用儀表板的評測區塊有摺疊的對照組表；LuCI 狀態頁、Windows 設定頁的上游區塊有一行摘要（「對照組 37 台：判出 20、沒判出 5、沒測到 12；回歸 0」，ui-core.js 的 `controlSummary`）。
 
 ### 手動執行的工作優先
 

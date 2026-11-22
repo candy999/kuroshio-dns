@@ -570,6 +570,8 @@ struct Srv {
     tag: Tag,
     /// 執行時上線以來從未成功（主程式登記的 `neverOk`，3.5.0 A7）：照測，但今天不選
     never_ok: bool,
+    /// 對照組的資格賽網域被擋（3.5.0 A2）：記為判出過濾（`stage = preflight`），照樣測網域
+    preflight: Option<String>,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -591,6 +593,7 @@ impl Srv {
             protected: None,
             tag,
             never_ok: false,
+            preflight: None,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -670,9 +673,13 @@ impl Srv {
             // Phase 2 查完業者之後才填（classify_region）
             region: String::new(),
             near: false,
+            region_source: "registered",
             tier: self.tag.tier.name(),
             op: self.tag.op.clone(),
             excluded: self.never_ok,
+            // compute() 裡用台灣網段算（3.5.0 B5）
+            tw_rate: None,
+            ecs: self.tag.ecs,
         }
     }
 }
@@ -702,15 +709,51 @@ fn protected_ids(paths: &BenchPaths) -> Vec<(String, String, Tag)> {
         .collect()
 }
 
-/// 對照組的結果：判出過濾（封殺、汙染、可疑）、沒判出（倖存）、沒測到（連不上、資格賽失敗）
-fn protected_result(s: &Srv) -> &'static str {
-    if s.alive {
-        "passed"
-    } else if ["封殺", "汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p)) {
-        "detected"
-    } else {
-        "untested"
+/// 對照組的結果（result, stage, reason）：
+/// - `detected`：網域判斷判出過濾（封殺、汙染、可疑，`stage = domain`）；或網域都沒判出、但資格賽網域被擋（`stage = preflight`，3.5.0）
+/// - `passed`：網域都沒判出（`stage = domain`）
+/// - `untested`：連不上、逾時（資格賽就連不上是 `preflight`，測網域時才連不上是 `domain`）
+///
+/// A5（惡意網站探測）之後會多 `stage = probe`
+fn protected_outcome(s: &Srv) -> (&'static str, &'static str, String) {
+    let judged = ["封殺", "汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p));
+    if !s.alive && judged {
+        return ("detected", "domain", s.fail_reason.clone());
     }
+    if let Some(pf) = &s.preflight {
+        return ("detected", "preflight", pf.clone());
+    }
+    if s.alive {
+        return ("passed", "domain", String::new());
+    }
+    let stage = if s.fail_reason.starts_with("資格賽") {
+        "preflight"
+    } else {
+        "domain"
+    };
+    ("untested", stage, s.fail_reason.clone())
+}
+
+/// 這個過濾類型今天有沒有對應的判斷（給 `expectMet`）：Some(true)＝有而且正常、Some(false)＝有但今天失效、None＝沒有。
+/// 評測網域（`web.txt`）有廣告追蹤與成人網站；惡意網站要等 A5 的探測（自我檢查通過才算），在那之前是 None
+fn category_checked(cat: &str) -> Option<bool> {
+    match cat {
+        "ads" | "adult" | "tracking" | "telemetry" => Some(true),
+        _ => None,
+    }
+}
+
+/// 對照組的預期值（`expectMet`）：`filter=` 裡至少有一種類型今天有判斷 → 判出了沒有（資格賽網域被擋不算，那不是這些類型）；
+/// 都沒有判斷（例如只擋惡意網站、A5 之前）或今天沒測到 → None
+fn expect_met(expect: &str, result: &str, stage: &str) -> Option<bool> {
+    if result == "untested" {
+        return None;
+    }
+    let types: Vec<Option<bool>> = expect.split(',').map(|t| category_checked(t.trim())).collect();
+    if !types.contains(&Some(true)) {
+        return None;
+    }
+    Some(result == "detected" && stage != "preflight")
 }
 
 /// 社群好友提供的上游候選最多收幾個（社群模組已經先合併、排序、限制成 100 個；這裡再擋一次，
@@ -973,8 +1016,15 @@ impl Benchmark {
         let protected = protected_ids(&self.paths);
         // 學習資料（3.5.0）：執行時上線以來從未成功的（主程式登記的）今天照測、不選；排除 3 次之後忘掉重來
         let mut learned = self.paths.learn_file.as_ref().map(|p| learn::Learn::load(p));
-        let (never_ok, learn_changed) = learned.as_mut().map(|l| l.take_never_ok_round()).unwrap_or_default();
+        let (never_ok, mut learn_dirty) = learned.as_mut().map(|l| l.take_never_ok_round()).unwrap_or_default();
         let never_ok: HashSet<String> = never_ok.into_iter().collect();
+        let today_n = learn::day_of(now);
+        // 不支援 HTTP/3 的 DoH（3.5.0 A6）：它的 https:// 已經不在名單的刪掉
+        if let Some(l) = learned.as_mut() {
+            let h3_ids: HashSet<&str> = ids.iter().filter(|c| c.id.starts_with("h3://")).map(|c| c.id.as_str()).collect();
+            learn_dirty |= l.h3_prune(|k| h3_ids.contains(k)) > 0;
+        }
+        let mut h3_skipped = 0usize;
         // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
         let mut journal = Journal::default();
         // 路徑檢查：一般 DNS 被接走、IPv6 不能用、協定被擋時，那些候選今天不測（測了也只會冤枉它們）
@@ -1035,6 +1085,14 @@ impl Benchmark {
                     continue;
                 }
             }
+            // 連續好幾天 QUIC 連不上（https:// 正常）的 h3://：跳過期間不測（3.5.0 A6）
+            if !pinned_or_control
+                && up.kind == kuroshio_net::upstream::Kind::Doh3
+                && learned.as_ref().is_some_and(|l| l.h3_skipping(spec, today_n))
+            {
+                h3_skipped += 1;
+                continue;
+            }
             let mut s = Srv::new(spec.clone(), up, pinned, tag.clone());
             s.protected = expect.cloned();
             s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
@@ -1056,6 +1114,13 @@ impl Benchmark {
         if !unsupported.is_empty() {
             jinfo!(journal, "這個版本還不支援的類型先略過（之後版本加入）：{}", unsupported.join("、"));
         }
+        if h3_skipped > 0 {
+            jinfo!(
+                journal,
+                "HTTP/3 先不測 {h3_skipped} 個：連續 {} 天以上 QUIC 連不上、HTTPS 正常（跳過 7～30 天，到期再試）",
+                learn::H3_FAIL_DAYS
+            );
+        }
         for s in all.iter().filter(|s| s.never_ok) {
             jinfo!(journal, "  {}：執行時上線以來從未成功，今天照測、不選", s.id);
         }
@@ -1072,10 +1137,48 @@ impl Benchmark {
         let (pf_domain, pf_expected) = self.preflight.clone();
         jinfo!(journal, "[Phase 0] 資格賽 ({pf_domain})");
         let results = self.query_all(&all, (0..all.len()).collect(), &pf_domain, &cfg).await;
+        // 每個候選的資格賽結果（A6 用：h3:// 與它的 https://）
+        let mut pf: Vec<Option<Preflight>> = vec![None; all.len()];
         for (i, r) in results {
             let pass = matches!(&r.outcome, Outcome::Ok(ips) if ips.iter().any(|ip| pf_expected.contains(ip)));
+            pf[i] = Some(match (&r.outcome, pass) {
+                (_, true) => Preflight::Pass,
+                (Outcome::Error(_), _) => Preflight::Error,
+                _ => Preflight::Answered,
+            });
             if !pass {
+                // 對照組（3.5.0 A2）：有回答、只是資格賽網域被擋（NXDOMAIN、封鎖位址、導到封鎖頁）——
+                // 家庭／兒童類的過濾 DNS 常把其他公共 DNS 的主機名稱也擋掉（防止繞過）。這也是判出過濾，
+                // 而且伺服器是正常的：照樣測網域（對照組本來每天就要測一輪），看評測判不判得出它擋的類型。
+                // 連線失敗、逾時照舊是沒測到
+                if all[i].protected.is_some() && !matches!(r.outcome, Outcome::Error(_)) {
+                    let what = match &r.outcome {
+                        Outcome::Ok(ips) => format!("導向 {}", ips.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")),
+                        _ => reason_of(&r),
+                    };
+                    jinfo!(
+                        journal,
+                        "   [對照組] {} -> 資格賽網域被擋（{what}）：記為判出過濾，照樣測網域",
+                        all[i].id
+                    );
+                    all[i].preflight = Some(format!("封殺 {pf_domain}（資格賽：{what}）"));
+                    continue;
+                }
                 all[i].kill(format!("資格賽失敗 ({})", reason_of(&r)));
+            }
+        }
+        if let Some(l) = learned.as_mut() {
+            let c = record_h3(l, &all, &pf, today_n);
+            learn_dirty |= c.any();
+            if c.any() || l.h3_skipping_count(today_n) > 0 {
+                jinfo!(
+                    journal,
+                    "HTTP/3：多記一天 {}、開始跳過 {}、恢復 {}（目前跳過 {} 個）",
+                    c.counted,
+                    c.skipped,
+                    c.cleared,
+                    l.h3_skipping_count(today_n)
+                );
             }
         }
         let verified: Vec<usize> = (0..all.len()).filter(|i| all[*i].alive).collect();
@@ -1438,28 +1541,94 @@ impl Benchmark {
                 let in_tw = matches!((&tw_nets, ip), (Some(n), Some(ip)) if n.contains(*ip));
                 let cc = info.map(|x| x.cc.as_str()).unwrap_or("");
                 (s.region, s.near) = select::classify_region(in_tw, cc, s.min, cfg.near_max_ms);
+                s.region_source = select::region_source(in_tw);
                 s
             })
             .collect();
         drop(tw_nets);
         // 對照組：判出過濾、沒判出、沒測到（不算淘汰，另外列）
-        let control: Vec<Value> = all
+        let outcomes: Vec<(&Srv, (&'static str, &'static str, String))> = all
             .iter()
-            .filter_map(|s| {
-                let expect = s.protected.as_ref()?;
-                Some(json!({ "id": s.id, "type": s.kind, "expect": expect, "result": protected_result(s), "reason": s.fail_reason }))
+            .filter(|s| s.protected.is_some())
+            .map(|s| (s, protected_outcome(s)))
+            .collect();
+        // 跨天回歸（3.5.0 A2）：學習檔的 control 記每台最近 30 天；名單裡有、今天沒測（路徑檢查略過、不支援）的記 u
+        if let Some(l) = learned.as_mut() {
+            let tested: HashMap<&str, char> = outcomes.iter().map(|(s, (r, _, _))| (s.id.as_str(), day_char(r))).collect();
+            let results: Vec<(String, char)> = protected
+                .iter()
+                .map(|(spec, _, _)| (spec.clone(), tested.get(spec.as_str()).copied().unwrap_or('u')))
+                .fold(Vec::new(), |mut v, x| {
+                    if !v.iter().any(|(k, _): &(String, char)| *k == x.0) {
+                        v.push(x);
+                    }
+                    v
+                });
+            learn_dirty |= l.control_record(today_n, &results);
+        }
+        let hist_of = |id: &str, r: &str| -> String {
+            match learned
+                .as_ref()
+                .filter(|l| l.control_day == today_n)
+                .and_then(|l| l.control.get(id))
+            {
+                Some(h) => h.clone(),
+                None => day_char(r).to_string(),
+            }
+        };
+        let control: Vec<Value> = outcomes
+            .iter()
+            .map(|(s, (result, stage, reason))| {
+                let expect = s.protected.as_deref().unwrap_or("?");
+                let hist = hist_of(&s.id, result);
+                let recent: String = hist.chars().take(learn::CONTROL_RECENT).collect();
+                json!({
+                    "id": s.id, "type": s.kind, "expect": expect, "result": result, "reason": reason,
+                    "stage": stage, "preflight": s.preflight, "recent": recent,
+                    "regress": learn::control_regress(&hist), "expectMet": expect_met(expect, result, stage),
+                })
             })
             .collect();
+        drop(outcomes);
         if !control.is_empty() {
             let n = |r: &str| control.iter().filter(|c| c["result"] == r).count();
+            let regress: Vec<&str> = control
+                .iter()
+                .filter(|c| c["regress"] == true)
+                .filter_map(|c| c["id"].as_str())
+                .collect();
             jinfo!(
                 journal,
-                "[對照組] {} 台：判出過濾 {}、沒判出 {}、沒測到 {}（永遠不選、不記可疑、不進黑名單）",
+                "[對照組] {} 台：判出過濾 {}（資格賽網域被擋 {}）、沒判出 {}、沒測到 {}、回歸 {}（永遠不選、不記可疑、不進黑名單）",
                 control.len(),
                 n("detected"),
+                control
+                    .iter()
+                    .filter(|c| c["stage"] == "preflight" && c["result"] == "detected")
+                    .count(),
                 n("passed"),
-                n("untested")
+                n("untested"),
+                regress.len()
             );
+            // 只報告，不改變今天選出來的上游
+            for id in &regress {
+                let line = format!("[對照組] {id} 以前判得出過濾，今天沒判出：評測可能判不出這一類了");
+                warn!("{line}");
+                journal.push(line);
+            }
+            if let Some((t, m)) = learned
+                .as_ref()
+                .filter(|l| l.control_day == today_n)
+                .and_then(|l| learn::control_overall_drop(l.control.values().map(String::as_str)))
+            {
+                let line = format!(
+                    "[對照組] 今天判出過濾的比例 {}% 比過去 7 天的中位數 {}% 少一半以上：評測網域檔或判斷規則可能改壞了",
+                    to_fixed(t * 100.0, 0),
+                    to_fixed(m * 100.0, 0)
+                );
+                warn!("{line}");
+                journal.push(line);
+            }
             for c in control.iter().filter(|c| c["result"] == "passed") {
                 jinfo!(
                     journal,
@@ -1489,7 +1658,17 @@ impl Benchmark {
         drop(universe);
         let opts = cfg.select.clone();
         let want_reports = out_dir.is_some();
-        let calc = tokio::task::spawn_blocking(move || compute(scored_list, scored, total, &opts, want_reports, eliminated)).await?;
+        let tw = self.tw.clone();
+        let calc = tokio::task::spawn_blocking(move || compute(scored_list, scored, total, &opts, want_reports, eliminated, tw.as_deref()))
+            .await?;
+        match calc.tw_domains {
+            Some(n) if n >= select::TW_RATE_MIN_DOMAINS => jinfo!(
+                journal,
+                "  台灣率：{n} 個網域至少有一台回過台灣節點（分母）；覆蓋差在 10% 以內時先挑台灣率高的"
+            ),
+            Some(n) => jinfo!(journal, "  台灣率：只有 {n} 個網域有台灣節點，樣本太少，不算"),
+            None => {}
+        }
 
         let selected: Vec<Value> = calc
             .selection
@@ -1497,7 +1676,7 @@ impl Benchmark {
             .iter()
             .map(|p| {
                 let s = &calc.finals[p.idx];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near, "tier": s.tier, "op": s.op })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "regionSource": s.region_source, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
             })
             .collect();
         // 候補（3.5.0 A7）：沒選上、但合格的前幾台（依速度）；執行時可用的自動上游不夠時依序補上
@@ -1506,7 +1685,7 @@ impl Benchmark {
             .iter()
             .map(|&i| {
                 let s = &calc.finals[i];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": 0, "reason": "候補", "region": s.region, "near": s.near, "tier": s.tier, "op": s.op })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": 0, "reason": "候補", "region": s.region, "regionSource": s.region_source, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
             })
             .collect();
         let pinned: Vec<Value> = calc
@@ -1562,7 +1741,7 @@ impl Benchmark {
         );
         write_json(&self.paths.upstreams_file, &state)?;
         // 學習資料：有變動才寫（每天最多一次）；系統時間倒退時不寫
-        if let (Some(l), Some(p), true) = (learned.as_mut(), self.paths.learn_file.as_ref(), learn_changed) {
+        if let (Some(l), Some(p), true) = (learned.as_mut(), self.paths.learn_file.as_ref(), learn_dirty) {
             if l.advance(learn::day_of(now)) {
                 if let Err(e) = l.save(p) {
                     warn!("寫入評測學習資料失敗：{e}");
@@ -1575,16 +1754,26 @@ impl Benchmark {
             }
             report(&d.join("upstreams.json"), &serde_json::to_vec_pretty(&state).unwrap_or_default());
             if let Some(c) = state["protected"].as_array().filter(|c| !c.is_empty()) {
-                let mut csv = String::from("dns,type,expect,result,reason\n");
+                // 3.5.0 在最後加 stage、preflight、recent、regress、expectMet（舊的欄位順序不變）
+                let mut csv = String::from("dns,type,expect,result,reason,stage,preflight,recent,regress,expectMet\n");
                 for x in c {
-                    let f = |k: &str| x[k].as_str().unwrap_or("").replace([',', '\n'], " ");
+                    let f = |k: &str| match &x[k] {
+                        Value::String(v) => v.replace([',', '\n'], " "),
+                        Value::Bool(b) => if *b { "Y" } else { "N" }.to_string(),
+                        _ => String::new(),
+                    };
                     csv.push_str(&format!(
-                        "{},{},{},{},{}\n",
+                        "{},{},{},{},{},{},{},{},{},{}\n",
                         f("id"),
                         f("type"),
                         f("expect"),
                         f("result"),
-                        f("reason")
+                        f("reason"),
+                        f("stage"),
+                        f("preflight"),
+                        f("recent"),
+                        f("regress"),
+                        f("expectMet")
                     ));
                 }
                 report(&d.join("protected.csv"), csv.as_bytes());
@@ -1832,6 +2021,57 @@ impl Benchmark {
     }
 }
 
+/// 對照組一天的結果字元（學習檔的 `control`）
+fn day_char(result: &str) -> char {
+    match result {
+        "detected" => 'd',
+        "passed" => 'p',
+        _ => 'u',
+    }
+}
+
+/// 一個候選的資格賽結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preflight {
+    /// 通過
+    Pass,
+    /// 有回答，但不是預期的（封殺、答案不對）
+    Answered,
+    /// 連線錯誤、逾時
+    Error,
+}
+
+/// 不支援 HTTP/3 的 DoH（3.5.0 A6）：一般候選裡的每個 h3://，依它與它的 https:// 的資格賽結果記一筆。
+/// 算一次失敗要三個條件都成立：h3:// 是連線錯誤（不是封殺、不是答案不對）、它的 https:// 通過資格賽、
+/// 今天至少有一個 h3:// 連得上（全部都連不上時可能是 QUIC 整條被擋、路徑檢查沒抓到，不冤枉）。
+/// 路徑檢查判斷 QUIC 被擋時 h3:// 根本不在候選裡，也就不會記
+fn record_h3(l: &mut learn::Learn, all: &[Srv], pf: &[Option<Preflight>], today: u32) -> learn::H3Change {
+    use learn::H3Seen;
+    let mut change = learn::H3Change::default();
+    let h3: Vec<usize> = (0..all.len())
+        .filter(|&i| all[i].kind == "doh3" && all[i].selectable() && all[i].id.starts_with("h3://"))
+        .collect();
+    let quic_ok = h3.iter().any(|&i| matches!(pf[i], Some(Preflight::Pass | Preflight::Answered)));
+    let by_id: HashMap<&str, usize> = all.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
+    for &i in &h3 {
+        let seen = match pf[i] {
+            Some(Preflight::Error) => {
+                let https = format!("https://{}", &all[i].id["h3://".len()..]);
+                let https_ok = by_id.get(https.as_str()).is_some_and(|&j| pf[j] == Some(Preflight::Pass));
+                if quic_ok && https_ok {
+                    H3Seen::Fail
+                } else {
+                    H3Seen::Neutral
+                }
+            }
+            Some(_) => H3Seen::Ok,
+            None => H3Seen::Neutral,
+        };
+        l.h3_record(&all[i].id, today, seen, &mut change);
+    }
+    change
+}
+
 /// 收集到的原始答案大約佔多少記憶體（每筆：結果本身 + 幾個 IP；估計值，誤差約 ±30%）。
 /// 只算原始答案，不含每台上游的歷史、ASN 快取、連線緩衝。放在 `/api/status` 的 `memory.jobs.rawBytes`
 fn raw_bytes(entries: usize) -> usize {
@@ -1915,6 +2155,8 @@ impl CollectJob {
 struct Calc {
     /// 依延遲排序
     finals: Vec<Scored>,
+    /// 台灣率的分母（至少有一台回過台灣 IP 的網域數）；沒有台灣網段資料是 None
+    tw_domains: Option<usize>,
     selection: select::Selection,
     /// 候補（`finals` 的位置）
     spares: Vec<usize>,
@@ -1928,8 +2170,14 @@ fn compute(
     opts: &SelectOpts,
     want_reports: bool,
     eliminated: Vec<(String, &'static str, String)>,
+    tw: Option<&crate::geo::TwIp>,
 ) -> Calc {
     select::extended_metrics(&mut finals, scored_domains);
+    // 台灣率（3.5.0 B5）：台灣網段讀不到時不算，選擇跟 3.4.4 一樣
+    let tw_domains = tw.map(|t| {
+        let nets = t.all();
+        select::tw_rates(&mut finals, |ip| nets.contains(IpAddr::V4(Ipv4Addr::from(ip))))
+    });
     finals.sort_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap_or(std::cmp::Ordering::Equal));
     let refs: Vec<&Scored> = finals.iter().collect();
     let asn_best = select::best_per_asn(&refs);
@@ -1961,6 +2209,7 @@ fn compute(
     }
     Calc {
         finals,
+        tw_domains,
         selection,
         spares,
         reports,

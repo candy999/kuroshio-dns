@@ -164,6 +164,34 @@ pub const DEFAULT_LIST: &str = "default-list";
 /// 暫停過的自動上游，暫停結束後要穩定這麼久才把暫停次數歸零（暫停時間重新從 1 分鐘算）
 const TRIP_RESET: Duration = Duration::from_secs(10 * 60);
 
+/// 評測判斷的上游所在地（`upstreams.json` 的 `selected[]`）：只影響顯示
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place {
+    /// ISO 國碼；沒有是 None
+    region: Option<String>,
+    /// `"tw-net"`（位址在台灣網段）或 `"registered"`（IP 的註冊地；舊的 `upstreams.json` 沒有這個欄位也是這個）
+    source: &'static str,
+    /// 鄰近（評測用量到的最低延遲判斷）
+    near: bool,
+}
+
+impl Place {
+    fn from_json(s: &Value) -> Place {
+        Place {
+            region: s
+                .get("region")
+                .and_then(Value::as_str)
+                .filter(|r| !r.is_empty())
+                .map(str::to_string),
+            source: match s.get("regionSource").and_then(Value::as_str) {
+                Some("tw-net") => "tw-net",
+                _ => "registered",
+            },
+            near: s.get("near").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Up {
     pub up: Upstream,
@@ -171,8 +199,8 @@ pub struct Up {
     stats: Mutex<Stats>,
     /// 每日評測選上的原因（最快、覆蓋）
     reason: Mutex<Option<String>>,
-    /// 評測判斷的所在地區（ISO 國碼，3.4.0；沒有是 None）
-    region: Mutex<Option<String>>,
+    /// 評測判斷的所在地區（ISO 國碼，3.4.0）與依據、鄰近（3.5.0 B9）；不是評測選上的（固定、備援、串接）是 None
+    region: Mutex<Option<Place>>,
     /// 只有串接上游：連續失敗時通知誰
     trouble: Option<Arc<Trouble>>,
     /// Manager 共用的狀態（3.5.0）：沒有時不會「先不用」（判斷不了是不是整台斷網）
@@ -364,6 +392,7 @@ impl Up {
     }
 
     pub fn json(&self) -> Value {
+        let place = self.region.lock().unwrap().clone();
         let s = self.stats.lock().unwrap();
         json!({
             "id": self.up.id, "type": kind_name(self.up.kind), "role": self.role.name(),
@@ -372,7 +401,10 @@ impl Up {
             "paused": s.open_until.map(|t| t > Instant::now()).unwrap_or(false),
             // 3.3.6：選上的原因、路徑檢查判斷不能用、經由攔截者（一般 DNS 被接走時）
             "reason": self.reason.lock().unwrap().clone(),
-            "region": self.region.lock().unwrap().clone(),
+            // 3.5.0：國別是註冊地還是台灣網段（regionSource）、鄰近（near）；介面用 ui-core.js 的 regionLabel 顯示
+            "region": place.as_ref().and_then(|p| p.region.clone()),
+            "regionSource": place.as_ref().map(|p| p.source),
+            "near": place.as_ref().map(|p| p.near),
             "pathBlocked": self.path_blocked(),
             "via": if self.via_interceptor() { Value::from("interceptor") } else { Value::Null },
             // 3.5.0：上線以來從未成功、先不用（每 6 小時試一次）
@@ -644,11 +676,7 @@ impl Manager {
                 .unwrap_or_else(|| Up::with_pulse(u, Role::Auto, Some(self.pulse.clone())));
             *up.reason.lock().unwrap() = s.get("reason").and_then(Value::as_str).map(str::to_string);
             // 上游多樣性（3.4.0）：評測判斷的所在地區
-            *up.region.lock().unwrap() = s
-                .get("region")
-                .and_then(Value::as_str)
-                .filter(|r| !r.is_empty())
-                .map(str::to_string);
+            *up.region.lock().unwrap() = Some(Place::from_json(s));
             list.push(up);
         }
         list
@@ -862,6 +890,47 @@ mod tests {
         let by = |id: &str| list.as_array().unwrap().iter().find(|u| u["id"] == id).cloned().unwrap();
         assert_eq!(by("udp://192.0.2.10:53")["region"], "TW");
         assert_eq!(by("udp://192.0.2.11:53")["region"], Value::Null);
+    }
+
+    /// 3.5.0 B9：selected[] 的 regionSource、near 帶到 /api/upstreams；舊的 upstreams.json（沒有 regionSource）一律當註冊地；
+    /// 固定上游、備援沒有評測的地區（null）
+    #[test]
+    fn old_state_defaults_to_registered() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-upsrc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("upstreams.json");
+        std::fs::write(
+            &f,
+            r#"{"generatedAt":"2026-11-10 04:30","selected":[
+                {"id":"udp://192.0.2.20","type":"udp","region":"TW","regionSource":"tw-net","near":true},
+                {"id":"udp://192.0.2.21","type":"udp","region":"GB","regionSource":"registered","near":true},
+                {"id":"udp://192.0.2.22","type":"udp","region":"US","near":false},
+                {"id":"udp://192.0.2.23","type":"udp","region":"JP","regionSource":"something-new"}]}"#,
+        )
+        .unwrap();
+        let mut c = cfg();
+        c["upstream"]["autoMax"] = json!(5);
+        let m = Manager::new(&c, f);
+        let list = m.list_json();
+        let by = |id: &str| list.as_array().unwrap().iter().find(|u| u["id"] == id).cloned().unwrap();
+        let src = |id: &str| (by(id)["region"].clone(), by(id)["regionSource"].clone(), by(id)["near"].clone());
+        assert_eq!(src("udp://192.0.2.20:53"), (json!("TW"), json!("tw-net"), json!(true)));
+        assert_eq!(src("udp://192.0.2.21:53"), (json!("GB"), json!("registered"), json!(true)));
+        assert_eq!(
+            src("udp://192.0.2.22:53"),
+            (json!("US"), json!("registered"), json!(false)),
+            "舊的：註冊地"
+        );
+        assert_eq!(
+            src("udp://192.0.2.23:53"),
+            (json!("JP"), json!("registered"), json!(false)),
+            "不認得的值當註冊地"
+        );
+        assert_eq!(
+            src("udp://10.0.0.1:53"),
+            (Value::Null, Value::Null, Value::Null),
+            "固定上游沒有評測的地區"
+        );
     }
 
     #[test]

@@ -569,6 +569,18 @@
   const verdictTag = v => !v ? tag('—') : v.verdict === 'ok' ? tag('可置換', 'ok') : v.verdict === 'fail' ? tag('不可', 'bad') : tag('未判定', 'warn');
   Object.assign(KD, { table, tag, verdictTag });
 
+  /**
+   * 上游的地區（3.5.0）：國別是 IP 的「註冊地」（任播的公共 DNS 在東京的節點也會標成 GB），不寫成實際位置。
+   * 跟 data/shared/ui-core.js 的 regionLabel 同一份規則（tools/ui-core-test.js 用同一組向量檢查）
+   */
+  KD.regionLabel = u => {
+    if (!u) return '';
+    const region = u.region ? String(u.region) : '', near = u.near === true;
+    if (region && u.regionSource === 'tw-net') return '台灣';
+    if (region) return (near ? '鄰近（註冊地 ' : '註冊地 ') + region + (near ? '）' : '');
+    return near ? '鄰近' : '';
+  };
+
   // =====================================================================================
   // 轉接器：資料從哪裡來
   // =====================================================================================
@@ -843,7 +855,8 @@
             // 3.5.0：從未成功、先不用的自動上游（benched）與候補（spare）標出來
             { h: '角色', v: u => tag(u.benched ? '從未成功，先不用' : u.spare ? '候補' : u.role === 'pinned' ? '固定' : u.role === 'auto' ? '自動' : u.role === 'fallback' ? '備援' : u.role === 'chain' ? '串接' : u.role, u.paused || u.benched ? 'bad' : '') },
             { h: '成功', v: u => nf.format(u.ok), num: 1 }, { h: '失敗', v: u => nf.format(u.fail), num: 1 },
-            { h: '平均 ms', v: u => u.avgMs ?? '—', num: 1 }
+            { h: '平均 ms', v: u => u.avgMs ?? '—', num: 1 },
+            { h: '地區', v: u => KD.regionLabel(u) || '—' }
           ]);
           const er = s.errors || { count: 0, recent: [] };
           const eb = sec.errBox; eb.textContent = er.count ? `處理例外 ${nf.format(er.count)} 次（已回 SERVFAIL，沒有讓裝置乾等）· 最近：${er.recent.slice(0, 3).map(x => ago(x.at) + ' ' + x.msg.slice(0, 120)).join('；')}` : '處理例外 0 次';
@@ -882,9 +895,34 @@
         box.appendChild(el('div', 'muted', `${fmtTime(b.generatedAt)} · 測試 ${b.counts.total} 台 · 存活 ${b.counts.survivors} · 淘汰 ${b.counts.eliminated} · 涵蓋率 ${pct1(b.coverage)}`));
         const t = el('table'); const w = el('div', 'tbl kd-mt8'); w.appendChild(t); box.appendChild(w);
         table(t, [...b.selected.map(x => ({ ...x, role: '自動' })), ...b.pinned.map(x => ({ ...x, role: '固定', type: '', newItems: x.coverageItems, reason: x.issues.length ? x.issues.length + ' 個問題' : '' }))], [
-          { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 }, { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
+          { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 },
+          // 台灣率（3.5.0）：CDN 網域的答案本來就是台灣節點的比例（只在覆蓋差不多時當決勝條件）；ECS＝名單標記會帶 ECS
+          { h: '地區', v: r => KD.regionLabel(r) || '—' },
+          { h: '台灣率', v: r => (r.twRate == null ? '—' : pct1(r.twRate)) + (r.ecs ? ' · ECS' : ''), num: 1 },
+          { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
         ]);
         if (b.blocked && b.blocked.length) box.appendChild(el('div', 'muted', `封殺紀錄 ${b.blocked.length} 筆（例：${b.blocked.slice(0, 3).map(x => x.dns + ' → ' + x.domain).join('、')}）`));
+        // 對照組（3.5.0）：有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選。摺疊起來，點開才看每一台
+        const ctl = b.protected || [];
+        if (ctl.length) {
+          const n = r => ctl.filter(x => x.result === r).length;
+          const reg = ctl.filter(x => x.regress === true).length;
+          const RES = { detected: ['判出', 'ok'], passed: ['沒判出', 'warn'], untested: ['沒測到', ''] };
+          const CAT = { ads: '廣告', adult: '成人', malware: '惡意', tracking: '追蹤', telemetry: '追蹤' };
+          const d = el('details', 'table kd-mt8');
+          d.appendChild(el('summary', '', `對照組 ${ctl.length} 台：判出 ${n('detected')}、沒判出 ${n('passed')}、沒測到 ${n('untested')}；回歸 ${reg}`));
+          const t2 = el('table'); const w2 = el('div', 'tbl'); w2.appendChild(t2); d.appendChild(w2); box.appendChild(d);
+          table(t2, ctl, [
+            { h: '上游', v: r => r.id, cls: 'mono' },
+            { h: '預期會擋', v: r => String(r.expect || '').split(',').map(x => CAT[x] || x).join('、') },
+            { h: '今天', v: r => { const x = RES[r.result] || [r.result, '']; return tag(x[0] + (r.result === 'detected' && r.stage === 'preflight' ? '（資格賽）' : ''), x[1]); } },
+            { h: '近 7 天', v: r => r.recent || '—', cls: 'mono' },
+            { h: '預期', v: r => r.expectMet === true ? '符合' : r.expectMet === false ? tag('不符', 'warn') : '—' },
+            { h: '回歸', v: r => r.regress ? tag('回歸', 'bad') : '—' },
+            { h: '說明', v: r => r.reason || '' }
+          ]);
+          d.appendChild(el('p', 'muted', '近 7 天：最左邊是今天；d＝判出、p＝沒判出、u＝沒測到、-＝那天沒跑。回歸＝以前判得出、今天沒判出（只報告，不影響選上游）。'));
+        }
       }, e => fail(sec.bench, e));
     }
 

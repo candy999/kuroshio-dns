@@ -578,6 +578,25 @@
 		if (z.filterListRules != null) out.push('清單 ' + fmtNum(z.filterListRules) + ' 條');
 		return out.join(' · ');
 	}
+	/**
+	 * 每日評測對照組的一行摘要（3.5.0，ui-core.js 的 controlSummary）：讀 /api/benchmark（評測結果原樣），
+	 * 只在評測時間變了才重讀（狀態每 5 秒更新，評測一天一次）
+	 */
+	var ctlAt = null, ctlBusy = false;
+	function controlLine(au) {
+		var at = au ? au.generatedAt || '' : '';
+		if (ctlBusy || at === ctlAt || typeof core.controlSummary !== 'function') return;
+		ctlBusy = true;
+		api('/api/benchmark').then(function (r) {
+			ctlBusy = false;
+			ctlAt = at;
+			var t = r.ok && r.data ? core.controlSummary(r.data.protected) : null;
+			var p = $('st-control');
+			if (!p) return;
+			p.hidden = !t;
+			p.textContent = t ? t + '（有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選）' : '';
+		});
+	}
 	function renderStatus(st, acme) {
 		var s = S.session, d = (st.stats && st.stats.today) || {}, sys = st.system || {}, lat = d.latency || {};
 		var ms = function (x) { return x && x.p50 != null ? x.p50 + ' / ' + (x.p95 != null ? x.p95 : '>1000') + ' ms' : '-'; };
@@ -668,6 +687,7 @@
 		$('st-up-desc').textContent = au && au.source === 'default-list' ? '自動上游來自預設名單（還沒評測，' + fmtNum(au.count) + ' 台）：第一次評測完成後換成評測結果。' :
 			au ? (au.source === 'chain' ? '自動上游來自上游黑潮 ' : '自動上游來自 ') + fmtTime(au.generatedAt) + ' 的評測（' + fmtNum(au.count) + ' 台）' +
 			(au.source === 'chain' ? '，是串接的共用結果。' : '。') : '還沒有每日評測結果，暫時使用固定上游與備援。';
+		controlLine(au);
 		tableRows($('st-up').tBodies[0], (st.upstreams || []).map(function (u) {
 			var n = (u.ok || 0) + (u.fail || 0), rate = n ? u.ok / n : null, h;
 			if (u.benched) h = badge('從未成功，先不用', 'warn');
@@ -677,8 +697,9 @@
 			else if (rate >= 0.9) h = badge('正常 ' + Math.round(rate * 100) + '%', 'ok');
 			else if (rate >= 0.5) h = badge('不穩 ' + Math.round(rate * 100) + '%', 'warn');
 			else h = badge('異常 ' + Math.round(rate * 100) + '%', 'err');
-			// 選上的原因；上游所在地區（3.4.0，評測判斷的國別）放在原因旁邊
-			var why = [u.reason, u.region].filter(function (x) { return !!x; }).join(' · ');
+			// 選上的原因；上游所在地區放在原因旁邊（3.5.0：國別是 IP 的註冊地，標成「註冊地 GB」「鄰近（註冊地 GB）」，ui-core.js 的 regionLabel）
+			var place = typeof core.regionLabel === 'function' ? core.regionLabel(u) : u.region;
+			var why = [u.reason, place].filter(function (x) { return !!x; }).join(' · ');
 			var role = (ROLE[u.role] || u.role) + (why ? '（' + why + '）' : '') + (u.via === 'interceptor' ? ' · 經由攔截者' : '');
 			return [{ text: u.id, cls: 'mono' }, role, { text: fmtNum(u.ok), cls: 'num' }, { text: fmtNum(u.fail), cls: 'num' }, { text: u.avgMs != null ? u.avgMs + ' ms' : '-', cls: 'num' }, h];
 		}), 6);

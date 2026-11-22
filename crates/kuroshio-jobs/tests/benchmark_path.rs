@@ -396,7 +396,7 @@ async fn protected_control_group() {
     assert!(csv.contains(&format!("{blocker},udp,ads,detected,封殺 cdn.beta.com")), "{csv}");
     let log = std::fs::read_to_string(root.join("persist/benchmark-last/judge.log")).unwrap();
     assert!(
-        log.contains("對照組 4") && log.contains("[對照組] 4 台：判出過濾 2、沒判出 2、沒測到 0"),
+        log.contains("對照組 4") && log.contains("[對照組] 4 台：判出過濾 2（資格賽網域被擋 0）、沒判出 2、沒測到 0、回歸 0"),
         "{log}"
     );
 }
