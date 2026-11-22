@@ -676,6 +676,9 @@ impl Srv {
             tier: self.tag.tier.name(),
             op: self.tag.op.clone(),
             excluded: self.never_ok,
+            // compute() 裡用台灣網段算（3.5.0 B5）
+            tw_rate: None,
+            ecs: self.tag.ecs,
         }
     }
 }
@@ -1653,7 +1656,17 @@ impl Benchmark {
         drop(universe);
         let opts = cfg.select.clone();
         let want_reports = out_dir.is_some();
-        let calc = tokio::task::spawn_blocking(move || compute(scored_list, scored, total, &opts, want_reports, eliminated)).await?;
+        let tw = self.tw.clone();
+        let calc = tokio::task::spawn_blocking(move || compute(scored_list, scored, total, &opts, want_reports, eliminated, tw.as_deref()))
+            .await?;
+        match calc.tw_domains {
+            Some(n) if n >= select::TW_RATE_MIN_DOMAINS => jinfo!(
+                journal,
+                "  台灣率：{n} 個網域至少有一台回過台灣節點（分母）；覆蓋差在 10% 以內時先挑台灣率高的"
+            ),
+            Some(n) => jinfo!(journal, "  台灣率：只有 {n} 個網域有台灣節點，樣本太少，不算"),
+            None => {}
+        }
 
         let selected: Vec<Value> = calc
             .selection
@@ -1661,7 +1674,7 @@ impl Benchmark {
             .iter()
             .map(|p| {
                 let s = &calc.finals[p.idx];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near, "tier": s.tier, "op": s.op })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
             })
             .collect();
         // 候補（3.5.0 A7）：沒選上、但合格的前幾台（依速度）；執行時可用的自動上游不夠時依序補上
@@ -1670,7 +1683,7 @@ impl Benchmark {
             .iter()
             .map(|&i| {
                 let s = &calc.finals[i];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": 0, "reason": "候補", "region": s.region, "near": s.near, "tier": s.tier, "op": s.op })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": 0, "reason": "候補", "region": s.region, "near": s.near, "tier": s.tier, "op": s.op, "twRate": s.tw_rate.map(|r| fixed_num(r as f64, 3)), "ecs": s.ecs })
             })
             .collect();
         let pinned: Vec<Value> = calc
@@ -2140,6 +2153,8 @@ impl CollectJob {
 struct Calc {
     /// 依延遲排序
     finals: Vec<Scored>,
+    /// 台灣率的分母（至少有一台回過台灣 IP 的網域數）；沒有台灣網段資料是 None
+    tw_domains: Option<usize>,
     selection: select::Selection,
     /// 候補（`finals` 的位置）
     spares: Vec<usize>,
@@ -2153,8 +2168,14 @@ fn compute(
     opts: &SelectOpts,
     want_reports: bool,
     eliminated: Vec<(String, &'static str, String)>,
+    tw: Option<&crate::geo::TwIp>,
 ) -> Calc {
     select::extended_metrics(&mut finals, scored_domains);
+    // 台灣率（3.5.0 B5）：台灣網段讀不到時不算，選擇跟 3.4.4 一樣
+    let tw_domains = tw.map(|t| {
+        let nets = t.all();
+        select::tw_rates(&mut finals, |ip| nets.contains(IpAddr::V4(Ipv4Addr::from(ip))))
+    });
     finals.sort_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap_or(std::cmp::Ordering::Equal));
     let refs: Vec<&Scored> = finals.iter().collect();
     let asn_best = select::best_per_asn(&refs);
@@ -2186,6 +2207,7 @@ fn compute(
     }
     Calc {
         finals,
+        tw_domains,
         selection,
         spares,
         reports,

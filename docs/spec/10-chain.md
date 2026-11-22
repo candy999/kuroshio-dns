@@ -738,6 +738,8 @@ ip-api 查不到（離線、被限速）時只靠 `tw-ip.json` 與延遲，功�
 
 `coverage_region = any` 時跟 3.3.7 一樣（一輪、不分遠近）。
 
+台灣率（3.5.0）：兩輪的每一步，新增覆蓋差在 10% 以內的候選裡先挑台灣率高的（答案本來就是台灣節點的網域比例，評測時用台灣網段算）；差距更大時照舊，台數上限、覆蓋率目標、`near` 的分輪都不變。台灣網段讀不到、或有台灣節點的網域不到 10 個時不看，跟 3.4.4 一樣。
+
 | UCI（`config benchmark 'benchmark'`） | JSON | 預設 | 說明 |
 |---|---|---|---|
 | `coverage_region` | `benchmark.coverageRegion` | `near` | `near`／`any` |

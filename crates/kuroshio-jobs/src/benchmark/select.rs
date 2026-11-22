@@ -34,6 +34,40 @@ pub struct Scored {
     pub op: String,
     /// 今天不選（3.5.0 A7：執行時上線以來從未成功）：照測、照算覆蓋，只是不選、也不當候補
     pub excluded: bool,
+    /// 台灣率（3.5.0 B5）：答案裡有台灣網段 IP 的網域數 ÷「至少有一台倖存者回過台灣 IP 的網域」數；
+    /// 分母不到 [`TW_RATE_MIN_DOMAINS`] 或沒有台灣網段資料時是 None。只在「覆蓋」差不多時當決勝條件
+    pub tw_rate: Option<f32>,
+    /// 名單標記的 `ecs=1`（3.5.0 B5）：會帶 ECS。只輸出
+    pub ecs: bool,
+}
+
+/// 台灣率的分母（至少有一台倖存者回過台灣 IP 的網域）少於這個數就不算（樣本太少）
+pub const TW_RATE_MIN_DOMAINS: usize = 10;
+/// 「覆蓋」階段：新增覆蓋差在這個比例以內才看台灣率（10%）
+pub const TW_TIE_RATIO: f64 = 0.9;
+
+/// 算每台的台灣率（3.5.0 B5）。分母排除在台灣根本沒有節點的網站（沒有任何一台回過台灣 IP 的網域），
+/// 分母不到 [`TW_RATE_MIN_DOMAINS`] 時全部是 None。`is_tw`：這個 IPv4 在不在台灣網段。回傳分母
+pub fn tw_rates(servers: &mut [Scored], is_tw: impl Fn(u32) -> bool) -> usize {
+    let mut tw_domains: HashSet<u32> = HashSet::new();
+    let per: Vec<usize> = servers
+        .iter()
+        .map(|s| {
+            let mut n = 0;
+            for (d, ips) in &s.history {
+                if ips.iter().any(|ip| is_tw(*ip)) {
+                    tw_domains.insert(*d);
+                    n += 1;
+                }
+            }
+            n
+        })
+        .collect();
+    let denom = tw_domains.len();
+    for (s, n) in servers.iter_mut().zip(per) {
+        s.tw_rate = (denom >= TW_RATE_MIN_DOMAINS).then(|| n as f32 / denom as f32);
+    }
+    denom
 }
 
 /// 鄰近的四地
@@ -137,16 +171,28 @@ fn stable_sort_by_avg(list: &mut [usize], servers: &[&Scored]) {
 
 /// 貪婪選擇（同 2.x `greedy`）：回傳（選擇順序, 剩下的依延遲排序）
 pub fn greedy(servers: &[&Scored], total: usize, strategy: Strategy, pre: &HashSet<u64>) -> (Vec<Step>, Vec<usize>) {
+    greedy_inner(servers, total, strategy, pre, false)
+}
+
+/// `tw_tie`（3.5.0 B5，只用在選上游的「覆蓋」階段）：每一步新增覆蓋差在 10% 以內的候選裡，
+/// 台灣率比原本選到的高就改選它（台灣率高的有好幾台時，照原本的規則：新增多的、再快的）。
+/// 台灣率是 None（沒有台灣網段資料、樣本太少）時跟原本一模一樣；報表（`greedy_csv`）不用
+fn greedy_inner(servers: &[&Scored], total: usize, strategy: Strategy, pre: &HashSet<u64>, tw_tie: bool) -> (Vec<Step>, Vec<usize>) {
     let mut covered = pre.clone();
     let mut result = Vec::new();
     let mut cands: Vec<usize> = (0..servers.len()).collect();
+    let mut news: Vec<(usize, usize)> = Vec::new(); // (cands 位置, 新增數)
     while covered.len() < total {
         let mut best: Option<(usize, usize)> = None; // (cands 位置, 新增數)
+        news.clear();
         for (pos, &i) in cands.iter().enumerate() {
             let s = servers[i];
             let nw = s.items().filter(|k| !covered.contains(k)).count();
             if nw == 0 {
                 continue;
+            }
+            if tw_tie {
+                news.push((pos, nw));
             }
             let Some((bp, bn)) = best else {
                 best = Some((pos, nw));
@@ -161,7 +207,36 @@ pub fn greedy(servers: &[&Scored], total: usize, strategy: Strategy, pre: &HashS
                 best = Some((pos, nw));
             }
         }
-        let Some((bp, bn)) = best else { break };
+        let Some((mut bp, mut bn)) = best else { break };
+        if tw_tie && strategy == Strategy::Coverage {
+            // 新增覆蓋差在 10% 以內的（含原本選到的）裡，台灣率最高的比原本選到的高 → 在那幾台裡照原本的規則挑
+            if let Some(base) = servers[cands[bp]].tw_rate {
+                let close = |nw: usize| nw as f64 >= bn as f64 * TW_TIE_RATIO;
+                let top = news
+                    .iter()
+                    .filter(|(_, nw)| close(*nw))
+                    .filter_map(|(pos, _)| servers[cands[*pos]].tw_rate)
+                    .fold(base, f32::max);
+                if top > base {
+                    let mut pick: Option<(usize, usize)> = None;
+                    for &(pos, nw) in news
+                        .iter()
+                        .filter(|(pos, nw)| close(*nw) && servers[cands[*pos]].tw_rate == Some(top))
+                    {
+                        let better = match pick {
+                            None => true,
+                            Some((pp, pn)) => nw > pn || (nw == pn && servers[cands[pos]].avg < servers[cands[pp]].avg),
+                        };
+                        if better {
+                            pick = Some((pos, nw));
+                        }
+                    }
+                    if let Some(p) = pick {
+                        (bp, bn) = p;
+                    }
+                }
+            }
+        }
         let idx = cands.remove(bp);
         covered.extend(servers[idx].items());
         result.push(Step {
@@ -288,7 +363,7 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
                 break;
             }
             let refs: Vec<&Scored> = round.iter().map(|&i| finals[i]).collect();
-            let (steps, _) = greedy(&refs, total, Strategy::Coverage, &covered);
+            let (steps, _) = greedy_inner(&refs, total, Strategy::Coverage, &covered, true);
             for st in steps {
                 if done(selected.len(), covered.len()) {
                     break 'rounds;
@@ -370,13 +445,13 @@ pub fn greedy_csv(servers: &[&Scored], total: usize, strategy: Strategy) -> Stri
     csv
 }
 
-/// final_dns_smart.csv（`finals` 依延遲排序）。3.4.0 在最後加 `Region`、`Near` 兩欄、3.5.0 再加 `Tier`（舊的欄位順序不變）
+/// final_dns_smart.csv（`finals` 依延遲排序）。3.4.0 在最後加 `Region`、`Near` 兩欄、3.5.0 再加 `Tier`、`TW_Rate`（舊的欄位順序不變）
 pub fn final_csv(finals: &[&Scored]) -> String {
-    let mut csv = String::from("\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near,Tier\n");
+    let mut csv = String::from("\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near,Tier,TW_Rate\n");
     for (i, s) in finals.iter().enumerate() {
         let e = &s.ext;
         csv.push_str(&format!(
-            "{},{},{},\"{}\",{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},\"{}\",{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             i + 1,
             s.id,
             s.kind,
@@ -393,7 +468,8 @@ pub fn final_csv(finals: &[&Scored]) -> String {
             if s.pinned { "Y" } else { "" },
             s.region,
             if s.near { "Y" } else { "" },
-            s.tier
+            s.tier,
+            s.tw_rate.map(|r| pct(r as f64, 1)).unwrap_or_default()
         ));
     }
     csv
@@ -687,7 +763,118 @@ mod tests {
         s.tier = "A";
         let csv = final_csv(&[&s]);
         let mut lines = csv.lines();
-        assert!(lines.next().unwrap().ends_with(",Pinned,Region,Near,Tier"));
-        assert!(lines.next().unwrap().ends_with(",,JP,Y,A"));
+        assert!(lines.next().unwrap().ends_with(",Pinned,Region,Near,Tier,TW_Rate"));
+        assert!(lines.next().unwrap().ends_with(",,JP,Y,A,"));
+        s.tw_rate = Some(0.625);
+        assert!(final_csv(&[&s]).lines().nth(1).unwrap().ends_with(",,JP,Y,A,62.5%"));
+    }
+
+    /// 網域 d 的答案：`tw` 為真時是台灣網段（>= 1000），否則不是
+    fn ans(d: u32, tw: bool) -> (u32, u32) {
+        (d, if tw { 1000 + d } else { d + 1 })
+    }
+
+    #[test]
+    fn tw_rate_denominator_excludes_sites_without_tw_nodes() {
+        // 12 個網域有台灣節點（a 全部回台灣、b 一半）；另外 6 個網域在台灣根本沒有節點（誰都沒回過台灣 IP）
+        let a: Vec<(u32, u32)> = (0..12).map(|d| ans(d, true)).chain((20..26).map(|d| ans(d, false))).collect();
+        let b: Vec<(u32, u32)> = (0..12).map(|d| ans(d, d % 2 == 0)).chain((20..26).map(|d| ans(d, false))).collect();
+        let c: Vec<(u32, u32)> = (20..26).map(|d| ans(d, false)).collect();
+        let mut v = vec![
+            srv("a", "A__AS1", 10.0, &a),
+            srv("b", "B__AS2", 10.0, &b),
+            srv("c", "C__AS3", 10.0, &c),
+        ];
+        tw_rates(&mut v, |ip| ip >= 1000);
+        assert_eq!(v[0].tw_rate, Some(1.0), "分母是 12，不是 18");
+        assert_eq!(v[1].tw_rate, Some(0.5));
+        assert_eq!(v[2].tw_rate, Some(0.0));
+    }
+
+    #[test]
+    fn tw_rate_none_when_few_domains() {
+        let a: Vec<(u32, u32)> = (0..9).map(|d| ans(d, true)).chain((20..40).map(|d| ans(d, false))).collect();
+        let mut v = vec![srv("a", "A__AS1", 10.0, &a)];
+        tw_rates(&mut v, |ip| ip >= 1000);
+        assert_eq!(v[0].tw_rate, None, "分母只有 9 個網域");
+        // 沒有台灣網段資料：一律 None
+        tw_rates(&mut v, |_| false);
+        assert_eq!(v[0].tw_rate, None);
+    }
+
+    fn with_tw(mut s: Scored, r: Option<f32>) -> Scored {
+        s.tw_rate = r;
+        s
+    }
+
+    #[test]
+    fn tie_break_prefers_higher_tw_rate_only_within_ten_percent() {
+        let items = |base: u32, n: u32| -> Vec<(u32, u32)> { (0..n).map(|k| (1, base + k)).collect() };
+        let mk = |x_tw: f32, y_n: u32| {
+            let mut v = vec![
+                with_tw(srv("f", "F__AS1", 1.0, &[(0, 1)]), Some(0.1)),
+                with_tw(srv("x", "X__AS2", 10.0, &items(100, 10)), Some(x_tw)),
+                with_tw(srv("y", "Y__AS3", 20.0, &items(200, y_n)), Some(0.8)),
+                with_tw(srv("z", "Z__AS4", 5.0, &items(300, 8)), Some(0.9)),
+            ];
+            extended_metrics(&mut v, 10);
+            v
+        };
+        let o = SelectOpts {
+            max_n: 2,
+            ..Default::default()
+        };
+        let run = |v: &Vec<Scored>| {
+            let refs: Vec<&Scored> = v.iter().collect();
+            picks(&select(&refs, &best_per_asn(&refs), 100, &o))
+        };
+        // y 新增 9、x 新增 10：差在 10% 以內 → 台灣率高的 y；z 新增 8（差超過 10%）台灣率再高也不選
+        assert_eq!(run(&mk(0.2, 9)), vec![(0, 1, "最快"), (2, 9, "覆蓋")]);
+        // y 只有 8：差超過 10% → 照舊選新增最多的 x
+        assert_eq!(run(&mk(0.2, 8)), vec![(0, 1, "最快"), (1, 10, "覆蓋")]);
+        // x 的台灣率本來就最高 → 照舊
+        assert_eq!(run(&mk(0.95, 9)), vec![(0, 1, "最快"), (1, 10, "覆蓋")]);
+        // 報表的貪婪（greedy_csv）不看台灣率
+        let v = mk(0.2, 9);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let (steps, _) = greedy(&refs[1..], 100, Strategy::Coverage, &HashSet::new());
+        assert_eq!(steps[0].idx, 0, "x");
+    }
+
+    #[test]
+    fn no_tw_data_matches_previous_selection() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..300 {
+            let n = 2 + rnd(12) as usize;
+            let mut v: Vec<Scored> = (0..n)
+                .map(|i| {
+                    let items: Vec<(u32, u32)> = (0..rnd(12)).map(|_| (rnd(4) as u32, rnd(16) as u32)).collect();
+                    let mut s = srv(&format!("s{i}"), &format!("O{i}__AS{i}"), (rnd(30) * 10) as f64, &items);
+                    s.count = 9 + rnd(2) as usize;
+                    s
+                })
+                .collect();
+            extended_metrics(&mut v, 10);
+            v.sort_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap());
+            let refs: Vec<&Scored> = v.iter().collect();
+            let asn = best_per_asn(&refs);
+            let o = SelectOpts {
+                max_n: 1 + rnd(5) as usize,
+                min_auto: rnd(5) as usize,
+                ..Default::default()
+            };
+            let want = select_337(&refs, &asn, 60, &o);
+            // 沒有台灣網段資料（None）、或每台一樣：跟 3.3.7 逐項相同
+            assert_eq!(select(&refs, &asn, 60, &o), want, "第 {round} 組（None）");
+            let same: Vec<Scored> = v.iter().cloned().map(|s| with_tw(s, Some(0.5))).collect();
+            let refs2: Vec<&Scored> = same.iter().collect();
+            assert_eq!(select(&refs2, &asn, 60, &o), want, "第 {round} 組（一樣的台灣率）");
+        }
     }
 }

@@ -256,11 +256,16 @@ async fn upstreams_json_has_region() {
     let mut lines = csv.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near,Tier"
+        "\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near,Tier,TW_Rate"
     );
     let row = |id: &str| csv.lines().find(|l| l.split(',').nth(1) == Some(id)).unwrap().to_string();
-    assert!(row(&ids[1]).ends_with(",,TW,Y,B"), "{csv}");
-    assert!(row(&ids[3]).ends_with(",,US,,B"), "{csv}");
+    assert!(row(&ids[1]).ends_with(",,TW,Y,B,"), "{csv}");
+    assert!(row(&ids[3]).ends_with(",,US,,B,"), "{csv}");
+    // 台灣率（3.5.0 B5）：只有 2 個網域，樣本太少 → null；ecs 來自名單標記（沒寫是 false）
+    for x in state["selected"].as_array().unwrap() {
+        assert_eq!(x["twRate"], Value::Null, "{x}");
+        assert_eq!(x["ecs"], false, "{x}");
+    }
     let log = std::fs::read_to_string(out.join("judge.log")).unwrap();
     assert!(log.contains("覆蓋：鄰近 2 台、其他 2 台"), "{log}");
     // 快取：新查到的有 cc，答案的 /16（只在汙染判斷用到）不補查
@@ -372,5 +377,85 @@ async fn never_ok_excluded_from_selection_for_three_runs() {
     assert_eq!(*n, None);
     let l = Learn::load(&learn_file);
     assert_eq!(l.day, day_of(clock.now_ms() - 24 * 3600 * 1000));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 3.5.0 B5：網域夠多時寫出台灣率（台灣網段裡的答案 ÷ 有台灣節點的網域）；名單的 ecs=1 帶到結果
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tw_rate_written() {
+    // 12 個網域：每台回 93.1.k.n（tw_nets 裡）或 94.2.k.n；a 全部台灣、b 一半、c 都不是
+    async fn many(n: u8, tw_every: u8) -> SocketAddr {
+        // 不同的 /16：假 ip-api 給不同的業者（每個 ASN 只留一台）
+        let sock = Arc::new(UdpSocket::bind(format!("127.{}.0.9:0", 5 + n)).await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            loop {
+                let Ok((len, peer)) = sock.recv_from(&mut buf).await else { break };
+                let Ok(q) = Message::parse(&buf[..len]) else { continue };
+                let name = q.question().map(|x| x.name.clone()).unwrap_or_default();
+                let mut r = Message::response_to(&q, 0);
+                if name == "one.one.one.one" {
+                    r.answers.push(Record::a(&name, 60, Ipv4Addr::new(1, 1, 1, 1)));
+                } else if let Some(k) = name
+                    .strip_prefix('d')
+                    .and_then(|x| x.split('.').next())
+                    .and_then(|x| x.parse::<u8>().ok())
+                {
+                    let tw = tw_every > 0 && k % tw_every == 0;
+                    r.answers.push(Record::a(
+                        &name,
+                        60,
+                        Ipv4Addr::new(if tw { 93 } else { 94 }, if tw { 1 } else { 2 }, k, n),
+                    ));
+                } else {
+                    r.rcode = 3;
+                }
+                let _ = sock.send_to(&r.encode(), peer).await;
+            }
+        });
+        addr
+    }
+    let (root, p, _) = setup("twrate").await;
+    let a = many(1, 1).await.to_string();
+    let b = many(2, 2).await.to_string();
+    let c = many(3, 0).await.to_string();
+    std::fs::write(p.list_dir.join("iplist.txt"), format!("{a}\n{b}\n{c}\n")).unwrap();
+    let web: Vec<String> = (0..12).map(|k| format!("d{k}.example.com")).collect();
+    std::fs::write(p.list_dir.join("web.txt"), web.join("\n")).unwrap();
+    std::fs::write(p.list_dir.join("dohlist.txt"), "").unwrap();
+    let tw = {
+        let j = r#"{"generatedAt":"2026-11-01","groups":[{"id":"test","name":"測試","v4":["93.1.0.0/16"]}]}"#.as_bytes();
+        Some(Arc::new(TwIp::parse(j).unwrap()))
+    };
+    let (api, _) = fake_ip_api().await;
+    let ip_api = IpApi::new("127.0.0.1", api.port(), Duration::from_millis(10));
+    let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(cfg("any")));
+    let state = Benchmark::with(p.clone(), Arc::new(LocalOnly), Arc::new(ip_api))
+        .with_tw(tw)
+        .run(&ctx)
+        .await
+        .unwrap();
+    let rate = |id: &str| {
+        state["selected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(state["spares"].as_array().unwrap())
+            .find(|x| x["id"] == id)
+            .and_then(|x| x["twRate"].as_f64())
+    };
+    assert_eq!(rate(&a), Some(1.0), "{state:#}");
+    assert_eq!(rate(&b), Some(0.5), "{state:#}");
+    assert_eq!(rate(&c), Some(0.0), "{state:#}");
+    let out = p.out_root.clone().unwrap().join(state["date"].as_str().unwrap());
+    let log = std::fs::read_to_string(out.join("judge.log")).unwrap();
+    assert!(log.contains("台灣率：12 個網域至少有一台回過台灣節點"), "{log}");
+    let csv = std::fs::read_to_string(out.join("final_dns_smart.csv")).unwrap();
+    assert!(
+        csv.lines().any(|l| l.contains(&format!(",{a},")) && l.ends_with(",100.0%")),
+        "{csv}"
+    );
+    assert!(csv.lines().any(|l| l.contains(&format!(",{b},")) && l.ends_with(",50.0%")), "{csv}");
     let _ = std::fs::remove_dir_all(&root);
 }

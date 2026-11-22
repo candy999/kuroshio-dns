@@ -881,7 +881,10 @@
         box.appendChild(el('div', 'muted', `${fmtTime(b.generatedAt)} · 測試 ${b.counts.total} 台 · 存活 ${b.counts.survivors} · 淘汰 ${b.counts.eliminated} · 涵蓋率 ${pct1(b.coverage)}`));
         const t = el('table'); const w = el('div', 'tbl kd-mt8'); w.appendChild(t); box.appendChild(w);
         table(t, [...b.selected.map(x => ({ ...x, role: '自動' })), ...b.pinned.map(x => ({ ...x, role: '固定', type: '', newItems: x.coverageItems, reason: x.issues.length ? x.issues.length + ' 個問題' : '' }))], [
-          { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 }, { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
+          { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 },
+          // 台灣率（3.5.0）：CDN 網域的答案本來就是台灣節點的比例（只在覆蓋差不多時當決勝條件）；ECS＝名單標記會帶 ECS
+          { h: '台灣率', v: r => (r.twRate == null ? '—' : pct1(r.twRate)) + (r.ecs ? ' · ECS' : ''), num: 1 },
+          { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
         ]);
         if (b.blocked && b.blocked.length) box.appendChild(el('div', 'muted', `封殺紀錄 ${b.blocked.length} 筆（例：${b.blocked.slice(0, 3).map(x => x.dns + ' → ' + x.domain).join('、')}）`));
         // 對照組（3.5.0）：有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選。摺疊起來，點開才看每一台
