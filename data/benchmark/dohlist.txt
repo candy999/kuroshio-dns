@@ -2,10 +2,10 @@
 # 格式：一行一個 https://主機/路徑；# 開頭是註解，網址後面的文字會被忽略；每一筆也會自動以 HTTP/3（h3://）再測一次，不必另列 DoH3
 # 2026-11-22 重新整理（3.4.2）：在沒有攔截的線路上（台灣 HiNet PPPoE 直接撥號）重測黑潮原本的名單與 HaGeZi 的 DoH 清單，
 #   3 輪都通過、答案正確、「不存在」沒被改寫、不擋廣告／成人／惡意網站的才收。
-#   tier=A：經營者明確（知名的公共 DNS）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
+#   tier=A：經營者明確（知名的公共 DNS、國家級電信商自己的伺服器，carrier=1）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
 #   連不上的、有改寫的不在這裡；有過濾的大型 DNS 是對照組，另外列在 protected.txt（照常評測、永遠不選）。
 #   op＝AS 名稱（租機房的經營者會是機房的名字）；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
-# 共 373 筆：A 155、B 218
+# 共 350 筆：A 134、B 216
 
 # ---- A 級 ----
 https://dns.hinet.net/dns-query  # tier=A op=Data_Communication_Business_Group ms=3.1 src=kuroshio-default checked=2026-11-22
@@ -28,11 +28,11 @@ https://8888.google/dns-query  # tier=A op=Google_LLC ms=8.5 ecs=1 src=kuroshio-
 https://mozilla.cloudflare-dns.com/dns-query  # tier=A op=Cloudflare ms=8.7 src=kuroshio-default checked=2026-11-22
 https://dns.google/dns-query  # tier=A op=Google_LLC ms=9.2 ecs=1 src=kuroshio-default checked=2026-11-22
 https://dns.twnic.tw/dns-query  # tier=A op=Taiwan_Network_Information_Center ms=9.8 src=kuroshio-default checked=2026-11-22
-https://rethinkdns.com/dns-query  # tier=A op=Cloudflare ms=11.2 src=kuroshio-default checked=2026-11-22
 https://tor.cloudflare-dns.com/dns-query  # tier=A op=Cloudflare ms=12.3 src=kuroshio-default checked=2026-11-22
-https://v.recipes/dns-query  # tier=A op=Cloudflare ms=19.7 src=kuroshio-default checked=2026-11-22
 https://unfiltered.adguard-dns.com/dns-query  # tier=A op=AdGuard_Software_Limited ms=21.2 ecs=1 src=kuroshio-default checked=2026-11-22
 https://dns-unfiltered.adguard.com/dns-query  # tier=A op=AdGuard_Software_Limited ms=21.4 ecs=1 src=kuroshio-default checked=2026-11-22
+https://doh.pub/dns-query  # tier=A op=Tencent_Building ms=23.6 ecs=1 src=kuroshio-default checked=2026-11-22
+https://dns.pub/dns-query  # tier=A op=Tencent_Building ms=25.5 ecs=1 src=kuroshio-default checked=2026-11-22
 https://hkg02.dnscry.pt/dns-query  # tier=A op=Prinode_AB ms=26.0 src=kuroshio-default checked=2026-11-22
 https://hkg03.dnscry.pt/dns-query  # tier=A op=Tele_Asia_Limited ms=26.1 src=kuroshio-default checked=2026-11-22
 https://hk-hkg.doh.sb/dns-query  # tier=A op=xTom ms=26.8 src=kuroshio-default checked=2026-11-22
@@ -41,23 +41,22 @@ https://hkg01.dnscry.pt/dns-query  # tier=A op=LEASEWEB_HONG_KONG_LIMITED ms=28.
 https://dns.sb/dns-query  # tier=A op=SB_Professional_Services ms=34.1 src=kuroshio-default checked=2026-11-22
 https://public-dns-b.dns.sb/dns-query  # tier=A op=SB_Professional_Services ms=34.2 src=kuroshio-default checked=2026-11-22
 https://public.dns.iij.jp/dns-query  # tier=A op=Internet_Initiative_Japan_Inc. ms=35.6 src=kuroshio-default checked=2026-11-22
-https://jp-to.foxyfy.net/dns-query  # tier=A op=xTom_Japan_Corporation ms=36.2 src=hagezi checked=2026-11-22
 https://jp-kix.doh.sb/dns-query  # tier=A op=xTom ms=43.1 src=kuroshio-default checked=2026-11-22
+https://doh.sb/dns-query  # tier=A op=SB_Professional_Services ms=44.6 src=kuroshio-default checked=2026-11-22
 https://public-dns-a.dns.sb/dns-query  # tier=A op=SB_Professional_Services ms=44.9 src=kuroshio-default checked=2026-11-22
 https://tyo02.dnscry.pt/dns-query  # tier=A op=WebHorizon_Internet_Services ms=52.4 src=kuroshio-default checked=2026-11-22
 https://doh.dns.sb/dns-query  # tier=A op=xTom_Japan_Corporation ms=53.2 src=kuroshio-default checked=2026-11-22
-https://dns.gamban.com/dns-query  # tier=A op=Cloudflare ms=53.3 src=kuroshio-default checked=2026-11-22
-https://basic.rethinkdns.com/dns-query  # tier=A op=Cloudflare ms=58.6 src=kuroshio-default checked=2026-11-22
-https://sky.rethinkdns.com/dns-query  # tier=A op=Cloudflare ms=59.8 src=kuroshio-default checked=2026-11-22
 https://sel02.dnscry.pt/dns-query  # tier=A op=HostHatch_Korea ms=63.6 src=kuroshio-default checked=2026-11-22
+https://kr-sel.doh.sb/dns-query  # tier=A op=Amazon.com ms=64.8 src=kuroshio-default checked=2026-11-22
 https://sin02.dnscry.pt/dns-query  # tier=A op=WebHorizon_Internet_Services ms=70.7 src=kuroshio-default checked=2026-11-22
+https://sm2.doh.pub/dns-query  # tier=A op=Shenzhen_Tencent_Computer_Systems_Compan ms=71.7 ecs=1 src=kuroshio-default checked=2026-11-22
 https://jkt01.dnscry.pt/dns-query  # tier=A op=PT_Industri_Kreatif_Digital ms=77.8 src=kuroshio-default checked=2026-11-22
+https://in-blr.doh.sb/dns-query  # tier=A op=DigitalOcean ms=99.5 src=kuroshio-default checked=2026-11-22
 https://blr01.dnscry.pt/dns-query  # tier=A op=RACKVOLT_CLOUD_SOLUTIONS_PRIVATE_LIMITED ms=104.0 src=kuroshio-default checked=2026-11-22
 https://sin03.dnscry.pt/dns-query  # tier=A op=Host_Universal_Pty_Ltd ms=116.0 src=kuroshio-default checked=2026-11-22
 https://sjc01.dnscry.pt/dns-query  # tier=A op=EGIHosting ms=134.2 src=kuroshio-default checked=2026-11-22
 https://sjc02.dnscry.pt/dns-query  # tier=A op=DESIVPS ms=135.4 src=kuroshio-default checked=2026-11-22
 https://phx01.dnscry.pt/dns-query  # tier=A op=tzulo ms=144.4 src=kuroshio-default checked=2026-11-22
-https://doh.disconnect.app/dns-query  # tier=A op=Cloudflare ms=144.6 src=kuroshio-default checked=2026-11-22
 https://lax01.dnscry.pt/dns-query  # tier=A op=EXTRAVM_LLC ms=147.6 src=kuroshio-default checked=2026-11-22
 https://mel01.dnscry.pt/dns-query  # tier=A op=Alpha_Layer_Pty_Ltd ms=149.6 src=kuroshio-default checked=2026-11-22
 https://sea01.dnscry.pt/dns-query  # tier=A op=Shock_Hosting_LLC ms=150.6 src=kuroshio-default checked=2026-11-22
@@ -66,48 +65,37 @@ https://pdx01.dnscry.pt/dns-query  # tier=A op=Hosteons_Pte._Ltd. ms=152.1 src=k
 https://lax02.dnscry.pt/dns-query  # tier=A op=GWY_IT_PTY_LTD ms=152.7 src=kuroshio-default checked=2026-11-22
 https://au-syd.doh.sb/dns-query  # tier=A op=xTom_Pty_Ltd ms=155.2 src=kuroshio-default checked=2026-11-22
 https://syd02.dnscry.pt/dns-query  # tier=A op=Alpha_Layer_Pty_Ltd ms=157.1 src=kuroshio-default checked=2026-11-22
-https://bravedns.com/dns-query  # tier=A op=Cloudflare ms=158.3 src=kuroshio-default checked=2026-11-22
 https://ogd01.dnscry.pt/dns-query  # tier=A op=WebNX ms=159.2 src=hagezi checked=2026-11-22
-https://basic.bravedns.com/dns-query  # tier=A op=Cloudflare ms=159.5 src=kuroshio-default checked=2026-11-22
 https://geg01.dnscry.pt/dns-query  # tier=A op=Redoubt_Networks ms=162.0 src=kuroshio-default checked=2026-11-22
-https://dns.bmwhocking.com/dns-query  # tier=A op=Cloudflare ms=163.5 ecs=1 src=kuroshio-default checked=2026-11-22
 https://den01.dnscry.pt/dns-query  # tier=A op=Shock_Hosting_LLC ms=164.0 src=hagezi checked=2026-11-22
-https://bazooki-infra.dev/dns-query  # tier=A op=Cloudflare ms=165.3 ecs=1 src=kuroshio-default checked=2026-11-22
 https://yyc01.dnscry.pt/dns-query  # tier=A op=Free_Range_Cloud_Hosting_Inc. ms=165.4 src=hagezi checked=2026-11-22
-https://dns.mayx.eu.org/dns-query  # tier=A op=Cloudflare ms=165.5 ecs=1 src=kuroshio-default checked=2026-11-22
 https://llk01.dnscry.pt/dns-query  # tier=A op=IncogNet_LLC ms=167.3 src=kuroshio-default checked=2026-11-22
-https://xn--durhre-yxa.de/dns-query  # tier=A op=Cloudflare ms=168.9 ecs=1 src=kuroshio-default checked=2026-11-22
-https://dns.paulo.nom.za/dns-query  # tier=A op=Cloudflare ms=169.5 ecs=1 src=kuroshio-default checked=2026-11-22
-https://cn-dns.hashtable.io/dns-query  # tier=A op=Cloudflare ms=171.1 ecs=1 src=hagezi checked=2026-11-22
 https://ord01.dnscry.pt/dns-query  # tier=A op=GigeNET ms=171.5 src=kuroshio-default checked=2026-11-22
-https://dns.xuming.studio/dns-query  # tier=A op=Cloudflare ms=172.3 src=kuroshio-default checked=2026-11-22
 https://las01.dnscry.pt/dns-query  # tier=A op=Hostodo ms=173.2 src=hagezi checked=2026-11-22
 https://mci01.dnscry.pt/dns-query  # tier=A op=Rozint ms=173.3 src=hagezi checked=2026-11-22
-https://regiopolis.cloud/dns-query  # tier=A op=Cloudflare ms=175.9 ecs=1 src=kuroshio-default checked=2026-11-22
 https://tsm01.dnscry.pt/dns-query  # tier=A op=Brownrice_Internet ms=176.0 src=kuroshio-default checked=2026-11-22
 https://dfw02.dnscry.pt/dns-query  # tier=A op=LINVEO ms=180.8 src=hagezi checked=2026-11-22
 https://ind01.dnscry.pt/dns-query  # tier=A op=Unlimited_Net ms=184.2 src=hagezi checked=2026-11-22
 https://mia01.dnscry.pt/dns-query  # tier=A op=EXTRAVM_LLC ms=185.0 src=hagezi checked=2026-11-22
 https://bei01.dnscry.pt/dns-query  # tier=A op=Psychz_Networks ms=185.5 src=hagezi checked=2026-11-22
-https://dns.guard.io/dns-query  # tier=A op=Google_LLC ms=185.5 ecs=1 src=hagezi checked=2026-11-22
 https://slc01.dnscry.pt/dns-query  # tier=A op=Hosteons_Pte._Ltd. ms=186.4 src=kuroshio-default checked=2026-11-22
 https://abe01.dnscry.pt/dns-query  # tier=A op=IncogNet_LLC ms=186.5 src=kuroshio-default checked=2026-11-22
 https://ott01.dnscry.pt/dns-query  # tier=A op=LINVEO ms=188.3 src=hagezi checked=2026-11-22
 https://fnt01.dnscry.pt/dns-query  # tier=A op=Interconnecx ms=188.4 src=kuroshio-default checked=2026-11-22
 https://dtw01.dnscry.pt/dns-query  # tier=A op=Hostodo ms=189.2 src=kuroshio-default checked=2026-11-22
 https://yyz01.dnscry.pt/dns-query  # tier=A op=Amanah_Tech_Inc. ms=189.5 src=hagezi checked=2026-11-22
-https://doh.maskab.com/dns-query  # tier=A op=Cloudflare ms=193.5 ecs=1 src=kuroshio-default checked=2026-11-22
+https://ca-yyc.doh.sb/dns-query  # tier=A op=The_Constant_Company ms=190.0 src=kuroshio-default checked=2026-11-22
 https://jax01.dnscry.pt/dns-query  # tier=A op=Shock_Hosting_LLC ms=195.4 src=hagezi checked=2026-11-22
 https://ymq01.dnscry.pt/dns-query  # tier=A op=Hive_Data_Center_Inc. ms=197.5 src=hagezi checked=2026-11-22
 https://tpa01.dnscry.pt/dns-query  # tier=A op=Solid_Systems_LLC ms=199.0 src=kuroshio-default checked=2026-11-22
 https://grr01.dnscry.pt/dns-query  # tier=A op=RackGenius ms=201.6 src=hagezi checked=2026-11-22
 https://nyc01.dnscry.pt/dns-query  # tier=A op=EXTRAVM_LLC ms=201.9 src=hagezi checked=2026-11-22
-https://arashi.eu.org/dns-query  # tier=A op=Cloudflare ms=205.3 ecs=1 src=kuroshio-default checked=2026-11-22
 https://ped01.dnscry.pt/dns-query  # tier=A op=? ms=205.4 src=hagezi checked=2026-11-22
 https://atl01.dnscry.pt/dns-query  # tier=A op=PrivateSystems_Networks ms=208.1 src=kuroshio-default checked=2026-11-22
 https://iah01.dnscry.pt/dns-query  # tier=A op=Snaju_Development ms=215.5 src=hagezi checked=2026-11-22
 https://yhz01.dnscry.pt/dns-query  # tier=A op=Free_Range_Cloud_Hosting_Inc. ms=217.1 src=hagezi checked=2026-11-22
 https://waw02.dnscry.pt/dns-query  # tier=A op=MEVSPACE_sp._z_o.o. ms=219.3 src=kuroshio-default checked=2026-11-22
+https://dns.njal.la/dns-query  # tier=A op=Materialism_s.r.l. ms=220.4 src=kuroshio-default checked=2026-11-22
 https://huv01.dnscry.pt/dns-query  # tier=A op=Internetport_Sweden_AB ms=223.6 src=hagezi checked=2026-11-22
 https://ams01.dnscry.pt/dns-query  # tier=A op=Gigahost_AS ms=227.6 src=kuroshio-default checked=2026-11-22
 https://trf01.dnscry.pt/dns-query  # tier=A op=Gigahost_AS ms=227.7 src=kuroshio-default checked=2026-11-22
@@ -117,6 +105,9 @@ https://dus02.dnscry.pt/dns-query  # tier=A op=Felix_Gassan ms=243.0 src=hagezi 
 https://muc01.dnscry.pt/dns-query  # tier=A op=Webhosting24_GmbH ms=243.6 src=kuroshio-default checked=2026-11-22
 https://dus03.dnscry.pt/dns-query  # tier=A op=Luca_Heidemann ms=243.6 src=hagezi checked=2026-11-22
 https://zrh01.dnscry.pt/dns-query  # tier=A op=Private_Layer_INC ms=248.0 src=hagezi checked=2026-11-22
+https://dot.ffmuc.net/dns-query  # tier=A op=Freie_Netze_Muenchen_e.V. ms=250.4 src=kuroshio-default checked=2026-11-22
+https://doh.libredns.gr/dns-query  # tier=A op=Hetzner_Online_GmbH ms=252.0 src=kuroshio-default checked=2026-11-22
+https://doh.ffmuc.net/dns-query  # tier=A op=Freie_Netze_Muenchen_e.V. ms=259.2 src=kuroshio-default checked=2026-11-22
 https://ams03.dnscry.pt/dns-query  # tier=A op=IncogNet_LLC ms=259.4 src=hagezi checked=2026-11-22
 https://cvt01.dnscry.pt/dns-query  # tier=A op=Shock_Hosting_LLC ms=262.3 src=kuroshio-default checked=2026-11-22
 https://sto02.dnscry.pt/dns-query  # tier=A op=No_ACK_Group_Holding_AB ms=263.1 src=hagezi checked=2026-11-22
@@ -134,43 +125,31 @@ https://dub01.dnscry.pt/dns-query  # tier=A op=MVPS_LTD ms=281.0 src=kuroshio-de
 https://hel01.dnscry.pt/dns-query  # tier=A op=FlokiNET_ehf ms=281.1 src=kuroshio-default checked=2026-11-22
 https://de-dus.doh.sb/dns-query  # tier=A op=xTom_GmbH ms=283.8 src=kuroshio-default checked=2026-11-22
 https://mrs01.dnscry.pt/dns-query  # tier=A op=Ouiheberg_SARL ms=284.2 src=hagezi checked=2026-11-22
-https://ns.net.kg/dns-query  # tier=A op=Cloudflare ms=284.5 ecs=1 src=hagezi checked=2026-11-22
 https://vno01.dnscry.pt/dns-query  # tier=A op=Castlegem_SRL ms=284.7 src=kuroshio-default checked=2026-11-22
 https://cph01.dnscry.pt/dns-query  # tier=A op=Stacket_Group_ApS ms=286.5 src=kuroshio-default checked=2026-11-22
 https://lis02.dnscry.pt/dns-query  # tier=A op=Netureza ms=286.5 src=hagezi checked=2026-11-22
 https://sto01.dnscry.pt/dns-query  # tier=A op=Hollander_&_Jacobsen_UG_(haftungsbeschra ms=292.7 src=kuroshio-default checked=2026-11-22
-https://de-fra-w-f-3.nashkan.net/dns-query  # tier=A op=xTom_GmbH ms=293.1 src=hagezi checked=2026-11-22
-https://de-fra-w-f-1.nashkan.net/dns-query  # tier=A op=xTom_GmbH ms=295.9 src=hagezi checked=2026-11-22
 https://de-fra.doh.sb/dns-query  # tier=A op=xTom_GmbH ms=297.3 src=kuroshio-default checked=2026-11-22
 https://iev02.dnscry.pt/dns-query  # tier=A op=South_Park_Networks_LLC ms=298.2 src=hagezi checked=2026-11-22
 https://omr01.dnscry.pt/dns-query  # tier=A op=Andrei_Tiberiu_Holt ms=298.7 src=hagezi checked=2026-11-22
 https://fra02.dnscry.pt/dns-query  # tier=A op=Owl_Limited ms=299.4 src=kuroshio-default checked=2026-11-22
-https://de-fra-w-f-2.nashkan.net/dns-query  # tier=A op=xTom_GmbH ms=300.0 src=hagezi checked=2026-11-22
 https://prg01.dnscry.pt/dns-query  # tier=A op=ROUTE_95_LLC ms=300.3 src=hagezi checked=2026-11-22
 https://tia01.dnscry.pt/dns-query  # tier=A op=Castlegem_SRL ms=305.2 src=hagezi checked=2026-11-22
 https://gdn01.dnscry.pt/dns-query  # tier=A op=ROUTE_95_LLC ms=306.0 src=hagezi checked=2026-11-22
 https://mru02.dnscry.pt/dns-query  # tier=A op=Rogers_Capital_Technology_Services_Ltd ms=306.7 src=hagezi checked=2026-11-22
 https://ee-tll.doh.sb/dns-query  # tier=A op=xTom_GmbH ms=306.9 src=kuroshio-default checked=2026-11-22
 https://nue01.dnscry.pt/dns-query  # tier=A op=netcup_GmbH ms=311.4 src=kuroshio-default checked=2026-11-22
-https://ublockdns.com/dns-query  # tier=A op=Cloudflare ms=312.5 ecs=1 src=hagezi checked=2026-11-22
-https://adguard-kartoffel.zernico.de/dns-query  # tier=A op=Cloudflare ms=313.7 src=kuroshio-default checked=2026-11-22
-https://adg.3k.work/dns-query  # tier=A op=Cloudflare ms=314.6 src=hagezi checked=2026-11-22
-https://doh.greenwood.eu.org/dns-query  # tier=A op=Cloudflare ms=318.2 src=hagezi checked=2026-11-22
 https://tsr01.dnscry.pt/dns-query  # tier=A op=UNMANAGED_LTD ms=319.8 src=hagezi checked=2026-11-22
-https://doh.fullhosting.ru/dns-query  # tier=A op=Cloudflare ms=327.3 src=hagezi checked=2026-11-22
-https://dns.enzomtp.party/dns-query  # tier=A op=Cloudflare ms=329.9 src=hagezi checked=2026-11-22
-https://dns.opendoh.com/dns-query  # tier=A op=Cloudflare ms=330.1 src=hagezi checked=2026-11-22
-https://doh.tiarap.org/dns-query  # tier=A op=Cloudflare ms=333.3 src=kuroshio-default checked=2026-11-22
 https://zal01.dnscry.pt/dns-query  # tier=A op=Zappie_Host_LLC ms=333.8 src=hagezi checked=2026-11-22
 https://jnb02.dnscry.pt/dns-query  # tier=A op=Web_Squad_Connect_(Pty)_Ltd ms=416.6 src=hagezi checked=2026-11-22
 
 # ---- B 級 ----
-https://doh.360.cn/dns-query  # tier=B op=Beijing_Qihu_Technology_Company_Limited ms=22.9 src=kuroshio-default checked=2026-11-22
-https://doh.pub/dns-query  # tier=B op=Tencent_Building ms=23.6 ecs=1 src=kuroshio-default checked=2026-11-22
-https://dns.pub/dns-query  # tier=B op=Tencent_Building ms=25.5 ecs=1 src=kuroshio-default checked=2026-11-22
+https://rethinkdns.com/dns-query  # tier=B op=Cloudflare ms=11.2 src=kuroshio-default checked=2026-11-22
+https://v.recipes/dns-query  # tier=B op=Cloudflare ms=19.7 src=kuroshio-default checked=2026-11-22
 https://mresquire.com/dns-query  # tier=B op=Alibaba_(US)_Technology_Co. ms=26.3 ecs=1 src=hagezi checked=2026-11-22
 https://sunnygyl.com/dns-query  # tier=B op=Alibaba_(US)_Technology_Co. ms=26.6 ecs=1 src=hagezi checked=2026-11-22
 https://dns.yunzheng.space/dns-query  # tier=B op=zhenyun_sun ms=27.3 src=kuroshio-default checked=2026-11-22
+https://jp-to.foxyfy.net/dns-query  # tier=B op=xTom_Japan_Corporation ms=36.2 src=hagezi checked=2026-11-22
 https://dns.zui.lol/dns-query  # tier=B op=DigiRock ms=36.2 ecs=1 src=hagezi checked=2026-11-22
 https://dns.nodoa.me/dns-query  # tier=B op=Amazon.com ms=36.3 src=kuroshio-default checked=2026-11-22
 https://doh.armadillodns.net/dns-query  # tier=B op=DigiRock ms=36.4 ecs=1 src=hagezi checked=2026-11-22
@@ -178,22 +157,19 @@ https://hydra.plan9-ns1.com/dns-query  # tier=B op=DigiRock ms=36.6 ecs=1 src=ha
 https://dns.labnekotest.site/dns-query  # tier=B op=DigiRock ms=36.7 ecs=1 src=hagezi checked=2026-11-22
 https://max.rethinkdns.com/dns-query  # tier=B op=Fly.io ms=37.1 src=kuroshio-default checked=2026-11-22
 https://jp2.ooroot.com/dns-query  # tier=B op=Oracle_Corporation ms=38.0 src=kuroshio-default checked=2026-11-22
-https://jp01.dns4me.net/dns-query  # tier=B op=Amazon.com ms=41.5 ecs=1 src=kuroshio-default checked=2026-11-22
-https://doh.sb/dns-query  # tier=B op=SB_Professional_Services ms=44.6 src=kuroshio-default checked=2026-11-22
 https://jpdns.cola16.app/dns-query  # tier=B op=Oracle_Corporation ms=47.7 src=kuroshio-default checked=2026-11-22
 https://dns.lobbygod.com/dns-query  # tier=B op=Amazon.com ms=50.9 ecs=1 src=kuroshio-default checked=2026-11-22
-https://sg01.dns4me.net/  # tier=B op=Amazon.com ms=54.0 ecs=1 src=kuroshio-default checked=2026-11-22
 https://sg-w-f-1.nashkan.net/dns-query  # tier=B op=LEASEWEB_SINGAPORE_PTE._LTD. ms=57.5 src=kuroshio-default checked=2026-11-22
 https://httpdns.platform.dbankcloud.com/dns-query  # tier=B op=HUAWEI_CLOUDS ms=57.5 src=hagezi checked=2026-11-22
+https://basic.rethinkdns.com/dns-query  # tier=B op=Cloudflare ms=58.6 src=kuroshio-default checked=2026-11-22
+https://sky.rethinkdns.com/dns-query  # tier=B op=Cloudflare ms=59.8 src=kuroshio-default checked=2026-11-22
 https://doh.rezhajul.io/dns-query  # tier=B op=LEASEWEB_SINGAPORE_PTE._LTD. ms=61.6 src=kuroshio-default checked=2026-11-22
-https://kr-sel.doh.sb/dns-query  # tier=B op=Amazon.com ms=64.8 src=kuroshio-default checked=2026-11-22
 https://doh.tiar.app/dns-query  # tier=B op=DigitalOcean ms=65.5 src=kuroshio-default checked=2026-11-22
 https://akari.anime.com.my/dns-query  # tier=B op=BRANDON_MAXWELL_LOOI ms=65.9 ecs=1 src=hagezi checked=2026-11-22
 https://kr1.ooroot.com/dns-query  # tier=B op=Oracle_Corporation ms=68.7 src=kuroshio-default checked=2026-11-22
 https://dot.tiar.app/dns-query  # tier=B op=DigitalOcean ms=69.3 src=kuroshio-default checked=2026-11-22
 https://kr2.ooroot.com/dns-query  # tier=B op=Oracle_Corporation ms=69.4 src=kuroshio-default checked=2026-11-22
 https://dns-sgx1.itsec.my.id/dns-query  # tier=B op=OVH_SAS ms=71.6 ecs=1 src=hagezi checked=2026-11-22
-https://sm2.doh.pub/dns-query  # tier=B op=Shenzhen_Tencent_Computer_Systems_Compan ms=71.7 ecs=1 src=kuroshio-default checked=2026-11-22
 https://httpdns-browser.platform.dbankcloud.cn/dns-query  # tier=B op=Huawei_Cloud_Service_data_center ms=71.8 src=hagezi checked=2026-11-22
 https://www.c-dns.com/dns-query  # tier=B op=Shenzhen_Tencent_Computer_Systems_Compan ms=73.9 ecs=1 src=kuroshio-default checked=2026-11-22
 https://maherhost.uk/dns-query  # tier=B op=Oracle_Corporation ms=75.1 src=hagezi checked=2026-11-22
@@ -243,7 +219,6 @@ https://axaxa.fun/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=93.8 src=hagezi
 https://united-arab-emirates.privacy-dns.pw/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=93.8 ecs=1 src=hagezi checked=2026-11-22
 https://switzerland.privacy-dns.pw/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=94.5 ecs=1 src=hagezi checked=2026-11-22
 https://externalmobiel.lekdijk.online/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=94.6 src=hagezi checked=2026-11-22
-https://securedns.vendorvista.xyz/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=94.8 src=hagezi checked=2026-11-22
 https://dns.daarrk.tech/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=94.9 ecs=1 src=hagezi checked=2026-11-22
 https://las-vegas.privacy-dns.pw/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=95.1 ecs=1 src=hagezi checked=2026-11-22
 https://dns.ikataruto.com/dns-query  # tier=B op=Hangzhou_Alibaba_Advertising_Co. ms=96.1 ecs=1 src=kuroshio-default checked=2026-11-22
@@ -251,13 +226,10 @@ https://quic.lol/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=96.6 ecs=1 src=h
 https://dns-free.link/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=97.2 ecs=1 src=hagezi checked=2026-11-22
 https://adg.yybyy.wiki/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=97.7 ecs=1 src=hagezi checked=2026-11-22
 https://ag.brianlee.fun/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=98.0 ecs=1 src=hagezi checked=2026-11-22
-https://ads.hunga1k47.com/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=98.9 ecs=1 src=hagezi checked=2026-11-22
-https://in-blr.doh.sb/dns-query  # tier=B op=DigitalOcean ms=99.5 src=kuroshio-default checked=2026-11-22
 https://dns.mathewakhil.online/dns-query  # tier=B op=SAKURA_Internet_Inc. ms=100.5 ecs=1 src=hagezi checked=2026-11-22
 https://httpdns.platform.dbankcloud.cn/dns-query  # tier=B op=IDC ms=105.3 src=hagezi checked=2026-11-22
 https://dns.lithvik.com/dns-query  # tier=B op=HOSTDZIRE_WEB_SERVICES_PRIVATE_LIMITED ms=122.1 src=hagezi checked=2026-11-22
 https://dns.beardic.cn/dns-query  # tier=B op=Shenzhen_Tencent_Computer_Systems_Compan ms=122.5 src=kuroshio-default checked=2026-11-22
-https://dns.blokada.org/dns-query  # tier=B op=Blocka_AB ms=130.0 src=kuroshio-default checked=2026-11-22
 https://hitian.me/dns-query  # tier=B op=Oracle_Corporation ms=135.7 src=kuroshio-default checked=2026-11-22
 https://us.aab.im/dns-query  # tier=B op=HostPapa ms=146.0 ecs=1 src=hagezi checked=2026-11-22
 https://dns-us.ibmcloud.top/dns-query  # tier=B op=HostPapa ms=149.6 ecs=1 src=hagezi checked=2026-11-22
@@ -265,40 +237,43 @@ https://us-lax-w-f-1.nashkan.net/dns-query  # tier=B op=HostHatch ms=152.9 src=h
 https://dns.yuzia.cc/dns-query  # tier=B op=Zont_LLC ms=153.3 ecs=1 src=hagezi checked=2026-11-22
 https://au-syd-w-f-1.nashkan.net/dns-query  # tier=B op=HostHatch ms=154.2 src=kuroshio-default checked=2026-11-22
 https://doh-2.seby.io/dns-query  # tier=B op=The_Constant_Company ms=156.2 src=kuroshio-default checked=2026-11-22
+https://bravedns.com/dns-query  # tier=B op=Cloudflare ms=158.3 src=kuroshio-default checked=2026-11-22
+https://basic.bravedns.com/dns-query  # tier=B op=Cloudflare ms=159.5 src=kuroshio-default checked=2026-11-22
 https://rudolphdesigns.com/dns-query  # tier=B op=Comcast_Cable_Communications ms=160.1 src=hagezi checked=2026-11-22
+https://dns.bmwhocking.com/dns-query  # tier=B op=Cloudflare ms=163.5 ecs=1 src=kuroshio-default checked=2026-11-22
+https://bazooki-infra.dev/dns-query  # tier=B op=Cloudflare ms=165.3 ecs=1 src=kuroshio-default checked=2026-11-22
 https://doh.seby.io/dns-query  # tier=B op=The_Constant_Company ms=165.4 src=kuroshio-default checked=2026-11-22
+https://dns.mayx.eu.org/dns-query  # tier=B op=Cloudflare ms=165.5 ecs=1 src=kuroshio-default checked=2026-11-22
 https://dot.seby.io/dns-query  # tier=B op=The_Constant_Company ms=166.7 src=kuroshio-default checked=2026-11-22
+https://xn--durhre-yxa.de/dns-query  # tier=B op=Cloudflare ms=168.9 ecs=1 src=kuroshio-default checked=2026-11-22
+https://dns.paulo.nom.za/dns-query  # tier=B op=Cloudflare ms=169.5 ecs=1 src=kuroshio-default checked=2026-11-22
+https://cn-dns.hashtable.io/dns-query  # tier=B op=Cloudflare ms=171.1 ecs=1 src=hagezi checked=2026-11-22
+https://dns.xuming.studio/dns-query  # tier=B op=Cloudflare ms=172.3 src=kuroshio-default checked=2026-11-22
 https://dns.stormycloud.org/dns-query  # tier=B op=StormyCloud_Inc ms=172.8 src=kuroshio-default checked=2026-11-22
 https://us-kan-w-f-1.nashkan.net/dns-query  # tier=B op=WholeSale_Internet ms=173.0 src=kuroshio-default checked=2026-11-22
 https://us-chi-w-f-1.nashkan.net/dns-query  # tier=B op=HostHatch ms=174.0 src=kuroshio-default checked=2026-11-22
-https://us01.dns4me.net/  # tier=B op=Amazon.com ms=175.5 ecs=1 src=kuroshio-default checked=2026-11-22
+https://regiopolis.cloud/dns-query  # tier=B op=Cloudflare ms=175.9 ecs=1 src=kuroshio-default checked=2026-11-22
 https://dns.oryxlabs.com/dns-query  # tier=B op=Amazon.com ms=183.0 src=hagezi checked=2026-11-22
 https://dns.sec511.com/dns-query  # tier=B op=Amazon.com ms=186.1 src=hagezi checked=2026-11-22
-https://ca-yyc.doh.sb/dns-query  # tier=B op=The_Constant_Company ms=190.0 src=kuroshio-default checked=2026-11-22
 https://tor.vasi.li/dns-query  # tier=B op=The_Constant_Company ms=190.1 src=kuroshio-default checked=2026-11-22
 https://dns-idx1.itsec.my.id/dns-query  # tier=B op=PT_Infinys_System_Indonesia ms=190.3 src=hagezi checked=2026-11-22
 https://dns1.dnscrypt.ca/dns-query  # tier=B op=GLOBALTELEHOST_Corp. ms=191.4 src=hagezi checked=2026-11-22
-https://safeservedns.com/dns-query  # tier=B op=Namecheap ms=192.5 src=kuroshio-default checked=2026-11-22
+https://doh.maskab.com/dns-query  # tier=B op=Cloudflare ms=193.5 ecs=1 src=kuroshio-default checked=2026-11-22
 https://us-jac-w-f-1.nashkan.net/dns-query  # tier=B op=Nexeon_Technologies ms=196.6 src=kuroshio-default checked=2026-11-22
 https://dns.sev.monster/dns-query  # tier=B op=InMotion_Hosting ms=198.7 src=hagezi checked=2026-11-22
 https://adguard.greenbridge.ai/dns-query  # tier=B op=Amazon.com ms=198.9 src=hagezi checked=2026-11-22
 https://doth.huque.com/dns-query  # tier=B op=Amazon.com ms=199.1 src=kuroshio-default checked=2026-11-22
 https://us-ny.foxyfy.net/dns-query  # tier=B op=HostPapa ms=200.5 src=hagezi checked=2026-11-22
-https://au01.dns4me.net/dns-query  # tier=B op=Amazon.com ms=202.7 ecs=1 src=kuroshio-default checked=2026-11-22
 https://doh.aaaab3n.moe/dns-query  # tier=B op=AT&T_Enterprises ms=203.9 src=hagezi checked=2026-11-22
-https://us02.dns4me.net/  # tier=B op=Amazon.com ms=204.6 ecs=1 src=kuroshio-default checked=2026-11-22
-https://ca01.dns4me.net/  # tier=B op=Amazon.com ms=206.4 ecs=1 src=kuroshio-default checked=2026-11-22
+https://arashi.eu.org/dns-query  # tier=B op=Cloudflare ms=205.3 ecs=1 src=kuroshio-default checked=2026-11-22
 https://dns.novg.net/dns-query  # tier=B op=Scaleway_SAS ms=206.4 src=kuroshio-default checked=2026-11-22
-https://nz01.dns4me.net/  # tier=B op=RIMU_HOSTING_LIMITED ms=208.3 ecs=1 src=kuroshio-default checked=2026-11-22
 https://yavin.securahost.ca/dns-query  # tier=B op=OVH_SAS ms=208.7 src=hagezi checked=2026-11-22
 https://dns.dns-53.com/dns-query  # tier=B op=OVH_SAS ms=210.1 src=kuroshio-default checked=2026-11-22
 https://doh.suche.org/dns-query  # tier=B op=smcc.net_GmbH ms=213.2 ecs=1 src=hagezi checked=2026-11-22
 https://dns.dns-53.us/dns-query  # tier=B op=OVH_SAS ms=214.8 src=kuroshio-default checked=2026-11-22
-https://dns.njal.la/dns-query  # tier=B op=Materialism_s.r.l. ms=220.4 src=kuroshio-default checked=2026-11-22
 https://dns.easyhns.com/dns-query  # tier=B op=Amazon.com ms=232.1 src=hagezi checked=2026-11-22
 https://dns.moklav.co.jp/dns-query  # tier=B op=MOKLAV_GLOBAL_(OPC)_PRIVATE_LIMITED ms=236.8 src=kuroshio-default checked=2026-11-22
 https://carolinareaper.heeremans.net/dns-query  # tier=B op=Enreach_Netherlands_B.V. ms=237.1 src=hagezi checked=2026-11-22
-https://uk01.dns4me.net/  # tier=B op=Amazon.com ms=237.9 ecs=1 src=kuroshio-default checked=2026-11-22
 https://dns.adnull.com/dns-query  # tier=B op=Global_Technologies_of_Ukraine_LLC ms=237.9 src=hagezi checked=2026-11-22
 https://ams.core.access.zznet.fun/dns-query  # tier=B op=The_Infrastructure_Group_B.V. ms=238.1 ecs=1 src=hagezi checked=2026-11-22
 https://agh.mihanentalpo.me/dns-query  # tier=B op=JSC_Selectel ms=239.1 src=hagezi checked=2026-11-22
@@ -310,29 +285,22 @@ https://dns.liberador.net/  # tier=B op=The_Constant_Company ms=249.2 ecs=1 src=
 https://tri-dns.net/dns-query  # tier=B op=DigitalOcean ms=249.3 src=kuroshio-default checked=2026-11-22
 https://dns.schmidt-zoarn.de/dns-query  # tier=B op=EWE_TEL_GmbH ms=249.7 src=hagezi checked=2026-11-22
 https://eu.tri-dns.net/dns-query  # tier=B op=Akenes_SA ms=250.0 src=kuroshio-default checked=2026-11-22
-https://dot.ffmuc.net/dns-query  # tier=B op=Freie_Netze_Muenchen_e.V. ms=250.4 src=kuroshio-default checked=2026-11-22
-https://doh.libredns.gr/dns-query  # tier=B op=Hetzner_Online_GmbH ms=252.0 src=kuroshio-default checked=2026-11-22
-https://de01.dns4me.net/  # tier=B op=Amazon.com ms=252.3 ecs=1 src=kuroshio-default checked=2026-11-22
 https://doh.lacontrevoie.fr/dns-query  # tier=B op=Hetzner_Online_GmbH ms=253.1 src=kuroshio-default checked=2026-11-22
-https://doh.kidzonet.io/dns-query  # tier=B op=Amazon.com ms=253.2 src=hagezi checked=2026-11-22
 https://dns.3wv.de/dns-query  # tier=B op=Hetzner_Online_GmbH ms=254.3 src=kuroshio-default checked=2026-11-22
 https://doh.42l.fr/dns-query  # tier=B op=Hetzner_Online_GmbH ms=255.1 src=kuroshio-default checked=2026-11-22
 https://dns.digitalsize.net/dns-query  # tier=B op=Hetzner_Online_GmbH ms=255.3 src=kuroshio-default checked=2026-11-22
 https://dns.artikel10.org/dns-query  # tier=B op=Individual_Network_Berlin_(_IN-Berlin_)_ ms=256.2 src=kuroshio-default checked=2026-11-22
-https://ca02.dns4me.net/  # tier=B op=IBM_Cloud ms=256.6 ecs=1 src=kuroshio-default checked=2026-11-22
 https://doh-rs.whalebone.io/dns-query  # tier=B op=Hetzner_Online_GmbH ms=257.0 src=hagezi checked=2026-11-22
-https://doh.ffmuc.net/dns-query  # tier=B op=Freie_Netze_Muenchen_e.V. ms=259.2 src=kuroshio-default checked=2026-11-22
 https://dns.floriantinney.de/dns-query  # tier=B op=SpaceNet_GmbH ms=259.8 src=kuroshio-default checked=2026-11-22
 https://dns.froth.zone/dns-query  # tier=B op=Hetzner_Online_GmbH ms=262.6 src=kuroshio-default checked=2026-11-22
 https://gb-cov-w-f-1.nashkan.net/dns-query  # tier=B op=TransitX_Ltd ms=262.7 src=kuroshio-default checked=2026-11-22
 https://dns.envs.net/dns-query  # tier=B op=Hetzner_Online_GmbH ms=264.2 src=hagezi checked=2026-11-22
 https://doh.niyawe.de/dns-query  # tier=B op=Hetzner_Online_GmbH ms=264.5 src=kuroshio-default checked=2026-11-22
-https://ie01.dns4me.net/  # tier=B op=Amazon.com ms=266.3 ecs=1 src=kuroshio-default checked=2026-11-22
 https://doh.li/dns-query  # tier=B op=Hetzner_Online_GmbH ms=268.4 src=kuroshio-default checked=2026-11-22
 https://dns.vaioswolke.xyz/dns-query  # tier=B op=Hetzner_Online_GmbH ms=268.9 src=kuroshio-default checked=2026-11-22
 https://v0dka.ru/dns-query  # tier=B op=AI_DATACENTER_LIMITED ms=275.4 src=hagezi checked=2026-11-22
 https://dns.aquilenet.fr/dns-query  # tier=B op=AQUILENET ms=278.5 src=kuroshio-default checked=2026-11-22
-https://sa01.dns4me.net/  # tier=B op=Host_Africa_(Pty)_Ltd ms=285.1 ecs=1 src=kuroshio-default checked=2026-11-22
+https://ns.net.kg/dns-query  # tier=B op=Cloudflare ms=284.5 ecs=1 src=hagezi checked=2026-11-22
 https://nl.dns.privex.io/dns-query  # tier=B op=Privex_Inc. ms=285.7 ecs=1 src=hagezi checked=2026-11-22
 https://ns.00dani.me/dns-query  # tier=B op=DigitalOcean ms=286.9 src=hagezi checked=2026-11-22
 https://dns1.feear.se/dns-query  # tier=B op=IONOS_SE ms=287.1 src=hagezi checked=2026-11-22
@@ -346,14 +314,16 @@ https://dns2.feear.se/dns-query  # tier=B op=IONOS_SE ms=290.3 src=hagezi checke
 https://doh.kekew.racing/dns-query  # tier=B op=Deutsche_Telekom_AG ms=290.3 src=hagezi checked=2026-11-22
 https://dns.chenu.ch/dns-query  # tier=B op=Oracle_Corporation ms=291.6 src=kuroshio-default checked=2026-11-22
 https://dns.csaonline.de/dns-query  # tier=B op=Niedermayr_IT_GmbH ms=291.7 src=hagezi checked=2026-11-22
+https://de-fra-w-f-3.nashkan.net/dns-query  # tier=B op=xTom_GmbH ms=293.1 src=hagezi checked=2026-11-22
 https://d.kekew.racing/dns-query  # tier=B op=Deutsche_Telekom_AG ms=293.7 src=hagezi checked=2026-11-22
 https://dns.dns-53.uk/dns-query  # tier=B op=OVH_SAS ms=294.5 src=kuroshio-default checked=2026-11-22
+https://de-fra-w-f-1.nashkan.net/dns-query  # tier=B op=xTom_GmbH ms=295.9 src=hagezi checked=2026-11-22
 https://ledns.eu/dns-query  # tier=B op=OVH_SAS ms=295.9 src=hagezi checked=2026-11-22
-https://secure.hafnova.com/dns-query  # tier=B op=OVH_SAS ms=296.0 src=kuroshio-default checked=2026-11-22
 https://dns.kescher.at/dns-query  # tier=B op=netcup_GmbH ms=296.4 src=kuroshio-default checked=2026-11-22
 https://dns.csa-rz.de/dns-query  # tier=B op=R-KOM_Regensburger_Telekommunikationsges ms=296.9 src=hagezi checked=2026-11-22
 https://doh.kekew.info/dns-query  # tier=B op=Deutsche_Telekom_AG ms=298.3 src=hagezi checked=2026-11-22
 https://servis4u.top/dns-query  # tier=B op=Contabo_GmbH ms=299.4 src=hagezi checked=2026-11-22
+https://de-fra-w-f-2.nashkan.net/dns-query  # tier=B op=xTom_GmbH ms=300.0 src=hagezi checked=2026-11-22
 https://d.svc.ultratop.icu/dns-query  # tier=B op=ETERNITY_NETWORKS_LLC ms=300.3 src=hagezi checked=2026-11-22
 https://cubedns.com/dns-query  # tier=B op=NETDIREKT_BILISIM_DANISMANLIK_ILETISIM_H ms=301.4 src=hagezi checked=2026-11-22
 https://dukun.de/dns-query  # tier=B op=netcup_GmbH ms=304.3 src=kuroshio-default checked=2026-11-22
@@ -366,9 +336,16 @@ https://adguard.shutgaming.net/dns-query  # tier=B op=netcup_GmbH ms=311.2 src=k
 https://opennic2.i2pd.xyz/dns-query  # tier=B op=OVH_SAS ms=312.1 src=kuroshio-default checked=2026-11-22
 https://dns-1.wil.cloud/dns-query  # tier=B op=OVH_SAS ms=312.1 src=hagezi checked=2026-11-22
 https://abel.waringer-atg.de/dns-query  # tier=B op=netcup_GmbH ms=312.4 src=kuroshio-default checked=2026-11-22
+https://adguard-kartoffel.zernico.de/dns-query  # tier=B op=Cloudflare ms=313.7 src=kuroshio-default checked=2026-11-22
+https://adg.3k.work/dns-query  # tier=B op=Cloudflare ms=314.6 src=hagezi checked=2026-11-22
+https://doh.greenwood.eu.org/dns-query  # tier=B op=Cloudflare ms=318.2 src=hagezi checked=2026-11-22
 https://ro-bu.foxyfy.net/dns-query  # tier=B op=M247_Europe_SRL ms=319.8 src=hagezi checked=2026-11-22
 https://es-ma.foxyfy.net/dns-query  # tier=B op=M247_Europe_SRL ms=319.9 src=kuroshio-default checked=2026-11-22
+https://doh.fullhosting.ru/dns-query  # tier=B op=Cloudflare ms=327.3 src=hagezi checked=2026-11-22
+https://dns.enzomtp.party/dns-query  # tier=B op=Cloudflare ms=329.9 src=hagezi checked=2026-11-22
+https://dns.opendoh.com/dns-query  # tier=B op=Cloudflare ms=330.1 src=hagezi checked=2026-11-22
 https://dns.simplylinux.ch/dns-query  # tier=B op=OVH_SAS ms=332.8 src=hagezi checked=2026-11-22
+https://doh.tiarap.org/dns-query  # tier=B op=Cloudflare ms=333.3 src=kuroshio-default checked=2026-11-22
 https://dns.christerwaren.fi/dns-query  # tier=B op=OVH_SAS ms=352.9 src=kuroshio-default checked=2026-11-22
 https://dns.warma.me/dns-query  # tier=B op=GMO_Internet ms=365.4 src=hagezi checked=2026-11-22
 https://sitdns.com/dns-query  # tier=B op=GMO_Internet ms=365.9 src=hagezi checked=2026-11-22
