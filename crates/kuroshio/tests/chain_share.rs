@@ -733,8 +733,17 @@ fn ranges_reject_bad_names_and_cidrs() {
 }
 
 fn saved(at: u64) -> Vec<u8> {
-    let k = |sha: &str| json!({ "sha": sha.repeat(64), "at": 1, "importedAt": at, "bytes": 10 });
+    saved_kid(at, "")
+}
+
+/// 3.4.3：紀錄帶著是哪一台上游給的（金鑰 ID）；「新鮮」只算目前綁定的那一台給的
+fn saved_kid(at: u64, kid: &str) -> Vec<u8> {
+    let k = |sha: &str| json!({ "sha": sha.repeat(64), "at": 1, "importedAt": at, "bytes": 10, "kid": kid });
     serde_json::to_vec(&json!({ "v": 1, "kinds": { "upstreams": k("a"), "cdn-pools": k("b"), "cdn-ranges": k("c") } })).unwrap()
+}
+
+fn kid_hex(c: &Client) -> String {
+    kuroshio_community::util::hex(&kuroshio_community::identity::kid_of(&c.bound_key().unwrap()))
 }
 
 #[tokio::test]
@@ -754,10 +763,14 @@ async fn jobs_skipped_only_when_fresh_and_chained() {
     // 串接中，但匯入是 37 小時前（狀態檔讀回來的）：不略過；1 小時前：略過
     let (up2, addr2) = upstream(true, src_basic(), true).await;
     let d2 = down(true, addr2).await;
-    let old = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 37 * 3600 * 1000)));
+    let kid = kid_hex(&d2.client);
+    let old = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved_kid(now_ms() - 37 * 3600 * 1000, &kid)));
     assert!(JOBS.iter().all(|j| !old.skip_job(j)));
-    let recent = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 3600 * 1000)));
+    let recent = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved_kid(now_ms() - 3600 * 1000, &kid)));
     assert!(JOBS.iter().all(|j| recent.skip_job(j)));
+    // 3.4.2 以前的紀錄（沒有記是哪一台）或別台給的：不算新鮮（下一次同步會重新確認）
+    let other = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 3600 * 1000)));
+    assert!(JOBS.iter().all(|j| !other.skip_job(j)));
     // chain 關著：不發查詢、不略過
     up2.manifests.store(0, Ordering::SeqCst);
     let d3 = down(false, addr2).await;
@@ -774,8 +787,8 @@ async fn jobs_skipped_only_when_fresh_and_chained() {
     assert!(JOBS.iter().all(|j| !na.skip_job(j)));
 }
 
-fn saved_own(at: u64, own: u64) -> Vec<u8> {
-    let mut v: serde_json::Value = serde_json::from_slice(&saved(at)).unwrap();
+fn saved_own(at: u64, own: u64, kid: &str) -> Vec<u8> {
+    let mut v: serde_json::Value = serde_json::from_slice(&saved_kid(at, kid)).unwrap();
     v["own"] = json!({ "dns-benchmark": own, "cdn-pool": own, "cdn-scan": own, "cdn-ranges": own });
     serde_json::to_vec(&v).unwrap()
 }
@@ -787,12 +800,13 @@ async fn own_jobs_still_run_every_7_days() {
     const JOBS: [&str; 4] = ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"];
     let (_up, addr) = upstream(true, src_basic(), true).await;
     let d = down(true, addr).await;
+    let kid = kid_hex(&d.client);
     let fresh = now_ms() - 3600 * 1000;
     // 自己 8 天前跑過：上游的新鮮也照樣自己跑
     let stale_own = Syncer::new(
         d.client.clone(),
         FakeSink::new(),
-        Some(&saved_own(fresh, now_ms() - 8 * 24 * 3600 * 1000)),
+        Some(&saved_own(fresh, now_ms() - 8 * 24 * 3600 * 1000, &kid)),
     );
     assert!(JOBS.iter().all(|j| !stale_own.skip_job(j)));
     // 自己跑完一次：之後略過，紀錄寫進快照
@@ -802,13 +816,13 @@ async fn own_jobs_still_run_every_7_days() {
     let snap: serde_json::Value = serde_json::from_slice(&stale_own.snapshot()).unwrap();
     assert!(snap["own"]["cdn-pool"].as_u64().unwrap() >= now_ms() - 60_000);
     // 沒有紀錄（第一次串接）：當成 6 天前跑過 → 現在略過，24 小時後到期
-    let first = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved(fresh)));
+    let first = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved_kid(fresh, &kid)));
     assert!(JOBS.iter().all(|j| first.skip_job(j)));
     let due = first.status_json()["ownRuns"]["dns-benchmark"]["dueAt"].as_u64().unwrap();
     let day = 24 * 3600 * 1000;
     assert!(due > now_ms() + day - 120_000 && due < now_ms() + day + 120_000, "{due}");
     // 時間在未來（時鐘倒退）不算跑過
-    let future = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved_own(fresh, now_ms() + 3600 * 1000)));
+    let future = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved_own(fresh, now_ms() + 3600 * 1000, &kid)));
     assert!(JOBS.iter().all(|j| !future.skip_job(j)));
 }
 
@@ -1308,4 +1322,18 @@ async fn distrust_release_requests_own_jobs() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(*asked.lock().unwrap(), vec!["dns-benchmark", "cdn-ranges", "cdn-pool"]);
+}
+
+/// 3.4.3：「新鮮」只算目前綁定的那一台上游給的；換成另一台（另一把金鑰）的上游，舊上游給的資料不能再讓這台略過自己的工作
+#[tokio::test]
+async fn freshness_bound_to_upstream_key() {
+    let (_up, d, s, _sink) = pair(src_basic()).await;
+    assert_eq!(s.sync_once().await.error, None);
+    assert!(s.fresh(KIND_UPSTREAMS));
+    // 另一台上游（另一把金鑰）
+    let (_up2, addr2) = upstream(true, src_basic(), true).await;
+    let d2 = down(true, addr2).await;
+    let s2 = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&s.snapshot()));
+    assert!(!s2.fresh(KIND_UPSTREAMS), "舊上游給的紀錄：對新上游不算新鮮");
+    drop(d);
 }

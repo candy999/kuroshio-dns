@@ -60,6 +60,9 @@ pub struct ChainSettings {
     pub allow_downstream: bool,
     /// `upstream.pathCheck`：關掉時串接沒有偵測來源，等同 chain 關
     pub path_check: bool,
+    /// `upstream.chainPin`（UCI `chain_pin`）：只跟這個指紋的上游黑潮串接（空的＝不限定；3.4.3）。
+    /// 只留英數字、轉小寫後比對，寫法可以帶空格或冒號
+    pub pin: Option<String>,
     /// 看不懂的寫法（已經改用預設值），啟動時記 warn
     pub warnings: Vec<String>,
 }
@@ -77,18 +80,33 @@ impl ChainSettings {
         let chain = read("upstream.chain");
         let allow_downstream = read("upstream.allowDownstream");
         let path_check = read("upstream.pathCheck");
+        let pin = get(cfg, "upstream.chainPin")
+            .and_then(Value::as_str)
+            .map(normalize_fp)
+            .filter(|s| !s.is_empty());
         ChainSettings {
             chain,
             allow_downstream,
             path_check,
+            pin,
             warnings,
         }
+    }
+
+    /// 這個指紋符不符合 `chainPin`（沒設定時一律符合）
+    pub fn pin_ok(&self, fingerprint: &str) -> bool {
+        self.pin.as_deref().is_none_or(|p| normalize_fp(fingerprint) == p)
     }
 
     /// 下游角色實際上有沒有啟用：chain && path_check
     pub fn downstream_enabled(&self) -> bool {
         self.chain && self.path_check
     }
+}
+
+/// 指紋的比對形式：只留英數字、轉小寫
+pub fn normalize_fp(s: &str) -> String {
+    s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
 }
 
 /// 背景補問（規格 5.2，`resolver.backfill`）
@@ -226,9 +244,16 @@ mod tests {
                 chain: true,
                 allow_downstream: true,
                 path_check: true,
+                pin: None,
                 warnings: vec![]
             }
         );
+        // 限定上游的指紋（3.4.3）：寫法可以帶空格、冒號、大小寫
+        let s = ChainSettings::from_cfg(&build(&json!({ "upstream": { "chainPin": "3F2A-91C0 77ab" } })));
+        assert_eq!(s.pin.as_deref(), Some("3f2a91c077ab"));
+        assert!(s.pin_ok("3f2a:91c0:77AB"));
+        assert!(!s.pin_ok("3F2A-91C0-0000"));
+        assert!(ChainSettings::from_cfg(&build(&json!({}))).pin_ok("anything"), "沒設定：不限定");
         // 路徑檢查關掉：串接沒有偵測來源，下游角色等同關閉；上游角色不受影響
         let s = ChainSettings::from_cfg(&build(&json!({ "upstream": { "pathCheck": false } })));
         assert!(s.chain && s.allow_downstream);

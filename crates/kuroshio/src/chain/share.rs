@@ -64,6 +64,8 @@ pub const OBJECT_MAX: u64 = 1 << 20;
 pub const FRESH_MS: u64 = 36 * 3600 * 1000;
 /// 串接解除時手上的評測結果超過這個時間就請排程器補跑評測
 pub const STALE_ON_RELEASE_MS: u64 = 48 * 3600 * 1000;
+/// 上游的金鑰換了之後多久不收它的共用資料（3.4.3）
+pub const KEY_CHANGE_HOLD_MS: u64 = 24 * 3600 * 1000;
 /// 因為上游不可信而解除串接時，請排程器補跑的工作（3.4.3）
 const DISTRUST_JOBS: [&str; 3] = ["dns-benchmark", "cdn-ranges", "cdn-pool"];
 
@@ -534,6 +536,8 @@ pub struct Imported {
     pub at: u64,
     pub imported_at: u64,
     pub bytes: u64,
+    /// 是哪一台上游給的（金鑰 ID，十六進位；3.4.2 以前的紀錄是空的）。「新鮮」只算目前綁定的那一台給的（3.4.3）
+    pub kid: String,
 }
 
 /// `chain-share.json`：`{ "v": 1, "kinds": { "<種類>": { "sha", "at", "importedAt", "bytes" } }, "own": { "<工作>": 毫秒 }, "ownSince": 毫秒 }`。
@@ -545,7 +549,7 @@ fn saved_json(kinds: &BTreeMap<String, Imported>, own: &BTreeMap<String, u64>, o
         .map(|(k, i)| {
             (
                 k.clone(),
-                json!({ "sha": i.sha, "at": i.at, "importedAt": i.imported_at, "bytes": i.bytes }),
+                json!({ "sha": i.sha, "at": i.at, "importedAt": i.imported_at, "bytes": i.bytes, "kid": i.kid }),
             )
         })
         .collect();
@@ -588,6 +592,7 @@ fn saved_parse(b: &[u8]) -> BTreeMap<String, Imported> {
                     at: n(x, "at"),
                     imported_at: n(x, "importedAt"),
                     bytes: n(x, "bytes"),
+                    kid: x.get("kid").and_then(Value::as_str).unwrap_or("").to_string(),
                 },
             ))
         })
@@ -781,13 +786,19 @@ impl Syncer {
 
     fn imported_recently(&self, key: &str) -> bool {
         let now = now_ms();
+        // 只算目前綁定的那一台上游給的（3.4.3）：換了上游（或金鑰），舊上游給的資料不能再讓這台略過自己的工作
+        let Some(cur) = self.client.bound_key().map(|p| hex(&kid_of(&p))) else {
+            return false;
+        };
         self.state
             .lock()
             .unwrap()
             .kinds
             .get(key)
             // 時間在未來（時鐘倒退）不算
-            .is_some_and(|i| i.imported_at <= now.saturating_add(60_000) && now.saturating_sub(i.imported_at) < FRESH_MS)
+            .is_some_and(|i| {
+                i.kid == cur && i.imported_at <= now.saturating_add(60_000) && now.saturating_sub(i.imported_at) < FRESH_MS
+            })
     }
 
     /// 這個工作要不要略過（規格 3.5 的對照）
@@ -928,6 +939,10 @@ impl Syncer {
         if !self.client.last_probe().is_some_and(|p| p.caps.iter().any(|c| c == "share")) {
             return Err(fatal("no-share"));
         }
+        // 上游的金鑰剛換過（24 小時內）：照樣當解析的上游，但先不收它的共用資料，自己的工作照排程跑（3.4.3）
+        if self.client.key_changed_within(KEY_CHANGE_HOLD_MS) {
+            return Err(fatal("key-changed"));
+        }
         let sink = self.sink();
         if !sink.pressure_ok() {
             return Err(fatal("memory"));
@@ -1046,8 +1061,8 @@ impl Syncer {
         }
         let key = kind_key(&o.k, &o.name);
         let sha_hex = hex(&sha);
-        // 雜湊沒變：不重抓
-        if self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex) {
+        // 雜湊沒變、也是同一台上游給的：不重抓
+        if self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex && i.kid == hex(upstream_kid)) {
             return Ok(Fetch::Done);
         }
         // 這台自己的評測結果比上游這份新：不蓋掉自己的（直系血親，規格 10 第 3.8 節）。記成看過這份，
@@ -1060,6 +1075,7 @@ impl Syncer {
                     at: o.at,
                     imported_at: now_ms(),
                     bytes: o.size,
+                    kid: hex(upstream_kid),
                 },
             );
             return Ok(Fetch::OwnNewer);
@@ -1117,6 +1133,7 @@ impl Syncer {
                 at: o.at,
                 imported_at: now,
                 bytes: o.size,
+                kid: hex(upstream_kid),
             },
         );
         rep.imported.push(key);

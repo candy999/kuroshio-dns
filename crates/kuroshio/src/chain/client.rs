@@ -491,6 +491,11 @@ fn lerp(a: Duration, b: Duration, t: f64) -> Duration {
     a + (b - a).mul_f64(t.clamp(0.0, 1.0))
 }
 
+/// `at`（毫秒）是不是在 `now` 之前 `ms` 毫秒內
+fn changed_within(at: Option<u64>, now: u64, ms: u64) -> bool {
+    at.is_some_and(|t| now < t.saturating_add(ms))
+}
+
 fn short_fp(p: &[u8; 32]) -> String {
     fingerprint(p)
 }
@@ -685,6 +690,11 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
                 warn!("串接：驗證時上游的公鑰跟探測時不同，不串接");
                 return reject(i, Reason::VerifyFailed, now);
             };
+            // 限定了上游的指紋（`chainPin`）：不符就不串接（3.4.3）
+            if !i.settings.pin_ok(&short_fp(&public)) {
+                warn!("串接：上游的指紋 {} 跟設定的 chainPin 不符，不串接", short_fp(&public));
+                return reject(i, Reason::VerifyFailed, now);
+            }
             let Some((hit, tcp)) = i.view.as_ref().and_then(View::usable_hit) else {
                 return to_none(i, None);
             };
@@ -1213,6 +1223,11 @@ impl Client {
     }
 
     /// 綁定中的上游公鑰（WP5 驗清單用）
+    /// 上游的金鑰在 `ms` 毫秒內換過（3.4.3：換了之後 24 小時內不收共用資料）
+    pub fn key_changed_within(&self, ms: u64) -> bool {
+        changed_within(self.inner.lock().unwrap().key_changed_at, kuroshio_community::util::now_ms(), ms)
+    }
+
     pub fn bound_key(&self) -> Option<[u8; 32]> {
         self.inner.lock().unwrap().bound.as_ref().map(|b| b.public)
     }
@@ -1524,6 +1539,7 @@ mod tests {
             chain,
             allow_downstream: true,
             path_check: true,
+            pin: None,
             warnings: Vec::new(),
         }
     }
@@ -1852,6 +1868,38 @@ mod tests {
         chained(&mut i, [6; 32]);
         step(&mut i, Event::AuditFailed, &[], now());
         assert!(hours(&i) < 6.7);
+    }
+
+    /// 3.4.3：上游的金鑰換了之後 24 小時內不收共用資料（`Syncer` 看這個）
+    #[test]
+    fn key_change_hold_window() {
+        let day = 24 * 3600 * 1000;
+        assert!(!changed_within(None, 1_000, day));
+        assert!(changed_within(Some(1_000), 1_000 + day - 1, day));
+        assert!(!changed_within(Some(1_000), 1_000 + day, day));
+    }
+
+    /// 3.4.3：限定了上游的指紋（`chainPin`）：指紋不符的上游不串接；符合的照常串接
+    #[test]
+    fn chain_pin_rejects_other_keys() {
+        let mut i = inner(true);
+        i.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[9u8; 32])));
+        step(&mut i, Event::Report(view(Some("3.4.0"))), &[], now());
+        step(&mut i, Event::Probed(ok_probe([5; 32], vec![])), &[], now());
+        let io = step(
+            &mut i,
+            Event::Verified {
+                again: ok_probe([5; 32], vec![]),
+                gateway: None,
+            },
+            &[],
+            now(),
+        );
+        assert!(!io.iter().any(|x| matches!(x, Io::Bind { .. })), "{io:?}");
+        assert_ne!(i.state, State::Chained);
+        let mut j = inner(true);
+        j.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[5u8; 32])));
+        chained(&mut j, [5; 32]);
     }
 
     /// 3.4.3：上游的查詢一直失敗（暫停 5 次）、心跳卻正常 → 解除串接（no-response），照退避重試
