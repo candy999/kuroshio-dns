@@ -350,6 +350,9 @@ struct Inner {
     hb_fail: u32,
     /// 最近一次登記的結果（`chain.upstream.registered`）
     registered: Option<Registered>,
+    /// 因為抽查不通過而解除的上游公鑰與次數（同一把金鑰一再不通過，重試間隔逐次拉長；3.4.3）
+    audit_key: Option<[u8; 32]>,
+    audit_strikes: u32,
 }
 
 /// 最近一次登記的結果
@@ -394,6 +397,8 @@ impl Inner {
             next_hb: None,
             hb_fail: 0,
             registered: None,
+            audit_key: None,
+            audit_strikes: 0,
         }
     }
 }
@@ -421,6 +426,8 @@ enum Event {
     Disabled,
     /// 抽查上游給的答案不通過（3.4.2）
     AuditFailed,
+    /// 上游的查詢一直失敗、心跳卻正常：暫停了 `CHAIN_RELEASE_TRIPS` 次（3.4.3）
+    Unhealthy,
 }
 
 /// 狀態機要外層做的事
@@ -534,6 +541,10 @@ fn to_none(i: &mut Inner, reason: Option<Reason>) -> Vec<Io> {
     io
 }
 
+/// 抽查不通過後第一次重試前等多久（同一把金鑰再不通過就加倍，最多 [`AUDIT_RETRY_MAX`]；3.4.3）
+const AUDIT_RETRY: Duration = Duration::from_secs(6 * 3600);
+const AUDIT_RETRY_MAX: Duration = Duration::from_secs(24 * 3600);
+
 fn next_backoff(i: &mut Inner) -> Duration {
     let d = match i.backoff {
         Some(b) => (b * 2).min(i.timing.retry_max),
@@ -595,8 +606,20 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             if i.state != State::Chained {
                 return Vec::new();
             }
-            let retry = i.timing.retry_max.mul_f64(1.0 + 0.5 * now.rnd);
-            release(i, Reason::AuditFailed, Some(retry), now)
+            // 同一把金鑰一再不通過：重試間隔 6、12、24 小時（最多 24 小時；以前固定 10～15 分鐘就重試，
+            // 說謊的上游會讓下游無限次「串接、解除」）。換了金鑰重新算（3.4.3）
+            let key = i.bound.as_ref().map(|b| b.public);
+            i.audit_strikes = if key.is_some() && key == i.audit_key { i.audit_strikes + 1 } else { 1 };
+            i.audit_key = key;
+            let retry = AUDIT_RETRY.saturating_mul(1 << (i.audit_strikes - 1).min(2)).min(AUDIT_RETRY_MAX);
+            release(i, Reason::AuditFailed, Some(retry.mul_f64(1.0 + 0.1 * now.rnd)), now)
+        }
+        Event::Unhealthy => {
+            if i.state != State::Chained {
+                return Vec::new();
+            }
+            let retry = next_backoff(i).mul_f64(1.0 + 0.2 * now.rnd);
+            release(i, Reason::NoResponse, Some(retry), now)
         }
         Event::WanChanged => {
             i.view = None;
@@ -871,9 +894,9 @@ impl Client {
         *self.responder.lock().unwrap() = responder.map(Arc::downgrade);
         {
             let me = Arc::downgrade(self);
-            mgr.on_chain_trouble(Arc::new(move || {
+            mgr.on_chain_trouble(Arc::new(move |trips| {
                 if let Some(c) = me.upgrade() {
-                    c.trouble();
+                    c.trouble(trips);
                 }
             }));
         }
@@ -1151,7 +1174,22 @@ impl Client {
     }
 
     /// 串接上游連續失敗（解析流程）：立刻補一次心跳
-    fn trouble(&self) {
+    /// 上游黑潮的查詢連續失敗、暫停了第 `trips` 次：立刻補一次心跳；暫停太多次（心跳正常、查詢卻一直失敗）
+    /// 就解除串接，照退避重試（3.4.3）
+    fn trouble(&self, trips: u32) {
+        if trips >= crate::upstreams::CHAIN_RELEASE_TRIPS {
+            let (io, before) = {
+                let mut i = self.inner.lock().unwrap();
+                let before = i.state;
+                (step(&mut i, Event::Unhealthy, &[], Now::get()), before)
+            };
+            if !io.is_empty() {
+                warn!("串接：上游黑潮的查詢一直失敗（暫停 {trips} 次），解除串接，改用自己的上游");
+            }
+            self.exec_sync(io);
+            self.changed(before);
+            return;
+        }
         let mut i = self.inner.lock().unwrap();
         if i.state == State::Chained {
             i.next_hb = Some(Instant::now());
@@ -1784,22 +1822,48 @@ mod tests {
         assert_eq!(i.state, State::None);
     }
 
-    /// 3.4.2：抽查上游給的答案不通過 → 解除串接（audit-failed），10～15 分鐘後重試、重試時重新探測；
-    /// 沒有串接時不做任何事
+    /// 抽查上游給的答案不通過 → 解除串接（audit-failed），6 小時後重試、重試時重新探測；同一把金鑰再不通過
+    /// 就 12、24 小時（3.4.3；3.4.2 是固定 10～15 分鐘）；沒有串接時不做任何事
     #[test]
     fn audit_failed_releases_and_retries() {
         let mut i = inner(true);
         assert!(step(&mut i, Event::AuditFailed, &[], now()).is_empty(), "沒有串接：不動");
-        chained(&mut i, [5; 32]);
-        let io = step(&mut i, Event::AuditFailed, &[], now());
-        assert!(io.contains(&Io::Unbind));
-        assert_eq!((i.state, i.reason), (State::Released, Some(Reason::AuditFailed)));
-        let wait = i.retry_at.unwrap().saturating_duration_since(now().at);
-        let max = i.timing.retry_max;
-        assert!(wait >= max.mul_f64(0.99) && wait <= max.mul_f64(1.51), "{wait:?}");
+        let hours = |i: &Inner| i.retry_at.unwrap().saturating_duration_since(now().at).as_secs_f64() / 3600.0;
+        // 重新串接（同一台機器的狀態機記著前幾次的不通過）
+        let again = |i: &Inner| {
+            let mut j = inner(true);
+            (j.audit_key, j.audit_strikes) = (i.audit_key, i.audit_strikes);
+            j
+        };
+        for (n, want) in [(1, 6.0), (2, 12.0), (3, 24.0), (4, 24.0)] {
+            i = again(&i);
+            chained(&mut i, [5; 32]);
+            let io = step(&mut i, Event::AuditFailed, &[], now());
+            assert!(io.contains(&Io::Unbind));
+            assert_eq!((i.state, i.reason), (State::Released, Some(Reason::AuditFailed)));
+            let h = hours(&i);
+            assert!(h >= want * 0.99 && h <= want * 1.11, "第 {n} 次：{h} 小時");
+        }
         assert!(Client::text(&i, 0).contains("抽查上游給的答案不通過"));
         let io = step(&mut i, Event::Retry, &[], now());
         assert_eq!(io, vec![Io::Probe { addr: hit(), tcp: false }], "重試：重新探測");
+        // 換了金鑰：重新從 6 小時算
+        i = again(&i);
+        chained(&mut i, [6; 32]);
+        step(&mut i, Event::AuditFailed, &[], now());
+        assert!(hours(&i) < 6.7);
+    }
+
+    /// 3.4.3：上游的查詢一直失敗（暫停 5 次）、心跳卻正常 → 解除串接（no-response），照退避重試
+    #[test]
+    fn unhealthy_releases_with_backoff() {
+        let mut i = inner(true);
+        assert!(step(&mut i, Event::Unhealthy, &[], now()).is_empty(), "沒有串接：不動");
+        chained(&mut i, [5; 32]);
+        let io = step(&mut i, Event::Unhealthy, &[], now());
+        assert!(io.contains(&Io::Unbind));
+        assert_eq!((i.state, i.reason), (State::Released, Some(Reason::NoResponse)));
+        assert!(i.retry_at.is_some());
     }
 
     #[test]

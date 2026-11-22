@@ -459,7 +459,7 @@ async fn manifest_signed_and_objects_verify() {
     assert!(d.client.last_probe().unwrap().caps.contains(&"share".to_string()));
     let rep = s.sync_once().await;
     assert_eq!(rep.error, None, "{rep:?}");
-    assert_eq!(sink.calls(), vec!["upstreams", "cdn-ranges", "cdn-pools"], "照規格的順序");
+    assert_eq!(sink.calls(), vec!["upstreams", "cdn-pools", "cdn-ranges"], "照規格的順序（3.4.3 起節點池在官方範圍之前）");
     // 節點池原封不動
     assert_eq!(sink.pools.lock().unwrap().as_deref(), Some(&pools_json()[..]));
     assert_eq!(
@@ -570,7 +570,7 @@ async fn tampered_chunk_rejected() {
     // 竄改停止後下一次就正常
     up.tamper.store(false, Ordering::SeqCst);
     s.sync_once().await;
-    assert_eq!(sink.calls(), vec!["upstreams", "cdn-ranges", "cdn-pools"]);
+    assert_eq!(sink.calls(), vec!["upstreams", "cdn-pools", "cdn-ranges"]);
 }
 
 #[tokio::test]
@@ -721,6 +721,11 @@ fn ranges_reject_bad_names_and_cidrs() {
     assert!(ok(json!({ "-ipv4.txt": "104.16.0.0/13" })).is_err());
     assert!(ok(json!({ "cloudflare-ipv4.txt": "not a cidr" })).is_err());
     assert!(ok(json!({ "cloudflare-ipv4.txt": "104.16.0.0/33" })).is_err());
+    // 前綴太短（整個網路都算成這家 CDN）：不收（3.4.3）
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "0.0.0.0/0" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "104.0.0.0/7" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv6.txt": "::/0" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "104.0.0.0/8" })).is_ok());
     assert!(ok(json!({ "cloudflare-ipv4.txt": "2606:4700::/32" })).is_err(), "家族不符");
     assert!(ok(json!({ "cloudflare-ipv4.txt": 5 })).is_err());
     assert!(ok(json!({})).is_err());
@@ -832,6 +837,15 @@ async fn own_newer_benchmark_not_overwritten() {
     *up.custom.lock().unwrap() = Some(craft(&key, vec![(o2, zstd(&u2))]));
     s.sync_once().await;
     assert_eq!(sink.calls(), vec!["upstreams"]);
+    // 上游宣稱一個未來的時間（10 天後）：不採信，自己剛跑過的比較新，不被蓋掉（3.4.3）
+    s.note_own_run("dns-benchmark");
+    let u3 = upstreams_json("future");
+    let mut o3 = obj(KIND_UPSTREAMS, u3.len() as u64);
+    o3.at = now_ms() + 10 * 86_400_000;
+    *up.custom.lock().unwrap() = Some(craft(&key, vec![(o3, zstd(&u3))]));
+    s.sync_once().await;
+    assert_eq!(sink.calls(), vec!["upstreams"], "沒有再匯入");
+    assert_eq!(status_obj(&s, KIND_UPSTREAMS)["error"], "own-newer");
 }
 
 async fn wait_ready(c: &ShareCache) {
@@ -1026,6 +1040,7 @@ fn live(dir: &std::path::Path) -> Arc<kuroshio::chain::share::Live> {
         cdn: None,
         seed_upstreams: dir.join("no-seed.json"),
         max_per_provider: 48,
+        min_auto: 3,
     })
 }
 
@@ -1174,6 +1189,7 @@ async fn live_upstreams_import_and_source() {
         cdn: None,
         seed_upstreams: dd.0.join("seed.json"),
         max_per_provider: 48,
+        min_auto: 3,
     };
     let j = check_upstreams(&upstreams_json("live"), &[1; 8], 5).unwrap();
     std::thread::sleep(Duration::from_millis(20));
@@ -1197,6 +1213,21 @@ async fn live_upstreams_import_and_source() {
     assert!(ShareSource::cdn(&l).is_none());
     // 沒有 CDN：節點池匯入失敗（不會被當成匯入過）
     assert!(ShareSink::import_cdn_pools(&l, &pools_json()).is_err());
+    // 照這台的設定（只用 DoQ）一台都不能用：不匯入、不算新鮮，自己的評測照排程跑（3.4.3）
+    let cfg2 = kuroshio_config::with_overrides(&json!({ "upstream": { "pinned": [], "fallback": [], "autoTypes": ["doq"] } }));
+    let state2 = dd.0.join("state").join("upstreams-doq.json");
+    let mgr2 = Arc::new(kuroshio::upstreams::Manager::new(&cfg2, state2.clone()));
+    let l2 = kuroshio::chain::share::Live {
+        mgr: mgr2,
+        cdn: None,
+        seed_upstreams: dd.0.join("seed.json"),
+        max_per_provider: 48,
+        min_auto: 3,
+    };
+    let j = check_upstreams(&upstreams_json("doq"), &[1; 8], 5).unwrap();
+    let e = ShareSink::import_upstreams(&l2, j).unwrap_err().to_string();
+    assert!(e.contains("not-usable"), "{e}");
+    assert!(!state2.exists(), "沒有寫進評測結果");
 }
 
 /// 真的服務當上游（評測結果在快照目錄、不是種子）：auth 公告 share、下游拿得到評測結果；
@@ -1256,4 +1287,25 @@ async fn protected_step_not_shed_without_lists() {
     assert_eq!(f.list_rules(), 0);
     let step = kuroshio::memgov::ProtectedStep { filter: f.clone() };
     assert!(!step.can_shed(), "沒有清單：不暫停");
+}
+
+/// 3.4.3：因為「上游不可信」（抽查不通過）解除串接：請排程器補跑評測、CDN 範圍與節點池（以前只在評測結果
+/// 超過 48 小時時補跑評測，不可信的上游給的範圍與節點池照用到自己的排程）
+#[tokio::test]
+async fn distrust_release_requests_own_jobs() {
+    let (_up, d, s, _sink) = pair(src_basic()).await;
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let a2 = asked.clone();
+    s.set_on_stale(Arc::new(move |jobs: &[&str]| {
+        a2.lock().unwrap().extend(jobs.iter().map(|j| j.to_string()));
+    }));
+    assert_eq!(s.sync_once().await.error, None);
+    d.client.audit_failed();
+    for _ in 0..50 {
+        if !asked.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(*asked.lock().unwrap(), vec!["dns-benchmark", "cdn-ranges", "cdn-pool"]);
 }

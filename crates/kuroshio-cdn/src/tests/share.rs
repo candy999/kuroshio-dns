@@ -116,3 +116,36 @@ fn export_then_import_roundtrip() {
     assert!(down.state().v6.contains("cloudflare", ip("2606:4700::7")));
     assert!(down.state().pools.p["cloudflare"].pool6.iter().any(|x| x.ip == ip("2606:4700::7")));
 }
+
+/// 3.4.3：串接拿到的節點池跟這台原本的合併（上游的在前），這台記的壞節點不清掉、也不放進來
+#[test]
+fn import_shared_merges_and_keeps_bad_marks() {
+    let c = cdn("share-merge");
+    c.with_state(|st| {
+        st.pools
+            .replace("cloudflare", vec![PoolNode::new(ip("104.16.9.9"))], vec![], Default::default());
+        let d = st.pools.p.get_mut("cloudflare").unwrap();
+        d.bad.insert(
+            ip("104.16.1.1"),
+            crate::pools::Bad {
+                at: crate::util::now_ms(),
+                reason: "連線失敗".into(),
+                quality: false,
+            },
+        );
+    });
+    c.import_shared(Some(&pools_json(&["104.16.1.1", "104.16.2.2"], &[])), None, 48)
+        .unwrap();
+    assert_eq!(pool4(&c, "cloudflare"), vec!["104.16.2.2", "104.16.9.9"], "上游的在前、自己的留著、壞的不放進來");
+    assert!(c.state().pools.p["cloudflare"].bad.contains_key(&ip("104.16.1.1")), "壞節點紀錄還在");
+}
+
+/// 3.4.3：上游給的官方範圍跟這台現有的重疊多少（串接匯入範圍前檢查）
+#[test]
+fn ranges_overlap_against_own_ranges() {
+    let c = cdn("share-overlap");
+    let f = c.ranges_overlap("cloudflare", &[ip("104.16.0.1"), ip("192.0.2.1")]).unwrap();
+    assert!((f - 0.5).abs() < 1e-9, "{f}");
+    assert_eq!(c.ranges_overlap("cloudflare", &[]), None);
+    assert_eq!(c.ranges_overlap("no-such-cdn", &[ip("104.16.0.1")]), None);
+}

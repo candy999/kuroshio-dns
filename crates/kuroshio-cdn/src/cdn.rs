@@ -1256,6 +1256,20 @@ impl Cdn {
     /// - 換掉之後標成要寫檔（照平常的快照流程寫出）；重新量健康與品質由呼叫端排
     ///
     /// 回傳各家收了幾個節點
+    /// 這些位址有多少比例落在這台目前的 `provider` 官方範圍裡；這台還沒有這家的範圍、或清單是空的 → None（3.4.3）
+    pub fn ranges_overlap(&self, provider: &str, ips: &[IpAddr]) -> Option<f64> {
+        if ips.is_empty() {
+            return None;
+        }
+        let st = self.state();
+        let p = st.pools.p.get(provider)?;
+        if p.range4.is_empty() && p.range6.is_empty() {
+            return None;
+        }
+        let inside = ips.iter().filter(|ip| st.pools.in_ranges(provider, **ip)).count();
+        Some(inside as f64 / ips.len() as f64)
+    }
+
     pub fn import_shared(&self, pools: Option<&[u8]>, v6: Option<&[u8]>, max_per_provider: usize) -> anyhow::Result<Vec<(String, usize)>> {
         let max = max_per_provider.max(1);
         let mut out: Vec<(String, usize)> = Vec::new();
@@ -1319,7 +1333,9 @@ impl Cdn {
                         .collect();
                     rest.insert("prefixes".into(), Value::Object(m));
                 }
-                st.pools.replace(name, pool4, pool6, rest);
+                // 合併（3.4.3）：上游的節點在前，這台自己的節點留著（每家上限照舊），自己記的壞節點也不清掉
+                // （以前整個換掉：自己觀察到的壞節點紀錄被丟掉，規格 10 第 3.8 節寫的是「合併、兩邊都留著」）
+                st.pools.merge_shared(name, pool4, pool6, rest, max);
                 out.push((name.to_string(), kept));
             }
         }

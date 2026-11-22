@@ -9,7 +9,7 @@
 //!   `chain` 關著、`allow_downstream` 關著、沒有串接、上游沒資料時一律照原本的排程跑（跟 3.3.7 一樣）。
 //! - `chain-share.json`（快照目錄，幾百 bytes）記每個種類最後一次成功匯入的時間與雜湊。
 
-use super::client::{Client, State};
+use super::client::{Client, Reason, State};
 use crate::upstream::{Kind, Upstream};
 use anyhow::{anyhow, bail, Context, Result};
 use kuroshio_community::chain::{self as proto, ManifestBody, Object, CHUNK, MANIFEST_NAME, PROTO};
@@ -38,8 +38,9 @@ pub const KIND_CDN_RANGES: &str = "cdn-ranges";
 /// 拿到的就是正本）。舊版上游的清單裡還會有這一種，下游照「不認得的種類」略過
 pub const KIND_FILTER_COPY: &str = "filter-copy";
 
-/// 處理順序（規格 3.4）；不在這裡的種類略過（含 3.4.2 以前的 `filter-copy`）
-const ORDER: [&str; 4] = [KIND_UPSTREAMS, KIND_CDN_RANGES, KIND_CDN_POOLS, KIND_CDN_V6];
+/// 處理順序（規格 3.4）；不在這裡的種類略過（含 3.4.2 以前的 `filter-copy`）。
+/// 節點池在官方範圍之前（3.4.3）：節點用這台「匯入前」的官方範圍檢查，上游不能先放寬範圍、再塞範圍外的節點
+const ORDER: [&str; 4] = [KIND_UPSTREAMS, KIND_CDN_POOLS, KIND_CDN_V6, KIND_CDN_RANGES];
 
 /// 3.4.0 認得的格式版本（每個種類都是 1）
 pub const FMT: u8 = 1;
@@ -63,6 +64,8 @@ pub const OBJECT_MAX: u64 = 1 << 20;
 pub const FRESH_MS: u64 = 36 * 3600 * 1000;
 /// 串接解除時手上的評測結果超過這個時間就請排程器補跑評測
 pub const STALE_ON_RELEASE_MS: u64 = 48 * 3600 * 1000;
+/// 因為上游不可信而解除串接時，請排程器補跑的工作（3.4.3）
+const DISTRUST_JOBS: [&str; 3] = ["dns-benchmark", "cdn-ranges", "cdn-pool"];
 
 /// 各種類解壓後的上限（規格 3.4 的表）
 pub fn raw_limit(kind: &str) -> u64 {
@@ -423,11 +426,18 @@ fn valid_cidr(s: &str, v6: bool) -> bool {
     let (Ok(ip), Ok(len)) = (ip.parse::<IpAddr>(), len.parse::<u8>()) else {
         return false;
     };
+    // 前綴至少 /8（IPv6 /16）：`0.0.0.0/0` 這種把整個網路都算成某家 CDN 的不收（3.4.3）
     match ip {
-        IpAddr::V4(_) => !v6 && len <= 32,
-        IpAddr::V6(_) => v6 && len <= 128,
+        IpAddr::V4(_) => !v6 && (MIN_PREFIX_V4..=32).contains(&len),
+        IpAddr::V6(_) => v6 && (MIN_PREFIX_V6..=128).contains(&len),
     }
 }
+
+/// 官方範圍可以收的最短前綴（3.4.3）
+const MIN_PREFIX_V4: u8 = 8;
+const MIN_PREFIX_V6: u8 = 16;
+/// 上游給的官方範圍至少要有這麼多（比例）落在這台自己現有的範圍裡，才換上（3.4.3）
+const RANGE_OVERLAP_MIN: f64 = 0.5;
 
 /// `cdn-ranges` 的檢查（規格 3.4）：`{ "files": { "<cdn>-ipv4.txt": "…" } }`，檔名只能是
 /// `[a-z0-9-]+-ipv[46].txt`、每行是合法的 CIDR（空行可以）
@@ -624,7 +634,8 @@ pub struct SyncReport {
 }
 
 type PersistFn = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
-type StaleFn = Arc<dyn Fn() + Send + Sync>;
+/// 串接解除時請排程器補跑的工作（參數是工作名稱）
+pub type StaleFn = Arc<dyn Fn(&[&str]) + Send + Sync>;
 
 /// 下游的同步
 pub struct Syncer {
@@ -717,15 +728,26 @@ impl Syncer {
             self.init_own();
         }
         if from == State::Chained && to != State::Chained {
+            let f = self.on_stale.lock().unwrap().clone();
+            // 因為「不可信」解除（抽查不通過、竄改、金鑰換了、驗證失敗）：它給的評測結果、CDN 範圍與節點池都不再
+            // 照用，請排程器補跑這些工作（排程器的最小間隔照舊；3.4.3。以前只在評測結果超過 48 小時時補跑評測）
+            let distrust = matches!(
+                self.client.state().1,
+                Some(Reason::AuditFailed | Reason::Tampered | Reason::UpstreamChanged | Reason::VerifyFailed)
+            );
             let at = self.state.lock().unwrap().kinds.get(KIND_UPSTREAMS).map(|i| i.imported_at);
-            if let Some(at) = at.filter(|at| now_ms().saturating_sub(*at) > STALE_ON_RELEASE_MS) {
+            if distrust {
+                info!("串接解除（上游不可信）：自己重做評測、CDN 範圍與節點池");
+                if let Some(f) = &f {
+                    f(&DISTRUST_JOBS);
+                }
+            } else if let Some(at) = at.filter(|at| now_ms().saturating_sub(*at) > STALE_ON_RELEASE_MS) {
                 info!(
                     "串接解除：上游給的評測結果已經是 {} 小時前的，請排程器補跑評測",
                     now_ms().saturating_sub(at) / 3_600_000
                 );
-                let f = self.on_stale.lock().unwrap().clone();
-                if let Some(f) = f {
-                    f();
+                if let Some(f) = &f {
+                    f(&["dns-benchmark"]);
                 }
             }
         }
@@ -804,6 +826,9 @@ impl Syncer {
             KIND_UPSTREAMS => "dns-benchmark",
             _ => return false,
         };
+        // 上游宣稱的時間比現在晚（超過 10 分鐘的時鐘誤差）：不採信，當成最舊的。不然宣稱一個未來的時間，
+        // 這台自己的評測結果就永遠被蓋掉（3.4.3）
+        let data_at = if data_at > now_ms().saturating_add(10 * 60_000) { 0 } else { data_at };
         self.state.lock().unwrap().own.get(job).is_some_and(|&t| t > data_at)
     }
 
@@ -1222,6 +1247,8 @@ pub struct Live {
     pub seed_upstreams: PathBuf,
     /// 匯入節點池時每家最多幾個（`pool.poolSize × 4`）
     pub max_per_provider: usize,
+    /// 匯入評測結果時，照這台的設定至少要有幾台能用（`benchmark.minAuto`，最多看 2 台；3.4.3）
+    pub min_auto: usize,
 }
 
 impl Live {
@@ -1281,6 +1308,14 @@ impl ShareSource for Live {
 
 impl ShareSink for Live {
     fn import_upstreams(&self, json: Vec<u8>) -> Result<()> {
+        // 照這台自己的設定篩完不夠用：不匯入、不算新鮮，自己的評測照排程跑（3.4.3；以前照樣算匯入成功，
+        // 最多 7 天不自己評測，手上卻沒有可用的自動上游）
+        let v: Value = serde_json::from_slice(&json)?;
+        let n = self.mgr.usable_auto(&v);
+        let need = self.min_auto.clamp(1, 2);
+        if n < need {
+            bail!("照這台的設定（類型、台數）只有 {n} 台能用（至少要 {need} 台），不匯入（not-usable）");
+        }
         crate::persist::write_atomic(self.mgr.state_file(), &json)?;
         self.mgr.reload_auto();
         Ok(())
@@ -1291,7 +1326,21 @@ impl ShareSink for Live {
         let dir = c.paths.state_dir.join("cdn").join("ranges");
         std::fs::create_dir_all(&dir)?;
         let mut changed = false;
+        let mut rejected = Vec::new();
         for (name, text) in files {
+            // 跟這台自己現有的範圍大部分重疊才換上（直系血親：上游不能把範圍改成跟官方無關的網段；3.4.3）。
+            // 這台還沒有這家的範圍時照收
+            let provider = name.rsplit_once("-ipv").map_or(name.as_str(), |(p, _)| p);
+            let bases: Vec<IpAddr> = text
+                .lines()
+                .filter_map(|l| l.trim().split_once('/').and_then(|(ip, _)| ip.parse().ok()))
+                .collect();
+            if let Some(f) = c.ranges_overlap(provider, &bases) {
+                if f < RANGE_OVERLAP_MIN {
+                    rejected.push(format!("{name}（{:.0}% 在自己的範圍裡）", f * 100.0));
+                    continue;
+                }
+            }
             let p = dir.join(&name);
             if std::fs::read(&p).ok().as_deref() == Some(text.as_bytes()) {
                 continue;
@@ -1301,6 +1350,12 @@ impl ShareSink for Live {
         }
         if changed {
             c.reload_ranges();
+        }
+        if !rejected.is_empty() {
+            warn!("共用結果：上游給的官方範圍跟這台的差太多，沒有換上：{}", rejected.join("、"));
+            if !changed {
+                bail!("官方範圍跟這台的差太多（ranges-mismatch）");
+            }
         }
         Ok(())
     }
@@ -1342,6 +1397,7 @@ pub fn start(
         cdn,
         seed_upstreams: crate::app::share_dir(cfg).join("seed").join("upstreams.json"),
         max_per_provider: kuroshio_cdn::config::JobsConfig::from_value(cfg).pool_size.max(1) * 4,
+        min_auto: cfg.pointer("/benchmark/minAuto").and_then(Value::as_u64).unwrap_or(3) as usize,
     });
     // 上游
     if let Some(r) = resolver.chain.get() {
@@ -1377,9 +1433,11 @@ pub fn start(
     match scheduler {
         Some(sched) => {
             let w = Arc::downgrade(sched);
-            s.set_on_stale(Arc::new(move || {
+            s.set_on_stale(Arc::new(move |jobs: &[&str]| {
                 if let Some(sc) = w.upgrade() {
-                    sc.request("dns-benchmark", "串接解除");
+                    for j in jobs {
+                        sc.request(j, "串接解除");
+                    }
                 }
             }));
         }

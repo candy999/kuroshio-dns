@@ -752,6 +752,9 @@ impl Resolver {
                         d.source = format!("{}(上游擋，改用自己的上游)", d.source);
                         // 狀態頁看得到次數（D3 這類只收 WARN 日誌的機器，看不到來源標籤；3.4.2）
                         self.stats.count(StatKind::ChainBypass);
+                    } else if results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::ServFail) {
+                        d.source = format!("{}(上游解析不到，改用自己的上游)", d.source);
+                        self.stats.count(StatKind::ChainRetry);
                     }
                     d
                 })
@@ -822,20 +825,18 @@ impl Resolver {
         });
     }
 
-    /// 抽查上游黑潮給的 CDN 答案：連到它給的 IP、用網域名稱做 TLS 握手檢查憑證；不符時用自己的加密上游
+    /// 抽查上游黑潮給的答案（3.4.3 起不限 CDN）：連到它給的 IP、用網域名稱做 TLS 握手檢查憑證；不符時用自己的加密上游
     /// 解析一次、對自己拿到的 IP 做同樣的檢查，自己的正常才算可疑。1 小時內 3 次可疑 → 解除串接（規格 10 第 3.8 節）
     fn maybe_audit(self: &Arc<Self>, qname: &str, qtype: u16, e: &Entry, upq: &[u8]) {
         if !self.chain_active() || !crate::clock::synced() || crate::app::pressure() != crate::sysinfo::Pressure::Normal {
             return;
         }
-        let Some(cdn) = self.steer_cdn() else { return };
+        // 不限 CDN 的答案、也不看這台有沒有開 CDN 置換（3.4.3）：以前只查 CDN 答案，下游關掉 CDN 時
+        // 對上游完全沒有查核。抽樣、間隔、同時一個的上限照舊
         let msg = Message {
             answers: e.answers.clone(),
             ..Default::default()
         };
-        if cdn.provider_of(&msg, qtype).is_none() {
-            return;
-        }
         let Some(ip) = logic::ips_of(&msg, qtype).into_iter().next() else {
             return;
         };
@@ -1027,7 +1028,12 @@ impl Resolver {
                     };
                     match r.ok().and_then(|b| Message::parse(&b).ok()) {
                         Some(msg) => {
-                            let class = logic::classify(&msg, qtype);
+                            let mut class = logic::classify(&msg, qtype);
+                            // 上游黑潮擋掉非 A／AAAA 的查詢時回空答案＋EDE（被擋／被過濾）：當成「上游擋」，
+                            // 由下游自己的過濾決定要不要擋（3.4.3；以前當成 NODATA 直接回給裝置）
+                            if up.role == Role::Chain && class == Class::NoData && blocked_by_ede(&msg) {
+                                class = Class::Blocked;
+                            }
                             if class == Class::ServFail && up.role != Role::Chain {
                                 servfails.push((up.clone(), ms));
                             } else {
@@ -1305,6 +1311,17 @@ fn timeout_for(p: &Params, up: &Up) -> Duration {
     }
 }
 
+/// 回應帶著 EDE 15（被擋）或 17（被過濾）：上游的過濾擋掉的（RFC 8914）
+fn blocked_by_ede(msg: &Message) -> bool {
+    msg.opt.as_ref().is_some_and(|o| {
+        o.options.iter().any(|(code, d)| {
+            *code == kuroshio_proto::message::opt_code::EDE
+                && d.len() >= 2
+                && matches!(u16::from_be_bytes([d[0], d[1]]), logic::ede::BLOCKED | logic::ede::FILTERED)
+        })
+    })
+}
+
 /// 這個回答算不算上游「有回應」（健康紀錄用）。串接上游回 SERVFAIL 是它自己解析不到（例如權威伺服器太慢），
 /// 上游黑潮本身是好的：不算串接失敗。以前算失敗，連續 3 次就暫停串接 30 秒、全部改走自己的加密上游（3.4.2）
 fn answered_ok(up: &Up, class: Class) -> bool {
@@ -1393,11 +1410,14 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
             chained: pick.up.role == Role::Chain,
         });
     }
-    // 串接上游（上游黑潮）解析失敗（SERVFAIL）：它已經問過自己的上游與備援，就是最後的答案，
-    // 下游不再問自己的加密上游重做一次（3.4.2：以前會，剛註冊的網域一多就重複使用網路、做 CDN 驗證）。
-    // 上游黑潮「擋掉」的不在這裡：下游的過濾沒有擋，就用自己的加密上游解析一次（下游自己決定要不要擋；
-    // 自己的上游也沒有答案時，才照上游的擋）
-    if let Some(c) = results.iter().find(|r| r.up.role == Role::Chain && r.class == Class::ServFail) {
+    // 串接上游（上游黑潮）解析失敗（SERVFAIL）：第一輪不當成答案，改問自己的上游（3.4.3）。上游黑潮自己的上游
+    // 壞了、心跳卻正常時，以前下游每一筆都 SERVFAIL、永遠不會退回自己的上游；每台黑潮都要能自己解析。
+    // 自己的上游也解析不到時（最後一輪，`accept_blocked`），才照上游的 SERVFAIL。
+    // 上游黑潮「擋掉」的同理：下游的過濾沒有擋，就用自己的加密上游解析一次（下游自己決定要不要擋）
+    if let Some(c) = results
+        .iter()
+        .find(|r| accept_blocked && r.up.role == Role::Chain && r.class == Class::ServFail)
+    {
         return Some(Decided {
             msg: c.msg.clone(),
             class: Class::ServFail,

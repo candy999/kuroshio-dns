@@ -980,7 +980,7 @@ async fn chained_answers_skip_cdn_and_ranking() {
     assert_eq!(r.stats.summary()["today"]["cdn"]["fastly"], 3, "還是統計是哪家 CDN");
 }
 
-// ---------------------------------------------------------------- 3.4.2 串接上游的 SERVFAIL／擋掉是最後答案
+// ---------------------------------------------------------------- 串接上游的 SERVFAIL／擋掉：下游自己再解析一次（3.4.3）
 
 fn servfail(_name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
     (2, vec![], 0)
@@ -990,14 +990,15 @@ fn sinkhole(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
     (0, vec![a(name, 300, [0, 0, 0, 0])], 0)
 }
 
-/// 串接上游（上游黑潮）自己解析不到（SERVFAIL）：下游照它的答案回、不再問自己的加密上游，也不算串接失敗
-/// （以前連續 3 次就暫停串接 30 秒、全部改走自己的上游）。上游擋掉的（0.0.0.0）：下游的過濾沒擋，
-/// 就用自己的上游解析一次（下游自己決定），一樣不算串接失敗；自己的上游也沒有答案才照上游的擋
+/// 串接上游（上游黑潮）解析不到（SERVFAIL）：下游改問自己的上游（3.4.3；上游黑潮自己的上游壞了、心跳卻正常時，
+/// 以前下游每一筆都 SERVFAIL），不算串接失敗；自己的上游也解析不到才照上游的 SERVFAIL。
+/// 上游擋掉的（0.0.0.0）：下游的過濾沒擋，就用自己的上游解析一次（下游自己決定），一樣不算串接失敗；
+/// 自己的上游也沒有答案才照上游的擋
 #[tokio::test]
-async fn chain_servfail_is_final_blocked_falls_back_to_own() {
+async fn chain_servfail_and_blocked_fall_back_to_own() {
     // 備援用的是明文上游：一般 DNS 沒有被接走時才會當備援（被接走時只用自己的加密上游繞過）
     let _path = PATH_STATE.lock().await;
-    // 上游黑潮 SERVFAIL：照樣回 SERVFAIL，不問自己的上游
+    // 上游黑潮 SERVFAIL：改問自己的上游
     let (chain, n_chain) = upstream(0, servfail).await;
     let (own, n_own) = upstream(0, answer_ok_ip).await;
     let mut c = cfg(&[], json!({}));
@@ -1007,11 +1008,22 @@ async fn chain_servfail_is_final_blocked_falls_back_to_own() {
         .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
     for i in 0..5u16 {
         let m = Message::parse(&r.handle(&q(i, &format!("servfail{i}.example.com"), 1), &CTX).await.unwrap()).unwrap();
-        assert_eq!(m.rcode, 2, "上游黑潮解析不到：照樣回 SERVFAIL");
+        assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(198, 51, 100, 77)), "上游黑潮解析不到：改用自己的上游");
     }
     assert_eq!(n_chain.load(Ordering::SeqCst), 5);
-    assert_eq!(n_own.load(Ordering::SeqCst), 0, "SERVFAIL：不問自己的上游");
-    assert!(!r.upstreams.chain_suspended(), "連續 5 次也不暫停串接");
+    assert_eq!(n_own.load(Ordering::SeqCst), 5);
+    assert!(!r.upstreams.chain_suspended(), "SERVFAIL 不算串接失敗");
+    assert_eq!(r.stats.summary()["today"]["chainRetry"], 5);
+    // 自己的上游也解析不到：照上游黑潮的 SERVFAIL
+    let (chain, _) = upstream(0, servfail).await;
+    let (own, _) = upstream(0, servfail).await;
+    let mut c = cfg(&[], json!({}));
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    let m = Message::parse(&r.handle(&q(1, "nowhere.example.com", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 2, "兩邊都解析不到：SERVFAIL");
 
     // 上游黑潮擋掉、下游的過濾沒擋：用自己的加密上游解析一次（下游自己決定），不算串接失敗
     let (chain, n_chain) = upstream(0, sinkhole).await;
@@ -1092,4 +1104,50 @@ async fn servfail_counts_only_when_others_answer() {
     r.handle(&q(9, "mixed.example.com", 1), &CTX).await.unwrap();
     assert_eq!(fail_of(&r, &ida), 1);
     assert_eq!(fail_of(&r, &format!("udp://{ok}")), 0);
+}
+
+/// 上游黑潮擋掉非 A／AAAA 的查詢：回空答案＋EDE 17（被過濾）。下游當成「上游擋」，自己的過濾沒擋就用自己的上游解析（3.4.3）
+#[tokio::test]
+async fn chain_ede_blocked_falls_back_to_own() {
+    let _path = PATH_STATE.lock().await;
+    // 自己組回應：NOERROR、沒有答案、OPT 裡帶 EDE 17
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let chain = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1500];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
+            let Ok(qm) = Message::parse(&buf[..n]) else { continue };
+            let mut r = Message::response_to(&qm, 0);
+            if r.opt.is_none() {
+                r.opt = Some(kuroshio_proto::message::Opt::default());
+            }
+            kuroshio_proto::logic::add_ede(&mut r, kuroshio_proto::logic::ede::FILTERED, "x");
+            let _ = sock.send_to(&r.encode(), peer).await;
+        }
+    });
+    let (own, n_own) = upstream(0, answer_txt).await;
+    let mut c = cfg(&[], json!({}));
+    kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.upstreams
+        .set_chain(Some(kuroshio::upstream::Upstream::parse(&format!("udp://{chain}")).unwrap()));
+    let m = Message::parse(&r.handle(&q(1, "txt.example.com", 16), &CTX).await.unwrap()).unwrap();
+    assert!(!m.answers.is_empty(), "上游擋掉的 TXT：改用自己的上游");
+    assert_eq!(n_own.load(Ordering::SeqCst), 1);
+    assert_eq!(r.stats.summary()["today"]["chainBypass"], 1);
+}
+
+fn answer_txt(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
+    (
+        0,
+        vec![Record {
+            name: name.to_string(),
+            rtype: 16,
+            class: 1,
+            ttl: 300,
+            data: RData::Raw(vec![2, b'o', b'k']),
+        }],
+        0,
+    )
 }

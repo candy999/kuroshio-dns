@@ -36,11 +36,16 @@ impl Role {
 
 /// 串接上游連續失敗幾次就暫停
 pub const CHAIN_FAIL_LIMIT: u32 = 3;
-/// 串接上游暫停多久
+/// 串接上游第一次暫停多久（之後每次加倍，最多 [`CHAIN_PAUSE_MAX`]；3.4.3）
 pub const CHAIN_PAUSE: Duration = Duration::from_secs(30);
+/// 串接上游暫停的上限
+pub const CHAIN_PAUSE_MAX: Duration = Duration::from_secs(600);
+/// 暫停這麼多次（中間沒有穩定 10 分鐘）就解除串接，交給串接狀態機照退避重試（3.4.3）：
+/// 心跳正常、查詢卻一直失敗時，以前每 30～45 秒暫停、接回一次，沒有盡頭
+pub const CHAIN_RELEASE_TRIPS: u32 = 5;
 
-/// 串接上游連續失敗時的通知（串接模組立刻補一次心跳）
-pub type TroubleFn = Arc<dyn Fn() + Send + Sync>;
+/// 串接上游連續失敗時的通知：參數是第幾次暫停（串接模組立刻補一次心跳；達到 [`CHAIN_RELEASE_TRIPS`] 就解除串接）
+pub type TroubleFn = Arc<dyn Fn(u32) + Send + Sync>;
 
 #[derive(Default)]
 struct Trouble(RwLock<Option<TroubleFn>>);
@@ -141,7 +146,7 @@ impl Up {
         self.record_inner(ok, ms, &mut notify);
         // 放掉 stats 的鎖之後才通知（回呼可能會讀這個上游的狀態）
         if let Some(f) = notify {
-            f();
+            f(0);
         }
     }
 
@@ -173,14 +178,20 @@ impl Up {
                 );
             }
             if self.role == Role::Chain && s.consec_fail >= CHAIN_FAIL_LIMIT {
-                s.open_until = Some(now + CHAIN_PAUSE);
+                s.trips += 1;
+                let pause = CHAIN_PAUSE.saturating_mul(1 << (s.trips - 1).min(8)).min(CHAIN_PAUSE_MAX);
+                s.open_until = Some(now + pause);
                 s.consec_fail = 0;
                 warn!(
-                    "串接：上游黑潮 {} 連續失敗 {CHAIN_FAIL_LIMIT} 次，暫停 {} 秒，先用自己的上游",
+                    "串接：上游黑潮 {} 連續失敗 {CHAIN_FAIL_LIMIT} 次，暫停 {} 秒（第 {} 次），先用自己的上游",
                     self.up.id,
-                    CHAIN_PAUSE.as_secs()
+                    pause.as_secs(),
+                    s.trips
                 );
-                *notify = self.trouble.as_ref().and_then(|t| t.0.read().unwrap().clone());
+                let trips = s.trips;
+                if let Some(f) = self.trouble.as_ref().and_then(|t| t.0.read().unwrap().clone()) {
+                    *notify = Some(Arc::new(move |_| f(trips)));
+                }
             }
         }
     }
@@ -326,6 +337,26 @@ impl Manager {
         };
         m.reload_auto();
         m
+    }
+
+    /// 一份評測結果（`upstreams.json` 的內容）照這台自己的設定（`autoTypes`、`autoMax`、固定上游、這個版本支援的類型）
+    /// 能用幾台。串接拿到上游的評測結果時先看這個，不夠就不匯入（3.4.3）
+    pub fn usable_auto(&self, st: &Value) -> usize {
+        let pinned: Vec<&str> = self.pinned.iter().map(|p| p.up.id.as_str()).collect();
+        st.get("selected")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                let ty = s.get("type").and_then(Value::as_str).unwrap_or("udp");
+                self.auto_types.iter().any(|t| t == ty)
+                    && s.get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| Upstream::parse(id).ok())
+                        .is_some_and(|u| u.supported() && !pinned.contains(&u.id.as_str()))
+            })
+            .count()
+            .min(self.auto_max)
     }
 
     /// 讀每日評測結果；檔案沒變就不重讀
@@ -696,7 +727,7 @@ mod tests {
         let m = Manager::new(&cfg(), PathBuf::from("/nonexistent/upstreams.json"));
         let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let n2 = n.clone();
-        m.on_chain_trouble(Arc::new(move || {
+        m.on_chain_trouble(Arc::new(move |_| {
             n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
         m.set_chain(Some(Upstream::parse("udp://192.168.1.1:53").unwrap()));
@@ -716,6 +747,39 @@ mod tests {
         assert_eq!(m.list_json()[0]["role"], "chain");
         m.set_chain(None);
         assert!(m.chain().is_none() && !m.chain_suspended());
+    }
+
+    fn pause_left(u: &Up) -> Duration {
+        u.stats
+            .lock()
+            .unwrap()
+            .open_until
+            .map_or(Duration::ZERO, |t| t.saturating_duration_since(Instant::now()))
+    }
+
+    /// 3.4.3：串接上游一直失敗、心跳卻正常時，暫停時間逐次加倍（最多 10 分鐘），回呼帶著第幾次
+    #[test]
+    fn chain_pause_doubles_and_reports_trips() {
+        let m = Manager::new(&cfg(), PathBuf::from("/nonexistent/upstreams.json"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        m.on_chain_trouble(Arc::new(move |t| s2.lock().unwrap().push(t)));
+        m.set_chain(Some(Upstream::parse("udp://192.168.1.1:53").unwrap()));
+        let c = m.chain().unwrap();
+        let mut pauses = Vec::new();
+        for _ in 0..7 {
+            for _ in 0..CHAIN_FAIL_LIMIT {
+                c.record(false, 0.0);
+            }
+            pauses.push(pause_left(&c).as_secs());
+            // 暫停結束（模擬）：下一輪的失敗才會再暫停
+            c.stats.lock().unwrap().open_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert!(pauses[0] <= 30 && pauses[0] >= 29, "{pauses:?}");
+        assert!(pauses[1] >= 59 && pauses[2] >= 119, "{pauses:?}");
+        assert!(pauses.iter().all(|&p| p <= 600), "最多 10 分鐘：{pauses:?}");
+        assert!(pauses[6] >= 599, "{pauses:?}");
     }
 
     #[test]
