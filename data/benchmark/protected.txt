@@ -37,3 +37,8 @@ quic://doh-mullvad.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保
 9.9.9.9  # filter=malware 依據：Quad9 官方 checked=2026-11-22
 149.112.112.9  # filter=malware 依據：dns9.quad9.net checked=2026-11-22
 2620:fe::fe:9  # filter=malware 依據：dns9.quad9.net checked=2026-11-22
+149.112.112.112  # filter=malware 依據：Quad9 官方：9.9.9.9 的第二個位址 checked=2026-11-22
+2620:fe::9  # filter=malware 依據：Quad9 官方：dns9.quad9.net checked=2026-11-22
+76.76.2.1  # filter=malware 依據：ControlD p1（擋惡意網站的那一組，依名稱推定） checked=2026-11-22
+2606:1a40::1  # filter=malware 依據：ControlD p1 checked=2026-11-22
+2606:1a40:1::1  # filter=malware 依據：ControlD s1（p1 的第二組） checked=2026-11-22
