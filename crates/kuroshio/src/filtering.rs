@@ -354,16 +354,34 @@ impl ListCopies {
     /// 呼叫端在 async 裡邊收邊解析，每一段之間會讓出執行緒，重建大清單時 DNS 照常回答。沒有副本回傳 None
     pub fn stream(&self, url: &str) -> Option<tokio::sync::mpsc::Receiver<CopyChunk>> {
         let m = self.meta(url)?;
-        let path = self.persister.lock().unwrap().file_path(&m.file);
+        let (pending, path) = {
+            let p = self.persister.lock().unwrap();
+            (p.pending_bytes(&m.file), p.file_path(&m.file))
+        };
+        // 還沒寫到磁碟（登記之後要等下一輪快照）：讀記憶體裡的待寫內容。以前直接開檔，開不到就當成副本壞掉、
+        // 整份重新下載（3.4.2 Windows 複驗：留在記憶體的清單存成副本後、下一輪快照前恢復清單，又全部下載一次）
+        if let Some(z) = pending {
+            return Some(stream_zstd(move || Some(std::io::Cursor::new(z)), m.hash));
+        }
         Some(stream_zstd(move || std::fs::File::open(&path).ok(), m.hash))
     }
 
     /// 讀副本（解壓後一段一段交給 `feed`）。回傳有沒有讀到
     pub fn read(&self, url: &str, feed: &mut dyn FnMut(&[u8])) -> bool {
         let Some(m) = self.meta(url) else { return false };
-        let path = self.persister.lock().unwrap().file_path(&m.file);
-        let Ok(f) = std::fs::File::open(&path) else { return false };
-        let Ok(mut dec) = zstd::stream::read::Decoder::new(f) else {
+        let (pending, path) = {
+            let p = self.persister.lock().unwrap();
+            (p.pending_bytes(&m.file), p.file_path(&m.file))
+        };
+        // 還沒寫到磁碟：讀待寫內容（同 `stream`）
+        let src: Box<dyn Read> = match pending {
+            Some(z) => Box::new(std::io::Cursor::new(z)),
+            None => match std::fs::File::open(&path) {
+                Ok(f) => Box::new(f),
+                Err(_) => return false,
+            },
+        };
+        let Ok(mut dec) = zstd::stream::read::Decoder::new(src) else {
             return false;
         };
         let mut buf = vec![0u8; 64 * 1024];
@@ -1835,6 +1853,11 @@ mod copy_tests {
         };
         let (h, z) = sink(&body);
         assert!(c.offer(url, h, z, &v, 100, 10), "第一次：登記寫出");
+        // 還沒寫到磁碟（等下一輪快照）就要讀得到：恢復清單時不重新下載
+        assert!(c.available_same(url, h));
+        let mut early = Vec::new();
+        assert!(c.read(url, &mut |b| early.extend_from_slice(b)), "待寫的副本讀得到");
+        assert_eq!(early, body);
         let now = crate::persist::now_secs();
         assert_eq!(p.lock().unwrap().flush(now).unwrap(), 2, "副本 + 索引");
         let file = c.meta(url).unwrap().file;
