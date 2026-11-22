@@ -1816,9 +1816,16 @@ pub async fn start(cfg: &Value) -> Result<Started> {
             );
         }
     }
-    // 第一次啟動：state 還是空的就帶入種子資料（評測結果、節點池、網站驗證紀錄）
+    // 第一次啟動：state 還是空的就帶入種子資料（節點池、IPv6 節點、網站驗證紀錄）
     // （apply_seeds 自己會記錄帶入了哪些）
     let _ = kuroshio_jobs::apply_seeds(&persist_dir(cfg), &share_dir(cfg).join("seed"));
+    // 還沒有評測結果：初始上游用預設名單的 A 級（3.5.0；以前用種子裡別條線路的評測結果）。
+    // 只讀名單、不查詢任何伺服器；評測完成就被取代
+    {
+        let state_dir = persist_dir(cfg);
+        let base = state_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| state_dir.clone());
+        let _ = kuroshio_jobs::apply_initial_upstreams(&crate::benchjob::bench_paths(cfg, &state_dir, &base), cfg);
+    }
     let resolver = build_resolver(cfg)?;
     // 來源 IP 存取控制（規格 08）：在任何監聽啟動之前
     let access = {

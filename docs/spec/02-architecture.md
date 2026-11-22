@@ -97,6 +97,8 @@ kuroshio check-config <file>                     檢查設定檔
 | state | `/usr/share/kuroshio/state/`（可改到外接硬碟） | `%ProgramData%\kuroshio\state\` |
 | 種子資料 | `/usr/share/kuroshio/seed/` | `%ProgramFiles%\kuroshio\seed\` |
 
+種子資料（`data/seed/`）：台灣節點池（`cdn-pools.json`）、永久 IPv6 節點（`v6-nodes.json`）、CDN 網域驗證紀錄（`cdn-domains.json`），state 裡對應的檔不存在或是空的才帶入（`kuroshio_jobs::seed::apply_seeds`）。3.5.0 起**不帶上游評測結果**（以前的 `upstreams.json` 是某一條線路上的評測結果，帶著那條線路的固定上游與封殺清單）：`state/upstreams.json` 還是空的時，啟動時由 `seed::initial_upstreams()` 從預設名單的 A 級產生初始上游（依名單的 `ms`、同經營者 1 台、加密的優先、`upstream.autoTypes` 有的類型，取 `upstream.autoMax` 台＋3 台 `spares`），寫成 `{ "generatedAt": null, "source": "default-list", "selected": […], "spares": […], "counts": {…} }`。只讀名單、不查詢任何伺服器；已經有 `upstreams.json`（升級、備份匯入、串接匯入）不動。沒有 `generatedAt` 的不分享給下游（下游自己也有預設名單）。
+
 ### 5.2 state 檔案（格式不變，3.0 照讀照寫）
 
 | 檔案 | 內容 |

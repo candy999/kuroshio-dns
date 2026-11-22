@@ -28,8 +28,9 @@ use tracing::{debug, error, info, warn};
 /// 子程序的隱藏指令
 pub const CHILD_CMD: &str = "__job-dns-benchmark";
 
-/// 依設定建一個評測（主程式與子程序共用，路徑一模一樣）
-pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchmark {
+/// 評測用到的檔案位置：使用者的名單（`benchmark.dir`）不存在就用程式附帶的；兩邊不同時合併。
+/// 評測與首次啟動的初始上游（3.5.0）共用
+pub fn bench_paths(cfg: &Value, state_dir: &Path, base_dir: &Path) -> BenchPaths {
     let mut paths = BenchPaths::from_config(cfg, state_dir, base_dir);
     let shipped = share_dir(cfg).join("benchmark");
     if !paths.list_dir.is_dir() {
@@ -38,6 +39,12 @@ pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchma
     if shipped.is_dir() && shipped != paths.list_dir {
         paths.default_list_dir = Some(shipped);
     }
+    paths
+}
+
+/// 依設定建一個評測（主程式與子程序共用，路徑一模一樣）
+pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchmark {
+    let mut paths = bench_paths(cfg, state_dir, base_dir);
     // 評測報表放記憶體：Flash 上不寫每天的報表；
     // 最近一次的摘要（judge.log、eliminated.csv、upstreams.json，各 128 KB 以內）另存到學習資料區，重開機後還查得到
     let mut keep_last = None;

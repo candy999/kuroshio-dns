@@ -434,7 +434,7 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 
 - 「新鮮」＝ 36 小時內成功匯入過，而且現在是串接中。略過時日誌寫「由上游黑潮提供，略過」（`dns-benchmark` 在 `/api/jobs` 的 `detail.dns-benchmark.last.skipped` 也有）。
 - 不新鮮（上游沒資料、驗證失敗、36 小時沒同步成功、串接解除、`chain` 關著）時，工作照原本的排程自己跑，跟 3.3.7 一樣。匯入的資料不刪，解除後繼續用，直到自己的工作算出新的。
-- 狀態記在快照目錄的 `chain-share.json`（幾百 bytes）。`/api/status` 的 `autoUpstreams.source` 是 `"chain"`（上游給的）或 `"benchmark"`（自己評測的）。
+- 狀態記在快照目錄的 `chain-share.json`（幾百 bytes）。`/api/status` 的 `autoUpstreams.source` 是 `"chain"`（上游給的）或 `"benchmark"`（自己評測的）；3.5.0 起還沒評測、來自預設名單的是 `"default-list"`。
 
 ### 上游放行下游
 
@@ -598,6 +598,14 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 - `upstreams.json`（`/api/benchmark`）的 `selected[]` 每筆多 `tier`（`"A"`／`"B"`／`"user"`；沒標記的算 `"B"`）與 `op`（經營者，最長 64 bytes；沒有是空字串），`counts` 多 `byTier`（候選依分級的台數，固定上游與對照組不算）。
 - `final_dns_smart.csv` 最後多 `Tier` 一欄。
+
+### 首次啟動的初始上游
+
+全新的 state 第一次啟動時，`state/upstreams.json` 由預設名單的 A 級產生（不再用種子裡的評測結果）：
+
+- `generatedAt` 是 `null`、`source` 是 `"default-list"`；`selected[]` 的 `reason` 是 `"預設名單"`、`tier` 是 `"A"`、另外有 `listMs`（名單裡的延遲，只是排序依據）；`spares[]` 是候補（格式同 `selected[]`，最多 3 台）。
+- `/api/status` 的 `autoUpstreams` 是 `{ "generatedAt": null, "count": 5, "source": "default-list" }`（以前沒有評測結果時是 `null`）。狀態頁顯示「自動上游來自預設名單（還沒評測）」。
+- 第一次評測完成就被評測結果取代；串接時不分享給下游。
 
 ## 重新載入不斷線（3.4.0 起）
 

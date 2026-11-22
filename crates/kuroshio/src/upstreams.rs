@@ -66,6 +66,9 @@ struct Stats {
     open_until: Option<Instant>,
 }
 
+/// `upstreams.json` 的 `source`：還沒評測、初始上游來自預設名單（3.5.0，見 `kuroshio_jobs::seed::initial_upstreams`）
+pub const DEFAULT_LIST: &str = "default-list";
+
 /// 暫停過的自動上游，暫停結束後要穩定這麼久才把暫停次數歸零（暫停時間重新從 1 分鐘算）
 const TRIP_RESET: Duration = Duration::from_secs(10 * 60);
 
@@ -295,6 +298,8 @@ fn build(specs: &[String], role: Role) -> Vec<Arc<Up>> {
 struct Auto {
     list: Vec<Arc<Up>>,
     generated_at: Option<String>,
+    /// `upstreams.json` 的 `source` 是字串時（3.5.0：`"default-list"` = 還沒評測、來自預設名單）
+    source: Option<String>,
     mtime: Option<SystemTime>,
 }
 
@@ -327,6 +332,7 @@ impl Manager {
             auto: RwLock::new(Auto {
                 list: Vec::new(),
                 generated_at: None,
+                source: None,
                 mtime: None,
             }),
             state_file,
@@ -415,16 +421,26 @@ impl Manager {
             list.push(up);
         }
         let generated_at = st.get("generatedAt").and_then(Value::as_str).map(str::to_string);
+        let source = st.get("source").and_then(Value::as_str).map(str::to_string);
         info!(
             "自動上游已載入（{}）：{}",
-            generated_at.as_deref().unwrap_or("?"),
+            generated_at.as_deref().unwrap_or(if source.as_deref() == Some(DEFAULT_LIST) {
+                "預設名單，還沒評測"
+            } else {
+                "?"
+            }),
             if list.is_empty() {
                 "無".to_string()
             } else {
                 list.iter().map(|u| u.up.id.clone()).collect::<Vec<_>>().join(", ")
             }
         );
-        *self.auto.write().unwrap() = Auto { list, generated_at, mtime };
+        *self.auto.write().unwrap() = Auto {
+            list,
+            generated_at,
+            source,
+            mtime,
+        };
     }
 
     /// 這次查詢要用的上游：固定上游一律參與、暫停中的自動上游跳過；都沒有就用備援。
@@ -530,12 +546,21 @@ impl Manager {
             .collect()
     }
 
+    /// `/api/status` 的 `autoUpstreams`：評測結果的時間與台數；還沒評測、初始上游來自預設名單時（3.5.0）
+    /// 是 `{ "generatedAt": null, "count", "source": "default-list" }`；都沒有是 null
     pub fn auto_info(&self) -> Value {
         let a = self.auto.read().unwrap();
-        match &a.generated_at {
-            Some(g) => json!({ "generatedAt": g, "count": a.list.len() }),
-            None => Value::Null,
+        match (&a.generated_at, a.source.as_deref()) {
+            (Some(g), _) => json!({ "generatedAt": g, "count": a.list.len() }),
+            (None, Some(DEFAULT_LIST)) => json!({ "generatedAt": null, "count": a.list.len(), "source": DEFAULT_LIST }),
+            _ => Value::Null,
         }
+    }
+
+    /// 自動上游還沒評測過（來自預設名單，3.5.0）
+    pub fn auto_from_default_list(&self) -> bool {
+        let a = self.auto.read().unwrap();
+        a.generated_at.is_none() && a.source.as_deref() == Some(DEFAULT_LIST)
     }
 
     pub fn state_file(&self) -> &Path {

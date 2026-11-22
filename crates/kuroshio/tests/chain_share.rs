@@ -1236,6 +1236,28 @@ async fn live_upstreams_import_and_source() {
     assert!(ShareSource::upstreams(&l).is_some());
     std::fs::copy(&state, dd.0.join("seed.json")).unwrap();
     assert!(ShareSource::upstreams(&l).is_none());
+    // 3.5.0：預設名單產生的初始上游（沒有 generatedAt）不分享；以前附帶的種子（種子檔已經移除）也認得
+    let _ = std::fs::remove_file(dd.0.join("seed.json"));
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &state,
+        br#"{"generatedAt":null,"source":"default-list","selected":[{"id":"https://dns.example.com/dns-query","type":"doh","reason":"default"}]}"#,
+    )
+    .unwrap();
+    mgr.reload_auto();
+    assert!(ShareSource::upstreams(&l).is_none());
+    let auto = kuroshio::chain::share::auto_info(&mgr);
+    assert_eq!(
+        (auto["source"].as_str(), auto["count"].as_u64()),
+        (Some("default-list"), Some(1)),
+        "{auto}"
+    );
+    std::fs::write(
+        &state,
+        br#"{"generatedAt":"2026-11-10T20:13:34.970Z","selected":[{"id":"https://dns.example.com/dns-query","type":"doh"}]}"#,
+    )
+    .unwrap();
+    assert!(ShareSource::upstreams(&l).is_none(), "3.4.x 的種子");
     assert!(ShareSource::cdn(&l).is_none());
     // 沒有 CDN：節點池匯入失敗（不會被當成匯入過）
     assert!(ShareSink::import_cdn_pools(&l, &pools_json()).is_err());

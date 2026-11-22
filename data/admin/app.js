@@ -656,7 +656,8 @@
 
 		// 上游
 		var au = st.autoUpstreams;
-		$('st-up-desc').textContent = au ? (au.source === 'chain' ? '自動上游來自上游黑潮 ' : '自動上游來自 ') + fmtTime(au.generatedAt) + ' 的評測（' + fmtNum(au.count) + ' 台）' +
+		$('st-up-desc').textContent = au && au.source === 'default-list' ? '自動上游來自預設名單（還沒評測，' + fmtNum(au.count) + ' 台）：第一次評測完成後換成評測結果。' :
+			au ? (au.source === 'chain' ? '自動上游來自上游黑潮 ' : '自動上游來自 ') + fmtTime(au.generatedAt) + ' 的評測（' + fmtNum(au.count) + ' 台）' +
 			(au.source === 'chain' ? '，是串接的共用結果。' : '。') : '還沒有每日評測結果，暫時使用固定上游與備援。';
 		tableRows($('st-up').tBodies[0], (st.upstreams || []).map(function (u) {
 			var n = (u.ok || 0) + (u.fail || 0), rate = n ? u.ok / n : null, h;

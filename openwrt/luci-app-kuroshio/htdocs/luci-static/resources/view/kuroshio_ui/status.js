@@ -232,7 +232,9 @@ return view.extend({
 			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', note.join(' · ')];
 		});
 		var upSec = common.section(_('上游'), [
-			E('p', { 'class': 'cbi-section-descr' }, api.autoUpstreams ? (api.autoUpstreams.source === 'chain'
+			E('p', { 'class': 'cbi-section-descr' }, api.autoUpstreams && api.autoUpstreams.source === 'default-list'
+				? _('自動上游來自預設名單（還沒評測，%d 台）：第一次評測完成後換成評測結果').format(api.autoUpstreams.count || 0)
+				: api.autoUpstreams ? (api.autoUpstreams.source === 'chain'
 				? _('自動上游來自上游黑潮 %s 的評測（串接的共用結果；最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)
 				: _('自動上游來自 %s 的評測（最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
 			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups, [2, 3, 4])

@@ -1239,7 +1239,9 @@ fn e2e_share_falls_back() {
         !c["shared"]["skippedJobs"].as_array().unwrap().iter().any(|j| j == "dns-benchmark"),
         "{c}"
     );
-    assert_eq!(p.down.status()["autoUpstreams"]["source"], "benchmark");
+    // 3.5.0：全新的 state 不帶種子評測結果（以前帶入種子，這裡是 "benchmark"）；這組測試的 autoTypes 是空的，
+    // 也不產生預設名單的初始上游：沒有任何自動上游的來源
+    assert!(p.down.status()["autoUpstreams"].is_null(), "{}", p.down.status()["autoUpstreams"]);
 }
 
 /// 過濾清單伺服器：`/bypass.txt`（繞過防護）
