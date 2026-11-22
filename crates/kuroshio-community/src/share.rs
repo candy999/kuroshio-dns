@@ -24,6 +24,26 @@ pub fn limit_of(k: Kind) -> usize {
     }
 }
 
+/// 全部好友的資料合計最少能存幾筆（記憶體再少也留這麼多）
+pub const MIN_RECORD_BUDGET: usize = 1_000;
+
+/// 全部好友的資料（`received.cbor.zst`）合計最多存幾筆：一份好友資料解壓後的上限
+/// （[`crate::Config::max_plain_bytes`]，跟著記憶體控制縮放）每 1 KB 一筆。
+/// 一筆記錄在記憶體裡大約幾百 bytes，所以全部好友的資料最多用掉差不多這個上限的大小
+pub fn record_budget(max_plain_bytes: usize) -> usize {
+    (max_plain_bytes / 1024).max(MIN_RECORD_BUDGET)
+}
+
+/// 每個好友能存幾筆：總量由好友平分（先同步的好友不會把位置占光）
+pub fn friend_budget(total: usize, friends: usize) -> usize {
+    total / friends.max(1)
+}
+
+/// 延遲差不到這麼多不算內容變動（只影響「要不要通知好友」，分享出去的還是當時量到的值）
+pub const MS_TOLERANCE: u32 = 10;
+/// 上游成功率差不到這麼多不算內容變動（成功率是一直在算的，每筆查詢都可能讓它差一點點）
+pub const OK_TOLERANCE: f32 = 0.05;
+
 pub fn ttl_of(k: Kind) -> u64 {
     match k {
         Kind::Upstream => 2 * DAY,
@@ -112,15 +132,26 @@ pub fn to_wire(r: &LocalRecord, now: u64) -> Option<WireRecord> {
     (w.exp > now).then_some(w)
 }
 
-/// 內容一樣（不看 seq / obs；有效期限差不到 12 小時也算一樣，避免每次重新驗證就重送整包）
+/// 內容一樣（不看 seq / obs；有效期限差不到 12 小時、延遲差不到 [`MS_TOLERANCE`]、上游成功率差不到
+/// [`OK_TOLERANCE`] 也算一樣，避免每次重新驗證、重新量延遲就重送整包、每 10 分鐘通知所有好友一次）
 fn same_content(a: &WireRecord, b: &WireRecord) -> bool {
     let strip = |r: &WireRecord| WireRecord {
         seq: 0,
         obs: 0,
         exp: 0,
+        ms: r.ms.map(|_| 0),
+        ok: r.ok.map(|_| 0.0),
         ..r.clone()
     };
-    strip(a) == strip(b) && a.exp.abs_diff(b.exp) <= 12 * HOUR
+    let ms_close = match (a.ms, b.ms) {
+        (Some(x), Some(y)) => x.abs_diff(y) < MS_TOLERANCE,
+        (x, y) => x == y,
+    };
+    let ok_close = match (a.ok, b.ok) {
+        (Some(x), Some(y)) => (x - y).abs() < OK_TOLERANCE,
+        (x, y) => x == y,
+    };
+    strip(a) == strip(b) && ms_close && ok_close && a.exp.abs_diff(b.exp) <= 12 * HOUR
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,6 +612,54 @@ mod tests {
         // 快照
         let back = ShareSet::load(&s.snapshot()).unwrap();
         assert_eq!((back.epoch, back.seq, back.floor, back.len()), (s.epoch, s.seq, s.floor, s.len()));
+    }
+
+    #[test]
+    fn small_latency_changes_are_not_content_changes() {
+        // 節點池每次重新量延遲都會差幾 ms：不算變動，不重送、不通知好友；差 10 ms 以上才更新
+        let now = 100 * DAY;
+        let with_ms = |ms: Option<u32>| LocalRecord::Node {
+            p: "cloudflare".into(),
+            ip: "104.16.1.1".parse().unwrap(),
+            pop: "TPE".into(),
+            ms,
+            obs: now,
+            permanent: false,
+        };
+        let w = |r: LocalRecord| to_wire(&r, now).into_iter().collect::<Vec<_>>();
+        let mut s = ShareSet::new();
+        assert!(s.refresh(w(with_ms(Some(30))), now));
+        assert!(!s.refresh(w(with_ms(Some(35))), now + HOUR));
+        assert!(
+            !s.refresh(w(with_ms(Some(39))), now + HOUR),
+            "跟已分享的值比（30），不會一點一點飄走"
+        );
+        assert_eq!(s.records().next().unwrap().ms, Some(30), "分享的還是原本量到的值");
+        assert!(s.refresh(w(with_ms(Some(40))), now + HOUR));
+        assert_eq!(s.records().next().unwrap().ms, Some(40));
+        assert!(s.refresh(w(with_ms(None)), now + HOUR), "有沒有量到延遲算變動");
+        // 上游同樣
+        let up = |ms: u32, ok: f32| LocalRecord::Upstream {
+            url: "https://dns.example.net/dns-query".into(),
+            proto: "doh".into(),
+            ms: Some(ms),
+            ok,
+            obs: now,
+        };
+        let mut s = ShareSet::new();
+        assert!(s.refresh(w(up(12, 1.0)), now));
+        assert!(!s.refresh(w(up(18, 0.998)), now + HOUR), "成功率差一點點不算");
+        assert!(s.refresh(w(up(25, 1.0)), now + HOUR));
+        assert!(s.refresh(w(up(25, 0.9)), now + HOUR), "成功率差 0.05 以上才算");
+    }
+
+    #[test]
+    fn record_budget_scales_and_is_shared() {
+        assert_eq!(record_budget(32 << 20), 32 * 1024);
+        assert_eq!(record_budget(4 << 20), 4 * 1024);
+        assert_eq!(record_budget(0), MIN_RECORD_BUDGET, "記憶體再少也留一點");
+        assert_eq!(friend_budget(32 * 1024, 0), 32 * 1024);
+        assert_eq!(friend_budget(32 * 1024, 4), 8 * 1024);
     }
 
     #[test]

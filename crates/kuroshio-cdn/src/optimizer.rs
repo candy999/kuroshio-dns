@@ -411,12 +411,14 @@ impl Cdn {
         let Some(x) = e.cross4.as_deref().filter(|x| x.is("ok")) else {
             return vec![];
         };
-        let ips = x.ips.clone().unwrap_or_default();
+        // 跨 CDN 只驗證 IPv4（cross4）：IPv6 一律不回（不然 A 記錄被換成空的）。
+        // Akamai 的節點是這台自己帶台灣網段解析到的（不在節點池）；其他家要仍在節點池可用
+        let ips = x.ips.clone().unwrap_or_default().into_iter().filter(IpAddr::is_ipv4);
         let to = x.to.as_deref().unwrap_or("");
         let mut out: Vec<IpAddr> = if to == "akamai" {
-            ips
+            ips.collect()
         } else {
-            ips.into_iter().filter(|ip| pools.usable(to, *ip)).collect()
+            ips.filter(|ip| pools.usable(to, *ip)).collect()
         };
         out.truncate(4);
         out

@@ -2,10 +2,11 @@
 //!
 //! - 分享（`DataProvider::local_records`）：台灣節點池（排除壞節點與種子資料）、v6 節點、
 //!   網站驗證結果（OK 的，只分享網域雜湊）、跨 CDN 結果、每日評測選出的上游
-//! - 收到的資料一律只是候選：網站與跨 CDN 提示經 `kuroshio_cdn::Hints` 交給 CDN，CDN 在本機驗證後回報命中率
+//! - 收到的資料一律只是候選：網站與跨 CDN 提示經 `kuroshio_cdn::Hints` 交給 CDN，CDN 在本機驗證後回報命中率；
+//!   台灣節點放進節點池工作的候選名單（`DataProvider::on_received`），量測過才使用
 
-use kuroshio_cdn::{Cdn, CrossHint as CdnCross, HintIp, Hints};
-use kuroshio_community::provider::{DataProvider, LocalRecord, RangeCheck};
+use kuroshio_cdn::{Cdn, CrossHint as CdnCross, HintIp, HintKind, Hints};
+use kuroshio_community::provider::{DataProvider, LocalRecord, RangeCheck, Received};
 use kuroshio_community::score::{Kind, Outcome};
 use kuroshio_community::Community;
 use std::net::IpAddr;
@@ -138,6 +139,19 @@ impl DataProvider for CdnData {
         out
     }
 
+    /// 好友給的資料：網站與跨 CDN 提示等有人查到時才經 [`CommunityHints`] 拿；台灣節點在這裡放進
+    /// 節點池工作的候選名單（同分享檔的節點：只收官方範圍內的，每日節點池工作量測過才使用）
+    fn on_received(&self, batch: &Received) {
+        let Some(cdn) = &self.cdn else { return };
+        if batch.nodes.is_empty() {
+            return;
+        }
+        let n = cdn.add_friend_nodes(batch.nodes.iter().map(|x| (x.p.as_str(), x.ip)));
+        if n > 0 {
+            tracing::debug!("社群：{} 給的台灣節點 {n} 個放進候選名單（每日節點池工作量測後才使用）", batch.from);
+        }
+    }
+
     fn in_range(&self, provider: &str, ip: IpAddr) -> RangeCheck {
         let Some(cdn) = &self.cdn else { return RangeCheck::UnknownProvider };
         if kuroshio_cdn::providers::get(provider).is_none() {
@@ -147,6 +161,14 @@ impl DataProvider for CdnData {
             Some(c) if c.provider == provider => RangeCheck::InRange,
             _ => RangeCheck::OutOfRange,
         }
+    }
+}
+
+/// CDN 回報的提示種類 → 好友資料品質分數的種類（網站、跨 CDN 分開算，各自暫停）
+fn score_kind(k: HintKind) -> Kind {
+    match k {
+        HintKind::Site => Kind::Site,
+        HintKind::Cross => Kind::Cross,
     }
 }
 
@@ -165,10 +187,10 @@ impl Hints for CommunityHints {
             .collect()
     }
 
-    fn hint_result(&self, from: &str, ok: bool) {
+    fn hint_result(&self, from: &str, kind: HintKind, ok: bool) {
         let Some(c) = self.0.upgrade() else { return };
         let froms: Vec<String> = from.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
-        c.report(&froms, Kind::Site, if ok { Outcome::Ok } else { Outcome::Fail });
+        c.report(&froms, score_kind(kind), if ok { Outcome::Ok } else { Outcome::Fail });
     }
 
     fn cross_hint(&self, name: &str) -> Option<CdnCross> {
@@ -221,7 +243,36 @@ pub fn friend_targets(peers: &serde_json::Value) -> (Vec<String>, Vec<IpAddr>) {
     (domains, ips)
 }
 
-/// 存取控制（規格 08）：好友目前的 IP 永遠允許。每 10 分鐘解析一次好友網域（A / AAAA）
+/// 每個好友網域解析到的位址最多允許幾個（IPv4、IPv6 合計）
+pub const FRIEND_IPS_PER_DOMAIN: usize = 4;
+
+/// 好友網域解析到的位址：去掉重複後 IPv4、IPv6 交錯取，最多 [`FRIEND_IPS_PER_DOMAIN`] 個
+/// （兩種位址都有機會；好友的網域是對方設定的，不能讓它把一大串位址塞進允許清單）
+pub fn pick_friend_ips(addrs: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+    for ip in addrs {
+        let l = if ip.is_ipv4() { &mut v4 } else { &mut v6 };
+        if !l.contains(&ip) {
+            l.push(ip);
+        }
+    }
+    let mut out = Vec::with_capacity(FRIEND_IPS_PER_DOMAIN);
+    let (mut a, mut b) = (v4.into_iter(), v6.into_iter());
+    while out.len() < FRIEND_IPS_PER_DOMAIN {
+        let (x, y) = (a.next(), b.next());
+        if x.is_none() && y.is_none() {
+            break;
+        }
+        out.extend(x);
+        if out.len() < FRIEND_IPS_PER_DOMAIN {
+            out.extend(y);
+        }
+    }
+    out
+}
+
+/// 存取控制（規格 08）：好友目前的 IP 永遠允許。每 10 分鐘解析一次好友網域（A / AAAA），
+/// 每個網域最多 [`FRIEND_IPS_PER_DOMAIN`] 個位址，再加上好友最近一次連線的來源 IP
 pub fn spawn_friend_ips(node: Weak<Community>, access: Arc<crate::ipfilter::Access>) {
     tokio::spawn(async move {
         loop {
@@ -231,7 +282,7 @@ pub fn spawn_friend_ips(node: Weak<Community>, access: Arc<crate::ipfilter::Acce
             for d in domains {
                 let look = tokio::net::lookup_host((d.as_str(), 443));
                 if let Ok(Ok(addrs)) = tokio::time::timeout(std::time::Duration::from_secs(5), look).await {
-                    ips.extend(addrs.map(|a| a.ip()));
+                    ips.extend(pick_friend_ips(addrs.map(|a| a.ip())));
                 }
             }
             ips.sort();
@@ -245,6 +296,13 @@ pub fn spawn_friend_ips(node: Weak<Community>, access: Arc<crate::ipfilter::Acce
 #[cfg(test)]
 mod own_domain_tests {
     use super::*;
+
+    #[test]
+    fn hint_kinds_are_scored_separately() {
+        // 跨 CDN 提示的結果記在跨 CDN 的分數（以前一律記成網站，跨 CDN 提示再不準也不會暫停）
+        assert_eq!(score_kind(HintKind::Site), Kind::Site);
+        assert_eq!(score_kind(HintKind::Cross), Kind::Cross);
+    }
 
     #[test]
     fn own_domains_are_not_shared() {
@@ -304,7 +362,38 @@ mod own_domain_tests {
 
 #[cfg(test)]
 mod access_tests {
-    use super::friend_targets;
+    use super::{friend_targets, pick_friend_ips, FRIEND_IPS_PER_DOMAIN};
+    use std::net::IpAddr;
+
+    #[test]
+    fn friend_domain_ips_are_capped() {
+        let p = |s: &str| s.parse::<IpAddr>().unwrap();
+        // 一大串位址：最多 4 個，IPv4、IPv6 交錯
+        let many: Vec<IpAddr> = (1..=20)
+            .map(|i| p(&format!("192.0.2.{i}")))
+            .chain((1..=20).map(|i| p(&format!("2001:db8::{i}"))))
+            .collect();
+        assert_eq!(
+            pick_friend_ips(many),
+            vec![p("192.0.2.1"), p("2001:db8::1"), p("192.0.2.2"), p("2001:db8::2")]
+        );
+        // 只有 IPv4、有重複
+        let v4: Vec<IpAddr> = [
+            "198.51.100.1",
+            "198.51.100.1",
+            "198.51.100.2",
+            "198.51.100.3",
+            "198.51.100.4",
+            "198.51.100.5",
+        ]
+        .iter()
+        .map(|s| p(s))
+        .collect();
+        let got = pick_friend_ips(v4);
+        assert_eq!(got.len(), FRIEND_IPS_PER_DOMAIN);
+        assert_eq!(got[0..2], [p("198.51.100.1"), p("198.51.100.2")]);
+        assert!(pick_friend_ips(Vec::new()).is_empty());
+    }
     use serde_json::json;
 
     #[test]

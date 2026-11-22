@@ -15,12 +15,16 @@ pub struct Config {
     pub stale_days: u32,
     pub sync_interval_min: u32,
     pub max_friends: usize,
-    /// 資料品質分數下限（0 = 不檢查）
+    /// 資料品質分數下限（0 = 不檢查；預設 0.3，試過 20 次以上才判斷）
     pub min_hit_rate: f64,
     /// 分數低於下限時自動刪除好友（v1 行為，預設關閉；關閉時只暫停採用）
     pub auto_delete_low_hit_rate: bool,
     pub share_domains: bool,
     pub share_upstreams: bool,
+    /// 使用好友給的 CDN 資料（網站、跨 CDN 提示與台灣節點候選）；關掉 = 照常收（有上限）但不拿來用
+    pub use_hints: bool,
+    /// 使用好友給的上游 DNS（每日評測的候選）；關掉 = 照常收（有上限）但不放進評測
+    pub use_upstreams: bool,
     pub rules: Vec<Value>,
     /// 收到的資料（解壓後）上限，依等級 4 / 8 / 32 MB
     pub max_bundle_mb: u32,
@@ -37,10 +41,12 @@ impl Default for Config {
             stale_days: 7,
             sync_interval_min: 60,
             max_friends: 50,
-            min_hit_rate: 0.0,
+            min_hit_rate: 0.3,
             auto_delete_low_hit_rate: false,
             share_domains: true,
             share_upstreams: true,
+            use_hints: true,
+            use_upstreams: true,
             rules: vec![],
             max_bundle_mb: 32,
         }
@@ -99,6 +105,8 @@ impl Config {
             auto_delete_low_hit_rate: flag(c.get("autoDeleteLowHitRate"), d.auto_delete_low_hit_rate),
             share_domains: flag(c.get("shareDomains"), d.share_domains),
             share_upstreams: flag(c.get("shareUpstreams"), d.share_upstreams),
+            use_hints: flag(c.get("useHints"), d.use_hints),
+            use_upstreams: flag(c.get("useUpstreams"), d.use_upstreams),
             rules: c.get("rules").and_then(Value::as_array).cloned().unwrap_or_default(),
             max_bundle_mb: num(c.get("maxBundleMB"))
                 .map(|x| x.clamp(1.0, 32.0) as u32)
@@ -212,5 +220,11 @@ mod tests {
         assert_eq!(c.max_plain_bytes(), 4 * 1024 * 1024);
         assert!(!c.share_domains);
         assert_eq!(c.rules.len(), 1);
+        // 沒有寫的照預設：使用好友的提示與上游、品質分數下限 0.3
+        assert!(c.use_hints && c.use_upstreams);
+        assert_eq!(c.min_hit_rate, 0.3);
+        let off = Config::from_json(&json!({ "useHints": "0", "useUpstreams": false, "minHitRate": "0" }));
+        assert!(!off.use_hints && !off.use_upstreams);
+        assert_eq!(off.min_hit_rate, 0.0, "0 = 不檢查（照樣可以關掉）");
     }
 }

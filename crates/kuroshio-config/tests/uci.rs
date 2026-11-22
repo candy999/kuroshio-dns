@@ -531,6 +531,22 @@ fn bad_numbers_warn() {
     );
 }
 
+/// 好友資料的「用不用」開關（3.4.3）：`use_hints`、`use_upstreams`；沒寫 = 預設使用；品質分數下限預設 0.3
+#[test]
+fn community_use_switches_map_to_config() {
+    let c = load(&default_text(), &env());
+    assert_eq!(g(&c, "community.useHints"), &json!(true));
+    assert_eq!(g(&c, "community.useUpstreams"), &json!(true));
+    assert_eq!(g(&c, "community.minHitRate"), &json!(0.3));
+    let text = default_text().replace(
+        "config community 'community'\n\toption enabled '0'",
+        "config community 'community'\n\toption enabled '0'\n\toption use_hints '0'\n\toption use_upstreams '0'",
+    );
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "community.useHints"), &json!(false));
+    assert_eq!(g(&c, "community.useUpstreams"), &json!(false));
+}
+
 /// `community.max_bundle_mb` → `maxBundleMB`（駝峰式會轉成 maxBundleMb，社群模組讀不到）
 #[test]
 fn max_bundle_mb_maps_to_config_field() {

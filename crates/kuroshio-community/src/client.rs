@@ -42,22 +42,59 @@ fn fail(reason: impl std::fmt::Display) -> Value {
     json!({ "ok": false, "reason": reason.to_string() })
 }
 
-/// 收到的上游候選（所有好友合併）
-pub(crate) fn upstream_ids(st: &State) -> Vec<String> {
-    let mut v: Vec<String> = st
-        .remote
-        .iter()
-        .filter(|(d, _)| {
-            st.store
-                .get(d)
-                .map(|p| p.rel == Rel::Friend && !score::is_paused(&p.score, Kind::Upstream))
-                .unwrap_or(false)
-        })
-        .flat_map(|(_, r)| r.recs.values().filter(|x| x.kind == "upstream").filter_map(|x| x.url.clone()))
-        .collect();
-    v.sort();
-    v.dedup();
-    v
+/// 好友給的上游候選，全部好友合計最多幾個（每日評測要一個一個測，不能讓好友一多就放大）
+pub const MAX_UPSTREAM_CANDIDATES: usize = 100;
+
+/// 收到的上游候選（所有好友合併）：越多好友提到的越前面，同樣多的照網址排（每次結果一樣），最多
+/// [`MAX_UPSTREAM_CANDIDATES`] 個。`use_upstreams` 關掉時一個都不給（設定 `community.useUpstreams`）
+pub(crate) fn upstream_ids(st: &State, use_upstreams: bool) -> Vec<String> {
+    if !use_upstreams {
+        return vec![];
+    }
+    merge_upstreams(
+        st.remote
+            .iter()
+            .filter(|(d, _)| {
+                st.store
+                    .get(d)
+                    .map(|p| p.rel == Rel::Friend && !score::is_paused(&p.score, Kind::Upstream))
+                    .unwrap_or(false)
+            })
+            .map(|(_, r)| {
+                r.recs
+                    .values()
+                    .filter(|x| x.kind == "upstream")
+                    .filter_map(|x| x.url.as_deref())
+                    .collect()
+            }),
+    )
+}
+
+/// 合併每個好友的上游清單：（提到的好友數由多到少, 網址）排序，取前 [`MAX_UPSTREAM_CANDIDATES`] 個
+pub(crate) fn merge_upstreams<'a>(lists: impl IntoIterator<Item = Vec<&'a str>>) -> Vec<String> {
+    let mut n: HashMap<&'a str, u32> = HashMap::new();
+    for mut l in lists {
+        l.sort_unstable();
+        l.dedup();
+        for u in l {
+            *n.entry(u).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(&str, u32)> = n.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v.into_iter().take(MAX_UPSTREAM_CANDIDATES).map(|(u, _)| u.to_string()).collect()
+}
+
+/// 收到的記錄先處理哪一種（全部好友的資料有總量上限，滿了之後的新記錄不收）：
+/// 節點、上游筆數少又最有用，先收；網站提示最多，最後
+fn kind_rank(r: &crate::envelope::Lenient) -> u8 {
+    match r.0.as_ref().map(|x| x.kind.as_str()) {
+        Some("node") => 0,
+        Some("upstream") => 1,
+        Some("cross") => 2,
+        Some("site") => 3,
+        _ => 4,
+    }
 }
 
 /// 好友提示的一個 IP，與提到它的好友
@@ -632,8 +669,18 @@ impl Community {
         }
     }
 
-    fn ingest_locked(&self, st: &mut State, domain: &str, resp: SyncResponse, now: u64) -> std::result::Result<(Value, Received), Value> {
+    fn ingest_locked(
+        &self,
+        st: &mut State,
+        domain: &str,
+        mut resp: SyncResponse,
+        now: u64,
+    ) -> std::result::Result<(Value, Received), Value> {
         let full = resp.full.unwrap_or(true);
+        let cfg = self.config();
+        // 全部好友的資料合計有上限（跟著記憶體縮放），每個好友平分；滿了之後新的記錄不收（舊的照常更新），
+        // 等記錄過期或對方下次給完整集合時自己恢復
+        let budget = crate::share::friend_budget(crate::share::record_budget(cfg.max_plain_bytes()), st.store.friends().count());
         let remote = st.remote.entry(domain.to_string()).or_default();
         let epoch = resp.epoch.as_ref().map(|e| e.to_vec()).unwrap_or_default();
         if !full && remote.epoch != epoch {
@@ -649,7 +696,16 @@ impl Community {
         let mut fresh = vec![];
         let mut counts: HashMap<Kind, usize> = Kind::ALL.iter().map(|k| (*k, remote.count(*k))).collect();
         let mut out_of_range = 0usize;
+        let mut over_budget = 0u32;
         let mut nodes = vec![];
+        // 刪除先套用（同一個增量裡同一筆不會又刪又加）：空出來的位置給這次新增的記錄
+        let mut deleted = vec![];
+        for (kind, key) in resp.deletes {
+            if remote.delete(&kind, &key) {
+                deleted.push((kind, key));
+            }
+        }
+        resp.upserts.sort_by_key(kind_rank);
         for x in resp.upserts {
             let Some(r) = x.0 else {
                 invalid_total += 1;
@@ -661,6 +717,10 @@ impl Community {
                     let exists = remote.get(&rec.kind, &rec.key).is_some();
                     let c = counts.get_mut(&k).unwrap();
                     if !exists && *c >= limit_of(k) {
+                        continue;
+                    }
+                    if !exists && remote.recs.len() >= budget {
+                        over_budget += 1;
                         continue;
                     }
                     if k == Kind::Node {
@@ -690,12 +750,6 @@ impl Community {
                         *invalid.entry(k).or_default() += 1;
                     }
                 }
-            }
-        }
-        let mut deleted = vec![];
-        for (kind, key) in resp.deletes {
-            if remote.delete(&kind, &key) {
-                deleted.push((kind, key));
             }
         }
         remote.epoch = epoch;
@@ -737,6 +791,10 @@ impl Community {
             deleted: deleted.clone(),
             ..Default::default()
         };
+        // 使用者選擇不用好友的 CDN 資料 / 上游（`useHints`、`useUpstreams`）：照常存（有上限），不交出去
+        if !cfg.use_hints {
+            nodes.clear();
+        }
         for (in_range, r) in nodes {
             if take(Kind::Node) {
                 batch.nodes.push(NodeCandidate {
@@ -753,6 +811,8 @@ impl Community {
         let ips = |v: &Option<Vec<String>>| v.iter().flatten().filter_map(|s| s.parse().ok()).collect::<Vec<IpAddr>>();
         for (k, r) in &fresh {
             match k {
+                Kind::Site | Kind::Cross if !cfg.use_hints => {}
+                Kind::Upstream if !cfg.use_upstreams => {}
                 Kind::Site if take(Kind::Site) => batch.sites.push(SiteHint {
                     h: r.h.as_ref().map(|h| h.as_slice().try_into().unwrap()).unwrap(),
                     p: r.p.clone().unwrap_or_default(),
@@ -788,9 +848,12 @@ impl Community {
             return Err(json!({ "ok": false, "status": "blocked", "reason": "資料格式錯誤太多，已封鎖" }));
         }
         let seq = remote_seq(st, domain);
+        if over_budget > 0 {
+            tracing::debug!("社群：{domain} 的資料超過存放上限（每個好友 {budget} 筆），{over_budget} 筆新記錄沒有收");
+        }
         let summary = json!({
             "ok": true, "status": "ok", "full": full, "upserts": valid, "deletes": batch.deleted.len(),
-            "invalid": invalid_total, "seq": seq,
+            "invalid": invalid_total, "seq": seq, "overBudget": over_budget,
         });
         Ok((summary, batch))
     }
@@ -907,12 +970,18 @@ impl Community {
 
     /// 這個網站好友驗證過的 IP（越多好友提到、分數越高的排越前面）
     pub fn site_hints(&self, name: &str, provider: &str, fam: u8) -> Vec<Hint> {
+        if !self.cfg.read().unwrap().use_hints {
+            return vec![];
+        }
         let key = format!("{}/{fam}", hex(&site_hash(name)));
         self.collect_hints("site", &key, Kind::Site, |r| r.p.as_deref() == Some(provider))
     }
 
     /// 跨 CDN 提示：（換到哪一家, IP）
     pub fn cross_hint(&self, name: &str) -> Option<(String, Vec<Hint>)> {
+        if !self.cfg.read().unwrap().use_hints {
+            return None;
+        }
         let key = hex(&site_hash(name));
         let to = {
             let st = self.lock();
@@ -967,7 +1036,8 @@ impl Community {
 
     /// 好友提供的上游（每日評測的候選）
     pub fn upstream_candidates(&self) -> Vec<String> {
-        upstream_ids(&self.lock())
+        let on = self.cfg.read().unwrap().use_upstreams;
+        upstream_ids(&self.lock(), on)
     }
 
     /// 本機驗證結果回饋到好友的資料品質分數（例如網站提示的 IP 實際可用 / 不可用）
@@ -1106,4 +1176,37 @@ fn remote_seq(st: &State, domain: &str) -> u64 {
 pub(crate) fn p_block(st: &mut State, domain: &str, why: &str) {
     st.store.block(domain, why);
     st.remote.remove(domain);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_candidates_total_cap_prefers_shared() {
+        // 很多好友、每個都給滿 100 個：合計最多 100 個，越多好友提到的越前面，同樣多的照網址排
+        let urls: Vec<Vec<String>> = (0..30)
+            .map(|f| (0..100).map(|i| format!("https://f{f}-{i:03}.example.net/dns-query")).collect())
+            .collect();
+        let common = "https://common.example.com/dns-query";
+        let two = "https://two.example.com/dns-query";
+        let lists = urls.iter().enumerate().map(|(f, l)| {
+            let mut v: Vec<&str> = l.iter().map(String::as_str).collect();
+            v.push(common);
+            v.push(common); // 同一個好友重複列也只算一次
+            if f < 2 {
+                v.push(two);
+            }
+            v
+        });
+        let out = merge_upstreams(lists);
+        assert_eq!(out.len(), MAX_UPSTREAM_CANDIDATES);
+        assert_eq!(out[0], common);
+        assert_eq!(out[1], two);
+        assert_eq!(out[2], "https://f0-000.example.net/dns-query");
+        let mut sorted = out[2..].to_vec();
+        sorted.sort();
+        assert_eq!(sorted, out[2..].to_vec(), "其他的照網址排，每次結果一樣");
+        assert!(merge_upstreams(Vec::<Vec<&str>>::new()).is_empty());
+    }
 }
