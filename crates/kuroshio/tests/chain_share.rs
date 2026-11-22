@@ -973,6 +973,44 @@ async fn manifest_never_blocks_and_builds_once() {
     assert_eq!(c2.build_count(), 1);
 }
 
+/// 3.5.0 C11：下游登記成功時先建好清單（之後第一次同步不必先拿到 REFUSED）；10 分鐘內不重建；
+/// 記憶體壓力大不建；同時很多次也只建一次
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prewarm_builds_manifest_once() {
+    let src = src_basic();
+    let c = Arc::new(ShareCache::new(src.clone()));
+    src.pressure_bad.store(true, Ordering::SeqCst);
+    c.prewarm(now_ms());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!c.ready() && !c.building(), "記憶體壓力大：不建");
+    src.pressure_bad.store(false, Ordering::SeqCst);
+    for _ in 0..8 {
+        c.prewarm(now_ms());
+    }
+    wait_ready(&c).await;
+    assert_eq!(c.build_count(), 1, "同時很多次只建一次");
+    let key = KeyPair::generate();
+    assert!(c.manifest(&key, now_ms()).is_some(), "登記之後第一次同步就拿得到");
+    c.prewarm(now_ms() + 5 * 60_000);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(c.build_count(), 1, "10 分鐘內不重建");
+}
+
+/// 3.5.0 C11：REFUSED 之後的重試間隔是 5、15、30 秒（`first` 30 秒的 1/6、1/2、1 倍，加 0～20% 亂數）
+#[test]
+fn refused_retry_waits_5_15_30() {
+    let first = Duration::from_secs(30);
+    for (n, lo) in [(1u32, 5u64), (2, 15), (3, 30)] {
+        for _ in 0..50 {
+            let w = kuroshio::chain::share::refused_wait(n, first);
+            assert!(
+                w >= Duration::from_secs(lo) && w <= Duration::from_millis(lo * 1200),
+                "第 {n} 次：{w:?}"
+            );
+        }
+    }
+}
+
 /// 上游的清單還沒建好時回 REFUSED（不卡住回答查詢），建好之後下游同步成功
 #[tokio::test]
 async fn responder_refuses_until_built() {

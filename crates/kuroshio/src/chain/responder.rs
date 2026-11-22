@@ -358,6 +358,10 @@ impl Responder {
                 return refused();
             }
         };
+        // 通過四項檢查的下游：先把共用結果的清單建好，它約 30 秒後第一次同步時就拿得到（3.5.0）
+        if let Some(c) = self.share.get() {
+            c.prewarm(now);
+        }
         let sealed = seal(&key, "regack", to_cbor(&ack));
         let mut r = Message::response_to(query, 0);
         r.answers.push(Record {

@@ -232,6 +232,20 @@ impl ShareCache {
         }
     }
 
+    /// 下游登記成功時先建好（3.5.0）：下游綁定後約 30 秒才第一次同步，清單通常已經建好，不必先回 REFUSED。
+    /// 以前清單閒置 30 分鐘被釋放後，重新啟動的下游第一次同步一定 REFUSED、30 秒後才成功。
+    /// 跟 `manifest()` 一樣：沒有建好、或超過 10 分鐘才背景建置（同一時間最多一個）；記憶體壓力不是 Normal 不建
+    pub fn prewarm(self: &Arc<Self>, now_ms: u64) {
+        if !self.src.pressure_ok() {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.last_used = st.last_used.max(now_ms);
+        if st.built.as_ref().map_or(true, |b| now_ms.saturating_sub(b.at) >= MANIFEST_TTL_MS) {
+            self.spawn_build(now_ms);
+        }
+    }
+
     /// 啟動時先在背景建一次（第一個下游來問時大多已經就緒）
     pub fn warm(self: &Arc<Self>) {
         if self.src.pressure_ok() {
@@ -1171,7 +1185,8 @@ impl Syncer {
                     continue;
                 }
                 // 上游的清單還在背景建置（第一次、或 30 分鐘沒人用釋放過）時會先回 REFUSED：
-                // 隔 `first`（30 秒）再試，連續最多 3 次，之後回到正常的間隔
+                // 隔 5、15、30 秒（`first` 的 1/6、1/2、1 倍，加 0～20% 亂數）再試，連續最多 3 次，之後回到正常的間隔
+                // （3.5.0；以前每次都隔 30 秒）
                 let mut refused = 0u32;
                 while alive(&me) && me.client.is_chained() {
                     let wait = if me.sink().pressure_ok() {
@@ -1180,8 +1195,9 @@ impl Syncer {
                         refused = if retry { refused + 1 } else { 0 };
                         let j = t.jitter.as_millis() as u64;
                         if retry {
-                            me.state.lock().unwrap().next_sync_at = Some(now_ms() + t.first.as_millis() as u64);
-                            if !me.sleep_chained(t.first).await {
+                            let w = refused_wait(refused, t.first);
+                            me.state.lock().unwrap().next_sync_at = Some(now_ms() + w.as_millis() as u64);
+                            if !me.sleep_chained(w).await {
                                 break;
                             }
                             continue;
@@ -1209,6 +1225,18 @@ impl Syncer {
         }
         self.client.is_chained()
     }
+}
+
+/// 第 `n` 次（1～3）因為 REFUSED 重試前要等多久：`first` 的 1/6、1/2、1 倍，各加 0～20% 亂數
+/// （預設 `first` 30 秒 → 5、15、30 秒）。次數上限在呼叫端（最多 3 次）
+pub fn refused_wait(n: u32, first: Duration) -> Duration {
+    let base = match n {
+        0 | 1 => first / 6,
+        2 => first / 2,
+        _ => first,
+    };
+    let ms = base.as_millis() as u64;
+    Duration::from_millis(ms + random_below(ms / 5 + 1))
 }
 
 /// 狀態檔裡的鍵（3.4.2 以前過濾清單副本是一份清單一個：`filter-copy <網址>`，讀到的舊紀錄留著不影響）
