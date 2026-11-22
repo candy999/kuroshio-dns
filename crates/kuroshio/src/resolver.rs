@@ -1113,6 +1113,8 @@ impl Resolver {
                 up.record(false, ms);
             }
         }
+        // 效能計數器（3.5.0）：這次實際送出幾個上游查詢（list 裡還沒拿出來的就是沒送）
+        perf::note_ask(list.len() - rest.len(), all);
         Asked {
             answers: out,
             unasked: rest.collect(),
@@ -1374,6 +1376,37 @@ fn answered_ok(up: &Up, class: Class) -> bool {
         Class::ServFail => up.role == Role::Chain,
         Class::Refused => up.role != Role::Chain,
         _ => true,
+    }
+}
+
+/// 效能計數器（3.5.0，規格 11 C12）：每次詢問（ask）實際送出幾個上游查詢、背景補問送出幾個。
+/// 只在 ask() 結束時加一次（`AtomicU32`，沒有鎖）；32 位元機器沒有 64 位元原子操作，溢位就從 0 重來
+pub mod perf {
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 送出 1、2、3、4 個以上上游查詢的次數（0 個不記：沒有可用的上游）
+    static FANOUT: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+    /// 背景補問送出的上游查詢數
+    static BACKFILL: AtomicU32 = AtomicU32::new(0);
+
+    pub fn note_ask(sent: usize, backfill: bool) {
+        if backfill {
+            BACKFILL.fetch_add(sent as u32, Ordering::Relaxed);
+        } else if sent > 0 {
+            FANOUT[sent.min(4) - 1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `/api/status` 的 `perf`
+    pub fn json() -> Value {
+        let f: Vec<u32> = FANOUT.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        json!({
+            "tls": kuroshio_net::perf::json(),
+            // 每次詢問送出 1、2、3、4 個以上上游查詢的次數（一筆查詢可能詢問兩次：先問主要的，再問備援）
+            "fanout": { "1": f[0], "2": f[1], "3": f[2], "4+": f[3] },
+            "backfillQueries": BACKFILL.load(Ordering::Relaxed),
+        })
     }
 }
 

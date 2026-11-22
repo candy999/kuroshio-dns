@@ -693,6 +693,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "dohMode": st.encrypted.doh_mode,
                 "doh3Provider": st.encrypted.doh3_provider,
                 "access": access,
+                // 效能計數器（3.5.0）：加密上游的握手（完整／續用、AES／ChaCha）、每次詢問送出幾個上游查詢
+                "perf": crate::resolver::perf::json(),
             }))
         }
         // 來源 IP 存取控制（規格 08）；?ip= 說明這個 IP 的判斷結果

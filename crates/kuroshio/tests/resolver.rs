@@ -271,6 +271,9 @@ async fn admin_api() {
     let (code, st) = http_get(admin, "/api/status?lite=1", "127.0.0.1:8054").await;
     assert_eq!(code, 200);
     assert_eq!(st["stats"]["today"]["query"], 1);
+    // 效能計數器（3.5.0）：這筆查詢問了一個上游（計數器整個行程共用，只看有沒有）
+    assert!(st["perf"]["fanout"]["1"].as_u64().unwrap() >= 1, "{}", st["perf"]);
+    assert!(st["perf"]["tls"]["dot"]["full"].is_u64());
     assert_eq!(st["cacheEntries"], 1);
     assert!(st["system"].get("tier").is_none(), "沒有硬體等級");
     assert!(st["system"]["memory"]["reserveKB"].as_u64().is_some());

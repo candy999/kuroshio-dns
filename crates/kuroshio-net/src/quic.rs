@@ -109,11 +109,15 @@ async fn connect(host: &str, port: u16, alpn: &[u8], timeout: Duration) -> Resul
             Ok::<_, anyhow::Error>(connecting.await?)
         };
         match tokio::time::timeout(timeout, r).await {
-            Ok(Ok(c)) => return Ok(c),
+            Ok(Ok(c)) => {
+                crate::perf::QUIC_NEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(c);
+            }
             Ok(Err(e)) => last = e,
             Err(_) => last = anyhow!("QUIC 連線逾時 {ip}:{port}"),
         }
     }
+    crate::perf::QUIC_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Err(last)
 }
 

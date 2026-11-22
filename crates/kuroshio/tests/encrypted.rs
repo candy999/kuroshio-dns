@@ -64,6 +64,17 @@ async fn dot_and_doh_serve_queries() {
     let dot = started.encrypted.dot.expect("DoT 有啟動");
     let doh = started.encrypted.doh.expect("DoH 有啟動");
 
+    // 效能計數器（3.5.0）：握手完成時記完整／續用與密碼套件（計數器是整個行程共用的，只看有沒有增加）
+    use std::sync::atomic::Ordering::Relaxed;
+    let hs = |t: &kuroshio_net::perf::Tls| t.full.load(Relaxed) + t.resumed.load(Relaxed);
+    let suites = |t: &kuroshio_net::perf::Tls| t.aes.load(Relaxed) + t.chacha.load(Relaxed);
+    let (dot0, doh0, s0) = (
+        hs(&kuroshio_net::perf::DOT),
+        hs(&kuroshio_net::perf::DOH),
+        suites(&kuroshio_net::perf::DOT),
+    );
+    let quic0 = kuroshio_net::perf::QUIC_NEW.load(Relaxed);
+
     // DoT：同一條連線同時多筆
     let u = Upstream::parse(&format!("tls://{dot}")).unwrap();
     let mut set = tokio::task::JoinSet::new();
@@ -74,10 +85,13 @@ async fn dot_and_doh_serve_queries() {
     while let Some(m) = set.join_next().await {
         assert_eq!(m.unwrap().answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)));
     }
+    assert!(hs(&kuroshio_net::perf::DOT) > dot0, "DoT 的握手有記到");
+    assert!(suites(&kuroshio_net::perf::DOT) > s0, "協商到的密碼套件有記到");
     // DoH（HTTP/2 POST）
     let u = Upstream::parse(&format!("https://{doh}/dns-query")).unwrap();
     let m = Message::parse(&u.exchange(&q(7, "h.test"), Duration::from_secs(3)).await.unwrap()).unwrap();
     assert_eq!((m.id, m.answers.len()), (7, 1));
+    assert!(hs(&kuroshio_net::perf::DOH) > doh0, "DoH 的握手有記到");
     // DoH GET ?dns=（HTTP/1.1，自己發請求）
     let tls = kuroshio::tls::connect_h1("127.0.0.1", doh.port(), Duration::from_secs(3))
         .await
@@ -125,6 +139,7 @@ async fn dot_and_doh_serve_queries() {
         assert!(m.id >= 100, "id 改回原本的");
         assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)));
     }
+    assert!(kuroshio_net::perf::QUIC_NEW.load(Relaxed) > quic0, "QUIC 連線有記到");
     // DoH3
     let u = Upstream::parse(&format!("h3://{doh3}/dns-query")).unwrap();
     for i in 0..3u16 {

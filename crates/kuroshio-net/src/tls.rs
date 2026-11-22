@@ -329,7 +329,18 @@ fn cached_config_h1() -> Arc<rustls::ClientConfig> {
 
 /// 連線（依序試每個 IP）並完成 TLS 握手
 pub async fn connect(host: &str, port: u16, alpn_h2: bool, timeout: Duration) -> Result<TlsStream<TcpStream>> {
-    connect_with(host, port, cached_config(alpn_h2), timeout, None).await
+    let r = connect_with(host, port, cached_config(alpn_h2), timeout, None).await;
+    // 效能計數器（3.5.0）：加密上游（DoT、DoH）的握手是完整還是續用、協商到哪一種密碼套件
+    let t = if alpn_h2 { &crate::perf::DOH } else { &crate::perf::DOT };
+    match &r {
+        Ok(s) => {
+            let c = s.get_ref().1;
+            let resumed = c.handshake_kind() == Some(rustls::HandshakeKind::Resumed);
+            t.handshake(resumed, c.negotiated_cipher_suite().map(|x| x.suite()));
+        }
+        Err(_) => t.failed(),
+    }
+    r
 }
 
 /// 不檢查憑證（2.x 的 `verifyCert: false`）：只用來探測節點、測速，不拿來傳使用者資料
