@@ -10,7 +10,7 @@ Windows 版跟 OpenWrt 版是同一個核心程式（`kuroshio.exe`），差別�
 |---|---|---|
 | 指令 | `kuroshio.exe run [-c config.json]` | `kuroshio.exe service install` / `uninstall` / `start` / `stop` |
 | 啟動 | 手動 | 開機自動啟動，不用登入 |
-| 關閉 | 關視窗或 Ctrl+C（Ctrl+C 會正常收尾、寫出快照） | 不受登出、關視窗影響 |
+| 關閉 | 關視窗、Ctrl+C、Ctrl+Break、登出、關機都正常收尾、寫出快照、寫日誌（3.5.0；以前只有 Ctrl+C） | 不受登出、關視窗影響 |
 | 當掉 | 不會自動重啟 | 自動重啟（服務復原設定） |
 | 日誌 | 直接顯示在視窗 | 日誌檔，設定頁「日誌」分頁可看 |
 | 適合 | 測試、臨時用、攜帶版 | 長期 24 小時運作 |
@@ -18,6 +18,19 @@ Windows 版跟 OpenWrt 版是同一個核心程式（`kuroshio.exe`），差別�
 - **可以切換**：先用 cmd 測試，再 `service install`，沿用同一份設定與資料。
 - **攜帶版**：`kuroshio.exe` 旁邊有 `config.json` 時，設定與資料都放在執行檔所在的資料夾（可以放隨身碟）；沒有的話用 `%ProgramData%\kuroshio\`。
 - 啟動時在日誌與設定頁顯示：執行方式（cmd / 服務）、設定來源、是否有系統管理員權限。
+
+### 1.2 主控台關閉／登出／關機（3.5.0）
+
+- `main.rs` 的 `shutdown_signal()` 在 Windows 同時等 tokio 的 `ctrl_c`、`ctrl_break`、`ctrl_close`、`ctrl_logoff`、`ctrl_shutdown`，回傳是哪一種（`app::StopReason`）。
+  五種都走同一個正常停止（`Started::shutdown_for`），日誌寫「收到主控台關閉，正常停止（……）」之類的一行（關閉／登出／關機是 WARN，只收警告的日誌也看得到）。
+- **時間限制**：`CTRL_CLOSE_EVENT`、`CTRL_LOGOFF_EVENT`、`CTRL_SHUTDOWN_EVENT` 這三種，系統在事件發生後大約 5 秒就強制結束行程。
+  tokio 1.54 的處理函式收到這三種時**不回傳**（停在處理函式的執行緒裡，見 tokio `signal/windows/sys.rs` 的 `terminates()`），
+  所以行程留給程式自己結束：主迴圈收到通知、寫快照、`main` 回傳，行程就正常結束。不需要自己用 `windows-sys` 註冊 `SetConsoleCtrlHandler`。
+- 這三種時寫快照（含準備內容）最多 3 秒（`persist::CONSOLE_SHUTDOWN_BUDGET`，`flush_for_shutdown_within`），小檔先寫，寫不完的下次啟動用上一次存的；
+  每一輪的執行環境結束時只等 0.2 秒（平常 3 秒）。Ctrl+C、Ctrl+Break、服務停止照舊 10 秒。檔案日誌是直接寫檔（沒有緩衝），不必另外沖出。
+- 服務模式（`winsvc.rs`）不改流程：`ServiceControl::Stop | Shutdown` 照舊，等服務管理員的時間（`wait_hint` 20 秒）。
+- 限制：Windows 只把登出與關機事件送給**沒有載入 `user32.dll`／`gdi32.dll`** 的主控台程式（載入了就被當成視窗程式，改收視窗訊息）；
+  黑潮沒有直接用這兩個函式庫，但要在 Windows 實測確認（第 6 節）。主控台已經關掉時寫到視窗的日誌會失敗（不影響檔案日誌與快照）。
 
 ### 1.1 權限
 
@@ -132,3 +145,5 @@ Windows 版跟 OpenWrt 版是同一個核心程式（`kuroshio.exe`），差別�
 - CI（Windows runner）：cmd 執行、服務安裝 / 啟動 / 停止 / 移除、設定頁登入、DoH / DoT / DoQ / DoH3 查詢
 - 實機（Windows 11 + IIS）：模式 B 與 C 各跑一次，IIS 其他網站照常；DoH3 在 HTTP.sys 有開 / 沒開 HTTP/3 兩種情況都能用
 - 一般權限 cmd 執行：需要權限的項目失敗時程式照常運作，設定頁正確列出缺少的項目
+- 主控台停止（3.5.0）：cmd 執行時關閉視窗、登出、關機、Ctrl+Break、Ctrl+C 五種，各看日誌最後幾行（「收到…，正常停止」「關機前寫出 N 份快照」「結束」）、
+  花幾秒、下次啟動有沒有讀到快照；服務模式的停止與關機沒有變（回歸）。CI 沒辦法自動測「關閉視窗」

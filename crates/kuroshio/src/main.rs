@@ -4,9 +4,10 @@ mod winsvc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use kuroshio::app::StopReason;
 use kuroshio::sysinfo::SysInfo;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(name = "kuroshio", version, about = "黑潮 DNS（Kuroshio DNS）：把連線帶回台灣節點的 DNS 伺服器")]
@@ -535,13 +536,17 @@ pub fn build_runtime(threads: usize) -> std::io::Result<tokio::runtime::Runtime>
     }
 }
 
-/// 執行服務直到 `stop` 完成（cmd 的 Ctrl+C / SIGTERM，或 Windows 服務的「停止」）
+/// 收到系統只給幾秒的停止事件（Windows 主控台關閉／登出／關機）：每一輪的執行環境結束時不多等（3.5.0 C1）
+static FAST_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 執行服務直到 `stop` 完成（cmd 的 Ctrl+C / SIGTERM / 主控台關閉，或 Windows 服務的「停止」）；`stop` 的結果是停止的原因，
+/// 決定日誌與關機寫快照的時間上限（3.5.0 C1）
 pub async fn serve(
     config: PathBuf,
     uci: bool,
     threads: usize,
     log_file: Option<PathBuf>,
-    stop: impl std::future::Future<Output = ()>,
+    stop: impl std::future::Future<Output = StopReason>,
 ) -> Result<()> {
     let (cfg, ..) = effective(&config, uci)?;
     init_log_to(Some(&cfg), log_file.as_deref());
@@ -620,7 +625,7 @@ pub async fn serve(
                 info!("過濾清單是舊版預設值，已更新成新的預設清單");
             }
         }
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<StopReason>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<bool>>();
         let (config2, show_url) = (config.clone(), first && mode == "cmd");
         let (slot, interactive) = (console.clone(), console_rx.is_some());
@@ -629,7 +634,9 @@ pub async fn serve(
                 let rt = build_runtime(threads)?;
                 let r = rt.block_on(generation(cfg, config2, uci, mode, show_url, interactive, slot.clone(), stop_rx));
                 *slot.lock().unwrap() = None;
-                rt.shutdown_timeout(std::time::Duration::from_secs(3));
+                // 主控台關閉／登出／關機：快照已經寫了，剩下的工作不等（系統大約 5 秒就強制結束）
+                let fast = FAST_EXIT.load(std::sync::atomic::Ordering::Relaxed);
+                rt.shutdown_timeout(std::time::Duration::from_millis(if fast { 200 } else { 3000 }));
                 r
             })();
             let _ = done_tx.send(r);
@@ -638,10 +645,16 @@ pub async fn serve(
         let mut stop_tx = Some(stop_tx);
         let result = loop {
             tokio::select! {
-                _ = &mut stop, if !stopping => {
+                why = &mut stop, if !stopping => {
                     stopping = true;
+                    if why.time_limited() {
+                        FAST_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
+                        warn!("{}", why.log_line());
+                    } else {
+                        info!("{}", why.log_line());
+                    }
                     if let Some(t) = stop_tx.take() {
-                        let _ = t.send(());
+                        let _ = t.send(why);
                     }
                     break (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false);
                 }
@@ -692,7 +705,7 @@ pub async fn serve(
                         Action::Quit => {
                             stopping = true;
                             if let Some(t) = stop_tx.take() {
-                                let _ = t.send(());
+                                let _ = t.send(StopReason::Quit);
                             }
                             break (&mut done_rx).await.unwrap_or(Ok(false)).map(|_| false);
                         }
@@ -857,7 +870,7 @@ async fn generation(
     show_url: bool,
     interactive: bool,
     console: ConsoleSlot,
-    stop: tokio::sync::oneshot::Receiver<()>,
+    stop: tokio::sync::oneshot::Receiver<StopReason>,
 ) -> Result<bool> {
     // KUROSHIO_ON_CONFIG_WRITE：監看設定檔所在的資料夾與設定目錄（快照目錄的上一層），不含快照與執行期目錄
     {
@@ -918,11 +931,15 @@ async fn generation(
         p.daily_budget / 1024
     );
     let reload = started.state.reload.clone();
-    let again = tokio::select! {
-        _ = stop => false,
-        _ = reload.notified() => true,
+    let (again, why) = tokio::select! {
+        r = stop => (false, r.ok()),
+        _ = reload.notified() => (true, None),
     };
-    started.shutdown();
+    // 停止：依原因決定寫快照的時間上限（主控台關閉／登出／關機只有大約 5 秒，3.5.0 C1）；重新載入照舊
+    match why {
+        Some(w) => started.shutdown_for(w),
+        None => started.shutdown(),
+    }
     Ok(again)
 }
 
@@ -2382,18 +2399,54 @@ impl Signals {
     }
 }
 
-async fn shutdown_signal() {
+/// cmd／前景執行時等停止訊號，回傳是哪一種（3.5.0 C1）
+///
+/// Windows：Ctrl+C、Ctrl+Break、關閉主控台視窗、登出、關機都走同一個正常停止。後三種系統在事件發生後大約 5 秒
+/// 就強制結束行程：tokio 1.54 的處理函式收到這三種事件時不會回傳（停在那裡），行程留給程式自己結束，
+/// 所以在時限內寫完快照、`main` 回傳時行程就正常結束；關機寫快照的上限縮成 3 秒（[`StopReason::flush_budget`]）。
+/// 有一種註冊失敗（不該發生）時其他的照等
+async fn shutdown_signal() -> StopReason {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate()).expect("signal");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => StopReason::CtrlC,
+            _ = term.recv() => StopReason::Terminate,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut c = windows::ctrl_c().ok();
+        let mut brk = windows::ctrl_break().ok();
+        let mut close = windows::ctrl_close().ok();
+        let mut logoff = windows::ctrl_logoff().ok();
+        let mut shut = windows::ctrl_shutdown().ok();
+        // 每一種都是「有註冊就等它、沒有就永遠不會來」
+        macro_rules! wait {
+            ($s:expr) => {
+                async {
+                    match $s.as_mut() {
+                        Some(s) => {
+                            s.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                }
+            };
+        }
+        tokio::select! {
+            _ = wait!(c) => StopReason::CtrlC,
+            _ = wait!(brk) => StopReason::CtrlBreak,
+            _ = wait!(close) => StopReason::ConsoleClose,
+            _ = wait!(logoff) => StopReason::Logoff,
+            _ = wait!(shut) => StopReason::SystemShutdown,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        StopReason::CtrlC
     }
 }
