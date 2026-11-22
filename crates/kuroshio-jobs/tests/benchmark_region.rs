@@ -255,11 +255,11 @@ async fn upstreams_json_has_region() {
     let mut lines = csv.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near"
+        "\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near,Tier"
     );
     let row = |id: &str| csv.lines().find(|l| l.split(',').nth(1) == Some(id)).unwrap().to_string();
-    assert!(row(&ids[1]).ends_with(",,TW,Y"), "{csv}");
-    assert!(row(&ids[3]).ends_with(",,US,"), "{csv}");
+    assert!(row(&ids[1]).ends_with(",,TW,Y,B"), "{csv}");
+    assert!(row(&ids[3]).ends_with(",,US,,B"), "{csv}");
     let log = std::fs::read_to_string(out.join("judge.log")).unwrap();
     assert!(log.contains("覆蓋：鄰近 2 台、其他 2 台"), "{log}");
     // 快取：新查到的有 cc，答案的 /16（只在汙染判斷用到）不補查

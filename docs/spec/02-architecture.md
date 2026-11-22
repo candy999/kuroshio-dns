@@ -101,7 +101,7 @@ kuroshio check-config <file>                     檢查設定檔
 
 | 檔案 | 內容 |
 |---|---|
-| `state/upstreams.json` | 每日評測結果 |
+| `state/upstreams.json` | 每日評測結果（3.5.0 起 `selected[]` 多 `tier`、`op`，`counts` 多 `byTier`，見下面） |
 | `state/benchmark/` | 評測過程資料 |
 | `state/cdn/domains/`（`manifest.json`、`{N}-{i}.json.zst`） | 每個 CDN 網站的驗證 / ECS / 跨 CDN 結果，分片、zstd 壓縮（規格 05 第 5.3 節；舊版的 `state/cdn-domains.json` 啟動時自動搬過來） |
 | `state/cdn/pools.json(.zst)` | 台灣節點池 |

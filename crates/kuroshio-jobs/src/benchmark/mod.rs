@@ -32,6 +32,7 @@
 pub mod probe;
 pub mod rules;
 pub mod select;
+pub mod tags;
 
 use crate::scheduler::{resolve_path, BoxFuture, Job, JobCtx};
 use crate::time::{fmt_time, iso_string, local_date_str, parse_date_utc, DAY_MS};
@@ -51,6 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tags::{Tag, Tier};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
@@ -98,6 +100,44 @@ impl BenchPaths {
                 if seen.insert(key(&l)) {
                     out.push(l);
                 }
+            }
+        }
+        out
+    }
+
+    /// 同 [`read_lists`](Self::read_lists)，另外帶著每一筆的標記（3.5.0，見 [`tags`]）。合併與去重的規則相同；
+    /// 使用者名單（`list_dir` 跟 `default_list_dir` 不同時）裡沒寫標記的是 [`Tier::User`]；
+    /// 同一個上游兩邊都有、使用者那一筆沒寫標記時，用使用者那一筆的網址、預設名單的標記
+    pub fn read_lists_tagged(&self, name: &str) -> Vec<(String, Tag)> {
+        let read = |d: &Path| tags::parse_tagged(&std::fs::read_to_string(d.join(name)).unwrap_or_default());
+        let mut out = read(&self.list_dir);
+        let Some(d) = self.default_list_dir.as_ref().filter(|d| **d != self.list_dir) else {
+            return out;
+        };
+        let key = |l: &str| l.split_whitespace().next().unwrap_or("").trim_end_matches('/').to_ascii_lowercase();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (i, (l, _)) in out.iter().enumerate() {
+            seen.entry(key(l)).or_insert(i);
+        }
+        let mut bare: Vec<bool> = out.iter().map(|(_, t)| t.is_bare()).collect();
+        for (l, t) in read(d) {
+            match seen.get(&key(&l)) {
+                Some(&i) => {
+                    if bare[i] {
+                        out[i].1 = t;
+                        bare[i] = false;
+                    }
+                }
+                None => {
+                    seen.insert(key(&l), out.len());
+                    out.push((l, t));
+                    bare.push(false);
+                }
+            }
+        }
+        for (i, (_, t)) in out.iter_mut().enumerate() {
+            if bare.get(i).copied().unwrap_or(false) {
+                t.tier = Tier::User;
             }
         }
         out
@@ -522,6 +562,8 @@ struct Srv {
     pinned: bool,
     /// 對照組：預期會擋的類型（`filter=` 標記，例如 `ads,adult`）
     protected: Option<String>,
+    /// 名單的標記（3.5.0）：只當起點與排序依據，不跳過任何檢查
+    tag: Tag,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -534,13 +576,14 @@ struct Srv {
 }
 
 impl Srv {
-    fn new(id: String, up: Upstream, pinned: bool) -> Srv {
+    fn new(id: String, up: Upstream, pinned: bool, tag: Tag) -> Srv {
         Srv {
             id,
             kind: kind_name(up.kind),
             up,
             pinned,
             protected: None,
+            tag,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -620,6 +663,8 @@ impl Srv {
             // Phase 2 查完業者之後才填（classify_region）
             region: String::new(),
             near: false,
+            tier: self.tag.tier.name(),
+            op: self.tag.op.clone(),
         }
     }
 }
@@ -630,23 +675,21 @@ fn pick_token(line: &str, prefix: &str) -> String {
 }
 
 /// 對照組（`protected.txt`）：一行一個上游（一般 DNS 的位址或 `https://`、`tls://`、`quic://`、`sdns://`），
-/// 後面的 `filter=ads,adult,malware` 是預期會擋的類型；最多 [`MAX_PROTECTED`] 台
-fn protected_ids(paths: &BenchPaths) -> Vec<(String, String)> {
-    let lines = paths.read_lists("protected.txt");
+/// 後面的 `filter=ads,adult,malware` 是預期會擋的類型；最多 [`MAX_PROTECTED`] 台。
+/// 回傳（上游、預期會擋的類型、標記）
+fn protected_ids(paths: &BenchPaths) -> Vec<(String, String, Tag)> {
+    let lines = paths.read_lists_tagged("protected.txt");
     if lines.len() > MAX_PROTECTED {
         warn!("對照組 {} 台，超過上限 {MAX_PROTECTED}，多的不測", lines.len());
     }
     lines
-        .iter()
+        .into_iter()
         .take(MAX_PROTECTED)
-        .filter_map(|l| {
+        .filter_map(|(l, mut tag)| {
             let spec = l.split_whitespace().next()?.to_string();
-            let expect = l
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix("filter="))
-                .unwrap_or("?")
-                .to_string();
-            Some((spec, expect))
+            tag.protected = true;
+            let expect = tag.filter.clone().unwrap_or_else(|| "?".to_string());
+            Some((spec, expect, tag))
         })
         .collect()
 }
@@ -666,28 +709,51 @@ fn protected_result(s: &Srv) -> &'static str {
 /// 檔案是舊版寫的或被改過也不會放大評測）
 const MAX_SHARED: usize = 100;
 
-/// 依 2.x 的順序組出候選清單：udp、doh（含社群提供的加密上游）、doq，再加上 3.0 新增的 dot、doh3、dnscrypt
-fn candidate_ids(paths: &BenchPaths) -> (Vec<String>, usize) {
-    let mut udp = paths.read_lists("iplist.txt");
-    let mut doh: Vec<String> = paths.read_lists("dohlist.txt").iter().map(|l| pick_token(l, "http")).collect();
-    let doq: Vec<String> = paths.read_lists("doqlist.txt").iter().map(|l| pick_token(l, "quic")).collect();
-    let dot: Vec<String> = paths
-        .read_lists("dotlist.txt")
-        .iter()
-        .map(|l| {
-            let t = l
+/// 一個候選與它在名單裡的標記（3.5.0）
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cand {
+    pub id: String,
+    pub tag: Tag,
+}
+
+/// 依 2.x 的順序組出候選清單：udp、doh（含社群提供的加密上游）、doq，再加上 3.0 新增的 dot、doh3、dnscrypt。
+/// 回傳（候選、社群好友提供的個數）
+pub fn candidate_ids(paths: &BenchPaths) -> (Vec<Cand>, usize) {
+    let cand = |(id, tag): (String, Tag)| Cand { id, tag };
+    let mut udp: Vec<Cand> = paths.read_lists_tagged("iplist.txt").into_iter().map(cand).collect();
+    let mut doh: Vec<Cand> = paths
+        .read_lists_tagged("dohlist.txt")
+        .into_iter()
+        .map(|(l, t)| cand((pick_token(&l, "http"), t)))
+        .collect();
+    let doq: Vec<Cand> = paths
+        .read_lists_tagged("doqlist.txt")
+        .into_iter()
+        .map(|(l, t)| cand((pick_token(&l, "quic"), t)))
+        .collect();
+    let dot: Vec<Cand> = paths
+        .read_lists_tagged("dotlist.txt")
+        .into_iter()
+        .map(|(l, t)| {
+            let tok = l
                 .split_whitespace()
                 .find(|p| p.contains("://"))
-                .unwrap_or_else(|| l.split_whitespace().next().unwrap_or(l));
-            if t.contains("://") {
-                t.to_string()
+                .unwrap_or_else(|| l.split_whitespace().next().unwrap_or(&l));
+            let id = if tok.contains("://") {
+                tok.to_string()
             } else {
-                format!("tls://{t}")
-            }
+                format!("tls://{tok}")
+            };
+            cand((id, t))
         })
         .collect();
-    let stamps: Vec<String> = paths.read_lists("stamps.txt").iter().map(|l| pick_token(l, "sdns://")).collect();
-    // 社群好友提供的上游：只是候選，照常經過資格賽、汙染、封殺、速度檢查
+    let stamps: Vec<Cand> = paths
+        .read_lists_tagged("stamps.txt")
+        .into_iter()
+        .map(|(l, t)| cand((pick_token(&l, "sdns://"), t)))
+        .collect();
+    // 社群好友提供的上游：只是候選，照常經過資格賽、汙染、封殺、速度檢查；
+    // 一律當 B 級（好友給的只是候選，不能靠別人的話升到 A）
     let shared: Vec<String> = paths
         .community_candidates
         .as_ref()
@@ -698,25 +764,40 @@ fn candidate_ids(paths: &BenchPaths) -> (Vec<String>, usize) {
         .filter_map(|x| x.as_str().map(str::to_string))
         .take(MAX_SHARED)
         .collect();
+    let shared_tag = || Tag {
+        tier: Tier::B,
+        ..Default::default()
+    };
     for id in &shared {
         if id.starts_with("https://") || id.starts_with("tls://") {
-            if !doh.contains(id) {
-                doh.push(id.clone());
+            if !doh.iter().any(|c| c.id == *id) {
+                doh.push(Cand {
+                    id: id.clone(),
+                    tag: shared_tag(),
+                });
             }
         } else {
             let ip = id.strip_prefix("udp://").unwrap_or(id);
-            if ip.parse::<IpAddr>().is_ok() && !udp.iter().any(|u| u == ip) {
-                udp.push(ip.to_string());
+            if ip.parse::<IpAddr>().is_ok() && !udp.iter().any(|u| u.id == ip) {
+                udp.push(Cand {
+                    id: ip.to_string(),
+                    tag: shared_tag(),
+                });
             }
         }
     }
     if !shared.is_empty() {
         info!("社群好友提供的上游候選 {} 個", shared.len());
     }
-    // DoH 每一筆同時測 HTTP/2 與 HTTP/3（規格 01 第 1.2 節）
-    let h3: Vec<String> = doh
+    // DoH 每一筆同時測 HTTP/2 與 HTTP/3（規格 01 第 1.2 節）；h3:// 沿用它的 https:// 那一筆的標記
+    let h3: Vec<Cand> = doh
         .iter()
-        .filter_map(|u| u.strip_prefix("https://").map(|r| format!("h3://{r}")))
+        .filter_map(|c| {
+            c.id.strip_prefix("https://").map(|r| Cand {
+                id: format!("h3://{r}"),
+                tag: c.tag.clone(),
+            })
+        })
         .collect();
     info!(
         "=== 每日 DNS 評測：UDP {} / DoH {} / DoQ {} / DoT {} / DNSCrypt {} ===",
@@ -900,13 +981,18 @@ impl Benchmark {
         let mut all: Vec<Srv> = Vec::new();
         let mut skipped: BTreeMap<&'static str, usize> = BTreeMap::new();
         // 順序：固定上游、對照組、一般候選（同一個上游出現在兩邊時，以前面的為準）
+        // 固定上游是使用者指定的：標記當成 user
+        let user_tag = Tag {
+            tier: Tier::User,
+            ..Default::default()
+        };
         let roles = cfg
             .pinned
             .iter()
-            .map(|p| (p, true, None))
-            .chain(protected.iter().map(|(p, e)| (p, false, Some(e))))
-            .chain(ids.iter().map(|i| (i, false, None)));
-        for (spec, pinned, expect) in roles {
+            .map(|p| (p, true, None, &user_tag))
+            .chain(protected.iter().map(|(p, e, t)| (p, false, Some(e), t)))
+            .chain(ids.iter().map(|c| (&c.id, false, None, &c.tag)));
+        for (spec, pinned, expect, tag) in roles {
             // 對照組不看永久黑名單：用來確認判斷正常，不能被永久封殺
             let pinned_or_control = pinned || expect.is_some();
             if !pinned_or_control && blacklist.contains(spec.as_str()) {
@@ -937,7 +1023,7 @@ impl Benchmark {
                     continue;
                 }
             }
-            let mut s = Srv::new(spec.clone(), up, pinned);
+            let mut s = Srv::new(spec.clone(), up, pinned, tag.clone());
             s.protected = expect.cloned();
             all.push(s);
         }
@@ -1373,7 +1459,12 @@ impl Benchmark {
             .map(|s| (s.id.clone(), s.kind, s.fail_reason.clone()))
             .collect();
         let issues: HashMap<String, Vec<String>> = all.iter().filter(|s| s.pinned).map(|s| (s.id.clone(), s.issues.clone())).collect();
-        let counts = json!({ "total": all.len(), "verified": verified.len(), "survivors": finals.len(), "eliminated": eliminated.len(), "protected": control.len() });
+        // 候選的分級（3.5.0）：固定上游與對照組不算
+        let mut by_tier: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for s in all.iter().filter(|s| s.selectable()) {
+            *by_tier.entry(s.tag.tier.name()).or_default() += 1;
+        }
+        let counts = json!({ "total": all.len(), "verified": verified.len(), "survivors": finals.len(), "eliminated": eliminated.len(), "protected": control.len(), "byTier": by_tier });
         drop(all);
         ctx.checkpoint().await;
 
@@ -1390,7 +1481,7 @@ impl Benchmark {
             .iter()
             .map(|p| {
                 let s = &calc.finals[p.idx];
-                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near })
+                json!({ "id": s.id, "type": s.kind, "owner": s.owner, "avgMs": fixed_num(s.avg, 2), "newItems": p.newly, "reason": p.why, "region": s.region, "near": s.near, "tier": s.tier, "op": s.op })
             })
             .collect();
         let pinned: Vec<Value> = calc
@@ -1957,6 +2048,120 @@ mod list_merge_tests {
         // 使用者沒有這個檔：只用程式附帶的
         std::fs::write(shipped.join("dotlist.txt"), "tls://dot.example\n").unwrap();
         assert_eq!(p.read_lists("dotlist.txt"), vec!["tls://dot.example"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn two_lists(name: &str) -> (PathBuf, BenchPaths) {
+        let root = std::env::temp_dir().join(format!("kuroshio-tags-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (user, shipped) = (root.join("etc"), root.join("share"));
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&shipped).unwrap();
+        let mut p = BenchPaths::from_config(&json!({}), &root.join("state"), &root);
+        p.list_dir = user;
+        p.default_list_dir = Some(shipped);
+        p.community_candidates = Some(root.join("state/community/upstream-candidates.json"));
+        (root, p)
+    }
+
+    #[test]
+    fn user_list_without_tags_is_user_tier() {
+        let (root, p) = two_lists("user");
+        let user = p.list_dir.clone();
+        std::fs::write(
+            user.join("dohlist.txt"),
+            "https://mine.example.com/dns-query\nhttps://tagged.example.com/dns-query  # tier=B op=Mine\n",
+        )
+        .unwrap();
+        std::fs::write(user.join("iplist.txt"), "192.0.2.7\n").unwrap();
+        let l = p.read_lists_tagged("dohlist.txt");
+        assert_eq!(l[0].1.tier, Tier::User);
+        assert_eq!(l[1].1.tier, Tier::B, "使用者自己寫了標記：照它的");
+        assert_eq!(l[1].1.op, "Mine");
+        assert_eq!(p.read_lists_tagged("iplist.txt")[0].1.tier, Tier::User);
+        // 只有一個名單（list_dir 就是程式附帶的）：沒標記的是 Unknown，不是 User
+        let mut single = p.clone();
+        single.default_list_dir = None;
+        assert_eq!(single.read_lists_tagged("dohlist.txt")[0].1.tier, Tier::Unknown);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_tag_kept_when_user_repeats_entry() {
+        let (root, p) = two_lists("repeat");
+        std::fs::write(
+            p.list_dir.join("dohlist.txt"),
+            "https://Both.example.com/dns-query/\nhttps://own.example.net/dns-query  # tier=B\n",
+        )
+        .unwrap();
+        std::fs::write(
+            p.default_list_dir.as_ref().unwrap().join("dohlist.txt"),
+            "# ---- A 級 ----\nhttps://both.example.com/dns-query  # tier=A op=Example_Net ms=3.1\nhttps://own.example.net/dns-query  # tier=A op=Other\nhttps://new.example.com/dns-query  # op=New\n",
+        )
+        .unwrap();
+        let l = p.read_lists_tagged("dohlist.txt");
+        let ids: Vec<&str> = l.iter().map(|(i, _)| i.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "https://Both.example.com/dns-query/",
+                "https://own.example.net/dns-query",
+                "https://new.example.com/dns-query"
+            ],
+            "網址用使用者那一筆、去重"
+        );
+        assert_eq!(l[0].1.tier, Tier::A, "使用者沒寫標記：用預設名單的");
+        assert_eq!(l[0].1.op, "Example_Net");
+        assert_eq!(l[1].1.tier, Tier::B, "使用者寫了標記：不被預設名單蓋掉");
+        assert_eq!(l[1].1.op, "");
+        assert_eq!(l[2].1.tier, Tier::A, "分段行的分級");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn h3_inherits_https_tag() {
+        let (root, mut p) = two_lists("h3");
+        p.default_list_dir = None;
+        std::fs::write(
+            p.list_dir.join("dohlist.txt"),
+            "https://dns.example.com/dns-query  # tier=A op=Example_Net ecs=1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            p.list_dir.join("iplist.txt"),
+            "# ---- A 級 ----\n# A Example_Net（AS64500）TW 3.9 ms\n192.0.2.1\n",
+        )
+        .unwrap();
+        let (c, _) = candidate_ids(&p);
+        let get = |id: &str| c.iter().find(|x| x.id == id).unwrap_or_else(|| panic!("{id}: {c:?}")).tag.clone();
+        let https = get("https://dns.example.com/dns-query");
+        assert_eq!(https.tier, Tier::A);
+        assert_eq!(get("h3://dns.example.com/dns-query"), https);
+        let udp = get("192.0.2.1");
+        assert_eq!((udp.tier, udp.op.as_str(), udp.ms), (Tier::A, "Example_Net", Some(3.9)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_candidates_are_tier_b() {
+        let (root, mut p) = two_lists("shared");
+        p.default_list_dir = None;
+        std::fs::write(p.list_dir.join("dohlist.txt"), "https://dns.example.com/dns-query  # tier=A\n").unwrap();
+        let f = p.community_candidates.clone().unwrap();
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        let ids = [
+            "https://dns.example.com/dns-query",
+            "https://friend.example.net/dns-query",
+            "udp://192.0.2.53",
+        ];
+        std::fs::write(&f, serde_json::to_vec(&json!({ "ids": ids })).unwrap()).unwrap();
+        let (c, n) = candidate_ids(&p);
+        assert_eq!(n, 3);
+        let tier = |id: &str| c.iter().find(|x| x.id == id).map(|x| x.tag.tier);
+        assert_eq!(tier("https://dns.example.com/dns-query"), Some(Tier::A), "名單已經有的照名單");
+        assert_eq!(tier("https://friend.example.net/dns-query"), Some(Tier::B));
+        assert_eq!(tier("h3://friend.example.net/dns-query"), Some(Tier::B));
+        assert_eq!(tier("192.0.2.53"), Some(Tier::B));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

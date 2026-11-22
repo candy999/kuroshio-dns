@@ -28,6 +28,10 @@ pub struct Scored {
     pub region: String,
     /// 鄰近（台灣、日本、香港、新加坡且延遲合理，或延遲本身就夠低）：`coverage_region = near` 時優先挑
     pub near: bool,
+    /// 名單的分級（3.5.0）："A"／"B"／"user"；只輸出，不影響選擇
+    pub tier: &'static str,
+    /// 名單標記的經營者（3.5.0）
+    pub op: String,
 }
 
 /// 鄰近的四地
@@ -350,13 +354,13 @@ pub fn greedy_csv(servers: &[&Scored], total: usize, strategy: Strategy) -> Stri
     csv
 }
 
-/// final_dns_smart.csv（`finals` 依延遲排序）。3.4.0 在最後加 `Region`、`Near` 兩欄（舊的欄位順序不變）
+/// final_dns_smart.csv（`finals` 依延遲排序）。3.4.0 在最後加 `Region`、`Near` 兩欄、3.5.0 再加 `Tier`（舊的欄位順序不變）
 pub fn final_csv(finals: &[&Scored]) -> String {
-    let mut csv = String::from("\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near\n");
+    let mut csv = String::from("\u{feff}Rank,DNS_Server,Type,DNS_Owner,Min,Max,Avg,Count,Success_Rate,Total_IPs,Unique_IPs,Unique_Ratio_Self,Unique_Ratio_Global,Pinned,Region,Near,Tier\n");
     for (i, s) in finals.iter().enumerate() {
         let e = &s.ext;
         csv.push_str(&format!(
-            "{},{},{},\"{}\",{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},\"{}\",{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             i + 1,
             s.id,
             s.kind,
@@ -372,7 +376,8 @@ pub fn final_csv(finals: &[&Scored]) -> String {
             pct(e.exclusive_ratio_global, 4),
             if s.pinned { "Y" } else { "" },
             s.region,
-            if s.near { "Y" } else { "" }
+            if s.near { "Y" } else { "" },
+            s.tier
         ));
     }
     csv
@@ -663,9 +668,10 @@ mod tests {
         let mut s = srv("a", "A__AS1", 10.0, &[(0, 1)]);
         s.region = "JP".into();
         s.near = true;
+        s.tier = "A";
         let csv = final_csv(&[&s]);
         let mut lines = csv.lines();
-        assert!(lines.next().unwrap().ends_with(",Pinned,Region,Near"));
-        assert!(lines.next().unwrap().ends_with(",,JP,Y"));
+        assert!(lines.next().unwrap().ends_with(",Pinned,Region,Near,Tier"));
+        assert!(lines.next().unwrap().ends_with(",,JP,Y,A"));
     }
 }

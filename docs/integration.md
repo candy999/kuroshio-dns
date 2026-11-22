@@ -584,6 +584,21 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - `upstreams.json` 的 `selected[]` 每筆多 `region` 與 `near`；`final_dns_smart.csv` 最後多 `Region`、`Near` 兩欄（舊的欄位順序不變）。
 - `/api/status` 的 `upstreams[]` 多 `region`（沒有是 `null`）。狀態頁顯示在選上原因的旁邊，例如「自動（覆蓋 · JP）」。
 
+## 每日評測與預設名單（3.5.0 起）
+
+### 名單標記
+
+評測名單每一筆可以帶「整理名單時的資料」：`dohlist.txt`、`dotlist.txt`、`doqlist.txt`、`protected.txt` 寫在同一行的 `#` 後面（`tier=A op=Example_Net ms=3.1 ecs=1 carrier=1 filter=ads`，不認識的 key 忽略）；`iplist.txt` 同一行不能加註解，寫在位址的上一行（`# A Example_Net（AS64500）TW 3.9 ms ECS`）。分段行 `# ---- A 級 ----`／`# ---- B 級 ----` 是那一段沒寫分級的預設。
+
+- 使用者自己的名單（`benchmark.dir` 跟程式附帶的名單不同時）裡沒寫標記的是 `user`；同一個上游兩邊都有、使用者沒寫標記時用預設名單的標記。社群好友給的候選一律是 `B`，`h3://` 沿用它的 `https://` 那一筆。
+- 標記只是起點與排序依據，**不跳過任何檢查**（資格賽、汙染、封殺、憑證）；`ms` 是整理名單那天、那條線路量的，不當成今天的延遲。3.5.0 第 1 批只把標記帶到輸出，不影響選擇。
+- 舊格式（沒有標記）照常可用。
+
+輸出（只新增欄位，舊版不認得就不顯示）：
+
+- `upstreams.json`（`/api/benchmark`）的 `selected[]` 每筆多 `tier`（`"A"`／`"B"`／`"user"`；沒標記的算 `"B"`）與 `op`（經營者，最長 64 bytes；沒有是空字串），`counts` 多 `byTier`（候選依分級的台數，固定上游與對照組不算）。
+- `final_dns_smart.csv` 最後多 `Tier` 一欄。
+
 ## 重新載入不斷線（3.4.0 起）
 
 重新載入設定（SIGHUP、設定頁存檔）時，舊的一輪要完全結束才建新的一輪，中間有 0.2～0.4 秒沒有人在聽。3.4.0 起監聽 socket 留在程式裡，不跟著舊的一輪關掉：

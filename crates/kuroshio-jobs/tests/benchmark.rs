@@ -181,7 +181,12 @@ async fn end_to_end_with_mock_servers() {
     let iplist: Vec<String> = [s1, s2, s3, s4, s5, s6, s7, s8, s10].iter().map(|a| a.to_string()).collect();
     std::fs::write(
         list.join("iplist.txt"),
-        format!("\u{feff}{}\r\n# 註解\r\n{}\r\n", iplist.join("\r\n"), s1),
+        // 名單標記（3.5.0）：s1 上一行的註解是它的分級與經營者，其他沒有標記
+        format!(
+            "\u{feff}# A Owner1_Ltd（AS901）JP 1.0 ms\r\n{}\r\n# 註解\r\n{}\r\n",
+            iplist.join("\r\n"),
+            s1
+        ),
     )
     .unwrap();
     std::fs::write(list.join("dohlist.txt"), "https://dns.example/dns-query\n").unwrap();
@@ -255,8 +260,13 @@ async fn end_to_end_with_mock_servers() {
     assert_eq!(up["coverage"], json!(0.8571));
     assert_eq!(
         up["counts"],
-        json!({ "total": 9, "verified": 7, "survivors": 4, "eliminated": 5, "protected": 0 })
+        json!({ "total": 9, "verified": 7, "survivors": 4, "eliminated": 5, "protected": 0, "byTier": { "A": 1, "B": 7 } })
     );
+    // 標記跟著候選走到結果：只是輸出，選擇照舊
+    assert_eq!(up["selected"][0]["tier"], "A");
+    assert_eq!(up["selected"][0]["op"], "Owner1_Ltd");
+    assert_eq!(up["selected"][1]["tier"], "B");
+    assert_eq!(up["selected"][1]["op"], "");
     assert_eq!(
         up["blocked"],
         json!([{ "dns": s4.to_string(), "domain": "cdn.beta.com", "reason": "導向 0.0.0.0", "pinned": false, "protected": false }])
@@ -647,4 +657,22 @@ async fn dropped_run_clears_progress_and_saves() {
     let suspects = read(&root.join("state/blacklist-suspects.json"));
     assert_eq!(suspects[quiet.to_string()], json!(["2026-11-10"]), "{suspects}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 3.5.0：程式附帶的名單讀得出分級，數字跟檔頭寫的一樣（iplist 用上一行的註解，其他用行內標記）
+#[test]
+fn repository_lists_have_tiers() {
+    use kuroshio_jobs::benchmark::tags::{parse_tagged, Tier};
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/benchmark");
+    for (name, a, b) in [
+        ("iplist.txt", 77, 762),
+        ("dohlist.txt", 134, 216),
+        ("dotlist.txt", 114, 76),
+        ("doqlist.txt", 8, 24),
+    ] {
+        let l = parse_tagged(&std::fs::read_to_string(dir.join(name)).unwrap());
+        let n = |t: Tier| l.iter().filter(|(_, x)| x.tier == t).count();
+        assert_eq!((n(Tier::A), n(Tier::B), n(Tier::Unknown)), (a, b, 0), "{name}");
+        assert!(l.iter().filter(|(_, x)| x.tier == Tier::A).all(|(_, x)| !x.op.is_empty()), "{name}");
+    }
 }
