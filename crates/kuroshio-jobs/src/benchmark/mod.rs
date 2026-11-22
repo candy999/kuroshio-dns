@@ -973,8 +973,15 @@ impl Benchmark {
         let protected = protected_ids(&self.paths);
         // 學習資料（3.5.0）：執行時上線以來從未成功的（主程式登記的）今天照測、不選；排除 3 次之後忘掉重來
         let mut learned = self.paths.learn_file.as_ref().map(|p| learn::Learn::load(p));
-        let (never_ok, learn_changed) = learned.as_mut().map(|l| l.take_never_ok_round()).unwrap_or_default();
+        let (never_ok, mut learn_dirty) = learned.as_mut().map(|l| l.take_never_ok_round()).unwrap_or_default();
         let never_ok: HashSet<String> = never_ok.into_iter().collect();
+        let today_n = learn::day_of(now);
+        // 不支援 HTTP/3 的 DoH（3.5.0 A6）：它的 https:// 已經不在名單的刪掉
+        if let Some(l) = learned.as_mut() {
+            let h3_ids: HashSet<&str> = ids.iter().filter(|c| c.id.starts_with("h3://")).map(|c| c.id.as_str()).collect();
+            learn_dirty |= l.h3_prune(|k| h3_ids.contains(k)) > 0;
+        }
+        let mut h3_skipped = 0usize;
         // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
         let mut journal = Journal::default();
         // 路徑檢查：一般 DNS 被接走、IPv6 不能用、協定被擋時，那些候選今天不測（測了也只會冤枉它們）
@@ -1035,6 +1042,14 @@ impl Benchmark {
                     continue;
                 }
             }
+            // 連續好幾天 QUIC 連不上（https:// 正常）的 h3://：跳過期間不測（3.5.0 A6）
+            if !pinned_or_control
+                && up.kind == kuroshio_net::upstream::Kind::Doh3
+                && learned.as_ref().is_some_and(|l| l.h3_skipping(spec, today_n))
+            {
+                h3_skipped += 1;
+                continue;
+            }
             let mut s = Srv::new(spec.clone(), up, pinned, tag.clone());
             s.protected = expect.cloned();
             s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
@@ -1056,6 +1071,13 @@ impl Benchmark {
         if !unsupported.is_empty() {
             jinfo!(journal, "這個版本還不支援的類型先略過（之後版本加入）：{}", unsupported.join("、"));
         }
+        if h3_skipped > 0 {
+            jinfo!(
+                journal,
+                "HTTP/3 先不測 {h3_skipped} 個：連續 {} 天以上 QUIC 連不上、HTTPS 正常（跳過 7～30 天，到期再試）",
+                learn::H3_FAIL_DAYS
+            );
+        }
         for s in all.iter().filter(|s| s.never_ok) {
             jinfo!(journal, "  {}：執行時上線以來從未成功，今天照測、不選", s.id);
         }
@@ -1072,10 +1094,31 @@ impl Benchmark {
         let (pf_domain, pf_expected) = self.preflight.clone();
         jinfo!(journal, "[Phase 0] 資格賽 ({pf_domain})");
         let results = self.query_all(&all, (0..all.len()).collect(), &pf_domain, &cfg).await;
+        // 每個候選的資格賽結果（A6 用：h3:// 與它的 https://）
+        let mut pf: Vec<Option<Preflight>> = vec![None; all.len()];
         for (i, r) in results {
             let pass = matches!(&r.outcome, Outcome::Ok(ips) if ips.iter().any(|ip| pf_expected.contains(ip)));
+            pf[i] = Some(match (&r.outcome, pass) {
+                (_, true) => Preflight::Pass,
+                (Outcome::Error(_), _) => Preflight::Error,
+                _ => Preflight::Answered,
+            });
             if !pass {
                 all[i].kill(format!("資格賽失敗 ({})", reason_of(&r)));
+            }
+        }
+        if let Some(l) = learned.as_mut() {
+            let c = record_h3(l, &all, &pf, today_n);
+            learn_dirty |= c.any();
+            if c.any() || l.h3_skipping_count(today_n) > 0 {
+                jinfo!(
+                    journal,
+                    "HTTP/3：多記一天 {}、開始跳過 {}、恢復 {}（目前跳過 {} 個）",
+                    c.counted,
+                    c.skipped,
+                    c.cleared,
+                    l.h3_skipping_count(today_n)
+                );
             }
         }
         let verified: Vec<usize> = (0..all.len()).filter(|i| all[*i].alive).collect();
@@ -1562,7 +1605,7 @@ impl Benchmark {
         );
         write_json(&self.paths.upstreams_file, &state)?;
         // 學習資料：有變動才寫（每天最多一次）；系統時間倒退時不寫
-        if let (Some(l), Some(p), true) = (learned.as_mut(), self.paths.learn_file.as_ref(), learn_changed) {
+        if let (Some(l), Some(p), true) = (learned.as_mut(), self.paths.learn_file.as_ref(), learn_dirty) {
             if l.advance(learn::day_of(now)) {
                 if let Err(e) = l.save(p) {
                     warn!("寫入評測學習資料失敗：{e}");
@@ -1830,6 +1873,48 @@ impl Benchmark {
             })
             .collect()
     }
+}
+
+/// 一個候選的資格賽結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preflight {
+    /// 通過
+    Pass,
+    /// 有回答，但不是預期的（封殺、答案不對）
+    Answered,
+    /// 連線錯誤、逾時
+    Error,
+}
+
+/// 不支援 HTTP/3 的 DoH（3.5.0 A6）：一般候選裡的每個 h3://，依它與它的 https:// 的資格賽結果記一筆。
+/// 算一次失敗要三個條件都成立：h3:// 是連線錯誤（不是封殺、不是答案不對）、它的 https:// 通過資格賽、
+/// 今天至少有一個 h3:// 連得上（全部都連不上時可能是 QUIC 整條被擋、路徑檢查沒抓到，不冤枉）。
+/// 路徑檢查判斷 QUIC 被擋時 h3:// 根本不在候選裡，也就不會記
+fn record_h3(l: &mut learn::Learn, all: &[Srv], pf: &[Option<Preflight>], today: u32) -> learn::H3Change {
+    use learn::H3Seen;
+    let mut change = learn::H3Change::default();
+    let h3: Vec<usize> = (0..all.len())
+        .filter(|&i| all[i].kind == "doh3" && all[i].selectable() && all[i].id.starts_with("h3://"))
+        .collect();
+    let quic_ok = h3.iter().any(|&i| matches!(pf[i], Some(Preflight::Pass | Preflight::Answered)));
+    let by_id: HashMap<&str, usize> = all.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
+    for &i in &h3 {
+        let seen = match pf[i] {
+            Some(Preflight::Error) => {
+                let https = format!("https://{}", &all[i].id["h3://".len()..]);
+                let https_ok = by_id.get(https.as_str()).is_some_and(|&j| pf[j] == Some(Preflight::Pass));
+                if quic_ok && https_ok {
+                    H3Seen::Fail
+                } else {
+                    H3Seen::Neutral
+                }
+            }
+            Some(_) => H3Seen::Ok,
+            None => H3Seen::Neutral,
+        };
+        l.h3_record(&all[i].id, today, seen, &mut change);
+    }
+    change
 }
 
 /// 收集到的原始答案大約佔多少記憶體（每筆：結果本身 + 幾個 IP；估計值，誤差約 ±30%）。

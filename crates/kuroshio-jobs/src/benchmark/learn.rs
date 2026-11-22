@@ -3,12 +3,13 @@
 //!
 //! ```json
 //! { "v": 1, "day": 20781,
+//!   "h3skip":  { "<h3:// 的 id>": { "f": 3, "n": 1, "until": 20790, "last": 20783 } },
 //!   "neverOk": { "<id>": { "since": 20780, "n": 2 } } }
 //! ```
 //!
 //! - 丟了只是重新學，不影響正確性（`space.rs` 歸 `Rebuildable`）；不進備份的分享檔、不傳給下游與好友。
 //! - 讀不到、格式不對、`v` 不認識、太大：當成空的，不失敗。
-//! - 這一版只用到 `neverOk`（A7）；其他區段（之後的 `control`、`hist`、`h3skip`）原樣保留，不會被這裡蓋掉。
+//! - 用到的區段：`neverOk`（A7）、`h3skip`（A6）；不認得的區段（之後的 `hist`）原樣保留，不會被這裡蓋掉。
 //! - `day` 是台北的日數（Unix 毫秒換算，`u32`）；系統時間倒退（還沒對時）時不寫。
 
 use crate::time::{DAY_MS, TPE_OFFSET_MS};
@@ -28,6 +29,72 @@ pub const MAX_RAW: u64 = 256 * 1024;
 pub const MAX_NEVER_OK: usize = 32;
 /// 連續幾次評測都排除後忘掉重來（它可能修好了）
 pub const NEVER_OK_RUNS: u32 = 3;
+/// `h3skip` 最多幾筆（不支援 HTTP/3 的 DoH，A6）
+pub const MAX_H3_SKIP: usize = 512;
+/// `h3://` 連續幾天（不同日期）QUIC 連不上、`https://` 正常，才開始跳過
+pub const H3_FAIL_DAYS: u32 = 3;
+/// 跳過的基本天數（第 n 輪是 `7 × 2^n`）
+pub const H3_SKIP_BASE: u32 = 7;
+/// 跳過的輪數最多算到幾（7、14、28 天之後一直是 28 天）
+pub const H3_MAX_ROUND: u32 = 2;
+/// 跳過最多幾天（含亂數）：一定會再試
+pub const H3_MAX_SKIP: u32 = 30;
+/// 亂數最多加幾天（0～3）
+pub const H3_JITTER: u32 = 3;
+
+/// 不支援 HTTP/3 的 DoH（A6）：`h3://` 連續幾天 QUIC 連不上、它的 `https://` 正常，跳過一段時間再試
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct H3Skip {
+    /// 連續失敗的天數（同一天評測好幾次只算一天）
+    pub f: u32,
+    /// 已經跳過幾輪（最多 [`H3_MAX_ROUND`]）
+    pub n: u32,
+    /// 跳過到哪一天（這天以前不測；0 = 還沒開始跳過）
+    pub until: u32,
+    /// 最後一次記錄的日數（同一天不重複算、超過上限時先丟最舊的）
+    pub last: u32,
+}
+
+/// 這次評測裡一個 `h3://` 候選的資格賽結果（給 [`Learn::h3_record`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3Seen {
+    /// QUIC 連得上（有回答，不論答案對不對）：整筆刪掉
+    Ok,
+    /// 算一次失敗：連線錯誤、它的 `https://` 通過資格賽、今天 QUIC 沒有整條被擋
+    Fail,
+    /// 不算（`https://` 自己也失敗、QUIC 可能整條被擋）：不改
+    Neutral,
+}
+
+/// `h3skip` 的變化（寫進 judge.log）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct H3Change {
+    /// 多記了一天失敗（還沒開始跳過）
+    pub counted: usize,
+    /// 開始跳過（含到期再測又失敗、進下一輪的）
+    pub skipped: usize,
+    /// 恢復（QUIC 連得上，整筆刪掉）
+    pub cleared: usize,
+}
+
+impl H3Change {
+    pub fn any(&self) -> bool {
+        self.counted + self.skipped + self.cleared > 0
+    }
+}
+
+/// 跳過幾天：`7 × 2^n`（n 最多 2）再加 0～3 天亂數，合計最多 30 天。
+/// 亂數用 id 的雜湊加日數（不用另外的亂數來源，測試才穩；同一天開始跳過的不會全部同一天回來）
+pub fn h3_skip_days(id: &str, today: u32, n: u32) -> u32 {
+    // FNV-1a：固定、跨平台一樣
+    let mut h: u32 = 0x811c_9dc5;
+    for b in id.as_bytes().iter().chain(&today.to_le_bytes()) {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    let jitter = h % (H3_JITTER + 1);
+    ((H3_SKIP_BASE << n.min(H3_MAX_ROUND)) + jitter).min(H3_MAX_SKIP)
+}
 
 /// 執行時上線以來從未成功、被先停用的自動上游（A7）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +109,8 @@ pub struct NeverOk {
 pub struct Learn {
     pub day: u32,
     pub never_ok: BTreeMap<String, NeverOk>,
+    /// 不支援 HTTP/3 的 DoH（A6），以 `h3://` 的 id 為鍵
+    pub h3skip: BTreeMap<String, H3Skip>,
     /// 這一版不認得的區段：原樣保留
     rest: Map<String, Value>,
 }
@@ -91,7 +160,30 @@ impl Learn {
                 }
             }
         }
-        let mut l = Learn { day, never_ok, rest: o };
+        let mut h3skip = BTreeMap::new();
+        if let Some(Value::Object(m)) = o.remove("h3skip") {
+            for (id, e) in m {
+                let f = |k: &str| e.get(k).and_then(Value::as_u64).map(|x| x.min(u32::MAX as u64) as u32);
+                if let (Some(fd), Some(n), Some(until)) = (f("f"), f("n"), f("until")) {
+                    let last = f("last").unwrap_or(until);
+                    h3skip.insert(
+                        id,
+                        H3Skip {
+                            f: fd,
+                            n: n.min(H3_MAX_ROUND),
+                            until,
+                            last,
+                        },
+                    );
+                }
+            }
+        }
+        let mut l = Learn {
+            day,
+            never_ok,
+            h3skip,
+            rest: o,
+        };
         l.cap();
         l
     }
@@ -103,6 +195,20 @@ impl Learn {
                 break;
             };
             self.never_ok.remove(&oldest);
+        }
+        self.cap_h3();
+    }
+
+    /// `h3skip` 超過上限時丟 `last` 最舊的（名單裡已經沒有的由 [`h3_prune`](Self::h3_prune) 先丟）
+    fn cap_h3(&mut self) {
+        let over = self.h3skip.len().saturating_sub(MAX_H3_SKIP);
+        if over == 0 {
+            return;
+        }
+        let mut by_age: Vec<(u32, String)> = self.h3skip.iter().map(|(k, e)| (e.last, k.clone())).collect();
+        by_age.sort();
+        for (_, k) in by_age.into_iter().take(over) {
+            self.h3skip.remove(&k);
         }
     }
 
@@ -116,6 +222,12 @@ impl Learn {
             .map(|(k, e)| (k.clone(), json!({ "since": e.since, "n": e.n })))
             .collect();
         o.insert("neverOk".into(), Value::Object(m));
+        let h: Map<String, Value> = self
+            .h3skip
+            .iter()
+            .map(|(k, e)| (k.clone(), json!({ "f": e.f, "n": e.n, "until": e.until, "last": e.last })))
+            .collect();
+        o.insert("h3skip".into(), Value::Object(h));
         Value::Object(o)
     }
 
@@ -161,6 +273,77 @@ impl Learn {
             e.n += 1;
         }
         (ids, changed)
+    }
+}
+
+impl Learn {
+    /// 這個 `h3://` 今天要不要跳過（還在跳過期間）。系統時間倒退（今天比檔案的日數舊）時一律不跳過；
+    /// `until` 離今天超過上限（時間曾經跳到未來又回來）也不跳過，不會卡住
+    pub fn h3_skipping(&self, id: &str, today: u32) -> bool {
+        if today < self.day {
+            return false;
+        }
+        self.h3skip
+            .get(id)
+            .is_some_and(|e| e.until > today && e.until - today <= H3_MAX_SKIP)
+    }
+
+    /// 記下一個 `h3://` 候選今天的結果。回傳有沒有變動。
+    /// - 還沒開始跳過：失敗一天記一天（同一天不重複），連續 [`H3_FAIL_DAYS`] 天就開始跳過 `h3_skip_days` 天；
+    /// - 跳過到期再測：失敗 1 次就進下一輪（7 → 14 → 28 天）；
+    /// - QUIC 連得上：整筆刪掉
+    pub fn h3_record(&mut self, id: &str, today: u32, seen: H3Seen, change: &mut H3Change) -> bool {
+        if today < self.day {
+            return false;
+        }
+        match seen {
+            H3Seen::Neutral => false,
+            H3Seen::Ok => {
+                let hit = self.h3skip.remove(id).is_some();
+                change.cleared += hit as usize;
+                hit
+            }
+            H3Seen::Fail => {
+                let e = self.h3skip.entry(id.to_string()).or_default();
+                if e.until > 0 {
+                    // 跳過到期、再測又失敗：直接進下一輪
+                    if e.until > today && e.until - today <= H3_MAX_SKIP {
+                        return false; // 還在跳過期間（照理不會測到）
+                    }
+                    e.until = today + h3_skip_days(id, today, e.n);
+                    e.n = (e.n + 1).min(H3_MAX_ROUND);
+                    e.last = today;
+                    change.skipped += 1;
+                    return true;
+                }
+                if e.f > 0 && e.last == today {
+                    return false;
+                }
+                e.f += 1;
+                e.last = today;
+                if e.f >= H3_FAIL_DAYS {
+                    e.until = today + h3_skip_days(id, today, e.n);
+                    e.n = (e.n + 1).min(H3_MAX_ROUND);
+                    change.skipped += 1;
+                } else {
+                    change.counted += 1;
+                }
+                self.cap_h3();
+                true
+            }
+        }
+    }
+
+    /// 名單裡已經沒有的（它的 `https://` 不在名單了）刪掉；回傳刪了幾筆
+    pub fn h3_prune(&mut self, keep: impl Fn(&str) -> bool) -> usize {
+        let before = self.h3skip.len();
+        self.h3skip.retain(|k, _| keep(k));
+        before - self.h3skip.len()
+    }
+
+    /// 今天在跳過期間的筆數
+    pub fn h3_skipping_count(&self, today: u32) -> usize {
+        self.h3skip.keys().filter(|k| self.h3_skipping(k, today)).count()
     }
 }
 
@@ -261,5 +444,140 @@ mod tests {
         assert!(!merge_never_ok(&p, &["b".into()], 1000));
         assert!(!Learn::load(&p).never_ok.contains_key("b"));
         assert!(merge_never_ok(&p, &[], 1000), "沒有要寫的");
+    }
+
+    #[test]
+    fn h3_skip_backoff_7_14_28_capped_30_with_jitter() {
+        // 亂數 0～3 天、固定（同一個 id 同一天結果一樣）、合計不超過 30
+        for n in 0..5 {
+            for d in 20_000..20_050 {
+                let k = h3_skip_days("h3://dns.example.com/dns-query", d, n);
+                let base = 7 << n.min(H3_MAX_ROUND);
+                assert!(
+                    k >= base.min(H3_MAX_SKIP) && k <= (base + H3_JITTER).min(H3_MAX_SKIP),
+                    "n={n} d={d} k={k}"
+                );
+                assert_eq!(k, h3_skip_days("h3://dns.example.com/dns-query", d, n));
+            }
+        }
+        let spread: std::collections::HashSet<u32> = (0..64)
+            .map(|i| h3_skip_days(&format!("h3://dns{i}.example.com/q"), 20_000, 0))
+            .collect();
+        assert!(spread.len() > 1, "不同的 id 不會全部同一天回來");
+        assert!((20_000..20_100).all(|d| h3_skip_days("h3://x.example.net/q", d, 2) <= 30));
+
+        let id = "h3://dns.example.com/dns-query";
+        let mut l = Learn::default();
+        let mut c = H3Change::default();
+        // 同一天評測好幾次只算一天
+        assert!(l.h3_record(id, 100, H3Seen::Fail, &mut c));
+        assert!(!l.h3_record(id, 100, H3Seen::Fail, &mut c));
+        assert!(l.h3_record(id, 101, H3Seen::Fail, &mut c));
+        assert!(!l.h3_skipping(id, 102));
+        assert_eq!(c.counted, 2);
+        // 第 3 天開始跳過 7～10 天
+        assert!(l.h3_record(id, 102, H3Seen::Fail, &mut c));
+        assert_eq!(c.skipped, 1);
+        let e = l.h3skip[id];
+        assert_eq!((e.f, e.n), (3, 1));
+        assert!((109..=112).contains(&e.until), "{e:?}");
+        assert!(l.h3_skipping(id, 103) && l.h3_skipping(id, e.until - 1));
+        assert!(!l.h3_skipping(id, e.until), "到期再測");
+        // 到期再測：失敗 1 次就進下一輪（14～17 天），再來 28～30 天，之後一直 28～30 天
+        let mut day = e.until;
+        for want in [14u32, 28, 28, 28] {
+            assert!(l.h3_record(id, day, H3Seen::Fail, &mut c));
+            let e = l.h3skip[id];
+            assert!(
+                e.until - day >= want && e.until - day <= (want + 3).min(30),
+                "{want}: {e:?} day={day}"
+            );
+            assert!(e.n <= H3_MAX_ROUND);
+            day = e.until;
+        }
+        // 系統時間倒退（比檔案的日數舊）：不跳過、不記
+        let mut l = Learn {
+            day: 500,
+            ..Default::default()
+        };
+        l.h3skip.insert(
+            id.into(),
+            H3Skip {
+                f: 3,
+                n: 1,
+                until: 505,
+                last: 498,
+            },
+        );
+        assert!(!l.h3_skipping(id, 400));
+        assert!(!l.h3_record(id, 400, H3Seen::Ok, &mut c));
+        // 時間曾經跳到未來：until 離今天超過 30 天，不會卡住
+        let mut far = Learn::default();
+        far.h3skip.insert(
+            id.into(),
+            H3Skip {
+                f: 3,
+                n: 0,
+                until: 9_999,
+                last: 100,
+            },
+        );
+        assert!(!far.h3_skipping(id, 200));
+    }
+
+    #[test]
+    fn h3_success_clears() {
+        let id = "h3://dns.example.net/dns-query";
+        let mut l = Learn::default();
+        let mut c = H3Change::default();
+        for d in 0..3 {
+            l.h3_record(id, 10 + d, H3Seen::Fail, &mut c);
+        }
+        assert!(l.h3_skipping(id, 13));
+        let until = l.h3skip[id].until;
+        // 不算的（https:// 自己也失敗、QUIC 可能整條被擋）：不改
+        assert!(!l.h3_record(id, until, H3Seen::Neutral, &mut c));
+        assert_eq!(l.h3skip[id].until, until);
+        // 到期再測成功：整筆刪掉
+        assert!(l.h3_record(id, until, H3Seen::Ok, &mut c));
+        assert!(!l.h3skip.contains_key(id));
+        assert_eq!(c.cleared, 1);
+        // 還沒跳過、中間成功一天：重新算
+        l.h3_record(id, 50, H3Seen::Fail, &mut c);
+        l.h3_record(id, 51, H3Seen::Fail, &mut c);
+        l.h3_record(id, 52, H3Seen::Ok, &mut c);
+        l.h3_record(id, 53, H3Seen::Fail, &mut c);
+        assert_eq!(l.h3skip[id].f, 1);
+        assert!(!l.h3_skipping(id, 54));
+        // 存檔再讀回來一樣
+        let p = tmp("h3");
+        l.save(&p).unwrap();
+        assert_eq!(Learn::load(&p).h3skip, l.h3skip);
+    }
+
+    #[test]
+    fn h3skip_capped_512() {
+        let mut l = Learn::default();
+        let mut c = H3Change::default();
+        for i in 0..(MAX_H3_SKIP as u32 + 40) {
+            l.h3_record(&format!("h3://dns{i}.example.com/q"), i, H3Seen::Fail, &mut c);
+        }
+        assert_eq!(l.h3skip.len(), MAX_H3_SKIP);
+        assert!(!l.h3skip.contains_key("h3://dns0.example.com/q"), "先丟 last 最舊的");
+        assert!(l.h3skip.contains_key(&format!("h3://dns{}.example.com/q", MAX_H3_SKIP + 39)));
+        // 名單裡已經沒有的刪掉
+        let n = l.h3_prune(|k| k.ends_with("1.example.com/q"));
+        assert!(n > 0 && l.h3skip.keys().all(|k| k.ends_with("1.example.com/q")));
+        // 讀檔時也套用上限
+        let mut big = Map::new();
+        for i in 0..600u32 {
+            big.insert(format!("h3://x{i}.example.net/q"), json!({ "f": 1, "n": 9, "until": 0, "last": i }));
+        }
+        let p = tmp("h3cap");
+        std::fs::write(&p, serde_json::to_vec(&json!({ "v": 1, "day": 1, "h3skip": big })).unwrap()).unwrap();
+        let l = Learn::load(&p);
+        assert_eq!(l.h3skip.len(), MAX_H3_SKIP);
+        assert!(l.h3skip.values().all(|e| e.n <= H3_MAX_ROUND));
+        assert!(!l.h3skip.contains_key("h3://x0.example.net/q"));
     }
 }
