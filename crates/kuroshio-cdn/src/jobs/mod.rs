@@ -33,7 +33,14 @@ pub struct JobCtx {
     pub only: Option<String>,
     /// 檢查點掛勾（由排程器接進來；單元測試、命令列沒有）
     pub checkpoint: Option<Checkpoint>,
+    /// 有優先的工作在等（3.5.0：手動觸發的）：網段分類在「一家 CDN 掃完」的邊界讓出。None 不讓出
+    pub yield_check: Option<YieldCheck>,
+    /// 網段分類續跑時跳過的 CDN（讓出之前已經掃完的那幾家）
+    pub scan_skip: Vec<String>,
 }
+
+/// 「要不要讓出」的檢查（由排程器接進來）
+pub type YieldCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl JobCtx {
     pub fn new(cfg: Value, cdn: Arc<Cdn>) -> JobCtx {
@@ -42,7 +49,20 @@ impl JobCtx {
             cdn,
             only: None,
             checkpoint: None,
+            yield_check: None,
+            scan_skip: Vec::new(),
         }
+    }
+
+    /// 接上「要不要讓出」的檢查（網段分類用）
+    pub fn with_yield_check(mut self, f: YieldCheck) -> JobCtx {
+        self.yield_check = Some(f);
+        self
+    }
+
+    /// 有優先的工作在等
+    pub(crate) fn should_yield(&self) -> bool {
+        self.yield_check.as_ref().is_some_and(|f| f())
     }
 
     /// 接上檢查點掛勾

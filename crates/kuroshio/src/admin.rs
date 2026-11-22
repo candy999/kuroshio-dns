@@ -732,7 +732,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
         "/api/jobs/run" => match (&st.scheduler, q.get("name")) {
             (None, _) => bad("排程器未啟動", 400),
             (_, None) => bad("需要 name", 400),
-            (Some(s), Some(n)) => ok(s.request(n, "手動 (管理介面)")),
+            // 手動的排到佇列最前面，不等補跑的長工作（3.5.0）
+            (Some(s), Some(n)) => ok(s.request_priority(n, "手動 (管理介面)")),
         },
         // 規格 02 第 6 節
         "/api/defaults" => ok(kuroshio_config::build(&json!({}))),

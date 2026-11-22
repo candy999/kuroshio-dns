@@ -778,6 +778,17 @@ fn start_scheduler(
     o.provided = Some(Arc::new(crate::chain::share_skips));
     // 正在驗證上游黑潮、或串接了還沒同步過：先等第一次同步，再決定要不要補跑（最多 10 分鐘）
     o.provided_pending = Some(Arc::new(crate::chain::share_pending));
+    // 自動上游還沒評測過（來自預設名單、或舊版的種子：upstreams.json 沒有 generatedAt）：
+    // 每日評測的補跑排在 cdn-scan 前面（3.5.0）
+    let up_file = state_path(
+        cfg,
+        get(cfg, "upstream.autoStateFile")
+            .and_then(Value::as_str)
+            .unwrap_or("./state/upstreams.json"),
+    );
+    o.catch_up_first = Some(Arc::new(move |name: &str| {
+        name == "dns-benchmark" && !upstreams_benchmarked(&up_file)
+    }));
     let slot: Arc<std::sync::OnceLock<std::sync::Weak<Scheduler>>> = Arc::new(std::sync::OnceLock::new());
     let (s2, p2) = (slot.clone(), persister.clone());
     o.on_state_change = Some(Arc::new(move || {
@@ -811,6 +822,14 @@ fn start_scheduler(
         s2.start();
     });
     sched
+}
+
+/// `upstreams.json` 是不是評測過的結果（有 `generatedAt`）。預設名單產生的初始上游、讀不到的都不算
+fn upstreams_benchmarked(path: &std::path::Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .is_some_and(|v| v.get("generatedAt").is_some_and(Value::is_string))
 }
 
 /// 背景工作用的記憶體檢查：吃緊時回傳原因。記憶體控制改版時只要改這裡
@@ -881,14 +900,28 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
         }
     });
     let c = cdn.clone();
+    // 有手動執行的工作在等時，在一家 CDN 掃完的邊界讓出、5 分鐘後續跑（跳過已經掃完的那幾家），最多讓出 3 次（3.5.0）
+    let resume: Arc<Mutex<scan::Resume>> = Default::default();
     sched.register("cdn-scan", move |ctx: kuroshio_jobs::JobCtx| {
-        let c = c.clone();
+        let (c, resume) = (c.clone(), resume.clone());
         async move {
             if crate::chain::share_skips("cdn-scan") {
                 info!("cdn-scan：由上游黑潮提供，略過");
                 return Ok(());
             }
-            let r = scan::run(&cdn_job_ctx(ctx, c)).await?;
+            let (skip, may_yield) = resume.lock().unwrap().prepare(Instant::now());
+            let mut cctx = cdn_job_ctx(ctx.clone(), c);
+            cctx.scan_skip = skip;
+            if may_yield && ctx.can_requeue() {
+                let ctx2 = ctx.clone();
+                cctx = cctx.with_yield_check(Arc::new(move || ctx2.priority_waiting()));
+            }
+            let r = scan::run(&cctx).await?;
+            resume.lock().unwrap().finish(&r, Instant::now());
+            if r.yielded {
+                ctx.request_later(Duration::from_secs(300), "續跑（讓給手動執行的工作）");
+                return Ok(());
+            }
             crate::chain::note_own_run("cdn-scan");
             info!(
                 "CDN 網段分類：{} 家，{}",

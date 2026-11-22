@@ -178,7 +178,7 @@ kuroshio notify trim [--hold 秒] [-c 設定檔] [--uci]
 
 `runId` 是開始時間（毫秒），同一次執行的程式裡只會變大；服務重新啟動後 `filter.update` 從 `idle`、`runId: null` 開始。
 
-其他會等一下的動作：`POST /api/jobs/run`（排進佇列就回）、`POST /api/acme/issue`（背景申請）、`kuroshio notify wan-changed` 立刻回來；`POST /api/ddns/update`（每個請求逾時 8 秒，記錄很多時會久一點）、`POST /api/cdn/verify`、`POST /api/cdn/ecs`（一個網域的幾次連線）會等到完成才回。進度都可以從 `/api/status`、`/api/ddns`、`/api/jobs` 查。
+其他會等一下的動作：`POST /api/jobs/run`（排進佇列就回；3.5.0 起排在佇列最前面，見[手動執行的工作優先](#手動執行的工作優先)）、`POST /api/acme/issue`（背景申請）、`kuroshio notify wan-changed` 立刻回來；`POST /api/ddns/update`（每個請求逾時 8 秒，記錄很多時會久一點）、`POST /api/cdn/verify`、`POST /api/cdn/ecs`（一個網域的幾次連線）會等到完成才回。進度都可以從 `/api/status`、`/api/ddns`、`/api/jobs` 查。
 
 ### 其他常用指令
 
@@ -606,6 +606,13 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - `generatedAt` 是 `null`、`source` 是 `"default-list"`；`selected[]` 的 `reason` 是 `"預設名單"`、`tier` 是 `"A"`、另外有 `listMs`（名單裡的延遲，只是排序依據）；`spares[]` 是候補（格式同 `selected[]`，最多 3 台）。
 - `/api/status` 的 `autoUpstreams` 是 `{ "generatedAt": null, "count": 5, "source": "default-list" }`（以前沒有評測結果時是 `null`）。狀態頁顯示「自動上游來自預設名單（還沒評測）」。
 - 第一次評測完成就被評測結果取代；串接時不分享給下游。
+
+### 手動執行的工作優先
+
+- `POST /api/jobs/run?name=…`（設定頁、LuCI 的「立即執行」）排到佇列**最前面**；已經在佇列裡的移到最前面（不會重複）。排程與補跑照舊排在後面。仍然一次只跑一個：正在跑的不中斷，回 `{"ok": false, "error": "執行中"}`。
+- `/api/jobs` 的 `queue[]` 每筆多 `priority`（`true` = 手動、排在最前面的）。
+- 正在跑 `cdn-scan`（網段分類，一跑十幾分鐘）時，有手動的工作在等，它在「一家 CDN 掃完」的時候讓出：掃完的那幾家照寫，5 分鐘後續跑（原因「續跑（讓給手動執行的工作）」），續跑時跳過 6 小時內已經掃完的那幾家；一家掃到一半不讓出，最多讓出 3 次，之後跑到完。手動的工作最多等一家 CDN 的時間。
+- 補跑的先後：自動上游還沒評測過（`upstreams.json` 沒有 `generatedAt`，例如剛安裝、來自預設名單）時，`dns-benchmark` 的補跑排在 `cdn-scan` 前面（`cdn-scan` 的補跑延到評測之後 1 秒排入；`startDelaySec` 的預設值不變）。
 
 ## 重新載入不斷線（3.4.0 起）
 
