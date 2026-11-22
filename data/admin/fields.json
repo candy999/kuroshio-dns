@@ -603,6 +603,7 @@
           "fields": [
             { "key": "scan.samplesPerSubnet", "type": "int", "label": "每個 /24 抽樣幾個 IP", "min": 1 },
             { "key": "scan.concurrency", "type": "int", "label": "掃描同時連線數", "help": "預設依 CPU 核心數自動。", "min": 1 },
+            { "key": "scan.maxPerSec", "type": "int", "label": "掃描每秒最多新連線", "help": "每秒最多開始幾個探測；預設依 CPU 核心數（每核心 50，50～200），小記憶體減量時再減半。", "min": 1, "max": 1000 },
             { "key": "scan.timeoutMs", "type": "int", "label": "掃描逾時（毫秒）", "min": 1 },
             { "key": "pool.candidatesPerProvider", "type": "int", "label": "每家 CDN 候選 IP 數", "min": 1 },
             { "key": "pool.poolSize", "type": "int", "label": "節點池大小", "min": 1 },

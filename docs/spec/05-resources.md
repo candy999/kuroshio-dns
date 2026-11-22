@@ -255,6 +255,7 @@ c = CPU 核心數（`available_parallelism`）：
 | `cdn.verifyConcurrency`（每個都是 TLS 握手） | clamp(2c, 2, 8) | 2 | 4 | 8 | 8 |
 | `benchmark.concurrency` | clamp(8c, 8, 50) | 8 | 16 | 32 | 50 |
 | `scan.concurrency` | clamp(50c, 32, 400) | 50 | 100 | 200 | 400 |
+| `scan.maxPerSec`（每秒最多開始幾個探測，3.5.0；`cdn.lite` 時再減半） | clamp(50c, 50, 200) | 50 | 100 | 200 | 200 |
 | `pool.latencyConcurrency` | clamp(32c, 32, 200) | 32 | 64 | 128 | 200 |
 | `pool.probeConcurrency` | clamp(8c, 8, 32) | 8 | 16 | 32 | 32 |
 | `system.maxTlsConnections`（每條約 30–60 KB，記憶體另由 09 收緊） | clamp(128c, 128, 2048) | 128 | 256 | 512 | 1,024（16 核 2,048） |

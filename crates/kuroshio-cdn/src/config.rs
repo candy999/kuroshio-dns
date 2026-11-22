@@ -254,6 +254,8 @@ impl CdnConfig {
 pub struct JobsConfig {
     pub scan_samples: usize,
     pub scan_concurrency: usize,
+    /// 網段掃描每秒最多開始幾個探測（`scan.maxPerSec`，1～1000；3.5.0）
+    pub scan_max_per_sec: u32,
     pub scan_timeout_ms: u64,
     pub candidates_per_provider: usize,
     pub pool_size: usize,
@@ -274,6 +276,7 @@ impl JobsConfig {
         JobsConfig {
             scan_samples: or(cfg, "scan.samplesPerSubnet", 6.0) as usize,
             scan_concurrency: or(cfg, "scan.concurrency", 400.0) as usize,
+            scan_max_per_sec: (or(cfg, "scan.maxPerSec", 100.0) as u32).clamp(1, 1000),
             scan_timeout_ms: or(cfg, "scan.timeoutMs", 2000.0) as u64,
             candidates_per_provider: or(cfg, "pool.candidatesPerProvider", 1500.0) as usize,
             pool_size: or(cfg, "pool.poolSize", 12.0) as usize,
@@ -306,6 +309,19 @@ mod tests {
             (50, 6, 1500, 32)
         );
         assert_eq!(kuroshio_config::get(&one, "jobs.cdn-scan.enabled"), Some(&json!(true)));
+        // 3.5.0 B8：每秒最多幾個探測依核心數（每核心 50、50～200）；每台往後錯開 0～30 分鐘
+        assert_eq!(j.scan_max_per_sec, 50);
+        assert_eq!(
+            JobsConfig::from_value(&build_for(&Host { cores: 2, aes: false }, &json!({}))).scan_max_per_sec,
+            100
+        );
+        assert_eq!(
+            JobsConfig::from_value(&build_for(&Host { cores: 8, aes: true }, &json!({}))).scan_max_per_sec,
+            200
+        );
+        assert_eq!(kuroshio_config::get(&one, "jobs.cdn-scan.jitterMin"), Some(&json!(30)));
+        let user = build_for(&Host { cores: 8, aes: true }, &json!({ "scan": { "maxPerSec": 5000 } }));
+        assert_eq!(JobsConfig::from_value(&user).scan_max_per_sec, 1000, "使用者的值最多 1000");
         let large = CdnConfig::from_value(&build_for(&Host { cores: 8, aes: true }, &json!({})));
         assert_eq!((large.verify_concurrency, large.max_entries), (8, 200000));
         assert_eq!(large.enabled_alias(), ["cloudflare", "cloudfront", "fastly", "gcore", "azure"]);

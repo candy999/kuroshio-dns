@@ -293,6 +293,7 @@ return view.extend({
 		s = m.section(form.NamedSection, 'scan', 'scan', _('CDN 網段掃描'));
 		num('samples_per_subnet', _('每個 /24 抽樣幾個 IP'), 'scan.samplesPerSubnet');
 		num('concurrency', _('同時連線數'), 'scan.concurrency');
+		num('max_per_sec', _('每秒最多新連線'), 'scan.maxPerSec', _('每秒最多開始幾個探測；預設依 CPU 核心數（每核心 50，50～200），小記憶體減量時再減半。避免一秒上千條新連線塞滿連線追蹤表。'));
 		num('timeout_ms', _('逾時（毫秒）'), 'scan.timeoutMs');
 
 		s = m.section(form.NamedSection, 'pool', 'pool', _('節點池建立'));

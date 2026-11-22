@@ -465,6 +465,7 @@
       "weekdays": [
         0
       ],
+      "jitterMin": 30,
       "startDelaySec": 60,
       "timeoutMin": 240
     },
@@ -516,6 +517,7 @@
   "scan": {
     "samplesPerSubnet": 6,
     "concurrency": "auto",
+    "maxPerSec": "auto",
     "timeoutMs": 2000
   },
   "pool": {

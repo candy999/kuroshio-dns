@@ -69,7 +69,7 @@ pub fn auto_parallel(host: &Host) -> u64 {
 
 /// 依 CPU 核心數換算的設定（`"auto"` 或沒寫時套用；規格 05 第 7 節）。
 /// 每一項：（路徑，每個核心多少，下限，上限）；`resolver.parallel` 另外處理
-pub const PER_CORE: [(&str, u64, u64, u64); 10] = [
+pub const PER_CORE: [(&str, u64, u64, u64); 11] = [
     // 開機預熱每秒重問幾個名稱：單核心 5、四核心以上 20
     ("resolver.warmRate", 5, 5, 20),
     // 上游 IP 測速同時幾個連線
@@ -80,6 +80,9 @@ pub const PER_CORE: [(&str, u64, u64, u64); 10] = [
     ("benchmark.concurrency", 8, 8, 50),
     // 網段掃描同時幾個探測
     ("scan.concurrency", 50, 32, 400),
+    // 網段掃描每秒最多開始幾個探測（3.5.0；以前沒有上限，Windows 實測每秒 1,832～1,904 條新連線）。
+    // 小記憶體減量（cdn.lite）時再砍半
+    ("scan.maxPerSec", 50, 50, 200),
     ("pool.latencyConcurrency", 32, 32, 200),
     ("pool.probeConcurrency", 8, 8, 32),
     // 加密連線（每條約 30–60 KB）：核心數決定處理得了多少握手；記憶體由執行時的壓力判斷再收緊

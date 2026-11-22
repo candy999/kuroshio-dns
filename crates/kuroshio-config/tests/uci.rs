@@ -814,3 +814,12 @@ fn cdn_lite_from_uci() {
     let c = load("config cdn 'cdn'\n", &env());
     assert_eq!(g(&c, "cdn.lite"), &json!("auto"));
 }
+
+/// 3.5.0 B8：`scan` 區段自動對應 snake_case → camelCase（`max_per_sec` → `scan.maxPerSec`）
+#[test]
+fn scan_max_per_sec_from_uci() {
+    let text = "config kuroshio 'main'\n\toption enabled '1'\n\nconfig scan 'scan'\n\toption max_per_sec '80'\n";
+    let raw = overrides(&parse_text(text).unwrap(), &env());
+    assert_eq!(g(&raw, "scan.maxPerSec"), &json!(80));
+    assert!(get(&raw, "scan.max_per_sec").is_none(), "不留 snake_case 的名稱");
+}

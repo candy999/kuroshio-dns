@@ -72,6 +72,45 @@ const DEAD: u8 = 3;
 /// 批與批之間過檢查點，暫停時最多只有這一批還在跑完）
 const BATCH_PER_WORKER: usize = 4;
 
+/// 每秒最多開始幾個探測的節拍器（3.5.0）。到 CDN 只有幾 ms 時，光靠並行數擋不住「一秒幾千條新連線」
+/// （Windows 實測每秒 1,832～1,904 條，多半是 80 埠）。
+///
+/// 每個探測開始前登記「下一個可以開始的時間」，間隔 `1 / per_sec`；落後了（前面的探測卡住逾時）不補，
+/// 卡住之後照樣每秒最多 `per_sec` 個（跟 3.4.2 修過的 `map_paced()` 同一個做法）
+pub struct Pacer {
+    gap: Duration,
+    next: Mutex<tokio::time::Instant>,
+}
+
+impl Pacer {
+    pub fn new(per_sec: u32) -> Pacer {
+        Pacer {
+            gap: Duration::from_micros(1_000_000 / u64::from(per_sec.max(1))),
+            next: Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+
+    /// 等到輪到這一個
+    pub async fn wait(&self) {
+        let at = {
+            let mut n = self.next.lock().unwrap();
+            let at = (*n).max(tokio::time::Instant::now());
+            *n = at + self.gap;
+            at
+        };
+        tokio::time::sleep_until(at).await;
+    }
+}
+
+/// 這一次掃描每秒最多開始幾個探測：設定值，小記憶體減量（`cdn.lite`）時砍半（至少 1）
+pub fn effective_per_sec(max_per_sec: u32, lite: bool) -> u32 {
+    if lite {
+        (max_per_sec / 2).max(1)
+    } else {
+        max_per_sec.max(1)
+    }
+}
+
 /// 一批網段的探測（`range` 是 `tasks` 的索引範圍）
 struct ScanBatch {
     name: &'static str,
@@ -88,6 +127,7 @@ struct ScanBatch {
     done: Arc<AtomicUsize>,
     last_pct: Arc<Mutex<i64>>,
     net: Arc<dyn Net>,
+    pacer: Arc<Pacer>,
 }
 
 /// 用固定數量的工作者輪流取這一批的網段，全部探測完才回來
@@ -106,6 +146,7 @@ async fn scan_batch(b: ScanBatch) {
                 }
                 let (mut live, mut tw) = (false, false);
                 for ip in samples(tasks[i], b.n) {
+                    b.pacer.wait().await;
                     let r = b.net.http_probe(ip, b.host, b.path, b.timeout).await;
                     if !r.ok {
                         continue;
@@ -147,6 +188,9 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
     let conc = jc.scan_concurrency.max(1);
     let timeout = Duration::from_millis(jc.scan_timeout_ms);
     let out_dir = ctx.cdn.paths.state_dir.join("cdn").join("scan");
+    let per_sec = effective_per_sec(jc.scan_max_per_sec, ctx.cdn.cfg.lite);
+    // 每家 CDN 共用同一個節拍器：整個工作每秒最多開始 per_sec 個探測
+    let pacer = Arc::new(Pacer::new(per_sec));
     let mut report = Report::default();
     for prov in providers::PROVIDERS {
         let name = prov.name;
@@ -161,7 +205,15 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         }
         let mut seen = HashSet::new();
         let tasks: Arc<Vec<u32>> = Arc::new(cidrs.iter().flat_map(|c| expand_to_24(c)).filter(|p| seen.insert(*p)).collect());
-        info!("[{name}] 展開 {} 個 /24，每段抽樣 {n} 個 IP，並行 {conc}", tasks.len());
+        // 至少每段一個探測、最多每段 n 個（沒回應的網段會把 n 個都試完）
+        let (lo, hi) = (tasks.len() as u64, tasks.len() as u64 * n as u64);
+        let min = |probes: u64| probes.div_ceil(u64::from(per_sec) * 60);
+        info!(
+            "[{name}] 展開 {} 個 /24，每段抽樣 {n} 個 IP，並行 {conc}；每秒最多 {per_sec} 個探測，預計 {}～{} 分鐘",
+            tasks.len(),
+            min(lo),
+            min(hi)
+        );
         let cls: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0; tasks.len()]));
         let pops: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let done = Arc::new(AtomicUsize::new(0));
@@ -187,6 +239,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                 done: done.clone(),
                 last_pct: last_pct.clone(),
                 net: ctx.cdn.net().clone(),
+                pacer: pacer.clone(),
             })
             .await;
             start = end;
@@ -259,6 +312,70 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 暫停的時鐘下跑 `jobs` 個 `wait()`（`workers` 個同時），回傳每一秒開始了幾個
+    async fn starts_per_second(p: Arc<Pacer>, jobs: usize, workers: usize, stall_first: Duration) -> Vec<usize> {
+        let t0 = tokio::time::Instant::now();
+        let idx = Arc::new(AtomicUsize::new(0));
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let mut set = tokio::task::JoinSet::new();
+        for w in 0..workers {
+            let (p, idx, times) = (p.clone(), idx.clone(), times.clone());
+            set.spawn(async move {
+                loop {
+                    let i = idx.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs {
+                        return;
+                    }
+                    p.wait().await;
+                    times.lock().unwrap().push(t0.elapsed());
+                    // 第一個工作者的第一個探測卡住（逾時），其他工作者的名額照常
+                    if w == 0 && i == 0 {
+                        tokio::time::sleep(stall_first).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(3)).await;
+                    }
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+        let t = times.lock().unwrap();
+        let secs = t.iter().map(|d| d.as_secs() as usize).max().unwrap_or(0) + 1;
+        let mut out = vec![0; secs];
+        for d in t.iter() {
+            out[d.as_secs() as usize] += 1;
+        }
+        out
+    }
+
+    /// 3.5.0 B8：每秒開始的探測不超過上限（以前 400 個工作者同時打，每秒上千條新連線）
+    #[tokio::test(start_paused = true)]
+    async fn scan_paced_never_exceeds_per_sec() {
+        let per = starts_per_second(Arc::new(Pacer::new(20)), 200, 50, Duration::from_millis(3)).await;
+        assert!(per.iter().all(|n| *n <= 20), "{per:?}");
+        assert!(per.len() >= 10, "200 個、每秒 20 個要 10 秒：{per:?}");
+    }
+
+    /// 3.5.0 B8：前面的探測卡住 10 秒之後，不會一次補回落後的（拿到名額才登記）
+    #[tokio::test(start_paused = true)]
+    async fn scan_no_burst_after_stall() {
+        let p = Arc::new(Pacer::new(10));
+        // 先登記一些，然後整個停 10 秒（像所有工作者都在等逾時）
+        for _ in 0..5 {
+            p.wait().await;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let per = starts_per_second(p, 60, 30, Duration::from_secs(10)).await;
+        assert!(per.iter().all(|n| *n <= 10), "卡住之後不爆發：{per:?}");
+    }
+
+    #[test]
+    fn lite_halves_rate() {
+        assert_eq!(effective_per_sec(100, false), 100);
+        assert_eq!(effective_per_sec(100, true), 50);
+        assert_eq!(effective_per_sec(1, true), 1);
+        assert_eq!(effective_per_sec(0, false), 1);
+    }
 
     #[test]
     fn expand_and_sample() {
