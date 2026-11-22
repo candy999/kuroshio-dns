@@ -678,7 +678,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 // source：chain（上游黑潮給的）／benchmark（自己評測的）
                 "autoUpstreams": crate::chain::share::auto_info(&r.upstreams),
                 "filter": filter,
-                "cdn": r.cdn().map(|c| c.status_lite()),
+                // CDN 關掉時給 `{"enabled": false}`，不是 null（3.5.0；D3 3.4.3 回報 null 看不出是關掉還是讀不到）
+                "cdn": r.cdn().map(|c| c.status_lite()).unwrap_or_else(|| json!({ "enabled": false })),
                 "jobs": st.scheduler.as_ref().map(|s| s.status()),
                 "system": st.system_json(),
                 // 記憶體控制（規格 09）：狀態、預算、釋出中的項目（system.memory 是同一份）
@@ -971,6 +972,9 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
 }
 
 /// 除錯用：完整追蹤一個網域（過濾、每個上游的回答、IP 測速、快取）
+/// 追蹤結果裡，被攔截的一般 DNS 的說明
+const INTERCEPTED_NOTE: &str = "被閘道接走：一般 DNS 在路上被路由器（或更上游的設備）攔下，回答的其實是攔截者，不是這個位址";
+
 async fn trace(st: &Arc<AppState>, name: &str, qtype: u16) -> Value {
     let r = &st.resolver;
     let filter = r.filter.read().unwrap().clone().and_then(|f| f.check(name, qtype));
@@ -986,14 +990,20 @@ async fn trace(st: &Arc<AppState>, name: &str, qtype: u16) -> Value {
             let t0 = Instant::now();
             let res = u.up.exchange(&q, t).await;
             let ms = (t0.elapsed().as_secs_f64() * 10000.0).round() / 10.0;
-            match res.ok().and_then(|b| Message::parse(&b).ok()) {
+            let mut v = match res.ok().and_then(|b| Message::parse(&b).ok()) {
                 Some(m) => json!({
                     "id": u.up.id, "role": u.role.name(), "ms": ms, "rcode": m.rcode,
                     "cls": format!("{:?}", kuroshio_proto::logic::classify(&m, qtype)).to_lowercase(),
                     "answers": m.answers.iter().map(|a| format!("{} {} {} {}", a.rtype, a.name, a.ttl, rdata_text(&a.data))).collect::<Vec<_>>(),
                 }),
                 None => json!({ "id": u.up.id, "role": u.role.name(), "ms": ms, "error": "沒有回應或格式錯誤" }),
+            };
+            // 一般 DNS 被路上的攔截者接走（路徑檢查）：回答的其實是攔截者，不是這個位址（3.5.0；D3 3.4.2 回報）
+            v["viaInterceptor"] = json!(u.via_interceptor());
+            if u.via_interceptor() {
+                v["note"] = json!(INTERCEPTED_NOTE);
             }
+            v
         });
     }
     let mut ups = Vec::new();

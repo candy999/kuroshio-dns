@@ -39,7 +39,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub const MB: u64 = 1 << 20;
 
@@ -389,6 +389,11 @@ pub fn restore_room(r: &Reading, res: &Reserve) -> u64 {
 
 /// 清單層最多可以用多少 bytes（純函式）：目前的清單 + 可以長大的空間 ÷ 1.3；
 /// 另外重建時新舊兩份會同時存在，新的一份不超過系統可用記憶體的一半
+/// 讓出的記憶體值不值得寫一行 WARN（1 KB 以上）
+fn worth_warning(bytes: u64) -> bool {
+    bytes >= 1024
+}
+
 pub fn list_allowance(r: &Reading, res: &Reserve, lists_bytes: u64) -> Option<u64> {
     let av = r.avail?;
     let grow = restore_room(r, res) / 13 * 10;
@@ -705,7 +710,12 @@ impl Governor {
                     i.next_shed_at = now + self.gap;
                     match res {
                         Ok(o) => {
-                            warn!("記憶體控制：{}（約 {} KB）{}", s.label(), o.bytes / 1024, o.detail);
+                            // 讓出不到 1 KB 的步驟（例如快取已經是空的）不寫 WARN：只收 WARN 日誌的小機器上是雜訊（3.5.0）
+                            if worth_warning(o.bytes) {
+                                warn!("記憶體控制：{}（約 {} KB）{}", s.label(), o.bytes / 1024, o.detail);
+                            } else {
+                                debug!("記憶體控制：{}（約 {} KB）{}", s.label(), o.bytes / 1024, o.detail);
+                            }
                             i.freed_total += o.bytes;
                             freed += o.bytes;
                             Self::event(i, now, format!("釋出：{} {}（約 {} KB）", s.label(), o.detail, o.bytes / 1024));
@@ -1391,6 +1401,14 @@ impl Step for ProtectedStep {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// 3.5.0：讓出不到 1 KB 的步驟不寫 WARN
+    #[test]
+    fn tiny_shed_not_warned() {
+        assert!(!worth_warning(0));
+        assert!(!worth_warning(1023));
+        assert!(worth_warning(1024));
+    }
 
     /// 1 GB 的機器、保留 100 MB（遲滯 50 MB）：可用 a MB
     fn rd(avail_mb: u64) -> Reading {

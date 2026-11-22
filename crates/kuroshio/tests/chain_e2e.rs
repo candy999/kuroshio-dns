@@ -1215,6 +1215,8 @@ fn e2e_share() {
     assert!(saved["source"]["chain"].is_string(), "{saved}");
     assert_eq!(saved["generatedAt"], "2026-11-18T04:30:00.000Z");
     assert_eq!(down.status()["autoUpstreams"]["source"], "chain");
+    // CDN 關著：狀態給 enabled false，不是 null（3.5.0）
+    assert_eq!(down.status()["cdn"]["enabled"], false);
     assert!(up.chain()["serving"]["share"]["requests"].as_u64().unwrap() >= 1);
     // 手動跑 dns-benchmark：由上游提供，略過（不會真的評測）
     let r = down.post("/api/jobs/run?name=dns-benchmark");

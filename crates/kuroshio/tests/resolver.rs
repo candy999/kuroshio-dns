@@ -259,6 +259,8 @@ async fn http_req(addr: SocketAddr, method: &str, path: &str, host: &str) -> (u1
 
 #[tokio::test]
 async fn admin_api() {
+    // 追蹤結果看路徑檢查的狀態（viaInterceptor）：跟改它的測試輪流跑
+    let _path = PATH_STATE.lock().await;
     let (up, _) = upstream(0, answer).await;
     let mut c = cfg(&[up], json!({}));
     c["listen"] = json!({ "plain": { "binds": ["127.0.0.1"], "port": 0 } });
@@ -279,6 +281,9 @@ async fn admin_api() {
     assert_eq!(f["action"], "block");
     let (_, t) = http_get(admin, "/api/trace?name=www.example.test", "localhost").await;
     assert_eq!(t["upstreams"][0]["answers"][0], "1 www.example.test 300 1.2.3.4");
+    // 一般 DNS 沒有被接走：標 false、沒有說明（3.5.0）
+    assert_eq!(t["upstreams"][0]["viaInterceptor"], false);
+    assert!(t["upstreams"][0].get("note").is_none());
     assert_eq!(t["cache"]["source"], format!("udp://{up}"));
 
     // 會改東西的動作只接受 POST（GET 任何網頁都能用 <img> 送出）
@@ -290,6 +295,15 @@ async fn admin_api() {
     assert_eq!(fl["ok"], true);
     let (_, st) = http_get(admin, "/api/status", "localhost").await;
     assert_eq!(st["cacheEntries"], 0);
+
+    // 一般 DNS 被接走：追蹤結果標出來（回答的其實是攔截者）
+    let mut rep = kuroshio_net::path::Report::default();
+    rep.plain_v4.udp = true;
+    kuroshio_net::path::apply(&rep, false);
+    let (_, t) = http_get(admin, "/api/trace?name=www2.example.test", "localhost").await;
+    kuroshio_net::path::clear();
+    assert_eq!(t["upstreams"][0]["viaInterceptor"], true, "{t}");
+    assert!(t["upstreams"][0]["note"].as_str().unwrap().contains("被閘道接走"));
 
     let (code, _) = http_get(admin, "/api/status", "evil.example.com").await;
     assert_eq!(code, 403, "DNS rebinding 擋下");

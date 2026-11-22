@@ -568,6 +568,8 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 `/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。3.4.3 起另有 `chainRetry`：上游黑潮解析不到（SERVFAIL）、改用自己的加密上游解析到的次數。`memory.pressure`（3.4.3）：當下的記憶體量測（`normal`／`low`／`critical`）；`memory.state` 放鬆前要穩定幾分鐘，兩者會差幾分鐘。
 
+3.5.0：`/api/status` 的 `cdn` 在 CDN 關掉時是 `{"enabled": false}`（以前是 `null`，看不出是關掉還是讀不到）。`/api/trace` 的 `upstreams[]` 多 `viaInterceptor`：一般 DNS 被路上的攔截者（路由器）接走時是 `true`，並附一句 `note`，表示回答的其實是攔截者、不是那個位址。
+
 ## 上游多樣性（3.4.0 起）
 
 每日評測選「覆蓋」上游時，先在鄰近（台灣、日本、香港、新加坡，或延遲夠低）的候選裡選；名額還有、覆蓋率還不夠才選遠的。這樣 CDN 回的節點比較常在亞洲。
