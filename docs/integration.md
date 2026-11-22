@@ -504,7 +504,7 @@ UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: tr
 | `upstream` | 探測到的上游（沒探測過、或 `chain` 關著是 `null`）。`via`：`gateway`（上游就是預設閘道）/ `intercept`（經攔截，`address` 是被轉走的保留位址，`text` 寫閘道並加註「經攔截」）；`depth` 是含這台的層數；`viaNat`：上游看到的來源不是這台（中間隔了 NAT） |
 | `backupActive` | 串接上游暫時不能用，正在用自己的加密上游 |
 | `retryAt` | `released` 時下一次重試的時間 |
-| `shared` | 共用結果（沒有串接是 `null`）。`error` 與 `objects[].error` 是代碼，例如 `memory`（記憶體不夠，這次沒同步）、`no-room`（清單副本存不下、記憶體也留不下）、`not-subscribed`、`newer-format`、`own-newer`（3.4.2：這台自己的評測結果比上游給的新，不拿來蓋掉；只是說明、不是失敗）。`ownRuns`（3.4.2）：這台自己真的跑完每個工作的時間（`at`，還沒跑過是 `null`）與最晚什麼時候會自己跑（`dueAt`）：上游給的資料再新鮮，自己超過 7 天沒跑就照排程自己跑一次 |
+| `shared` | 共用結果（沒有串接是 `null`）。`error` 與 `objects[].error` 是代碼，例如 `memory`（記憶體不夠，這次沒同步）、`key-changed`（3.4.3：上游的金鑰 24 小時內換過，先不收共用資料）、`import-failed`（例如評測結果照這台的設定篩完不夠用、官方範圍跟這台的差太多）、`newer-format`、`own-newer`（3.4.2：這台自己的評測結果比上游給的新，不拿來蓋掉；只是說明、不是失敗）。`ownRuns`（3.4.2）：這台自己真的跑完每個工作的時間（`at`，還沒跑過是 `null`）與最晚什麼時候會自己跑（`dueAt`）：上游給的資料再新鮮，自己超過 7 天沒跑就照排程自己跑一次 |
 | `audit` | 3.4.2：抽查上游給的 CDN 答案（每 16 筆抽 1、每 30 秒最多 1 個）。`valid` 憑證有效、`unverified` 連不上或不判斷、`siteInvalid` 網站本身憑證不符（自己的上游給的也不符）、`suspicious` 上游給的不符而自己的正常、`recentSuspicious` 1 小時內的可疑次數（到 3 就解除串接）、`releases` 因此解除的次數、`last` 最近一次可疑（名稱、IP、時間） |
 | `serving` | 上游角色（服務還沒啟動完成時是 `null`）。`text` 開著時是「提供資料給下游黑潮：目前 N 台」或「…目前沒有下游連上來」；關著時是「不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）」，24 小時內有下游來問過時接著寫「最近有下游黑潮來問過（…）」。`note` 只有開著時有。`probes` 是 `allow_downstream` 關著時收到的探測；`refused` 是拒絕的串接查詢（太頻繁、不是私有來源、沒有開放） |
 
@@ -566,7 +566,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `backfill` | `resolver.backfill` | `cdn` | `cdn`：上面的行為；`off`（或 `0` / `false`）：不補問（3.3.7 的行為） |
 | `backfill_sample` | `resolver.backfillSample` | `16` | 非 CDN 查詢每幾次抽一次；`0` ＝ 不抽樣 |
 
-`/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。
+`/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。3.4.3 起另有 `chainRetry`：上游黑潮解析不到（SERVFAIL）、改用自己的加密上游解析到的次數。`memory.pressure`（3.4.3）：當下的記憶體量測（`normal`／`low`／`critical`）；`memory.state` 放鬆前要穩定幾分鐘，兩者會差幾分鐘。
 
 ## 上游多樣性（3.4.0 起）
 
