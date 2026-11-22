@@ -3,11 +3,11 @@
 # 只有在 53 埠沒有被路上的攔截者接走時才測（路徑檢查發現被接走就整批略過）
 # 2026-11-22 重新整理（3.4.2）：public-dns.info 的有效名單 6,695 筆，在台灣 HiNet PPPoE 直接撥號的線路上
 #   3 輪測試（固定答案、「不存在」沒被改寫、不擋廣告／成人／惡意、不審查、DNSSEC、EDNS、TCP、丟包、延遲）。
-#   用戶線路上的開放解析器（家用路由器之類）不收。
+#   用戶線路上的開放解析器（家用路由器之類）不收；有過濾的大型 DNS 是對照組，另外列在 protected.txt。
 #   A：經營者明確，每個 ASN 最多 4 台、同一個名稱 IPv4／IPv6 各最多 2 台（anycast 業者有幾百個位址，全收會對同一家打幾百台）；
 #   B：品質都過、經營者看不出來，每個 ASN 最多 1 台（同一家的位址只留一台，不對同一家打幾百台）。
 #   另外保留舊名單裡、同一天 D3 直連評測倖存的位址（不在 public-dns.info 的有效名單、或被收集腳本誤判的）。
-# 共 784 筆：A 38、B 566、舊名單保留 180
+# 共 781 筆：A 35、B 566、舊名單保留 180
 
 # ---- A 級 ----
 # A NextDNS（AS34939）US dns1.nextdns.io 3.9 ms
@@ -48,14 +48,8 @@
 9.9.9.10
 # A Cisco_OpenDNS（AS36692）US resolver1.opendns.com 31.8 ms ECS
 2620:119:35::35
-# A Quad9（AS19281）? dns9.quad9.net 49.7 ms
-9.9.9.9
-# A Quad9（AS19281）US dns9.quad9.net 49.6 ms
-149.112.112.9
 # A Google_LLC（AS15169）US dns.google 12.1 ms ECS
 8.8.4.4
-# A Quad9（AS19281）US dns9.quad9.net 59.8 ms
-2620:fe::fe:9
 # A Vercara（AS12008）US rec1pubns2.ultradns.net 68.5 ms
 64.6.65.6
 # A Vercara（AS12008）US rec1pubns1.ultradns.net 31.8 ms

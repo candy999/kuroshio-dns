@@ -2,6 +2,7 @@
 //! - 一般 DNS 的答案完全一樣時只算一票（攔截者的幾百票不能變成「多數」）
 //! - 路徑檢查判斷一般 DNS 被接走、IPv6 不能用時，那些候選不測、不記可疑
 //! - 好幾家互相獨立的加密 DNS 都「網站無法驗證」時，照常計分、今天照用，不記可疑天數
+//! - 對照組（protected.txt）：照常測、照常判，永遠不選、不記可疑、不看永久黑名單（3.4.2）
 
 use kuroshio_jobs::benchmark::probe::{AsnSource, NetProber, Prober, SiteCheck, StaticAsn};
 use kuroshio_jobs::benchmark::rules::AsnInfo;
@@ -324,4 +325,77 @@ async fn multi_cdn_domain_timeouts_are_not_suspects() {
     let log = std::fs::read_to_string(root.join("persist/benchmark-last/judge.log")).unwrap();
     assert!(log.contains("多家 CDN") && log.contains("[保留] https://sea01.same-op"), "{log}");
     assert!(!log.contains("[今天不用] https://sea01.same-op"), "{log}");
+}
+
+/// 對照組：擋網域的判出過濾、回答被判可疑的也判出（不記可疑天數），正常回答的「沒判出」但永遠不選；
+/// 列在永久黑名單裡的對照組照樣測；對照組不參加多數決
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_control_group() {
+    let mut ids = Vec::new();
+    for n in 1..=4u8 {
+        ids.push(mock(move |d| honest(d, n)).await.to_string());
+    }
+    // 擋 cdn.beta.com（回 NXDOMAIN）
+    let blocker = mock(|d| if d == "cdn.beta.com" { None } else { honest(d, 40) }).await.to_string();
+    // 正常回答（官方沒寫有沒有過濾、評測也判不出來的那種）
+    let quiet = mock(|d| honest(d, 41)).await.to_string();
+    // 在永久黑名單裡，也正常回答
+    let listed = mock(|d| honest(d, 42)).await.to_string();
+    // 回答別家業者、網站無法驗證（擋網站時導到自己的封鎖頁）
+    let redirect = mock(|d| match d {
+        "www.alpha.com" => Some(vec![ip("99.7.0.9")]),
+        _ => honest(d, 43),
+    })
+    .await
+    .to_string();
+    let root = tmp("protected");
+    let p = paths(&root);
+    std::fs::write(p.list_dir.join("iplist.txt"), ids.join("\n")).unwrap();
+    std::fs::write(
+        p.list_dir.join("protected.txt"),
+        format!("# 對照組\n{blocker}  # filter=ads\n{quiet}  # filter=malware\n{listed}  # filter=adult\n{redirect}  # filter=adult\n"),
+    )
+    .unwrap();
+    std::fs::write(p.list_dir.join("blacklist.txt"), format!("{listed}\n")).unwrap();
+    std::fs::write(p.list_dir.join("web.txt"), "www.alpha.com\ncdn.beta.com\n").unwrap();
+    let mut b = Benchmark::with(p.clone(), Arc::new(Mapped(HashMap::new())), asn());
+    b.keep_last = Some(root.join("persist/benchmark-last"));
+    run(&root, b, &["udp"]).await;
+
+    let up = read(&p.upstreams_file);
+    let result = |id: &str| {
+        up["protected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .map(|c| c["result"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| panic!("{id} 不在對照組結果：{up:#}"))
+    };
+    assert_eq!(result(&blocker), "detected", "{up:#}");
+    assert_eq!(result(&redirect), "detected", "{up:#}");
+    assert_eq!(result(&quiet), "passed", "{up:#}");
+    assert_eq!(result(&listed), "passed", "永久黑名單裡的對照組照樣測：{up:#}");
+    assert_eq!(up["counts"]["protected"], 4, "{up:#}");
+    // 永遠不選；正常的 4 台照常選、照常倖存
+    let picked = up["selected"].to_string();
+    for c in [&blocker, &quiet, &listed, &redirect] {
+        assert!(!picked.contains(c.as_str()), "對照組被選了：{c}");
+    }
+    assert!(ids.iter().any(|h| picked.contains(h.as_str())), "{up:#}");
+    assert_eq!(up["counts"]["survivors"], 4, "{up:#}");
+    // 不記可疑、不進永久黑名單、不算淘汰
+    let suspects = std::fs::read_to_string(root.join("state/blacklist-suspects.json")).unwrap_or_default();
+    assert!(!suspects.contains(redirect.as_str()), "{suspects}");
+    let bl = std::fs::read_to_string(root.join("state/blacklist.txt")).unwrap_or_default();
+    assert!(!bl.contains(redirect.as_str()) && !bl.contains(blocker.as_str()), "{bl}");
+    let elim = std::fs::read_to_string(root.join("persist/benchmark-last/eliminated.csv")).unwrap();
+    assert!(!elim.contains(blocker.as_str()) && !elim.contains(redirect.as_str()), "{elim}");
+    let csv = std::fs::read_to_string(root.join("persist/benchmark-last/protected.csv")).unwrap();
+    assert!(csv.contains(&format!("{blocker},udp,ads,detected,封殺 cdn.beta.com")), "{csv}");
+    let log = std::fs::read_to_string(root.join("persist/benchmark-last/judge.log")).unwrap();
+    assert!(
+        log.contains("對照組 4") && log.contains("[對照組] 4 台：判出過濾 2、沒判出 2、沒測到 0"),
+        "{log}"
+    );
 }
