@@ -1,31 +1,51 @@
-﻿# DoQ（DNS over QUIC，RFC 9250）候選名單：每日評測用
+# DoQ（DNS over QUIC，RFC 9250）候選名單：每日評測用
 # 格式：一行一個 quic://主機[:埠]（預設 853 埠）；# 開頭是註解，網址後面的文字會被忽略
-# 新增只收「不過濾」端點；標 ECS 的會把用戶網段帶給 CDN，較容易導到台灣節點
-# 來源（2026-11 整理）：AdGuard「Known DNS Providers」、Quad9 DoQ 公告（quad9.net/news/blog/quad9-enables-dns-over-http-3-and-dns-over-quic）
-#   與 docs.quad9.net/services、docs.controld.com/docs/free-dns、digitale-gesellschaft.ch/dns、dns.hostux.net
-# 目前公開且有官方文件的 DoQ 不多（Google、Cloudflare、DNS.SB、DNSPod、HiNet、Quad101 都沒有）
+# 2026-11-22 重新整理（3.4.2）：在沒有攔截的線路上（台灣 HiNet PPPoE 直接撥號）重測黑潮原本的名單與 HaGeZi 的 DoH 清單，
+#   3 輪都通過、答案正確、「不存在」沒被改寫、不擋廣告／成人／惡意網站的才收。
+#   tier=A：經營者明確（知名的公共 DNS）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
+#   有過濾的大型 DNS（保護組）、連不上的、有改寫的不在這裡；保護組在 3.5.0 另外列。
+#   op＝AS 名稱（租機房的經營者會是機房的名字）；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
+# 共 39 筆：A 10、B 29
 
-quic://dns.adguard-dns.com
-quic://dns.alidns.com:853
-quic://dns.caliph.dev:853
-quic://dns.comss.one
-quic://dns.dnsguard.pub
-quic://dns.jupitrdns.com
-quic://dns.surfsharkdns.com
-quic://doh.tiar.app
-quic://doq.ffmuc.net
-quic://family.adguard-dns.com
-quic://ibksturm.synology.me
-quic://juuri.hagezi.org
-quic://root.hagezi.org
-quic://router.comss.one
-quic://rx.techomespace.com
-quic://unfiltered.adguard-dns.com
-quic://wurzn.hagezi.org
+# ---- A 級 ----
+quic://unfiltered.adguard-dns.com  # tier=A op=AdGuard_Software_Limited ms=21.4 ecs=1 src=kuroshio-default checked=2026-11-22
+quic://dns13.quad9.net  # tier=A op=Quad9 ms=48.9 src=hagezi checked=2026-11-22
+quic://dns-nosec.quad9.net  # tier=A op=Quad9 ms=50.1 src=hagezi checked=2026-11-22
+quic://dns.quad9.net  # tier=A op=Quad9 ms=52.2 src=hagezi checked=2026-11-22
+quic://alpha-dns.quad9.net  # tier=A op=Quad9 ms=52.7 src=hagezi checked=2026-11-22
+quic://dns9.quad9.net  # tier=A op=Quad9 ms=53.0 src=hagezi checked=2026-11-22
+quic://dns12.quad9.net  # tier=A op=Quad9 ms=57.0 ecs=1 src=kuroshio-default checked=2026-11-22
+quic://dns11.quad9.net  # tier=A op=Quad9 ms=57.2 ecs=1 src=hagezi checked=2026-11-22
+quic://dns10.quad9.net  # tier=A op=Quad9 ms=57.8 src=kuroshio-default checked=2026-11-22
+quic://doh-mullvad.quad9.net  # tier=A op=Quad9 ms=60.9 src=hagezi checked=2026-11-22
 
-# 2026-11 新增（不過濾）
-quic://dns10.quad9.net  # Quad9 不擋威脅
-quic://dns12.quad9.net  # Quad9 不擋威脅 + ECS
-quic://p0.freedns.controld.com  # Control D 不過濾
-quic://dns.digitale-gesellschaft.ch  # Digitale Gesellschaft（瑞士）
-quic://dns.hostux.net  # Hostux 標準版（不過濾）
+# ---- B 級 ----
+quic://dns.alidns.com  # tier=B op=Alibaba_(US)_Technology_Co. ms=26.1 ecs=1 src=kuroshio-default checked=2026-11-22
+quic://akari.anime.com.my  # tier=B op=BRANDON_MAXWELL_LOOI ms=62.1 ecs=1 src=hagezi checked=2026-11-22
+quic://doh.tiar.app  # tier=B op=DigitalOcean ms=64.8 src=kuroshio-default checked=2026-11-22
+quic://dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=68.9 src=hagezi checked=2026-11-22
+quic://dns.caliph.dev  # tier=B op=PT_Trisula_Media_Data ms=69.1 src=kuroshio-default checked=2026-11-22
+quic://admin-dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=69.6 src=hagezi checked=2026-11-22
+quic://dns-idx2.itsec.my.id  # tier=B op=PT_Biznet_Gio_Nusantara ms=77.7 src=hagezi checked=2026-11-22
+quic://dns-telkominfra.disacloud.com  # tier=B op=PT_Deneva ms=82.9 src=hagezi checked=2026-11-22
+quic://us.aab.im  # tier=B op=HostPapa ms=148.7 ecs=1 src=hagezi checked=2026-11-22
+quic://dns.yuzia.cc  # tier=B op=Zont_LLC ms=152.6 ecs=1 src=hagezi checked=2026-11-22
+quic://10.ln7371.top  # tier=B op=HostPapa ms=200.9 ecs=1 src=hagezi checked=2026-11-22
+quic://dns.digitale-gesellschaft.ch  # tier=B op=CommunityRack.org_Verein ms=213.1 src=kuroshio-default checked=2026-11-22
+quic://dns1.digitale-gesellschaft.ch  # tier=B op=CommunityRack.org_Verein ms=223.1 src=hagezi checked=2026-11-22
+quic://ams.core.access.zznet.fun  # tier=B op=The_Infrastructure_Group_B.V. ms=237.5 ecs=1 src=hagezi checked=2026-11-22
+quic://agh.mihanentalpo.me  # tier=B op=JSC_Selectel ms=244.1 src=hagezi checked=2026-11-22
+quic://doh.defaultroutes.de  # tier=B op=active_1_GmbH ms=246.1 src=hagezi checked=2026-11-22
+quic://dns.hostux.net  # tier=B op=GANDI_SAS ms=248.0 src=kuroshio-default checked=2026-11-22
+quic://doq.ffmuc.net  # tier=B op=Freie_Netze_Muenchen_e.V. ms=256.2 src=kuroshio-default checked=2026-11-22
+quic://dns.as212683.net  # tier=B op=Olilo_UK_&_Ireland_Ltd. ms=264.1 src=hagezi checked=2026-11-22
+quic://dns.dnsguard.pub  # tier=B op=dataforest_GmbH ms=286.5 src=kuroshio-default checked=2026-11-22
+quic://dns2.feear.se  # tier=B op=IONOS_SE ms=286.8 src=hagezi checked=2026-11-22
+quic://dns1.feear.se  # tier=B op=IONOS_SE ms=288.4 src=hagezi checked=2026-11-22
+quic://dns-uk.puregeni.us  # tier=B op=OVH_SAS ms=294.9 src=hagezi checked=2026-11-22
+quic://doh3.kekew.info  # tier=B op=Deutsche_Telekom_AG ms=295.9 src=hagezi checked=2026-11-22
+quic://doh.kekew.info  # tier=B op=Deutsche_Telekom_AG ms=300.7 src=hagezi checked=2026-11-22
+quic://cubedns.com  # tier=B op=NETDIREKT_BILISIM_DANISMANLIK_ILETISIM_H ms=308.7 src=hagezi checked=2026-11-22
+quic://dns.simplylinux.ch  # tier=B op=OVH_SAS ms=329.6 src=hagezi checked=2026-11-22
+quic://crm.techsphere.ru  # tier=B op=Aruba_S.p.A. ms=350.0 src=hagezi checked=2026-11-22
+quic://adguard.adrianofrongillo.ovh  # tier=B op=Oracle_Corporation ms=384.3 src=hagezi checked=2026-11-22

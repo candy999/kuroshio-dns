@@ -1,77 +1,212 @@
 # DoT（DNS over TLS，RFC 7858）候選名單：每日評測用
-# 格式：一行一個，寫 tls://主機[:埠] 或只寫主機（預設 853 埠）；# 開頭是註解，網址後面的文字會被忽略
-# 只收「不過濾」的端點（過濾版會在評測被淘汰，只是浪費路由器時間）；標 ECS 的會把用戶網段帶給 CDN，較容易導到台灣節點
-# 來源（2026-11 整理）：AdGuard「Known DNS Providers」(adguard-dns.io/kb/general/dns-providers)、
-#   dnsprivacy.org Public Resolvers、各家官方頁（docs.quad9.net/services、docs.controld.com/docs/free-dns、
-#   developers.google.com/speed/public-dns、dns.sb/dot、applied-privacy.net、digitale-gesellschaft.ch/dns、
-#   joindns4.eu/for-public、dns.hostux.net）、dnscry.pt 各節點頁（www.dnscry.pt/public-resolvers/<代號>）
-# 中華電信 HiNet 官方沒有公開 DoT 端點，查無可驗證來源故未收
+# 格式：一行一個 tls://主機[:埠]（或只寫主機，預設 853 埠）；# 開頭是註解，網址後面的文字會被忽略
+# 2026-11-22 重新整理（3.4.2）：在沒有攔截的線路上（台灣 HiNet PPPoE 直接撥號）重測黑潮原本的名單與 HaGeZi 的 DoH 清單，
+#   3 輪都通過、答案正確、「不存在」沒被改寫、不擋廣告／成人／惡意網站的才收。
+#   tier=A：經營者明確（知名的公共 DNS）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
+#   有過濾的大型 DNS（保護組）、連不上的、有改寫的不在這裡；保護組在 3.5.0 另外列。
+#   op＝AS 名稱（租機房的經營者會是機房的名字）；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
+# 共 200 筆：A 100、B 100
 
-# 台灣
-tls://101.101.101.101  # TWNIC Quad101（AdGuard 名單只列 IP 版）
-tls://tpe01.dnscry.pt  # dnscry.pt 台北
+# ---- A 級 ----
+tls://dns.nextdns.io  # tier=A op=Misaka_Network ms=3.2 src=kuroshio-default checked=2026-11-22
+tls://tpe01.dnscry.pt  # tier=A op=HostingInside_LTD ms=3.7 src=kuroshio-default checked=2026-11-22
+tls://anycast.dns.nextdns.io  # tier=A op=NextDNS ms=3.7 src=kuroshio-default checked=2026-11-22
+tls://one.one.one.one  # tier=A op=Cloudflare ms=4.6 src=kuroshio-default checked=2026-11-22
+tls://dns.google  # tier=A op=Google_LLC ms=6.8 ecs=1 src=kuroshio-default checked=2026-11-22
+tls://dns.google.com  # tier=A op=Google_LLC ms=6.8 ecs=1 src=hagezi checked=2026-11-22
+tls://unfiltered.adguard-dns.com  # tier=A op=AdGuard_Software_Limited ms=21.0 ecs=1 src=kuroshio-default checked=2026-11-22
+tls://hkg03.dnscry.pt  # tier=A op=Tele_Asia_Limited ms=24.1 src=kuroshio-default checked=2026-11-22
+tls://hkg02.dnscry.pt  # tier=A op=Prinode_AB ms=24.5 src=kuroshio-default checked=2026-11-22
+tls://hkg01.dnscry.pt  # tier=A op=LEASEWEB_HONG_KONG_LIMITED ms=28.0 src=kuroshio-default checked=2026-11-22
+tls://dns2.nordvpn.com  # tier=A op=PacketHub_S.A. ms=34.7 src=hagezi checked=2026-11-22
+tls://public.dns.iij.jp  # tier=A op=Internet_Initiative_Japan_Inc. ms=35.2 src=kuroshio-default checked=2026-11-22
+tls://jp-to.foxyfy.net  # tier=A op=xTom_Japan_Corporation ms=35.4 src=hagezi checked=2026-11-22
+tls://han01.dnscry.pt  # tier=A op=365_Online_technology_joint_stock_compan ms=46.9 src=kuroshio-default checked=2026-11-22
+tls://dns.quad9.net  # tier=A op=Quad9 ms=48.9 src=hagezi checked=2026-11-22
+tls://doh-mullvad.quad9.net  # tier=A op=Quad9 ms=49.0 src=hagezi checked=2026-11-22
+tls://dns13.quad9.net  # tier=A op=Quad9 ms=50.3 src=hagezi checked=2026-11-22
+tls://dns-nosec.quad9.net  # tier=A op=Quad9 ms=50.5 src=hagezi checked=2026-11-22
+tls://tyo02.dnscry.pt  # tier=A op=WebHorizon_Internet_Services ms=51.7 src=kuroshio-default checked=2026-11-22
+tls://tyo03.dnscry.pt  # tier=A op=Host_Universal_Pty_Ltd ms=55.7 src=kuroshio-default checked=2026-11-22
+tls://dns10.quad9.net  # tier=A op=Quad9 ms=58.2 src=kuroshio-default checked=2026-11-22
+tls://dns11.quad9.net  # tier=A op=Quad9 ms=58.8 ecs=1 src=hagezi checked=2026-11-22
+tls://alpha-dns.quad9.net  # tier=A op=Quad9 ms=59.0 src=hagezi checked=2026-11-22
+tls://dns12.quad9.net  # tier=A op=Quad9 ms=59.1 ecs=1 src=kuroshio-default checked=2026-11-22
+tls://sgn01.dnscry.pt  # tier=A op=HYPERCORE_TECHNOLOGY_JOINT_STOCK_COMPANY ms=62.8 src=kuroshio-default checked=2026-11-22
+tls://sel02.dnscry.pt  # tier=A op=HostHatch_Korea ms=63.1 src=kuroshio-default checked=2026-11-22
+tls://jhb01.dnscry.pt  # tier=A op=Terabix ms=65.2 src=kuroshio-default checked=2026-11-22
+tls://dns9.quad9.net  # tier=A op=Quad9 ms=68.8 src=hagezi checked=2026-11-22
+tls://sin02.dnscry.pt  # tier=A op=WebHorizon_Internet_Services ms=68.9 src=kuroshio-default checked=2026-11-22
+tls://jkt01.dnscry.pt  # tier=A op=PT_Industri_Kreatif_Digital ms=78.7 src=kuroshio-default checked=2026-11-22
+tls://doh.mullvad.net  # tier=A op=LOCIX_LIMITED ms=84.0 src=hagezi checked=2026-11-22
+tls://dns.mullvad.net  # tier=A op=LOCIX_LIMITED ms=84.1 src=hagezi checked=2026-11-22
+tls://dns1.nordvpn.com  # tier=A op=PacketHub_S.A. ms=88.1 src=hagezi checked=2026-11-22
+tls://sin03.dnscry.pt  # tier=A op=Host_Universal_Pty_Ltd ms=104.6 src=kuroshio-default checked=2026-11-22
+tls://blr01.dnscry.pt  # tier=A op=RACKVOLT_CLOUD_SOLUTIONS_PRIVATE_LIMITED ms=108.0 src=kuroshio-default checked=2026-11-22
+tls://bom02.dnscry.pt  # tier=A op=Intech_Online_Private_Limited ms=112.7 src=kuroshio-default checked=2026-11-22
+tls://dac01.dnscry.pt  # tier=A op=Flarezen_Ltd. ms=114.5 src=kuroshio-default checked=2026-11-22
+tls://sjc01.dnscry.pt  # tier=A op=EGIHosting ms=134.4 src=kuroshio-default checked=2026-11-22
+tls://sjc02.dnscry.pt  # tier=A op=DESIVPS ms=135.2 src=kuroshio-default checked=2026-11-22
+tls://lax01.dnscry.pt  # tier=A op=EXTRAVM_LLC ms=147.5 src=kuroshio-default checked=2026-11-22
+tls://mel01.dnscry.pt  # tier=A op=Alpha_Layer_Pty_Ltd ms=150.5 src=kuroshio-default checked=2026-11-22
+tls://sea01.dnscry.pt  # tier=A op=Shock_Hosting_LLC ms=151.2 src=kuroshio-default checked=2026-11-22
+tls://lax02.dnscry.pt  # tier=A op=GWY_IT_PTY_LTD ms=152.7 src=kuroshio-default checked=2026-11-22
+tls://akl01.dnscry.pt  # tier=A op=Zappie_Host_LLC ms=155.1 src=kuroshio-default checked=2026-11-22
+tls://ogd01.dnscry.pt  # tier=A op=WebNX ms=155.1 src=hagezi checked=2026-11-22
+tls://yvr01.dnscry.pt  # tier=A op=Free_Range_Cloud_Hosting_Inc. ms=155.6 src=hagezi checked=2026-11-22
+tls://syd02.dnscry.pt  # tier=A op=Alpha_Layer_Pty_Ltd ms=156.3 src=kuroshio-default checked=2026-11-22
+tls://den01.dnscry.pt  # tier=A op=Shock_Hosting_LLC ms=163.9 src=hagezi checked=2026-11-22
+tls://yyc01.dnscry.pt  # tier=A op=Free_Range_Cloud_Hosting_Inc. ms=166.1 src=hagezi checked=2026-11-22
+tls://private.canadianshield.cira.ca  # tier=A op=CIRA_Canadian_Internet_Registration_Auth ms=169.9 src=kuroshio-default checked=2026-11-22
+tls://las01.dnscry.pt  # tier=A op=Hostodo ms=173.3 src=hagezi checked=2026-11-22
+tls://mci01.dnscry.pt  # tier=A op=Rozint ms=174.6 src=hagezi checked=2026-11-22
+tls://dfw02.dnscry.pt  # tier=A op=LINVEO ms=180.9 src=hagezi checked=2026-11-22
+tls://ind01.dnscry.pt  # tier=A op=Unlimited_Net ms=183.6 src=hagezi checked=2026-11-22
+tls://mia01.dnscry.pt  # tier=A op=EXTRAVM_LLC ms=184.3 src=hagezi checked=2026-11-22
+tls://bei01.dnscry.pt  # tier=A op=Psychz_Networks ms=185.8 src=hagezi checked=2026-11-22
+tls://ott01.dnscry.pt  # tier=A op=LINVEO ms=188.6 src=hagezi checked=2026-11-22
+tls://yyz01.dnscry.pt  # tier=A op=Amanah_Tech_Inc. ms=189.8 src=hagezi checked=2026-11-22
+tls://yyz02.dnscry.pt  # tier=A op=Free_Range_Cloud_Hosting_Inc. ms=190.0 src=hagezi checked=2026-11-22
+tls://jax01.dnscry.pt  # tier=A op=Shock_Hosting_LLC ms=195.7 src=hagezi checked=2026-11-22
+tls://ymq01.dnscry.pt  # tier=A op=Hive_Data_Center_Inc. ms=197.5 src=hagezi checked=2026-11-22
+tls://grr01.dnscry.pt  # tier=A op=RackGenius ms=198.8 src=hagezi checked=2026-11-22
+tls://ped01.dnscry.pt  # tier=A op=? ms=200.9 src=hagezi checked=2026-11-22
+tls://aqx01.dnscry.pt  # tier=A op=RAVNIX_LLC ms=209.8 src=hagezi checked=2026-11-22
+tls://nyc01.dnscry.pt  # tier=A op=EXTRAVM_LLC ms=212.0 src=hagezi checked=2026-11-22
+tls://iah01.dnscry.pt  # tier=A op=Snaju_Development ms=215.8 src=hagezi checked=2026-11-22
+tls://waw01.dnscry.pt  # tier=A op=MEVSPACE_sp._z_o.o. ms=217.5 src=hagezi checked=2026-11-22
+tls://yhz01.dnscry.pt  # tier=A op=Free_Range_Cloud_Hosting_Inc. ms=217.5 src=hagezi checked=2026-11-22
+tls://huv01.dnscry.pt  # tier=A op=Internetport_Sweden_AB ms=221.7 src=hagezi checked=2026-11-22
+tls://moe01.dnscry.pt  # tier=A op=Stephan_Rakowski ms=240.7 src=hagezi checked=2026-11-22
+tls://bne01.dnscry.pt  # tier=A op=Mammoth_Media_Pty_Ltd ms=241.3 src=kuroshio-default checked=2026-11-22
+tls://dus03.dnscry.pt  # tier=A op=Luca_Heidemann ms=241.4 src=hagezi checked=2026-11-22
+tls://zrh01.dnscry.pt  # tier=A op=Private_Layer_INC ms=245.3 src=hagezi checked=2026-11-22
+tls://dus02.dnscry.pt  # tier=A op=Felix_Gassan ms=248.5 src=hagezi checked=2026-11-22
+tls://ams03.dnscry.pt  # tier=A op=IncogNet_LLC ms=263.1 src=hagezi checked=2026-11-22
+tls://ncl01.dnscry.pt  # tier=A op=Glitch_Servers_Ltd ms=264.7 src=hagezi checked=2026-11-22
+tls://tuu01.dnscry.pt  # tier=A op=Hetzner_Online_GmbH ms=265.8 src=hagezi checked=2026-11-22
+tls://sto02.dnscry.pt  # tier=A op=No_ACK_Group_Holding_AB ms=267.2 src=hagezi checked=2026-11-22
+tls://unfiltered.joindns4.eu  # tier=A op=Whalebone ms=271.1 src=kuroshio-default checked=2026-11-22
+tls://per01.dnscry.pt  # tier=A op=Mammoth_Media_Pty_Ltd ms=279.9 src=kuroshio-default checked=2026-11-22
+tls://fra01.dnscry.pt  # tier=A op=Oliver_Horscht_trading_as__SYNLINQ_ ms=281.5 src=hagezi checked=2026-11-22
+tls://bre01.dnscry.pt  # tier=A op=LWLcom_GmbH ms=281.9 src=hagezi checked=2026-11-22
+tls://protective.joindns4.eu  # tier=A op=Whalebone ms=282.6 src=hagezi checked=2026-11-22
+tls://mrs01.dnscry.pt  # tier=A op=Ouiheberg_SARL ms=285.4 src=hagezi checked=2026-11-22
+tls://child.joindns4.eu  # tier=A op=Whalebone ms=287.2 src=hagezi checked=2026-11-22
+tls://iev02.dnscry.pt  # tier=A op=South_Park_Networks_LLC ms=295.3 src=hagezi checked=2026-11-22
+tls://omr01.dnscry.pt  # tier=A op=Andrei_Tiberiu_Holt ms=298.7 src=hagezi checked=2026-11-22
+tls://cpt01.dnscry.pt  # tier=A op=Atomic_(Pty)_Ltd ms=299.5 src=hagezi checked=2026-11-22
+tls://prg01.dnscry.pt  # tier=A op=ROUTE_95_LLC ms=302.2 src=hagezi checked=2026-11-22
+tls://tia01.dnscry.pt  # tier=A op=Castlegem_SRL ms=302.4 src=hagezi checked=2026-11-22
+tls://buh01.dnscry.pt  # tier=A op=Shock_Hosting_LLC ms=304.0 src=hagezi checked=2026-11-22
+tls://mru02.dnscry.pt  # tier=A op=Rogers_Capital_Technology_Services_Ltd ms=304.4 src=hagezi checked=2026-11-22
+tls://rix01.dnscry.pt  # tier=A op=ROUTE_95_LLC ms=304.8 src=hagezi checked=2026-11-22
+tls://tsr01.dnscry.pt  # tier=A op=UNMANAGED_LTD ms=312.9 src=hagezi checked=2026-11-22
+tls://sao01.dnscry.pt  # tier=A op=JeskeSolutions_LTDA ms=325.1 src=hagezi checked=2026-11-22
+tls://zal01.dnscry.pt  # tier=A op=Zappie_Host_LLC ms=332.8 src=hagezi checked=2026-11-22
+tls://skg01.dnscry.pt  # tier=A op=GREEN_FLOID_LLC ms=333.7 src=hagezi checked=2026-11-22
+tls://los02.dnscry.pt  # tier=A op=SiteHUB_Agency_Ltd ms=367.9 src=hagezi checked=2026-11-22
+tls://cpt02.dnscry.pt  # tier=A op=Web_Squad_Connect_(Pty)_Ltd ms=399.4 src=hagezi checked=2026-11-22
+tls://jnb02.dnscry.pt  # tier=A op=Web_Squad_Connect_(Pty)_Ltd ms=414.2 src=hagezi checked=2026-11-22
 
-# 大型 anycast
-tls://one.one.one.one  # Cloudflare
-tls://dns.google  # Google Public DNS，ECS
-tls://dns10.quad9.net  # Quad9 不擋威脅
-tls://dns12.quad9.net  # Quad9 不擋威脅 + ECS
-tls://unfiltered.adguard-dns.com  # AdGuard 不過濾
-tls://p0.freedns.controld.com  # Control D 不過濾
-tls://dns.nextdns.io  # NextDNS 公開不過濾（低延遲）
-tls://anycast.dns.nextdns.io  # NextDNS 公開不過濾（anycast）
-tls://dns.opendns.com  # Cisco OpenDNS Standard
-tls://ordns.he.net  # Hurricane Electric
-tls://wikimedia-dns.org  # Wikimedia
-tls://dns.surfsharkdns.com  # Surfshark DNS
-tls://max.rethinkdns.com  # RethinkDNS 不過濾
-
-# 亞太其他業者
-tls://dot.sb  # DNS.SB
-tls://dot.pub  # 騰訊 DNSPod
-tls://dns.alidns.com  # 阿里 AliDNS
-tls://dot.360.cn  # 360 安全 DNS
-tls://dot-pure.onedns.net  # OneDNS 純淨版
-tls://public.dns.iij.jp  # 日本 IIJ
-tls://dot.seby.io  # Seby DNS（澳洲）
-tls://unfiltered.dns.bebasid.com  # BebasDNS 不過濾（印尼）
-tls://common.dot.dns.yandex.net  # Yandex 基本版
-
-# dnscry.pt 亞太與美西節點（不過濾、不記錄）
-tls://hkg01.dnscry.pt  # 香港
-tls://hkg02.dnscry.pt  # 香港
-tls://hkg03.dnscry.pt  # 香港
-tls://tyo02.dnscry.pt  # 東京
-tls://tyo03.dnscry.pt  # 東京
-tls://sel02.dnscry.pt  # 首爾
-tls://sin02.dnscry.pt  # 新加坡
-tls://sin03.dnscry.pt  # 新加坡
-tls://jhb01.dnscry.pt  # 柔佛
-tls://jkt01.dnscry.pt  # 雅加達
-tls://han01.dnscry.pt  # 河內
-tls://sgn01.dnscry.pt  # 胡志明市
-tls://blr01.dnscry.pt  # 班加羅爾
-tls://bom02.dnscry.pt  # 孟買
-tls://dac01.dnscry.pt  # 達卡
-tls://syd02.dnscry.pt  # 雪梨
-tls://mel01.dnscry.pt  # 墨爾本
-tls://bne01.dnscry.pt  # 布里斯本
-tls://per01.dnscry.pt  # 伯斯
-tls://akl01.dnscry.pt  # 奧克蘭
-tls://lax01.dnscry.pt  # 洛杉磯
-tls://lax02.dnscry.pt  # 洛杉磯
-tls://sjc01.dnscry.pt  # 聖塔克拉拉
-tls://sjc02.dnscry.pt  # 聖荷西
-tls://sea01.dnscry.pt  # 西雅圖
-
-# 歐美（不過濾）
-tls://dot1.applied-privacy.net  # Applied Privacy（奧地利）
-tls://dns.digitale-gesellschaft.ch  # Digitale Gesellschaft（瑞士）
-tls://dot.libredns.gr  # LibreDNS
-tls://unfiltered.joindns4.eu  # DNS4EU 不過濾
-tls://odvr.nic.cz  # CZ.NIC ODVR
-tls://private.canadianshield.cira.ca  # CIRA Canadian Shield Private
-tls://anycast.censurfridns.dk  # UncensoredDNS
-tls://open.dns.dremaxx.com  # Dremaxx 不過濾
-tls://dns.hostux.net  # Hostux 標準版（不過濾）
-tls://dot.ffmuc.net  # Freifunk München
+# ---- B 級 ----
+tls://dns.dreamworker.idv.tw  # tier=B op=Data_Communication_Business_Group ms=4.0 ecs=1 src=hagezi checked=2026-11-22
+tls://ordns.he.net  # tier=B op=Hurricane_Electric_LLC ms=22.9 src=kuroshio-default checked=2026-11-22
+tls://dot.sb  # tier=B op=SB_Professional_Services ms=43.3 src=kuroshio-default checked=2026-11-22
+tls://dot.pub  # tier=B op=Tencent_Building ms=44.5 ecs=1 src=kuroshio-default checked=2026-11-22
+tls://akari.anime.com.my  # tier=B op=BRANDON_MAXWELL_LOOI ms=56.5 ecs=1 src=hagezi checked=2026-11-22
+tls://unfiltered.dns.bebasid.com  # tier=B op=OVH_SAS ms=63.4 ecs=1 src=kuroshio-default checked=2026-11-22
+tls://wikimedia-dns.org  # tier=B op=Wikimedia_Foundation_Inc. ms=65.4 src=kuroshio-default checked=2026-11-22
+tls://admin-dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=73.0 src=hagezi checked=2026-11-22
+tls://dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=73.2 src=hagezi checked=2026-11-22
+tls://dns-idx2.itsec.my.id  # tier=B op=PT_Biznet_Gio_Nusantara ms=77.7 src=hagezi checked=2026-11-22
+tls://dns-telkominfra.disacloud.com  # tier=B op=PT_Deneva ms=81.0 src=hagezi checked=2026-11-22
+tls://dns.nic.in  # tier=B op=BHARAT_PUBLIC_DNS_(1.10.10.10) ms=102.2 src=hagezi checked=2026-11-22
+tls://dns.zzuhacker.cn  # tier=B op=Shenzhen_Tencent_Computer_Systems_Compan ms=119.4 src=hagezi checked=2026-11-22
+tls://dns.scott-smith.us  # tier=B op=Akamai_Connected_Cloud ms=133.3 src=hagezi checked=2026-11-22
+tls://dns.efficientdocuments.com  # tier=B op=Akamai_Connected_Cloud ms=133.7 src=hagezi checked=2026-11-22
+tls://us.aab.im  # tier=B op=HostPapa ms=143.9 ecs=1 src=hagezi checked=2026-11-22
+tls://dns.yuzia.cc  # tier=B op=Zont_LLC ms=147.0 ecs=1 src=hagezi checked=2026-11-22
+tls://dot.seby.io  # tier=B op=The_Constant_Company ms=170.9 src=kuroshio-default checked=2026-11-22
+tls://dns.furrix.zone  # tier=B op=WholeSale_Internet ms=173.2 src=hagezi checked=2026-11-22
+tls://dns.marbledfennec.net  # tier=B op=WholeSale_Internet ms=175.0 src=hagezi checked=2026-11-22
+tls://dns1.dnscrypt.ca  # tier=B op=GLOBALTELEHOST_Corp. ms=190.7 src=hagezi checked=2026-11-22
+tls://kronos.plan9-dns.com  # tier=B op=The_Constant_Company ms=191.1 src=hagezi checked=2026-11-22
+tls://us-ny.foxyfy.net  # tier=B op=HostPapa ms=198.0 src=hagezi checked=2026-11-22
+tls://dns.sev.monster  # tier=B op=InMotion_Hosting ms=198.3 src=hagezi checked=2026-11-22
+tls://10.ln7371.top  # tier=B op=HostPapa ms=198.8 src=hagezi checked=2026-11-22
+tls://dns.foxyfy.net  # tier=B op=HostPapa ms=199.0 src=hagezi checked=2026-11-22
+tls://dns.cmrg.net  # tier=B op=Koumbit ms=199.0 src=hagezi checked=2026-11-22
+tls://adguard.greenbridge.ai  # tier=B op=Amazon.com ms=200.2 src=hagezi checked=2026-11-22
+tls://res.zijji.com  # tier=B op=Videotron_Ltee ms=210.4 ecs=1 src=hagezi checked=2026-11-22
+tls://doh.morpheion.space  # tier=B op=Windcloud_4.0_GmbH ms=211.4 src=hagezi checked=2026-11-22
+tls://dns1.digitale-gesellschaft.ch  # tier=B op=CommunityRack.org_Verein ms=211.9 src=hagezi checked=2026-11-22
+tls://dns.lermer.nl  # tier=B op=Freedom_Internet_BV ms=212.5 src=hagezi checked=2026-11-22
+tls://pluton.plan9-dns.com  # tier=B op=The_Constant_Company ms=215.3 src=hagezi checked=2026-11-22
+tls://dns2.slowb.ro  # tier=B op=Oracle_Corporation ms=216.4 src=hagezi checked=2026-11-22
+tls://dns.digitale-gesellschaft.ch  # tier=B op=CommunityRack.org_Verein ms=216.8 src=kuroshio-default checked=2026-11-22
+tls://anycast.censurfridns.nu  # tier=B op=Thomas_Steen_Rasmussen ms=223.5 src=hagezi checked=2026-11-22
+tls://ns4.opennameserver.org  # tier=B op=Gigahost_AS ms=226.8 src=hagezi checked=2026-11-22
+tls://anycast.censurfridns.dk  # tier=B op=Thomas_Steen_Rasmussen ms=230.1 src=kuroshio-default checked=2026-11-22
+tls://ns1.fdn.fr  # tier=B op=Association__Gitoyen_ ms=231.1 src=hagezi checked=2026-11-22
+tls://dns.adnull.com  # tier=B op=Global_Technologies_of_Ukraine_LLC ms=231.3 src=hagezi checked=2026-11-22
+tls://ns0.fdn.fr  # tier=B op=Association__Gitoyen_ ms=232.0 src=hagezi checked=2026-11-22
+tls://dns.hostux.net  # tier=B op=GANDI_SAS ms=234.0 src=kuroshio-default checked=2026-11-22
+tls://dns.easyhns.com  # tier=B op=Amazon.com ms=236.9 src=hagezi checked=2026-11-22
+tls://dns.ipoac.nl  # tier=B op=Jelle_Kaufmann ms=236.9 src=hagezi checked=2026-11-22
+tls://getdnsapi.net  # tier=B op=Infracom_Holding_B.V. ms=239.3 src=hagezi checked=2026-11-22
+tls://ns2.opennameserver.org  # tier=B op=WIIT_AG ms=239.6 src=hagezi checked=2026-11-22
+tls://dns1.slowb.ro  # tier=B op=Mammoth_Media_Pty_Ltd ms=241.2 src=hagezi checked=2026-11-22
+tls://dns.keweon.center  # tier=B op=Leaseweb_Deutschland_GmbH ms=242.2 src=hagezi checked=2026-11-22
+tls://resolv.flokinet.net  # tier=B op=FlokiNET_ehf ms=242.6 src=hagezi checked=2026-11-22
+tls://doh.defaultroutes.de  # tier=B op=active_1_GmbH ms=244.3 src=hagezi checked=2026-11-22
+tls://agh.mihanentalpo.me  # tier=B op=JSC_Selectel ms=245.0 src=hagezi checked=2026-11-22
+tls://ams.core.access.zznet.fun  # tier=B op=The_Infrastructure_Group_B.V. ms=245.2 ecs=1 src=hagezi checked=2026-11-22
+tls://carolinareaper.heeremans.net  # tier=B op=Enreach_Netherlands_B.V. ms=245.3 src=hagezi checked=2026-11-22
+tls://dns.shareworx.net  # tier=B op=Hetzner_Online_GmbH ms=246.1 src=hagezi checked=2026-11-22
+tls://dot.libredns.gr  # tier=B op=Hetzner_Online_GmbH ms=246.8 src=kuroshio-default checked=2026-11-22
+tls://doh.kidzonet.io  # tier=B op=Amazon.com ms=247.5 src=hagezi checked=2026-11-22
+tls://dns1.in-berlin.de  # tier=B op=Individual_Network_Berlin_(_IN-Berlin_)_ ms=252.4 ecs=1 src=hagezi checked=2026-11-22
+tls://rfree2.blue-shield.at  # tier=B op=LINZ_STROM_GAS_WAERME_GmbH_fuer_Energied ms=255.1 ecs=1 src=hagezi checked=2026-11-22
+tls://de.dns.privex.io  # tier=B op=Hetzner_Online_GmbH ms=255.4 ecs=1 src=hagezi checked=2026-11-22
+tls://dns.switch.ch  # tier=B op=SWITCH ms=256.2 src=hagezi checked=2026-11-22
+tls://dns2.in-berlin.de  # tier=B op=Individual_Network_Berlin_(_IN-Berlin_)_ ms=257.0 src=hagezi checked=2026-11-22
+tls://dns-cache.switch.ch  # tier=B op=SWITCH ms=257.1 src=hagezi checked=2026-11-22
+tls://rfree1.blue-shield.at  # tier=B op=LINZ_STROM_GAS_WAERME_GmbH_fuer_Energied ms=259.3 ecs=1 src=hagezi checked=2026-11-22
+tls://dot.ffmuc.net  # tier=B op=Freie_Netze_Muenchen_e.V. ms=260.0 src=kuroshio-default checked=2026-11-22
+tls://dns.aa.net.uk  # tier=B op=Andrews_&_Arnold_Ltd ms=260.1 src=hagezi checked=2026-11-22
+tls://dns.envs.net  # tier=B op=Hetzner_Online_GmbH ms=263.8 ecs=1 src=hagezi checked=2026-11-22
+tls://dns.as212683.net  # tier=B op=Olilo_UK_&_Ireland_Ltd. ms=264.0 src=hagezi checked=2026-11-22
+tls://dns.mnet-online.de  # tier=B op=M-net_Telekommunikations_GmbH ms=264.7 src=hagezi checked=2026-11-22
+tls://helios.plan9-dns.com  # tier=B op=The_Constant_Company ms=271.1 src=hagezi checked=2026-11-22
+tls://dns1.feear.se  # tier=B op=IONOS_SE ms=283.8 src=hagezi checked=2026-11-22
+tls://dns2.feear.se  # tier=B op=IONOS_SE ms=284.7 src=hagezi checked=2026-11-22
+tls://ns1.opennameserver.org  # tier=B op=IONOS_SE ms=286.3 src=hagezi checked=2026-11-22
+tls://dnscache0.ns71.net  # tier=B op=IONOS_SE ms=286.4 src=hagezi checked=2026-11-22
+tls://dns.t53.de  # tier=B op=Deutsche_Telekom_AG ms=286.7 src=hagezi checked=2026-11-22
+tls://dns-uk.puregeni.us  # tier=B op=OVH_SAS ms=286.9 src=hagezi checked=2026-11-22
+tls://korridor.semia-infra.net  # tier=B op=Hohl_IT_e.U. ms=289.0 src=hagezi checked=2026-11-22
+tls://nl.dns.privex.io  # tier=B op=Privex_Inc. ms=289.8 ecs=1 src=hagezi checked=2026-11-22
+tls://dns.dremaxx.de  # tier=B op=iFog_GmbH ms=291.3 src=hagezi checked=2026-11-22
+tls://unicast2.servers.censurfridns.dk  # tier=B op=Norlys_Telco_A/S ms=292.3 src=hagezi checked=2026-11-22
+tls://open.dns.dremaxx.com  # tier=B op=iFog_GmbH ms=292.9 src=kuroshio-default checked=2026-11-22
+tls://ledns.eu  # tier=B op=OVH_SAS ms=293.8 src=hagezi checked=2026-11-22
+tls://doh.appliedprivacy.net  # tier=B op=Nessus_GmbH ms=295.0 src=hagezi checked=2026-11-22
+tls://unicast.censurfridns.nu  # tier=B op=Norlys_Telco_A/S ms=295.3 src=hagezi checked=2026-11-22
+tls://dot1.applied-privacy.net  # tier=B op=Nessus_GmbH ms=295.4 src=kuroshio-default checked=2026-11-22
+tls://odvr.nic.cz  # tier=B op=CZ.NIC ms=295.9 src=kuroshio-default checked=2026-11-22
+tls://dns.csa-rz.de  # tier=B op=R-KOM_Regensburger_Telekommunikationsges ms=296.0 src=hagezi checked=2026-11-22
+tls://dns.telekom.de  # tier=B op=Deutsche_Telekom_AG ms=296.3 src=hagezi checked=2026-11-22
+tls://dot1.appliedprivacy.net  # tier=B op=Nessus_GmbH ms=296.5 src=hagezi checked=2026-11-22
+tls://ns3.opennameserver.org  # tier=B op=Strato_GmbH ms=296.6 src=hagezi checked=2026-11-22
+tls://unicast.censurfridns.dk  # tier=B op=Norlys_Telco_A/S ms=296.8 src=hagezi checked=2026-11-22
+tls://dns.csaonline.de  # tier=B op=Niedermayr_IT_GmbH ms=298.0 src=hagezi checked=2026-11-22
+tls://dns.netvpn.net  # tier=B op=The_Constant_Company ms=299.7 src=hagezi checked=2026-11-22
+tls://dns.cert.ee  # tier=B op=Information_System_Authority ms=302.9 src=hagezi checked=2026-11-22
+tls://dns.kernel-error.de  # tier=B op=netcup_GmbH ms=303.4 src=hagezi checked=2026-11-22
+tls://cubedns.com  # tier=B op=NETDIREKT_BILISIM_DANISMANLIK_ILETISIM_H ms=307.3 src=hagezi checked=2026-11-22
+tls://jabber-germany.de  # tier=B op=netcup_GmbH ms=308.2 src=hagezi checked=2026-11-22
+tls://ro-bu.foxyfy.net  # tier=B op=M247_Europe_SRL ms=316.0 src=hagezi checked=2026-11-22
+tls://dns.simplylinux.ch  # tier=B op=OVH_SAS ms=324.9 src=hagezi checked=2026-11-22
+tls://crm.techsphere.ru  # tier=B op=Aruba_S.p.A. ms=340.3 src=hagezi checked=2026-11-22
+tls://adguard.adrianofrongillo.ovh  # tier=B op=Oracle_Corporation ms=382.1 src=hagezi checked=2026-11-22
