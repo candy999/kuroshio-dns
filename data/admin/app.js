@@ -415,7 +415,7 @@
 		if (t === 'settings') renderSettings();
 		noticeVisibility();
 		if (t === 'tools') renderTools();
-		if (t === 'log') refreshLog();
+		if (t === 'log') { refreshLog(); refreshQlog(); }
 		if (t === 'about') renderAbout();
 	}
 
@@ -468,6 +468,12 @@
 		});
 		$('log-refresh').addEventListener('click', refreshLog);
 		$('log-filter').addEventListener('input', showLog);
+		// 查詢紀錄（3.5.0）：暫時開啟／關閉、篩選
+		$('qlog-on').addEventListener('click', function () { api('/api/querylog/enable?minutes=10', { method: 'POST' }).then(refreshQlog); });
+		$('qlog-off').addEventListener('click', function () { api('/api/querylog/enable?minutes=0', { method: 'POST' }).then(refreshQlog); });
+		$('qlog-refresh').addEventListener('click', refreshQlog);
+		$('qlog-name').addEventListener('change', refreshQlog);
+		$('qlog-client').addEventListener('change', refreshQlog);
 		var saved = {};
 		try { saved = JSON.parse(store.get(LOG_KEY) || '{}') || {}; } catch (e) { saved = {}; }
 		if (saved.lines) $('log-lines').value = String(saved.lines);
@@ -490,7 +496,7 @@
 	function tick() {
 		if (document.visibilityState !== 'visible' || S.saving) return;
 		if (S.tab === 'status') refreshStatus();
-		if (S.tab === 'log' && $('log-auto').checked) refreshLog();
+		if (S.tab === 'log' && $('log-auto').checked) { refreshLog(); refreshQlog(); }
 	}
 
 	// ---------------------------------------------------------------- 儀表板分頁
@@ -2268,6 +2274,29 @@
 			if (r.status === 401) return;
 			logLines = r.ok && r.data ? (r.data.lines || []) : ['讀取失敗：' + errText(r)];
 			showLog();
+		});
+	}
+	var QLOG_RESULT = { hit: '快取', miss: '上游', blocked: '擋掉', stale: '過期資料' };
+	var qlogBusy = false;
+	function refreshQlog() {
+		if (qlogBusy) return;
+		qlogBusy = true;
+		var q = { limit: 200 };
+		if ($('qlog-name').value.trim()) q.name = $('qlog-name').value.trim();
+		if ($('qlog-client').value.trim()) q.client = $('qlog-client').value.trim();
+		api('/api/querylog?' + qs(q)).then(function (r) {
+			qlogBusy = false;
+			if (r.status === 401) return;
+			var body = $('qlog-body');
+			body.textContent = '';
+			if (!r.ok) { $('qlog-state').textContent = '讀取失敗：' + errText(r); return; }
+			var d = r.data || {};
+			$('qlog-state').textContent = d.enabled
+				? (d.permanent ? '常開（設定裡打開了）' : '開啟中，到 ' + fmtTime(d.until) + ' 自動關閉') + '：' + (d.size || 0) + ' 筆（最多 ' + (d.capacity || 0) + ' 筆）' + (d.dropped ? '，忙不過來丟掉 ' + d.dropped + ' 筆' : '')
+				: '沒有開啟';
+			(d.entries || []).forEach(function (e) {
+				body.appendChild(el('tr', {}, [fmtTime(e.at), e.client, e.name, String(e.type), (QLOG_RESULT[e.result] || e.result) + (e.rcode ? '（rcode ' + e.rcode + '）' : ''), e.ms + ' ms', e.source || ''].map(function (x) { return el('td', { text: x }); })));
+			});
 		});
 	}
 	function showLog() {

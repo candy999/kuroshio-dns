@@ -141,8 +141,20 @@
           <button type="button" class="btn small" id="log-refresh">重新整理</button>
         </div>
       </div>
-      <p class="muted">要看每一筆查詢，請在「設定 → 日誌 → 記錄每筆查詢」打開。</p>
       <pre class="log" id="log-pre"></pre>
+      <div class="qlog" id="qlog">
+        <h3>查詢紀錄</h3>
+        <p class="muted">每一筆查詢的網域、來源、結果與延遲，除錯用。只在記憶體、不寫磁碟、不進備份；暫時開啟最長 60 分鐘，到時間自動關閉。</p>
+        <p id="qlog-state" class="muted"></p>
+        <div class="log-ctl">
+          <button type="button" class="btn small primary" id="qlog-on">開啟 10 分鐘</button>
+          <button type="button" class="btn small" id="qlog-off">關閉</button>
+          <input type="search" id="qlog-name" placeholder="網域（包含這段文字）" aria-label="網域">
+          <input type="search" id="qlog-client" placeholder="來源 IP" aria-label="來源 IP">
+          <button type="button" class="btn small" id="qlog-refresh">重新整理</button>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>時間</th><th>來源</th><th>網域</th><th>類型</th><th>結果</th><th>延遲</th><th>答案來源</th></tr></thead><tbody id="qlog-body"></tbody></table></div>
+      </div>
     </section>
 
     <!-- 關於 -->

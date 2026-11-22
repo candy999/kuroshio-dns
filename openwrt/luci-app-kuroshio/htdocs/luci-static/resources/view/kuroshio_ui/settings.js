@@ -305,7 +305,7 @@ return view.extend({
 			o.datatype = 'port';
 			o.placeholder = '8054';
 
-			o = s.option(form.Flag, 'query_log', _('記錄每筆查詢'), _('寫進系統日誌，除錯用。會很快洗掉日誌緩衝區。'));
+			o = s.option(form.Flag, 'query_log', _('查詢紀錄常開'), _('除錯用。查詢紀錄只在記憶體（不寫進 Flash、不進備份），在「日誌」頁看；平常不用打開，需要時在「日誌」頁暫時開啟（最長 60 分鐘）。'));
 			o = s.option(form.ListValue, 'log_level', _('日誌等級'));
 			o.value('info', _('一般'));
 			o.value('debug', _('除錯（更詳細）'));

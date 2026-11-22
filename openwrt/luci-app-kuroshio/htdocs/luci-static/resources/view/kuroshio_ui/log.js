@@ -36,13 +36,46 @@ return view.extend({
 			if (follow.checked) pre.scrollTop = pre.scrollHeight;
 		};
 		show(lines);
-		poll.add(function() { return L.resolveDefault(callLog(300), []).then(show); }, 5);
+		// 查詢紀錄（3.5.0）：只在記憶體；暫時開啟 10 分鐘（最長 60 分鐘，到時間自動關閉）
+		var RESULT = { hit: _('快取'), miss: _('上游'), blocked: _('擋掉'), stale: _('過期資料') };
+		var qState = E('p', { 'class': 'cbi-section-descr', 'id': 'kuroshio-qlog-state' });
+		var qName = E('input', { 'type': 'search', 'placeholder': _('網域（包含這段文字）') });
+		var qBody = E('div', { 'id': 'kuroshio-qlog' });
+		var loadQ = function() {
+			var q = { limit: 200 };
+			if (qName.value.trim()) q.name = qName.value.trim();
+			return common.api('/api/querylog', q).then(function(r) {
+				var d = (r && r.result) || {};
+				qState.textContent = d.enabled ? (_('開啟中') + (d.until ? _('，到 %s 自動關閉').format(new Date(d.until).toLocaleTimeString()) : '') + '：' + (d.size || 0) + _(' 筆')) : _('沒有開啟');
+				var rows = (d.entries || []).map(function(e) {
+					return [new Date(e.at).toLocaleTimeString(), e.client, e.name, String(e.type), (RESULT[e.result] || e.result) + (e.rcode ? ' (rcode ' + e.rcode + ')' : ''), e.ms + ' ms', e.source || ''];
+				});
+				qBody.textContent = '';
+				qBody.appendChild(common.scroll(common.table([_('時間'), _('來源'), _('網域'), _('類型'), _('結果'), _('延遲'), _('答案來源')], rows, _('沒有紀錄'))));
+			});
+		};
+		var qBtn = function(label, minutes, cls) {
+			return E('button', { 'class': 'btn cbi-button ' + (cls || ''), 'click': ui.createHandlerFn(null, function() {
+				return common.action('/api/querylog/enable', { minutes: String(minutes) }).then(loadQ);
+			}) }, label);
+		};
+		loadQ();
+		poll.add(function() { return L.resolveDefault(callLog(300), []).then(show).then(loadQ); }, 5);
 		return E([], [
 			E('h2', {}, _('黑潮 DNS · 日誌')),
 			E('div', { 'class': 'cbi-section kuroshio-sec' }, [
 				E('label', { 'style': 'display:inline-flex;gap:.4em;align-items:center' }, [follow, _('自動捲到最新')]),
-				E('p', { 'class': 'cbi-section-descr' }, _('要看每一筆查詢，請在「基本設定 → 專業模式 → 記錄每筆查詢」打開。')),
 				pre
+			]),
+			E('div', { 'class': 'cbi-section kuroshio-sec' }, [
+				E('h3', {}, _('查詢紀錄')),
+				E('p', { 'class': 'cbi-section-descr' }, _('每一筆查詢的網域、來源、結果與延遲，除錯用。只在記憶體、不寫磁碟、不進備份；暫時開啟最長 60 分鐘，到時間自動關閉。')),
+				qState,
+				E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap;align-items:center;margin-bottom:.5em' }, [
+					qBtn(_('開啟 10 分鐘'), 10, 'cbi-button-action'), qBtn(_('關閉'), 0), qName,
+					E('button', { 'class': 'btn cbi-button', 'click': ui.createHandlerFn(this, loadQ) }, _('重新整理'))
+				]),
+				qBody
 			]),
 			common.footer()
 		]);

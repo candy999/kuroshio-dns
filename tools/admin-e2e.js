@@ -953,6 +953,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.fill('#log-filter', '重新載入');
         check(!/管理 API/.test(await page.textContent('#log-pre')) && /重新載入/.test(await page.textContent('#log-pre')), '日誌：關鍵字篩選');
         await page.fill('#log-filter', '');
+        // 查詢紀錄（3.5.0）：預設沒開；按「開啟 10 分鐘」之後顯示到幾點自動關閉；按「關閉」又關掉
+        await page.waitForFunction(() => /沒有開啟|開啟中|常開/.test(document.getElementById('qlog-state').textContent), null, { timeout: 10000 }).catch(() => {});
+        check(/沒有開啟/.test(await page.textContent('#qlog-state')), '日誌：查詢紀錄預設沒開');
+        await page.click('#qlog-on');
+        await page.waitForFunction(() => /開啟中，到 .* 自動關閉/.test(document.getElementById('qlog-state').textContent), null, { timeout: 10000 }).catch(() => {});
+        check(/開啟中，到 .* 自動關閉/.test(await page.textContent('#qlog-state')), '日誌：查詢紀錄暫時開啟');
+        await page.click('#qlog-off');
+        await page.waitForFunction(() => /沒有開啟/.test(document.getElementById('qlog-state').textContent), null, { timeout: 10000 }).catch(() => {});
+        check(/沒有開啟/.test(await page.textContent('#qlog-state')), '日誌：查詢紀錄關閉');
         await shot('09-log');
 
         console.log('儀表板（共用 dashboard.js、管理 API 的完整資料）');
