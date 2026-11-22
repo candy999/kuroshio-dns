@@ -1276,3 +1276,24 @@ fn answer_txt(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
         0,
     )
 }
+
+/// 3.5.0 C4：記憶體控制「縮小診斷緩衝」關閉並釋放查詢紀錄；恢復時不自動再開
+#[tokio::test]
+async fn diag_step_frees_query_log() {
+    use kuroshio::memgov::{DiagStep, Reading, Step};
+    let (up, _) = upstream(0, answer).await;
+    let r = kuroshio::app::build_resolver(&cfg(&[up], json!({}))).unwrap();
+    r.querylog.configure(100, true);
+    assert!(r.querylog.enabled());
+    let step = DiagStep::new(r.clone());
+    let o = step.shed(&Reading::default()).await.unwrap();
+    assert!(
+        o.bytes >= (100 * kuroshio::querylog::REC_BYTES) as u64,
+        "釋出的位元組算進去：{}",
+        o.bytes
+    );
+    assert!(o.detail.contains("關閉查詢紀錄"), "{}", o.detail);
+    assert!(!r.querylog.enabled());
+    step.restore().await.unwrap();
+    assert!(!r.querylog.enabled(), "恢復時不自動再開");
+}

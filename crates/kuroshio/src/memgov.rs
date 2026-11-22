@@ -1088,7 +1088,7 @@ impl Step for DiagStep {
         "diagnostics"
     }
     fn label(&self) -> &'static str {
-        "縮小診斷緩衝（日誌、熱門排行）"
+        "縮小診斷緩衝（日誌、熱門排行、查詢紀錄）"
     }
     fn can_shed(&self) -> bool {
         !self.shed.load(Ordering::Relaxed)
@@ -1101,9 +1101,12 @@ impl Step for DiagStep {
             self.shed.store(true, Ordering::Relaxed);
             let a = crate::logring::shed(true);
             let b = self.stats.stats.shed_tops(Some(SHED_TOP_KEEP));
+            // 查詢紀錄（3.5.0）：關閉並釋放緩衝；恢復時不自動再開（暫時開啟的要使用者重新按）
+            let q = self.stats.querylog.release();
+            let ql = if q > 0 { "、關閉查詢紀錄" } else { "" };
             Ok(Outcome {
-                bytes: (a + b) as u64,
-                detail: format!("日誌 {} 行、排行前 {SHED_TOP_KEEP} 名", crate::logring::SHED_LINES),
+                bytes: (a + b) as u64 + q,
+                detail: format!("日誌 {} 行、排行前 {SHED_TOP_KEEP} 名{ql}", crate::logring::SHED_LINES),
             })
         })
     }
