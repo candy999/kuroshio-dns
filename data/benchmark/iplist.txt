@@ -4,17 +4,19 @@
 # 2026-11-22 重新整理（3.4.2）：public-dns.info 的有效名單 6,695 筆，在台灣 HiNet PPPoE 直接撥號的線路上
 #   3 輪測試（固定答案、「不存在」沒被改寫、不擋廣告／成人／惡意、不審查、DNSSEC、EDNS、TCP、丟包、延遲）。
 #   用戶線路上的開放解析器（家用路由器之類）不收；有過濾的大型 DNS 是對照組，另外列在 protected.txt。
-#   A：經營者明確，每個 ASN 最多 4 台、同一個名稱 IPv4／IPv6 各最多 2 台（anycast 業者有幾百個位址，全收會對同一家打幾百台）；
+#   A：經營者明確，每個 ASN 最多 8 台、同一個名稱 IPv4／IPv6 各最多 2 台（anycast 業者有幾百個位址，全收會對同一家打幾百台）；
 #   B：品質都過、經營者看不出來，每個 ASN 最多 1 台（同一家的位址只留一台，不對同一家打幾百台）。
 #   舊名單照同一個標準分級（品質不夠的淘汰）；不在 public-dns.info 的只收經營者明確、官方寫明不過濾、
-#   而且同一天 D3 直連評測倖存的（TWNIC、DNS4EU 不過濾版），其他等 3.5.0 重測。
-# 共 605 筆：A 39、B 566
+#   而且同一天 D3 直連評測倖存的（TWNIC、Cloudflare 1.0.0.1、DNS4EU 不過濾版），其他等 3.5.0 重測。
+# 共 631 筆：A 65、B 566
 
 # ---- A 級 ----
 # A TWNIC（台灣網路資訊中心）TW 101.101.101.101（不在 public-dns.info；D3 直連評測倖存）
 101.101.101.101
 # A TWNIC（台灣網路資訊中心）TW 101.102.103.104（不在 public-dns.info；D3 直連評測倖存）
 101.102.103.104
+# A Cloudflare（AS13335）one.one.one.one 1.0.0.1（1.1.1.1 的第二個位址）（不在 public-dns.info；D3 直連評測倖存）
+1.0.0.1
 # A DNS4EU（Whalebone，不過濾版）CZ unfiltered.joindns4.eu（不在 public-dns.info；D3 直連評測倖存）
 86.54.11.100
 # A DNS4EU（Whalebone，不過濾版）CZ unfiltered.joindns4.eu（不在 public-dns.info；D3 直連評測倖存）
@@ -33,8 +35,12 @@
 2606:4700:4700::1001
 # A Cloudflare（AS13335）? one.one.one.one 4.8 ms
 1.1.1.1
+# A NextDNS（AS34939）US ns1.nextdns.io 4.3 ms
+45.90.28.1
 # A Google_LLC（AS15169）US dns.google 7.4 ms ECS
 2001:4860:4860::8888
+# A NextDNS（AS34939）US ns2.nextdns.io 4.2 ms
+45.90.30.1
 # A CONTROLD_INC.（AS398962）CA s0.freedns.controld.com 28.1 ms
 2606:1a40:1::
 # A Google_LLC（AS15169）US dns.google 8.1 ms ECS
@@ -45,6 +51,8 @@
 76.76.2.11
 # A CONTROLD_INC.（AS398962）CA s0.freedns.controld.com 35.2 ms
 76.76.10.0
+# A CONTROLD_INC.（AS398962）CA p1.freedns.controld.com 35.5 ms
+76.76.2.1
 # A AdGuard_Software_Limited（AS212772）CY dns.adguard-dns.com 21.1 ms ECS
 94.140.14.59
 # A Cisco_OpenDNS（AS36692）US resolver2.opendns.com 31.9 ms ECS
@@ -57,14 +65,26 @@
 9.9.9.10
 # A Cisco_OpenDNS（AS36692）US resolver1.opendns.com 31.8 ms ECS
 2620:119:35::35
+# A CONTROLD_INC.（AS398962）CA s1.freedns.controld.com 51.0 ms
+2606:1a40:1::1
 # A Google_LLC（AS15169）US dns.google 12.1 ms ECS
 8.8.4.4
+# A CONTROLD_INC.（AS398962）CA p1.freedns.controld.com 57.5 ms
+2606:1a40::1
+# A NextDNS（AS34939）US dns2.nextdns.io 56.8 ms
+2a07:a8c1::
+# A CONTROLD_INC.（AS398962）CA p0.freedns.controld.com 57.3 ms
+2606:1a40::
+# A Quad9（AS19281）US dns9.quad9.net 59.7 ms
+2620:fe::9
 # A Vercara（AS12008）US rec1pubns2.ultradns.net 68.5 ms
 64.6.65.6
 # A Vercara（AS12008）US rec1pubns1.ultradns.net 31.8 ms
 64.6.64.6
 # A Google_LLC（AS15169）US dns.google 11.7 ms ECS
 8.8.8.8
+# A Quad9（AS19281）US dns10.quad9.net 51.1 ms
+2620:fe::fe:10
 # A Vercara（AS12008）US rdns1.ultradns.net 32.4 ms
 156.154.70.1
 # A Data_Communication_Business_Group（AS3462）TW dns.hinet.net 3.8 ms
@@ -81,14 +101,46 @@
 168.95.1.1
 # A Data_Communication_Business_Group（AS3462）TW dns.hinet.net 4.5 ms
 2001:b000:168::1
+# A Quad9（AS19281）US dns10.quad9.net 48.3 ms
+149.112.112.10
+# A Quad9（AS19281）US dns.quad9.net 69.0 ms
+149.112.112.112
 # A Google_LLC（AS396982）US 140.84.94.34.bc.googleusercontent.com 136.0 ms
 34.94.84.140
+# A Vercara（AS12008）US rdns2.ultradns.net 66.3 ms
+156.154.71.1
+# A AdGuard_Software_Limited（AS212772）CY unfiltered.adguard-dns.com 157.2 ms ECS
+2a10:50c0::2:ff
+# A NextDNS（AS34939）US dns2.nextdns.io 56.2 ms
+2a07:a8c1::76:4378
+# A Cisco_OpenDNS（AS36692）US resolver3.opendns.com 58.3 ms ECS
+208.67.222.220
+# A Cisco_OpenDNS（AS36692）US resolver2.opendns.com 53.7 ms ECS
+208.67.220.220
+# A Cisco_OpenDNS（AS36692）US sandbox.sse.cisco.com 50.5 ms ECS
+208.67.222.2
+# A Cisco_OpenDNS（AS36692）US sandbox.opendns.com 50.0 ms ECS
+208.67.220.2
 # A Cloudflare（AS13335）? ns2.xplornet.com 126.5 ms
 162.159.27.162
 # A CIRA_Canadian_Internet_Registration_Auth（AS40568）CA private.canadianshield.cira.ca 166.5 ms
 149.112.121.10
 # A CIRA_Canadian_Internet_Registration_Auth（AS40568）CA private.canadianshield.cira.ca 169.5 ms
 149.112.122.10
+# A AdGuard_Software_Limited（AS212772）CY unfiltered.adguard-dns.com 158.8 ms ECS
+2a10:50c0::1:ff
+# A Cloudflare（AS13335）? 4.3 ms
+172.64.37.148
+# A Cloudflare（AS13335）? 4.6 ms
+172.64.36.65
+# A Cloudflare（AS13335）? 4.2 ms
+172.64.37.231
+# A Vercara（AS12008）US 32.3 ms
+156.154.70.60
+# A Vercara（AS12008）US 63.3 ms
+156.154.71.46
+# A Vercara（AS12008）US 68.7 ms
+156.154.71.5
 
 # ---- B 級 ----
 # B Amazon.com（AS16509）US dns2.fortiguard.net 4.8 ms ECS
