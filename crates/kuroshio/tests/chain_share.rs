@@ -5,8 +5,8 @@ use kuroshio::chain::client::{Client, Reason, State, Timing};
 use kuroshio::chain::ident::NodeKey;
 use kuroshio::chain::responder::Responder;
 use kuroshio::chain::share::{
-    check_ranges, check_upstreams, FilterCopy, ShareCache, ShareSink, ShareSource, Syncer, CACHE_MAX, KIND_CDN_POOLS, KIND_CDN_RANGES,
-    KIND_UPSTREAMS,
+    check_ranges, check_upstreams, ShareCache, ShareSink, ShareSource, Syncer, CACHE_MAX, KIND_CDN_POOLS, KIND_CDN_RANGES,
+    KIND_FILTER_COPY, KIND_UPSTREAMS,
 };
 use kuroshio::resolver::Ctx;
 use kuroshio_community::chain::{self as proto, ManifestBody, Object, CHUNK};
@@ -33,8 +33,6 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 struct FakeSource {
     upstreams: Mutex<Option<Vec<u8>>>,
     cdn: Mutex<Option<kuroshio_cdn::SharedExport>>,
-    copies: Mutex<Vec<FilterCopy>>,
-    files: Mutex<HashMap<String, Vec<u8>>>,
     pressure_bad: AtomicBool,
     /// 建置時多花的時間（模擬小機器上壓縮、算雜湊很慢）
     delay_ms: std::sync::atomic::AtomicU64,
@@ -47,15 +45,6 @@ impl ShareSource for FakeSource {
     }
     fn cdn(&self) -> Option<kuroshio_cdn::SharedExport> {
         self.cdn.lock().unwrap().clone()
-    }
-    fn filter_copies(&self) -> Vec<FilterCopy> {
-        self.copies.lock().unwrap().clone()
-    }
-    fn read_copy(&self, file: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
-        let f = self.files.lock().unwrap();
-        let b = f.get(file)?;
-        let s = (offset as usize).min(b.len());
-        Some(b[s..(s + len).min(b.len())].to_vec())
     }
     fn pressure_ok(&self) -> bool {
         !self.pressure_bad.load(Ordering::SeqCst)
@@ -97,12 +86,7 @@ struct FakeSink {
     upstreams: Mutex<Option<Vec<u8>>>,
     ranges: Mutex<Option<BTreeMap<String, String>>>,
     pools: Mutex<Option<Vec<u8>>>,
-    copies: Mutex<Vec<(Object, Vec<u8>)>>,
-    want: Mutex<Result<(), &'static str>>,
-    done: AtomicUsize,
     pressure_bad: AtomicBool,
-    /// 這台的副本跟上游的一樣（3.4.2）
-    current: AtomicBool,
 }
 
 impl FakeSink {
@@ -112,11 +96,7 @@ impl FakeSink {
             upstreams: Mutex::new(None),
             ranges: Mutex::new(None),
             pools: Mutex::new(None),
-            copies: Mutex::new(Vec::new()),
-            want: Mutex::new(Ok(())),
-            done: AtomicUsize::new(0),
             pressure_bad: AtomicBool::new(false),
-            current: AtomicBool::new(false),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -146,24 +126,6 @@ impl ShareSink for FakeSink {
     fn import_cdn_v6(&self, _json: &[u8]) -> anyhow::Result<()> {
         self.note("cdn-v6");
         Ok(())
-    }
-    fn filter_copy_current(&self, _o: &Object) -> bool {
-        let c = self.current.load(Ordering::SeqCst);
-        if c {
-            self.note("copy-current");
-        }
-        c
-    }
-    fn wants_filter_copy(&self, _o: &Object) -> Result<(), &'static str> {
-        *self.want.lock().unwrap()
-    }
-    fn import_filter_copy(&self, o: &Object, compressed: Vec<u8>) -> anyhow::Result<()> {
-        self.note("filter-copy");
-        self.copies.lock().unwrap().push((o.clone(), compressed));
-        Ok(())
-    }
-    fn filter_copies_done(&self, changed: usize) {
-        self.done.fetch_add(changed, Ordering::SeqCst);
     }
     fn pressure_ok(&self) -> bool {
         !self.pressure_bad.load(Ordering::SeqCst)
@@ -497,7 +459,11 @@ async fn manifest_signed_and_objects_verify() {
     assert!(d.client.last_probe().unwrap().caps.contains(&"share".to_string()));
     let rep = s.sync_once().await;
     assert_eq!(rep.error, None, "{rep:?}");
-    assert_eq!(sink.calls(), vec!["upstreams", "cdn-ranges", "cdn-pools"], "照規格的順序");
+    assert_eq!(
+        sink.calls(),
+        vec!["upstreams", "cdn-pools", "cdn-ranges"],
+        "照規格的順序（3.4.3 起節點池在官方範圍之前）"
+    );
     // 節點池原封不動
     assert_eq!(sink.pools.lock().unwrap().as_deref(), Some(&pools_json()[..]));
     assert_eq!(
@@ -608,7 +574,7 @@ async fn tampered_chunk_rejected() {
     // 竄改停止後下一次就正常
     up.tamper.store(false, Ordering::SeqCst);
     s.sync_once().await;
-    assert_eq!(sink.calls(), vec!["upstreams", "cdn-ranges", "cdn-pools"]);
+    assert_eq!(sink.calls(), vec!["upstreams", "cdn-pools", "cdn-ranges"]);
 }
 
 #[tokio::test]
@@ -759,6 +725,11 @@ fn ranges_reject_bad_names_and_cidrs() {
     assert!(ok(json!({ "-ipv4.txt": "104.16.0.0/13" })).is_err());
     assert!(ok(json!({ "cloudflare-ipv4.txt": "not a cidr" })).is_err());
     assert!(ok(json!({ "cloudflare-ipv4.txt": "104.16.0.0/33" })).is_err());
+    // 前綴太短（整個網路都算成這家 CDN）：不收（3.4.3）
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "0.0.0.0/0" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "104.0.0.0/7" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv6.txt": "::/0" })).is_err());
+    assert!(ok(json!({ "cloudflare-ipv4.txt": "104.0.0.0/8" })).is_ok());
     assert!(ok(json!({ "cloudflare-ipv4.txt": "2606:4700::/32" })).is_err(), "家族不符");
     assert!(ok(json!({ "cloudflare-ipv4.txt": 5 })).is_err());
     assert!(ok(json!({})).is_err());
@@ -766,8 +737,17 @@ fn ranges_reject_bad_names_and_cidrs() {
 }
 
 fn saved(at: u64) -> Vec<u8> {
-    let k = |sha: &str| json!({ "sha": sha.repeat(64), "at": 1, "importedAt": at, "bytes": 10 });
+    saved_kid(at, "")
+}
+
+/// 3.4.3：紀錄帶著是哪一台上游給的（金鑰 ID）；「新鮮」只算目前綁定的那一台給的
+fn saved_kid(at: u64, kid: &str) -> Vec<u8> {
+    let k = |sha: &str| json!({ "sha": sha.repeat(64), "at": 1, "importedAt": at, "bytes": 10, "kid": kid });
     serde_json::to_vec(&json!({ "v": 1, "kinds": { "upstreams": k("a"), "cdn-pools": k("b"), "cdn-ranges": k("c") } })).unwrap()
+}
+
+fn kid_hex(c: &Client) -> String {
+    kuroshio_community::util::hex(&kuroshio_community::identity::kid_of(&c.bound_key().unwrap()))
 }
 
 #[tokio::test]
@@ -787,10 +767,18 @@ async fn jobs_skipped_only_when_fresh_and_chained() {
     // 串接中，但匯入是 37 小時前（狀態檔讀回來的）：不略過；1 小時前：略過
     let (up2, addr2) = upstream(true, src_basic(), true).await;
     let d2 = down(true, addr2).await;
-    let old = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 37 * 3600 * 1000)));
+    let kid = kid_hex(&d2.client);
+    let old = Syncer::new(
+        d2.client.clone(),
+        FakeSink::new(),
+        Some(&saved_kid(now_ms() - 37 * 3600 * 1000, &kid)),
+    );
     assert!(JOBS.iter().all(|j| !old.skip_job(j)));
-    let recent = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 3600 * 1000)));
+    let recent = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved_kid(now_ms() - 3600 * 1000, &kid)));
     assert!(JOBS.iter().all(|j| recent.skip_job(j)));
+    // 3.4.2 以前的紀錄（沒有記是哪一台）或別台給的：不算新鮮（下一次同步會重新確認）
+    let other = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&saved(now_ms() - 3600 * 1000)));
+    assert!(JOBS.iter().all(|j| !other.skip_job(j)));
     // chain 關著：不發查詢、不略過
     up2.manifests.store(0, Ordering::SeqCst);
     let d3 = down(false, addr2).await;
@@ -807,8 +795,8 @@ async fn jobs_skipped_only_when_fresh_and_chained() {
     assert!(JOBS.iter().all(|j| !na.skip_job(j)));
 }
 
-fn saved_own(at: u64, own: u64) -> Vec<u8> {
-    let mut v: serde_json::Value = serde_json::from_slice(&saved(at)).unwrap();
+fn saved_own(at: u64, own: u64, kid: &str) -> Vec<u8> {
+    let mut v: serde_json::Value = serde_json::from_slice(&saved_kid(at, kid)).unwrap();
     v["own"] = json!({ "dns-benchmark": own, "cdn-pool": own, "cdn-scan": own, "cdn-ranges": own });
     serde_json::to_vec(&v).unwrap()
 }
@@ -820,12 +808,13 @@ async fn own_jobs_still_run_every_7_days() {
     const JOBS: [&str; 4] = ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"];
     let (_up, addr) = upstream(true, src_basic(), true).await;
     let d = down(true, addr).await;
+    let kid = kid_hex(&d.client);
     let fresh = now_ms() - 3600 * 1000;
     // 自己 8 天前跑過：上游的新鮮也照樣自己跑
     let stale_own = Syncer::new(
         d.client.clone(),
         FakeSink::new(),
-        Some(&saved_own(fresh, now_ms() - 8 * 24 * 3600 * 1000)),
+        Some(&saved_own(fresh, now_ms() - 8 * 24 * 3600 * 1000, &kid)),
     );
     assert!(JOBS.iter().all(|j| !stale_own.skip_job(j)));
     // 自己跑完一次：之後略過，紀錄寫進快照
@@ -835,13 +824,17 @@ async fn own_jobs_still_run_every_7_days() {
     let snap: serde_json::Value = serde_json::from_slice(&stale_own.snapshot()).unwrap();
     assert!(snap["own"]["cdn-pool"].as_u64().unwrap() >= now_ms() - 60_000);
     // 沒有紀錄（第一次串接）：當成 6 天前跑過 → 現在略過，24 小時後到期
-    let first = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved(fresh)));
+    let first = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved_kid(fresh, &kid)));
     assert!(JOBS.iter().all(|j| first.skip_job(j)));
     let due = first.status_json()["ownRuns"]["dns-benchmark"]["dueAt"].as_u64().unwrap();
     let day = 24 * 3600 * 1000;
     assert!(due > now_ms() + day - 120_000 && due < now_ms() + day + 120_000, "{due}");
     // 時間在未來（時鐘倒退）不算跑過
-    let future = Syncer::new(d.client.clone(), FakeSink::new(), Some(&saved_own(fresh, now_ms() + 3600 * 1000)));
+    let future = Syncer::new(
+        d.client.clone(),
+        FakeSink::new(),
+        Some(&saved_own(fresh, now_ms() + 3600 * 1000, &kid)),
+    );
     assert!(JOBS.iter().all(|j| !future.skip_job(j)));
 }
 
@@ -870,6 +863,15 @@ async fn own_newer_benchmark_not_overwritten() {
     *up.custom.lock().unwrap() = Some(craft(&key, vec![(o2, zstd(&u2))]));
     s.sync_once().await;
     assert_eq!(sink.calls(), vec!["upstreams"]);
+    // 上游宣稱一個未來的時間（10 天後）：不採信，自己剛跑過的比較新，不被蓋掉（3.4.3）
+    s.note_own_run("dns-benchmark");
+    let u3 = upstreams_json("future");
+    let mut o3 = obj(KIND_UPSTREAMS, u3.len() as u64);
+    o3.at = now_ms() + 10 * 86_400_000;
+    *up.custom.lock().unwrap() = Some(craft(&key, vec![(o3, zstd(&u3))]));
+    s.sync_once().await;
+    assert_eq!(sink.calls(), vec!["upstreams"], "沒有再匯入");
+    assert_eq!(status_obj(&s, KIND_UPSTREAMS)["error"], "own-newer");
 }
 
 async fn wait_ready(c: &ShareCache) {
@@ -990,58 +992,22 @@ async fn responder_refuses_until_built() {
     assert_eq!(resp.serving_json()["share"]["requests"], 1);
 }
 
+/// 3.4.3：清單副本不再共用。舊版上游的清單裡還有 `filter-copy`：下游不抓、不列、不算錯誤，其他照常匯入
 #[tokio::test]
-async fn filter_copy_only_when_wanted() {
-    let src = Arc::new(FakeSource::default());
-    let list = "||ads.example.com^\n||track.example.net^\n".repeat(2000);
-    let z = zstd(list.as_bytes());
-    src.files.lock().unwrap().insert("copy-1".into(), z.clone());
-    *src.copies.lock().unwrap() = vec![FilterCopy {
-        url: "https://filter.example.net/list.txt".into(),
-        file: "copy-1".into(),
-        bytes: z.len() as u64,
-        raw: 0,
-        hash: 0x1234,
-        rules: 4000,
-        etag: Some("\"v1\"".into()),
-        last_modified: None,
-        at: 1_794_980_000_000,
-    }];
-    let (up, _d, s, sink) = pair(src).await;
-    *sink.want.lock().unwrap() = Err("no-room");
+async fn old_upstream_filter_copy_ignored() {
+    let (up, _d, s, sink) = pair(src_basic()).await;
+    let key = up.keypair();
+    let body = zstd(b"||ads.example.com^\n");
+    let mut fc = obj(KIND_FILTER_COPY, 19);
+    fc.name = "https://filter.example.net/list.txt".into();
+    fc.hash = "0123456789abcdef".into();
+    let u = upstreams_json("fc");
+    *up.custom.lock().unwrap() = Some(craft(&key, vec![(obj(KIND_UPSTREAMS, u.len() as u64), zstd(&u)), (fc, body)]));
     let rep = s.sync_once().await;
     assert_eq!(rep.error, None);
-    assert_eq!(rep.chunks, 0);
-    assert_eq!(up.chunks.load(Ordering::SeqCst), 0);
-    let o = status_obj(&s, "filter-copy");
-    assert_eq!(o["error"], "no-room");
-    assert_eq!(o["name"], "https://filter.example.net/list.txt");
-    assert_eq!(o["fresh"], false);
-    assert!(o["importedAt"].is_null());
-    assert!(sink.calls().is_empty());
-    assert_eq!(sink.done.load(Ordering::SeqCst), 0);
-    // 留得下：抓回來原樣交給匯入端，抓完叫一次重建
-    *sink.want.lock().unwrap() = Ok(());
-    let rep = s.sync_once().await;
-    assert_eq!(rep.error, None);
-    assert_eq!(sink.calls(), vec!["filter-copy"]);
-    let (o, body) = sink.copies.lock().unwrap()[0].clone();
-    assert_eq!(body, z, "壓縮後的內容原樣存成副本");
-    assert_eq!(o.raw, list.len() as u64);
-    assert_eq!(o.rules, 4000);
-    assert_eq!(o.etag, "\"v1\"");
-    assert_eq!(o.hash.len(), 16);
-    assert_eq!(sink.done.load(Ordering::SeqCst), 1);
-    // 匯入之後這台有一樣的內容（正式的匯入端看本機副本或記憶體裡的）：不重抓
-    sink.current.store(true, Ordering::SeqCst);
-    let rep = s.sync_once().await;
-    assert_eq!(rep.chunks, 0);
-    assert_eq!(sink.done.load(Ordering::SeqCst), 1);
-    // 內容不見了（例如只留在記憶體、重新啟動過）：雜湊一樣也照樣重抓（3.4.2）
-    sink.current.store(false, Ordering::SeqCst);
-    let rep = s.sync_once().await;
-    assert!(rep.chunks > 0, "{rep:?}");
-    assert_eq!(sink.done.load(Ordering::SeqCst), 2);
+    assert_eq!(sink.calls(), vec!["upstreams"]);
+    assert_eq!(rep.chunks, 1, "只抓評測結果那一段，清單副本不抓");
+    assert!(status_obj(&s, KIND_FILTER_COPY).is_null(), "不列在狀態裡");
 }
 
 #[tokio::test]
@@ -1093,28 +1059,25 @@ fn persister(dir: &std::path::Path) -> Arc<Mutex<kuroshio::persist::Persister>> 
     Arc::new(Mutex::new(p))
 }
 
-fn live(dir: &std::path::Path, filter: Arc<kuroshio::filtering::FilterService>) -> Arc<kuroshio::chain::share::Live> {
+fn live(dir: &std::path::Path) -> Arc<kuroshio::chain::share::Live> {
     let cfg = kuroshio_config::with_overrides(&json!({ "upstream": { "pinned": ["udp://192.0.2.53"], "fallback": [] } }));
     Arc::new(kuroshio::chain::share::Live {
         mgr: Arc::new(kuroshio::upstreams::Manager::new(&cfg, dir.join("state").join("upstreams.json"))),
         cdn: None,
-        filter: Some(filter),
         seed_upstreams: dir.join("no-seed.json"),
         max_per_provider: 48,
+        min_auto: 3,
     })
 }
 
-/// 過濾清單副本（兩邊都是正式的 `Live`）：上游下載過、留了副本 → 下游不下載，拿副本建過濾器；
-/// 6 小時內的更新也不下載（當成 304）；上游的副本不整份讀進記憶體（分段時才從檔案讀）
+/// 3.4.3：正式的上游（`Live`）有本機清單副本也不列進共用清單：每台黑潮自己跟清單網址下載
 #[tokio::test]
-async fn filter_copy_end_to_end_with_live() {
-    use kuroshio::resolver::FilterCheck;
-    let body: String = (0..3000).map(|i| format!("||ads{i}.example.com^\n")).collect();
+async fn live_upstream_does_not_offer_filter_copies() {
+    let body: String = (0..300).map(|i| format!("||ads{i}.example.com^\n")).collect();
     let (srv, downloads) = list_server(body).await;
     let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
         { "name": "A", "url": format!("http://{srv}/a.txt"), "category": "ads" }
     ] } }));
-    // 上游：下載一次、留副本、寫到磁碟
     let ud = tmpdir("fc-up");
     let up_p = persister(&ud.0);
     let fu = kuroshio::filtering::FilterService::from_cfg(&cfg, &ud.0).unwrap();
@@ -1122,163 +1085,20 @@ async fn filter_copy_end_to_end_with_live() {
     assert!(fu.update_lists(false).await.unwrap());
     up_p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
     assert_eq!(downloads.load(Ordering::SeqCst), 1);
-    assert_eq!(fu.shared_copies().len(), 1);
-    let (_up, addr) = upstream(true, Arc::new(FakeSource::default()), false).await;
-    let cache = Arc::new(ShareCache::new(live(&ud.0, fu.clone())));
+    let up_state = ud.0.join("state").join("upstreams.json");
+    std::fs::create_dir_all(up_state.parent().unwrap()).unwrap();
+    std::fs::write(&up_state, upstreams_json("live")).unwrap();
+    let (up, addr) = upstream(true, Arc::new(FakeSource::default()), false).await;
+    let cache = Arc::new(ShareCache::new(live(&ud.0)));
     cache.rebuild_now(now_ms());
-    _up.resp.set_share(cache);
-    // 下游：沒有任何副本
-    let dd = tmpdir("fc-down");
-    let fd = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
-    fd.set_copies(persister(&dd.0));
+    up.resp.set_share(cache);
     let d = down(true, addr).await;
-    assert!(d.client.is_chained());
-    let s = Syncer::new(d.client.clone(), live(&dd.0, fd.clone()), None);
+    let sink = FakeSink::new();
+    let s = Syncer::new(d.client.clone(), sink.clone(), None);
     let rep = s.sync_once().await;
-    assert_eq!(rep.error, None, "{rep:?}");
-    assert_eq!(rep.imported, vec![format!("filter-copy http://{srv}/a.txt")]);
-    // 背景重建：等它建好
-    for _ in 0..200 {
-        if fd.check("ads2999.example.com", 1).is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(fd.check("ads2999.example.com", 1).unwrap().block, "用上游給的副本建好");
-    assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
-    let m = fd.copies().unwrap().meta(&format!("http://{srv}/a.txt")).unwrap();
-    assert_eq!(m.rules, 3000);
-    assert_eq!(m.etag.as_deref(), Some("\"v1\""));
-    // 下游自己的定時更新：6 小時內拿到的副本這一輪不下載
-    assert!(!fd.update_lists(false).await.unwrap());
-    assert_eq!(downloads.load(Ordering::SeqCst), 1);
-    // 不在下游清單裡的網址：不抓
-    let cfg2 = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
-        { "name": "B", "url": "http://198.51.100.1/other.txt", "category": "ads" }
-    ] } }));
-    let fo = kuroshio::filtering::FilterService::from_cfg(&cfg2, &dd.0).unwrap();
-    fo.set_copies(persister(&dd.0));
-    let s2 = Syncer::new(d.client.clone(), live(&dd.0, fo), None);
-    let rep = s2.sync_once().await;
-    assert_eq!(rep.chunks, 0);
-    assert_eq!(status_obj(&s2, "filter-copy")["error"], "not-subscribed");
-}
-
-/// 3.4.2：下游存不下清單副本（D3 的狀態分割區只有 7.5 MB）時，從上游拿到的副本留在記憶體、用它建過濾器，
-/// 不從網路下載；本機索引還記著、但檔案已經被刪掉的副本，不能當成「跟上游一樣、不用傳」
-#[tokio::test]
-async fn filter_copy_held_in_memory_when_no_room() {
-    use kuroshio::resolver::FilterCheck;
-    let body: String = (0..3000).map(|i| format!("||ads{i}.example.com^\n")).collect();
-    let (srv, downloads) = list_server(body).await;
-    let url = format!("http://{srv}/a.txt");
-    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
-        { "name": "A", "url": url, "category": "ads" }
-    ] } }));
-    let ud = tmpdir("held-up");
-    let up_p = persister(&ud.0);
-    let fu = kuroshio::filtering::FilterService::from_cfg(&cfg, &ud.0).unwrap();
-    fu.set_copies(up_p.clone());
-    assert!(fu.update_lists(false).await.unwrap());
-    up_p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
-    assert_eq!(downloads.load(Ordering::SeqCst), 1);
-    let (_up, addr) = upstream(true, Arc::new(FakeSource::default()), false).await;
-    let cache = Arc::new(ShareCache::new(live(&ud.0, fu.clone())));
-    cache.rebuild_now(now_ms());
-    _up.resp.set_share(cache);
-
-    // 下游：以前存過同一份副本（索引還在），但檔案被刪了，而且現在空間不夠
-    let dd = tmpdir("held-down");
-    let dp = persister(&dd.0);
-    let fd0 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
-    fd0.set_copies(dp.clone());
-    let s0 = Syncer::new(down(true, addr).await.client.clone(), live(&dd.0, fd0.clone()), None);
-    assert_eq!(s0.sync_once().await.error, None);
-    // 背景的重建（用剛拿到的副本）做完，再模擬副本檔被刪
-    for _ in 0..200 {
-        if fd0.check("ads2999.example.com", 1).is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(fd0.check("ads2999.example.com", 1).is_some());
-    dp.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
-    let file = fd0.copies().unwrap().meta(&url).unwrap().file;
-    std::fs::remove_file(dp.lock().unwrap().file_path(&file)).unwrap();
-    let small = {
-        let mut p = kuroshio::persist::Persister::new(
-            dd.0.join("state"),
-            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
-        );
-        p.set_free_probe(|_| Some(1 << 20));
-        Arc::new(Mutex::new(p))
-    };
-    // 重新啟動
-    let fd = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
-    fd.set_copies(small);
-    assert!(fd.copies().unwrap().meta(&url).is_some(), "索引還記著");
-    assert!(!fd.build_from_copies().await, "檔案不在：沒有副本可建");
-    let d = down(true, addr).await;
-    let s = Syncer::new(d.client.clone(), live(&dd.0, fd.clone()), None);
-    let rep = s.sync_once().await;
-    assert_eq!(rep.error, None, "{rep:?}");
-    assert_eq!(rep.imported, vec![format!("filter-copy {url}")], "檔案不在：照樣跟上游拿");
-    for _ in 0..200 {
-        if fd.check("ads2999.example.com", 1).is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(fd.check("ads2999.example.com", 1).unwrap().block, "用記憶體裡的副本建好");
-    assert_eq!(fd.stats()["heldCopies"]["count"], 1);
-    // 之後的定時更新與重建：都不從網路下載
-    assert!(!fd.update_lists(false).await.unwrap());
-    fd.rebuild_from_copies().await.unwrap();
-    assert!(fd.check("ads2999.example.com", 1).unwrap().block);
-    assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
-
-    // 再重新啟動一次：記憶體裡的副本不見了，但 chain-share.json 還記著同一個雜湊
-    // → 還是要跟上游拿（以前「雜湊沒變不重抓」，改從網路下載；padavan-tw 3.4.2 最後一輪：10.2 MB）
-    let saved = s.snapshot();
-    let small2 = {
-        let mut p = kuroshio::persist::Persister::new(
-            dd.0.join("state"),
-            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
-        );
-        p.set_free_probe(|_| Some(1 << 20));
-        Arc::new(Mutex::new(p))
-    };
-    let fr = kuroshio::filtering::FilterService::from_cfg(&cfg, &dd.0).unwrap();
-    fr.set_copies(small2);
-    assert_eq!(fr.stats()["heldCopies"]["count"], 0);
-    // 測試裡同一個上游短時間內不接受一直換身分、重複傳輸（防濫用）：換一個內容相同的上游（雜湊相同）
-    let (up2, addr2) = upstream(true, Arc::new(FakeSource::default()), false).await;
-    let cache2 = Arc::new(ShareCache::new(live(&ud.0, fu.clone())));
-    cache2.rebuild_now(now_ms());
-    up2.resp.set_share(cache2);
-    let d2 = down(true, addr2).await;
-    let s2 = Syncer::new(d2.client.clone(), live(&dd.0, fr.clone()), Some(&saved));
-    let rep = s2.sync_once().await;
-    assert_eq!(rep.error, None, "{rep:?}");
-    assert_eq!(
-        rep.imported,
-        vec![format!("filter-copy {url}")],
-        "重新啟動後記憶體裡沒有：照樣跟上游拿"
-    );
-    for _ in 0..200 {
-        if fr.check("ads2999.example.com", 1).is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(fr.check("ads2999.example.com", 1).unwrap().block);
-    assert_eq!(fr.stats()["heldCopies"]["count"], 1);
-    let sha = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap()["kinds"][format!("filter-copy {url}")]["sha"].clone();
-    assert_eq!(sha(&saved), sha(&s2.snapshot()), "雜湊跟重新啟動前記的一樣（以前會因此不重抓）");
-    // 同一次執行裡再同步：記憶體裡有一樣的，不再傳
-    let rep = s2.sync_once().await;
-    assert!(rep.imported.is_empty(), "{rep:?}");
-    assert_eq!(downloads.load(Ordering::SeqCst), 1, "下游沒有自己下載");
+    assert_eq!(rep.error, None);
+    assert_eq!(sink.calls(), vec!["upstreams"], "只有評測結果，沒有清單副本");
+    assert!(status_obj(&s, KIND_FILTER_COPY).is_null());
 }
 
 /// 3.4.2 Windows 壓力測試：單獨運作、存不了副本（記憶體恢復途中、空間不夠）時，下載到的清單留在記憶體；
@@ -1366,6 +1186,11 @@ async fn held_list_persisted_when_room_returns() {
     f2.set_copies(pers.clone());
     assert!(f2.build_from_copies().await);
     assert_eq!(downloads.load(Ordering::SeqCst), 1, "重新啟動不再下載");
+    // 存成副本時記了下載時間當「上次檢查」：重新啟動後照更新間隔檢查，不是一分鐘後就整份問一次（3.4.3，Windows 複驗 G3）
+    assert!(
+        f2.first_check_delay(kuroshio::persist::now_secs()).is_some(),
+        "留在記憶體再存成的副本也要記上次檢查時間"
+    );
 }
 
 /// 正式的匯入端：評測結果寫到 `upstream.autoStateFile`、Manager 重讀（明文拿掉），`autoUpstreams.source` 是 chain；
@@ -1388,9 +1213,9 @@ async fn live_upstreams_import_and_source() {
     let l = kuroshio::chain::share::Live {
         mgr: mgr.clone(),
         cdn: None,
-        filter: None,
         seed_upstreams: dd.0.join("seed.json"),
         max_per_provider: 48,
+        min_auto: 3,
     };
     let j = check_upstreams(&upstreams_json("live"), &[1; 8], 5).unwrap();
     std::thread::sleep(Duration::from_millis(20));
@@ -1412,9 +1237,23 @@ async fn live_upstreams_import_and_source() {
     std::fs::copy(&state, dd.0.join("seed.json")).unwrap();
     assert!(ShareSource::upstreams(&l).is_none());
     assert!(ShareSource::cdn(&l).is_none());
-    assert!(ShareSource::filter_copies(&l).is_empty());
     // 沒有 CDN：節點池匯入失敗（不會被當成匯入過）
     assert!(ShareSink::import_cdn_pools(&l, &pools_json()).is_err());
+    // 照這台的設定（只用 DoQ）一台都不能用：不匯入、不算新鮮，自己的評測照排程跑（3.4.3）
+    let cfg2 = kuroshio_config::with_overrides(&json!({ "upstream": { "pinned": [], "fallback": [], "autoTypes": ["doq"] } }));
+    let state2 = dd.0.join("state").join("upstreams-doq.json");
+    let mgr2 = Arc::new(kuroshio::upstreams::Manager::new(&cfg2, state2.clone()));
+    let l2 = kuroshio::chain::share::Live {
+        mgr: mgr2,
+        cdn: None,
+        seed_upstreams: dd.0.join("seed.json"),
+        max_per_provider: 48,
+        min_auto: 3,
+    };
+    let j = check_upstreams(&upstreams_json("doq"), &[1; 8], 5).unwrap();
+    let e = ShareSink::import_upstreams(&l2, j).unwrap_err().to_string();
+    assert!(e.contains("not-usable"), "{e}");
+    assert!(!state2.exists(), "沒有寫進評測結果");
 }
 
 /// 真的服務當上游（評測結果在快照目錄、不是種子）：auth 公告 share、下游拿得到評測結果；
@@ -1461,38 +1300,6 @@ async fn app_upstream_serves_benchmark_and_status() {
     assert_eq!(auto["source"], "benchmark");
 }
 
-/// 3.4.2：這台的副本跟上游的一樣（重新啟動後第一次同步）：不再傳一次，但每次同步都標成「剛從上游確認過」
-/// （清單更新那一輪才不會改從網路下載）
-#[tokio::test]
-async fn current_filter_copy_marked_without_transfer() {
-    let src = Arc::new(FakeSource::default());
-    let z = zstd("||ads.example.com^\n".repeat(500).as_bytes());
-    src.files.lock().unwrap().insert("copy-1".into(), z.clone());
-    *src.copies.lock().unwrap() = vec![FilterCopy {
-        url: "https://filter.example.net/list.txt".into(),
-        file: "copy-1".into(),
-        bytes: z.len() as u64,
-        raw: 0,
-        hash: 0x1234,
-        rules: 500,
-        etag: None,
-        last_modified: None,
-        at: 1_794_980_000_000,
-    }];
-    let (up, _d, s, sink) = pair(src).await;
-    sink.current.store(true, Ordering::SeqCst);
-    let rep = s.sync_once().await;
-    assert_eq!(rep.error, None);
-    assert_eq!((rep.chunks, up.chunks.load(Ordering::SeqCst)), (0, 0), "一樣的副本不再傳");
-    assert_eq!(sink.calls(), vec!["copy-current"]);
-    assert_eq!(status_obj(&s, "filter-copy")["fresh"], true);
-    assert_eq!(sink.done.load(Ordering::SeqCst), 0, "沒有新副本：不重建");
-    // 下一次同步（雜湊還是一樣）：照樣再標一次
-    s.sync_once().await;
-    assert_eq!(sink.calls(), vec!["copy-current", "copy-current"]);
-    assert!(!s.never_synced());
-}
-
 /// 3.4.2 Windows 複驗 G1：一份清單都還沒有（開機就記憶體不足、清單延後）時，記憶體控制不做「暫停全部清單」：
 /// 省不到記憶體，卻會讓記憶體恢復後的第一次更新什麼都不做（以前要等記憶體控制恢復這一步，9 分鐘才有清單）
 #[tokio::test]
@@ -1506,4 +1313,39 @@ async fn protected_step_not_shed_without_lists() {
     assert_eq!(f.list_rules(), 0);
     let step = kuroshio::memgov::ProtectedStep { filter: f.clone() };
     assert!(!step.can_shed(), "沒有清單：不暫停");
+}
+
+/// 3.4.3：因為「上游不可信」（抽查不通過）解除串接：請排程器補跑評測、CDN 範圍與節點池（以前只在評測結果
+/// 超過 48 小時時補跑評測，不可信的上游給的範圍與節點池照用到自己的排程）
+#[tokio::test]
+async fn distrust_release_requests_own_jobs() {
+    let (_up, d, s, _sink) = pair(src_basic()).await;
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let a2 = asked.clone();
+    s.set_on_stale(Arc::new(move |jobs: &[&str]| {
+        a2.lock().unwrap().extend(jobs.iter().map(|j| j.to_string()));
+    }));
+    assert_eq!(s.sync_once().await.error, None);
+    d.client.audit_failed();
+    for _ in 0..50 {
+        if !asked.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(*asked.lock().unwrap(), vec!["dns-benchmark", "cdn-ranges", "cdn-pool"]);
+}
+
+/// 3.4.3：「新鮮」只算目前綁定的那一台上游給的；換成另一台（另一把金鑰）的上游，舊上游給的資料不能再讓這台略過自己的工作
+#[tokio::test]
+async fn freshness_bound_to_upstream_key() {
+    let (_up, d, s, _sink) = pair(src_basic()).await;
+    assert_eq!(s.sync_once().await.error, None);
+    assert!(s.fresh(KIND_UPSTREAMS));
+    // 另一台上游（另一把金鑰）
+    let (_up2, addr2) = upstream(true, src_basic(), true).await;
+    let d2 = down(true, addr2).await;
+    let s2 = Syncer::new(d2.client.clone(), FakeSink::new(), Some(&s.snapshot()));
+    assert!(!s2.fresh(KIND_UPSTREAMS), "舊上游給的紀錄：對新上游不算新鮮");
+    drop(d);
 }

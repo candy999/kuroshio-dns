@@ -189,7 +189,7 @@ impl Cdn {
             if let Some(h) = self.hints() {
                 for x in &hinted {
                     if let Some(ok) = x.result {
-                        h.hint_result(&x.from, ok);
+                        h.hint_result(&x.from, crate::cdn::HintKind::Site, ok);
                     }
                 }
             }

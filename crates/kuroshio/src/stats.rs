@@ -102,6 +102,8 @@ struct Day {
     backfill_mismatch: u64,
     /// 串接中：上游黑潮擋掉、下游自己的過濾沒擋，改用自己的加密上游解析的次數（3.4.2）
     chain_bypass: u64,
+    /// 串接中：上游黑潮解析不到（SERVFAIL）、改用自己的上游解析到的次數（3.4.3）
+    chain_retry: u64,
     lat_hit: Histogram,
     lat_miss: Histogram,
     cdn_served: u64,
@@ -356,6 +358,8 @@ pub enum Kind {
     BackfillMismatch,
     /// 上游黑潮擋、下游自己解析（3.4.2）
     ChainBypass,
+    /// 上游黑潮解析不到、下游自己解析到（3.4.3）
+    ChainRetry,
 }
 
 impl Default for Stats {
@@ -459,6 +463,7 @@ impl Day {
             "stale": d.stale, "prefetch": d.prefetch,
             "backfill": d.backfill, "backfillMismatch": d.backfill_mismatch,
             "chainBypass": d.chain_bypass,
+            "chainRetry": d.chain_retry,
             "hitRate": if d.hit + d.miss > 0 { json!((d.hit as f64 * 1000.0 / (d.hit + d.miss) as f64).round() / 10.0) } else { Value::Null },
             "latency": { "hit": d.lat_hit.json(), "miss": d.lat_miss.json() }
         })
@@ -542,6 +547,7 @@ impl Day {
             backfill: n("backfill"),
             backfill_mismatch: n("backfillMismatch"),
             chain_bypass: n("chainBypass"),
+            chain_retry: n("chainRetry"),
             lat_hit: Histogram::from_json(v.get("latHit")),
             lat_miss: Histogram::from_json(v.get("latMiss")),
             cdn_served: n("cdnServed"),
@@ -573,6 +579,7 @@ impl Day {
         self.backfill += o.backfill;
         self.backfill_mismatch += o.backfill_mismatch;
         self.chain_bypass += o.chain_bypass;
+        self.chain_retry += o.chain_retry;
         for i in 0..12 {
             self.lat_hit.counts[i] += o.lat_hit.counts[i];
             self.lat_miss.counts[i] += o.lat_miss.counts[i];
@@ -773,6 +780,7 @@ impl Stats {
                 Kind::Backfill => d.backfill += 1,
                 Kind::BackfillMismatch => d.backfill_mismatch += 1,
                 Kind::ChainBypass => d.chain_bypass += 1,
+                Kind::ChainRetry => d.chain_retry += 1,
             }
             if let Kind::Query = k {
                 i.minute(Self::now_min()).q += 1;

@@ -107,7 +107,7 @@ impl Community {
                 "outgoing": count(&|p| p.rel == Rel::Out), "blocked": count(&|p| p.my_block),
                 "pendingKeys": count(&|p| p.pending_key.is_some()),
             },
-            "hints": { "domains": site_keys.len(), "cross": cross_keys.len(), "nodes": nodes, "upstreams": crate::client::upstream_ids(&st).len() },
+            "hints": { "domains": site_keys.len(), "cross": cross_keys.len(), "nodes": nodes, "upstreams": crate::client::upstream_ids(&st, cfg.use_upstreams).len() },
             "share": { "epoch": hex(&st.share.epoch), "seq": st.share.seq, "records": st.share.len() },
             // 邀請碼本身只在 /api/community/invite 給
             "invite": { "createdAt": invite_at },

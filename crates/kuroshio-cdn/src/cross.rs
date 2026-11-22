@@ -11,7 +11,7 @@
 //!
 //! 成功就記在網域資料庫（cross4），之後直接使用；每天複驗一次。
 
-use crate::cdn::Cdn;
+use crate::cdn::{Cdn, HintIp, HintKind};
 use crate::db::{Cross, Tried};
 use crate::providers::{self, hv, Headers};
 use crate::util::{self, intern, now_ms, Num, DAY_MS, HOUR_MS};
@@ -132,9 +132,55 @@ pub fn cross_broken(target: &str, r: &ProbeResult) -> Option<String> {
     None
 }
 
+/// 好友的跨 CDN 提示最多多加幾個 IP（每個都要連一次）
+const MAX_CROSS_HINTS: usize = 2;
+
+/// 好友提示的一個 IP 在本機的處理結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintUse {
+    /// 通過本機的檢查、排進候選（之後照常連線驗證）
+    Try,
+    /// 一定是錯的資料：位址家族不符（跨 CDN 只用 IPv4）、不在那家 CDN 的官方範圍
+    Bad,
+    /// 本機沒辦法確認（不在我的節點池、不在我自己解析到的 Akamai 節點裡，或超過上限）：不試、不計分
+    Skip,
+}
+
+/// 好友的跨 CDN 提示只能「排序、補充」自己的候選，不能取代：
+/// `check` 判斷每個提示的 IP（[`HintUse`]），通過的最多 [`MAX_CROSS_HINTS`] 個排在最前面，
+/// 後面接自己全部的候選（一個都不拿掉）。回傳（要試的 IP, 每個提示的處理結果）
+pub(crate) fn merge_cross_hint(own: Vec<IpAddr>, hint: &[HintIp], check: impl Fn(IpAddr) -> HintUse) -> (Vec<IpAddr>, Vec<HintUse>) {
+    let mut out: Vec<IpAddr> = Vec::new();
+    let mut uses = Vec::with_capacity(hint.len());
+    for x in hint {
+        let u = match check(x.ip) {
+            HintUse::Try if out.contains(&x.ip) || own.contains(&x.ip) => {
+                if !out.contains(&x.ip) {
+                    out.push(x.ip);
+                }
+                HintUse::Try
+            }
+            HintUse::Try if out.iter().filter(|ip| !own.contains(ip)).count() < MAX_CROSS_HINTS => {
+                out.push(x.ip);
+                HintUse::Try
+            }
+            HintUse::Try => HintUse::Skip,
+            u => u,
+        };
+        uses.push(u);
+    }
+    for ip in own {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    (out, uses)
+}
+
 impl Cdn {
-    /// 某家 CDN 的候選台灣節點
-    async fn target_ips(&self, target: &str, name: &str) -> Vec<IpAddr> {
+    /// 某家 CDN 的候選台灣節點：（先試的, 好友提示可以採用的範圍）。
+    /// 好友提示的範圍：Akamai 是這台自己帶台灣網段解析、量過延遲的全部節點；其他家不用（看節點池）
+    async fn target_ips(&self, target: &str, name: &str) -> (Vec<IpAddr>, Vec<IpAddr>) {
         if target == "akamai" {
             // 網站有放在 Akamai 才會有 <網域>.edgekey.net / .edgesuite.net；帶台灣網段去問，拿台灣節點
             let subnets: Vec<String> = self.ecs_subnets().into_iter().take(2).collect();
@@ -147,7 +193,7 @@ impl Cdn {
                 };
                 for s in list {
                     let ips = self.resolve_with_ecs(&edge, rtype::A, s).await;
-                    for ip in &ips {
+                    for ip in ips.iter().filter(|ip| ip.is_ipv4()) {
                         if !out.contains(ip) {
                             out.push(*ip);
                         }
@@ -161,24 +207,24 @@ impl Cdn {
                 }
             }
             if out.is_empty() {
-                return vec![];
+                return (vec![], vec![]);
             }
             let max = self.cfg.cross.akamai_max_ms;
-            return self
+            let good: Vec<IpAddr> = self
                 .net
                 .rank(&out)
                 .await
                 .into_iter()
                 .filter(|(_, l)| l.ok && l.ms <= max)
-                .take(2)
                 .map(|x| x.0)
                 .collect();
+            return (good.iter().take(2).copied().collect(), good);
         }
         let st = self.state();
         if !st.pools.has(target) {
-            return vec![];
+            return (vec![], vec![]);
         }
-        st.pools.serve_ips(target, 4).into_iter().take(2).collect()
+        (st.pools.serve_ips(target, 4).into_iter().take(2).collect(), vec![])
     }
 
     /// 探索（同 2.x `CrossCdn.explore`）：回傳 ok / fail / none
@@ -223,21 +269,40 @@ impl Cdn {
             order.retain(|t| *t != h.to);
             order.insert(0, TARGETS.iter().find(|t| **t == h.to).unwrap());
         }
+        // 每個提示 IP 的處理結果（輪到提示的那一家時才填）
+        let mut hint_uses: Vec<HintUse> = Vec::new();
         for to in order {
             if to == from {
                 continue;
             }
             let prov = providers::get(to);
-            let mut ips = self.target_ips(to, name).await;
+            let (mut ips, akamai_ok) = self.target_ips(to, name).await;
             if let Some(h) = hint.as_ref().filter(|h| h.to == to) {
-                let mut l: Vec<IpAddr> = h.ips.iter().map(|x| x.ip).collect();
-                for ip in ips {
-                    if !l.contains(&ip) {
-                        l.push(ip);
+                // 好友給的只是候選：本機確認過才排進來，而且只排序、補充自己的候選。
+                // Akamai：一定要是這台自己帶台灣網段解析到的節點（沒有 Akamai 設定就一個都不收）；
+                // 其他家：一定要在官方範圍內、而且在我的節點池可用（不然驗證通過也回不出去）
+                let st = self.state();
+                let check = |ip: IpAddr| {
+                    if !ip.is_ipv4() {
+                        HintUse::Bad
+                    } else if to == "akamai" {
+                        if akamai_ok.contains(&ip) {
+                            HintUse::Try
+                        } else {
+                            HintUse::Skip
+                        }
+                    } else if !st.pools.in_ranges(to, ip) {
+                        HintUse::Bad
+                    } else if st.pools.usable(to, ip) {
+                        HintUse::Try
+                    } else {
+                        HintUse::Skip
                     }
-                }
-                l.truncate(3);
-                ips = l;
+                };
+                let (merged, uses) = merge_cross_hint(ips, &h.ips, check);
+                drop(st);
+                ips = merged;
+                hint_uses = uses;
             }
             if ips.is_empty() {
                 tried.push(Tried {
@@ -309,10 +374,15 @@ impl Cdn {
             ok_list.push((to.to_string(), pass, q.ms));
         }
         ok_list.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        // 好友提示的命中率：試過的照結果算，一定錯的（家族不符、範圍外）算沒命中，本機沒辦法確認的不算
         if let (Some(h), Some(hs)) = (hint.as_ref(), self.hints()) {
             let passed: Vec<IpAddr> = ok_list.iter().find(|o| o.0 == h.to).map(|o| o.1.clone()).unwrap_or_default();
-            for x in &h.ips {
-                hs.hint_result(&x.from, passed.contains(&x.ip));
+            for (x, u) in h.ips.iter().zip(&hint_uses) {
+                match u {
+                    HintUse::Try => hs.hint_result(&x.from, HintKind::Cross, passed.contains(&x.ip)),
+                    HintUse::Bad => hs.hint_result(&x.from, HintKind::Cross, false),
+                    HintUse::Skip => {}
+                }
             }
         }
         let min_gain = self.cfg.nearest_min_gain_ms;

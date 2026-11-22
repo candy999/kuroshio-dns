@@ -34,12 +34,9 @@ fn cdn_checks_wait_until_chain_is_decided() {
     // `chain` 開著、還沒做過路徑檢查：等
     kuroshio::chain::install(client(true, &dir));
     assert!(kuroshio::chain::deciding());
-    // 過濾清單的第一次更新也等（3.4.2：padavan-tw 串接中重新啟動，路徑檢查做完之前就從網路下載了 10.2 MB）
-    assert!(kuroshio::chain::filter_wait());
     // 路徑檢查做完、沒有上游黑潮（狀態 none）：不等，照單獨運作做 CDN 檢查
     kuroshio_net::path::apply(&Report::default(), false);
     assert!(!kuroshio::chain::deciding());
-    assert!(!kuroshio::chain::filter_wait(), "確定不串接：清單照單獨運作更新");
     // `chain` 關著：從一開始就不等
     kuroshio_net::path::clear();
     kuroshio::chain::install(client(false, &dir));

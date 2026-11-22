@@ -45,7 +45,7 @@ function quality(p) {
 
 // 瀏覽器快取：LuCI 用固定的 ?v=（LuCI 本身的版本）載入外掛的檔案，升級黑潮之後瀏覽器可能還拿到舊的 common.js，
 // 新功能就會按了沒反應。版本對不上時重新下載本外掛的所有檔案（更新瀏覽器快取）再重新整理一次；還是對不上就提示
-var BUILD = '3.4.2';
+var BUILD = '3.4.4';
 if (common.build !== BUILD) (function() {
 	var key = 'kuroshio-ui-refresh-' + BUILD;
 	var v = L.env.resource_version ? '?v=' + L.env.resource_version : '';
@@ -338,12 +338,14 @@ return view.extend({
 		o.rmempty = false;
 		o = common.flag(s, null, 'share_domains', _('分享網站驗證結果'), 'community.shareDomains', _('只分享網域雜湊，不公開網站名稱。'));
 		o = common.flag(s, null, 'share_upstreams', _('分享上游 DNS'), 'community.shareUpstreams', _('好友收到後只當每日評測的候選。'));
+		o = common.flag(s, null, 'use_hints', _('使用好友的 CDN 資料'), 'community.useHints', _('好友給的網站驗證結果、跨 CDN 結果、台灣節點只當候選，本機驗證通過才使用。關掉 = 只靠自己找。'));
+		o = common.flag(s, null, 'use_upstreams', _('使用好友的上游 DNS'), 'community.useUpstreams', _('好友給的上游只當每日評測的候選（合計最多 100 個），照常經過汙染、封殺、速度檢查。'));
 		common.num(s, null, 'stale_days', _('好友幾天連不上就自動刪除'), 'community.staleDays');
 		if (pro) {
 			common.num(s, null, 'reject_days', _('拒絕後幾天才能再請求'), 'community.rejectDays');
 			common.num(s, null, 'sync_interval', _('多久向好友拉一次資料（分鐘）'), 'community.syncIntervalMin');
 			common.num(s, null, 'max_friends', _('好友數上限'), 'community.maxFriends', _('達到上限後，自動同意的請求改成人工審核。'));
-			common.num(s, null, 'min_hit_rate', _('命中率下限'), 'community.minHitRate', _('好友給的資料在我這邊驗證成功的比例（0～1）。0 = 不檢查。'), 'range(0,1)');
+			common.num(s, null, 'min_hit_rate', _('命中率下限'), 'community.minHitRate', _('好友給的資料在我這邊驗證成功的比例（0～1），試過 20 次以上還低於下限就暫停採用那一種資料，每 3 天重試一小批。預設 0.3；0 = 不檢查。'), 'range(0,1)');
 			common.flag(s, null, 'auto_delete_low_hit_rate', _('命中率太低時自動刪除好友'), 'community.autoDeleteLowHitRate', _('試過 20 次以上還低於命中率下限就自動刪除。'));
 			common.num(s, null, 'pow_bits', _('好友請求的工作量證明難度'), 'community.powBits', _('越高越難灌請求，但對方送請求也越久。'));
 		}

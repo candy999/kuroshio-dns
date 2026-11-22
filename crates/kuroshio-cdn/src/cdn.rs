@@ -57,6 +57,9 @@ impl Paths {
     }
 }
 
+/// 好友同步一次最多放進候選名單幾個節點（每家 CDN、每個家族；同分享檔）
+pub const FRIEND_MAX_NODES: usize = 500;
+
 /// 社群提示：好友驗證過的 IP
 #[derive(Debug, Clone, PartialEq)]
 pub struct HintIp {
@@ -71,10 +74,19 @@ pub struct CrossHint {
     pub ips: Vec<HintIp>,
 }
 
+/// 提示的種類（命中率分開算：網站提示準、跨 CDN 提示不準的好友，只暫停跨 CDN 那一種）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintKind {
+    /// 網站驗證過的台灣節點
+    Site,
+    /// 跨 CDN 結果
+    Cross,
+}
+
 /// 社群共享（規格 03）提供的提示；回報命中率
 pub trait Hints: Send + Sync {
     fn domain_hint(&self, name: &str, provider: &str, family: u8) -> Vec<HintIp>;
-    fn hint_result(&self, from: &str, ok: bool);
+    fn hint_result(&self, from: &str, kind: HintKind, ok: bool);
     fn cross_hint(&self, name: &str) -> Option<CrossHint>;
 }
 
@@ -507,6 +519,41 @@ impl Cdn {
     /// 節點不足時呼叫（2.x 的 `onLowPool`：排程重建節點池）
     pub fn set_on_low_pool(&self, f: impl Fn(&str) + Send + Sync + 'static) {
         *self.on_low_pool.write().unwrap() = Some(Arc::new(f));
+    }
+
+    /// 好友給的台灣節點（社群同步）：只當候選，跟分享檔的節點一樣處理——
+    /// 落在那家 CDN 官方範圍內、我的節點池還沒有的，放進節點池工作的候選名單（`cdn/harvest.json`），
+    /// 每家、每個家族一次最多 [`FRIEND_MAX_NODES`] 個，候選名單滿了就不放（不擠掉自己收集的）。
+    /// 不會直接寫進節點池：每日節點池工作在本機量測、確認是台灣節點後才會使用。回傳新增幾個
+    pub fn add_friend_nodes<'a>(&self, nodes: impl IntoIterator<Item = (&'a str, IpAddr)>) -> usize {
+        let mut added = 0;
+        let mut taken: HashMap<(String, bool), usize> = HashMap::new();
+        self.with_state(|st| {
+            for (p, ip) in nodes {
+                let ip = crate::pools::unmap(ip);
+                if !st.pools.in_ranges(p, ip) {
+                    continue;
+                }
+                let v6 = ip.is_ipv6();
+                let in_pool = st
+                    .pools
+                    .p
+                    .get(p)
+                    .is_some_and(|d| d.pool(if v6 { 6 } else { 4 }).iter().any(|x| x.ip == ip));
+                if in_pool {
+                    continue;
+                }
+                let n = taken.entry((p.to_string(), v6)).or_default();
+                if *n >= FRIEND_MAX_NODES {
+                    continue;
+                }
+                if st.db.add_harvest_candidate(p, ip) {
+                    *n += 1;
+                    added += 1;
+                }
+            }
+        });
+        added
     }
 
     pub fn set_hints(&self, h: Option<Arc<dyn Hints>>) {
@@ -1256,6 +1303,20 @@ impl Cdn {
     /// - 換掉之後標成要寫檔（照平常的快照流程寫出）；重新量健康與品質由呼叫端排
     ///
     /// 回傳各家收了幾個節點
+    /// 這些位址有多少比例落在這台目前的 `provider` 官方範圍裡；這台還沒有這家的範圍、或清單是空的 → None（3.4.3）
+    pub fn ranges_overlap(&self, provider: &str, ips: &[IpAddr]) -> Option<f64> {
+        if ips.is_empty() {
+            return None;
+        }
+        let st = self.state();
+        let p = st.pools.p.get(provider)?;
+        if p.range4.is_empty() && p.range6.is_empty() {
+            return None;
+        }
+        let inside = ips.iter().filter(|ip| st.pools.in_ranges(provider, **ip)).count();
+        Some(inside as f64 / ips.len() as f64)
+    }
+
     pub fn import_shared(&self, pools: Option<&[u8]>, v6: Option<&[u8]>, max_per_provider: usize) -> anyhow::Result<Vec<(String, usize)>> {
         let max = max_per_provider.max(1);
         let mut out: Vec<(String, usize)> = Vec::new();
@@ -1319,7 +1380,9 @@ impl Cdn {
                         .collect();
                     rest.insert("prefixes".into(), Value::Object(m));
                 }
-                st.pools.replace(name, pool4, pool6, rest);
+                // 合併（3.4.3）：上游的節點在前，這台自己的節點留著（每家上限照舊），自己記的壞節點也不清掉
+                // （以前整個換掉：自己觀察到的壞節點紀錄被丟掉，規格 10 第 3.8 節寫的是「合併、兩邊都留著」）
+                st.pools.merge_shared(name, pool4, pool6, rest, max);
                 out.push((name.to_string(), kept));
             }
         }

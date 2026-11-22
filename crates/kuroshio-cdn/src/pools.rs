@@ -310,7 +310,7 @@ impl ProviderPools {
     }
 }
 
-fn unmap(ip: IpAddr) -> IpAddr {
+pub(crate) fn unmap(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         _ => ip,
@@ -630,6 +630,37 @@ impl Pools {
     }
 
     /// 換掉某家 CDN 的節點池（節點池工作的結果）
+    /// 串接拿到的節點池（3.4.3）：上游的節點在前、這台原本的節點接在後面（同一個 IP 只留一個），各家族最多 `max`；
+    /// 這台記的壞節點（`bad`、`bad24`）不清掉，壞節點也不放進來
+    pub fn merge_shared(&mut self, name: &str, mut pool4: Vec<PoolNode>, mut pool6: Vec<PoolNode>, rest: Map<String, Value>, max: usize) {
+        let Some(d) = self.p.get(name) else { return };
+        let (bad, old4, old6) = (d.bad.clone(), d.pool4.clone(), d.pool6.clone());
+        let bad24 = d.bad24.clone();
+        let now = now_ms();
+        let is_bad = |ip: &IpAddr| {
+            bad.contains_key(ip)
+                || util::prefix24(*ip).is_some_and(|pf| bad24.get(&pf).is_some_and(|b| now.saturating_sub(b.at) <= BAD24_MS))
+        };
+        pool4.retain(|x| !is_bad(&x.ip));
+        pool6.retain(|x| !is_bad(&x.ip));
+        for (pool, old) in [(&mut pool4, old4), (&mut pool6, old6)] {
+            for n in old {
+                if pool.len() >= max {
+                    break;
+                }
+                if !pool.iter().any(|x| x.ip == n.ip) {
+                    pool.push(n);
+                }
+            }
+            pool.truncate(max.max(1));
+        }
+        self.replace(name, pool4, pool6, rest);
+        if let Some(d) = self.p.get_mut(name) {
+            d.bad = bad;
+            d.bad24 = bad24;
+        }
+    }
+
     pub fn replace(&mut self, name: &str, pool4: Vec<PoolNode>, pool6: Vec<PoolNode>, rest: Map<String, Value>) {
         let Some(d) = self.p.get_mut(name) else { return };
         d.prefixes = parse_prefixes(rest.get("prefixes"));

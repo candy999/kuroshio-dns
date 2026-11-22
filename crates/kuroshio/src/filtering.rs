@@ -209,14 +209,16 @@ where
     rx
 }
 
-/// 串接中從上游黑潮拿到、但這台存不下的清單副本（zstd）：留在記憶體，重建時讀它，不從網路下載（3.4.2：
-/// D3 的狀態分割區只有 7.5 MB，10 份清單只有 5 份存得下，每次重新啟動另外 5 份就從網路整份下載約 9 MB）。
-/// 不存檔：重新啟動後再跟上游拿一次（區網）
+/// 下載到、但這時候存不了本機副本的清單（zstd）：留在記憶體，重建時讀它，不必再從網路下載（3.4.2）。
+/// 不存檔；空間與記憶體都夠了之後存成本機副本（[`FilterService::persist_held`]）
 #[derive(Clone)]
 struct Held {
     hash: u64,
     z: Arc<Vec<u8>>,
     v: Validators,
+    /// 這份內容是什麼時候下載的（Unix 秒）：存成本機副本時當成「上次檢查更新」的時間，
+    /// 重新啟動後才會照更新間隔檢查，不會一分鐘後就把剛下載過的清單整份再問一次（3.4.3，Windows 複驗 G3）
+    fetched: u64,
 }
 
 /// 記憶體裡最多留多少（壓縮後合計）
@@ -442,12 +444,13 @@ impl ListCopies {
         staged
     }
 
-    /// 這幾份清單剛檢查過更新（全部沒變、或有變的已經下載換上）：記下時間。每次定時更新最多寫一次小小的索引
+    /// 這幾份清單剛檢查過更新（全部沒變、或有變的已經下載換上）：記下時間。每次定時更新最多寫一次小小的索引。
+    /// 只往後記：留在記憶體的清單存成副本時記的是下載時間，不能把已經記著、比較新的檢查時間蓋回去
     pub fn note_checked(&self, urls: &[&str], now: u64) {
         let mut idx = self.index.lock().unwrap();
         let mut any = false;
         for u in urls {
-            if let Some(m) = idx.get_mut(*u) {
+            if let Some(m) = idx.get_mut(*u).filter(|m| m.checked < now) {
                 m.checked = now;
                 any = true;
             }
@@ -541,14 +544,9 @@ pub struct FilterService {
     update_run: Mutex<UpdateRun>,
     /// 每次更新結束時送出那一次的 runId（`?wait=1` 等結果用）
     update_done: tokio::sync::watch::Sender<u64>,
-    /// 串接模式（3.4.0）：從上游黑潮拿到副本的清單（網址 → Unix 秒）；6 小時內的這一輪不下載（當成 304）
-    shared_at: Mutex<HashMap<String, u64>>,
-    /// 串接中從上游拿到、這台存不下的副本（網址 → 內容），見 [`Held`]
+    /// 下載到、但這台這時候存不了副本的清單（網址 → 內容），見 [`Held`]
     held: Mutex<HashMap<String, Held>>,
 }
-
-/// 從上游黑潮拿到的副本多久內不再自己下載（規格 10 第 3.4 節）
-const SHARED_FRESH_SECS: u64 = 6 * 3600;
 
 /// 錯誤是不是「工作被取消」（runtime 結束時 `spawn_blocking` 的工作）
 fn is_cancelled(e: &anyhow::Error) -> bool {
@@ -647,7 +645,6 @@ impl FilterService {
             missing: Mutex::new(Vec::new()),
             update_run: Mutex::new(UpdateRun::default()),
             update_done: tokio::sync::watch::channel(0).0,
-            shared_at: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
         }))
     }
@@ -737,70 +734,6 @@ impl FilterService {
         self.copies.get()
     }
 
-    // ---------------- 串接模式的清單副本（3.4.0，規格 10 第 3.3、3.4 節） ----------------
-
-    /// 上游：可以分享的副本（目前啟用、沒有被停用、檔案已經寫在磁碟上的）：（網址，紀錄，檔案路徑）。
-    /// 只列檔案，不讀內容
-    pub fn shared_copies(&self) -> Vec<(String, CopyMeta, PathBuf)> {
-        let Some(c) = self.copies.get() else { return Vec::new() };
-        let ex = self.excluded();
-        let mut out = Vec::new();
-        for (i, s) in self.sources.iter().enumerate() {
-            if ex[i] {
-                continue;
-            }
-            let Some(m) = c.meta(&s.url) else { continue };
-            let path = c.persister.lock().unwrap().file_path(&m.file);
-            if path.is_file() {
-                out.push((s.url.clone(), m, path));
-            }
-        }
-        out
-    }
-
-    /// 下游：這個網址是不是這台有啟用的清單
-    pub fn subscribes(&self, url: &str) -> bool {
-        let ex = self.excluded();
-        self.sources.iter().enumerate().any(|(i, s)| !ex[i] && s.url == url)
-    }
-
-    /// 下游：重建時多 `rules` 條規則放不放得下（記憶體控制提供的重建空間；沒有限制時一定可以）
-    pub fn build_room_ok(&self, rules: u64) -> bool {
-        let need = rules.saturating_mul(BUILD_BYTES_PER_RULE);
-        self.build_room.get().and_then(|f| f()).map_or(true, |room| need <= room)
-    }
-
-    /// 下游：留不留得下這麼大的副本（沒有副本功能＝留不下）
-    pub fn copy_wanted(&self, size: u64) -> bool {
-        self.copies.get().is_some_and(|c| c.wanted(size))
-    }
-
-    /// 下游：從上游黑潮拿到、雜湊驗過的副本（zstd 壓縮的原始清單），原樣存成本機副本。回傳有沒有登記新的副本
-    pub fn import_shared_copy(&self, url: &str, hash: u64, compressed: Vec<u8>, v: &Validators, rules: u64) -> bool {
-        let Some(c) = self.copies.get() else { return false };
-        let now = crate::persist::now_secs();
-        let staged = c.offer(url, hash, Some(compressed), v, now, rules);
-        if staged || c.available_same(url, hash) {
-            self.shared_at.lock().unwrap().insert(url.to_string(), now);
-            // 存得下了：記憶體裡那份不再需要
-            self.held.lock().unwrap().remove(url);
-        }
-        staged
-    }
-
-    /// 下游：存不下的副本能不能先留在記憶體（記憶體還能長大、合計不超過 [`HELD_MAX`]）
-    pub fn can_hold(&self, url: &str, size: u64) -> bool {
-        let used: u64 = self
-            .held
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(u, _)| *u != url)
-            .map(|(_, h)| h.z.len() as u64)
-            .sum();
-        crate::memgov::growth_allowed() && used + size <= HELD_MAX
-    }
-
     /// 下載到、但這時候存不了副本的清單能不能先留在記憶體：不看記憶體能不能長大（內容已經下載進來了，
     /// 丟掉的話下一次重建又要整份下載），只看合計不超過 [`HELD_MAX`]；記憶體已經「不足」時不留（跟以前一樣）
     fn held_room(&self, url: &str, size: u64) -> bool {
@@ -816,19 +749,6 @@ impl FilterService {
             .map(|(_, h)| h.z.len() as u64)
             .sum();
         used + size <= HELD_MAX
-    }
-
-    /// 下游：從上游黑潮拿到、雜湊驗過、但這台存不下的副本：留在記憶體，重建時讀它（不從網路下載）
-    pub fn hold_shared_copy(&self, url: &str, hash: u64, compressed: Vec<u8>, v: &Validators) {
-        self.held.lock().unwrap().insert(
-            url.to_string(),
-            Held {
-                hash,
-                z: Arc::new(compressed),
-                v: v.clone(),
-            },
-        );
-        self.shared_at.lock().unwrap().insert(url.to_string(), crate::persist::now_secs());
     }
 
     /// 留在記憶體的副本份數與大小（狀態頁）
@@ -867,6 +787,10 @@ impl FilterService {
                 .map_or(0, |i| self.sizes.lock().unwrap()[i].1);
             let staged = c.offer(&url, h.hash, Some(h.z.as_ref().clone()), &h.v, now, rules);
             if staged || c.available_same(&url, h.hash) {
+                // 內容是 `fetched` 那時下載的：記成上次檢查時間（沒記的話索引是 0，重新啟動一分鐘後就整份檢查）
+                if h.fetched > 0 {
+                    c.note_checked(&[url.as_str()], h.fetched.min(now));
+                }
                 self.held.lock().unwrap().remove(&url);
                 n += 1;
             }
@@ -877,29 +801,8 @@ impl FilterService {
         n
     }
 
-    /// 下游：上游黑潮的副本跟這台的本機副本內容一樣（雜湊相同）→ 標成剛從上游確認過，回傳 true（3.4.2）
-    pub fn mark_shared_if_same(&self, url: &str, hash: u64) -> bool {
-        let Some(c) = self.copies.get() else { return false };
-        let held = self.held.lock().unwrap().get(url).is_some_and(|h| h.hash == hash);
-        if !held && !c.available_same(url, hash) {
-            return false;
-        }
-        self.shared_at.lock().unwrap().insert(url.to_string(), crate::persist::now_secs());
-        true
-    }
-
-    /// 這份清單是不是 6 小時內從上游黑潮拿到的
-    fn shared_recently(&self, url: &str) -> bool {
-        let now = crate::persist::now_secs();
-        self.shared_at
-            .lock()
-            .unwrap()
-            .get(url)
-            .is_some_and(|t| now.saturating_sub(*t) < SHARED_FRESH_SECS)
-    }
-
-    /// 下游：拿到新的副本之後，用「副本優先」重建一次（既有的重建入口；全部清單暫停中時不建）。
-    /// 重建只讀磁碟上的副本：剛登記、還在等寫出的副本先寫出去（最多每 6 小時一次，清單有變才會發生）
+    /// 用「副本優先」重建一次（既有的重建入口；全部清單暫停中時不建）。
+    /// 重建只讀磁碟上的副本：剛登記、還在等寫出的副本先寫出去
     pub async fn rebuild_from_copies(&self) -> anyhow::Result<bool> {
         let _g = self.rebuild_lock.lock().await;
         if self.all_suspended() || self.sources.is_empty() {
@@ -1039,19 +942,9 @@ impl FilterService {
         // 有變的那份不在這裡下載（收到第一段就停），重建時才下載一次；沒變而且有本機副本的，重建時直接讀副本
         let mut reuse = vec![false; self.sources.len()];
         let missing = !self.missing.lock().unwrap().is_empty();
-        if !force
-            && have
-            && active
-                .iter()
-                .any(|&i| prev[i].etag.is_some() || prev[i].last_modified.is_some() || self.shared_recently(&self.sources[i].url))
-        {
+        if !force && have && active.iter().any(|&i| prev[i].etag.is_some() || prev[i].last_modified.is_some()) {
             let mut changed = missing;
             for &i in &active {
-                // 串接：6 小時內從上游黑潮拿到的副本，這一輪不下載（當成 304；沒有串接時這個表是空的）
-                if self.shared_recently(&self.sources[i].url) {
-                    reuse[i] = true;
-                    continue;
-                }
                 if prev[i].etag.is_none() && prev[i].last_modified.is_none() {
                     changed = true;
                     continue;
@@ -1314,6 +1207,7 @@ impl FilterService {
                                     hash: h,
                                     z: Arc::new(z),
                                     v: v.clone(),
+                                    fetched: crate::persist::now_secs(),
                                 },
                             );
                         }
@@ -1606,26 +1500,7 @@ impl FilterService {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
-            // 還不知道會不會串接（第一次路徑檢查還沒做完）、正在驗證上游黑潮、或已經串接但還沒跟上游同步過清單副本：
-            // 先等（合計最多 10 分鐘），不然存不下副本的清單會在同步前從網路整份下載
-            // （3.4.2：padavan-tw 串接中重新啟動，第 66～81 秒從網路收了 10.2 MB——那時路徑檢查還沒做完，
-            // 以前只看 share_pending，判斷成「不用等」）
-            // 沒有本機副本（第一次安裝）時不等串接確定：過濾還沒有任何清單，等下去這段時間就沒有保護；
-            // 這時只等「已經串接、在等第一次同步」（3.4.1 以前的條件）
-            let wait = || {
-                if built {
-                    crate::chain::filter_wait()
-                } else {
-                    crate::chain::share_pending()
-                }
-            };
-            let t1 = std::time::Instant::now();
-            if wait() {
-                info!("過濾清單：等串接確定、跟上游黑潮同步清單副本之後再檢查更新");
-                while wait() && t1.elapsed() < Duration::from_secs(600) {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                }
-            }
+            // 3.4.3 起清單一律自己跟清單網址下載（不跟上游黑潮拿副本），不必等串接確定
             // 上次檢查還沒過更新間隔（重新啟動、重新載入、換版）：等到該檢查的時候，不必一開機就全部問一次
             if built {
                 if let Some(w) = me.first_check_delay(crate::persist::now_secs()) {

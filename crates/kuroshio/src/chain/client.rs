@@ -74,6 +74,8 @@ pub enum Reason {
     Tampered,
     /// 抽查上游給的 CDN 答案：憑證不符、而自己的上游的答案正常，1 小時內 3 次（3.4.2，規格 10 第 3.8 節）
     AuditFailed,
+    /// 上游的指紋跟設定的 `chainPin` 不符（3.4.4；3.4.3 算成 `VerifyFailed`，狀態頁寫「簽章不對」）
+    PinMismatch,
 }
 
 impl Reason {
@@ -90,6 +92,7 @@ impl Reason {
             Reason::TooDeep => "too-deep",
             Reason::Tampered => "tampered",
             Reason::AuditFailed => "audit-failed",
+            Reason::PinMismatch => "pin-mismatch",
         }
     }
 
@@ -107,6 +110,7 @@ impl Reason {
             Reason::TooDeep => "上游的串接已經有 4 層（超過上限）",
             Reason::Tampered => "攔截者竄改答案",
             Reason::AuditFailed => "上游給的答案查核不通過（憑證不符，自己的上游的答案正常）",
+            Reason::PinMismatch => "上游的指紋跟設定的 chainPin 不符",
         }
     }
 }
@@ -350,6 +354,9 @@ struct Inner {
     hb_fail: u32,
     /// 最近一次登記的結果（`chain.upstream.registered`）
     registered: Option<Registered>,
+    /// 因為抽查不通過而解除的上游公鑰與次數（同一把金鑰一再不通過，重試間隔逐次拉長；3.4.3）
+    audit_key: Option<[u8; 32]>,
+    audit_strikes: u32,
 }
 
 /// 最近一次登記的結果
@@ -394,6 +401,8 @@ impl Inner {
             next_hb: None,
             hb_fail: 0,
             registered: None,
+            audit_key: None,
+            audit_strikes: 0,
         }
     }
 }
@@ -421,6 +430,8 @@ enum Event {
     Disabled,
     /// 抽查上游給的答案不通過（3.4.2）
     AuditFailed,
+    /// 上游的查詢一直失敗、心跳卻正常：暫停了 `CHAIN_RELEASE_TRIPS` 次（3.4.3）
+    Unhealthy,
 }
 
 /// 狀態機要外層做的事
@@ -484,8 +495,18 @@ fn lerp(a: Duration, b: Duration, t: f64) -> Duration {
     a + (b - a).mul_f64(t.clamp(0.0, 1.0))
 }
 
+/// `at`（毫秒）是不是在 `now` 之前 `ms` 毫秒內
+fn changed_within(at: Option<u64>, now: u64, ms: u64) -> bool {
+    at.is_some_and(|t| now < t.saturating_add(ms))
+}
+
 fn short_fp(p: &[u8; 32]) -> String {
     fingerprint(p)
+}
+
+/// 登記的對象符不符合 `chainPin`（沒設定時一律符合；探測沒有公鑰時不符合）
+fn reg_pin_ok(i: &Inner, p: &Probe) -> bool {
+    p.public.is_some_and(|k| i.settings.pin_ok(&short_fp(&k)))
 }
 
 fn set_state(i: &mut Inner, st: State, reason: Option<Reason>) {
@@ -534,6 +555,10 @@ fn to_none(i: &mut Inner, reason: Option<Reason>) -> Vec<Io> {
     io
 }
 
+/// 抽查不通過後第一次重試前等多久（同一把金鑰再不通過就加倍，最多 [`AUDIT_RETRY_MAX`]；3.4.3）
+const AUDIT_RETRY: Duration = Duration::from_secs(6 * 3600);
+const AUDIT_RETRY_MAX: Duration = Duration::from_secs(24 * 3600);
+
 fn next_backoff(i: &mut Inner) -> Duration {
     let d = match i.backoff {
         Some(b) => (b * 2).min(i.timing.retry_max),
@@ -557,7 +582,7 @@ fn reject(i: &mut Inner, r: Reason, now: Now) -> Vec<Io> {
             i.unsupported_retried = true;
             Some(i.timing.retry_max)
         }
-        Reason::VerifyFailed | Reason::NoResponse => Some(next_backoff(i)),
+        Reason::VerifyFailed | Reason::NoResponse | Reason::PinMismatch => Some(next_backoff(i)),
         // 上游關了 allow_downstream：每 10 分鐘（加 0～20% 亂數）探測一次，上游重新開放後自動接回（3.4.2；
         // 以前要等下一次路徑檢查，最久 6 小時）。探測只是一筆 CH TXT 查詢
         Reason::NotAllowed => Some(i.timing.retry_max.mul_f64(1.0 + 0.2 * now.rnd)),
@@ -595,8 +620,24 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             if i.state != State::Chained {
                 return Vec::new();
             }
-            let retry = i.timing.retry_max.mul_f64(1.0 + 0.5 * now.rnd);
-            release(i, Reason::AuditFailed, Some(retry), now)
+            // 同一把金鑰一再不通過：重試間隔 6、12、24 小時（最多 24 小時；以前固定 10～15 分鐘就重試，
+            // 說謊的上游會讓下游無限次「串接、解除」）。換了金鑰重新算（3.4.3）
+            let key = i.bound.as_ref().map(|b| b.public);
+            i.audit_strikes = if key.is_some() && key == i.audit_key {
+                i.audit_strikes + 1
+            } else {
+                1
+            };
+            i.audit_key = key;
+            let retry = AUDIT_RETRY.saturating_mul(1 << (i.audit_strikes - 1).min(2)).min(AUDIT_RETRY_MAX);
+            release(i, Reason::AuditFailed, Some(retry.mul_f64(1.0 + 0.1 * now.rnd)), now)
+        }
+        Event::Unhealthy => {
+            if i.state != State::Chained {
+                return Vec::new();
+            }
+            let retry = next_backoff(i).mul_f64(1.0 + 0.2 * now.rnd);
+            release(i, Reason::NoResponse, Some(retry), now)
         }
         Event::WanChanged => {
             i.view = None;
@@ -662,6 +703,11 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
                 warn!("串接：驗證時上游的公鑰跟探測時不同，不串接");
                 return reject(i, Reason::VerifyFailed, now);
             };
+            // 限定了上游的指紋（`chainPin`）：不符就不串接（3.4.3）
+            if !i.settings.pin_ok(&short_fp(&public)) {
+                warn!("串接：上游的指紋 {} 跟設定的 chainPin 不符，不串接", short_fp(&public));
+                return reject(i, Reason::PinMismatch, now);
+            }
             let Some((hit, tcp)) = i.view.as_ref().and_then(View::usable_hit) else {
                 return to_none(i, None);
             };
@@ -871,9 +917,9 @@ impl Client {
         *self.responder.lock().unwrap() = responder.map(Arc::downgrade);
         {
             let me = Arc::downgrade(self);
-            mgr.on_chain_trouble(Arc::new(move || {
+            mgr.on_chain_trouble(Arc::new(move |trips| {
                 if let Some(c) = me.upgrade() {
-                    c.trouble();
+                    c.trouble(trips);
                 }
             }));
         }
@@ -993,6 +1039,10 @@ impl Client {
             }
             let p = i.probe.clone()?;
             if p.error.is_some() || !p.allow || !p.caps.iter().any(|c| c == "reg") || p.public.is_none() || p.kid.is_none() {
+                return None;
+            }
+            // 設了 `chainPin`、上游的指紋不符：不登記（主機名稱只給鎖定的那一台；3.4.4，3.4.3 複驗 G5）
+            if !reg_pin_ok(&i, &p) {
                 return None;
             }
             // 綁定中用綁定的位址；還沒綁定（或中斷）用攔截命中的保留位址。TCP 可用就走 TCP（登記封包比較大）
@@ -1151,7 +1201,22 @@ impl Client {
     }
 
     /// 串接上游連續失敗（解析流程）：立刻補一次心跳
-    fn trouble(&self) {
+    /// 上游黑潮的查詢連續失敗、暫停了第 `trips` 次：立刻補一次心跳；暫停太多次（心跳正常、查詢卻一直失敗）
+    /// 就解除串接，照退避重試（3.4.3）
+    fn trouble(&self, trips: u32) {
+        if trips >= crate::upstreams::CHAIN_RELEASE_TRIPS {
+            let (io, before) = {
+                let mut i = self.inner.lock().unwrap();
+                let before = i.state;
+                (step(&mut i, Event::Unhealthy, &[], Now::get()), before)
+            };
+            if !io.is_empty() {
+                warn!("串接：上游黑潮的查詢一直失敗（暫停 {trips} 次），解除串接，改用自己的上游");
+            }
+            self.exec_sync(io);
+            self.changed(before);
+            return;
+        }
         let mut i = self.inner.lock().unwrap();
         if i.state == State::Chained {
             i.next_hb = Some(Instant::now());
@@ -1175,6 +1240,11 @@ impl Client {
     }
 
     /// 綁定中的上游公鑰（WP5 驗清單用）
+    /// 上游的金鑰在 `ms` 毫秒內換過（3.4.3：換了之後 24 小時內不收共用資料）
+    pub fn key_changed_within(&self, ms: u64) -> bool {
+        changed_within(self.inner.lock().unwrap().key_changed_at, kuroshio_community::util::now_ms(), ms)
+    }
+
     pub fn bound_key(&self) -> Option<[u8; 32]> {
         self.inner.lock().unwrap().bound.as_ref().map(|b| b.public)
     }
@@ -1245,6 +1315,9 @@ impl Client {
                 format!("上游黑潮 {ver} 沒有回應串接查詢：不串接，自己做評測")
             }
             (State::Released, Some(Reason::VerifyFailed)) => "上游黑潮的身分驗證失敗（簽章不對）：不串接，用自己的上游".into(),
+            (State::Released, Some(Reason::PinMismatch)) => {
+                "不串接：上游黑潮的指紋跟設定的 chainPin 不符（設定鎖定的是別台），用自己的上游".into()
+            }
             (State::Released, Some(Reason::UpstreamChanged)) => "上游節點的金鑰換了：重新驗證中".into(),
             (State::Released, Some(Reason::Loop)) => "不串接：上游的串接鏈裡有這台（會形成迴圈）".into(),
             (State::Released, Some(Reason::TooDeep)) => "不串接：上游的串接已經有 4 層（超過上限）".into(),
@@ -1486,6 +1559,7 @@ mod tests {
             chain,
             allow_downstream: true,
             path_check: true,
+            pin: None,
             warnings: Vec::new(),
         }
     }
@@ -1784,22 +1858,93 @@ mod tests {
         assert_eq!(i.state, State::None);
     }
 
-    /// 3.4.2：抽查上游給的答案不通過 → 解除串接（audit-failed），10～15 分鐘後重試、重試時重新探測；
-    /// 沒有串接時不做任何事
+    /// 抽查上游給的答案不通過 → 解除串接（audit-failed），6 小時後重試、重試時重新探測；同一把金鑰再不通過
+    /// 就 12、24 小時（3.4.3；3.4.2 是固定 10～15 分鐘）；沒有串接時不做任何事
     #[test]
     fn audit_failed_releases_and_retries() {
         let mut i = inner(true);
         assert!(step(&mut i, Event::AuditFailed, &[], now()).is_empty(), "沒有串接：不動");
-        chained(&mut i, [5; 32]);
-        let io = step(&mut i, Event::AuditFailed, &[], now());
-        assert!(io.contains(&Io::Unbind));
-        assert_eq!((i.state, i.reason), (State::Released, Some(Reason::AuditFailed)));
-        let wait = i.retry_at.unwrap().saturating_duration_since(now().at);
-        let max = i.timing.retry_max;
-        assert!(wait >= max.mul_f64(0.99) && wait <= max.mul_f64(1.51), "{wait:?}");
+        let hours = |i: &Inner| i.retry_at.unwrap().saturating_duration_since(now().at).as_secs_f64() / 3600.0;
+        // 重新串接（同一台機器的狀態機記著前幾次的不通過）
+        let again = |i: &Inner| {
+            let mut j = inner(true);
+            (j.audit_key, j.audit_strikes) = (i.audit_key, i.audit_strikes);
+            j
+        };
+        for (n, want) in [(1, 6.0), (2, 12.0), (3, 24.0), (4, 24.0)] {
+            i = again(&i);
+            chained(&mut i, [5; 32]);
+            let io = step(&mut i, Event::AuditFailed, &[], now());
+            assert!(io.contains(&Io::Unbind));
+            assert_eq!((i.state, i.reason), (State::Released, Some(Reason::AuditFailed)));
+            let h = hours(&i);
+            assert!(h >= want * 0.99 && h <= want * 1.11, "第 {n} 次：{h} 小時");
+        }
         assert!(Client::text(&i, 0).contains("抽查上游給的答案不通過"));
         let io = step(&mut i, Event::Retry, &[], now());
         assert_eq!(io, vec![Io::Probe { addr: hit(), tcp: false }], "重試：重新探測");
+        // 換了金鑰：重新從 6 小時算
+        i = again(&i);
+        chained(&mut i, [6; 32]);
+        step(&mut i, Event::AuditFailed, &[], now());
+        assert!(hours(&i) < 6.7);
+    }
+
+    /// 3.4.3：上游的金鑰換了之後 24 小時內不收共用資料（`Syncer` 看這個）
+    #[test]
+    fn key_change_hold_window() {
+        let day = 24 * 3600 * 1000;
+        assert!(!changed_within(None, 1_000, day));
+        assert!(changed_within(Some(1_000), 1_000 + day - 1, day));
+        assert!(!changed_within(Some(1_000), 1_000 + day, day));
+    }
+
+    /// 3.4.3：限定了上游的指紋（`chainPin`）：指紋不符的上游不串接；符合的照常串接
+    #[test]
+    fn chain_pin_rejects_other_keys() {
+        let mut i = inner(true);
+        i.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[9u8; 32])));
+        step(&mut i, Event::Report(view(Some("3.4.0"))), &[], now());
+        step(&mut i, Event::Probed(ok_probe([5; 32], vec![])), &[], now());
+        let io = step(
+            &mut i,
+            Event::Verified {
+                again: ok_probe([5; 32], vec![]),
+                gateway: None,
+            },
+            &[],
+            now(),
+        );
+        assert!(!io.iter().any(|x| matches!(x, Io::Bind { .. })), "{io:?}");
+        assert_ne!(i.state, State::Chained);
+        // 原因是 pin-mismatch（3.4.4；以前算 verify-failed，狀態頁寫「簽章不對」）
+        assert_eq!(i.reason, Some(Reason::PinMismatch));
+        assert_eq!(Reason::PinMismatch.code(), "pin-mismatch");
+        let mut j = inner(true);
+        j.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[5u8; 32])));
+        chained(&mut j, [5; 32]);
+    }
+
+    /// 3.4.4（3.4.3 複驗 G5）：`chainPin` 不符的上游不登記主機名稱；符合或沒設定時照常登記
+    #[test]
+    fn chain_pin_blocks_registration() {
+        let mut i = inner(true);
+        assert!(reg_pin_ok(&i, &ok_probe([5; 32], vec![])), "沒設定 chainPin：照常登記");
+        i.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[9u8; 32])));
+        assert!(!reg_pin_ok(&i, &ok_probe([5; 32], vec![])), "指紋不符：不登記");
+        assert!(reg_pin_ok(&i, &ok_probe([9; 32], vec![])), "指紋符合：照常登記");
+    }
+
+    /// 3.4.3：上游的查詢一直失敗（暫停 5 次）、心跳卻正常 → 解除串接（no-response），照退避重試
+    #[test]
+    fn unhealthy_releases_with_backoff() {
+        let mut i = inner(true);
+        assert!(step(&mut i, Event::Unhealthy, &[], now()).is_empty(), "沒有串接：不動");
+        chained(&mut i, [5; 32]);
+        let io = step(&mut i, Event::Unhealthy, &[], now());
+        assert!(io.contains(&Io::Unbind));
+        assert_eq!((i.state, i.reason), (State::Released, Some(Reason::NoResponse)));
+        assert!(i.retry_at.is_some());
     }
 
     #[test]

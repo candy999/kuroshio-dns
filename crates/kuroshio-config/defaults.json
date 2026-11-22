@@ -432,10 +432,12 @@
     "staleDays": 7,
     "syncIntervalMin": 60,
     "maxFriends": 50,
-    "minHitRate": 0,
+    "minHitRate": 0.3,
     "autoDeleteLowHitRate": false,
     "shareDomains": true,
     "shareUpstreams": true,
+    "useHints": true,
+    "useUpstreams": true,
     "rules": [],
     "maxBundleMB": 32
   },

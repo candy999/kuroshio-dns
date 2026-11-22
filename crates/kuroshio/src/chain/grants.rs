@@ -253,6 +253,7 @@ mod tests {
             chain: true,
             allow_downstream: allow,
             path_check: true,
+            pin: None,
             warnings: vec![],
         }
     }

@@ -430,7 +430,7 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 | `upstreams` | 每日評測的結果 | `dns-benchmark` |
 | `cdn-pools`、`cdn-v6` | 台灣節點池 | `cdn-pool`、`cdn-scan` |
 | `cdn-ranges` | CDN 官方範圍 | `cdn-ranges` |
-| `filter-copy` | 過濾清單副本（上游有留副本、網址相同的清單；下游存不下時留在記憶體，3.4.2 起） | （清單照原本的更新排程，改向上游拿） |
+| `filter-copy` | 3.4.0～3.4.2 的過濾清單副本。**3.4.3 起不再提供也不再接收**：每台自己跟清單網址下載；舊版上游的清單裡有這一種時下游略過，不列在 `objects` | — |
 
 - 「新鮮」＝ 36 小時內成功匯入過，而且現在是串接中。略過時日誌寫「由上游黑潮提供，略過」（`dns-benchmark` 在 `/api/jobs` 的 `detail.dns-benchmark.last.skipped` 也有）。
 - 不新鮮（上游沒資料、驗證失敗、36 小時沒同步成功、串接解除、`chain` 關著）時，工作照原本的排程自己跑，跟 3.3.7 一樣。匯入的資料不刪，解除後繼續用，直到自己的工作算出新的。
@@ -470,8 +470,7 @@ UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: tr
   "shared": {
     "enabled": true, "lastSyncAt": 1795000500000, "nextSyncAt": 1795022100000, "error": null,
     "objects": [
-      { "kind": "upstreams", "at": 1794990000000, "bytes": 6624, "importedAt": 1795000500000, "fresh": true, "error": null },
-      { "kind": "filter-copy", "name": "https://filter.example.net/list.txt", "at": 1794980000000, "bytes": 412345, "importedAt": null, "fresh": false, "error": "no-room" }
+      { "kind": "upstreams", "at": 1794990000000, "bytes": 6624, "importedAt": 1795000500000, "fresh": true, "error": null }
     ],
     "skippedJobs": ["dns-benchmark", "cdn-pool", "cdn-scan", "cdn-ranges"],
     "ownRuns": { "dns-benchmark": { "at": 1794500000000, "dueAt": 1795104800000 }, "cdn-pool": { "at": null, "dueAt": 1795086400000 } }
@@ -500,12 +499,12 @@ UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: tr
 |---|---|
 | `enabled` | 這台的 `chain` 開關 |
 | `state` | `none`（沒有偵測到）/ `detected`（偵測到，驗證中）/ `verifying`（做最後確認）/ `chained`（串接中）/ `released`（偵測到但沒有串接，原因在 `reason`） |
-| `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案）、`audit-failed`（3.4.2：抽查上游給的答案，1 小時內 3 次憑證不符、而自己的上游的答案正常；10～15 分鐘後重試） |
+| `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`pin-mismatch`（3.4.4：上游的指紋跟 `upstream.chainPin` 不符）、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案）、`audit-failed`（3.4.2：抽查上游給的答案，1 小時內 3 次憑證不符、而自己的上游的答案正常；10～15 分鐘後重試） |
 | `text` | 給狀態頁直接顯示的一行白話，每一種情況都寫出原因與影響（例如「上游黑潮 3.4.0 不提供資料（allow_downstream 關閉）：自己做評測，會重複使用網路」）。文字內容不是約定；請整句顯示，不要截斷或自己拼 |
 | `upstream` | 探測到的上游（沒探測過、或 `chain` 關著是 `null`）。`via`：`gateway`（上游就是預設閘道）/ `intercept`（經攔截，`address` 是被轉走的保留位址，`text` 寫閘道並加註「經攔截」）；`depth` 是含這台的層數；`viaNat`：上游看到的來源不是這台（中間隔了 NAT） |
 | `backupActive` | 串接上游暫時不能用，正在用自己的加密上游 |
 | `retryAt` | `released` 時下一次重試的時間 |
-| `shared` | 共用結果（沒有串接是 `null`）。`error` 與 `objects[].error` 是代碼，例如 `memory`（記憶體不夠，這次沒同步）、`no-room`（清單副本存不下、記憶體也留不下）、`not-subscribed`、`newer-format`、`own-newer`（3.4.2：這台自己的評測結果比上游給的新，不拿來蓋掉；只是說明、不是失敗）。`ownRuns`（3.4.2）：這台自己真的跑完每個工作的時間（`at`，還沒跑過是 `null`）與最晚什麼時候會自己跑（`dueAt`）：上游給的資料再新鮮，自己超過 7 天沒跑就照排程自己跑一次 |
+| `shared` | 共用結果（沒有串接是 `null`）。`error` 與 `objects[].error` 是代碼，例如 `memory`（記憶體不夠，這次沒同步）、`key-changed`（3.4.3：上游的金鑰 24 小時內換過，先不收共用資料）、`import-failed`（例如評測結果照這台的設定篩完不夠用、官方範圍跟這台的差太多）、`newer-format`、`own-newer`（3.4.2：這台自己的評測結果比上游給的新，不拿來蓋掉；只是說明、不是失敗）。`ownRuns`（3.4.2）：這台自己真的跑完每個工作的時間（`at`，還沒跑過是 `null`）與最晚什麼時候會自己跑（`dueAt`）：上游給的資料再新鮮，自己超過 7 天沒跑就照排程自己跑一次 |
 | `audit` | 3.4.2：抽查上游給的 CDN 答案（每 16 筆抽 1、每 30 秒最多 1 個）。`valid` 憑證有效、`unverified` 連不上或不判斷、`siteInvalid` 網站本身憑證不符（自己的上游給的也不符）、`suspicious` 上游給的不符而自己的正常、`recentSuspicious` 1 小時內的可疑次數（到 3 就解除串接）、`releases` 因此解除的次數、`last` 最近一次可疑（名稱、IP、時間） |
 | `serving` | 上游角色（服務還沒啟動完成時是 `null`）。`text` 開著時是「提供資料給下游黑潮：目前 N 台」或「…目前沒有下游連上來」；關著時是「不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）」，24 小時內有下游來問過時接著寫「最近有下游黑潮來問過（…）」。`note` 只有開著時有。`probes` 是 `allow_downstream` 關著時收到的探測；`refused` 是拒絕的串接查詢（太頻繁、不是私有來源、沒有開放） |
 
@@ -567,7 +566,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `backfill` | `resolver.backfill` | `cdn` | `cdn`：上面的行為；`off`（或 `0` / `false`）：不補問（3.3.7 的行為） |
 | `backfill_sample` | `resolver.backfillSample` | `16` | 非 CDN 查詢每幾次抽一次；`0` ＝ 不抽樣 |
 
-`/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。
+`/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。3.4.3 起另有 `chainRetry`：上游黑潮解析不到（SERVFAIL）、改用自己的加密上游解析到的次數。`memory.pressure`（3.4.3）：當下的記憶體量測（`normal`／`low`／`critical`）；`memory.state` 放鬆前要穩定幾分鐘，兩者會差幾分鐘。
 
 ## 上游多樣性（3.4.0 起）
 
@@ -610,7 +609,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - 背景工作在記憶體吃緊時延後、執行中的會暫停（每日評測、CDN 的範圍 / 網段分類 / 節點池都一樣）。每日評測（dns-benchmark）同時只測 `benchmark.concurrency` 個候選（`auto` = 每核心 8 個，8–50），也不超過「可用記憶體扣掉保留量的 1/4 ÷ 512 KB（3.3.3 起；以前是 128 KB）」；每個候選測完就關閉連線，暫停時先關閉手上的連線。
 - 各結構目前的用量在 `/api/status` 的 `memory.sizes`（`cacheBytes`、`cdnBytes`、`filterListsBytes` 等，都是估計值）。3.4.1 起多 `accountedBytes`（分項加總）與 `otherBytes`（實體記憶體減掉分項：程式本身、連線與背景工作、配置器還沒還給系統的空間；讀不到實體記憶體時是 `null`）。CDN 的背景工作在 `cdn.background`：`{"verify":排隊中的驗證,"ecs":排隊中的 ECS 探測,"cross":排隊中的跨 CDN 探索,"deferred":排隊已滿而沒排的累計次數}`。背景工作在 `memory.jobs`：`{"running":執行中的工作 | null,"rawBytes":每日評測手上的原始答案（估計）,"openConnections":每日評測開著的連線,"processRssBytes":評測子程序目前的實體記憶體,"processPeakRssBytes":評測子程序的最高值,"lastBenchmark":{"finishedAt":Unix 毫秒,"ok":true,"durationSec":秒,"processPeakRssBytes":上一次評測子程序的最高值}}`（`lastBenchmark` 在評測結束後也查得到，服務重新啟動前一直留著），工作結束後回到 `null` / `0`（資格賽階段也有連線數；3.3.3 起）。
 - **每日評測在子程序裡跑**（3.3.3 起）：同一個執行檔的隱藏指令，結束時記憶體全部還給系統，主程式的 RSS 不會停在評測的高點（以前會因為記憶體碎片多留 20 MB 左右）。日誌照樣出現在主程式的日誌裡，結束時記一行「評測子程序結束，記憶體最高 X MB」。進行中 `ps` 會多看到一個 `kuroshio __job-dns-benchmark`；服務管理程式只要管主程式（主程式結束時子程序會跟著結束）。不想要子程序時設 `benchmark.subprocess: false`。
-- **串接的共用結果**（3.4.0 起）：下游一次只處理一個物件，非過濾類的尖峰約 3 MiB，處理完就釋放；過濾清單副本（壓縮後最多 8 MiB）只在記憶體狀態正常時才抓；存不下副本的小 Flash 機器（3.4.2 起）把副本留在記憶體（壓縮後合計最多 8 MiB，記憶體不能長大時不留、照舊自己下載），重建時讀它、不從網路下載，`/api/status` 的 `filter.heldCopies` 看得到份數與大小。上游的共用快取最多 1 MiB，30 分鐘沒人用就釋放。串接中的下游不跑每日評測與 CDN 掃描，尖峰反而比較低。
+- **串接的共用結果**（3.4.0 起）：下游一次只處理一個物件，尖峰約 3 MiB，處理完就釋放（過濾清單 3.4.3 起不共用，每台自己下載）。下載到、但這時候存不了本機副本的清單（小 Flash、記憶體吃緊）留在記憶體（壓縮後合計最多 8 MiB，記憶體不足時不留），重建時讀它、不必再下載，空間與記憶體都夠了之後存成副本；`/api/status` 的 `filter.heldCopies` 看得到份數與大小。上游的共用快取最多 1 MiB，30 分鐘沒人用就釋放。串接中的下游不跑每日評測與 CDN 掃描，尖峰反而比較低。
 - **`kuroshio memory-plan`**（3.3.3 起）：用跟執行時同一套規則推算這台機器（或 `--ram 64 128` 指定的大小、`--bits 32` 指定 32 位元）的保留量、常駐用量、會載入哪些清單、每日評測同時測幾個、會不會暫停；`--json` 給程式用。常數是實測推算的，輸出裡有列出來。
 
 真的要限制時可以調的設定：

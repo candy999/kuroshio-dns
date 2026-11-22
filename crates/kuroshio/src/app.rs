@@ -1614,7 +1614,9 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             if p != last {
                 let (a, res) = (r.avail.unwrap_or(0) >> 20, reserve.bytes >> 20);
                 match p {
-                    Pressure::Normal => info!("記憶體恢復正常（可用 {a} MB，保留 {res} MB）"),
+                    // 這是「當下」的量測；記憶體控制的狀態（`memory.state`）要穩定一段時間才放鬆（遲滯，預設 3 分鐘），
+                    // 兩者會差幾分鐘（3.4.3：日誌寫「恢復正常」、狀態頁卻還是吃緊，看起來像錯誤）
+                    Pressure::Normal => info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆"),
                     Pressure::Low => info!("記憶體接近保留量（可用 {a} MB，保留 {res} MB）：背景工作延後、記憶體結構不再長大"),
                     Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }
@@ -1946,7 +1948,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));
     // 串接的共用結果（3.4.0，規格 10 第 3 節）：CDN、過濾、排程器都啟動之後。上游接上 ShareCache、
     // 下游建立／接回同步（工作開頭的 share_skips 只在共用結果新鮮、而且串接中時略過）
-    crate::chain::share::start(cfg, &resolver, cdn.clone(), filter.clone(), &persister, scheduler.as_ref());
+    crate::chain::share::start(cfg, &resolver, cdn.clone(), &persister, scheduler.as_ref());
     let ddns = crate::ddns::Config::from_cfg(cfg).map(crate::ddns::Ddns::new);
     if let Some(d) = &ddns {
         d.spawn();

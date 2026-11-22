@@ -662,6 +662,10 @@ fn protected_result(s: &Srv) -> &'static str {
     }
 }
 
+/// 社群好友提供的上游候選最多收幾個（社群模組已經先合併、排序、限制成 100 個；這裡再擋一次，
+/// 檔案是舊版寫的或被改過也不會放大評測）
+const MAX_SHARED: usize = 100;
+
 /// 依 2.x 的順序組出候選清單：udp、doh（含社群提供的加密上游）、doq，再加上 3.0 新增的 dot、doh3、dnscrypt
 fn candidate_ids(paths: &BenchPaths) -> (Vec<String>, usize) {
     let mut udp = paths.read_lists("iplist.txt");
@@ -692,6 +696,7 @@ fn candidate_ids(paths: &BenchPaths) -> (Vec<String>, usize) {
         .unwrap_or_default()
         .iter()
         .filter_map(|x| x.as_str().map(str::to_string))
+        .take(MAX_SHARED)
         .collect();
     for id in &shared {
         if id.starts_with("https://") || id.starts_with("tls://") {
@@ -2045,5 +2050,31 @@ mod asn_cache_tests {
         c.lookup(&src, &[v4("192.0.2.1")], true).await;
         assert_eq!(src.calls.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+
+    #[test]
+    fn shared_candidates_are_capped() {
+        let d = std::env::temp_dir().join(format!("kuroshio-bench-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let ids: Vec<String> = (0..300).map(|i| format!("https://dns{i}.example.net/dns-query")).collect();
+        let f = d.join("upstream-candidates.json");
+        std::fs::write(&f, serde_json::to_vec(&serde_json::json!({ "ids": ids })).unwrap()).unwrap();
+        let paths = BenchPaths {
+            list_dir: d.join("lists"),
+            out_root: None,
+            upstreams_file: d.join("upstreams.json"),
+            community_candidates: Some(f),
+            default_list_dir: None,
+            blacklist_file: None,
+        };
+        let (_, n) = candidate_ids(&paths);
+        assert_eq!(n, MAX_SHARED, "好友的上游候選最多 100 個");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -9,7 +9,7 @@
 //!   `chain` 關著、`allow_downstream` 關著、沒有串接、上游沒資料時一律照原本的排程跑（跟 3.3.7 一樣）。
 //! - `chain-share.json`（快照目錄，幾百 bytes）記每個種類最後一次成功匯入的時間與雜湊。
 
-use super::client::{Client, State};
+use super::client::{Client, Reason, State};
 use crate::upstream::{Kind, Upstream};
 use anyhow::{anyhow, bail, Context, Result};
 use kuroshio_community::chain::{self as proto, ManifestBody, Object, CHUNK, MANIFEST_NAME, PROTO};
@@ -18,8 +18,7 @@ use kuroshio_community::identity::{kid_of, KeyPair};
 use kuroshio_community::util::{hex, now_ms, random_below, sha256};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::hash::Hasher;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::PathBuf;
 // 32 位元 MIPS（MT7621）沒有 AtomicU64：建置次數與世代編號用 AtomicU32（不用鎖）
@@ -35,10 +34,13 @@ pub const KIND_UPSTREAMS: &str = "upstreams";
 pub const KIND_CDN_POOLS: &str = "cdn-pools";
 pub const KIND_CDN_V6: &str = "cdn-v6";
 pub const KIND_CDN_RANGES: &str = "cdn-ranges";
+/// 過濾清單副本：3.4.0～3.4.2 會共用，3.4.3 起不再提供、也不再接收（每台黑潮自己跟清單網址下載，
+/// 拿到的就是正本）。舊版上游的清單裡還會有這一種，下游照「不認得的種類」略過
 pub const KIND_FILTER_COPY: &str = "filter-copy";
 
-/// 處理順序（規格 3.4）；不在這裡的種類略過
-const ORDER: [&str; 5] = [KIND_UPSTREAMS, KIND_CDN_RANGES, KIND_CDN_POOLS, KIND_CDN_V6, KIND_FILTER_COPY];
+/// 處理順序（規格 3.4）；不在這裡的種類略過（含 3.4.2 以前的 `filter-copy`）。
+/// 節點池在官方範圍之前（3.4.3）：節點用這台「匯入前」的官方範圍檢查，上游不能先放寬範圍、再塞範圍外的節點
+const ORDER: [&str; 4] = [KIND_UPSTREAMS, KIND_CDN_POOLS, KIND_CDN_V6, KIND_CDN_RANGES];
 
 /// 3.4.0 認得的格式版本（每個種類都是 1）
 pub const FMT: u8 = 1;
@@ -56,20 +58,16 @@ pub const CACHE_MAX: usize = 1 << 20;
 pub const MANIFEST_MAX: usize = 16 * 1024;
 /// 清單裡最多幾個物件
 pub const MAX_OBJECTS: usize = 64;
-/// 單一過濾清單副本（壓縮後）的上限
-pub const COPY_MAX: u64 = 8 << 20;
-/// 過濾清單副本解壓後的上限
-pub const COPY_RAW_MAX: u64 = 64 << 20;
-/// 非過濾類物件（壓縮後）的上限
+/// 物件（壓縮後）的上限
 pub const OBJECT_MAX: u64 = 1 << 20;
-/// 上游記著幾份過濾清單副本的 SHA-256（副本沒變不重算）
-const SUM_CACHE_MAX: usize = 64;
-/// 上游讀副本、下游解壓時一次處理多少
-const STREAM_STEP: usize = 64 * 1024;
 /// 新鮮：多久內匯入過
 pub const FRESH_MS: u64 = 36 * 3600 * 1000;
 /// 串接解除時手上的評測結果超過這個時間就請排程器補跑評測
 pub const STALE_ON_RELEASE_MS: u64 = 48 * 3600 * 1000;
+/// 上游的金鑰換了之後多久不收它的共用資料（3.4.3）
+pub const KEY_CHANGE_HOLD_MS: u64 = 24 * 3600 * 1000;
+/// 因為上游不可信而解除串接時，請排程器補跑的工作（3.4.3）
+const DISTRUST_JOBS: [&str; 3] = ["dns-benchmark", "cdn-ranges", "cdn-pool"];
 
 /// 各種類解壓後的上限（規格 3.4 的表）
 pub fn raw_limit(kind: &str) -> u64 {
@@ -77,7 +75,6 @@ pub fn raw_limit(kind: &str) -> u64 {
         KIND_UPSTREAMS => 256 << 10,
         KIND_CDN_RANGES => 2 << 20,
         KIND_CDN_POOLS | KIND_CDN_V6 => 1 << 20,
-        KIND_FILTER_COPY => COPY_RAW_MAX,
         _ => 0,
     }
 }
@@ -104,59 +101,19 @@ fn sha_of(b: &[u8]) -> [u8; 32] {
     sha256(&[b])
 }
 
-/// 寫進去的 bytes 數（解壓時只算大小，不留內容）
-struct Counter(u64);
-
-impl Write for Counter {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0 += b.len() as u64;
-        if self.0 > COPY_RAW_MAX {
-            return Err(std::io::Error::other("解壓後超過上限"));
-        }
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 // ---------------- 上游 ----------------
-
-/// 一份可以分享的過濾清單副本（上游）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilterCopy {
-    /// 清單網址
-    pub url: String,
-    /// 副本檔（[`ShareSource::read_copy`] 認得的名稱；正式環境是檔案路徑）
-    pub file: String,
-    /// 壓縮後大小
-    pub bytes: u64,
-    /// 解壓後大小（不知道是 0，`ShareCache` 算 SHA-256 時順便算）
-    pub raw: u64,
-    /// 原始內容的雜湊（`CopyMeta.hash`）
-    pub hash: u64,
-    pub rules: u64,
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
-    /// 存副本的時間（Unix 毫秒）
-    pub at: u64,
-}
 
 /// 上游的資料來源（`app` 用 [`Live`]，測試換成假的）
 pub trait ShareSource: Send + Sync {
     /// `upstreams.json` 的內容（種子資料、空的 → None）
     fn upstreams(&self) -> Option<Vec<u8>>;
     fn cdn(&self) -> Option<kuroshio_cdn::SharedExport>;
-    fn filter_copies(&self) -> Vec<FilterCopy>;
-    /// 讀副本檔的一段（壓縮後的內容）
-    fn read_copy(&self, file: &str, offset: u64, len: usize) -> Option<Vec<u8>>;
     /// 記憶體壓力是 Normal
     fn pressure_ok(&self) -> bool;
 }
 
 enum Stored {
     Mem(Vec<u8>),
-    File { file: String, size: u64 },
 }
 
 struct Built {
@@ -182,24 +139,16 @@ fn manifest_body(kid: &[u8], at: u64, list: &[Object]) -> Vec<u8> {
     })
 }
 
-/// `Sealed` 外層與簽章多出來的大小（CBOR 的 map、兩個鍵、64 bytes 簽章，留一點餘裕）
-const SEAL_OVERHEAD: usize = 128;
-
 #[derive(Default)]
 struct CacheState {
     built: Option<Built>,
     last_used: u64,
 }
 
-/// （副本檔，大小，內容雜湊）→（SHA-256，解壓後大小）
-type SumKey = (String, u64, u64);
-/// （SHA-256，解壓後大小）
-type Sum = ([u8; 32], u64);
-
 /// 上游的共用結果快取
 ///
-/// 清單在背景建置（`spawn_blocking`，同一時間最多一個）：壓縮評測結果與 CDN 資料、串流讀副本算
-/// SHA-256（最多 8 MiB）在小機器上可能要好幾秒，不能卡住回答 DNS 查詢的工作執行緒。
+/// 清單在背景建置（`spawn_blocking`，同一時間最多一個）：壓縮評測結果與 CDN 資料在小機器上可能要
+/// 一兩秒，不能卡住回答 DNS 查詢的工作執行緒。
 /// 回答查詢時只拿已經建好的那一份（過期了也先用，背景建好再換）。
 ///
 /// 記憶體：一份最多 [`CACHE_MAX`]（1 MiB）。建好換上的那一刻舊的才放掉，所以背景建置期間
@@ -207,7 +156,6 @@ type Sum = ([u8; 32], u64);
 pub struct ShareCache {
     src: Arc<dyn ShareSource>,
     state: Mutex<CacheState>,
-    sums: Mutex<Vec<(SumKey, Sum)>>,
     /// 背景建置中（避免重複）
     building: AtomicBool,
     /// 建好幾次（測試用）
@@ -253,7 +201,6 @@ impl ShareCache {
         ShareCache {
             src,
             state: Mutex::new(CacheState::default()),
-            sums: Mutex::new(Vec::new()),
             building: AtomicBool::new(false),
             builds: AtomicU32::new(0),
         }
@@ -373,54 +320,10 @@ impl ShareCache {
             }
         }
         let mem_bytes = size(&mem);
-        // 2. 過濾清單副本：只記檔名、大小與雜湊（第一次用串流算）
-        let mut files: Vec<(Object, Stored)> = Vec::new();
-        for c in self.src.filter_copies() {
-            if mem.len() + files.len() >= MAX_OBJECTS {
-                break;
-            }
-            if c.bytes == 0 || c.bytes > COPY_MAX {
-                continue;
-            }
-            let Some((sha, raw)) = self.sum(&c) else { continue };
-            if raw > COPY_RAW_MAX {
-                continue;
-            }
-            files.push((
-                Object {
-                    k: KIND_FILTER_COPY.into(),
-                    fmt: FMT,
-                    id: sha[..8].to_vec(),
-                    sha: sha.to_vec(),
-                    size: c.bytes,
-                    raw,
-                    enc: "zstd".into(),
-                    name: c.url.clone(),
-                    at: c.at,
-                    rules: c.rules,
-                    hash: format!("{:016x}", c.hash),
-                    etag: c.etag.clone().unwrap_or_default(),
-                    last_modified: c.last_modified.clone().unwrap_or_default(),
-                },
-                Stored::File {
-                    file: c.file.clone(),
-                    size: c.bytes,
-                },
-            ));
-        }
-        // 3. 簽好的清單超過 16 KiB 就從最後一份副本開始拿掉（金鑰 ID 長度固定，先用 0 估大小）
-        let mut all = mem;
-        all.extend(files);
-        let size_of = |objs: &[(Object, Stored)]| {
-            let list: Vec<Object> = objs.iter().map(|(o, _)| o.clone()).collect();
-            manifest_body(&[0u8; 8], now, &list).len() + SEAL_OVERHEAD
-        };
-        while size_of(&all) > MANIFEST_MAX && all.last().is_some_and(|(o, _)| o.k == KIND_FILTER_COPY) {
-            all.pop();
-        }
-        let mut list = Vec::with_capacity(all.len());
+        // 3.4.3 起不再列過濾清單副本：每台黑潮自己跟清單網址下載
+        let mut list = Vec::with_capacity(mem.len());
         let mut objects = HashMap::new();
-        for (o, s) in all {
+        for (o, s) in mem {
             if let Ok(id) = <[u8; 8]>::try_from(o.id.as_slice()) {
                 objects.insert(id, s);
             }
@@ -436,63 +339,18 @@ impl ShareCache {
         }
     }
 
-    /// 副本的 SHA-256 與解壓後大小（一次讀 64 KiB；以（檔案，大小，雜湊）為鍵記著）
-    fn sum(&self, c: &FilterCopy) -> Option<([u8; 32], u64)> {
-        let key: SumKey = (c.file.clone(), c.bytes, c.hash);
-        if let Some((_, v)) = self.sums.lock().unwrap().iter().find(|(k, _)| *k == key) {
-            return Some(*v);
-        }
-        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-        let mut dec = zstd::stream::write::Decoder::new(Counter(0)).ok()?;
-        let mut off = 0u64;
-        let mut over = false;
-        while off < c.bytes {
-            let n = (c.bytes - off).min(STREAM_STEP as u64) as usize;
-            let b = self.src.read_copy(&c.file, off, n)?;
-            if b.is_empty() {
-                return None;
-            }
-            ctx.update(&b);
-            if !over && dec.write_all(&b).is_err() {
-                over = true;
-            }
-            off += b.len() as u64;
-        }
-        if !over && dec.flush().is_err() {
-            over = true;
-        }
-        let raw = if over { u64::MAX } else { dec.get_ref().0 };
-        let sha: [u8; 32] = ctx.finish().as_ref().try_into().ok()?;
-        let mut sums = self.sums.lock().unwrap();
-        if sums.len() >= SUM_CACHE_MAX {
-            sums.remove(0);
-        }
-        sums.push((key, (sha, raw)));
-        Some((sha, raw))
-    }
-
     /// 一段（32 KiB）。物件不在目前的快取裡 → None（NXDOMAIN，下游重新拿清單）
     pub fn chunk(&self, oid: &[u8; 8], idx: u32) -> Option<Vec<u8>> {
-        let (file, off, len) = {
-            let mut st = self.state.lock().unwrap();
-            st.last_used = st.last_used.max(now_ms());
-            let s = st.built.as_ref()?.objects.get(oid)?;
-            let off = idx as u64 * CHUNK as u64;
-            let size = match s {
-                Stored::Mem(b) => b.len() as u64,
-                Stored::File { size, .. } => *size,
-            };
-            if off >= size {
-                return (size == 0 && idx == 0).then(Vec::new);
-            }
-            let len = (size - off).min(CHUNK as u64) as usize;
-            match s {
-                Stored::Mem(b) => return Some(b[off as usize..off as usize + len].to_vec()),
-                Stored::File { file, .. } => (file.clone(), off, len),
-            }
-        };
-        // 副本檔不拿著鎖讀
-        self.src.read_copy(&file, off, len)
+        let mut st = self.state.lock().unwrap();
+        st.last_used = st.last_used.max(now_ms());
+        let Stored::Mem(b) = st.built.as_ref()?.objects.get(oid)?;
+        let off = idx as u64 * CHUNK as u64;
+        let size = b.len() as u64;
+        if off >= size {
+            return (size == 0 && idx == 0).then(Vec::new);
+        }
+        let len = (size - off).min(CHUNK as u64) as usize;
+        Some(b[off as usize..off as usize + len].to_vec())
     }
 
     /// 30 分鐘沒人用就整個釋放（每分鐘呼叫）
@@ -570,11 +428,18 @@ fn valid_cidr(s: &str, v6: bool) -> bool {
     let (Ok(ip), Ok(len)) = (ip.parse::<IpAddr>(), len.parse::<u8>()) else {
         return false;
     };
+    // 前綴至少 /8（IPv6 /16）：`0.0.0.0/0` 這種把整個網路都算成某家 CDN 的不收（3.4.3）
     match ip {
-        IpAddr::V4(_) => !v6 && len <= 32,
-        IpAddr::V6(_) => v6 && len <= 128,
+        IpAddr::V4(_) => !v6 && (MIN_PREFIX_V4..=32).contains(&len),
+        IpAddr::V6(_) => v6 && (MIN_PREFIX_V6..=128).contains(&len),
     }
 }
+
+/// 官方範圍可以收的最短前綴（3.4.3）
+const MIN_PREFIX_V4: u8 = 8;
+const MIN_PREFIX_V6: u8 = 16;
+/// 上游給的官方範圍至少要有這麼多（比例）落在這台自己現有的範圍裡，才換上（3.4.3）
+const RANGE_OVERLAP_MIN: f64 = 0.5;
 
 /// `cdn-ranges` 的檢查（規格 3.4）：`{ "files": { "<cdn>-ipv4.txt": "…" } }`，檔名只能是
 /// `[a-z0-9-]+-ipv[46].txt`、每行是合法的 CIDR（空行可以）
@@ -612,15 +477,6 @@ pub trait ShareSink: Send + Sync {
     fn import_cdn_ranges(&self, files: BTreeMap<String, String>) -> Result<()>;
     fn import_cdn_pools(&self, json: &[u8]) -> Result<()>;
     fn import_cdn_v6(&self, json: &[u8]) -> Result<()>;
-    /// Err = 不抓的原因（`no-room`、`not-subscribed`、`memory`…）
-    fn wants_filter_copy(&self, o: &Object) -> Result<(), &'static str>;
-    fn import_filter_copy(&self, o: &Object, compressed: Vec<u8>) -> Result<()>;
-    /// 這台的清單副本跟上游的一樣（內容雜湊相同）：不必再傳，標成「剛從上游確認過」，回傳 true（3.4.2）
-    fn filter_copy_current(&self, _o: &Object) -> bool {
-        false
-    }
-    /// 有新副本 → 用副本優先重建一次
-    fn filter_copies_done(&self, changed: usize);
     fn pressure_ok(&self) -> bool;
 }
 
@@ -680,6 +536,8 @@ pub struct Imported {
     pub at: u64,
     pub imported_at: u64,
     pub bytes: u64,
+    /// 是哪一台上游給的（金鑰 ID，十六進位；3.4.2 以前的紀錄是空的）。「新鮮」只算目前綁定的那一台給的（3.4.3）
+    pub kid: String,
 }
 
 /// `chain-share.json`：`{ "v": 1, "kinds": { "<種類>": { "sha", "at", "importedAt", "bytes" } }, "own": { "<工作>": 毫秒 }, "ownSince": 毫秒 }`。
@@ -691,7 +549,7 @@ fn saved_json(kinds: &BTreeMap<String, Imported>, own: &BTreeMap<String, u64>, o
         .map(|(k, i)| {
             (
                 k.clone(),
-                json!({ "sha": i.sha, "at": i.at, "importedAt": i.imported_at, "bytes": i.bytes }),
+                json!({ "sha": i.sha, "at": i.at, "importedAt": i.imported_at, "bytes": i.bytes, "kid": i.kid }),
             )
         })
         .collect();
@@ -734,6 +592,7 @@ fn saved_parse(b: &[u8]) -> BTreeMap<String, Imported> {
                     at: n(x, "at"),
                     imported_at: n(x, "importedAt"),
                     bytes: n(x, "bytes"),
+                    kid: x.get("kid").and_then(Value::as_str).unwrap_or("").to_string(),
                 },
             ))
         })
@@ -780,7 +639,8 @@ pub struct SyncReport {
 }
 
 type PersistFn = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
-type StaleFn = Arc<dyn Fn() + Send + Sync>;
+/// 串接解除時請排程器補跑的工作（參數是工作名稱）
+pub type StaleFn = Arc<dyn Fn(&[&str]) + Send + Sync>;
 
 /// 下游的同步
 pub struct Syncer {
@@ -873,15 +733,26 @@ impl Syncer {
             self.init_own();
         }
         if from == State::Chained && to != State::Chained {
+            let f = self.on_stale.lock().unwrap().clone();
+            // 因為「不可信」解除（抽查不通過、竄改、金鑰換了、驗證失敗）：它給的評測結果、CDN 範圍與節點池都不再
+            // 照用，請排程器補跑這些工作（排程器的最小間隔照舊；3.4.3。以前只在評測結果超過 48 小時時補跑評測）
+            let distrust = matches!(
+                self.client.state().1,
+                Some(Reason::AuditFailed | Reason::Tampered | Reason::UpstreamChanged | Reason::VerifyFailed | Reason::PinMismatch)
+            );
             let at = self.state.lock().unwrap().kinds.get(KIND_UPSTREAMS).map(|i| i.imported_at);
-            if let Some(at) = at.filter(|at| now_ms().saturating_sub(*at) > STALE_ON_RELEASE_MS) {
+            if distrust {
+                info!("串接解除（上游不可信）：自己重做評測、CDN 範圍與節點池");
+                if let Some(f) = &f {
+                    f(&DISTRUST_JOBS);
+                }
+            } else if let Some(at) = at.filter(|at| now_ms().saturating_sub(*at) > STALE_ON_RELEASE_MS) {
                 info!(
                     "串接解除：上游給的評測結果已經是 {} 小時前的，請排程器補跑評測",
                     now_ms().saturating_sub(at) / 3_600_000
                 );
-                let f = self.on_stale.lock().unwrap().clone();
-                if let Some(f) = f {
-                    f();
+                if let Some(f) = &f {
+                    f(&["dns-benchmark"]);
                 }
             }
         }
@@ -915,13 +786,17 @@ impl Syncer {
 
     fn imported_recently(&self, key: &str) -> bool {
         let now = now_ms();
+        // 只算目前綁定的那一台上游給的（3.4.3）：換了上游（或金鑰），舊上游給的資料不能再讓這台略過自己的工作
+        let Some(cur) = self.client.bound_key().map(|p| hex(&kid_of(&p))) else {
+            return false;
+        };
         self.state
             .lock()
             .unwrap()
             .kinds
             .get(key)
             // 時間在未來（時鐘倒退）不算
-            .is_some_and(|i| i.imported_at <= now.saturating_add(60_000) && now.saturating_sub(i.imported_at) < FRESH_MS)
+            .is_some_and(|i| i.kid == cur && i.imported_at <= now.saturating_add(60_000) && now.saturating_sub(i.imported_at) < FRESH_MS)
     }
 
     /// 這個工作要不要略過（規格 3.5 的對照）
@@ -959,6 +834,13 @@ impl Syncer {
         let job = match kind {
             KIND_UPSTREAMS => "dns-benchmark",
             _ => return false,
+        };
+        // 上游宣稱的時間比現在晚（超過 10 分鐘的時鐘誤差）：不採信，當成最舊的。不然宣稱一個未來的時間，
+        // 這台自己的評測結果就永遠被蓋掉（3.4.3）
+        let data_at = if data_at > now_ms().saturating_add(10 * 60_000) {
+            0
+        } else {
+            data_at
         };
         self.state.lock().unwrap().own.get(job).is_some_and(|&t| t > data_at)
     }
@@ -1001,16 +883,12 @@ impl Syncer {
                 let imp = st.kinds.get(&key);
                 let fresh =
                     imp.is_some_and(|i| i.imported_at <= now.saturating_add(60_000) && now.saturating_sub(i.imported_at) < FRESH_MS);
-                let mut v = json!({
+                json!({
                     "kind": o.kind, "at": o.at, "bytes": o.bytes,
                     "importedAt": imp.map(|i| i.imported_at),
                     "fresh": fresh && o.error.is_none(),
                     "error": o.error,
-                });
-                if o.kind == KIND_FILTER_COPY {
-                    v["name"] = json!(o.name);
-                }
-                v
+                })
             })
             .collect();
         json!({
@@ -1063,6 +941,10 @@ impl Syncer {
         if !self.client.last_probe().is_some_and(|p| p.caps.iter().any(|c| c == "share")) {
             return Err(fatal("no-share"));
         }
+        // 上游的金鑰剛換過（24 小時內）：照樣當解析的上游，但先不收它的共用資料，自己的工作照排程跑（3.4.3）
+        if self.client.key_changed_within(KEY_CHANGE_HOLD_MS) {
+            return Err(fatal("key-changed"));
+        }
         let sink = self.sink();
         if !sink.pressure_ok() {
             return Err(fatal("memory"));
@@ -1076,7 +958,6 @@ impl Syncer {
         let mut conn = kuroshio_net::path::ChaosTcp::connect(addr, ask)
             .await
             .map_err(|_| fatal("no-tcp"))?;
-        let mut changed_copies = 0usize;
         // 分段回 NXDOMAIN（上游重新產生了清單）：重新拿一次清單
         for attempt in 0..2 {
             let m = self.fetch_manifest(&mut conn, &key, ask, rep).await?;
@@ -1087,7 +968,7 @@ impl Syncer {
             for o in objs {
                 let mut s = ObjStatus {
                     kind: o.k.clone(),
-                    name: if o.k == KIND_FILTER_COPY { o.name.clone() } else { String::new() },
+                    name: String::new(),
                     at: o.at,
                     bytes: o.size,
                     error: None,
@@ -1110,9 +991,6 @@ impl Syncer {
                         s.error = Some(e);
                     }
                 }
-                if s.error.is_none() && o.k == KIND_FILTER_COPY && rep.imported.iter().any(|k| *k == kind_key(&o.k, &o.name)) {
-                    changed_copies += 1;
-                }
                 statuses.push(s);
             }
             self.state.lock().unwrap().objects = statuses;
@@ -1120,9 +998,6 @@ impl Syncer {
                 break;
             }
             debug!("共用結果：上游的清單換過了，重新拿一次");
-        }
-        if changed_copies > 0 {
-            sink.filter_copies_done(changed_copies);
         }
         if !rep.imported.is_empty() {
             info!("共用結果：從上游黑潮匯入 {}", rep.imported.join("、"));
@@ -1188,25 +1063,15 @@ impl Syncer {
         }
         let key = kind_key(&o.k, &o.name);
         let sha_hex = hex(&sha);
-        let filter = o.k == KIND_FILTER_COPY;
-        // 清單副本跟這台的一樣（重新啟動後第一次同步、或上游沒有更新）：不再傳一次，但要標成「剛從上游確認過」，
-        // 不然清單更新那一輪會當成沒有副本、改從網路下載（3.4.2：padavan-tw 的串接壓測從其他位址收到 44.5 MB）
-        if filter && sink.filter_copy_current(o) {
-            self.state.lock().unwrap().kinds.insert(
-                key,
-                Imported {
-                    sha: sha_hex,
-                    at: o.at,
-                    imported_at: now_ms(),
-                    bytes: o.size,
-                },
-            );
-            return Ok(Fetch::Done);
-        }
-        // 雜湊沒變：不重抓。清單副本例外：上面已經確認過這台「真的有一樣的內容」（本機副本或記憶體裡的）；
-        // 走到這裡就是沒有——例如只留在記憶體的副本，重新啟動後就不見了，但 chain-share.json 還記著同一個雜湊
-        // （3.4.2：padavan-tw 串接中重新啟動，這些清單不再跟上游要、改從網路下載）。要不要拿照樣由 wants_filter_copy 決定
-        if !filter && self.state.lock().unwrap().kinds.get(&key).is_some_and(|i| i.sha == sha_hex) {
+        // 雜湊沒變、也是同一台上游給的：不重抓
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .kinds
+            .get(&key)
+            .is_some_and(|i| i.sha == sha_hex && i.kid == hex(upstream_kid))
+        {
             return Ok(Fetch::Done);
         }
         // 這台自己的評測結果比上游這份新：不蓋掉自己的（直系血親，規格 10 第 3.8 節）。記成看過這份，
@@ -1219,17 +1084,13 @@ impl Syncer {
                     at: o.at,
                     imported_at: now_ms(),
                     bytes: o.size,
+                    kid: hex(upstream_kid),
                 },
             );
             return Ok(Fetch::OwnNewer);
         }
         let limit = raw_limit(&o.k);
-        if filter {
-            if o.size > COPY_MAX || o.raw > COPY_RAW_MAX {
-                return Err("too-large".into());
-            }
-            sink.wants_filter_copy(o).map_err(str::to_string)?;
-        } else if o.size > OBJECT_MAX || o.raw > limit {
+        if o.size > OBJECT_MAX || o.raw > limit {
             return Err("too-large".into());
         }
         if !matches!(o.enc.as_str(), "zstd" | "none") {
@@ -1237,7 +1098,7 @@ impl Syncer {
         }
         // 分段：一次一段，累計超過 size 立刻中止
         let n = o.size.div_ceil(CHUNK as u64).max(1);
-        let mut buf: Vec<u8> = Vec::with_capacity(o.size.min(COPY_MAX) as usize);
+        let mut buf: Vec<u8> = Vec::with_capacity(o.size.min(OBJECT_MAX) as usize);
         for idx in 0..n {
             rep.chunks += 1;
             let r = conn
@@ -1261,22 +1122,14 @@ impl Syncer {
         }
         let now = now_ms();
         let kid: [u8; 8] = upstream_kid.try_into().map_err(|_| "bad-object".to_string())?;
-        let r = if filter {
-            // 解壓一遍：確認大小沒有超過宣稱的（防壓縮炸彈），並用這台自己的方式算內容雜湊
-            let h = copy_hash(&buf, &o.enc, o.raw.min(COPY_RAW_MAX)).map_err(|e| e.to_string())?;
-            let mut o2 = o.clone();
-            o2.hash = format!("{h:016x}");
-            sink.import_filter_copy(&o2, buf)
-        } else {
-            let data = decode(&buf, &o.enc, o.raw.min(limit)).map_err(|e| e.to_string())?;
-            drop(buf);
-            match o.k.as_str() {
-                KIND_UPSTREAMS => check_upstreams(&data, &kid, now).and_then(|j| sink.import_upstreams(j)),
-                KIND_CDN_RANGES => check_ranges(&data).and_then(|f| sink.import_cdn_ranges(f)),
-                KIND_CDN_POOLS => sink.import_cdn_pools(&data),
-                KIND_CDN_V6 => sink.import_cdn_v6(&data),
-                _ => return Err("unknown-kind".into()),
-            }
+        let data = decode(&buf, &o.enc, o.raw.min(limit)).map_err(|e| e.to_string())?;
+        drop(buf);
+        let r = match o.k.as_str() {
+            KIND_UPSTREAMS => check_upstreams(&data, &kid, now).and_then(|j| sink.import_upstreams(j)),
+            KIND_CDN_RANGES => check_ranges(&data).and_then(|f| sink.import_cdn_ranges(f)),
+            KIND_CDN_POOLS => sink.import_cdn_pools(&data),
+            KIND_CDN_V6 => sink.import_cdn_v6(&data),
+            _ => return Err("unknown-kind".into()),
         };
         if let Err(e) = r {
             warn!("共用結果：{} 沒有匯入：{e:#}", o.k);
@@ -1289,9 +1142,13 @@ impl Syncer {
                 at: o.at,
                 imported_at: now,
                 bytes: o.size,
+                kid: hex(upstream_kid),
             },
         );
-        rep.imported.push(key);
+        // 上游在同步中途換了清單、重拿一次時，同一種可能再匯入一次：日誌只列一次（3.4.4，3.4.3 複驗 G4）
+        if !rep.imported.contains(&key) {
+            rep.imported.push(key);
+        }
         Ok(Fetch::Done)
     }
 
@@ -1354,13 +1211,9 @@ impl Syncer {
     }
 }
 
-/// 狀態檔裡的鍵：過濾清單副本一份清單一個
-fn kind_key(kind: &str, name: &str) -> String {
-    if kind == KIND_FILTER_COPY {
-        format!("{kind} {name}")
-    } else {
-        kind.to_string()
-    }
+/// 狀態檔裡的鍵（3.4.2 以前過濾清單副本是一份清單一個：`filter-copy <網址>`，讀到的舊紀錄留著不影響）
+fn kind_key(kind: &str, _name: &str) -> String {
+    kind.to_string()
 }
 
 /// 解壓（限制輸出大小：超過 `limit` 就中止，防壓縮炸彈）
@@ -1378,30 +1231,6 @@ fn decode(buf: &[u8], enc: &str, limit: u64) -> Result<Vec<u8>> {
         bail!("too-large");
     }
     Ok(out)
-}
-
-/// 過濾清單副本的內容雜湊（同 `filtering::CopySink` 的算法），邊解壓邊算、不留內容；超過 `limit` 就中止
-fn copy_hash(buf: &[u8], enc: &str, limit: u64) -> Result<u64> {
-    if enc != "zstd" {
-        bail!("bad-encoding");
-    }
-    let mut dec = zstd::stream::read::Decoder::new(buf).map_err(|_| anyhow!("bad-encoding"))?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut n = 0u64;
-    let mut chunk = vec![0u8; STREAM_STEP];
-    loop {
-        let k = dec.read(&mut chunk).map_err(|_| anyhow!("bad-encoding"))?;
-        if k == 0 {
-            break;
-        }
-        n += k as u64;
-        if n > limit {
-            bail!("too-large");
-        }
-        h.write(&chunk[..k]);
-    }
-    h.write_u64(n);
-    Ok(h.finish())
 }
 
 // ---------------- 行程層級 ----------------
@@ -1439,15 +1268,16 @@ pub fn auto_info(mgr: &crate::upstreams::Manager) -> Value {
 
 // ---------------- 正式環境的來源與匯入端 ----------------
 
-/// `app` 用的 [`ShareSource`] 與 [`ShareSink`]：接到這一輪的 Manager、CDN、過濾
+/// `app` 用的 [`ShareSource`] 與 [`ShareSink`]：接到這一輪的 Manager、CDN（過濾清單 3.4.3 起不共用）
 pub struct Live {
     pub mgr: Arc<crate::upstreams::Manager>,
     pub cdn: Option<Arc<kuroshio_cdn::Cdn>>,
-    pub filter: Option<Arc<crate::filtering::FilterService>>,
     /// 隨程式附帶的種子評測結果（跟它一樣的不分享）
     pub seed_upstreams: PathBuf,
     /// 匯入節點池時每家最多幾個（`pool.poolSize × 4`）
     pub max_per_provider: usize,
+    /// 匯入評測結果時，照這台的設定至少要有幾台能用（`benchmark.minAuto`，最多看 2 台；3.4.3）
+    pub min_auto: usize,
 }
 
 impl Live {
@@ -1500,33 +1330,6 @@ impl ShareSource for Live {
         self.cdn.as_ref().filter(|c| c.enabled()).map(|c| c.export_shared())
     }
 
-    fn filter_copies(&self) -> Vec<FilterCopy> {
-        let Some(f) = &self.filter else { return Vec::new() };
-        f.shared_copies()
-            .into_iter()
-            .map(|(url, m, path)| FilterCopy {
-                url,
-                bytes: std::fs::metadata(&path).map(|x| x.len()).unwrap_or(m.bytes),
-                file: path.to_string_lossy().into_owned(),
-                raw: 0,
-                hash: m.hash,
-                rules: m.rules,
-                etag: m.etag,
-                last_modified: m.last_modified,
-                at: m.at * 1000,
-            })
-            .collect()
-    }
-
-    fn read_copy(&self, file: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
-        use std::io::Seek;
-        let mut f = std::fs::File::open(file).ok()?;
-        f.seek(std::io::SeekFrom::Start(offset)).ok()?;
-        let mut out = Vec::with_capacity(len);
-        f.take(len as u64).read_to_end(&mut out).ok()?;
-        Some(out)
-    }
-
     fn pressure_ok(&self) -> bool {
         crate::app::pressure() == crate::sysinfo::Pressure::Normal
     }
@@ -1534,6 +1337,14 @@ impl ShareSource for Live {
 
 impl ShareSink for Live {
     fn import_upstreams(&self, json: Vec<u8>) -> Result<()> {
+        // 照這台自己的設定篩完不夠用：不匯入、不算新鮮，自己的評測照排程跑（3.4.3；以前照樣算匯入成功，
+        // 最多 7 天不自己評測，手上卻沒有可用的自動上游）。這台沒開自動上游時不檢查（自己評測也用不到）
+        let v: Value = serde_json::from_slice(&json)?;
+        let n = self.mgr.usable_auto(&v);
+        let need = self.min_auto.clamp(1, 2);
+        if self.mgr.uses_auto() && n < need {
+            bail!("照這台的設定（類型、台數）只有 {n} 台能用（至少要 {need} 台），不匯入（not-usable）");
+        }
         crate::persist::write_atomic(self.mgr.state_file(), &json)?;
         self.mgr.reload_auto();
         Ok(())
@@ -1544,7 +1355,21 @@ impl ShareSink for Live {
         let dir = c.paths.state_dir.join("cdn").join("ranges");
         std::fs::create_dir_all(&dir)?;
         let mut changed = false;
+        let mut rejected = Vec::new();
         for (name, text) in files {
+            // 跟這台自己現有的範圍大部分重疊才換上（直系血親：上游不能把範圍改成跟官方無關的網段；3.4.3）。
+            // 這台還沒有這家的範圍時照收
+            let provider = name.rsplit_once("-ipv").map_or(name.as_str(), |(p, _)| p);
+            let bases: Vec<IpAddr> = text
+                .lines()
+                .filter_map(|l| l.trim().split_once('/').and_then(|(ip, _)| ip.parse().ok()))
+                .collect();
+            if let Some(f) = c.ranges_overlap(provider, &bases) {
+                if f < RANGE_OVERLAP_MIN {
+                    rejected.push(format!("{name}（{:.0}% 在自己的範圍裡）", f * 100.0));
+                    continue;
+                }
+            }
             let p = dir.join(&name);
             if std::fs::read(&p).ok().as_deref() == Some(text.as_bytes()) {
                 continue;
@@ -1554,6 +1379,12 @@ impl ShareSink for Live {
         }
         if changed {
             c.reload_ranges();
+        }
+        if !rejected.is_empty() {
+            warn!("共用結果：上游給的官方範圍跟這台的差太多，沒有換上：{}", rejected.join("、"));
+            if !changed {
+                bail!("官方範圍跟這台的差太多（ranges-mismatch）");
+            }
         }
         Ok(())
     }
@@ -1577,54 +1408,6 @@ impl ShareSink for Live {
         Ok(())
     }
 
-    fn filter_copy_current(&self, o: &Object) -> bool {
-        let (Some(f), Ok(hash)) = (&self.filter, u64::from_str_radix(&o.hash, 16)) else {
-            return false;
-        };
-        f.subscribes(&o.name) && f.mark_shared_if_same(&o.name, hash)
-    }
-
-    fn wants_filter_copy(&self, o: &Object) -> Result<(), &'static str> {
-        let Some(f) = &self.filter else { return Err("not-subscribed") };
-        if !f.subscribes(&o.name) {
-            return Err("not-subscribed");
-        }
-        if !ShareSink::pressure_ok(self) || !f.build_room_ok(o.rules) {
-            return Err("memory");
-        }
-        // 存不下：先留在記憶體（重建時讀它，不從網路下載；3.4.2）
-        if !f.copy_wanted(o.size) && !f.can_hold(&o.name, o.size) {
-            return Err("no-room");
-        }
-        Ok(())
-    }
-
-    fn import_filter_copy(&self, o: &Object, compressed: Vec<u8>) -> Result<()> {
-        let f = self.filter.as_ref().ok_or_else(|| anyhow!("過濾沒有啟用"))?;
-        let hash = u64::from_str_radix(&o.hash, 16).map_err(|_| anyhow!("內容雜湊格式錯誤"))?;
-        let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
-        let v = crate::fetch::Validators {
-            etag: some(&o.etag),
-            last_modified: some(&o.last_modified),
-        };
-        if f.copy_wanted(o.size) {
-            f.import_shared_copy(&o.name, hash, compressed, &v, o.rules);
-        } else {
-            f.hold_shared_copy(&o.name, hash, compressed, &v);
-        }
-        Ok(())
-    }
-
-    fn filter_copies_done(&self, changed: usize) {
-        let Some(f) = self.filter.clone() else { return };
-        info!("共用結果：從上游黑潮拿到 {changed} 份清單副本，用副本重建過濾器");
-        tokio::spawn(async move {
-            if let Err(e) = f.rebuild_from_copies().await {
-                warn!("用上游給的清單副本重建過濾器失敗：{e:#}");
-            }
-        });
-    }
-
     fn pressure_ok(&self) -> bool {
         crate::app::pressure() == crate::sysinfo::Pressure::Normal
     }
@@ -1635,16 +1418,15 @@ pub fn start(
     cfg: &Value,
     resolver: &Arc<crate::resolver::Resolver>,
     cdn: Option<Arc<kuroshio_cdn::Cdn>>,
-    filter: Option<Arc<crate::filtering::FilterService>>,
     persister: &Arc<Mutex<crate::persist::Persister>>,
     scheduler: Option<&Arc<kuroshio_jobs::Scheduler>>,
 ) {
     let live = Arc::new(Live {
         mgr: resolver.upstreams.clone(),
         cdn,
-        filter,
         seed_upstreams: crate::app::share_dir(cfg).join("seed").join("upstreams.json"),
         max_per_provider: kuroshio_cdn::config::JobsConfig::from_value(cfg).pool_size.max(1) * 4,
+        min_auto: cfg.pointer("/benchmark/minAuto").and_then(Value::as_u64).unwrap_or(3) as usize,
     });
     // 上游
     if let Some(r) = resolver.chain.get() {
@@ -1680,9 +1462,11 @@ pub fn start(
     match scheduler {
         Some(sched) => {
             let w = Arc::downgrade(sched);
-            s.set_on_stale(Arc::new(move || {
+            s.set_on_stale(Arc::new(move |jobs: &[&str]| {
                 if let Some(sc) = w.upgrade() {
-                    sc.request("dns-benchmark", "串接解除");
+                    for j in jobs {
+                        sc.request(j, "串接解除");
+                    }
                 }
             }));
         }
@@ -1708,8 +1492,6 @@ mod tests {
         assert_eq!(decode(&z, "zstd", 10_000).unwrap().len(), 10_000);
         assert!(decode(&z, "zstd", 9_999).is_err());
         assert!(decode(b"xx", "none", 1).is_err());
-        assert!(copy_hash(&z, "zstd", 9_999).is_err());
-        assert!(copy_hash(&z, "zstd", 10_000).is_ok());
     }
 
     #[test]

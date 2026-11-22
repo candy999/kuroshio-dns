@@ -601,7 +601,8 @@ impl Resolver {
         let mut r = Message::response_to(query, e.rcode);
         r.answers = e.answers.iter().map(|a| Record { ttl, ..a.clone() }).collect();
         // CDN 調整會改寫答案：要 DNSSEC 記錄或類別不是 IN 的查詢不動（同 job() 的 verbatim）
-        let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1;
+        // 下游黑潮自己關掉了 CDN 置換（查詢帶著私有選項）：照原樣回答，不幫它換台灣節點（3.4.3：每台黑潮自己決定）
+        let verbatim = query.dnssec_ok() || query.questions[0].qclass != 1 || wants_no_cdn(query);
         if let Some(cdn) = self.steer_cdn().filter(|_| !verbatim && (e.chained || self.chain_active())) {
             // 串接上游（上游黑潮）給的答案：CDN 節點上游已經驗證、換好（3.4.1）。
             // 下游不再改寫、不排背景驗證（MIPS 上的 TLS 驗證很吃 CPU），只記哪家 CDN（統計用，唯讀快照）
@@ -716,7 +717,7 @@ impl Resolver {
 
         let active = self.upstreams.active();
         let Asked { answers: results, unasked } = self
-            .ask(&active, &upq, qtype, false, |a| {
+            .ask(&active, &upq, qtype, false, false, |a| {
                 if fast_sent || !self.params.fast_path || a.class != Class::Ok {
                     return;
                 }
@@ -744,19 +745,35 @@ impl Resolver {
         if decided.is_none() {
             // 全部失敗或都被上游擋：改問備援
             used_backup = true;
-            let more = self.ask(&self.upstreams.backup(), &upq, qtype, false, |_| {}).await.answers;
-            decided = decide(&more, false, cdn.as_deref(), qtype)
+            // 上游黑潮解析不到（SERVFAIL）才改問自己的上游時，多半是網域本身壞了：自己的上游沒回應也先不算失敗，
+            // 同一輪有別的上游正常回答才算（跟 SERVFAIL 一樣）。不然串接中自己的上游只收到這些壞網域，
+            // 連續失敗一直累積，被暫停 1→2→4 分鐘（3.4.4，3.4.3 複驗 G6）
+            let chain_servfail = results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::ServFail);
+            let backup = self.upstreams.backup();
+            let more = self.ask(&backup, &upq, qtype, false, chain_servfail, |_| {}).await.answers;
+            let first = decide(&more, false, cdn.as_deref(), qtype);
+            // 上游黑潮解析不到、自己的上游裡只有一台回否定答案（其他都沒回應或也解析不到）：不採用，照上游的 SERVFAIL。
+            // 權威伺服器掛掉的網域，偶爾有一台上游回空答案，裝置就以為「網域存在、沒有這種記錄」（3.4.4，3.4.3 複驗 G7）
+            let lone = chain_servfail && first.as_ref().is_some_and(|d| lone_negative(d, &more, backup.len()));
+            decided = (if lone { None } else { first })
                 .map(|mut d| {
                     // 上游黑潮擋掉、下游用自己的上游解析的：來源標出來（狀態頁、日誌看得到是繞過上游的過濾）
                     if results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::Blocked) {
                         d.source = format!("{}(上游擋，改用自己的上游)", d.source);
                         // 狀態頁看得到次數（D3 這類只收 WARN 日誌的機器，看不到來源標籤；3.4.2）
                         self.stats.count(StatKind::ChainBypass);
+                    } else if results.iter().any(|r| r.up.role == Role::Chain && r.class == Class::ServFail) {
+                        d.source = format!("{}(上游解析不到，改用自己的上游)", d.source);
+                        self.stats.count(StatKind::ChainRetry);
                     }
                     d
                 })
                 .or_else(|| {
-                    let all: Vec<Arc<Answer>> = results.iter().chain(&more).cloned().collect();
+                    let all: Vec<Arc<Answer>> = results
+                        .iter()
+                        .chain(more.iter().filter(|a| !(lone && is_negative(a.class))))
+                        .cloned()
+                        .collect();
                     decide(&all, true, cdn.as_deref(), qtype)
                 });
         }
@@ -822,20 +839,18 @@ impl Resolver {
         });
     }
 
-    /// 抽查上游黑潮給的 CDN 答案：連到它給的 IP、用網域名稱做 TLS 握手檢查憑證；不符時用自己的加密上游
+    /// 抽查上游黑潮給的答案（3.4.3 起不限 CDN）：連到它給的 IP、用網域名稱做 TLS 握手檢查憑證；不符時用自己的加密上游
     /// 解析一次、對自己拿到的 IP 做同樣的檢查，自己的正常才算可疑。1 小時內 3 次可疑 → 解除串接（規格 10 第 3.8 節）
     fn maybe_audit(self: &Arc<Self>, qname: &str, qtype: u16, e: &Entry, upq: &[u8]) {
         if !self.chain_active() || !crate::clock::synced() || crate::app::pressure() != crate::sysinfo::Pressure::Normal {
             return;
         }
-        let Some(cdn) = self.steer_cdn() else { return };
+        // 不限 CDN 的答案、也不看這台有沒有開 CDN 置換（3.4.3）：以前只查 CDN 答案，下游關掉 CDN 時
+        // 對上游完全沒有查核。抽樣、間隔、同時一個的上限照舊
         let msg = Message {
             answers: e.answers.clone(),
             ..Default::default()
         };
-        if cdn.provider_of(&msg, qtype).is_none() {
-            return;
-        }
         let Some(ip) = logic::ips_of(&msg, qtype).into_iter().next() else {
             return;
         };
@@ -854,7 +869,7 @@ impl Resolver {
                 SiteCheck::Invalid => {
                     // 自己的加密上游（不經攔截者）解析一次，看是網站本身的問題、還是上游給的答案不對
                     let own = me.upstreams.backup();
-                    let asked = me.ask(&own, &upq, qtype, false, |_| {}).await;
+                    let asked = me.ask(&own, &upq, qtype, false, false, |_| {}).await;
                     let mine = asked
                         .answers
                         .iter()
@@ -929,7 +944,7 @@ impl Resolver {
                 cdn,
                 ..
             } = b;
-            let more = me.ask(&unasked, &upq, qtype, true, |_| {}).await.answers;
+            let more = me.ask(&unasked, &upq, qtype, true, false, |_| {}).await.answers;
             if backfill_mismatch(&first, &more) {
                 me.stats.count(StatKind::BackfillMismatch);
                 debug!(
@@ -963,7 +978,8 @@ impl Resolver {
     /// 並行詢問一組上游：全部回來，或第一個正常回應後再等 window；
     /// `parallel` > 0 時先問前幾個，失敗或每隔 hedge 沒有正常回應再加問下一個。
     /// `all`：不套 `parallel`，全部一起問（背景補問用）。回傳收到的回答與這次沒有問到的上游
-    async fn ask(&self, list: &[Arc<Up>], q: &[u8], qtype: u16, all: bool, mut on_each: impl FnMut(&Answer)) -> Asked {
+    /// `defer_silent`：沒有回應的上游跟 SERVFAIL 一樣，同一輪有別的上游正常回答才算失敗（串接上游 SERVFAIL 後的重問用）
+    async fn ask(&self, list: &[Arc<Up>], q: &[u8], qtype: u16, all: bool, defer_silent: bool, mut on_each: impl FnMut(&Answer)) -> Asked {
         let mut out = Vec::new();
         if list.is_empty() {
             return Asked::default();
@@ -992,8 +1008,13 @@ impl Resolver {
         }
         let list = &ordered[..];
         let mut set = JoinSet::new();
+        // 這台自己沒開 CDN 置換：問上游黑潮時請它照原樣回答（3.4.3）
+        let no_cdn = self.steer_cdn().is_none().then(|| with_no_cdn(q)).flatten();
         let spawn = |set: &mut JoinSet<_>, up: Arc<Up>| {
-            let q = q.to_vec();
+            let q = match &no_cdn {
+                Some(nq) if up.role == Role::Chain => nq.clone(),
+                _ => q.to_vec(),
+            };
             let t = timeout_for(p, &up);
             set.spawn(async move {
                 let t0 = Instant::now();
@@ -1027,7 +1048,12 @@ impl Resolver {
                     };
                     match r.ok().and_then(|b| Message::parse(&b).ok()) {
                         Some(msg) => {
-                            let class = logic::classify(&msg, qtype);
+                            let mut class = logic::classify(&msg, qtype);
+                            // 上游黑潮擋掉非 A／AAAA 的查詢時回空答案＋EDE（被擋／被過濾）：當成「上游擋」，
+                            // 由下游自己的過濾決定要不要擋（3.4.3；以前當成 NODATA 直接回給裝置）
+                            if up.role == Role::Chain && class == Class::NoData && blocked_by_ede(&msg) {
+                                class = Class::Blocked;
+                            }
                             if class == Class::ServFail && up.role != Role::Chain {
                                 servfails.push((up.clone(), ms));
                             } else {
@@ -1061,7 +1087,11 @@ impl Resolver {
                             }
                         }
                         None => {
-                            up.record(false, ms);
+                            if defer_silent && up.role != Role::Chain {
+                                servfails.push((up.clone(), ms));
+                            } else {
+                                up.record(false, ms);
+                            }
                             if let Some(u) = rest.next() { spawn(&mut set, u); }
                         }
                     }
@@ -1305,6 +1335,37 @@ fn timeout_for(p: &Params, up: &Up) -> Duration {
     }
 }
 
+/// 查詢帶著黑潮的「不要換 CDN 節點」選項（下游黑潮自己關掉了 CDN 置換；3.4.3）
+fn wants_no_cdn(q: &Message) -> bool {
+    q.opt.as_ref().is_some_and(|o| {
+        o.options
+            .iter()
+            .any(|(c, _)| *c == kuroshio_proto::message::opt_code::KUROSHIO_NO_CDN)
+    })
+}
+
+/// 在查詢加上「不要換 CDN 節點」選項（沒有 OPT 就加一個）；解析不了 → None（照原樣送）
+fn with_no_cdn(q: &[u8]) -> Option<Vec<u8>> {
+    let mut m = Message::parse(q).ok()?;
+    let o = m.opt.get_or_insert_with(|| kuroshio_proto::message::Opt {
+        udp_size: 1232,
+        ..Default::default()
+    });
+    o.options.push((kuroshio_proto::message::opt_code::KUROSHIO_NO_CDN, Vec::new()));
+    Some(m.encode())
+}
+
+/// 回應帶著 EDE 15（被擋）或 17（被過濾）：上游的過濾擋掉的（RFC 8914）
+fn blocked_by_ede(msg: &Message) -> bool {
+    msg.opt.as_ref().is_some_and(|o| {
+        o.options.iter().any(|(code, d)| {
+            *code == kuroshio_proto::message::opt_code::EDE
+                && d.len() >= 2
+                && matches!(u16::from_be_bytes([d[0], d[1]]), logic::ede::BLOCKED | logic::ede::FILTERED)
+        })
+    })
+}
+
 /// 這個回答算不算上游「有回應」（健康紀錄用）。串接上游回 SERVFAIL 是它自己解析不到（例如權威伺服器太慢），
 /// 上游黑潮本身是好的：不算串接失敗。以前算失敗，連續 3 次就暫停串接 30 秒、全部改走自己的加密上游（3.4.2）
 fn answered_ok(up: &Up, class: Class) -> bool {
@@ -1314,6 +1375,15 @@ fn answered_ok(up: &Up, class: Class) -> bool {
         Class::Refused => up.role != Role::Chain,
         _ => true,
     }
+}
+
+fn is_negative(c: Class) -> bool {
+    matches!(c, Class::NoData | Class::NxDomain)
+}
+
+/// 決定的否定答案只有一台給、而且問了兩台以上：其他上游都沒有同樣的否定答案
+fn lone_negative(d: &Decided, answers: &[Arc<Answer>], asked: usize) -> bool {
+    is_negative(d.class) && asked >= 2 && answers.iter().filter(|a| a.class == d.class).count() < 2
 }
 
 fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_cdn::Cdn>, qtype: u16) -> Option<Decided> {
@@ -1393,11 +1463,14 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
             chained: pick.up.role == Role::Chain,
         });
     }
-    // 串接上游（上游黑潮）解析失敗（SERVFAIL）：它已經問過自己的上游與備援，就是最後的答案，
-    // 下游不再問自己的加密上游重做一次（3.4.2：以前會，剛註冊的網域一多就重複使用網路、做 CDN 驗證）。
-    // 上游黑潮「擋掉」的不在這裡：下游的過濾沒有擋，就用自己的加密上游解析一次（下游自己決定要不要擋；
-    // 自己的上游也沒有答案時，才照上游的擋）
-    if let Some(c) = results.iter().find(|r| r.up.role == Role::Chain && r.class == Class::ServFail) {
+    // 串接上游（上游黑潮）解析失敗（SERVFAIL）：第一輪不當成答案，改問自己的上游（3.4.3）。上游黑潮自己的上游
+    // 壞了、心跳卻正常時，以前下游每一筆都 SERVFAIL、永遠不會退回自己的上游；每台黑潮都要能自己解析。
+    // 自己的上游也解析不到時（最後一輪，`accept_blocked`），才照上游的 SERVFAIL。
+    // 上游黑潮「擋掉」的同理：下游的過濾沒有擋，就用自己的加密上游解析一次（下游自己決定要不要擋）
+    if let Some(c) = results
+        .iter()
+        .find(|r| accept_blocked && r.up.role == Role::Chain && r.class == Class::ServFail)
+    {
         return Some(Decided {
             msg: c.msg.clone(),
             class: Class::ServFail,
@@ -1423,6 +1496,18 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.4.3：下游黑潮自己關掉 CDN 置換時，問上游黑潮的查詢帶著私有選項；上游看到就照原樣回答
+    #[test]
+    fn no_cdn_option_roundtrip() {
+        let q = kuroshio_proto::build_query(7, "www.example.com", 1);
+        assert!(!wants_no_cdn(&Message::parse(&q).unwrap()));
+        let nq = with_no_cdn(&q).unwrap();
+        let m = Message::parse(&nq).unwrap();
+        assert!(wants_no_cdn(&m));
+        assert_eq!(m.questions[0].name, "www.example.com");
+        assert!(with_no_cdn(b"bad").is_none());
+    }
 
     #[test]
     fn local_forward_names() {

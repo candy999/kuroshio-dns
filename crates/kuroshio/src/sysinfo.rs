@@ -234,6 +234,17 @@ pub enum Pressure {
     Critical = 2,
 }
 
+impl Pressure {
+    /// `/api/status` 的 `memory.pressure`
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pressure::Normal => "normal",
+            Pressure::Low => "low",
+            Pressure::Critical => "critical",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

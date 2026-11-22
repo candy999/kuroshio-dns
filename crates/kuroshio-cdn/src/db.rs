@@ -1304,6 +1304,18 @@ impl Db {
         }
     }
 
+    /// 別人給的候選節點（好友同步、分享檔）：還有空位才放，不擠掉自己流量收集到的。回傳有沒有新增
+    pub fn add_harvest_candidate(&mut self, provider: &str, ip: IpAddr) -> bool {
+        let h = self.harvest.entry(provider.to_string()).or_default();
+        let m = if ip.is_ipv6() { &mut h.v6 } else { &mut h.v4 };
+        if m.contains_key(&ip) || m.len() >= HARVEST_MAX {
+            return false;
+        }
+        m.insert(ip, now_ms());
+        self.harvest_dirty = true;
+        true
+    }
+
     pub fn harvest_of(&self, provider: &str, v6: bool) -> Vec<IpAddr> {
         self.harvest
             .get(provider)
