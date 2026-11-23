@@ -406,9 +406,10 @@ async fn deepest_shed_state_still_forwards_plain_dns() {
     assert!(f.list_rules() > 0, "清單載入了");
     let m = udp_query(addr, 1, "ads.example").await.unwrap();
     assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::UNSPECIFIED), "清單有效");
-    // 注入：系統可用記憶體只剩 4 MB（保留 64 MB 的 1/16）
+    // 注入：系統可用記憶體只剩 4 MB（保留 64 MB 的 1/16）。黑潮自己 40 MB：用量 × 2 ≥ 缺口 60 MB，
+    // 讓得出來（不是「於事無補」，3.5.0）——記憶體監看也用這個量測判斷，自己用量太小會整段不讓
     let low = kuroshio::memgov::Reading {
-        rss: Some(20 << 20),
+        rss: Some(40 << 20),
         total: Some(128 << 20),
         avail: Some(4 << 20),
         psi: None,

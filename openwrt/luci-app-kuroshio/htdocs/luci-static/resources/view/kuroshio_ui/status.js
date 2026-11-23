@@ -179,11 +179,13 @@ return view.extend({
 		// 記憶體控制（規格 09）：釋出中的項目、停用中的過濾清單（停用期間少了這些保護，要明顯）
 		var shed = mem.shed || [], fl = api.filter || {};
 		var sim = mem.simulated;
-		var memSec = (shed.length || fl.notice || mem.floor || sim) ? common.section(_('記憶體控制'), [
+		var memSec = (shed.length || fl.notice || mem.floor || sim || mem.futile) ? common.section(_('記憶體控制'), [
 			// 測試開關（3.5.0，system.testHooks）：模擬記憶體不足中
 			sim ? E('div', { 'class': 'alert-message warning' }, _('測試模式：模擬系統可用記憶體只剩 %s MB（還有 %s 分鐘，到期自動恢復）。不是測試的話請把設定的 system.testHooks 關掉。').format(sim.availMB, Math.ceil((sim.remainingSec || 0) / 60))) : '',
 			mem.protectedSuspended ? E('div', { 'class': 'alert-message danger' }, _('記憶體嚴重不足：連保護清單（惡意 / 反詐騙）都暫停了，只剩自訂規則；DNS 照常轉送。記憶體回來後自動恢復。'))
 				: (mem.floor ? E('div', { 'class': 'alert-message danger' }, _('記憶體不足：只轉送 DNS（暫停 CDN 調整、快取最小）。記憶體回來後自動恢復。')) : ''),
+			// 退讓於事無補（3.5.0）：缺口是其他程式造成，黑潮全部讓出也補不了（路由器上幾乎不會出現）
+			mem.futile ? E('div', { 'class': 'alert-message warning' }, _('系統可用記憶體不足是其他程式造成，黑潮讓出也補不了：只停止長大、照樣寫出快照，不縮快取、不停用過濾清單。')) : '',
 			fl.notice ? E('div', { 'class': 'alert-message warning' }, fl.notice) : '',
 			E('p', {}, _('目前：%s（系統可用 %s MB / 保留 %s MB）').format(mem.stateLabel || mem.state || '-', mbOf(mem.availKB), mbOf(mem.reserveKB)) +
 				(mem.waiting ? ' · ' + mem.waiting : '')),

@@ -1328,8 +1328,8 @@ fn spawn_maintenance(r: Arc<Resolver>, legacy: bool) {
             r.upstreams.reload_auto();
             if tick % 2 == 0 {
                 r.sweep();
-                // 記憶體偏低：快取縮到一半（規格 05 第 3.2 節）
-                if legacy && pressure() != Pressure::Normal {
+                // 記憶體偏低：快取縮到一半（規格 05 第 3.2 節）；於事無補（缺口是其他程式造成）時不縮
+                if legacy && pressure() != Pressure::Normal && !crate::memgov::futile() {
                     let mut c = r.cache.lock().unwrap();
                     let max = c.max;
                     c.max = (max / 2).max(256);
@@ -1445,6 +1445,9 @@ impl AppState {
                     "reserveAuto": self.reserve.auto,
                     "reserveHow": self.reserve.how,
                     "headroomKB": crate::memgov::headroom(&r, &self.reserve).map(|b| b / 1024),
+                    "futile": crate::memgov::futile(),
+                    "deficitBytes": r.avail.map(|a| self.reserve.bytes.saturating_sub(a)),
+                    "ownBytes": r.rss,
                     "simulated": crate::memgov::simulation_json(crate::memgov::simulation(crate::memgov::steady_secs()), crate::memgov::steady_secs()),
                 })
             }
@@ -1748,12 +1751,23 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
     }
     tokio::spawn(async move {
         let mut last = Pressure::Normal;
+        // 記憶體控制關掉時自己判斷「於事無補」（開著時由記憶體控制判斷，狀態頁看得到同一份）
+        let mut gate = crate::memgov::FutileGate::default();
         loop {
             let r = match &gov {
                 Some(g) => g.read(),
                 None => Reading::now(),
             };
-            let p = pressure_of(&r, &reserve);
+            // 退讓於事無補（3.5.0，規格 09 第 12 節）：缺口是其他程式造成、黑潮全部讓出也補不到一半時，
+            // 「不足」降成「偏低」：不拒絕新的加密連線、清單更新不等到不足解除；記憶體結構照樣不長大。
+            // 快照寫入器依它自己的量測（`mem_now`）照樣立刻寫出，不看這個訊號
+            let now = crate::memgov::steady_secs();
+            let futile = match &gov {
+                Some(g) => g.observe_futile(&r, now),
+                None => crate::memgov::observe_futile_standalone(&mut gate, &r, &reserve, now),
+            };
+            crate::memgov::set_futile(futile);
+            let p = crate::memgov::signal_pressure(pressure_of(&r, &reserve), futile);
             PRESSURE.store(p as u8, Ordering::Relaxed);
             // 好友資料（社群共享）：解壓後不超過保留量以上可用空間的 1/4（至少 1 MB）
             let cap = crate::memgov::headroom(&r, &reserve).map_or(0, |h| ((h >> 20) / 4).clamp(1, u32::MAX as u64) as u32);
@@ -1764,6 +1778,9 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                     // 這是「當下」的量測；記憶體控制的狀態（`memory.state`）要穩定一段時間才放鬆（遲滯，預設 3 分鐘），
                     // 兩者會差幾分鐘（3.4.3：日誌寫「恢復正常」、狀態頁卻還是吃緊，看起來像錯誤）
                     Pressure::Normal => info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆"),
+                    Pressure::Low if futile => info!(
+                        "記憶體不足，但缺口是其他程式造成（可用 {a} MB，保留 {res} MB）：照「偏低」處理——背景工作延後、記憶體結構不再長大，照樣接受加密連線"
+                    ),
                     Pressure::Low => info!("記憶體接近保留量（可用 {a} MB，保留 {res} MB）：背景工作延後、記憶體結構不再長大"),
                     Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }

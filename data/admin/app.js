@@ -618,7 +618,7 @@
 		if (mb) {
 			clear(mb);
 			var sim = mem.simulated;
-			mb.hidden = !(shed.length || (f && f.notice) || mem.floor || sim);
+			mb.hidden = !(shed.length || (f && f.notice) || mem.floor || sim || mem.futile);
 			if (!mb.hidden) {
 				append(mb, [
 					el('h3', { text: '記憶體控制' }),
@@ -626,6 +626,8 @@
 					sim ? el('p', { class: 'msg warn', text: '測試模式：模擬系統可用記憶體只剩 ' + sim.availMB + ' MB（還有 ' + Math.ceil((sim.remainingSec || 0) / 60) + ' 分鐘，到期自動恢復）。不是測試的話請把設定的 system.testHooks 關掉。' }) : null,
 					mem.protectedSuspended ? el('p', { class: 'msg err', text: '記憶體嚴重不足：連保護清單（惡意 / 反詐騙）都暫停了，只剩自訂規則；DNS 照常轉送。記憶體回來後自動恢復。' }) :
 						mem.floor ? el('p', { class: 'msg err', text: '記憶體不足：只轉送 DNS（暫停 CDN 調整、快取最小）。記憶體回來後自動恢復。' }) : null,
+					// 退讓於事無補（3.5.0）：缺口是其他程式造成，黑潮全部讓出也補不了
+					mem.futile ? el('p', { class: 'msg warn', text: '系統可用記憶體不足是其他程式造成（缺口約 ' + fmtBytes(mem.deficitBytes) + '，黑潮自己約 ' + fmtBytes(mem.ownBytes) + '）：讓出也補不了，所以只停止長大、照樣寫出快照，不縮快取、不停用過濾清單。' }) : null,
 					f && f.notice ? el('p', { class: 'msg warn', text: f.notice }) : null,
 					el('p', { class: 'muted', text: '目前：' + (mem.stateLabel || mem.state || '-') + '（系統可用 ' + mbOf(mem.availKB) + ' MB / 保留 ' + mbOf(mem.reserveKB) + ' MB）' + (mem.waiting ? ' · ' + mem.waiting : '') }),
 					shed.length ? el('ul', {}, shed.map(function (x) { return el('li', { text: x.label + ' ' + (x.detail || '') + '（約 ' + fmtBytes(x.freedBytes) + '，' + fmtTime(x.at) + '）' }); })) : null

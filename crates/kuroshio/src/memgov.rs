@@ -6,6 +6,8 @@
 //!   高於「保留量 + 遲滯」（[`margin`]）才恢復、才讓記憶體結構繼續長大。預設依平台自動決定（[`auto_reserve`]），
 //!   可以用 `system.memoryReserveMB`（絕對值）與 / 或 `system.memoryReservePercent`（實體記憶體的百分比）指定，
 //!   兩個都填取大的；0 = 自動。不看自己用了多少（沒有「預算」），只看整台機器還剩多少。
+//! - **退讓於事無補**（3.5.0，[`FutileGate`]）：缺口（保留量 − 可用）大於自己用量的兩倍時（別的程式吃掉的，
+//!   自己全部讓出也補不到一半），只停止長大、照樣寫出快照，不走下面的階梯；壓力訊號「不足」降成「偏低」。
 //! - **反應快**：可用記憶體在保留量兩倍以內時每 2–3 秒量一次，離得遠時 30 秒（[`poll_interval`]）；
 //!   Linux 有 PSI（`/proc/pressure/memory`）時當作提早的訊號：別的程式已經在等記憶體了，就先讓。
 //!   沒有 PSI（舊核心，例如 Padavan 的 4.4）只能靠輪詢：比保留量多不到 [`NO_PSI_NEAR`] 時每 3 秒、其他 10 秒。
@@ -125,7 +127,7 @@ pub fn steady_to_wall_ms(t: u64) -> u64 {
 /// 一次量測（bytes；量不到是 None）。測試直接造這個，不碰主機真正的記憶體
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Reading {
-    /// 自己的常駐記憶體（只顯示，不拿來判斷）
+    /// 自己的常駐記憶體（Windows 是工作集）：不拿來決定狀態，只用在「於事無補」的判斷（[`futile_enter`]）
     pub rss: Option<u64>,
     /// 系統實體記憶體
     pub total: Option<u64>,
@@ -344,15 +346,16 @@ impl Reserve {
 ///   程式本身（OpenWrt 的 squashfs 上的執行檔與函式庫），全部回收就會一直重讀 Flash（thrashing）。
 ///   所以再留一段：至少 16 MB（128 MB 路由器上約 12%，夠 dnsmasq、hostapd、netifd 這類常駐程式的工作集），
 ///   大機器 5%；`min_free_kbytes` × 3 讓保留量一定高過核心開始直接回收（min 水位）與 kswapd 喚醒（low 水位）。
-/// - Windows：max(512 MB, min(實體記憶體 10%, 4 GB))。`ullAvailPhys` 包含待命清單（standby，可以回收的快取），
-///   Windows 會很積極地修剪工作集、把記憶體換到分頁檔；系統預設在可用約 32 MB / 4 GB（最多 64 MB）時才發
-///   「記憶體不足」通知，那時桌面早就卡了，所以留多一點。
+/// - Windows：max(128 MB, 實體記憶體 5%)（3.5.0；以前是 max(512 MB, min(10%, 4 GB))）。`ullAvailPhys` 包含待命清單
+///   （standby，可以回收的快取），系統預設在可用約 32 MB / 4 GB（最多 64 MB）時才發「記憶體不足」通知，所以還是比 Linux
+///   留得多；但 10% 在大記憶體的機器上（例如 64 GB、跑本地 AI 的桌機）一開機就吃緊，黑潮自己全部讓出也只有一兩百 MB。
+///   128 MB 是下限：很小的 VM（2 GB）上 5% 只有 100 MB。
 /// - 一律不超過實體記憶體的一半。
 pub fn auto_reserve(total: Option<u64>, platform: Platform, min_free_kb: Option<u64>) -> (u64, String) {
     let (bytes, how) = match platform {
         Platform::Windows => {
-            let pct = total.map(|t| (t / 10).min(4096 * MB)).unwrap_or(0);
-            (pct.max(512 * MB), "自動：max(512 MB, min(實體記憶體 10%, 4 GB))".to_string())
+            let pct = total.map(|t| t / 20).unwrap_or(0);
+            (pct.max(WINDOWS_RESERVE_FLOOR), "自動：max(128 MB, 實體記憶體 5%)".to_string())
         }
         Platform::Linux | Platform::Other => {
             let pct = total.map(|t| (t / 20).min(1024 * MB)).unwrap_or(0);
@@ -371,6 +374,9 @@ pub fn auto_reserve(total: Option<u64>, platform: Platform, min_free_kb: Option<
         _ => (bytes, how),
     }
 }
+
+/// Windows 自動保留量的下限（很小的 VM 上 5% 太少）
+pub const WINDOWS_RESERVE_FLOOR: u64 = 128 * MB;
 
 /// 保留量：使用者設定（MB、百分比，兩個都填取大的）或自動
 pub fn derive_reserve(total: Option<u64>, platform: Platform, min_free_kb: Option<u64>, user_mb: u64, user_pct: u64) -> Reserve {
@@ -464,6 +470,129 @@ pub fn pressure_of(r: &Reading, res: &Reserve) -> Pressure {
         None if psi.stalled() => Pressure::Low,
         _ => Pressure::Normal,
     }
+}
+
+// ------------------------------------------------------------ 退讓於事無補（3.5.0，規格 09 第 12 節）
+//
+// 缺口（保留量 − 可用）大到黑潮自己全部讓出也補不到一半時（用量 × 2 < 缺口），讓出只會讓 DNS 變差、對系統沒有幫助
+// ——例如 Windows 上別的程式吃掉幾十 GB，黑潮自己只有一兩百 MB。這時只停止長大、照樣寫出快照（保護資料），
+// 不縮快取、不移出 CDN 冷資料、不縮診斷緩衝、不停用清單、不暫停保護清單；給其他模組的壓力訊號從「不足」降成「偏低」
+// （不拒絕新的加密連線，只限 32 條）。路由器上保留量只有十幾到二十幾 MB，缺口最多就是保留量，
+// 黑潮自己通常好幾十 MB，所以小機器上不會成立。讀不到自己的用量或可用記憶體時規則不成立（照舊）。
+
+/// 離開「於事無補」要離開的條件連續成立多久（秒）；回到寬裕（可用 ≥ 保留量 + 遲滯）時立刻離開
+pub const FUTILE_EXIT_SECS: u64 = 60;
+
+/// 缺口（保留量 − 可用，沒有缺是 0）與自己的用量（bytes）；有一個量不到（或用量是 0）就是 None
+pub fn deficit_and_own(r: &Reading, res: &Reserve) -> Option<(u64, u64)> {
+    let own = r.rss.filter(|&b| b > 0)?;
+    let a = r.avail?;
+    Some((res.bytes.saturating_sub(a), own))
+}
+
+/// 進入：自己全部讓出也補不到缺口的一半（用量 × 2 < 缺口）
+pub fn futile_enter(r: &Reading, res: &Reserve) -> bool {
+    deficit_and_own(r, res).is_some_and(|(d, own)| (own as u128) * 2 < d as u128)
+}
+
+/// 維持：用量 × 2 < 缺口 × 1.2（離開要「用量 × 2 ≥ 缺口 × 1.2」：比進入的門檻多 20% 的遲滯）
+pub fn futile_hold(r: &Reading, res: &Reserve) -> bool {
+    deficit_and_own(r, res).is_some_and(|(d, own)| (own as u128) * 20 < d as u128 * 12)
+}
+
+/// 「於事無補」的判定與遲滯（純狀態，測試直接造）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FutileGate {
+    pub on: bool,
+    /// 離開的條件從什麼時候開始一直成立
+    exit_since: Option<u64>,
+}
+
+impl FutileGate {
+    /// 依量測更新，回傳有沒有改變。進入：立刻（只會少做事）；離開：讀不到量測或回到寬裕時立刻，
+    /// 否則「用量 × 2 ≥ 缺口 × 1.2」要連續 `dwell` 秒（不會每幾秒切換一次）
+    pub fn step(&mut self, r: &Reading, res: &Reserve, dwell: u64, now: u64) -> bool {
+        if !self.on {
+            if futile_enter(r, res) {
+                self.on = true;
+                self.exit_since = None;
+                return true;
+            }
+            return false;
+        }
+        let comfortable = r.avail.is_some_and(|a| a >= res.bytes.saturating_add(res.margin()));
+        if deficit_and_own(r, res).is_none() || comfortable {
+            self.on = false;
+            self.exit_since = None;
+            return true;
+        }
+        if futile_hold(r, res) {
+            self.exit_since = None;
+            return false;
+        }
+        let since = *self.exit_since.get_or_insert(now);
+        if now.saturating_sub(since) >= dwell {
+            self.on = false;
+            self.exit_since = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// 進入 / 離開「於事無補」的那一行日誌（進入 WARN、離開 info；只在改變時寫）
+pub fn futile_message(on: bool, r: &Reading, res: &Reserve) -> String {
+    let (d, own) = deficit_and_own(r, res).unwrap_or((0, 0));
+    if on {
+        format!(
+            "可用記憶體不足是其他程式造成（缺口 {} MB，黑潮全部讓出也只有 {} MB）：只停止長大、寫出快照，不縮快取、不停用清單",
+            d >> 20,
+            own >> 20
+        )
+    } else {
+        format!(
+            "記憶體缺口回到黑潮讓得出來的範圍（缺口 {} MB，黑潮 {} MB）：照一般的方式讓出與恢復",
+            d >> 20,
+            own >> 20
+        )
+    }
+}
+
+fn log_futile(on: bool, r: &Reading, res: &Reserve) -> String {
+    let msg = futile_message(on, r, res);
+    if on {
+        warn!("{msg}");
+    } else {
+        info!("{msg}");
+    }
+    msg
+}
+
+/// 給整個程式的壓力訊號：於事無補時「不足」降成「偏低」（不拒絕新的加密連線、清單更新不延後到不足解除）
+pub fn signal_pressure(p: Pressure, futile: bool) -> Pressure {
+    match p {
+        Pressure::Critical if futile => Pressure::Low,
+        p => p,
+    }
+}
+
+/// 目前是不是「於事無補」（記憶體監看每一輪更新；給沒有記憶體控制時的舊做法與狀態頁的提醒）
+static FUTILE: AtomicBool = AtomicBool::new(false);
+
+pub fn futile() -> bool {
+    FUTILE.load(Ordering::Relaxed)
+}
+
+pub fn set_futile(on: bool) {
+    FUTILE.store(on, Ordering::Relaxed);
+}
+
+/// 記憶體控制關掉時，記憶體監看自己判斷（同一套規則與日誌）
+pub fn observe_futile_standalone(gate: &mut FutileGate, r: &Reading, res: &Reserve, now: u64) -> bool {
+    if gate.step(r, res, FUTILE_EXIT_SECS, now) {
+        log_futile(gate.on, r, res);
+    }
+    gate.on
 }
 
 /// 狀態與遲滯
@@ -673,6 +802,8 @@ struct Inner {
     growth: bool,
     /// `trim` 要求的「先不長大、不恢復」到這個時間（秒）
     hold_until: u64,
+    /// 退讓於事無補（3.5.0）：由記憶體監看每一輪 [`Governor::observe_futile`] 更新
+    futile: FutileGate,
 }
 
 type Reader = Box<dyn Fn() -> Reading + Send + Sync>;
@@ -714,6 +845,7 @@ impl Governor {
                 waiting: None,
                 growth: true,
                 hold_until: 0,
+                futile: FutileGate::default(),
             }),
             gap: 5,
             dwell: 180,
@@ -737,6 +869,23 @@ impl Governor {
 
     pub fn last_reading(&self) -> Reading {
         self.inner.lock().unwrap().last
+    }
+
+    /// 退讓於事無補（3.5.0）：用這次的量測更新判定（記憶體監看每一輪呼叫，在 [`tick`](Self::tick) 之前），
+    /// 改變時記一行日誌與事件。回傳現在是不是於事無補
+    pub fn observe_futile(&self, r: &Reading, now: u64) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let i = &mut *g;
+        if i.futile.step(r, &self.reserve, FUTILE_EXIT_SECS, now) {
+            let msg = log_futile(i.futile.on, r, &self.reserve);
+            Self::event(i, now, msg);
+        }
+        i.futile.on
+    }
+
+    /// 目前是不是「於事無補」
+    pub fn is_futile(&self) -> bool {
+        self.inner.lock().unwrap().futile.on
     }
 
     /// 到了最低限度（只轉送）
@@ -805,7 +954,17 @@ impl Governor {
             let growth_change = (growth != i.growth).then_some(growth);
             i.growth = growth;
             i.waiting = None;
-            let plan = if state > State::Comfortable {
+            let plan = if state > State::Comfortable && i.futile.on {
+                // 於事無補：只停止長大（上面已經停了）、快照照樣由寫入器依它自己的量測寫出；不讓出任何東西。
+                // 之前已經讓出的照舊等寬裕才恢復（不因為判定改變就恢復或停用，不來回）
+                let (d, own) = deficit_and_own(&r, &self.reserve).unwrap_or((0, 0));
+                i.waiting = Some(format!(
+                    "於事無補：缺口 {} MB 是其他程式造成（黑潮全部讓出也只有 {} MB），只停止長大、不讓出",
+                    d >> 20,
+                    own >> 20
+                ));
+                None
+            } else if state > State::Comfortable {
                 let any = (0..self.steps.len()).any(|k| self.eligible(i, k, state, &r, now));
                 (now >= i.next_shed_at && any).then(|| {
                     let deficit = r.avail.map_or(0, |a| self.reserve.bytes.saturating_sub(a));
@@ -1046,6 +1205,10 @@ impl Governor {
             "holdUntil": (i.hold_until > steady_secs()).then(|| steady_to_wall_ms(i.hold_until)),
             "floor": floor,
             "protectedSuspended": protected,
+            // 退讓於事無補（3.5.0）：缺口（保留量 − 可用）與自己的用量；量不到是 null
+            "futile": i.futile.on,
+            "deficitBytes": r.avail.map(|a| self.reserve.bytes.saturating_sub(a)),
+            "ownBytes": r.rss,
             "sizes": Value::Object(sizes),
             "shed": i.shed.iter().map(|s| json!({
                 "step": s.key, "label": s.label, "detail": s.detail, "freedBytes": s.bytes,
@@ -1638,13 +1801,28 @@ mod tests {
             "不超過實體記憶體一半"
         );
         assert_eq!(derive_reserve(None, Platform::Linux, None, 0, 0).bytes, 16 * MB);
-        // Windows 自動：max(512 MB, 10%（最多 4 GB）)
-        assert_eq!(derive_reserve(Some(4096 * MB), Platform::Windows, None, 0, 0).bytes, 512 * MB);
+        // Windows 自動（3.5.0）：max(128 MB, 實體記憶體 5%)，不超過一半（以前 max(512 MB, min(10%, 4 GB))）
+        let win = |gb: u64| derive_reserve(Some(gb * 1024 * MB), Platform::Windows, None, 0, 0);
+        assert_eq!(win(4).bytes, 4096 * MB / 20, "4 GB：約 205 MB（以前 512 MB）");
+        assert_eq!(win(8).bytes, 8192 * MB / 20, "8 GB：約 410 MB（以前 819 MB）");
+        assert_eq!(win(16).bytes, 16384 * MB / 20, "16 GB：約 819 MB（以前 1.6 GB）");
+        assert_eq!(win(32).bytes, 32768 * MB / 20, "32 GB：約 1.6 GB（以前 3.2 GB）");
+        assert_eq!(win(64).bytes, 65536 * MB / 20, "64 GB：約 3.2 GB（以前 4 GB）");
+        assert!(win(64).auto && win(64).how.contains("5%"), "{}", win(64).how);
+        assert_eq!(win(1).bytes, WINDOWS_RESERVE_FLOOR, "很小的 VM：下限 128 MB（5% 只有 51 MB）");
+        assert_eq!(win(2).bytes, WINDOWS_RESERVE_FLOOR, "2 GB：5% 是 102 MB，下限 128 MB");
         assert_eq!(
-            derive_reserve(Some(16384 * MB), Platform::Windows, None, 0, 0).bytes,
-            16384 * MB / 10
+            derive_reserve(Some(200 * MB), Platform::Windows, None, 0, 0).bytes,
+            100 * MB,
+            "下限也不超過實體記憶體一半"
         );
-        assert_eq!(derive_reserve(Some(65536 * MB), Platform::Windows, None, 0, 0).bytes, 4096 * MB);
+        assert_eq!(derive_reserve(None, Platform::Windows, None, 0, 0).bytes, WINDOWS_RESERVE_FLOOR);
+        // 使用者設定照舊優先
+        assert_eq!(derive_reserve(Some(65536 * MB), Platform::Windows, None, 1024, 0).bytes, 1024 * MB);
+        assert_eq!(
+            derive_reserve(Some(65536 * MB), Platform::Windows, None, 0, 10).bytes,
+            65536 * MB / 100 * 10
+        );
         // 使用者：絕對值、百分比、兩個都填取大的；百分比最多 90%
         let u = derive_reserve(Some(1000 * MB), Platform::Linux, None, 40, 0);
         assert_eq!((u.bytes, u.auto), (40 * MB, false));
@@ -1664,6 +1842,142 @@ mod tests {
         // 遲滯：一半，至少 8 MB
         assert_eq!(margin(100 * MB), 50 * MB);
         assert_eq!(margin(10 * MB), 8 * MB);
+    }
+
+    /// 可用 a MB、自己用 own MB（實體 1000 MB）
+    fn rdo(avail_mb: u64, own_mb: Option<u64>) -> Reading {
+        Reading {
+            rss: own_mb.map(|o| o * MB),
+            ..rd(avail_mb)
+        }
+    }
+
+    /// 3.5.0 退讓於事無補：用量 × 2 < 缺口才成立；讀不到自己的用量時不成立
+    #[test]
+    fn futile_enter_and_hold_thresholds() {
+        let res = res100();
+        // 缺口 70 MB：自己 20 MB（× 2 = 40 < 70）→ 成立；自己 40 MB（80 ≥ 70）→ 不成立
+        assert!(futile_enter(&rdo(30, Some(20)), &res));
+        assert!(!futile_enter(&rdo(30, Some(40)), &res));
+        assert!(!futile_enter(&rdo(30, None), &res), "讀不到自己的用量：照舊");
+        assert!(!futile_enter(&rdo(30, Some(0)), &res), "用量 0 當作讀不到");
+        assert!(
+            !futile_enter(
+                &Reading {
+                    avail: None,
+                    ..rdo(30, Some(1))
+                },
+                &res
+            ),
+            "讀不到可用記憶體"
+        );
+        assert!(!futile_enter(&rdo(150, Some(1)), &res), "沒有缺口");
+        // 維持：用量 × 2 < 缺口 × 1.2。缺口 70 × 1.2 = 84：自己 41 MB（82）還維持，42 MB（84）就離開
+        assert!(futile_hold(&rdo(30, Some(41)), &res));
+        assert!(!futile_hold(&rdo(30, Some(42)), &res));
+        assert!(!futile_hold(&rdo(30, None), &res));
+        // 壓力訊號：於事無補時「不足」降成「偏低」，其他不變
+        assert_eq!(signal_pressure(Pressure::Critical, true), Pressure::Low);
+        assert_eq!(signal_pressure(Pressure::Critical, false), Pressure::Critical);
+        assert_eq!(signal_pressure(Pressure::Low, true), Pressure::Low);
+        assert_eq!(signal_pressure(Pressure::Normal, true), Pressure::Normal);
+    }
+
+    /// Windows 實測的情境：64 GB、別的程式吃掉幾十 GB
+    #[test]
+    fn futile_on_big_windows_machine() {
+        let res = derive_reserve(Some(65536 * MB), Platform::Windows, None, 0, 0);
+        let r = |avail_mb: u64| Reading {
+            rss: Some(180 * MB),
+            total: Some(65536 * MB),
+            avail: Some(avail_mb * MB),
+            psi: None,
+        };
+        // 可用 3,896 MB：新的保留量（約 3.2 GB）以上，連吃緊都不是
+        assert_eq!(classify(&r(3896), &res), State::Comfortable);
+        // 可用 1,500 MB（以前的公式下是「不足」）：缺口約 1.7 GB，黑潮 180 MB → 於事無補
+        assert_eq!(classify(&r(1500), &res), State::Critical);
+        assert!(futile_enter(&r(1500), &res));
+        assert!(futile_message(true, &r(1500), &res).contains("黑潮全部讓出也只有 180 MB"));
+        // 缺口小（可用 3,000 MB，缺約 277 MB）：讓得出來，照舊
+        assert!(!futile_enter(&r(3000), &res));
+    }
+
+    /// 遲滯：離開要「用量 × 2 ≥ 缺口 × 1.2」連續 60 秒；回到寬裕或讀不到用量時立刻離開
+    #[test]
+    fn futile_gate_hysteresis() {
+        let res = res100();
+        let mut g = FutileGate::default();
+        let d = FUTILE_EXIT_SECS;
+        assert!(!g.step(&rdo(30, Some(40)), &res, d, 0), "缺口 70、自己 40：不成立");
+        assert!(g.step(&rdo(30, Some(20)), &res, d, 2), "缺口 70、自己 20：進入");
+        assert!(g.on);
+        // 自己 38 MB（76 < 84）：還在遲滯範圍裡，維持
+        assert!(!g.step(&rdo(30, Some(38)), &res, d, 4));
+        assert!(g.on);
+        // 自己 45 MB（90 ≥ 84）：離開的條件成立，但要連續 60 秒；中間掉回去一次重新計時
+        assert!(!g.step(&rdo(30, Some(45)), &res, d, 10));
+        assert!(!g.step(&rdo(30, Some(45)), &res, d, 40));
+        assert!(!g.step(&rdo(30, Some(20)), &res, d, 42));
+        assert!(!g.step(&rdo(30, Some(45)), &res, d, 44));
+        assert!(!g.step(&rdo(30, Some(45)), &res, d, 103));
+        assert!(g.step(&rdo(30, Some(45)), &res, d, 104), "連續 60 秒才離開");
+        assert!(!g.on);
+        // 每幾秒來回的讀數不會每幾秒切換：進入後只有連續 60 秒都讓得出來才離開
+        let mut g = FutileGate::default();
+        let mut changes = 0;
+        for t in 0..300u64 {
+            let own = if t % 2 == 0 { 20 } else { 45 };
+            if g.step(&rdo(30, Some(own)), &res, d, t * 3) {
+                changes += 1;
+            }
+        }
+        assert_eq!(changes, 1, "只進入一次");
+        // 回到寬裕（可用 ≥ 保留量 + 遲滯）：立刻離開
+        assert!(g.step(&rdo(160, Some(20)), &res, d, 2000));
+        assert!(!g.on);
+        // 讀不到自己的用量：規則不成立，立刻離開（照舊讓出）
+        assert!(g.step(&rdo(30, Some(20)), &res, d, 3000));
+        assert!(g.step(&rdo(30, None), &res, d, 3002));
+        assert!(!g.on);
+        assert!(!g.step(&rdo(30, None), &res, d, 3004), "讀不到就一直照舊");
+    }
+
+    /// 小機器的行為不變：路由器的自動保留量只有 16～26 MB，缺口最多就是保留量；黑潮自己 20 MB 以上時
+    /// 用量 × 2 一定 ≥ 缺口，可用從 0 到保留量都不成立
+    #[test]
+    fn futile_never_on_small_routers() {
+        let cases = [
+            ("128 MB 路由器", derive_reserve(Some(128 * MB), Platform::Linux, Some(1024), 0, 0)),
+            ("512 MB（D3）", derive_reserve(Some(512 * MB), Platform::Linux, Some(2048), 0, 0)),
+            (
+                "512 MB、min_free 16 MB",
+                derive_reserve(Some(512 * MB), Platform::Linux, Some(16384), 0, 0),
+            ),
+        ];
+        assert_eq!(cases[0].1.bytes, 16 * MB);
+        assert_eq!(cases[1].1.bytes, 512 * MB / 20);
+        assert_eq!(cases[2].1.bytes, 48 * MB);
+        for (name, res) in &cases {
+            // 黑潮的用量：保留量的一半以上就永遠不成立（缺口 ≤ 保留量）
+            let own = (res.bytes / 2).max(20 * MB);
+            let mut g = FutileGate::default();
+            for avail in (0..=res.bytes).step_by(256 * 1024) {
+                let r = Reading {
+                    rss: Some(own),
+                    total: Some(512 * MB),
+                    avail: Some(avail),
+                    psi: None,
+                };
+                assert!(!futile_enter(&r, res), "{name}：可用 {} KB", avail / 1024);
+                assert!(!g.step(&r, res, FUTILE_EXIT_SECS, avail));
+                assert_eq!(
+                    signal_pressure(pressure_of(&r, res), g.on),
+                    pressure_of(&r, res),
+                    "{name}：壓力訊號不變"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2067,6 +2381,42 @@ mod tests {
         assert_eq!((r.total, r.rss, r.psi), (rd(600).total, rd(600).rss, None), "其他欄位不動");
     }
 
+    /// 3.5.0：模擬只讓讀數變小。Windows（保留量是實體記憶體 5%）模擬 20 MB 時缺口遠大於黑潮自己的用量，
+    /// 是「於事無補」（W5 驗證這一條）；D3（保留約 25.6 MB）模擬 20 MB、4 MB 都不是，照舊走停用清單的路徑（D11）
+    #[test]
+    fn simulation_on_windows_is_futile_but_not_on_d3() {
+        let sim = Some(Simulation {
+            avail_mb: 20,
+            until: u64::MAX,
+        });
+        let win = derive_reserve(Some(16384 * MB), Platform::Windows, None, 0, 0);
+        let real = Reading {
+            rss: Some(150 * MB),
+            total: Some(16384 * MB),
+            avail: Some(8000 * MB),
+            psi: None,
+        };
+        let r = apply_simulation(real, sim);
+        assert!(futile_enter(&r, &win), "Windows 16 GB：缺口約 800 MB、黑潮 150 MB");
+        assert_eq!(signal_pressure(pressure_of(&r, &win), true), Pressure::Low);
+        let d3 = derive_reserve(Some(512 * MB), Platform::Linux, Some(2048), 0, 0);
+        for mb in [20, 10, 4] {
+            let r = apply_simulation(
+                Reading {
+                    rss: Some(20 * MB),
+                    total: Some(512 * MB),
+                    avail: Some(300 * MB),
+                    psi: None,
+                },
+                Some(Simulation {
+                    avail_mb: mb,
+                    until: u64::MAX,
+                }),
+            );
+            assert!(!futile_enter(&r, &d3), "D3 模擬 {mb} MB");
+        }
+    }
+
     #[test]
     fn simulate_capped_at_30_minutes() {
         let sim = SimState::new();
@@ -2131,6 +2481,105 @@ mod tests {
             now,
         );
         assert_eq!((j["availMB"].clone(), j["remainingSec"].clone()), (json!(20), json!(90)));
+    }
+
+    /// 3.5.0 於事無補：不讓出任何東西（不縮快取、不移出 CDN、不縮診斷、不停用清單、不到只轉送）、停止長大、
+    /// 壓力訊號是「偏低」（不拒絕新的加密連線），快照寫入器照樣判成「不足」立刻寫出
+    #[tokio::test]
+    async fn futile_sheds_nothing_but_stops_growth_and_still_flushes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut steps = ladder(&log, 2 * MB);
+        steps.push(Fake::new("protected", State::Critical, 1, 0, &log));
+        let grow = {
+            let f = Fake::new("cache2", State::Tight, 1, 0, &log);
+            let g = f.grow.clone();
+            steps.push(f);
+            g
+        };
+        let g = Governor::new(res100(), steps, 0);
+        g.tick(rdo(600, Some(20)), 100).await;
+        // 可用 30 MB、缺口 70 MB，黑潮自己 20 MB：於事無補
+        let r = rdo(30, Some(20));
+        let mut now = 1000;
+        for _ in 0..20 {
+            assert!(g.observe_futile(&r, now));
+            assert!(g.tick(r, now).await.is_none(), "什麼都不讓");
+            now += 2;
+        }
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        assert_eq!(*grow.lock().unwrap(), [false], "停止長大");
+        let st = g.status_json();
+        assert_eq!(st["state"], "critical", "狀態照實顯示");
+        assert_eq!(st["futile"], true);
+        assert_eq!(st["deficitBytes"], 70 * MB);
+        assert_eq!(st["ownBytes"], 20 * MB);
+        assert_eq!(st["growth"], false);
+        assert!(st["waiting"].as_str().unwrap().contains("於事無補"), "{}", st["waiting"]);
+        let ev = st["events"].as_array().unwrap();
+        assert_eq!(
+            ev.iter().filter(|e| e["msg"].as_str().unwrap().contains("其他程式造成")).count(),
+            1,
+            "進入時記一次，不是每次量測都記：{ev:?}"
+        );
+        // 給其他模組的訊號：偏低（加密連線不拒絕、清單更新不延後到不足解除）
+        assert_eq!(pressure_of(&r, &g.reserve), Pressure::Critical);
+        assert_eq!(signal_pressure(pressure_of(&r, &g.reserve), g.is_futile()), Pressure::Low);
+        // 快照：寫入器依自己的量測判斷（不看這個訊號），照樣是「不足」、下一輪就寫
+        let mem = crate::persist::Mem {
+            total_mb: Some(1000),
+            avail_mb: Some(30),
+            reserve_mb: 100,
+        };
+        assert_eq!(mem.pressure(), Pressure::Critical);
+        assert_eq!(
+            crate::persist::effective_interval(&crate::persist::Policy::new(sysinfo::StorageClass::Flash, 0, 256), mem),
+            0
+        );
+        // 缺口變小到讓得出來（黑潮 45 MB：90 ≥ 70 × 1.2）連續 60 秒：離開，照一般的方式讓出
+        let r2 = rdo(30, Some(45));
+        let end = now + FUTILE_EXIT_SECS + 4;
+        while now < end {
+            g.observe_futile(&r2, now);
+            g.tick(r2, now).await;
+            now += 2;
+        }
+        assert!(!g.is_futile());
+        let l = log.lock().unwrap().clone();
+        assert!(l.contains(&"shed:filter".to_string()), "{l:?}");
+        assert_eq!(g.status_json()["futile"], false);
+    }
+
+    /// 之前已經讓出（不是於事無補時）的東西：進入於事無補後不恢復也不再讓；照舊等寬裕才恢復
+    #[tokio::test]
+    async fn futile_keeps_earlier_sheds_until_comfortable() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let g = Governor::new(res100(), ladder(&log, 2 * MB), 0);
+        let mut now = 1000;
+        // 黑潮 40 MB、缺口 70 MB（80 ≥ 70）：讓得出來，整個階梯做完
+        let r = rdo(30, Some(40));
+        assert!(!g.observe_futile(&r, now));
+        g.tick(r, now).await;
+        assert_eq!(log.lock().unwrap().len(), 6);
+        log.lock().unwrap().clear();
+        // 別的程式又吃掉更多（可用 5 MB、缺口 95 MB，黑潮讓完剩 30 MB）：於事無補，不恢復也不再讓
+        let r = rdo(5, Some(30));
+        for _ in 0..200 {
+            now += 2;
+            assert!(g.observe_futile(&r, now));
+            g.tick(r, now).await;
+        }
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        assert_eq!(g.status_json()["floor"], true, "已經只轉送的維持");
+        // 回到寬裕：立刻離開於事無補，照一般規則依相反順序恢復
+        for _ in 0..400 {
+            now += 5;
+            g.observe_futile(&rdo(600, Some(30)), now);
+            g.tick(rdo(600, Some(30)), now).await;
+        }
+        assert!(!g.is_futile());
+        let l = log.lock().unwrap().clone();
+        assert_eq!(l.first().map(String::as_str), Some("restore:floor"), "{l:?}");
+        assert!(l.contains(&"restore:diagnostics".to_string()), "{l:?}");
     }
 
     #[tokio::test]

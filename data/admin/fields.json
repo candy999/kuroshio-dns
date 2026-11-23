@@ -569,7 +569,7 @@
             { "key": "system.maxQuicConnections", "type": "int", "label": "QUIC 同時連線上限", "help": "預設依 CPU 核心數（每核 32，32–512）；0 = 不開 QUIC。", "pro": true, "min": 0 },
             { "key": "system.memoryWatchdog", "type": "bool", "label": "記憶體監看（關掉記憶體控制時仍然依保留量暫停背景工作）", "pro": true },
             { "key": "system.memoryGovernor", "type": "bool", "label": "記憶體控制", "help": "系統可用記憶體低於保留量時依序讓出記憶體：診斷緩衝 → DNS 快取 → CDN 冷資料移到磁碟 → （真的不足時）優先順序最低的過濾清單 → 只轉送（暫停 CDN 調整、快取最小）→ 最後才暫停保護清單。區網的 DNS 轉送永遠不停。寬裕後依相反順序恢復。", "pro": true },
-            { "key": "system.memoryReserveMB", "type": "int", "label": "記憶體保留量（MB）", "help": "系統可用記憶體至少留這麼多給其他程式；低於它就讓出記憶體，高於它 + 遲滯才恢復、才讓快取長大。0 = 自動（Linux：max(16 MB, 5%, min_free_kbytes × 3)；Windows：max(512 MB, 10%)）。跟百分比都填時取大的。", "pro": true, "min": 0, "placeholder": "0" },
+            { "key": "system.memoryReserveMB", "type": "int", "label": "記憶體保留量（MB）", "help": "系統可用記憶體至少留這麼多給其他程式；低於它就讓出記憶體，高於它 + 遲滯才恢復、才讓快取長大。0 = 自動（Linux：max(16 MB, 5%, min_free_kbytes × 3)；Windows：max(128 MB, 5%)）。缺口是其他程式造成、黑潮全部讓出也補不了時只停止長大、不讓出。跟百分比都填時取大的。", "pro": true, "min": 0, "placeholder": "0" },
             { "key": "system.memoryReservePercent", "type": "int", "label": "記憶體保留量（%）", "help": "實體記憶體的百分比（最多 90），例如 5 = 系統可用記憶體低於 5% 就讓出。0 = 不用百分比。", "pro": true, "min": 0, "max": 90, "placeholder": "0" },
             { "key": "about.sourceUrl", "type": "text", "label": "原始碼網址", "help": "顯示在頁尾、「關於」與公開頁。GPL-3.0：散布修改過的版本時要提供對應的原始碼，改過程式的話請填自己的原始碼網址（http:// 或 https:// 開頭）；空白 = 官方網址。", "pro": true, "pattern": "^https?://\\S+$", "patternMsg": "請輸入 http:// 或 https:// 開頭的網址", "placeholder": "https://example.com/my-fork" }
           ]

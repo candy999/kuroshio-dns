@@ -119,6 +119,43 @@ async fn far_deficit_unloads_several_lists_with_one_rebuild() {
     assert_eq!(f.rebuild_count(), r0 + 1);
 }
 
+/// 3.5.0 退讓於事無補：缺口是其他程式造成（缺 70 MB、黑潮自己 20 MB）時不停用清單、不重建；
+/// 缺口回到讓得出來的範圍（黑潮 45 MB：90 ≥ 70 × 1.2）連續 60 秒後照一般的方式停用
+#[tokio::test]
+async fn futile_deficit_keeps_lists() {
+    let (f, _down, _dir) = c3_service("futile", [4000, 3000, 2000, 1000]).await;
+    let r0 = f.rebuild_count();
+    let g = kuroshio::memgov::Governor::new(
+        kuroshio::memgov::Reserve::fixed(100 * MB),
+        vec![Box::new(kuroshio::memgov::FilterStep { filter: f.clone() })],
+        0,
+    );
+    let own = |mb: u64| kuroshio::memgov::Reading {
+        rss: Some(mb * MB),
+        ..reading(30 * MB)
+    };
+    let mut now = 1000;
+    for _ in 0..10 {
+        assert!(g.observe_futile(&own(20), now));
+        assert!(g.tick(own(20), now).await.is_none());
+        now += 2;
+    }
+    assert!(f.unloaded().is_empty(), "不停用清單");
+    assert_eq!(f.rebuild_count(), r0, "不重建");
+    assert!(f.check("aa1.example", 1).unwrap().block, "清單照常擋");
+    assert_eq!(g.status_json()["futile"], true);
+    // 讓得出來了：離開要連續 60 秒，之後一輪停用、重建 1 次
+    let mut did = None;
+    for _ in 0..40 {
+        g.observe_futile(&own(45), now);
+        did = did.or(g.tick(own(45), now).await);
+        now += 2;
+    }
+    assert_eq!(did.as_deref(), Some("shed:filter"));
+    assert_eq!(f.rebuild_count(), r0 + 1);
+    assert!(!f.unloaded().is_empty());
+}
+
 /// 缺口小（或沒說缺多少）：照舊一次一份
 #[tokio::test]
 async fn near_deficit_still_unloads_one() {

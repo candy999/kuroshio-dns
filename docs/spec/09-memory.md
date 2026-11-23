@@ -30,7 +30,8 @@
 只看**整台機器還剩多少**，不看自己用了多少（沒有「預算」）：
 
 - 量測：Linux `/proc/meminfo` 的 `MemAvailable`，Windows `GlobalMemoryStatusEx` 的 `ullAvailPhys`；
-  Linux 有 `/proc/pressure/memory`（PSI）時一起讀。自己的 RSS 只顯示，不拿來判斷。
+  Linux 有 `/proc/pressure/memory`（PSI）時一起讀。自己的 RSS（Windows 是工作集）不拿來決定狀態，
+  只用在「退讓於事無補」的判斷（第 12 節，3.5.0）。
 - **保留量**（[`Reserve`]）：可用記憶體低於它就讓出記憶體；高於「保留量 + 遲滯」才恢復、才讓記憶體結構長大。
   遲滯 = 保留量的一半，至少 8 MB。
 - 使用者設定：`system.memoryReserveMB`（絕對值）與 / 或 `system.memoryReservePercent`（實體記憶體的百分比，最多 90）；
@@ -41,9 +42,16 @@
 | 平台 | 自動 | 128 MB 路由器 | 512 MB | 4 GB | 16 GB |
 |---|---|---|---|---|---|
 | Linux | max(16 MB, 實體記憶體 5%（最多 1 GB）, `vm.min_free_kbytes` × 3) | 16 MB | 25.6 MB（min_free_kbytes 小時） | 200 MB | 800 MB |
-| Windows | max(512 MB, 10%（最多 4 GB）) | — | — | 512 MB | 1.6 GB |
+| Windows | max(128 MB, 實體記憶體 5%)（3.5.0） | — | — | 204.8 MB | 819.2 MB |
 
 一律不超過實體記憶體的一半。
+
+Windows 3.5.0 前後對照（以前是 max(512 MB, min(10%, 4 GB))）：
+
+| 實體記憶體 | 2 GB | 4 GB | 8 GB | 16 GB | 32 GB | 64 GB |
+|---|---|---|---|---|---|---|
+| 以前 | 512 MB | 512 MB | 819.2 MB | 1,638.4 MB | 3,276.8 MB | 4,096 MB |
+| 3.5.0 | 128 MB（下限） | 204.8 MB | 409.6 MB | 819.2 MB | 1,638.4 MB | 3,276.8 MB |
 
 - **Linux 的 `MemAvailable`**（核心 3.14 起，`si_mem_available()`）＝ 空閒頁 − 核心保留（各區的 low watermark 合計）
   ＋ 可回收的檔案快取與 slab（各扣掉一半或 low watermark 中較小者）。它估的是「不 swap 還能給新程式多少」。
@@ -54,9 +62,13 @@
   低於 min 時配置記憶體的程式自己做直接回收（直接卡住）。保留量 ≥ min × 3，讓本程式在 kswapd 忙起來之前就先讓出。
 - **大機器 5%（最多 1 GB）**：x86 / 樹莓派上其他服務多、突發也大；1 GB 封頂，64 GB 的機器不必留 3 GB 給一個 DNS 程式讓。
   這就是維護者說的「大約 95%」，換成依實際機器穩定的值。
-- **Windows 留比較多**：`ullAvailPhys` 包含待命清單（standby，可以回收的快取），Windows 很積極修剪工作集、把記憶體換到分頁檔；
+- **Windows 的 5%**：`ullAvailPhys` 包含待命清單（standby，可以回收的快取），Windows 很積極修剪工作集、把記憶體換到分頁檔；
   系統預設在可用約 32 MB / 4 GB（最多 64 MB）時才發「記憶體不足」通知（`CreateMemoryResourceNotification` 的 low 門檻），
-  那時桌面早就卡了。512 MB 或 10% 讓本程式在使用者感覺到之前就讓出。
+  那時桌面早就卡了，所以還是比那個門檻高得多。3.5.0 以前是 max(512 MB, min(10%, 4 GB))：Windows 實測一台大記憶體的桌機
+  （本地 AI 吃掉幾十 GB），可用只剩 3,896 MB，比 4 GB 的保留量還低，一開機就「吃緊」；掉到 2 GB 以下就「不足」、停用清單、
+  拒絕新的加密連線——但黑潮自己全部讓出也只有一兩百 MB，對幾十 GB 的缺口於事無補，只讓 DNS 變差。現在 5%（64 GB 約 3.2 GB），
+  另外有 128 MB 的下限，避免很小的 VM（2 GB 以下）上幾乎沒有保留；下限也不超過實體記憶體一半。
+  缺口還是比黑潮自己大得多時，由第 12 節的「於事無補」處理。
 
 ## 3. 狀態與反應速度
 
@@ -74,6 +86,7 @@
   - **偏低**（可用 < 保留量 + 遲滯，或 PSI 有等待）：背景工作延後、記憶體結構停止長大、新的加密連線最多 32 條。
   - **不足**（可用 < 保留量的一半，或 PSI 嚴重）：快照立刻寫出並放掉待寫內容、暫不接受**新的加密**連線。
     區網的明文 DNS 一律照常回答。
+  - **於事無補**（第 12 節，3.5.0）時「不足」降成「偏低」給其他模組；快照寫入器用它自己的量測（`app::mem_now`），照樣立刻寫出。
 - 關掉記憶體控制（`system.memoryGovernor: false`）時，壓力訊號照樣依保留量運作（`system.memoryWatchdog`），
   快取與 CDN 用舊的「縮一半、刪三成」做法。
 
@@ -151,6 +164,10 @@
 
 ## 7. 誠實說明的限制
 
+- **於事無補時不讓**（第 12 節）：缺口是別的程式造成時，黑潮不縮快取、不停用清單；系統真的用光時由作業系統處理
+  （Windows 換頁、Linux 核心回收與 OOM，本程式是 -500）。使用者自己把保留量設得很大（例如 128 MB 的機器設 64 MB）時，
+  小機器上也可能成立。
+
 - **比量測更快的突增**：別的程式在 2 秒內一口氣吃掉超過保留量的記憶體時，本程式來不及讓；
   這時靠核心的回收（kswapd、直接回收），真的用光時 OOM killer 會先挑別的程式（本程式是 -500），
   被挑中的程式由它自己的 procd / 服務設定重啟。保留量越大，緩衝越多。
@@ -175,7 +192,12 @@
 
 單元 / 整合測試釘住的行為（全部用注入的量測值，不碰主機真正的記憶體）：
 
-- 保留量：自動（Linux / Windows 各種大小）、百分比、絕對值、兩個都填取大的、百分比上限、不超過一半（`reserve_derivation`）。
+- 保留量：自動（Linux / Windows 各種大小，Windows 4／8／16／32／64 GB、128 MB 下限、下限也不超過一半）、百分比、絕對值、兩個都填取大的、百分比上限、不超過一半（`reserve_derivation`）。
+- 於事無補（3.5.0，第 12 節）：門檻與讀不到用量時不成立（`futile_enter_and_hold_thresholds`）、64 GB 的 Windows 情境（`futile_on_big_windows_machine`）、
+  遲滯與 60 秒（`futile_gate_hysteresis`）、128 MB／512 MB 的路由器從可用 0 到保留量都不成立（`futile_never_on_small_routers`）、
+  不讓出任何東西但停止長大、壓力訊號是偏低、快照照樣寫出（`futile_sheds_nothing_but_stops_growth_and_still_flushes`）、
+  之前讓出的照舊等寬裕才恢復（`futile_keeps_earlier_sheds_until_comfortable`）、真的清單不停用不重建（`tests/memgov_lists.rs` 的 `futile_deficit_keeps_lists`）、
+  模擬 20 MB 時 Windows 成立、D3 不成立（`simulation_on_windows_is_futile_but_not_on_d3`）。
 - 量測間隔：低於保留量 2 秒、兩倍以內 3 秒、遠 30 秒、PSI 有等待 3 秒（`poll_interval_follows_distance_and_psi`）。
 - 遲滯：吃緊 → 寬裕要回到保留量 + 遲滯而且持續 180 秒；不足一次只放鬆一級（`hysteresis_and_dwell`）。
 - 狀態（`/api/status` 的 `memory.state`）是放鬆前要穩定的那一個；當下的量測另外放在 `memory.pressure`（`normal`／`low`／`critical`，3.4.3）。日誌的「記憶體回到保留量以上」看的是當下的量測，`state` 會晚幾分鐘才變回寬裕，這是刻意的（避免來回切換）。
@@ -226,6 +248,7 @@
 | `pollSec` | 目前的量測間隔 |
 | `growth` | 記憶體結構現在可不可以長大 |
 | `floor`、`protectedSuspended` | 到了只轉送、保護清單也暫停了（狀態頁紅色提示） |
+| `futile`、`deficitBytes`、`ownBytes` | 退讓於事無補（3.5.0，第 12 節）中；缺口（保留量 − 可用，沒有缺是 0）、本程式的用量（RSS／工作集）；量不到是 null |
 | `sizes` | 動態大小：`cacheEntries`、`cacheMax`、`cacheConfiguredMax`、`cdnInRam`、`cdnOnDiskOnly`、`filterListsBytes`、`filterListRules`、`filterListsUnloaded` |
 | `shed[]` | 釋出中的項目：`step`（`diagnostics` / `cache` / `cdn` / `filter` / `floor` / `protected`）、`label`、`detail`、`freedBytes`（估計）、`availDeltaKB`（下一輪量到的可用記憶體差）、`at` |
 | `freedBytes` / `freedTotalBytes` | 目前釋出中合計 / 啟動以來合計 |
@@ -261,6 +284,10 @@ kuroshio notify simulate-memory --off                        # 或 POST /api/mem
   到期記一行「測試模式結束」；`/api/status` 的 `memory.simulated`；Windows 設定頁與 LuCI 狀態頁的記憶體控制區塊顯示黃色橫幅。
 - 不走環境變數：環境變數會留在服務設定裡被忘記；設定 + API + 到期時間比較不會誤留。
 - `testHooks` 3.5.0 只有這一個用途；以後的新用途也要走同樣的兩道保險。
+- **Windows 上模擬會是「於事無補」**（第 12 節）：模擬只讓讀數變小，Windows 的保留量是實體記憶體 5%（16 GB 約 819 MB），
+  模擬 20 MB 時缺口約 800 MB，比黑潮自己的用量 × 2 大得多，所以判成於事無補：不停用清單、只停止長大，日誌一行
+  「可用記憶體不足是其他程式造成……」，`memory.futile` 是 true。這是預期行為，規格 11 的 W5 驗證的就是這一條；
+  停用清單、只轉送、恢復的路徑由 D3（保留約 25.6 MB，模擬 20 MB 時缺口只有 5.6 MB）的 D11 驗證。
 
 ### 11.1 在 D3（512 MB、padavan）上觸發 3.4.2 的 G1／G2 路徑
 
@@ -279,3 +306,35 @@ D3 的自動保留量約 25.6 MB（`kuroshio sysinfo` 的 `reserve`）。「不�
 5. 每一項看：一次停用幾份、重建幾次（「訂閱清單已載入」出現幾次）、到期後多久恢復、有沒有反覆停用／恢復（恢復後 10 分鐘內又吃緊會加倍間隔）。
 6. 測完把 `testHooks` 拿掉（或設 false）、重新載入。
 
+## 12. 退讓於事無補（3.5.0）
+
+**情境**：Windows 實測，一台大記憶體的桌機被別的程式（本地 AI）吃掉幾十 GB，可用只剩幾 GB。照第 4 節的階梯會一路讓到停用清單、
+只轉送、拒絕新的加密連線，但黑潮自己全部讓出也只有一兩百 MB，對幾十 GB 的缺口於事無補，只讓 DNS 變差。
+
+**判定**（`memgov.rs` 的 `futile_enter`／`futile_hold`／`FutileGate`，所有平台通用）：
+
+- 缺口 = 保留量 − 系統可用記憶體（沒有缺是 0）；自己的用量 = 本程式的 RSS（Linux `/proc/self/statm`，Windows 工作集 `WorkingSetSize`）。
+- **進入**：自己的用量 × 2 < 缺口（就算全部讓出也補不到一半）。立刻生效（只會少做事）。
+- **離開**：「用量 × 2 ≥ 缺口 × 1.2」連續 60 秒（`FUTILE_EXIT_SECS`）；或回到寬裕（可用 ≥ 保留量 + 遲滯）時立刻。
+  進入與離開之間差 20%，加上 60 秒，不會每幾秒切換。
+- 讀不到自己的用量、或讀不到可用記憶體時規則**不成立**（照舊）；已經成立時讀不到了就立刻離開。
+- 由記憶體監看每一輪判斷（開著記憶體控制時由 `Governor::observe_futile`，在 `tick` 之前；關掉時監看自己用同一套），
+  不在查詢路徑上：多一次比較，沒有鎖、配置、系統呼叫。
+
+**成立時**：
+
+| 做 | 不做 |
+|---|---|
+| 停止長大（記憶體控制的狀態照實是吃緊／不足，`growth` = false：快取上限停在當時的筆數、清單載入前的額度不再加、CDN 冷資料不整批讀回） | 縮小 DNS 快取、CDN 冷資料移出、診斷緩衝縮小（第 1～3 步） |
+| 快照照樣立刻寫出：快照寫入器用它自己的量測（`app::mem_now`，跟壓力訊號無關），可用 < 保留量的一半就是「不足」、下一輪就寫並放掉待寫內容 | 停用過濾清單、只轉送、暫停保護清單（第 4～6 步） |
+| 給其他模組的壓力訊號（`app::pressure()`）從「不足」降成「偏低」：背景工作照樣延後、新的加密連線最多 32 條 | 拒絕新的加密連線；清單更新延後到「不足」解除 |
+
+- 之前（不是於事無補時）已經讓出的東西維持原狀：不因為判定改變就恢復，也不再多讓；恢復條件照舊（寬裕、穩定 180 秒、空間 × 1.3）。
+- 記憶體控制關掉（`system.memoryGovernor: false`）時，舊的「縮一半、刪三成」做法在於事無補時也不做。
+- 日誌：進入時一行 WARN「可用記憶體不足是其他程式造成（缺口 N MB，黑潮全部讓出也只有 M MB）：只停止長大、寫出快照，不縮快取、不停用清單」，
+  離開時一行 info；不是每次量測都寫。`/api/status.memory` 的 `futile`、`deficitBytes`、`ownBytes`，`waiting` 寫明「於事無補」；
+  Windows 設定頁與 LuCI 狀態頁的記憶體控制區塊多一行黃色說明，`warnings` 也換成同樣的說明。
+
+**小機器的行為不變**：路由器上的自動保留量是 16～26 MB（D3 約 25.6 MB），缺口最多就是保留量；黑潮自己的用量通常好幾十 MB，
+用量 × 2 一定 ≥ 缺口，所以不會成立（測試 `futile_never_on_small_routers` 從可用 0 到保留量逐一驗證 128 MB、512 MB 的數字）。
+只有使用者自己把保留量設得比「黑潮用量 × 2」還大時，小機器上才可能成立。

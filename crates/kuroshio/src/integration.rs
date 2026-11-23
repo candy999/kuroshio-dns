@@ -74,6 +74,9 @@ pub fn warnings(data: &crate::manifest::DataCheck, synced: bool, pressure: Press
     }
     match pressure {
         Pressure::Normal => {}
+        Pressure::Low if crate::memgov::futile() => {
+            w.push("系統可用記憶體不足是其他程式造成（黑潮全部讓出也補不了）：只停止長大，不縮快取、不停用清單".into())
+        }
         Pressure::Low => w.push("記憶體接近保留量：背景工作延後".into()),
         Pressure::Critical => w.push("記憶體不足：已讓出記憶體、暫不接受新的加密連線".into()),
     }
