@@ -131,6 +131,7 @@
   // ---------- 折線圖（詳細頁的精簡樣式：最近 60 分鐘） ----------
   function lineChartCompact(container, data, series) {
     container.textContent = '';
+    if (!data || data.length < 2) { container.appendChild(el('p', 'muted', '資料累積中')); return; }
     const W = Math.max(300, container.clientWidth || 800), H = 190, L = 40, R = 8, T = 8, B = 22;
     const integer = !series.some(s => s.integer === false);
     const ax = niceTicks(Math.max(...data.flatMap(d => series.map(s => d[s.key] || 0))), integer);
@@ -138,7 +139,10 @@
     const svg = sv('svg', { viewBox: `0 0 ${W} ${H}` });
     ax.ticks.forEach(v => { const yy = y(v); sv('line', { x1: L, x2: W - R, y1: yy, y2: yy, stroke: 'var(--grid)' }, svg); sv('text', { x: L - 6, y: yy + 4, 'text-anchor': 'end', class: 'axis' }, svg).textContent = ax.digits ? v.toFixed(ax.digits) : nf.format(v); });
     const hm = t => fmtTime(t, 'time');
-    [0, 15, 30, 45, 59].forEach(i => sv('text', { x: x(i), y: H - 4, 'text-anchor': i === 0 ? 'start' : i === 59 ? 'end' : 'middle', class: 'axis' }, svg).textContent = hm(data[i].t));
+    // 刻度：60 個點（最近 60 分鐘）照舊；其他長度（3.5.0 的 24 小時歷史 288 點）平均取 5 個
+    const last = data.length - 1;
+    const ticks = data.length === 60 ? [0, 15, 30, 45, 59] : [0, 1, 2, 3, 4].map(k => Math.round(last * k / 4));
+    ticks.forEach(i => sv('text', { x: x(i), y: H - 4, 'text-anchor': i === 0 ? 'start' : i === last ? 'end' : 'middle', class: 'axis' }, svg).textContent = hm(data[i].t));
     series.forEach((s, idx) => {
       const d = data.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p[s.key]).toFixed(1)}`).join('');
       if (!idx) sv('path', { d: d + `L${x(data.length - 1)},${y(0)}L${x(0)},${y(0)}Z`, fill: s.color, opacity: .12 }, svg);
@@ -631,13 +635,13 @@
 
   /** 區塊的標題（`id` 給頁面導覽的錨點） */
   const SECTIONS = {
-    overview: '總覽', live: '查詢與排行', upstreams: '上游 DNS', routing: '機會成本（各 CDN）', map: '原本會被送去哪裡', pools: '台灣節點池',
+    overview: '總覽', observe: '線路與資料新鮮度', live: '查詢與排行', upstreams: '上游 DNS', routing: '機會成本（各 CDN）', map: '原本會被送去哪裡', pools: '台灣節點池',
     domains: 'CDN 網域資料庫', crosscdn: '跨 CDN 備援', top: '排行（未匿名，僅限本頁）', filter: '過濾規則', jobs: '排程工作', trace: '追蹤網域'
   };
   /** 詳細頁的區塊（跟 3.0 之前的詳細頁一樣） */
   KD.DETAIL_SECTIONS = ['overview', 'upstreams', 'routing', 'pools', 'domains', 'crosscdn', 'top', 'filter', 'jobs', 'trace'];
   /** 管理介面（LuCI、Windows 設定頁）的區塊：多了公開頁的圖表 */
-  KD.ADMIN_SECTIONS = ['overview', 'live', 'upstreams', 'routing', 'map', 'pools', 'domains', 'crosscdn', 'top', 'filter', 'jobs', 'trace'];
+  KD.ADMIN_SECTIONS = ['overview', 'observe', 'live', 'upstreams', 'routing', 'map', 'pools', 'domains', 'crosscdn', 'top', 'filter', 'jobs', 'trace'];
 
   /**
    * 在 `root` 裡畫出整個儀表板。
@@ -698,6 +702,25 @@
       c.appendChild(el('h3', '', '最近 60 分鐘'));
       legend(c, [['查詢', 'var(--s1)'], ['拉回台灣', 'var(--s3)'], ['攔截', 'var(--s2)']]);
       sec.rt = el('div', 'chart'); c.appendChild(sec.rt);
+    }
+    // ---- 線路與資料新鮮度（3.5.0 E 組；文字由 ui-core.js 產生，舊版核心沒有欄位時那一張卡片不顯示） ----
+    if (on('observe')) {
+      const s = sec.observe;
+      const g = el('div', 'grid g2'); s.appendChild(g);
+      const mk = (title, cap) => { const c = card(g, 'kd-hide'); c.appendChild(el('h3', '', title)); if (cap) c.appendChild(el('p', 'cap', cap)); return c; };
+      sec.freshCard = mk('資料新鮮度', '每一種會過期的資料：上次成功、狀態、下次預定');
+      sec.freshTable = tblBox(sec.freshCard);
+      sec.findCard = mk('發現', '觀察到的現象與經過（需要馬上處理的在狀態頁的提醒）');
+      sec.findBox = el('div', 'kd-find'); sec.findCard.appendChild(sec.findBox);
+      sec.reachCard = mk('這條線到得了哪些台灣機房', '機房是「IP × 這條線路」量出來的；大多數線路只到得了一個台灣機房');
+      sec.reachBox = el('div'); sec.reachCard.appendChild(sec.reachBox);
+      sec.pathsCard = mk('兩條路：原本的答案與台灣節點', '網站驗證時量到的兩邊（不另外發探測）');
+      sec.pathsBox = el('div'); sec.pathsCard.appendChild(sec.pathsBox);
+      sec.h24Card = card(s, 'kd-mt12 kd-hide');
+      sec.h24Card.appendChild(el('h3', '', '最近 24 小時（每 5 分鐘）'));
+      const g2 = el('div', 'grid g2'); sec.h24Card.appendChild(g2);
+      const c1 = el('div'); legend(c1, [['查詢', 'var(--s1)'], ['失敗', 'var(--s2)'], ['過期快取', 'var(--s4)']]); sec.h24a = el('div', 'chart'); c1.appendChild(sec.h24a); g2.appendChild(c1);
+      const c2 = el('div'); legend(c2, [['問上游 p50（ms）', 'var(--s5)'], ['換成台灣（%）', 'var(--s3)']]); sec.h24b = el('div', 'chart'); c2.appendChild(sec.h24b); g2.appendChild(c2);
     }
     // ---- 查詢與排行（公開頁的圖表） ----
     if (on('live')) {
@@ -834,6 +857,85 @@
         sec.crossSum.textContent = c.explored ? `試過 ${nf.format(c.explored)} 個網站，${nf.format(c.ok)} 個找到別家 CDN 的台灣節點（${pct1(c.ok / c.explored)}）` : '還沒有網站需要跨 CDN（原本的 CDN 沒有台灣節點、而且有人連線後才會測試）';
       }
       if (sec.updated) sec.updated.textContent = '更新於 ' + fmtTime(p.generatedAt || Date.now(), 'timesec');
+      renderObserveStats(p);
+    }
+    // ---- 線路與資料新鮮度（3.5.0）：ui-core.js 的 freshnessView、findingsView、reachView、pathsView、historySeries ----
+    const UC = () => (typeof window !== 'undefined' && window.KuroshioUiCore) || null;
+    const showCard = (c, yes) => { if (c) c.classList.toggle('kd-hide', !yes); };
+    function renderObserveStatus(s) {
+      const U = UC();
+      if (!sec.freshCard || !U || typeof U.freshnessView !== 'function') return;
+      const fr = Array.isArray(s.freshness) ? U.freshnessView(s.freshness) : null;
+      showCard(sec.freshCard, !!fr);
+      if (fr) table(sec.freshTable, fr, [
+        { h: '項目', v: r => r.label },
+        { h: '上次成功', v: r => r.last, cls: 'muted' },
+        { h: '狀態', v: r => tag(r.state, r.kind === 'ok' ? 'ok' : r.kind === 'err' ? 'bad' : r.kind === 'warn' ? 'warn' : '') },
+        { h: '下次', v: r => r.next }
+      ], '沒有資料');
+      const fi = Array.isArray(s.findings) ? U.findingsView(s.findings) : null;
+      showCard(sec.findCard, !!fi);
+      if (fi) {
+        sec.findBox.textContent = '';
+        if (!fi.length) sec.findBox.appendChild(el('p', 'muted', '目前沒有觀察到特別的現象'));
+        fi.forEach(f => {
+          const d = el('div', 'kd-find-row' + (f.dim ? ' kd-dim' : ''));
+          d.appendChild(tag(f.sev === 'warn' ? '注意' : '資訊', f.sev === 'warn' ? 'warn' : ''));
+          d.appendChild(el('span', '', ' ' + f.text + ' '));
+          d.appendChild(el('span', 'muted', f.meta));
+          sec.findBox.appendChild(d);
+        });
+      }
+      const rv = s.cdn ? U.reachView(s.cdn) : null;
+      showCard(sec.reachCard, !!rv);
+      if (rv) {
+        const b = sec.reachBox; b.textContent = '';
+        rv.lines.forEach(l => b.appendChild(el('p', 'kd-mt0', l)));
+        [rv.note, rv.unconfirmed, rv.audit].filter(Boolean).forEach(l => b.appendChild(el('p', 'muted', l)));
+        if (rv.fuse) b.appendChild(el('p', 'kd-warn', rv.fuse));
+        if (rv.pops.length || rv.nearby.length) {
+          const d = el('details', 'table'); d.appendChild(el('summary', '', '機房明細'));
+          const t = el('table'); d.appendChild(t); b.appendChild(d);
+          table(t, rv.pops.concat(rv.nearby.map(n => ({ family: '鄰近', pop: n.pop + '（' + (LABEL[n.provider] || n.provider) + '）', city: '', nodes: '-', prefixes: n.prefixes, providers: '-', ms: '-' }))), [
+            { h: '家族', v: r => r.family }, { h: '機房', v: r => r.pop + (r.city ? ' ' + r.city : '') },
+            { h: '節點', v: r => r.nodes, num: 1 }, { h: '網段', v: r => r.prefixes, num: 1 }, { h: 'CDN', v: r => r.providers, num: 1 }, { h: '延遲', v: r => r.ms, num: 1 }
+          ]);
+        }
+        if (rv.health.text || rv.health.rows.length) {
+          const d = el('details', 'table'); d.appendChild(el('summary', '', '機房健康'));
+          if (rv.health.text) d.appendChild(el('p', 'muted', rv.health.text));
+          if (rv.health.rows.length) {
+            const t = el('table'); d.appendChild(t);
+            table(t, rv.health.rows, [
+              { h: 'CDN', v: r => LABEL[r.provider] || r.provider }, { h: '家族', v: r => r.family }, { h: '機房', v: r => r.pop },
+              { h: '節點', v: r => r.nodes, num: 1 }, { h: '壞的', v: r => r.bad, num: 1 }, { h: '失敗率', v: r => r.failRate, num: 1 },
+              { h: '延遲', v: r => r.ms, num: 1 }, { h: '', v: r => r.held ? tag(r.held, 'warn') : '' }
+            ]);
+          }
+          b.appendChild(d);
+        }
+      }
+    }
+    function renderObserveStats(p) {
+      const U = UC();
+      if (!sec.pathsCard || !U || typeof U.pathsView !== 'function') return;
+      const pv = U.pathsView(p.paths, p.stale);
+      showCard(sec.pathsCard, !!pv);
+      if (pv) {
+        const b = sec.pathsBox; b.textContent = '';
+        b.appendChild(el('p', 'muted kd-mt0', pv.summary));
+        const t = el('table'); const w = el('div', 'tbl'); w.appendChild(t); b.appendChild(w);
+        table(t, pv.rows, [{ h: '', v: r => r.label }, { h: '原本的答案', v: r => r.orig, num: 1 }, { h: '台灣節點', v: r => r.tw, num: 1 }]);
+        if (pv.stale) b.appendChild(el('p', pv.stale.warn ? 'kd-warn kd-mt8' : 'muted kd-mt8', pv.stale.text));
+      }
+      const h = p.history ? U.historySeries(p.history) : null;
+      showCard(sec.h24Card, !!p.history);
+      if (h) {
+        lineChartCompact(sec.h24a, h.map(x => ({ t: x.t, q: x.q, fail: x.servfail, stale: x.stale })),
+          [{ key: 'q', name: '查詢', color: 'var(--s1)' }, { key: 'fail', name: '失敗', color: 'var(--s2)' }, { key: 'stale', name: '過期快取', color: 'var(--s4)' }]);
+        lineChartCompact(sec.h24b, h.map(x => ({ t: x.t, p50: x.p50, tw: x.tw })),
+          [{ key: 'p50', name: '問上游 p50（ms）', color: 'var(--s5)', integer: false }, { key: 'tw', name: '換成台灣（%）', color: 'var(--s3)', integer: false }]);
+      }
     }
     function loadStats() {
       return A.stats(range).then(renderStats, e => { fail(sec.tiles || sec.live, e); });
@@ -849,6 +951,7 @@
       const p = A.status();
       if (!firstStatus) firstStatus = p.catch(() => null);
       return p.then(s => {
+        renderObserveStatus(s);
         if (sec.upTable) {
           table(sec.upTable, s.upstreams, [
             { h: '上游', v: u => u.id, cls: 'mono' },

@@ -1,5 +1,5 @@
 {
-  "$comment": "data/shared/ui-core.js 的測試向量（tools/ui-core-test.js 檢查）。args = 傳給函式的參數；expect = 預期回傳值（JSON 比較，undefined 的屬性不列）。沒給時區參數的 fmtTime 案例以 TZ=Asia/Taipei 執行。網址一律用 example.com / example.net / example.org。restoreSummary、controlSummary、benchScope、regionLabel 的參數 \"bracket\" = 翻譯函式 s => \"[\" + s + \"]\"。",
+  "$comment": "data/shared/ui-core.js 的測試向量（tools/ui-core-test.js 檢查）。args = 傳給函式的參數；expect = 預期回傳值（JSON 比較，undefined 的屬性不列）。沒給時區參數的 fmtTime 案例以 TZ=Asia/Taipei 執行。網址一律用 example.com / example.net / example.org。restoreSummary、controlSummary、benchScope、regionLabel、agoText、freshnessView、findingsView、reachView、pathsView、ispGroupText 的參數 \"bracket\" = 翻譯函式 s => \"[\" + s + \"]\"。",
   "tz": "Asia/Taipei",
   "fmtTime": [
     {"args":[1794450123000],"expect":"2026-11-12 10:22"},
@@ -144,5 +144,48 @@
     {"name":"固定上游（沒有評測的地區）","args":[{"region":null,"regionSource":null,"near":null}],"expect":""},
     {"name":"沒有資料","args":[null],"expect":""},
     {"name":"翻譯函式","args":[{"region":"JP","regionSource":"registered","near":true},"bracket"],"expect":"[鄰近（註冊地 JP）]"}
+  ],
+  "agoText": [
+    {"args":[null,1795400000000],"expect":"-"},
+    {"args":[1795399970000,1795400000000],"expect":"剛剛"},
+    {"args":[1795399700000,1795400000000],"expect":"5 分鐘前"},
+    {"args":[1795389200000,1795400000000],"expect":"3 小時前"},
+    {"args":[1795227200000,1795400000000],"expect":"2 天前"},
+    {"args":[1795405400000,1795400000000],"expect":"2 小時後"},
+    {"args":[1795399700000,1795400000000,"bracket"],"expect":"[5 分鐘前]"}
+  ],
+  "freshnessView": [
+    {"args":[null],"expect":[]},
+    {"args":[[]],"expect":[]},
+    {"args":[[{"key":"cdn-pool","label":"節點池","lastOkAt":1795396400000,"failing":false,"fails":0,"nextAt":1795403600000,"stale":false,"pending":false,"source":"own","failingItems":null,"note":null},{"key":"benchmark","label":"每日評測","lastOkAt":1795313600000,"failing":false,"fails":0,"nextAt":null,"stale":false,"pending":false,"source":"chain"},{"key":"filter-lists","label":"過濾清單","lastOkAt":1795140800000,"failing":true,"fails":1,"nextAt":null,"stale":true,"pending":false,"source":"own","failingItems":2},{"key":"tw-ip","label":"台灣 IP 資料","lastOkAt":null,"failing":true,"fails":4,"nextAt":null,"stale":false,"pending":true,"source":"own","note":"資料產生於 2026-11-01"},{"key":"path-check","label":"路徑檢查","lastOkAt":1795353200000,"failing":false,"fails":0,"stale":true,"pending":false,"source":"own"},{"key":"friends-sync","label":"好友同步","lastOkAt":null,"failing":false,"fails":0,"stale":false,"pending":true,"source":"own"}],"bracket",1795400000000],"expect":[{"key":"cdn-pool","label":"[節點池]","last":"[1 小時前]","lastAt":"2026-11-23 09:13","state":"[正常]","kind":"ok","next":"2026-11-23 11:13","note":""},{"key":"benchmark","label":"[每日評測]","last":"[1 天前]","lastAt":"2026-11-22 10:13","state":"[由上游提供]","kind":"ok","next":"-","note":""},{"key":"filter-lists","label":"[過濾清單]","last":"[3 天前]","lastAt":"2026-11-20 10:13","state":"[失敗中（連續 1 次）][（2 項失敗）]","kind":"warn","next":"-","note":""},{"key":"tw-ip","label":"[台灣 IP 資料]","last":"[還沒成功過]","lastAt":"-","state":"[失敗中（連續 4 次）]","kind":"err","next":"-","note":"資料產生於 2026-11-01"},{"key":"path-check","label":"[路徑檢查]","last":"[13 小時前]","lastAt":"2026-11-22 21:13","state":"[過期]","kind":"warn","next":"-","note":""},{"key":"friends-sync","label":"[好友同步]","last":"[還沒成功過]","lastAt":"-","state":"[還沒成功過]","kind":"off","next":"-","note":""}]}
+  ],
+  "findingsView": [
+    {"args":[null],"expect":[]},
+    {"args":[[{"key":"upstream-failing","sev":"warn","text":"有 1 個上游連續失敗、暫停中","count":3,"firstAt":1795392800000,"lastAt":1795399700000,"active":true},{"key":"reach-single-pop","sev":"info","text":"這條線目前只到得了台北機房","count":1,"firstAt":1795313600000,"lastAt":1795392800000,"active":false},{"key":"new-key","sev":"other","count":0}],null,1795400000000],"expect":[{"key":"upstream-failing","sev":"warn","text":"有 1 個上游連續失敗、暫停中","meta":"3 次，最近 5 分鐘前","dim":false},{"key":"reach-single-pop","sev":"info","text":"這條線目前只到得了台北機房","meta":"1 次，最近 2 小時前","dim":true},{"key":"new-key","sev":"info","text":"new-key","meta":"1 次，最近 -","dim":false}]}
+  ],
+  "reachView": [
+    {"args":[null],"expect":null},
+    {"args":[{"enabled":false}],"expect":null},
+    {"args":[{"reach":{}}],"expect":null},
+    {"args":[{"reach":{"at":1795400000000,"wanEpoch":2,"stale":true,"unconfirmed":3,"v4":{"text":"這條線目前只到得了台北機房","multi":false,"pops":[{"pop":"TPE","city":"台北","nodes":31,"prefixes":22,"providers":4,"medianMs":4.1}]},"v6":{"text":"這條線的 IPv6 目前只到得了台北機房","multi":false,"pops":[]},"nearby":[{"provider":"fastly","pop":"NRT","prefixes":6}]},"popHealth":[{"provider":"cloudflare","family":4,"pop":"TPE","nodes":9,"bad":0,"failRate":0,"medianMs":4.2,"badStreak":0,"held":false,"heldUntil":null},{"provider":"cloudflare","family":4,"pop":"KHH","nodes":3,"bad":2,"failRate":0.4,"medianMs":6,"held":true,"heldUntil":1795401000}],"popSwitch":{"enabled":true,"eligible":false,"reason":"single-pop","switches24h":0},"popAudit":{"enabled":true,"pending":9,"confirmed":31,"mismatch":0,"probes24h":12,"lastMismatchAt":null,"chainPopUnreliable":false},"slowerFuseUntil":1795403600}],"expect":{"lines":["這條線目前只到得了台北機房","這條線的 IPv6 目前只到得了台北機房"],"note":"WAN 變動後還沒重新確認（下一輪健檢會更新）","unconfirmed":"另有 3 個上游給的節點還沒在這台確認機房","pops":[{"family":"IPv4","pop":"TPE","city":"台北","nodes":31,"prefixes":22,"providers":4,"ms":"4.1 ms"}],"nearby":[{"provider":"fastly","pop":"NRT","prefixes":6}],"health":{"text":"這條線只到得了一個機房，不做機房切換","rows":[{"provider":"cloudflare","family":"IPv4","pop":"TPE","nodes":9,"bad":0,"failRate":"0%","ms":"4.2 ms","held":""},{"provider":"cloudflare","family":"IPv4","pop":"KHH","nodes":3,"bad":2,"failRate":"40%","ms":"6 ms","held":"暫時排到後面，到 2026-11-23 10:30"}]},"audit":"上游給的節點：已確認機房 31、量到不一樣 0、還沒確認 9","fuse":"太多網站都量到台灣節點比原本慢（可能是量測問題）：2026-11-23 11:13 前照常換台灣節點"}},
+    {"args":[{"reach":{"v4":{"text":"這條線目前量不到台灣機房（節點池還沒建立，或節點都連不上）","pops":[]}},"popSwitch":{"reason":"weird","switches24h":2},"popAudit":{"enabled":false,"confirmed":3}},"bracket"],"expect":{"lines":["這條線目前量不到台灣機房（節點池還沒建立，或節點都連不上）"],"note":null,"unconfirmed":null,"pops":[],"nearby":[],"health":{"text":"weird[（24 小時內切換 2 次）]","rows":[]},"audit":null,"fuse":null}}
+  ],
+  "pathsView": [
+    {"args":[null,null],"expect":null},
+    {"args":[{"sites":1},null],"expect":null},
+    {"args":[{"sites":412,"orig":{"ok":398,"fail":14,"abroad":301,"medianMs":48},"tw":{"ok":371,"fail":22,"slower":5,"medianMs":6.5},"both":350,"twFaster":338,"twSlower":12,"medianSavedMs":37.5},{"today":120,"rateToday":0.004,"rate15m":0.06,"rate1h":0.001}],"expect":{"summary":"412 個網站，兩邊都量到延遲的 350 個：台灣比較快 338、比較慢 12；中位數省下 37.5 ms","rows":[{"label":"成功","orig":"398","tw":"371"},{"label":"失敗","orig":"14","tw":"22"},{"label":"延遲中位數","orig":"48 ms","tw":"6.5 ms"},{"label":"原本在國外","orig":"301","tw":"-"},{"label":"比原本慢、暫時用原本的答案","orig":"-","tw":"5"}],"stale":{"text":"過期快取的回答：今天 0.4%、最近 15 分鐘 6.0%、最近 1 小時 0.1%","warn":true}}},
+    {"args":[{"sites":2,"orig":{"ok":1,"fail":0,"abroad":1,"medianMs":null},"tw":{"ok":1,"fail":0,"slower":1,"medianMs":null},"both":1,"twFaster":0,"twSlower":1,"medianSavedMs":-12},{"today":0,"rateToday":0,"rate15m":0,"rate1h":0}],"expect":{"summary":"2 個網站，兩邊都量到延遲的 1 個：台灣比較快 0、比較慢 1；中位數多 12 ms","rows":[{"label":"成功","orig":"1","tw":"1"},{"label":"失敗","orig":"0","tw":"0"},{"label":"延遲中位數","orig":"-","tw":"-"},{"label":"原本在國外","orig":"1","tw":"-"},{"label":"比原本慢、暫時用原本的答案","orig":"-","tw":"1"}],"stale":{"text":"過期快取的回答：今天 0.0%、最近 15 分鐘 0.0%、最近 1 小時 0.0%","warn":false}}}
+  ],
+  "historySeries": [
+    {"args":[null],"expect":[]},
+    {"args":[{"stepSec":300,"from":0,"n":0,"q":[]}],"expect":[]},
+    {"args":[{"stepSec":300,"from":1795400100,"n":2,"q":[12,9],"blocked":[1,0],"servfail":[0,1],"stale":[0,2],"miss":[5,4],"p50":[20,null],"p95":[100,null],"abroad":[3,0],"tw":[2,0]}],"expect":[{"t":1795400100000,"q":12,"blocked":1,"servfail":0,"stale":0,"miss":5,"p50":20,"p95":100,"tw":66.7},{"t":1795400400000,"q":9,"blocked":0,"servfail":1,"stale":2,"miss":4,"p50":0,"p95":0,"tw":0}]}
+  ],
+  "ispGroupText": [
+    {"args":[null],"expect":null},
+    {"args":[{"share":false,"sameGroupFriends":0}],"expect":null},
+    {"args":[{"share":true,"mine":null,"sameGroupFriends":0}],"expect":"你的群組：偵測不到（不帶給好友）"},
+    {"args":[{"share":true,"mine":"cht","sameGroupFriends":2}],"expect":"你的群組：cht（同群組的好友 2 位）"},
+    {"args":[{"share":true,"mine":"cht","sameGroupFriends":0},"bracket"],"expect":"[你的群組：cht]"}
   ]
 }

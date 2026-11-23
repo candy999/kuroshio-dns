@@ -340,6 +340,11 @@ return view.extend({
 		o = common.flag(s, null, 'share_upstreams', _('分享上游 DNS'), 'community.shareUpstreams', _('好友收到後只當每日評測的候選。'));
 		o = common.flag(s, null, 'use_hints', _('使用好友的 CDN 資料'), 'community.useHints', _('好友給的網站驗證結果、跨 CDN 結果、台灣節點只當候選，本機驗證通過才使用。關掉 = 只靠自己找。'));
 		o = common.flag(s, null, 'use_upstreams', _('使用好友的上游 DNS'), 'community.useUpstreams', _('好友給的上游只當每日評測的候選（合計最多 100 個），照常經過汙染、封殺、速度檢查。'));
+		// ISP 群組（3.5.0 E10，預設關）：開關旁邊顯示「你的群組：○○」
+		var ig = data[1] && data[1].result ? common.ispGroupText(data[1].result.ispGroup) : null;
+		o = common.flag(s, null, 'share_isp_group', _('跟好友說我用哪一家業者（ISP 群組）'), 'community.shareIspGroup',
+			_('開了之後好友會知道你用哪一家業者（群組，例如 cht），不含 IP；身分文件不放，只有好友拿得到。收到的群組只用來決定好友提示的先後（同一家業者的先驗證），信任一律來自本機驗證。') +
+			(ig ? ' ' + ig : ''));
 		common.num(s, null, 'stale_days', _('好友幾天連不上就自動刪除'), 'community.staleDays');
 		if (pro) {
 			common.num(s, null, 'reject_days', _('拒絕後幾天才能再請求'), 'community.rejectDays');

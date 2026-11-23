@@ -278,6 +278,24 @@ return baseclass.extend({
 		return (u && u.region) || '';
 	},
 
+	/** 3.5.0 E 組：資料新鮮度、發現、線路、ISP 群組（ui-core.js 的 freshnessView 等）；ui-core.js 是舊的（瀏覽器快取）時回空的 */
+	freshnessView: function(list) {
+		var x = core();
+		return x && typeof x.freshnessView === 'function' ? x.freshnessView(list, function(s) { return _(s); }) : [];
+	},
+	findingsView: function(list) {
+		var x = core();
+		return x && typeof x.findingsView === 'function' ? x.findingsView(list, function(s) { return _(s); }) : [];
+	},
+	reachView: function(cdn) {
+		var x = core();
+		return x && typeof x.reachView === 'function' ? x.reachView(cdn, function(s) { return _(s); }) : null;
+	},
+	ispGroupText: function(ig) {
+		var x = core();
+		return x && typeof x.ispGroupText === 'function' ? x.ispGroupText(ig, function(s) { return _(s); }) : null;
+	},
+
 	/** 小標籤（狀態用）：kind = ok / warn / err / off */
 	badge: function(text, kind) {
 		return T('span', { 'class': 'kuroshio-badge', 'data-kind': kind || 'off',

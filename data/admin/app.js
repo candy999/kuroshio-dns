@@ -710,6 +710,31 @@
 
 		// 憑證、最近的錯誤
 		var ex = clear($('st-extra'));
+		// 發現與資料新鮮度（3.5.0 E1、E2；ui-core.js 的 findingsView、freshnessView）：舊版核心沒有欄位時不顯示
+		var finds = Array.isArray(st.findings) && typeof core.findingsView === 'function' ? core.findingsView(st.findings) : null;
+		if (finds && finds.length) {
+			ex.appendChild(el('h3', { text: '發現' }));
+			finds.forEach(function (f) {
+				ex.appendChild(el('p', { class: 'msg ' + (f.sev === 'warn' ? 'warn' : 'info') + (f.dim ? ' dim' : ''), text: f.text + '（' + f.meta + '）' }));
+			});
+		}
+		var fresh = Array.isArray(st.freshness) && typeof core.freshnessView === 'function' ? core.freshnessView(st.freshness) : null;
+		if (fresh && fresh.length) {
+			ex.appendChild(el('h3', { text: '資料新鮮度' }));
+			var ft = el('table', { class: 'tbl', id: 'st-freshness' }, [el('thead', {}, [el('tr', {}, ['項目', '上次成功', '狀態', '下次'].map(function (h) { return el('th', { text: h }); }))]), el('tbody')]);
+			ex.appendChild(ft);
+			tableRows(ft.tBodies[0], fresh.map(function (r) {
+				return [r.label + (r.note ? '（' + r.note + '）' : ''), r.last, badge(r.state, r.kind === 'err' ? 'err' : r.kind), r.next];
+			}), 4);
+		}
+		// 這條線到得了哪些台灣機房（3.5.0 E3）
+		var rv = st.cdn && typeof core.reachView === 'function' ? core.reachView(st.cdn) : null;
+		if (rv) {
+			ex.appendChild(el('h3', { text: '線路' }));
+			rv.lines.concat([rv.note, rv.unconfirmed, rv.audit].filter(Boolean)).forEach(function (l) { ex.appendChild(el('p', { class: 'msg info', text: l })); });
+			if (rv.health.text) ex.appendChild(el('p', { class: 'msg info', text: rv.health.text }));
+			if (rv.fuse) ex.appendChild(el('p', { class: 'msg warn', text: rv.fuse }));
+		}
 		// 網路路徑（3.3.6）：一般 DNS 有沒有被接走、被誰；被擋的協定；IPv6
 		var np = st.network && st.network.path;
 		if (np && (np.checkedAt || np.enabled === false)) {

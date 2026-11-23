@@ -176,3 +176,8 @@
 @media (prefers-reduced-motion: reduce) { .kd .flow, .kd .pulse { animation: none !important; } }
 .kd .map-legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--text-2); margin-top: 8px; }
 .kd .map-legend i { display: inline-block; width: 22px; height: 3px; border-radius: 3px; vertical-align: middle; margin-right: 6px; background: linear-gradient(90deg, var(--s2), var(--s1)); }
+/* 線路與資料新鮮度（3.5.0）：舊版核心沒有欄位時整張卡片不顯示；不 active 的發現用淡色；過期快取比率高、保險絲用警示色 */
+.kd .kd-hide { display: none; }
+.kd .kd-find-row { padding: 4px 0; font-size: 13.5px; }
+.kd .kd-dim { opacity: .55; }
+.kd .kd-warn { color: var(--warn); font-size: 13px; }

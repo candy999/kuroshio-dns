@@ -126,6 +126,30 @@ const ACCESS = query => {
         topDenied: [{ net: '45.135.232.0/24', count: 31 }, { net: '2a06:4880:1000::/48', count: 26 }],
         groups, selected: sel, allow: list(a.allow), deny: list(a.deny), log: a.log !== '0', localUpdate: a.local_update !== '0', dataSource: '/usr/share/kuroshio/geo/tw-ip.json', total: TWIP.total };
 };
+// 3.5.0 E 組：資料新鮮度、發現、過期快取比率、這條線到得了哪些台灣機房（甲批的欄位照規格 11 的格式）
+const NOWMS = Date.now(), HMS = 3600e3;
+STATUS.freshness = [
+    { key: 'benchmark', label: '每日評測', lastOkAt: NOWMS - 5 * HMS, failing: false, fails: 0, nextAt: NOWMS + 19 * HMS, stale: false, pending: false, source: 'own', failingItems: null, note: null },
+    { key: 'cdn-pool', label: '節點池', lastOkAt: NOWMS - 30 * HMS, failing: false, fails: 0, nextAt: NOWMS + 2 * HMS, stale: false, pending: false, source: 'chain', failingItems: null, note: null },
+    { key: 'tw-ip', label: '台灣 IP 資料', lastOkAt: NOWMS - 20 * 24 * HMS, failing: true, fails: 3, nextAt: NOWMS + 10 * 24 * HMS, stale: false, pending: false, source: 'own', failingItems: null, note: '資料產生於 2026-11-01' },
+    { key: 'filter-lists', label: '過濾清單', lastOkAt: NOWMS - 3 * 24 * HMS, failing: true, fails: 1, nextAt: NOWMS + HMS, stale: true, pending: false, source: 'own', failingItems: 1, note: null },
+    { key: 'path-check', label: '路徑檢查', lastOkAt: NOWMS - 2 * HMS, failing: false, fails: 0, nextAt: NOWMS + 4 * HMS, stale: false, pending: false, source: 'own', failingItems: null, note: null }
+];
+STATUS.findings = [
+    { key: 'job-failing', sev: 'warn', text: '背景工作連續失敗：台灣 IP 資料（3 次）', count: 1, firstAt: NOWMS - 2 * HMS, lastAt: NOWMS - 60e3, active: true },
+    { key: 'reach-single-pop', sev: 'info', text: '這條線目前只到得了台北機房', count: 1, firstAt: NOWMS - 26 * HMS, lastAt: NOWMS - 60e3, active: true },
+    { key: 'upstream-failing', sev: 'warn', text: '有 1 個上游連續失敗、暫停中（會逐次拉長暫停時間，恢復後自動接回）', count: 2, firstAt: NOWMS - 9 * HMS, lastAt: NOWMS - 5 * HMS, active: false }
+];
+STATUS.stale = { today: 120, rateToday: 0.004, rate15m: 0.0, rate1h: 0.001 };
+Object.assign(STATUS.cdn, {
+    reach: { at: NOWMS - 600e3, wanEpoch: 1, stale: false, unconfirmed: 0,
+        v4: { text: '這條線目前只到得了台北機房', multi: false, pops: [{ pop: 'TPE', city: '台北', nodes: 31, prefixes: 22, providers: 4, medianMs: 4.1 }] },
+        v6: { text: '這條線的 IPv6 目前只到得了台北機房', multi: false, pops: [{ pop: 'TPE', city: '台北', nodes: 12, prefixes: 5, providers: 2, medianMs: 4.6 }] },
+        nearby: [{ provider: 'fastly', pop: 'NRT', prefixes: 6 }] },
+    popHealth: [{ provider: 'cloudflare', family: 4, pop: 'TPE', nodes: 9, bad: 0, failRate: 0.0, medianMs: 4.2, badStreak: 0, held: false, heldUntil: null }],
+    popSwitch: { enabled: true, eligible: false, reason: 'single-pop', switches24h: 0 },
+    popAudit: { enabled: true, pending: 0, confirmed: 31, mismatch: 0, probes24h: 0, lastMismatchAt: null, chainPopUnreliable: false }
+});
 STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, failClosed: false, warning: null, generatedAt: TWIP.generatedAt,
     ranges: 1003, memoryBytes: 16048, dataBytes: 21312, denied: { total: 57, byListener: { dot: 40, doh: 17 } }, topDenied: [] };
 // 好友邀請碼（假的）：重新產生換一個；貼上時 KRS1.MOCKGOOD 開頭當成成功，其他當成檢查碼不符
@@ -176,7 +200,9 @@ const community = {
 };
 const COMMUNITY_STATUS = () => {
     const n = f => community.peers.filter(f).length;
-    return { enabled: true, ready: community.ready, domain: 'dns.example.com', fingerprint: '7197-1882-14EA-0AF1-8FCC-0C6C-00A3-7A4A',
+    // 3.5.0 E10：ISP 群組（mine 只在開著時給）
+    const share = (uci.kuroshio.community || {}).share_isp_group === '1';
+    return { ispGroup: share ? { share: true, mine: 'cht', sameGroupFriends: 1 } : { share: false, sameGroupFriends: 0 }, enabled: true, ready: community.ready, domain: 'dns.example.com', fingerprint: '7197-1882-14EA-0AF1-8FCC-0C6C-00A3-7A4A',
         check: { at: NOW - 10 * 60000, ready: community.ready, problems: community.ready ? [] : ['dns.example.com 解析出的 IP（198.51.100.7）跟出口 IP（203.0.113.25）不一樣'],
             cert: { validTo: '2027-01-31', daysLeft: 80 } },
         txt: { name: '_kuroshio.dns.example.com', value: 'v=k1; fp=719718821' },
@@ -237,8 +263,23 @@ function DASH(query) {
         outcomes: { cache: hit, upstream: Math.max(0, q - hit - blk), ads: sum('blockedAds') + sum('blockedCustom') + sum('blockedTelemetry'), malware: sum('blockedMalware') },
         topSites: top(sites, 30), topBlocked: top(blocked, 30),
         privacy: { minClients: 1 },
-        system: { uptimeSec: 3700, rules: { custom: 3, lists: 100000, byCategory: {} }, upstreams: 3, benchmarkAt: null }
+        system: { uptimeSec: 3700, rules: { custom: 3, lists: 100000, byCategory: {} }, upstreams: 3, benchmarkAt: null },
+        // 3.5.0 E8、E9：兩條路比對、過期快取比率、24 小時歷史（管理 API 才有）
+        paths: { sites: 412, orig: { ok: 398, fail: 14, abroad: 301, medianMs: 48.0 }, tw: { ok: 371, fail: 22, slower: 5, medianMs: 6.5 },
+            both: 350, twFaster: 338, twSlower: 12, medianSavedMs: 37.5 },
+        stale: STATUS.stale,
+        history: HISTORY(now)
     };
+}
+/** 24 小時歷史的假資料：288 格、晚上查詢多，凌晨有一段上游掛掉（失敗與過期快取變多） */
+function HISTORY(now) {
+    const n = 288, step = 300, end = Math.floor(now / 1000 / step) * step, from = end - n * step;
+    const col = f => Array.from({ length: n }, (_, i) => f(i));
+    const q = col(i => Math.round(80 + 60 * Math.sin((i - 60) / 46)) + (i % 5));
+    const down = i => i >= 40 && i < 52;
+    return { stepSec: step, from, n, q, blocked: col(i => Math.round(q[i] * 0.06)), servfail: col(i => down(i) ? 9 : i % 37 === 0 ? 1 : 0),
+        stale: col(i => down(i) ? 14 : 0), miss: col(i => Math.round(q[i] * 0.3)), p50: col(i => down(i) ? null : i % 3 ? 20 : 10), p95: col(i => down(i) ? null : 100),
+        abroad: col(i => Math.round(q[i] * 0.2)), tw: col(i => Math.round(q[i] * 0.16)) };
 }
 const POOLS = {
     cloudflare: { ranges: { v4: 14, v6: 7 }, scan: { tw: 78, global: 56, dead: 89 },

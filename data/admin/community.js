@@ -108,6 +108,10 @@
 			['好友', '好友 ' + (n.friends || 0) + '　待我審核 ' + (n.incoming || 0) + '　等待對方同意 ' + (n.outgoing || 0) + '　已封鎖 ' + (n.blocked || 0)],
 			['自我檢查', c.at ? fmtTime(c.at) : '-']
 		];
+		// ISP 群組（3.5.0 E10，community.shareIspGroup）：開著時顯示「你的群組：○○」
+		var core = window.KuroshioUiCore;
+		var ig = core && typeof core.ispGroupText === 'function' ? core.ispGroupText(s.ispGroup) : null;
+		if (ig) rows.push(['ISP 群組', ig]);
 		if (s.txt && s.txt.value && s.domain) {
 			rows.push(['TXT 記錄（選用）', el('div', {}, [
 				el('div', { class: 'mono', text: s.txt.name + '  TXT  "' + s.txt.value + '"' }),

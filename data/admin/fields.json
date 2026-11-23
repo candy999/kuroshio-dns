@@ -328,6 +328,10 @@
             ] },
             { "key": "cdn.multiCdn", "type": "bool", "label": "尊重多來源 CDN", "help": "網站自己在多家 CDN 之間分流時，每一家各自驗證、各自換成那一家的台灣節點，不把網站硬綁在其中一家，也不替它換到別家；網站換了 CDN 或第一層 CNAME 時，舊的跨 CDN 與 ECS 結果失效、重新驗證。關掉＝3.4.x 的行為。" },
             { "key": "cdn.appLayer", "type": "bool", "label": "App 自己選節點的服務不改寫", "help": "影音、系統更新這類由 App 或服務自己決定連哪個節點的 CDN（目前：Google、Apple）只辨識與統計，不換節點。個別網域可以在 CDN 網域表手動設成「一定換」。" },
+            { "key": "cdn.popAudit", "type": "bool", "label": "機房以這台量到的為準", "help": "上游黑潮（串接）給的節點，先記下它宣稱的機房，這台量到之後以自己量的為準；不一樣時列在狀態頁的「發現」。串接中搭答案抽查的名額量機房（10 分鐘最多 1 個、一天最多 24 個）。關掉＝照收上游的機房、串接中不量（3.4.x 的行為）。" },
+            { "key": "cdn.popSwitch", "type": "bool", "label": "機房層級的健康與切換", "help": "只有這條線到得了兩個以上台灣機房時才會動：某個機房連續 3 輪健檢變差、另一個明顯正常，就把變差的機房的節點暫時排到後面 4 小時，到期自動恢復；一天最多 2 次。大多數線路只到得了一個機房，只彙總、不切換。關掉＝只彙總。" },
+            { "key": "cdn.spreadPrefixes", "type": "bool", "label": "同機房內分散網段", "help": "回給裝置的那幾個台灣節點盡量來自不同的網段（IPv4 /24、IPv6 /48），一個網段出問題時不會全部一起壞；只換延遲差不多的節點（1.5 倍＋5 毫秒以內）。關掉＝照延遲排序。" },
+            { "key": "cdn.slowerFallback", "type": "bool", "label": "台灣節點比原本慢就先用原本的答案", "help": "驗證時台灣節點的請求時間明顯比原本的答案慢（1.5 倍＋30 毫秒，複測確認），這個網站暫時用原本的答案、6 小時後重測；太多網站都這樣時（量測可能有問題）自動停用 6 小時。只處理 IPv4。關掉＝驗證通過就換（3.4.x 的行為）。" },
             { "key": "cdn.ecs.twSubnets", "type": "list", "label": "ECS 台灣網段", "help": "DNS 分流型 CDN 用。放你用戶實際所在的 ISP 網段效果最好；本機對外 IP 的 /24 會自動放在最前面。" }
           ]
         },
@@ -523,6 +527,7 @@
             { "key": "community.shareUpstreams", "type": "bool", "label": "分享上游 DNS", "help": "好友收到後只當每日評測的候選。" },
             { "key": "community.useHints", "type": "bool", "label": "使用好友的 CDN 資料", "help": "好友給的網站驗證結果、跨 CDN 結果、台灣節點只當候選，本機驗證通過才使用。關掉 = 只靠自己找。" },
             { "key": "community.useUpstreams", "type": "bool", "label": "使用好友的上游 DNS", "help": "好友給的上游只當每日評測的候選（合計最多 100 個），照常經過汙染、封殺、速度檢查。" },
+            { "key": "community.shareIspGroup", "type": "bool", "label": "跟好友說我用哪一家業者（ISP 群組）", "help": "開了之後好友會知道你用哪一家業者（台灣 IP 資料的群組，例如 cht），不含 IP；身分文件不放，只有好友拿得到。收到的群組只用來決定好友提示的先後與別家業者好友的節點候選額度（同一家業者的先驗證），信任一律來自本機驗證。預設關。" },
             { "key": "community.staleDays", "type": "int", "label": "好友幾天連不上就自動刪除", "min": 1 },
             { "key": "community.rejectDays", "type": "int", "label": "拒絕後幾天才能再請求", "pro": true, "min": 0 },
             { "key": "community.syncIntervalMin", "type": "int", "label": "多久向好友拉一次資料（分鐘）", "pro": true, "min": 1 },

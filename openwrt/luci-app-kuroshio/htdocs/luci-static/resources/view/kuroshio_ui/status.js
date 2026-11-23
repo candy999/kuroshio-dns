@@ -215,6 +215,37 @@ return view.extend({
 			] : (np.enabled === false ? _('路徑檢查已關閉') : _('還沒檢查（啟動後幾秒內完成）')))
 		]), { 'id': 'kuroshio-path' }) : '';
 
+		// 資料新鮮度與發現（3.5.0 E1、E2）：舊版核心沒有這兩個欄位時不顯示；跟上面的提醒（warnings）分開
+		var fresh = Array.isArray(api.freshness) ? common.freshnessView(api.freshness) : null;
+		var freshSec = fresh && fresh.length ? common.section(_('資料新鮮度'), [
+			table([_('項目'), _('上次成功'), _('狀態'), _('下次')], fresh.map(function(r) {
+				return [r.label + (r.note ? '（' + r.note + '）' : ''), r.last, common.badge(r.state, r.kind), r.next];
+			}))
+		], { 'id': 'kuroshio-freshness' }) : '';
+		var finds = Array.isArray(api.findings) ? common.findingsView(api.findings) : null;
+		var findSec = finds ? common.section(_('發現'), finds.length ? finds.map(function(f) {
+			return E('p', { 'style': 'margin:.2em 0' + (f.dim ? ';opacity:.55' : '') }, [
+				common.badge(f.sev === 'warn' ? _('注意') : _('資訊'), f.sev === 'warn' ? 'warn' : 'off'), ' ', f.text, ' ',
+				E('span', { 'class': 'cbi-value-description', 'style': 'display:inline' }, f.meta)
+			]);
+		}) : [E('p', { 'class': 'cbi-section-descr' }, _('目前沒有觀察到特別的現象'))], { 'id': 'kuroshio-findings' }) : '';
+
+		// 這條線到得了哪些台灣機房（3.5.0 E3～E7）：一句話＋摺疊的機房表；CDN 關、舊版核心時不顯示
+		var rv = api.cdn ? common.reachView(api.cdn) : null;
+		var reachSec = rv ? common.section(_('線路'), [].concat(
+			rv.lines.map(function(l) { return E('p', { 'style': 'margin:.2em 0' }, l); }),
+			[rv.note, rv.unconfirmed, rv.audit].filter(function(x) { return !!x; }).map(function(l) { return E('p', { 'class': 'cbi-section-descr' }, l); }),
+			rv.fuse ? [E('div', { 'class': 'alert-message warning' }, rv.fuse)] : [],
+			rv.pops.length ? [E('details', {}, [E('summary', {}, _('機房明細')), table([_('家族'), _('機房'), _('節點'), _('網段'), _('CDN'), _('延遲')], rv.pops.map(function(p) {
+				return [p.family, p.pop + (p.city ? ' ' + p.city : ''), p.nodes, p.prefixes, p.providers, p.ms];
+			}), [2, 3, 4, 5])])] : [],
+			rv.health.text || rv.health.rows.length ? [E('details', {}, [E('summary', {}, _('機房健康')),
+				rv.health.text ? E('p', { 'class': 'cbi-section-descr' }, rv.health.text) : '',
+				rv.health.rows.length ? table([_('CDN'), _('家族'), _('機房'), _('節點'), _('壞的'), _('失敗率'), _('延遲'), ''], rv.health.rows.map(function(h) {
+					return [h.provider, h.family, h.pop, h.nodes, h.bad, h.failRate, h.ms, h.held];
+				}), [3, 4, 5, 6]) : ''])] : []
+		), { 'id': 'kuroshio-reach' }) : '';
+
 		// 串接模式（3.4.0）：下游角色（這台向上游黑潮拿資料）與上游角色（提供資料給下游）兩個區塊都一定顯示。
 		// 主要的句子直接用 API 給的 text / serving.text / serving.note；沒有同意、核准這類按鈕。
 		// 只有「重新檢查」（3.5.0）：立刻重新偵測上游黑潮（跟路徑檢查後的重新偵測一樣），不改任何設定
@@ -305,7 +336,7 @@ return view.extend({
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at, 'sec') + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
-		return E([], [head, tiles, hw, memSec, accSec, lsSec, pathSec, chainSec, upSec, jobSec, infoSec, actions, errSec]);
+		return E([], [head, tiles, findSec, freshSec, hw, memSec, accSec, lsSec, pathSec, reachSec, chainSec, upSec, jobSec, infoSec, actions, errSec]);
 	},
 
 	render: function(data) {

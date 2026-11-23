@@ -12,6 +12,13 @@
  *   benchScope(b, tr)               /api/benchmark 的 tiers、probe（評測範圍、惡意網站探測）→ 一行摘要
  *   controlSummary(list, tr)        /api/benchmark 的 protected[]（對照組）→ 一行摘要
  *   regionLabel(u, tr)              上游的地區（region、regionSource、near）→「台灣」「鄰近（註冊地 GB）」「註冊地 GB」「鄰近」
+ *   agoText(t, now, tr)             多久以前（剛剛／5 分鐘前／3 小時前／2 天前；未來的是「…後」）
+ *   freshnessView(list, tr, now)    /api/status 的 freshness（3.5.0 E1）→ 資料新鮮度表格的每一列
+ *   findingsView(list, tr, now)     /api/status 的 findings（3.5.0 E2）→ 發現清單的每一筆
+ *   reachView(cdn, tr)              /api/status 的 cdn（reach、popHealth、popSwitch、popAudit；3.5.0 E3～E7）→ 線路區塊
+ *   pathsView(paths, stale, tr)     /api/dashboard 的 paths、stale（3.5.0 E8）→ 兩條路對照
+ *   historySeries(h)                /api/dashboard 的 history（3.5.0 E9）→ 畫圖用的點
+ *   ispGroupText(ig, tr)            /api/community/status 的 ispGroup（3.5.0 E10）→「你的群組：cht」
  *   format(template, args)          %s / %d 代換
  * 每個函式的輸入與預期輸出在 data/shared/ui-core.tests.json（CI 用 tools/ui-core-test.js 檢查）。
  *
@@ -330,6 +337,184 @@
 		return near ? t('鄰近') : '';
 	}
 
+	// ---------------------------------------------------------------- 觀測（3.5.0 E 組）
+	var HOUR_MS = 3600000, MIN_MS = 60000;
+
+	/** 多久以前：不到 1 分鐘「剛剛」、「5 分鐘前」「3 小時前」「2 天前」；未來的時間是「…後」；空的回 '-' */
+	function agoText(t, now, tr) {
+		var tt = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (t === null || t === undefined || t === '' || t === 0) return '-';
+		if (typeof now !== 'number') now = Date.now();
+		var d = now - Number(t);
+		if (isNaN(d)) return '-';
+		var fut = d < 0;
+		d = Math.abs(d);
+		if (d < MIN_MS) return fut ? tt('馬上') : tt('剛剛');
+		if (d < HOUR_MS) return format(tt(fut ? '%d 分鐘後' : '%d 分鐘前'), [Math.round(d / MIN_MS)]);
+		if (d < DAY_MS) return format(tt(fut ? '%d 小時後' : '%d 小時前'), [Math.round(d / HOUR_MS)]);
+		return format(tt(fut ? '%d 天後' : '%d 天前'), [Math.round(d / DAY_MS)]);
+	}
+
+	/**
+	 * /api/status 的 freshness（3.5.0 E1）→ 資料新鮮度表格：
+	 * [{ key, label, last（多久以前）, lastAt（日期時間）, state, kind（ok / warn / err / off）, next }]。
+	 * state：由上游提供／失敗中（連續 N 次）／過期／還沒成功過／正常。舊版核心沒有這個欄位回 []
+	 */
+	function freshnessView(list, tr, now) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!list || !list.length) return [];
+		return list.map(function (x) {
+			var state, kind;
+			var fails = Math.max(1, x.fails || 0);
+			if (x.failing) { state = format(t('失敗中（連續 %d 次）'), [fails]); kind = fails >= 3 ? 'err' : 'warn'; }
+			else if (x.source === 'chain') { state = x.stale ? t('由上游提供（過期）') : t('由上游提供'); kind = x.stale ? 'warn' : 'ok'; }
+			else if (x.stale) { state = t('過期'); kind = 'warn'; }
+			else if (x.pending) { state = t('還沒成功過'); kind = 'off'; }
+			else { state = t('正常'); kind = 'ok'; }
+			if (x.failingItems) state += format(t('（%d 項失敗）'), [x.failingItems]);
+			return {
+				key: x.key, label: x.label ? t(x.label) : x.key,
+				last: x.lastOkAt ? agoText(x.lastOkAt, now, t) : t('還沒成功過'), lastAt: fmtTime(x.lastOkAt),
+				state: state, kind: kind, next: fmtTime(x.nextAt), note: x.note || ''
+			};
+		});
+	}
+
+	/**
+	 * /api/status 的 findings（3.5.0 E2）→ [{ key, sev（warn / info）, text, meta（「3 次，最近 5 分鐘前」）, dim（不 active，淡色）}]。
+	 * 順序照 API（warn 在前、新的在前）；不認得的 key 照 text 顯示。舊版核心沒有這個欄位回 []
+	 */
+	function findingsView(list, tr, now) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!list || !list.length) return [];
+		return list.map(function (x) {
+			return {
+				key: x.key, sev: x.sev === 'warn' ? 'warn' : 'info', text: x.text || x.key,
+				meta: format(t('%d 次，最近 %s'), [x.count || 1, agoText(x.lastAt, now, t)]),
+				dim: x.active === false
+			};
+		});
+	}
+
+	var SWITCH_REASON = {
+		'single-pop': '這條線只到得了一個機房，不做機房切換',
+		'nearest-provider': '最近節點型的 CDN 由自己的機房選擇處理，不做機房切換',
+		'chained': '串接中：節點由上游黑潮處理，不做機房切換',
+		'chain-pop-unreliable': '上游給的機房跟這台量到的常常不一樣，暫時不做機房切換',
+		'memory': '記憶體偏低，暫時不做機房切換',
+		'disabled': '機房切換已關閉（只彙總）',
+		'ok': '到得了兩個以上的機房：某個機房持續變差時，會暫時把它的節點排到後面'
+	};
+	var FAMILY = { v4: 'IPv4', v6: 'IPv6' };
+	/** 秒或毫秒都接受（小於 10^11 當成秒） */
+	var msOf = function (v) { return typeof v === 'number' && v > 0 ? (v < 1e11 ? v * 1000 : v) : null; };
+
+	/**
+	 * /api/status 的 cdn（3.5.0 E3～E7：reach、popHealth、popSwitch、popAudit、slowerFuseUntil）→ 線路區塊。
+	 * 沒有 reach（CDN 關、舊版核心、還沒算）回 null。回傳：
+	 *   { lines: [一句話（IPv4、IPv6）], note（WAN 變動後還沒重新確認）, unconfirmed, pops: [{ family, pop, city, nodes, prefixes, providers, ms }],
+	 *     nearby: [{ provider, pop, prefixes }], health: { text, rows: [{ provider, family, pop, nodes, bad, failRate, ms, held }] }, audit, fuse }
+	 */
+	function reachView(cdn, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		var r = cdn && cdn.reach;
+		if (!r || typeof r !== 'object' || (!r.v4 && !r.v6)) return null;
+		var lines = [], pops = [];
+		['v4', 'v6'].forEach(function (f) {
+			var x = r[f];
+			if (!x) return;
+			if (x.text) lines.push(x.text);
+			(x.pops || []).forEach(function (p) {
+				pops.push({ family: FAMILY[f], pop: p.pop || '-', city: p.city || '', nodes: p.nodes || 0, prefixes: p.prefixes || 0,
+					providers: p.providers || 0, ms: typeof p.medianMs === 'number' ? p.medianMs + ' ms' : '-' });
+			});
+		});
+		var ps = cdn.popSwitch, ph = cdn.popHealth || [];
+		var health = {
+			text: ps ? (SWITCH_REASON[ps.reason] ? t(SWITCH_REASON[ps.reason]) : String(ps.reason || '')) +
+				(ps.switches24h ? format(t('（24 小時內切換 %d 次）'), [ps.switches24h]) : '') : null,
+			rows: ph.map(function (h) {
+				var until = msOf(h.heldUntil);
+				return { provider: h.provider || '-', family: h.family === 6 ? 'IPv6' : 'IPv4', pop: h.pop || '-', nodes: h.nodes || 0, bad: h.bad || 0,
+					failRate: typeof h.failRate === 'number' ? (h.failRate * 100).toFixed(0) + '%' : '-',
+					ms: typeof h.medianMs === 'number' ? h.medianMs + ' ms' : '-',
+					held: h.held ? (until ? format(t('暫時排到後面，到 %s'), [fmtTime(until)]) : t('暫時排到後面')) : '' };
+			})
+		};
+		var a = cdn.popAudit;
+		var audit = a && a.enabled !== false && (a.confirmed || a.mismatch || a.pending)
+			? format(t('上游給的節點：已確認機房 %d、量到不一樣 %d、還沒確認 %d'), [a.confirmed || 0, a.mismatch || 0, a.pending || 0]) : null;
+		var fuseAt = msOf(cdn.slowerFuseUntil);
+		return {
+			lines: lines,
+			note: r.stale ? t('WAN 變動後還沒重新確認（下一輪健檢會更新）') : null,
+			unconfirmed: r.unconfirmed ? format(t('另有 %d 個上游給的節點還沒在這台確認機房'), [r.unconfirmed]) : null,
+			pops: pops,
+			nearby: (r.nearby || []).map(function (n) { return { provider: n.provider || '-', pop: n.pop || '-', prefixes: n.prefixes || 0 }; }),
+			health: health,
+			audit: audit,
+			fuse: fuseAt ? format(t('太多網站都量到台灣節點比原本慢（可能是量測問題）：%s 前照常換台灣節點'), [fmtTime(fuseAt)]) : null
+		};
+	}
+
+	var pctText = function (x) { return typeof x === 'number' ? (x * 100).toFixed(1) + '%' : '-'; };
+	var msText = function (x) { return typeof x === 'number' ? x + ' ms' : '-'; };
+
+	/**
+	 * /api/dashboard 的 paths、stale（3.5.0 E8）→ 兩條路對照：
+	 * { summary, rows: [{ label, orig, tw }], stale: { text, warn（最近 15 分鐘或 1 小時超過 5%）} }。沒有 paths（公開頁、舊版）回 null
+	 */
+	function pathsView(p, stale, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!p || !p.orig || !p.tw) return null;
+		var o = p.orig, w = p.tw;
+		var saved = typeof p.medianSavedMs === 'number' ? p.medianSavedMs : null;
+		var out = {
+			summary: format(t('%d 個網站，兩邊都量到延遲的 %d 個：台灣比較快 %d、比較慢 %d'), [p.sites || 0, p.both || 0, p.twFaster || 0, p.twSlower || 0]) +
+				(saved !== null ? format(t('；中位數%s'), [saved >= 0 ? format(t('省下 %s'), [msText(saved)]) : format(t('多 %s'), [msText(-saved)])]) : ''),
+			rows: [
+				{ label: t('成功'), orig: String(o.ok || 0), tw: String(w.ok || 0) },
+				{ label: t('失敗'), orig: String(o.fail || 0), tw: String(w.fail || 0) },
+				{ label: t('延遲中位數'), orig: msText(o.medianMs), tw: msText(w.medianMs) },
+				{ label: t('原本在國外'), orig: String(o.abroad || 0), tw: '-' },
+				{ label: t('比原本慢、暫時用原本的答案'), orig: '-', tw: String(w.slower || 0) }
+			],
+			stale: null
+		};
+		if (stale && typeof stale.rateToday === 'number') {
+			out.stale = {
+				text: format(t('過期快取的回答：今天 %s、最近 15 分鐘 %s、最近 1 小時 %s'), [pctText(stale.rateToday), pctText(stale.rate15m), pctText(stale.rate1h)]),
+				warn: (stale.rate15m || 0) > 0.05 || (stale.rate1h || 0) > 0.05
+			};
+		}
+		return out;
+	}
+
+	/**
+	 * /api/dashboard 的 history（3.5.0 E9，欄位分開的陣列）→ 畫圖用的點：
+	 * [{ t（毫秒）, q, blocked, servfail, stale, miss, p50, p95, tw（換成台灣的比例，0～100）}]；p50／p95 是 null（沒有問上游）的給 0。
+	 * 沒有歷史回 []
+	 */
+	function historySeries(h) {
+		if (!h || !h.n || !h.q) return [];
+		var step = (h.stepSec || 300) * 1000, from = (h.from || 0) * 1000, out = [];
+		var at = function (k, i) { var a = h[k]; return a && typeof a[i] === 'number' ? a[i] : 0; };
+		for (var i = 0; i < h.n; i++) {
+			var ab = at('abroad', i);
+			out.push({ t: from + i * step, q: at('q', i), blocked: at('blocked', i), servfail: at('servfail', i), stale: at('stale', i), miss: at('miss', i),
+				p50: at('p50', i), p95: at('p95', i), tw: ab ? Math.round(at('tw', i) * 1000 / ab) / 10 : 0 });
+		}
+		return out;
+	}
+
+	/** /api/community/status 的 ispGroup（3.5.0 E10）→「你的群組：cht（同群組的好友 2 位）」；沒開分享回 null */
+	function ispGroupText(ig, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!ig || !ig.share) return null;
+		if (!ig.mine) return t('你的群組：偵測不到（不帶給好友）');
+		return format(t('你的群組：%s'), [ig.mine]) + (ig.sameGroupFriends ? format(t('（同群組的好友 %d 位）'), [ig.sameGroupFriends]) : '');
+	}
+
 	var core = {
 		fmtTime: fmtTime,
 		fmtBytes: fmtBytes,
@@ -340,7 +525,14 @@
 		chainView: chainView,
 		controlSummary: controlSummary,
 		benchScope: benchScope,
-		regionLabel: regionLabel
+		regionLabel: regionLabel,
+		agoText: agoText,
+		freshnessView: freshnessView,
+		findingsView: findingsView,
+		reachView: reachView,
+		pathsView: pathsView,
+		historySeries: historySeries,
+		ispGroupText: ispGroupText
 	};
 
 	if (root) root.KuroshioUiCore = core;
