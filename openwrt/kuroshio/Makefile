@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=kuroshio
-PKG_VERSION:=3.4.4
+PKG_VERSION:=3.5.0
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Kuroshio DNS contributors
 PKG_LICENSE:=GPL-3.0-or-later

@@ -69,8 +69,9 @@ async fn friend_records_budget_and_use_switches() {
         upstream_rec("https://dns2.example.net/dns-query", "doh"),
     ]);
     assert!(b.c.refresh_share(now(), true));
+    // b 換了內容會通知 a，a 可能已經自己拉過（這時手動同步回 unchanged）：兩種都表示新內容已經同步過
     let res = sync(&a, "fb.test").await;
-    assert_eq!(res["status"], "ok", "{res}");
+    assert!(matches!(res["status"].as_str(), Some("ok" | "unchanged")), "{res}");
     let got = a.data.take();
     assert!(got
         .iter()

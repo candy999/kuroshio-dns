@@ -759,6 +759,12 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   | `/api/chain/recheck` | 動作（POST） | 3.4.0（rpcd 3.5.0 才開放） | 狀態頁「重新檢查上游黑潮」 |
   | `/api/cdn/domain` | 唯讀 | 3.0 | 沒有（給查詢用） |
   | `/api/cdn/cross` | 唯讀 | 3.0 | 沒有（給查詢用） |
+  | `/api/cdn/explain` | 唯讀 | 3.5.0 | CDN 頁「為什麼沒換到台灣」 |
+  | `/api/querylog` | 唯讀 | 3.5.0 | 日誌頁「查詢紀錄」 |
+  | `/api/querylog/enable` | 動作（POST） | 3.5.0 | 日誌頁「開啟 10 分鐘」「關閉」 |
+  | `/api/cdn/status`、`/api/protocols`、`/api/backup/last-import` | 唯讀 | 3.0～3.3（rpcd 3.5.0 才開放） | 沒有（給查詢用） |
+
+  刻意不開放：`/api/memory/simulate`（只給測試，`system.testHooks` 開著才能用）、`/api/notify/wan-changed`（系統通知用）、`/api/session`（網頁登入）；`/api/about`、`/api/defaults`、ACME 走 rpcd 自己的方法。
 
   `kuroshio` 套件裡有一個測試確認 rpcd 的唯讀白名單沒有會改變狀態的路徑、動作白名單都是會改變狀態的路徑。
 - **查詢紀錄**（3.5.0）：`GET /api/querylog?limit=200&name=&client=&since=` 讀最近的查詢（新的在前，`limit` 最多 1,000；`name` 是「包含這段文字」，`client` 是來源 IP，`since` 是毫秒時間戳）；`POST /api/querylog/enable?minutes=10` 暫時開啟（1～60 分鐘，到時間自動關閉並釋放；`minutes=0` 關閉）。`log.queryLog: true` 是常開。每一筆是 `{at, name, type, client, result（hit／miss／blocked／stale）, rcode, ms, source}`。
