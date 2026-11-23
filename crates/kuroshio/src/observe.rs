@@ -794,8 +794,9 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
         ),
     ));
 
-    // 3.5.0 F12：新網域很多（或 CPU 很忙），CDN 驗證減量中（狀態類；欄位不齊時不報）
-    let paced = i.cdn_pace["paced"] == true;
+    // 3.5.0 F12：新網域很多（或 CPU 很忙），CDN 驗證減量中（狀態類；欄位不齊時不報）。
+    // `cdn.lite` 的機器永遠在減量（`paced` 一直是 true），那是它的常態、不是狀況，不報
+    let paced = i.cdn_pace["paced"] == true && i.cdn_pace["lite"] != true;
     let per_min = i.cdn_pace["perMin"].as_u64().unwrap_or(0);
     out.push(state(
         "cdn-verify-paced",

@@ -738,7 +738,7 @@ fn cdn_db_pruning_text() {
     assert!(!f["text"].as_str().unwrap().contains("磁碟預算不夠"));
 }
 
-/// 3.5.0 F12：CDN 驗證減量中是 info 的狀態類；不在減量中、欄位不齊（甲批合併前 `pace_json()` 是空物件）不報
+/// 3.5.0 F12：CDN 驗證減量中是 info 的狀態類；不在減量中、欄位不齊、`cdn.lite`（永遠在減量）不報
 #[test]
 fn cdn_verify_paced_finding() {
     let with = |pace: Value| {
@@ -756,6 +756,13 @@ fn cdn_verify_paced_finding() {
     assert_eq!(f["sev"], "info");
     assert_eq!(f["text"], "新網域很多，CDN 驗證減量中（每分鐘 30 個）");
     assert!(with(json!({ "enabled": true, "perMin": 60, "paced": false })).is_none());
+    // 甲批 `pace_json()` 的實際形狀：減量中有 `since`；`cdn.lite` 永遠在減量（常態），不報
+    let real = json!({ "enabled": true, "lite": false, "perMin": 30, "maxPerMin": 60, "minPerMin": 7, "paced": true,
+                       "usedLastMin": 30, "usedThisMin": 12, "cpuPct": 41, "waited": 5, "capped": 1, "since": NOW - 60_000 });
+    assert_eq!(with(real.clone()).unwrap()["text"], "新網域很多，CDN 驗證減量中（每分鐘 30 個）");
+    let mut lite = real;
+    lite["lite"] = json!(true);
+    assert!(with(lite).is_none(), "小機器減量是常態");
     assert!(with(json!({})).is_none(), "還沒有欄位");
     assert!(with(Value::Null).is_none(), "CDN 關著");
 }

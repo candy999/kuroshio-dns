@@ -8,6 +8,8 @@ pub mod app;
 pub mod backup;
 pub mod benchjob;
 pub mod cache;
+#[cfg(test)]
+mod cdntest;
 pub mod certinfo;
 pub mod chain;
 pub mod clock;

@@ -930,7 +930,7 @@ impl Resolver {
             let t = Duration::from_secs(3);
             let outcome = match verify_site(ip, &name, t).await.0 {
                 SiteCheck::Valid => {
-                    // 3.5.0 E4：握手通過、這個 IP 是上游宣稱機房還沒確認的節點 → 用同一個名額量一次機房
+                    // 3.5.0 E4、F7：握手通過 → 用同一個名額量一次待確認節點的機房（答案的 IP，或 CDN 那一層挑的前幾名）
                     me.pop_audit(ip).await;
                     Outcome::Valid
                 }
@@ -967,28 +967,10 @@ impl Resolver {
         });
     }
 
-    /// 串接中的機房抽查（3.5.0 E4，規格 11）：只在答案抽查握手通過之後、拿著同一個抽查名額時呼叫。
-    /// 節點池裡上游宣稱機房（`upPop`）還沒確認的節點才量（`Cdn::pop_audit_wanted()`；上限在 CDN 那一層：
-    /// 10 分鐘 1 個、24 小時 24 個、每個節點一次，`cdn.lite` 30 分鐘 1 個、8 個；`cdn.popAudit` 關、記憶體壓力時回 None），
-    /// 用健檢同一個探測（那家 CDN 的 `probe` 路徑）拿到機房、交給 `Cdn::note_local_pop()` 比對。
-    /// 不動答案抽查的可疑計數、不解除串接（機房不同是線路拓樸，不是不可信）
-    ///
-    /// 3.5.0 F7：拿到名額、但答案的 IP 不是待確認的節點時，`pop_audit_wanted()` 改回（CDN, 待確認的前幾名節點），
-    /// 量回傳的那個節點（[`AuditTarget`]：舊的回傳只有 CDN 名稱時照舊量答案的 IP）
+    /// 串接中的機房抽查（3.5.0 E4，規格 11）：只在答案抽查握手通過之後、拿著同一個抽查名額時呼叫（[`pop_audit_probe`]）
     async fn pop_audit(&self, ip: IpAddr) {
-        let Some(cdn) = self.cdn() else { return };
-        let Some(t) = cdn.pop_audit_wanted(ip) else { return };
-        let (provider, ip) = t.target(ip);
-        let Some((prov, (host, path))) = kuroshio_cdn::providers::get(provider).and_then(|p| Some((p, p.probe?))) else {
-            return;
-        };
-        let r = cdn.net().http_probe(ip, host, path, Duration::from_secs(3)).await;
-        if !r.ok {
-            return;
-        }
-        let pop = prov.pop(&r.headers, &r.body);
-        if !pop.is_empty() {
-            cdn.note_local_pop(provider, ip, &pop);
+        if let Some(cdn) = self.cdn() {
+            pop_audit_probe(&cdn, ip).await;
         }
     }
 
@@ -1510,22 +1492,26 @@ fn answered_ok(up: &Up, class: Class) -> bool {
     }
 }
 
-/// `Cdn::pop_audit_wanted()` 的回傳（3.5.0 F7）：只有 CDN 名稱（E4：量答案的那個 IP），
-/// 或（CDN, 要量的節點 IP）（F7：答案的 IP 不是待確認的節點時，改量待確認的前幾名節點）。兩種都接，CDN 那一層改了這邊不用跟著改
-pub trait AuditTarget {
-    /// （CDN 名稱, 要量的 IP）；`answer_ip` 是答案抽查通過的那個 IP
-    fn target(self, answer_ip: IpAddr) -> (&'static str, IpAddr);
-}
-
-impl AuditTarget for &'static str {
-    fn target(self, answer_ip: IpAddr) -> (&'static str, IpAddr) {
-        (self, answer_ip)
+/// 串接中的機房抽查（3.5.0 E4，規格 11）：`answer_ip` 是答案抽查握手通過的那個 IP。
+/// `Cdn::pop_audit_pick()` 決定量哪個節點、扣名額（上限在 CDN 那一層：10 分鐘 1 個、24 小時 24 個、每個節點一次，
+/// `cdn.lite` 30 分鐘 1 個、8 個；`cdn.popAudit` 關、記憶體壓力時回 None）：
+/// 答案的 IP 是上游宣稱機房（`upPop`）還沒確認的節點就量它；不是的話（3.5.0 F7）改量一個待確認的前幾名節點。
+/// 用健檢同一個探測（那家 CDN 的 `probe` 路徑）量**回傳的那個 IP**，拿到的機房交給 `Cdn::note_local_pop()` 比對。
+/// 不動答案抽查的可疑計數、不解除串接（機房不同是線路拓樸，不是不可信）
+pub(crate) async fn pop_audit_probe(cdn: &kuroshio_cdn::Cdn, answer_ip: IpAddr) {
+    let Some((provider, target)) = cdn.pop_audit_pick(answer_ip) else {
+        return;
+    };
+    let Some((prov, (host, path))) = kuroshio_cdn::providers::get(provider).and_then(|p| Some((p, p.probe?))) else {
+        return;
+    };
+    let r = cdn.net().http_probe(target, host, path, Duration::from_secs(3)).await;
+    if !r.ok {
+        return;
     }
-}
-
-impl AuditTarget for (&'static str, IpAddr) {
-    fn target(self, _answer_ip: IpAddr) -> (&'static str, IpAddr) {
-        self
+    let pop = prov.pop(&r.headers, &r.body);
+    if !pop.is_empty() {
+        cdn.note_local_pop(provider, target, &pop);
     }
 }
 
@@ -1687,13 +1673,34 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
 mod tests {
     use super::*;
 
-    /// 3.5.0 F7：機房抽查量的 IP：CDN 那一層只回名稱時量答案的 IP；回（CDN, 節點 IP）時量那個節點
-    #[test]
-    fn pop_audit_target_uses_returned_node() {
-        let answer: IpAddr = "192.0.2.10".parse().unwrap();
-        let node: IpAddr = "198.51.100.20".parse().unwrap();
-        assert_eq!("cloudflare".target(answer), ("cloudflare", answer));
-        assert_eq!(("cloudflare", node).target(answer), ("cloudflare", node));
+    /// 3.5.0 F7：串接中的機房抽查量 CDN 那一層挑的節點（`pop_audit_pick()`），不是答案的 IP；
+    /// 量到的機房交給 `note_local_pop()`（待確認的前幾名少一個）。名額照舊（10 分鐘 1 個），`cdn.popAudit` 關就不量
+    #[tokio::test]
+    async fn pop_audit_probes_the_node_cdn_picked() {
+        use crate::cdntest::{cdn, cf_page, ip, node};
+        let (c, net) = cdn("popaudit", json!({}));
+        c.with_state(|st| {
+            *st.pools.p.get_mut("cloudflare").unwrap().pool_mut(4) =
+                vec![node("192.0.2.1", "KHH", 1.0, true), node("192.0.2.2", "KHH", 2.0, true)]
+        });
+        net.http.lock().unwrap().insert(ip("192.0.2.1"), cf_page("KHH", 5.0));
+        assert_eq!(c.observe_json()["popAudit"]["pendingServed"], 2);
+        // 答案的 IP 不是待確認的節點（W17：答案抽查一直抽不中）：改量待確認的第 1 名
+        pop_audit_probe(&c, ip("198.51.100.99")).await;
+        let calls = net.calls("http ");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].starts_with("http 192.0.2.1 "), "{calls:?}");
+        assert_eq!(c.observe_counters().pop_probes, 1);
+        assert_eq!(c.observe_counters().pop_confirmed, 1, "機房一樣：確認");
+        assert_eq!(c.observe_json()["popAudit"]["pendingServed"], 1);
+        // 名額 10 分鐘 1 個：馬上再來一次不量
+        pop_audit_probe(&c, ip("198.51.100.99")).await;
+        assert_eq!(net.calls("http ").len(), 1);
+        // cdn.popAudit 關：不量
+        let (c, net) = cdn("popaudit-off", json!({ "popAudit": false }));
+        c.with_state(|st| *st.pools.p.get_mut("cloudflare").unwrap().pool_mut(4) = vec![node("192.0.2.1", "KHH", 1.0, true)]);
+        pop_audit_probe(&c, ip("192.0.2.1")).await;
+        assert!(net.calls("http ").is_empty());
     }
 
     /// 3.4.3：下游黑潮自己關掉 CDN 置換時，問上游黑潮的查詢帶著私有選項；上游看到就照原樣回答

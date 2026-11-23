@@ -703,17 +703,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             // 規格 11 C12、E9、F2）
             let lite = flag(q, "lite");
             // 線路感知（3.5.0 E3～E7）：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil` 由 `status_lite()` 帶出
-            let cdn = r
-                .cdn()
-                .map(|c| {
-                    let mut v = c.status_lite();
-                    // 3.5.0 F12：CDN 驗證節流的狀態（`status_lite()` 已經帶就不重複放）
-                    if let Some(o) = v.as_object_mut() {
-                        o.entry("pace").or_insert_with(|| c.pace_json());
-                    }
-                    v
-                })
-                .unwrap_or_else(|| json!({ "enabled": false }));
+            // 3.5.0 F8、F12：`dbDiskKB`／`dbFileKB`／`cdnDirKB`、驗證節流 `pace`、背景工作 `bg` 也在 `status_lite()` 裡
+            let cdn = r.cdn().map(|c| c.status_lite()).unwrap_or_else(|| json!({ "enabled": false }));
             let mut out = json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
@@ -1085,13 +1076,10 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
         "/api/cdn/verify" => {
             let Some(n) = name else { return bad("需要 name", 400) };
             let fam = if q.get("family").map(String::as_str) == Some("6") { 6 } else { 4 };
-            match c.verify_now(&n, fam).await {
-                // 3.5.0 F9：這一次驗證的握手分數（`score`、`origScore`、`weighted`、`slower`、`state`、`confirmAfter`）
-                // 只放在回應裡、不存檔；CDN 那一層把它放在回傳值的 `speed`，這裡搬到最上層（沒有是 null）
-                Some((err, v)) => {
-                    let speed = v.get("speed").cloned().unwrap_or(Value::Null);
-                    ok(json!({ "result": v, "error": err, "entry": c.domain(&n), "speed": speed }))
-                }
+            match c.verify_now_speed(&n, fam).await {
+                // 3.5.0 F9：這一次驗證的握手判斷（`score`、`origScore`、`weighted`、`slower`、`state`、`confirmAfter`）
+                // 只放在回應裡、不存檔；沒有判（IPv6、最近節點型、手動「一定換」、量不到握手…）是 null
+                Some((err, v, speed)) => ok(json!({ "result": v, "error": err, "entry": c.domain(&n), "speed": speed })),
                 None => bad("資料庫裡沒有這個網域（先查詢一次）", 404),
             }
         }
@@ -1204,6 +1192,47 @@ fn rdata_text(d: &kuroshio_proto::RData) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.5.0 F9：`POST /api/cdn/verify` 的回應最上層帶這一次的握手判斷（`speed`）；CDN 那一層的規則在
+    /// `kuroshio-cdn` 的 `manual_verify_reports_speed_and_follows_same_rules`，這裡只看主程式有沒有接上
+    #[tokio::test]
+    async fn cdn_verify_reports_speed() {
+        use crate::cdntest::{cdn, cf_page, ip, node};
+        const SITE: &str = "slow.example.com";
+        const ORIG: &str = "198.51.100.200";
+        let (c, net) = cdn("admin-verify", json!({}));
+        c.with_state(|st| {
+            *st.pools.p.get_mut("cloudflare").unwrap().pool_mut(4) =
+                vec![node("192.0.2.1", "TPE", 3.0, false), node("198.51.100.1", "TPE", 4.0, false)];
+            st.db.touch(SITE, "cloudflare", "ip", &[ip(ORIG)], &[], None);
+        });
+        {
+            let mut h = net.https.lock().unwrap();
+            h.insert(ip(ORIG), cf_page("NRT", 100.0));
+            h.insert(ip("192.0.2.1"), cf_page("TPE", 250.0));
+            h.insert(ip("198.51.100.1"), cf_page("TPE", 250.0));
+        }
+        let q: HashMap<String, String> = [("name".to_string(), SITE.to_string())].into_iter().collect();
+        let r = cdn_route(&c, "/api/cdn/verify", &q).await;
+        assert_eq!(r.code, 200, "{}", r.body);
+        assert_eq!(r.body["error"], "ok", "{}", r.body);
+        let s = &r.body["speed"];
+        assert_eq!(s["state"], "slow1", "{}", r.body);
+        assert_eq!((s["score"].as_f64(), s["origScore"].as_f64()), (Some(250.0), Some(100.0)));
+        assert_eq!(s["slower"], true);
+        assert!(s["confirmAfter"].as_u64().unwrap() > 0);
+        assert!(r.body["result"].get("speed").is_none(), "只放在最上層");
+        assert!(r.body["entry"].is_object());
+        // IPv6：不判，speed 是 null
+        let q6: HashMap<String, String> = [("name".to_string(), SITE.to_string()), ("family".to_string(), "6".to_string())]
+            .into_iter()
+            .collect();
+        let r = cdn_route(&c, "/api/cdn/verify", &q6).await;
+        assert!(r.body["speed"].is_null(), "{}", r.body);
+        // 資料庫裡沒有的網域
+        let qx: HashMap<String, String> = [("name".to_string(), "none.example.com".to_string())].into_iter().collect();
+        assert_eq!(cdn_route(&c, "/api/cdn/verify", &qx).await.code, 404);
+    }
 
     /// LuCI 的 API 白名單（openwrt/kuroshio/files/rpcd.sh）：唯讀那一段（`api`）的路徑都不能是會改變狀態的，
     /// 動作那一段（`action`，用 POST）都要是會改變狀態的（3.5.0，規格 11 C13）

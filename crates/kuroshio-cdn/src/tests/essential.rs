@@ -96,3 +96,47 @@ fn explain_reports_essential() {
     assert!(v["text"].as_str().unwrap().contains("不改寫、不擋"), "{v}");
     assert!(c.take_tasks().is_empty());
 }
+
+/// 主程式（`kuroshio_net::comm`）的內建表真的接到 CDN：用 comm 自己的測試表（`*.essential.example.com`，
+/// 不經過這個檔的 `test_essential`）走 `comm::no_rewrite()` 那一條路。四類不改寫、系統更新照常改寫、
+/// `filter.protectComm`（`comm::set_enabled`）關掉下一次查詢就照常改寫；explain 的類別代碼來自 `comm::kind_of()`
+#[test]
+fn comm_table_no_rewrite_reaches_cdn() {
+    use kuroshio_net::comm;
+    let _g = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    comm::set_enabled(true);
+    comm::set_test_entries(comm::TEST_ENTRIES);
+    let (c, _) = setup(json!({}));
+    for (name, code) in [
+        ("a.ntp.essential.example.com", "ntp"),
+        ("a.netcheck.essential.example.com", "netcheck"),
+        ("a.ocsp.essential.example.com", "revocation"),
+        ("a.quake.essential.example.com", "quake"),
+    ] {
+        assert!(comm::no_rewrite(name), "{name}");
+        let (r, m) = query(&c, name);
+        assert_eq!(answer_ips(&m, 1), ["104.21.0.5"], "{name}：原本的答案");
+        assert_eq!(r.tags, ["內建服務:不改寫"], "{name}");
+        assert!(c.state().db.get(name).is_none(), "{name}：不記進網域資料庫");
+        let v = c.explain(name, Context::default());
+        assert_eq!(
+            (v["decision"].as_str(), v["essential"].as_str()),
+            (Some("essential"), Some(code)),
+            "{v}"
+        );
+    }
+    assert!(c.take_tasks().is_empty(), "不排任何背景工作");
+    assert_eq!(c.stats().essential_kept, 4);
+    // 系統與安全更新：照常改寫（排驗證）
+    let (r, _) = query(&c, "a.update.essential.example.com");
+    assert!(r.tags.iter().all(|t| t != "內建服務:不改寫"));
+    assert!(c.take_tasks().iter().any(|t| matches!(t, Task::Verify { .. })));
+    // filter.protectComm 關掉：下一次查詢就照常處理
+    comm::set_enabled(false);
+    let (r, _) = query(&c, "b.ntp.essential.example.com");
+    comm::set_enabled(true);
+    assert!(r.tags.iter().all(|t| t != "內建服務:不改寫"));
+    assert!(c.take_tasks().iter().any(|t| matches!(t, Task::Verify { .. })));
+    let (r, _) = query(&c, "c.ntp.essential.example.com");
+    assert_eq!(r.tags, ["內建服務:不改寫"], "打開馬上回來");
+}
