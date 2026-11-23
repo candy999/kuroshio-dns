@@ -2080,8 +2080,18 @@ async fn memory_plan_cmd(config: &std::path::Path, uci: bool, ram: Vec<u64>, bit
     Ok(())
 }
 
+/// 不啟動服務的指令（notify、status、chain、health、check-path、memory-plan）沒帶 `--uci`、預設的 JSON 設定檔不存在，但環境變數指了 UCI 設定（第三方韌體的做法）：
+/// 照 UCI 讀，不提示「設定檔不存在」（3.5.0 D3 回報：padavan 上每次 `kuroshio notify` 都印這行）。
+/// 明確用 `-c` 指了別的檔案、或預設的檔案存在時照舊
+fn implied_uci(config: &std::path::Path, uci: bool) -> bool {
+    uci || (std::env::var_os("KUROSHIO_UCI_FILE").is_some() || std::env::var_os("KUROSHIO_UCI_JSON").is_some())
+        && config == default_config_path()
+        && !config.exists()
+}
+
 /// 設定讀不到時：結束碼 2
 fn config_for_cli(config: &std::path::Path, uci: bool) -> std::result::Result<serde_json::Value, String> {
+    let uci = implied_uci(config, uci);
     user_config(config, uci).map(|u| kuroshio_config::build(&u)).map_err(|e| {
         let mut m = format!("{e:#}");
         // 第三方韌體直接執行 `--uci`：預設找 /etc/config/kuroshio（OpenWrt 的位置）

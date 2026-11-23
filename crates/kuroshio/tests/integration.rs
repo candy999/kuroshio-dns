@@ -426,6 +426,21 @@ fn uci_reload_failure_keeps_running_and_config_hook_fires() {
     until("管理 API", &|| status()["running"] == true);
     let st0 = status();
     assert_eq!(st0["warnings"], json!([]), "{st0}\n{}", log.lock().unwrap());
+    // 沒帶 --uci、預設的 config.json 不存在、環境變數指了 UCI：照 UCI 讀，不提示「設定檔不存在」（3.5.0 D3：padavan 的 notify）
+    if !Path::new("/etc/kuroshio/config.json").exists() {
+        let o = Command::new(env!("CARGO_BIN_EXE_kuroshio"))
+            .args(["status", "--json"])
+            .env("KUROSHIO_UCI_FILE", &uci)
+            .env("KUROSHIO_ETC", &etc)
+            .env("KUROSHIO_SHARE", root().join("data"))
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert_eq!(o.status.code(), Some(0), "{out}\n{err}");
+        assert_eq!(one_line_json(&out)["running"], true, "{out}");
+        assert!(!err.contains("不存在"), "{err}");
+    }
 
     // 恢復預設自訂規則：custom-rules.txt 在 KUROSHIO_ETC（不在快照目錄的上一層）
     std::fs::write(etc.join("custom-rules.txt"), "||mine.example^\n").unwrap();

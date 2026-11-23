@@ -445,6 +445,13 @@ impl Cdn {
             disk_kb: AtomicU32::new(u32::MAX),
         };
         me.reset_octet_verdicts();
+        // 啟動時先量一次實際的磁碟用量（3.5.0 D3 回報：重新啟動後到第一輪預算之前 dbDiskKB 是 null，
+        // 預算換算的筆數也沒辦法用實測校正）。只有設了預算（小 Flash）才量：讀分片目錄裡每個檔的大小
+        if me.cfg.db_disk_budget.is_some() {
+            let disk = me.shard_dir_bytes();
+            me.disk_kb
+                .store(disk.div_ceil(1024).min(u32::MAX as u64 - 1) as u32, Ordering::Relaxed);
+        }
         Arc::new(me)
     }
 
@@ -880,10 +887,21 @@ impl Cdn {
             .unwrap_or(0)
     }
 
-    /// 磁碟預算換算的筆數上限（沒有預算時 None）
+    /// 磁碟預算換算的筆數上限（沒有預算時 None）。
+    ///
+    /// 先用估計模型（每筆 125 bytes、每片 1.1 KB）；量到實際的磁碟用量之後依實測校正（[`calibrated_limit`]），
+    /// **只往上調**、最多到模型的 1.5 倍。3.5.0 D3 實測：模型比實際多估約 40%，照模型會多淘汰約三成其實放得下的網域。
+    /// 磁碟上的檔案落後記憶體時會估得偏高，但檔案寫出後實際超過預算就會照「磁碟上也超過」開始淘汰，下一次量到就降回來
     pub fn budget_limit(&self) -> Option<usize> {
-        let shards = self.state().db.shards;
-        db::budget_entries(self.cfg.db_disk_budget, shards).map(|n| n.min(self.cfg.max_entries.max(100)))
+        let budget = self.cfg.db_disk_budget?;
+        let (shards, total) = {
+            let st = self.state();
+            (st.db.shards, st.db.total_entries())
+        };
+        let model = db::budget_entries(Some(budget), shards)?;
+        let disk_kb = self.disk_kb.load(Ordering::Relaxed);
+        let disk = if disk_kb == u32::MAX { 0 } else { u64::from(disk_kb) * 1024 };
+        Some(calibrated_limit(model, shards, total, disk, budget).min(self.cfg.max_entries.max(100)))
     }
 
     /// 磁碟預算的一輪（背景：每次定時登記快照之前呼叫一次，關機時不呼叫；不在查詢路徑上）。
@@ -1599,6 +1617,25 @@ impl Cdn {
         }
         Ok(out)
     }
+}
+
+/// 磁碟預算換算的筆數：用實測的「每筆實際佔多少磁碟」校正估計模型（[`Cdn::budget_limit`]）。
+///
+/// 每片固定的部分（模型的 1.1 KB）先扣掉，剩下的照實測換算。實測要夠多（2,000 筆以上、磁碟上 512 KB 以上）才採用；只往上調（不會因為校正而多刪）、最多到模型的 1.5 倍
+/// （量錯或檔案落後記憶體時不會整個放開）。沒有實測（`disk_bytes` 是 0）就照模型
+pub(crate) fn calibrated_limit(model: usize, shards: usize, total: usize, disk_bytes: u64, budget_bytes: u64) -> usize {
+    if total < db::BUDGET_MIN_ENTRIES || disk_bytes < db::BUDGET_MIN_BYTES {
+        return model;
+    }
+    // 每片固定的部分照模型扣掉，剩下的照實測的每筆大小換算（只用比例換算的話，筆數少、固定部分佔比大時會估得太多）
+    let overhead = shards as u64 * db::BUDGET_SHARD_OVERHEAD;
+    let entry_bytes = disk_bytes.saturating_sub(overhead);
+    if entry_bytes == 0 {
+        return model;
+    }
+    let room = budget_bytes.saturating_sub(overhead) as u128;
+    let measured = (room * total as u128 / entry_bytes as u128).min(usize::MAX as u128) as usize;
+    measured.clamp(model, model.saturating_mul(3) / 2)
 }
 
 pub(crate) fn normalize(name: &str) -> String {

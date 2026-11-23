@@ -220,7 +220,7 @@ kuroshio notify simulate-memory --avail-mb MB [--minutes 分鐘] | --off [-c 設
 | `KUROSHIO_SHARE` | 唯讀資料目錄（data/：種子、評測名單、CDN 範圍、設定頁、公開頁）。優先於 `system.dataDir`。沒設定時依序找：`system.dataDir` → 執行檔旁的 `data/` → `/usr/share/kuroshio` → `./data` |
 | `KUROSHIO_INIT_CONFIG` | 只有 `kuroshio run`（不是 `--uci`）會看：`-c` 指的設定檔**不存在**、而且這個變數指向的檔案存在時，先建立設定檔的上層目錄、把它複製過去再啟動（標準錯誤輸出記一行）。設定檔已經存在就完全不動。讓容器映像附預設設定，同時保留 `/config/config.json` 給使用者改 |
 | `KUROSHIO_UCI_JSON` | `--uci`：先讀這個檔（`ubus call uci get '{"config":"kuroshio"}'` 的輸出）；讀不到才讀 UCI 設定檔 |
-| `KUROSHIO_UCI_FILE` | `--uci`：UCI 設定檔的位置，預設 `/etc/config/kuroshio` |
+| `KUROSHIO_UCI_FILE` | `--uci`：UCI 設定檔的位置，預設 `/etc/config/kuroshio`。`notify`、`status`、`chain`、`health`、`check-path`、`memory-plan` 沒帶 `--uci`、預設的 `config.json` 又不存在時，有這個（或 `KUROSHIO_UCI_JSON`）就照 UCI 讀（3.5.0 起） |
 | `KUROSHIO_ETC` | `--uci`：UCI 轉換時預設檔案放的目錄（憑證 `cert.pem` / `key.pem`、`custom-rules.txt`、社群金鑰 `community/`、評測名單 `benchmark/`），預設 `/etc/kuroshio` |
 | `KUROSHIO_LAN_IP4`、`KUROSHIO_LAN_ULA` | `--uci`：區網 IPv4 與 ULA（積極劫持、取代 dnsmasq 模式下綁定用；OpenWrt 的 init 腳本會給） |
 | `KUROSHIO_LOG` | 日誌等級，優先於設定的 `log.level`；寫法同 `tracing` 的 EnvFilter（例如 `info`、`debug`、`warn,kuroshio=debug`） |

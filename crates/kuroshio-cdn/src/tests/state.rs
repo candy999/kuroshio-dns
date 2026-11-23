@@ -600,8 +600,10 @@ fn budget_round_sweeps_in_rounds_and_survives_restart() {
     let before_disk = shard_dir_size(&dir);
     assert!(before_disk > 512 * 1024, "{before_disk}");
     let c = Cdn::load(&budget_cfg(512), paths.clone(), MockNet::new());
+    // 載入時就量了磁碟，筆數上限依實測校正：不低於模型、不超過模型的 1.5 倍
+    let model = crate::db::BUDGET_MIN_ENTRIES;
     let limit = c.budget_limit().unwrap();
-    assert_eq!(limit, crate::db::BUDGET_MIN_ENTRIES);
+    assert!((model..=model * 3 / 2).contains(&limit), "{limit}");
     assert!(!c.state().db.changed(), "載入時不淘汰");
     let mut rewritten = vec![0u32; shards];
     let mut rounds = 0;
@@ -627,9 +629,13 @@ fn budget_round_sweeps_in_rounds_and_survives_restart() {
     assert!(rewritten.iter().all(|n| *n <= 1), "每個分片最多重寫一次");
     let left = c.state().db.domains.len();
     assert_eq!(left, n0 - dropped);
-    assert!(left <= limit && left >= limit * 8 / 10, "{left} / {limit}");
     let after_disk = shard_dir_size(&dir);
-    assert!(after_disk < before_disk * 3 / 4, "磁碟上變小：{before_disk} → {after_disk}");
+    // 每輪重新量磁碟、重新校正：最後的上限也在模型～1.5 倍之間，留下的在上限以內、不會刪過頭
+    let limit = c.budget_limit().unwrap();
+    assert!((model..=model * 3 / 2).contains(&limit), "{limit}");
+    assert!(left <= limit && left >= limit * 8 / 10, "{left} / {limit}");
+    assert!(after_disk < before_disk * 9 / 10, "磁碟上變小：{before_disk} → {after_disk}");
+    assert!(after_disk <= 512 * 1024 * 21 / 20, "淘汰完在預算附近：{after_disk}");
     let st = c.status_lite();
     assert_eq!(st["dbBudgetKB"], json!(512));
     assert_eq!(st["dbBudgetEntries"], json!(limit));
@@ -667,7 +673,10 @@ fn prune_counts_evicted_cold_entries() {
     }
     assert!(rounds >= 8);
     let total = c.state().db.total_entries();
-    assert!(total <= limit && total >= limit * 8 / 10, "{total}");
+    // 每輪重新量磁碟校正上限：跟最後的上限比，而且不低於模型（筆數下限 2,000）的 80%
+    let last = c.budget_limit().unwrap();
+    assert!(last <= limit && last >= crate::db::BUDGET_MIN_ENTRIES, "{last} / {limit}");
+    assert!(total <= last && total >= last * 8 / 10, "{total} / {last}");
     // 磁碟上的筆數跟算的一樣（沒有被接回去）
     let mut on_disk = 0;
     for i in 0..shards {
@@ -714,4 +723,33 @@ fn budget_keeps_what_is_in_use() {
     assert!(st.db.get(&manual).is_some());
     let kept = in_use.iter().filter(|n| st.db.get(n).is_some()).count();
     assert_eq!(kept, in_use.len(), "今天查過的都在");
+}
+
+#[test]
+fn budget_calibrates_from_disk() {
+    use crate::cdn::calibrated_limit;
+    // 3.5.0 D3 實測：預算 2303 KB、256 片，模型換算約 16,613 筆；實際 23,158 筆在磁碟上只佔 2,218 KB
+    let budget = 2303 * 1024;
+    let model = crate::db::budget_entries(Some(budget), 256).unwrap();
+    assert_eq!(model, 16_613);
+    let n = calibrated_limit(model, 256, 23_158, 2218 * 1024, budget);
+    assert!((23_158..=25_000).contains(&n), "放得下的不淘汰：{n}");
+    // 只往上調：實測每筆比模型大時照模型
+    assert_eq!(calibrated_limit(model, 256, 10_000, 2400 * 1024, budget), model);
+    // 最多到模型的 1.5 倍（升級後第一次：56,222 筆、3,465 KB，壓縮比較好）
+    assert_eq!(calibrated_limit(model, 256, 56_222, 3465 * 1024, budget), model * 3 / 2);
+    // 實測太少、沒有實測：照模型
+    assert_eq!(calibrated_limit(model, 256, 1_500, 2218 * 1024, budget), model);
+    assert_eq!(calibrated_limit(model, 256, 23_158, 0, budget), model);
+    assert_eq!(calibrated_limit(model, 256, 23_158, 200 * 1024, budget), model);
+}
+
+#[test]
+fn budget_disk_measured_at_load() {
+    // 3.5.0 D3：重新啟動後到第一輪預算之前 dbDiskKB 是 null。有預算時載入就量
+    let (paths, _, _) = seeded_shards("budget-load-disk");
+    let disk = shard_dir_size(&paths.state_dir);
+    let c = Cdn::load(&budget_cfg(4096), paths, MockNet::new());
+    let st = c.status_lite();
+    assert_eq!(st["dbDiskKB"], json!(disk.div_ceil(1024)), "{st}");
 }
