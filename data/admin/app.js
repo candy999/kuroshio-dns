@@ -591,10 +591,12 @@
 			ctlBusy = false;
 			ctlAt = at;
 			var t = r.ok && r.data ? core.controlSummary(r.data.protected) : null;
+			// 評測範圍與惡意網站探測（3.5.0）
+			var scope = r.ok && r.data && typeof core.benchScope === 'function' ? core.benchScope(r.data) : null;
 			var p = $('st-control');
 			if (!p) return;
-			p.hidden = !t;
-			p.textContent = t ? t + '（有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選）' : '';
+			p.hidden = !t && !scope;
+			p.textContent = [scope, t ? t + '（有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選）' : null].filter(Boolean).join(' · ');
 		});
 	}
 	function renderStatus(st, acme) {

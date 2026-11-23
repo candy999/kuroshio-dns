@@ -292,6 +292,11 @@ return view.extend({
 		o.value('a', _('只測 A 級（加補位與探索）'));
 		o.value('ab', _('全部都測'));
 		o.default = 'auto';
+		// 惡意網站探測（3.5.0）
+		o = s.option(form.Flag, 'malware_probe', _('惡意網站探測'),
+			_('評測時用少數幾個人工確認過的探測網域（probe.txt）判出「有擋惡意網站的 DNS」，這類不選來用（不記可疑、不進黑名單）。名單是空的時不跑。評測只做 DNS 查詢、不連線；但查這類網域可能被上游或線路上的資安設備記錄，不想要可以關掉。'));
+		o.default = '1';
+		o.rmempty = false;
 		num('near_max_ms', _('鄰近的延遲上限（毫秒）'), 'benchmark.nearMaxMs', _('最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。'));
 		num('min_auto', _('至少選幾台'), 'benchmark.minAuto');
 		num('max_avg_latency_ms', _('平均延遲上限（毫秒）'), 'benchmark.maxAvgLatencyMs');

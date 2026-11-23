@@ -1,5 +1,5 @@
 {
-  "$comment": "data/shared/ui-core.js 的測試向量（tools/ui-core-test.js 檢查）。args = 傳給函式的參數；expect = 預期回傳值（JSON 比較，undefined 的屬性不列）。沒給時區參數的 fmtTime 案例以 TZ=Asia/Taipei 執行。網址一律用 example.com / example.net / example.org。restoreSummary、controlSummary、regionLabel 的參數 \"bracket\" = 翻譯函式 s => \"[\" + s + \"]\"。",
+  "$comment": "data/shared/ui-core.js 的測試向量（tools/ui-core-test.js 檢查）。args = 傳給函式的參數；expect = 預期回傳值（JSON 比較，undefined 的屬性不列）。沒給時區參數的 fmtTime 案例以 TZ=Asia/Taipei 執行。網址一律用 example.com / example.net / example.org。restoreSummary、controlSummary、benchScope、regionLabel 的參數 \"bracket\" = 翻譯函式 s => \"[\" + s + \"]\"。",
   "tz": "Asia/Taipei",
   "fmtTime": [
     {"args":[1794450123000],"expect":"2026-11-12 10:22"},
@@ -124,6 +124,15 @@
     {"name":"舊版沒有這個欄位","args":[null],"expect":null},
     {"name":"判出、沒判出、沒測到、回歸","args":[[{"id":"tls://dns.example.com","result":"detected","regress":false},{"id":"192.0.2.1","result":"detected"},{"id":"https://filter.example.net/dns-query","result":"passed","regress":true},{"id":"quic://dns.example.com","result":"untested","regress":false}]],"expect":"對照組 4 台：判出 2、沒判出 1、沒測到 1；回歸 1"},
     {"name":"翻譯函式","args":[[{"result":"passed"}],"bracket"],"expect":"[對照組 1 台：判出 0、沒判出 1、沒測到 0；回歸 0]"}
+  ],
+  "benchScope": [
+    {"name":"舊版沒有 tiers","args":[{"selected":[]}],"expect":null},
+    {"name":"沒有資料","args":[null],"expect":null},
+    {"name":"全部都測、沒有探測網域","args":[{"tiers":{"mode":"ab","fill":0,"explore":0,"skippedB":0},"probe":{"malware":{"state":"empty","blockedBy":0}}}],"expect":"評測範圍：全部都測"},
+    {"name":"只測 A 級","args":[{"tiers":{"mode":"a","auto":true,"a":467,"incumbent":2,"fill":3,"explore":40,"skippedB":1250,"promoted":5,"trial":8},"probe":{"malware":{"state":"off"}}}],"expect":"評測範圍：只測 A 級（A 級 467、依歷史拉上來的 B 級 13、沿用 2、補位 3、探索 40；其餘 B 級 1250 個今天不測）"},
+    {"name":"惡意網站探測有判斷","args":[{"tiers":{"mode":"ab"},"probe":{"malware":{"state":"ok","blockedBy":2}}}],"expect":"評測範圍：全部都測；惡意網站探測：2 台有擋（不選）"},
+    {"name":"惡意網站探測失效","args":[{"tiers":{"mode":"ab"},"probe":{"malware":{"state":"fuse","blockedBy":0}}}],"expect":"評測範圍：全部都測；惡意網站探測今天失效，沒有拿來判斷"},
+    {"name":"翻譯函式","args":[{"tiers":{"mode":"ab"}},"bracket"],"expect":"[評測範圍：全部都測]"}
   ],
   "regionLabel": [
     {"name":"台灣網段","args":[{"region":"TW","regionSource":"tw-net","near":true}],"expect":"台灣"},

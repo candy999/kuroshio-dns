@@ -599,6 +599,7 @@
               { "value": "a", "label": "只測 A 級（加補位與探索）" },
               { "value": "ab", "label": "全部都測" }
             ] },
+            { "key": "benchmark.malwareProbe", "type": "bool", "label": "惡意網站探測", "help": "評測時用少數幾個人工確認過的探測網域（probe.txt）判出「有擋惡意網站的 DNS」，這類不選來用（不記可疑、不進黑名單）。名單是空的時不跑。評測只做 DNS 查詢、不連線；但查這類網域可能被上游或線路上的資安設備記錄，不想要可以關掉。" },
             { "key": "benchmark.minAuto", "type": "int", "label": "至少選幾台", "min": 0 },
             { "key": "benchmark.maxAvgLatencyMs", "type": "int", "label": "平均延遲上限（毫秒）", "min": 1 },
             { "key": "benchmark.keepDays", "type": "int", "label": "報表保留天數", "min": 0 }

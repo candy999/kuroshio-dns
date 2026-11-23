@@ -659,15 +659,32 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 - **資格賽網域被擋**（NXDOMAIN、封鎖位址、導到封鎖頁這種「有回答但不是預期的位址」）的對照組算「判出過濾」（`stage` = `preflight`），而且照樣測評測網域；連線失敗、逾時照舊是 `untested`。以前這些一律是 `untested`、後面的網域也不測。
 - `upstreams.json`（`/api/benchmark`）的 `protected[]` 每台多：
-  - `stage`：結果在哪個階段決定（`preflight` 資格賽、`domain` 評測網域；A5 之後多 `probe`）。
+  - `stage`：結果在哪個階段決定（`preflight` 資格賽、`domain` 評測網域、`probe` 惡意網站探測——網域沒判出、探測判出有擋時）。
   - `preflight`：資格賽網域被擋的說明（例如 `封殺 one.one.one.one（資格賽：NXDOMAIN）`），沒有是 `null`。網域判斷也判出時 `result`／`reason` 用網域判斷的，這個欄位照樣留著。
   - `recent`：近 7 天的結果（7 個字元以內，最左邊是今天；`d` 判出、`p` 沒判出、`u` 沒測到、`-` 那天沒跑）。
   - `regress`：`true` = 過去 7 天（不含今天）裡有 3 天以上判出、今天沒判出（`u`、`-` 不算）。
-  - `expectMet`：`filter=` 的類型裡至少有一種今天有對應的判斷時，是否在評測網域判出（`true`／`false`；資格賽網域被擋不算）；都沒有對應判斷（例如只擋惡意網站——惡意網站的探測是之後的 A5）或沒測到是 `null`。
+  - `expectMet`：`filter=` 的類型裡至少有一種今天有對應的判斷時，那些類型有沒有判出（`true`／`false`）。廣告、追蹤、成人看評測網域（資格賽網域被擋不算）；惡意網站看惡意網站探測（這一台有回答、而且探測今天有效才算有判斷）。都沒有對應判斷（例如只擋惡意網站、而 `probe.txt` 是空的或探測今天失效）或沒測到是 `null`。
 - 回歸只報告，不改變選出來的上游：`judge.log` 與日誌各一行 WARN（「對照組 X 以前判得出過濾，今天沒判出」）。今天判出的比例比過去 7 天的中位數少一半以上（今天測到 8 台以上、過去有測到 8 台以上的天數）時另外一行 WARN（評測網域檔或判斷規則可能改壞了）。
 - 報表的 `protected.csv` 最後多 `stage,preflight,recent,regress,expectMet`（舊的欄位順序不變）。
 - 跨天的紀錄在評測學習檔的 `control`（每台最近 30 天，字串第一個字元是 `controlDay` 那天；最多 64 台，名單裡沒有的刪掉）。
 - 介面：共用儀表板的評測區塊有摺疊的對照組表；LuCI 狀態頁、Windows 設定頁的上游區塊有一行摘要（「對照組 37 台：判出 20、沒判出 5、沒測到 12；回歸 0」，ui-core.js 的 `controlSummary`）。
+
+### 惡意網站探測
+
+`benchmark.malwareProbe`（UCI `option malware_probe`，預設 `true`）；探測網域在評測名單目錄的 `probe.txt`（使用者的與程式附帶的合併）。**附帶的 `probe.txt` 是空的：整段不跑，評測跟 3.4.4 一樣**。
+
+- `probe.txt` 格式：`<網域>  # probe=malware src=<出處> checked=<日期>`；沒寫 `probe=malware` 的行不採用；跟 `web.txt` 或資格賽網域重複的不採用；最多讀 8 個。探測網域要人工確認（挑選標準在檔頭）。
+- 流程：
+  1. 資格賽之後、收集之前做**自我檢查**：參照是對照組裡 `filter=` 含 `malware`、資格賽有回答的（不同經營者，最多 6 台），與通過資格賽的一般候選（A 級優先、不同經營者，最多 6 台）。參照不足（對照組不到 2 家、候選不到 3 家）→ `no-reference`，不問。每台參照用一條連線把探測網域問一輪（最多 12 台 × 8 個 = 96 筆）。
+  2. 一個探測網域有效的條件：至少 2 家不同經營者的對照組回封鎖（NXDOMAIN、沒有 A 記錄、`0.0.0.0` 之類），而且不過濾那一邊至少 3 台有回答、其中 70% 以上解析得到。取有效的前 4 個；都沒有 → `invalid`。
+  3. 有效的探測網域接在 `web.txt` 的網域後面，每個候選在收集階段用同一條連線順便問（不另外連線、照 `benchmark.paceMs` 的間隔）。
+  4. 全部問完之後用全部候選的資料再驗一次同樣的兩個條件。一般候選在 2 個以上有效的探測都回封鎖 → 判為「有擋惡意網站」；有效的不到 2 個時不判斷一般候選（對照組擋 1 個就算）。
+  5. 保險絲：判出的超過有回答的一半 → `fuse`，整段作廢。
+- 判出的一般候選比照對照組：照常測評測網域、今天不選、不當候補、不算覆蓋、不參加多數決、不呼叫可疑紀錄、不進永久黑名單；不在 `eliminated.csv`。`judge.log` 建議把它移到 `protected.txt`。評測歷史裡那一天算沒倖存。固定上游不判。
+- 只認明確的阻擋；回「另一個位址」（業者自己的警告頁）不判。探測網域不做憑證驗證、不查業者、不算延遲。
+- `upstreams.json`（`/api/benchmark`）多 `probe.malware`：`{ "state": "off"｜"empty"｜"no-reference"｜"invalid"｜"fuse"｜"ok", "domains": probe.txt 裡幾個, "used": 這次用幾個, "valid": 問完之後還有效幾個, "blockedBy": 判出幾台, "filtering": [判出的上游，最多 100], "probed": 有回答的一般候選數, "queries": 探測多送的查詢數 }`；`counts` 多 `malwareFilter`。
+- 對照組：`protected[].stage` 可能是 `probe`（`reason` 是 `封殺 惡意網站探測`）。探測有設定但今天判不出來（`no-reference`／`invalid`／`fuse`）時，預期會擋惡意網站、其他都沒判出的對照組在 `recent` 記成 `u`（沒測到），不算回歸。
+- 介面：ui-core.js 的 `benchScope(b)` 把 `tiers` 與 `probe` 寫成一行（LuCI 狀態頁、Windows 設定頁的上游區塊；共用儀表板在評測區塊）。
 
 ### 手動執行的工作優先
 

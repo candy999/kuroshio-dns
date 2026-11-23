@@ -102,6 +102,8 @@ return view.extend({
 		return L.resolveDefault(common.fetch('/api/benchmark'), null).then(function(b) {
 			self._ctlAt = at;
 			self._ctl = b ? common.controlSummary(b.protected) : null;
+			// 評測範圍與惡意網站探測（3.5.0）
+			self._scope = b ? common.benchScope(b) : null;
 			return self._ctl;
 		});
 	},
@@ -260,6 +262,7 @@ return view.extend({
 				? _('自動上游來自上游黑潮 %s 的評測（串接的共用結果；最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)
 				: _('自動上游來自 %s 的評測（最快 = 速度最好；覆蓋 = 補足 CDN 節點涵蓋）').format(api.autoUpstreams.generatedAt)) : _('還沒有每日評測結果，暫時使用固定上游與備援。')),
 			table([_('上游'), _('角色'), _('成功'), _('失敗'), _('平均延遲'), ''], ups, [2, 3, 4]),
+			this._scope ? E('p', { 'class': 'cbi-section-descr', 'id': 'kuroshio-bench-scope' }, this._scope) : '',
 			this._ctl ? E('p', { 'class': 'cbi-section-descr', 'id': 'kuroshio-control' }, this._ctl + _('（有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選）')) : ''
 		]);
 

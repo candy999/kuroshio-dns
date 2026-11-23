@@ -23,7 +23,7 @@ const norm = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 const check = (ok, msg) => { if (ok) pass++; else { fail++; console.log(`  ✘ ${msg}`); } };
 const TR = { bracket: s => '[' + s + ']' };
 // 參數 "bracket" 換成翻譯函式的函式
-const TAKES_TR = ['restoreSummary', 'controlSummary', 'regionLabel'];
+const TAKES_TR = ['restoreSummary', 'controlSummary', 'benchScope', 'regionLabel'];
 
 check(win.KuroshioUiCore && typeof win.KuroshioUiCore.restorePlan === 'function', '以一般 <script> 載入時有全域的 KuroshioUiCore');
 const fns = Object.keys(core);

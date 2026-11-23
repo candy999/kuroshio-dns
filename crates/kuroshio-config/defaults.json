@@ -516,7 +516,8 @@
     "keepLastReport": true,
     "coverageRegion": "near",
     "nearMaxMs": 60,
-    "tiers": "auto"
+    "tiers": "auto",
+    "malwareProbe": true
   },
   "scan": {
     "samplesPerSubnet": 6,
