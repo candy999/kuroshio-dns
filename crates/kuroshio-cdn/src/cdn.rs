@@ -1996,6 +1996,10 @@ pub(crate) fn keep_untouched(name: &str) -> bool {
     kuroshio_net::comm::no_rewrite(name) || test_essential::matches(name)
 }
 
+pub(crate) fn normalize(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// 測試專用的內建表（`*.example.com`）：內建表是真實網域，測試只用 example.com
 #[cfg(test)]
 pub(crate) mod test_essential {
@@ -2029,8 +2033,4 @@ mod test_essential {
     pub fn matches(_: &str) -> bool {
         false
     }
-}
-
-pub(crate) fn normalize(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
 }
