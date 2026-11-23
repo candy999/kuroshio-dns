@@ -515,7 +515,8 @@
     "subprocess": true,
     "keepLastReport": true,
     "coverageRegion": "near",
-    "nearMaxMs": 60
+    "nearMaxMs": 60,
+    "tiers": "auto"
   },
   "scan": {
     "samplesPerSubnet": 6,

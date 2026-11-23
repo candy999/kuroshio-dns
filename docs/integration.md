@@ -603,6 +603,20 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - `upstreams.json`（`/api/benchmark`）的 `selected[]` 每筆多 `tier`（`"A"`／`"B"`／`"user"`；沒標記的算 `"B"`）與 `op`（經營者，最長 64 bytes；沒有是空字串），`counts` 多 `byTier`（候選依分級的台數，固定上游與對照組不算）。
 - `final_dns_smart.csv` 最後多 `Tier` 一欄。
 
+### 分級評測
+
+`benchmark.tiers`（UCI `option tiers`）：`auto`（預設）／`a`／`ab`。
+
+- `ab`：全部候選都測（3.4.4 以前的行為）。`auto`：實體記憶體小於 256 MB 用 `a`，其他（含讀不到記憶體大小）用 `ab`。
+- `a`：A 級、使用者自己加的（`user`）、固定上游、對照組照測；B 級（含沒標記的、好友給的）只測：
+  - 沿用：上一次評測 `selected[]`／`spares[]` 裡的（最多 16 個）；
+  - 補位：路徑檢查與黑名單略過之後，今天要測的候選裡（只算 `upstream.autoTypes` 的類型）經營者不到 12 家、或某一種類型不到 8 個（那一種類型今天能測的本來就不到 8 個時，有幾個算幾個）→ 從 B 級補，最多 32 個、同一個經營者最多 2 個；順序是評測歷史分數高的先，沒有歷史的依名單的 `ms` 小的先；
+  - 探索：B 級依 id 的雜湊排成固定順序、每 40 個一組，每天測「日數 mod 組數」那一組（同一天重跑是同一批）。
+  - 其餘 B 級今天不測：不送任何查詢、不算淘汰、不記任何紀錄。
+- 經營者：名單的 `op=`；沒有時用主機的可註冊網域（IP 用 /16）。
+- `upstreams.json`（`/api/benchmark`）多 `tiers`：`{ "mode": "a"｜"ab", "auto": 設定是不是 auto, "a": 今天測的 A 級, "incumbent": 沿用, "fill": 補位, "explore": 探索, "skippedB": 今天不測的 B 級 }`；`counts.total`、`counts.byTier` 只算今天實際測的。
+- 選上游仍然只看今天的評測結果；串接中的下游自己評測的那一次（超過 7 天沒跑）照自己的 `tiers`。
+
 ### 首次啟動的初始上游
 
 全新的 state 第一次啟動時，`state/upstreams.json` 由預設名單的 A 級產生（不再用種子裡的評測結果）：

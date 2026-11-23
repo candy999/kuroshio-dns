@@ -58,8 +58,16 @@ pub fn make_benchmark(cfg: &Value, state_dir: &Path, base_dir: &Path) -> Benchma
     let reserve = crate::memgov::reserve_from_cfg(cfg);
     let mut b = Benchmark::new(paths).with_headroom(Arc::new(move || crate::memgov::headroom(&crate::memgov::Reading::now(), &reserve)));
     b.keep_last = keep_last;
+    // 分級評測（3.5.0 A3）：`benchmark.tiers = auto` 時依實體記憶體換算（小於 256 MB 只測 A 級，是減量不是關掉）；
+    // 設定寫明 `a`／`ab` 時評測自己會照設定，這個值用不到
+    let b = b.with_tier_auto(tiers_auto(crate::sysinfo::mem_bytes().0.map(|t| t >> 20)));
     // 上游多樣性（3.4.0）：台灣網段判斷「鄰近」；用唯讀資料目錄的公版（評測只需要大致的範圍）
     b.with_tw(kuroshio_jobs::benchmark::read_tw_ip(&share_dir(cfg).join("geo").join("tw-ip.json")))
+}
+
+/// `benchmark.tiers = auto` 用哪一種（實體記憶體 MB；讀不到就照舊全部測）
+pub fn tiers_auto(mem_total_mb: Option<u64>) -> kuroshio_jobs::benchmark::tiers::Mode {
+    kuroshio_jobs::benchmark::tiers::auto_mode(mem_total_mb)
 }
 
 /// 子程序用哪個執行檔：設定允許、而且目前的執行檔是 kuroshio 本身才用
@@ -452,6 +460,14 @@ pub async fn child_main(state: PathBuf, base: PathBuf) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiers_auto_follows_memory() {
+        use kuroshio_jobs::benchmark::tiers::Mode;
+        assert_eq!(tiers_auto(Some(128)), Mode::A, "128 MB 的小機器只測 A 級");
+        assert_eq!(tiers_auto(Some(512)), Mode::Ab, "512 MB 的 D3 先照記憶體，全部測");
+        assert_eq!(tiers_auto(None), Mode::Ab);
+    }
 
     #[test]
     fn relay_keeps_levels_and_last_error() {

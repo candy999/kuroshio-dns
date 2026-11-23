@@ -633,7 +633,7 @@ fn uci_chain_options_convert() {
         )
         .replace(
             "config benchmark 'benchmark'\n",
-            "config benchmark 'benchmark'\n\toption coverage_region 'any'\n\toption near_max_ms '80'\n",
+            "config benchmark 'benchmark'\n\toption coverage_region 'any'\n\toption near_max_ms '80'\n\toption tiers 'a'\n",
         );
     for opt in ["option chain", "option backfill_sample", "option near_max_ms"] {
         assert!(text.contains(opt), "測試用的預設 UCI 要有對應的區段：{opt}");
@@ -648,6 +648,7 @@ fn uci_chain_options_convert() {
     assert_eq!(g(&raw, "resolver.backfillSample"), &json!(0));
     assert_eq!(g(&raw, "benchmark.coverageRegion"), &json!("any"));
     assert_eq!(g(&raw, "benchmark.nearMaxMs"), &json!(80));
+    assert_eq!(g(&raw, "benchmark.tiers"), &json!("a"), "分級評測（3.5.0 A3）");
     // 讀取函式讀得出來
     let s = ChainSettings::from_cfg(&o);
     assert!(!s.chain && !s.allow_downstream && !s.downstream_enabled());
@@ -726,6 +727,7 @@ fn shipped_uci_config_matches_defaults() {
         "resolver.backfillSample",
         "benchmark.coverageRegion",
         "benchmark.nearMaxMs",
+        "benchmark.tiers",
     ] {
         assert!(get(&d, k).is_some(), "defaults.json 沒有 {k}");
         assert_eq!(g(&c, k), g(&d, k), "{k}");
@@ -739,6 +741,7 @@ fn shipped_uci_config_matches_defaults() {
         "resolver.backfillSample",
         "benchmark.coverageRegion",
         "benchmark.nearMaxMs",
+        "benchmark.tiers",
     ] {
         assert!(get(&raw, k).is_some(), "預設 UCI 沒寫 {k}");
     }

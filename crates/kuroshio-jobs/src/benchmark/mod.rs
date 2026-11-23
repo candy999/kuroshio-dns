@@ -34,6 +34,7 @@ pub mod probe;
 pub mod rules;
 pub mod select;
 pub mod tags;
+pub mod tiers;
 
 use crate::scheduler::{resolve_path, BoxFuture, Job, JobCtx};
 use crate::time::{fmt_time, iso_string, local_date_str, parse_date_utc, DAY_MS};
@@ -186,6 +187,8 @@ pub struct Benchmark {
     pub keep_last: Option<PathBuf>,
     /// 台灣網段（`geo/tw-ip.json`）：判斷上游在不在台灣（規格 10 的 6.1）。None = 讀不到，只靠國別與延遲
     pub tw: Option<Arc<crate::geo::TwIp>>,
+    /// `benchmark.tiers = auto` 時用哪一種（主程式依實體記憶體換算，3.5.0 A3）。預設全部測
+    pub tier_auto: tiers::Mode,
 }
 
 /// 讀台灣網段（`tw-ip.json`，約 41 KB）給評測用；讀不到或格式錯誤是 None（不影響評測，只少一個訊號）。
@@ -235,7 +238,14 @@ impl Benchmark {
             path: PathSource::Off,
             keep_last: None,
             tw: None,
+            tier_auto: tiers::Mode::Ab,
         }
+    }
+
+    /// `benchmark.tiers = auto` 時用哪一種（見 [`tiers::auto_mode`]）
+    pub fn with_tier_auto(mut self, m: tiers::Mode) -> Benchmark {
+        self.tier_auto = m;
+        self
     }
 
     /// 指定台灣網段（`read_tw_ip` 讀出來的）
@@ -348,6 +358,8 @@ struct BenchCfg {
     select: SelectOpts,
     /// `benchmark.nearMaxMs`：最低延遲在這以內就算鄰近
     near_max_ms: f64,
+    /// `benchmark.tiers`：`a`／`ab`；None = `auto`（用 [`Benchmark::tier_auto`]）
+    tiers: Option<tiers::Mode>,
 }
 
 fn pos_f64(cfg: &Value, k: &str) -> Option<f64> {
@@ -366,6 +378,7 @@ impl BenchCfg {
             pinned: strings(cfg, "upstream.pinned").unwrap_or_default(),
             select: select_opts(cfg),
             near_max_ms: kuroshio_config::chain::coverage_region_of(cfg).1,
+            tiers: get(cfg, "benchmark.tiers").and_then(Value::as_str).and_then(tiers::Mode::parse),
         }
     }
 }
@@ -606,6 +619,15 @@ impl Srv {
         }
     }
 
+    /// 經營者（多樣性用）：名單的 `op=`，沒有就用主機的可註冊網域或 /16
+    fn op_key(&self) -> String {
+        if self.tag.op.is_empty() {
+            operator_of(&self.up.host)
+        } else {
+            self.tag.op.to_ascii_lowercase()
+        }
+    }
+
     /// 會不會被選來用（固定上游另外處理，對照組永遠不選）
     fn selectable(&self) -> bool {
         !self.pinned && self.protected.is_none()
@@ -754,6 +776,42 @@ fn expect_met(expect: &str, result: &str, stage: &str) -> Option<bool> {
         return None;
     }
     Some(result == "detected" && stage != "preflight")
+}
+
+/// 昨天選上或列為候補的上游（`upstreams.json` 的 `selected[]`、`spares[]`）：分級評測只測 A 級時沿用，
+/// 不然探索到的 B 級今天選上、明天又不測。讀不到就是空的
+fn incumbent_ids(file: &Path) -> HashSet<String> {
+    let Some(v) = read_json(file) else {
+        return HashSet::new();
+    };
+    ["selected", "spares"]
+        .iter()
+        .flat_map(|k| v[*k].as_array().into_iter().flatten())
+        .filter_map(|x| x["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// 分級評測的統計（`upstreams.json` 的 `tiers`）
+#[derive(Debug, Clone, Copy)]
+struct TierCounts {
+    mode: tiers::Mode,
+    /// 設定是 `auto`（依記憶體換算出來的）
+    auto: bool,
+    /// 今天測的 A 級
+    a: usize,
+    incumbent: usize,
+    fill: usize,
+    explore: usize,
+    skipped_b: usize,
+}
+
+impl TierCounts {
+    fn to_json(self) -> Value {
+        json!({
+            "mode": self.mode.name(), "auto": self.auto, "a": self.a, "incumbent": self.incumbent,
+            "fill": self.fill, "explore": self.explore, "skippedB": self.skipped_b,
+        })
+    }
 }
 
 /// 社群好友提供的上游候選最多收幾個（社群模組已經先合併、排序、限制成 100 個；這裡再擋一次，
@@ -1098,6 +1156,60 @@ impl Benchmark {
             s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
             all.push(s);
         }
+        // 分級評測（3.5.0 A3）：`a` 模式只測 A 級、使用者的、沿用、補位、探索；其餘 B 級今天不測
+        // （不算淘汰、不記任何紀錄）。在路徑檢查、黑名單略過之後才算：多樣性要看今天實際能測的
+        let tier_mode = cfg.tiers.unwrap_or(self.tier_auto);
+        let tier_plan = {
+            let incumbents = incumbent_ids(&self.paths.upstreams_file);
+            let items: Vec<tiers::Item> = all
+                .iter()
+                .map(|s| tiers::Item {
+                    id: &s.id,
+                    kind: s.kind,
+                    tier: s.tag.tier,
+                    op: s.op_key(),
+                    ms: s.tag.ms,
+                    always: s.pinned || s.protected.is_some() || s.never_ok,
+                    incumbent: incumbents.contains(s.id.as_str()),
+                    score: None,
+                    bad: false,
+                })
+                .collect();
+            tiers::plan(&items, tier_mode, today_n, &cfg.select.auto_types)
+        };
+        let tier_counts = TierCounts {
+            mode: tier_mode,
+            auto: cfg.tiers.is_none(),
+            a: (0..all.len())
+                .filter(|&i| tier_plan.why[i] == tiers::Why::Base && all[i].selectable() && all[i].tag.tier == Tier::A)
+                .count(),
+            incumbent: tier_plan.count(tiers::Why::Incumbent),
+            fill: tier_plan.count(tiers::Why::Fill),
+            explore: tier_plan.count(tiers::Why::Explore),
+            skipped_b: tier_plan.count(tiers::Why::Skip),
+        };
+        if tier_mode == tiers::Mode::A {
+            let mut k = 0usize;
+            all.retain(|_| {
+                k += 1;
+                tier_plan.tested(k - 1)
+            });
+            jinfo!(
+                journal,
+                "[分級] 今天測 A 級 {} 個、沿用昨天選上或候補的 B 級 {} 個、補位 {} 個{}、探索 {} 個；B 級其餘 {} 個今天不測（不算淘汰、不記紀錄）",
+                tier_counts.a,
+                tier_counts.incumbent,
+                tier_counts.fill,
+                if tier_plan.fill_reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("（原因：{}）", tier_plan.fill_reason)
+                },
+                tier_counts.explore,
+                tier_counts.skipped_b
+            );
+        }
+        drop(tier_plan);
         if !path_skipped.is_empty() {
             let parts: Vec<String> = path_skipped.iter().map(|(k, n)| format!("{} {n}", path_skip_label(k))).collect();
             jinfo!(
@@ -1705,6 +1817,7 @@ impl Benchmark {
             "counts": counts,
             "blocked": blocked_report,
             "protected": control,
+            "tiers": tier_counts.to_json(),
             "skippedTypes": skipped.iter().filter(|(k, _)| **k != "blacklist").map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "pathSkipped": path_skipped.iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "path": path.as_ref().map(|r| { let mut j = r.to_json(); j["policy"] = json!(policy); j }),

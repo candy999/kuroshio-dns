@@ -594,6 +594,11 @@
               { "value": "any", "label": "不分遠近（3.3.7 的行為）" }
             ] },
             { "key": "benchmark.nearMaxMs", "type": "int", "label": "鄰近的延遲上限（毫秒）", "help": "最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。", "min": 0 },
+            { "key": "benchmark.tiers", "type": "select", "label": "評測範圍", "fallbackDefault": "auto", "help": "預設名單分成 A 級（經營者明確的公共 DNS、電信商）與 B 級（品質都過、經營者看不出來）。只測 A 級是小機器的減量：自己加的上游照測，B 級每天只補位（A 級的經營者或類型不夠時，最多 32 個）與輪流探索 40 個。自動：記憶體小於 256 MB 只測 A 級。", "options": [
+              { "value": "auto", "label": "自動（依記憶體）" },
+              { "value": "a", "label": "只測 A 級（加補位與探索）" },
+              { "value": "ab", "label": "全部都測" }
+            ] },
             { "key": "benchmark.minAuto", "type": "int", "label": "至少選幾台", "min": 0 },
             { "key": "benchmark.maxAvgLatencyMs", "type": "int", "label": "平均延遲上限（毫秒）", "min": 1 },
             { "key": "benchmark.keepDays", "type": "int", "label": "報表保留天數", "min": 0 }

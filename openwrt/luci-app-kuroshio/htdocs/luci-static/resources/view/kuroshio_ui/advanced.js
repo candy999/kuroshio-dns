@@ -285,6 +285,13 @@ return view.extend({
 		o.value('near', _('鄰近優先（建議）'));
 		o.value('any', _('不分遠近（3.3.7 的行為）'));
 		o.default = 'near';
+		// 分級評測（3.5.0）
+		o = s.option(form.ListValue, 'tiers', _('評測範圍'),
+			_('預設名單分成 A 級（經營者明確的公共 DNS、電信商）與 B 級（品質都過、經營者看不出來）。只測 A 級是小機器的減量：自己加的上游照測，B 級每天只補位（A 級的經營者或類型不夠時，最多 32 個）與輪流探索 40 個。自動：記憶體小於 256 MB 只測 A 級。'));
+		o.value('auto', _('自動（依記憶體）'));
+		o.value('a', _('只測 A 級（加補位與探索）'));
+		o.value('ab', _('全部都測'));
+		o.default = 'auto';
 		num('near_max_ms', _('鄰近的延遲上限（毫秒）'), 'benchmark.nearMaxMs', _('最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。'));
 		num('min_auto', _('至少選幾台'), 'benchmark.minAuto');
 		num('max_avg_latency_ms', _('平均延遲上限（毫秒）'), 'benchmark.maxAvgLatencyMs');
