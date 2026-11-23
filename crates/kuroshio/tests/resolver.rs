@@ -1442,13 +1442,20 @@ async fn round_where_nobody_answers_counts_no_failures() {
     drop(hole);
 }
 
-/// 很快就回來的錯誤（連線被拒）是這台自己的問題：不等這一輪結束，照舊立刻記失敗，就算整輪沒有人答
+/// 很快就回來的錯誤（連線被拒、連上就被關掉）是這台自己的問題：不等這一輪結束，照舊立刻記失敗，就算整輪沒有人答
 #[tokio::test]
 async fn fast_errors_still_count_at_once() {
-    // 綁了又關掉的 TCP 埠：連線被拒
+    // 接受連線後立刻關掉的 TCP 上游：很快就失敗（讀到 EOF）。不用「綁了又關掉的埠」：
+    // Windows 連到關閉的本機埠會重試約 2 秒才回連線被拒，比這裡的逾時還久，就變成「逾時」了
     let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                drop(s);
+            }
+        });
+        a
     };
     let (dead, _) = dead_for_dead_names().await;
     let mut c = cfg(
@@ -1465,7 +1472,7 @@ async fn fast_errors_still_count_at_once() {
         r.upstreams.list_json().as_array().unwrap().iter().find(|u| u["id"] == id).unwrap()["fail"].clone()
     };
     r.handle(&q(1, "dead1.example.com", 1), &CTX).await.unwrap();
-    assert_eq!(tcp_fail(&r), 1, "整輪沒有人答：連線被拒的照算");
+    assert_eq!(tcp_fail(&r), 1, "整輪沒有人答：很快就失敗的照算");
     assert_eq!(up_json(&r, dead)["fail"], 0, "逾時的不算");
     r.handle(&q(2, "alive.example.com", 1), &CTX).await.unwrap();
     assert_eq!(tcp_fail(&r), 2);
