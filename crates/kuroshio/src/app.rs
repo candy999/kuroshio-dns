@@ -1773,7 +1773,10 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             let cap = crate::memgov::headroom(&r, &reserve).map_or(0, |h| ((h >> 20) / 4).clamp(1, u32::MAX as u64) as u32);
             kuroshio_community::config::set_memory_cap_mb(cap);
             if p != last {
-                let (a, res) = (r.avail.unwrap_or(0) >> 20, reserve.bytes >> 20);
+                let (a, res) = (
+                    crate::memgov::mb_round(r.avail.unwrap_or(0)),
+                    crate::memgov::mb_round(reserve.bytes),
+                );
                 match p {
                     // 這是「當下」的量測；記憶體控制的狀態（`memory.state`）要穩定一段時間才放鬆（遲滯，預設 3 分鐘），
                     // 兩者會差幾分鐘（3.4.3：日誌寫「恢復正常」、狀態頁卻還是吃緊，看起來像錯誤）
@@ -1928,7 +1931,7 @@ fn start_governor(
     }
     info!(
         "記憶體控制：系統保留 {} MB（{}），可用記憶體低於保留量時依序讓出記憶體",
-        reserve.bytes >> 20,
+        crate::memgov::mb_round(reserve.bytes),
         reserve.how
     );
     g
