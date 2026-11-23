@@ -71,7 +71,17 @@ struct Stats {
     open_until: Option<Instant>,
     /// 上線以來從未成功、先不用（3.5.0）：`open_until` 到了只放 1 筆試探
     benched: bool,
+    /// 來不及回答（別的上游先答完、這台被取消）的次數（3.5.0 F4，啟動後累計）
+    late: u64,
+    /// 連續幾次來不及回答（成功一次歸零；到 [`LATE_STREAK_FAIL`] 算 1 次失敗、歸零）
+    late_streak: u8,
+    /// 「每次都來不及回答」的 INFO 寫過了（每台上游每次啟動一行）
+    late_logged: bool,
 }
+
+/// 連續幾次來不及回答（而且這段期間沒有成功過）算 1 次失敗（3.5.0 F4）：自動上游要 5 次失敗才暫停，
+/// 也就是連續 40 筆都來不及才會暫停
+pub const LATE_STREAK_FAIL: u8 = 8;
 
 /// 從未成功的自動上游第幾次暫停時先不用（前兩次是 1、2 分鐘，合計已經失敗 15 筆）
 pub const BENCH_TRIPS: u32 = 3;
@@ -205,6 +215,10 @@ pub struct Up {
     trouble: Option<Arc<Trouble>>,
     /// Manager 共用的狀態（3.5.0）：沒有時不會「先不用」（判斷不了是不是整台斷網）
     pulse: Option<Arc<Pulse>>,
+    /// 正常回應了 SERVFAIL 的次數（3.5.0 F4；算不算失敗另外看同一輪別台。原子計數，不拿 `stats` 的鎖）
+    servfail: AtomicU32,
+    /// 逾時、但整輪沒有人回答所以沒有算它失敗的次數（3.5.0 F4）
+    unanswered: AtomicU32,
 }
 
 impl Up {
@@ -222,6 +236,8 @@ impl Up {
             region: Mutex::new(None),
             trouble: None,
             pulse,
+            servfail: AtomicU32::new(0),
+            unanswered: AtomicU32::new(0),
         })
     }
 
@@ -234,6 +250,8 @@ impl Up {
             region: Mutex::new(None),
             trouble: Some(trouble),
             pulse: None,
+            servfail: AtomicU32::new(0),
+            unanswered: AtomicU32::new(0),
         })
     }
 
@@ -306,7 +324,15 @@ impl Up {
     fn record_at(&self, ok: bool, ms: f64, now: Instant) {
         let mut notify = None;
         let mut benched = false;
-        self.record_inner(ok, ms, now, &mut notify, &mut benched);
+        {
+            let mut s = self.stats.lock().unwrap();
+            self.record_locked(&mut s, ok, ms, now, &mut notify, &mut benched);
+        }
+        self.after_record(ok, now, notify, benched);
+    }
+
+    /// 放掉 stats 的鎖之後才做的事（通知、先不用的登記）
+    fn after_record(&self, ok: bool, now: Instant, notify: Option<TroubleFn>, benched: bool) {
         if ok && self.role != Role::Chain {
             if let Some(p) = &self.pulse {
                 p.mark_ok(now);
@@ -325,11 +351,62 @@ impl Up {
         }
     }
 
-    fn record_inner(&self, ok: bool, ms: f64, now: Instant, notify: &mut Option<TroubleFn>, benched: &mut bool) {
-        let mut s = self.stats.lock().unwrap();
+    /// 這台正常回應了 SERVFAIL（3.5.0 F4：分開計，算不算失敗照舊看同一輪別台）
+    pub fn note_servfail(&self) {
+        self.servfail.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 這台逾時，但整輪沒有任何上游正常回答：不算它失敗，只記一次（3.5.0 F4）
+    pub fn note_unanswered(&self) {
+        self.unanswered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 來不及回答（3.5.0 F4）：已經送出、還沒回來，別的上游先答完、這一輪結束時被取消。`ms` 是已經等了多久。
+    /// 拿的是這台自己的 `stats` 鎖一次（它如果回來，本來就會在 `record()` 拿同一把鎖一次）。
+    /// - 沒有延遲紀錄時把平均延遲設成 `ms`（下限）、有紀錄而且比它小時往上修：不再永遠排第一。
+    /// - 連續 [`LATE_STREAK_FAIL`] 次（中間沒有成功）算 1 次失敗（走一般的失敗規則：自動上游會暫停、從未成功的會先不用）。
+    /// - 第一次「連續 8 次來不及、上線以來沒有成功過」時寫一行 INFO（每台上游每次啟動一行）
+    pub fn note_late(&self, ms: f64) {
+        self.note_late_at(ms, Instant::now());
+    }
+
+    fn note_late_at(&self, ms: f64, now: Instant) {
+        let mut notify = None;
+        let mut benched = false;
+        let mut log = false;
+        {
+            let mut s = self.stats.lock().unwrap();
+            s.late += 1;
+            s.ewma = Some(match s.ewma {
+                None => ms,
+                Some(e) if e < ms => e * 0.8 + ms * 0.2,
+                Some(e) => e,
+            });
+            s.late_streak = s.late_streak.saturating_add(1);
+            if s.late_streak < LATE_STREAK_FAIL {
+                return;
+            }
+            s.late_streak = 0;
+            if s.ok == 0 && !s.late_logged {
+                s.late_logged = true;
+                log = true;
+            }
+            self.record_locked(&mut s, false, ms, now, &mut notify, &mut benched);
+        }
+        if log {
+            info!(
+                "{} 每次都來不及回答（別的上游先答完），先排到後面；一直這樣的話可能是位址或協定不通",
+                self.up.id
+            );
+        }
+        self.after_record(false, now, notify, benched);
+    }
+
+    fn record_locked(&self, s: &mut Stats, ok: bool, ms: f64, now: Instant, notify: &mut Option<TroubleFn>, benched: &mut bool) {
         if ok {
             s.ok += 1;
             s.consec_fail = 0;
+            s.late_streak = 0;
             if s.benched {
                 // 試探成功：恢復，照常使用
                 s.benched = false;
@@ -409,6 +486,11 @@ impl Up {
             "via": if self.via_interceptor() { Value::from("interceptor") } else { Value::Null },
             // 3.5.0：上線以來從未成功、先不用（每 6 小時試一次）
             "benched": s.benched,
+            // 3.5.0 F4：正常回應了 SERVFAIL 的次數（失敗裡有多少是 SERVFAIL）、逾時但整輪沒有人答所以沒算失敗的次數、
+            // 來不及回答（別的上游先答完、被取消）的次數。成功率照舊用 ok ÷ (ok + fail)
+            "servfail": self.servfail.load(Ordering::Relaxed),
+            "unanswered": self.unanswered.load(Ordering::Relaxed),
+            "late": s.late,
         })
     }
 }
@@ -1296,6 +1378,86 @@ mod tests {
         assert!(!good.benched());
         assert!(pause_left_at(&good, t3 + Duration::from_secs(182)) <= Duration::from_secs(240));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 3.5.0 F4：連續 8 次來不及回答（中間沒有成功）算 1 次失敗、歸零；成功一次就重新算。平均延遲：沒有紀錄時設成等了多久，
+    /// 有紀錄而且比較小時往上修，比較大時不動
+    #[test]
+    fn late_streak_of_eight_counts_one_failure_and_success_resets() {
+        let u = Up::new(Upstream::parse("tls://dns.example.net").unwrap(), Role::Auto);
+        let t = Instant::now();
+        for _ in 0..7 {
+            u.note_late_at(100.0, t);
+        }
+        assert_eq!((u.json()["fail"].clone(), u.json()["late"].clone()), (json!(0), json!(7)));
+        assert_eq!(u.ewma(), Some(100.0), "沒有延遲紀錄：設成等了多久");
+        u.note_late_at(100.0, t);
+        assert_eq!(u.json()["fail"], 1, "第 8 次算 1 次失敗");
+        assert_eq!(u.json()["late"], 8);
+        // 成功一次就歸零
+        for _ in 0..7 {
+            u.note_late_at(100.0, t);
+        }
+        u.record_at(true, 100.0, t);
+        for _ in 0..7 {
+            u.note_late_at(100.0, t);
+        }
+        assert_eq!(u.json()["fail"], 1, "中間成功過：重新算");
+        u.note_late_at(100.0, t);
+        assert_eq!(u.json()["fail"], 2);
+        // 平均延遲
+        let v = Up::new(Upstream::parse("tls://dns2.example.net").unwrap(), Role::Auto);
+        v.note_late_at(100.0, t);
+        v.note_late_at(50.0, t);
+        assert_eq!(v.ewma(), Some(100.0), "比平均小：不往下修");
+        v.note_late_at(200.0, t);
+        assert_eq!(v.ewma(), Some(120.0), "比平均大：ewma × 0.8 + ms × 0.2");
+    }
+
+    /// 3.5.0 F4（H11）：連不上、每次都被別台先答完取消的自動上游：連續 40 筆來不及＝5 次失敗＝暫停，
+    /// 從未成功的照 A7 第 3 次暫停時先不用；INFO 只寫一次
+    #[test]
+    fn never_answering_auto_upstream_reaches_benched() {
+        let (dir, m) = manager_with("late", TWO, json!({}));
+        let (bad, good) = (
+            auto_by(&m, "tls://never.example.com:853"),
+            auto_by(&m, "tls://good.example.net:853"),
+        );
+        let late40 = |t: Instant| (0..40).for_each(|_| bad.note_late_at(150.0, t));
+        let t0 = Instant::now();
+        good.record_at(true, 5.0, t0);
+        (0..39).for_each(|_| bad.note_late_at(150.0, t0));
+        assert!(!bad.paused(t0), "39 筆還沒暫停");
+        bad.note_late_at(150.0, t0);
+        assert!(bad.paused(t0), "連續 40 筆來不及：暫停 1 分鐘");
+        assert!(pause_left_at(&bad, t0) <= Duration::from_secs(60));
+        assert!(bad.stats.lock().unwrap().late_logged, "寫過一次 INFO");
+        let t1 = t0 + Duration::from_secs(61);
+        good.record_at(true, 5.0, t1);
+        late40(t1);
+        assert!(!bad.benched());
+        let t2 = t1 + Duration::from_secs(121);
+        good.record_at(true, 5.0, t2);
+        late40(t2);
+        assert!(bad.benched(), "上線以來從未成功、第 3 次暫停、別的上游有成功：先不用");
+        assert_eq!(bad.json()["late"], 120);
+        assert_eq!(bad.json()["fail"], 15);
+        let _ = take_never_ok();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 3.5.0 F4：固定上游來不及回答也記失敗，但照舊不暫停（只會因為平均延遲排到後面）
+    #[test]
+    fn pinned_late_upstream_not_paused() {
+        let u = Up::new(Upstream::parse("https://192.0.2.1/dns-query").unwrap(), Role::Pinned);
+        let t = Instant::now();
+        for _ in 0..80 {
+            u.note_late_at(300.0, t);
+        }
+        assert_eq!(u.json()["fail"], 10);
+        assert_eq!(u.json()["paused"], false);
+        assert!(!u.benched());
+        assert_eq!(u.ewma(), Some(300.0));
     }
 
     fn pause_left_at(u: &Up, t: Instant) -> Duration {

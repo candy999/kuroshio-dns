@@ -91,7 +91,44 @@ fn quic_config(alpn: &[u8]) -> Result<quinn::ClientConfig> {
     Ok(c)
 }
 
-async fn connect(host: &str, port: u16, alpn: &[u8], timeout: Duration) -> Result<quinn::Connection> {
+/// 「開著的 QUIC 連線」的計數（3.5.0 F4，`perf.tls.quic.open`）：跟連線放在一起，連線結束或不再使用時 −1（只減一次）。
+///
+/// 另外開一個工作等連線結束（`closed()`）；那個工作也拿著連線，所以這個物件丟掉時要通知它放手，
+/// 不然最後一個使用者丟掉連線時 quinn 不會自動關閉（keep-alive 會讓它一直開著）
+pub struct OpenGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn track_open(conn: &quinn::Connection) -> OpenGuard {
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::perf::QUIC_OPEN.fetch_add(1, Relaxed);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    // −1 放在 Drop：工作被取消（runtime 結束）時也會減
+    struct Dec;
+    impl Drop for Dec {
+        fn drop(&mut self) {
+            crate::perf::QUIC_OPEN.fetch_sub(1, Relaxed);
+        }
+    }
+    let dec = Dec;
+    let c = conn.clone();
+    tokio::spawn(async move {
+        let _dec = dec;
+        tokio::select! {
+            _ = c.closed() => {}
+            _ = rx => {}
+        }
+    });
+    OpenGuard(Some(tx))
+}
+
+async fn connect(host: &str, port: u16, alpn: &[u8], timeout: Duration) -> Result<(quinn::Connection, OpenGuard)> {
     let ips = resolve_host(host).await?;
     let cfg = quic_config(alpn)?;
     let sni = host.trim_matches(|c| c == '[' || c == ']');
@@ -111,7 +148,8 @@ async fn connect(host: &str, port: u16, alpn: &[u8], timeout: Duration) -> Resul
         match tokio::time::timeout(timeout, r).await {
             Ok(Ok(c)) => {
                 crate::perf::QUIC_NEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(c);
+                let g = track_open(&c);
+                return Ok((c, g));
             }
             Ok(Err(e)) => last = e,
             Err(_) => last = anyhow!("QUIC 連線逾時 {ip}:{port}"),
@@ -145,13 +183,13 @@ pub async fn connect_addrs(host: &str, addrs: &[SocketAddr], alpn: &[u8], timeou
 
 #[derive(Default)]
 pub struct Doq {
-    conn: tokio::sync::Mutex<Option<quinn::Connection>>,
+    conn: tokio::sync::Mutex<Option<(quinn::Connection, OpenGuard)>>,
 }
 
 /// 最後一個持有者丟掉時就關閉連線（不等閒置逾時：keep-alive 會讓閒置逾時永遠不到）
 impl Drop for Doq {
     fn drop(&mut self) {
-        if let Some(c) = self.conn.get_mut().take() {
+        if let Some((c, _g)) = self.conn.get_mut().take() {
             c.close(0u32.into(), b"");
         }
     }
@@ -161,12 +199,12 @@ impl Doq {
     async fn get(&self, host: &str, port: u16, timeout: Duration, fresh: bool) -> Result<quinn::Connection> {
         let mut slot = self.conn.lock().await;
         if !fresh {
-            if let Some(c) = slot.as_ref().filter(|c| c.close_reason().is_none()) {
+            if let Some((c, _)) = slot.as_ref().filter(|(c, _)| c.close_reason().is_none()) {
                 return Ok(c.clone());
             }
         }
-        let c = connect(host, port, b"doq", timeout).await?;
-        *slot = Some(c.clone());
+        let (c, g) = connect(host, port, b"doq", timeout).await?;
+        *slot = Some((c.clone(), g));
         Ok(c)
     }
 
@@ -230,12 +268,12 @@ type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 #[derive(Default)]
 pub struct Doh3 {
-    send: tokio::sync::Mutex<Option<(H3Send, quinn::Connection)>>,
+    send: tokio::sync::Mutex<Option<(H3Send, quinn::Connection, OpenGuard)>>,
 }
 
 impl Drop for Doh3 {
     fn drop(&mut self) {
-        if let Some((_, c)) = self.send.get_mut().take() {
+        if let Some((_, c, _g)) = self.send.get_mut().take() {
             c.close(0u32.into(), b"");
         }
     }
@@ -245,13 +283,13 @@ impl Doh3 {
     async fn get(&self, host: &str, port: u16, timeout: Duration, fresh: bool) -> Result<H3Send> {
         let mut slot = self.send.lock().await;
         if !fresh {
-            if let Some((s, c)) = slot.as_ref() {
+            if let Some((s, c, _)) = slot.as_ref() {
                 if c.close_reason().is_none() {
                     return Ok(s.clone());
                 }
             }
         }
-        let conn = connect(host, port, b"h3", timeout).await?;
+        let (conn, guard) = connect(host, port, b"h3", timeout).await?;
         let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
             .await
             .map_err(|e| anyhow!("HTTP/3 握手失敗：{e}"))?;
@@ -259,7 +297,7 @@ impl Doh3 {
             let e = driver.wait_idle().await;
             debug!("DoH3 連線結束：{e}");
         });
-        *slot = Some((send.clone(), conn));
+        *slot = Some((send.clone(), conn, guard));
         Ok(send)
     }
 

@@ -37,8 +37,12 @@ fn q(id: u16, name: &str) -> Vec<u8> {
     kuroshio_proto::build_query(id, name, 1)
 }
 
+/// 會建立 QUIC 上游連線的測試排隊（`perf.tls.quic.open` 是整個行程共用的計數）
+static QUIC_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn dot_and_doh_serve_queries() {
+    let _quic = QUIC_TESTS.lock().await;
     let dir = std::env::temp_dir().join(format!("kuroshio-enc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("state")).unwrap();
@@ -247,6 +251,7 @@ async fn plain_http_doh_behind_proxy() {
 /// DoQ：未驗證的握手太多時先回 Retry（這裡設成一律 Retry），正常的用戶端照樣查得到
 #[tokio::test]
 async fn doq_retry_when_many_unvalidated_handshakes() {
+    let _quic = QUIC_TESTS.lock().await;
     let dir = std::env::temp_dir().join(format!("kuroshio-enc-retry-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("state")).unwrap();
@@ -269,6 +274,67 @@ async fn doq_retry_when_many_unvalidated_handshakes() {
         let m = Message::parse(&u.exchange(&q(300 + i, "retry.test"), Duration::from_secs(5)).await.unwrap()).unwrap();
         assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)));
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 3.5.0 F4（D9）：`perf.tls.quic.open` 是目前開著的 QUIC 上游連線數：連上 +1、同一條連線重複使用不變、
+/// 不再使用（上游丟掉）時 −1。`new` 是新建的連線數
+#[tokio::test]
+async fn quic_open_gauge_follows_connections() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _quic = QUIC_TESTS.lock().await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-enc-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let der = write_cert(&dir);
+    kuroshio::tls::add_root(der);
+    let up = upstream().await;
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "system": { "persistDir": dir.join("state").to_string_lossy() },
+        "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
+        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false }
+    }));
+    let r = kuroshio::app::build_resolver(&cfg).unwrap();
+    let certs = kuroshio::encrypted::CertStore::new(dir.join("cert.pem"), dir.join("key.pem"));
+    let doq = kuroshio::encrypted::listen_doq("127.0.0.1:0".parse().unwrap(), certs, r, kuroshio::encrypted::Limits::new(32))
+        .await
+        .unwrap();
+    let open = || kuroshio_net::perf::QUIC_OPEN.load(Relaxed);
+    let until = |what: &'static str, want: u32| async move {
+        let t0 = std::time::Instant::now();
+        while kuroshio_net::perf::QUIC_OPEN.load(Relaxed) != want {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "等不到：{what}（{}）",
+                kuroshio_net::perf::QUIC_OPEN.load(Relaxed)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    // 前一個測試的連線關閉時的 −1 可能還在路上：等到穩定
+    let mut base = open();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if open() == base {
+            break;
+        }
+        base = open();
+    }
+    let new0 = kuroshio_net::perf::QUIC_NEW.load(Relaxed);
+    let u = Upstream::parse(&format!("quic://{doq}")).unwrap();
+    for i in 0..3u16 {
+        let m = Message::parse(&u.exchange(&q(400 + i, "open.test"), Duration::from_secs(5)).await.unwrap()).unwrap();
+        assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)));
+    }
+    until("連上 +1", base + 1).await;
+    assert_eq!(
+        kuroshio_net::perf::QUIC_NEW.load(Relaxed),
+        new0 + 1,
+        "同一條連線重複使用：new 只加 1"
+    );
+    assert_eq!(kuroshio_net::perf::json()["quic"]["open"], json!(base + 1));
+    drop(u);
+    until("上游丟掉連線：−1", base).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
