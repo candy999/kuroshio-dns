@@ -83,8 +83,25 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
 type CacheHandoff = (String, String, Instant, crate::cache::Cache);
 static CACHE_HANDOFF: Mutex<Option<CacheHandoff>> = Mutex::new(None);
 
+/// `cdn` 裡只影響背景工作或觀測、不改變「這一筆查詢回什麼」的鍵（3.5.0 F5）：改了不清 DNS 快取
+const CDN_BACKGROUND_KEYS: [&str; 8] = [
+    "dbDiskBudgetKB",
+    "maxEntries",
+    "popAudit",
+    "verifyConcurrency",
+    "verifyPacing",
+    "verifyPerMin",
+    "healthIntervalMin",
+    "qualityIntervalMin",
+];
+/// `cdn.cross` 裡只影響背景探索的鍵（3.5.0 F5）
+const CDN_CROSS_BACKGROUND_KEYS: [&str; 3] = ["concurrency", "requestScore", "recheckHours"];
+
 /// 會改變快取裡答案的設定（上游、解析、CDN、本機網域、快照位置）：都沒變才沿用上一輪的快取。
-/// `upstream` 整段都算進去，所以串接的開關 `upstream.chain`（3.4.0，規格第 10 節）改了也不沿用
+/// `upstream` 整段都算進去，所以串接的開關 `upstream.chain`（3.4.0，規格第 10 節）改了也不沿用。
+/// 3.5.0 F5（H6）：`pool` 整段不算（只決定節點池工作怎麼量，量完之前快取裡的答案不會變）；`cdn` 裡只影響背景或觀測的
+/// 鍵（[`CDN_BACKGROUND_KEYS`]、`cross` 的 [`CDN_CROSS_BACKGROUND_KEYS`]）拿掉再算。`enabled`、`lite`、`slowerFallback`、
+/// `popSwitch`、`spreadPrefixes`、`v6Policy` 這些會改變回給裝置的答案，照舊算
 fn answer_fingerprint(cfg: &Value) -> String {
     let mut res = get(cfg, "resolver").cloned().unwrap_or_default();
     if let Some(m) = res.as_object_mut() {
@@ -93,16 +110,19 @@ fn answer_fingerprint(cfg: &Value) -> String {
             m.remove(k);
         }
     }
+    let mut cdn = get(cfg, "cdn").cloned().unwrap_or_default();
+    if let Some(m) = cdn.as_object_mut() {
+        for k in CDN_BACKGROUND_KEYS {
+            m.remove(k);
+        }
+        if let Some(x) = m.get_mut("cross").and_then(Value::as_object_mut) {
+            for k in CDN_CROSS_BACKGROUND_KEYS {
+                x.remove(k);
+            }
+        }
+    }
     let pick = |k: &str| get(cfg, k).cloned().unwrap_or_default();
-    json!([
-        pick("upstream"),
-        res,
-        pick("cdn"),
-        pick("pool"),
-        pick("domain"),
-        pick("system.persistDir")
-    ])
-    .to_string()
+    json!([pick("upstream"), res, cdn, pick("domain"), pick("system.persistDir")]).to_string()
 }
 
 /// 過濾相關的設定：`filter` 整段（含清單的 `bypass` 標記），加上決定「繞過防護清單放不放行下游」的
@@ -134,7 +154,7 @@ fn adopt_cache(cfg: &Value, r: &Resolver) {
         return;
     }
     if fp != answer_fingerprint(cfg) {
-        info!("重新載入：上游或解析設定有變，DNS 快取重新開始");
+        info!("重新載入：上游、解析或 CDN 的設定有變，DNS 快取重新開始");
         return;
     }
     let n = r.cache.lock().unwrap().adopt(c, ffp != filter_fingerprint(cfg), Instant::now());
@@ -1558,7 +1578,10 @@ impl StopReason {
                 self.flush_budget().as_secs()
             )
         } else {
-            format!("收到 {}，正常停止", self.label())
+            // 英文開頭的（SIGTERM、Ctrl+C）前面空一格，中文的不空（3.5.0 F6／H12：以前是「收到 服務停止」）
+            let l = self.label();
+            let sp = if l.starts_with(|c: char| c.is_ascii()) { " " } else { "" };
+            format!("收到{sp}{l}，正常停止")
         }
     }
 }
@@ -2244,6 +2267,19 @@ mod tests {
         }
     }
 
+    /// 3.5.0 F6／H12：「收到 服務停止」多一個空格；英文開頭的照舊空一格
+    #[test]
+    fn stop_line_has_no_double_space() {
+        use super::StopReason::*;
+        assert_eq!(Service.log_line(), "收到服務停止，正常停止");
+        assert_eq!(Quit.log_line(), "收到 quit 指令，正常停止");
+        assert_eq!(Terminate.log_line(), "收到 SIGTERM，正常停止");
+        for r in [Terminate, CtrlC, CtrlBreak, ConsoleClose, Logoff, SystemShutdown, Service, Quit] {
+            let l = r.log_line();
+            assert!(!l.contains("  ") && !l.contains("收到 服") && !l.contains("收到 主"), "{l}");
+        }
+    }
+
     /// 串接的設定（3.4.0）：`upstream.chain` 改了不沿用快取；清單的 `bypass`、`upstream.allowDownstream` 改了算過濾設定變了
     #[test]
     fn fingerprints_change_with_chain_settings() {
@@ -2270,6 +2306,54 @@ mod tests {
         let unmarked = with(json!({ "filter": { "lists": lists } }));
         assert_ne!(filter_fingerprint(&unmarked), f0, "清單的 bypass 改了：過濾設定變了");
         assert_eq!(answer_fingerprint(&unmarked), a0, "只改過濾：答案的指紋不變");
+    }
+
+    /// 3.5.0 F5（H6）：只改 `pool.*` 不清 DNS 快取（W3：只改 `pool.relativeSpeed`，快取被清空）
+    #[test]
+    fn pool_only_change_keeps_cache() {
+        let base = kuroshio_config::build(&json!({}));
+        let a0 = answer_fingerprint(&base);
+        for user in [
+            json!({ "pool": { "relativeSpeed": false } }),
+            json!({ "pool": { "relativeSpeed": false, "someFutureKey": 3 } }),
+        ] {
+            assert_eq!(answer_fingerprint(&kuroshio_config::build(&user)), a0, "{user}");
+        }
+    }
+
+    /// 3.5.0 F5：只影響背景或觀測的 `cdn.*` 不清 DNS 快取
+    #[test]
+    fn background_only_cdn_keys_keep_cache() {
+        let base = kuroshio_config::build(&json!({}));
+        let a0 = answer_fingerprint(&base);
+        for user in [
+            json!({ "cdn": { "dbDiskBudgetKB": 1234 } }),
+            json!({ "cdn": { "maxEntries": 999 } }),
+            json!({ "cdn": { "popAudit": false } }),
+            json!({ "cdn": { "verifyConcurrency": 1 } }),
+            json!({ "cdn": { "verifyPacing": false } }),
+            json!({ "cdn": { "verifyPerMin": 12 } }),
+            json!({ "cdn": { "healthIntervalMin": 99 } }),
+            json!({ "cdn": { "qualityIntervalMin": 99 } }),
+            json!({ "cdn": { "cross": { "concurrency": 1, "requestScore": false, "recheckHours": 48 } } }),
+        ] {
+            assert_eq!(answer_fingerprint(&kuroshio_config::build(&user)), a0, "{user}");
+        }
+    }
+
+    /// 3.5.0 F5：會改變回給裝置的答案的 `cdn.*` 照舊重來
+    #[test]
+    fn cdn_enabled_change_still_resets_cache() {
+        let base = kuroshio_config::build(&json!({}));
+        let a0 = answer_fingerprint(&base);
+        for user in [
+            json!({ "cdn": { "enabled": false } }),
+            json!({ "cdn": { "lite": true } }),
+            json!({ "cdn": { "slowerFallback": false } }),
+            json!({ "cdn": { "cross": { "enabled": false } } }),
+        ] {
+            assert_ne!(answer_fingerprint(&kuroshio_config::build(&user)), a0, "{user}");
+        }
     }
 
     #[test]

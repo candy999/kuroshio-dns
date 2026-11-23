@@ -173,18 +173,26 @@ impl QueryLog {
         bytes
     }
 
-    /// 暫時開啟 `minutes` 分鐘（1～60）；0 = 關閉暫時開啟（常開的不受影響）
-    pub fn enable_for(&self, minutes: u32, now: u32) {
-        if minutes == 0 {
+    /// 暫時開啟 `minutes` 分鐘（1～60）；0 = 關閉暫時開啟（常開的不受影響）。
+    /// 開、關各寫一行 INFO（3.5.0 F6／H12：以前沒有日誌），回傳那一行（測試用）
+    pub fn enable_for(&self, minutes: u32, now: u32) -> String {
+        let msg = if minutes == 0 {
             self.until.store(0, Ordering::Relaxed);
-            if !self.permanent.load(Ordering::Relaxed) {
+            if self.permanent.load(Ordering::Relaxed) {
+                "查詢紀錄的暫時開啟取消（設定是常開，照樣記錄）".to_string()
+            } else {
+                let n = self.ring.lock().unwrap().as_ref().map_or(0, |r| r.len);
                 self.close();
+                format!("查詢紀錄關閉（清掉 {n} 筆）")
             }
-            return;
-        }
-        let m = minutes.min(MAX_MINUTES);
-        self.until.store(now.saturating_add(m * 60), Ordering::Relaxed);
-        self.open();
+        } else {
+            let m = minutes.min(MAX_MINUTES);
+            self.until.store(now.saturating_add(m * 60), Ordering::Relaxed);
+            self.open();
+            format!("查詢紀錄開啟 {m} 分鐘（只在記憶體，到期自動關）")
+        };
+        tracing::info!("{msg}");
+        msg
     }
 
     /// 開著嗎（查詢路徑先看這個；關閉時只有這一次原子讀取）
@@ -390,6 +398,23 @@ mod tests {
         // 0 = 關掉
         q.enable_for(0, 2001);
         assert!(!q.enabled());
+    }
+
+    /// 3.5.0 F6／H12：開、關都寫一行（以前沒有日誌）
+    #[test]
+    fn querylog_toggle_is_logged() {
+        let q = QueryLog::default();
+        q.configure(100, false);
+        assert_eq!(q.enable_for(10, 1000), "查詢紀錄開啟 10 分鐘（只在記憶體，到期自動關）");
+        assert_eq!(q.enable_for(999, 1000), "查詢紀錄開啟 60 分鐘（只在記憶體，到期自動關）");
+        q.push(1001, "a.example.com", 1, ip(2), Kind::Miss, 0, 3.0, "");
+        q.push(1002, "b.example.com", 1, ip(2), Kind::Miss, 0, 3.0, "");
+        assert_eq!(q.enable_for(0, 1003), "查詢紀錄關閉（清掉 2 筆）");
+        assert!(!q.enabled());
+        let p = QueryLog::default();
+        p.configure(100, true);
+        assert!(p.enable_for(0, 1003).contains("常開"));
+        assert!(p.enabled());
     }
 
     #[test]
