@@ -1612,9 +1612,17 @@ impl Client {
         // 這兩個會回頭問狀態機（拿狀態的鎖）：先算好
         let shared = crate::chain::share::shared_json();
         let serving = self.responder().map(|r| r.serving_json()).unwrap_or(Value::Null);
+        // 自己（3.5.0 E13）：畫拓樸圖時跟 `upstream.path`、別台的 `downstreams[].nodeId` 對起來。
+        // `chain` 關著、回應器沒有建立時也給（不會為了這個建立金鑰檔：還沒有金鑰時 nodeId 是 null）
+        let (node_id, fp) = (self.key.node_id(), self.key.fingerprint());
         let i = self.inner.lock().unwrap();
         let now = now_ms();
+        let depth = match (&i.probe, &i.bound) {
+            (Some(p), Some(_)) if i.settings.chain => p.path.len() + 1,
+            _ => 1,
+        };
         json!({
+            "self": { "nodeId": node_id, "fingerprint": fp, "version": env!("CARGO_PKG_VERSION"), "depth": depth },
             "enabled": i.settings.chain,
             "state": i.state.code(),
             "reason": i.reason.map(Reason::code),

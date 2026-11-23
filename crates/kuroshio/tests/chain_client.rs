@@ -382,6 +382,15 @@ async fn chain_off_sends_nothing() {
     );
     assert!(s["upstream"].is_null());
     assert!(d.client.interceptor_json().is_null());
+    // 3.5.0 E13（chain_self_present_without_responder_and_when_disabled）：chain 關著、沒有回應器也有 self；
+    // 不為了這個建立金鑰檔（還沒有金鑰時 nodeId 是 null）
+    assert_eq!(s["self"]["depth"], 1);
+    assert!(s["self"]["nodeId"].is_null() && s["serving"].is_null(), "{s}");
+    assert!(!d.dir.join("community").join("key.pem").exists());
+    let me = Identity::load_or_create(&d.dir.join("community")).unwrap().key;
+    let s = d.client.status_json();
+    assert_eq!(s["self"]["nodeId"], kuroshio_community::util::hex(&me.kid));
+    assert_eq!(s["self"]["fingerprint"], me.fingerprint());
     // 解析跟 3.3.7 一樣：固定 + 自動；路徑檢查照樣有「一般 DNS 被…接走」的提醒
     assert_eq!(ids(&d.mgr), own_ids());
     assert!(d.mgr.chain().is_none());
@@ -451,6 +460,12 @@ async fn detects_verifies_and_chains_automatically() {
         assert_eq!(regs[0].peer, "127.0.0.1");
         assert_eq!(regs[0].tok, vec![7; 16]);
         assert!(regs[0].local, "127.0.0.1 是這台自己的位址：沒有經過 NAT");
+        // 3.5.0 E13（chain_self_node_id_matches_what_upstream_sees）：自己的節點 ID 就是上游看到的那一個
+        let s = d.client.status_json();
+        assert_eq!(s["self"]["nodeId"], kuroshio_community::util::hex(&regs[0].kid), "{s}");
+        assert_eq!(s["self"]["depth"], s["upstream"]["depth"]);
+        assert_eq!(s["self"]["depth"], 2);
+        assert_eq!(s["self"]["version"], env!("CARGO_PKG_VERSION"));
     }
     assert!(d.dir.join("community").join("key.pem").exists());
     assert!(d.client.key_change_warning(kuroshio_community::util::now_ms()).is_none());

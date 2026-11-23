@@ -1138,6 +1138,12 @@ fn e2e_three_layers() {
         .map(|x| x.as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, vec![a.node_id().unwrap(), b.node_id().unwrap()], "鏈從最上層排到 B：A、B");
+    // 3.5.0 E13：每一台的 self 跟別台看到的對得起來
+    let (sa, sb) = (a.chain()["self"].clone(), b.chain()["self"].clone());
+    assert_eq!((sa["nodeId"].as_str(), sa["depth"].as_u64()), (a.node_id().as_deref(), Some(1)));
+    assert_eq!(sb["nodeId"].as_str(), b.node_id().as_deref());
+    assert_eq!(sb["depth"], 2);
+    assert_eq!(st["self"]["depth"], 3);
     assert_eq!(c.resolve(other_client()), Some((0, vec![VIA_UPSTREAM])), "查詢經 B 到 A");
     drop((c, b, a));
     cleanup(&dir);
