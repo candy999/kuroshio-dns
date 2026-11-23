@@ -498,8 +498,9 @@ pub struct Cross {
     pub ms: Num,
     #[serde(default, skip_serializing_if = "Num::is_absent")]
     pub orig_ms: Num,
-    /// 實測分數（3.5.0 B4）：換過去那一家／原站的「連線＋握手＋TTFB」（毫秒；各取兩次裡比較小的）。
-    /// 判定失敗時兩個都有＝「連線比較近，但整個請求沒有比較快」
+    /// 實測分數（3.5.0 B4）：換過去那一家／原站的握手時間（3.5.0 F13 起是「連線＋TLS 握手」，不含 TTFB；
+    /// 之前存的是「連線＋握手＋TTFB」，下一次每日複驗時被新的值蓋掉）（毫秒；各取兩次裡比較小的）。
+    /// 判定失敗時兩個都有＝「連線比較近，但握手沒有比較快」
     #[serde(default, skip_serializing_if = "Num::is_absent")]
     pub score: Num,
     #[serde(default, skip_serializing_if = "Num::is_absent")]
@@ -2026,7 +2027,7 @@ impl Db {
     /// 跨 CDN 統計：試了幾個、成功幾個、各轉去哪一家
     pub fn cross_summary(&self) -> Value {
         let (mut explored, mut ok, mut fail, mut none) = (0u32, 0u32, 0u32, 0u32);
-        // 連線比較近、但整個請求沒有比較快而沒有採用的（3.5.0 B4）
+        // 連線比較近、但握手沒有比較快而沒有採用的（3.5.0 B4、F13）
         let mut score_rejected = 0u32;
         let mut by_to: IndexMap<String, u32> = IndexMap::new();
         let mut by_from: IndexMap<String, (u32, u32)> = IndexMap::new();
