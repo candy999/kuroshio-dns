@@ -972,9 +972,13 @@ impl Resolver {
     /// 10 分鐘 1 個、24 小時 24 個、每個節點一次，`cdn.lite` 30 分鐘 1 個、8 個；`cdn.popAudit` 關、記憶體壓力時回 None），
     /// 用健檢同一個探測（那家 CDN 的 `probe` 路徑）拿到機房、交給 `Cdn::note_local_pop()` 比對。
     /// 不動答案抽查的可疑計數、不解除串接（機房不同是線路拓樸，不是不可信）
+    ///
+    /// 3.5.0 F7：拿到名額、但答案的 IP 不是待確認的節點時，`pop_audit_wanted()` 改回（CDN, 待確認的前幾名節點），
+    /// 量回傳的那個節點（[`AuditTarget`]：舊的回傳只有 CDN 名稱時照舊量答案的 IP）
     async fn pop_audit(&self, ip: IpAddr) {
         let Some(cdn) = self.cdn() else { return };
-        let Some(provider) = cdn.pop_audit_wanted(ip) else { return };
+        let Some(t) = cdn.pop_audit_wanted(ip) else { return };
+        let (provider, ip) = t.target(ip);
         let Some((prov, (host, path))) = kuroshio_cdn::providers::get(provider).and_then(|p| Some((p, p.probe?))) else {
             return;
         };
@@ -1506,6 +1510,25 @@ fn answered_ok(up: &Up, class: Class) -> bool {
     }
 }
 
+/// `Cdn::pop_audit_wanted()` 的回傳（3.5.0 F7）：只有 CDN 名稱（E4：量答案的那個 IP），
+/// 或（CDN, 要量的節點 IP）（F7：答案的 IP 不是待確認的節點時，改量待確認的前幾名節點）。兩種都接，CDN 那一層改了這邊不用跟著改
+pub trait AuditTarget {
+    /// （CDN 名稱, 要量的 IP）；`answer_ip` 是答案抽查通過的那個 IP
+    fn target(self, answer_ip: IpAddr) -> (&'static str, IpAddr);
+}
+
+impl AuditTarget for &'static str {
+    fn target(self, answer_ip: IpAddr) -> (&'static str, IpAddr) {
+        (self, answer_ip)
+    }
+}
+
+impl AuditTarget for (&'static str, IpAddr) {
+    fn target(self, _answer_ip: IpAddr) -> (&'static str, IpAddr) {
+        self
+    }
+}
+
 /// 一輪詢問最多追蹤幾台上游有沒有回來（3.5.0 F4；`ask()` 裡的位元遮罩是 32 位元）。
 /// 一輪的上游超過這個數時，後面的不記「來不及回答」（照 3.4.x 的記法）
 const LATE_TRACK: usize = 32;
@@ -1663,6 +1686,15 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.5.0 F7：機房抽查量的 IP：CDN 那一層只回名稱時量答案的 IP；回（CDN, 節點 IP）時量那個節點
+    #[test]
+    fn pop_audit_target_uses_returned_node() {
+        let answer: IpAddr = "192.0.2.10".parse().unwrap();
+        let node: IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!("cloudflare".target(answer), ("cloudflare", answer));
+        assert_eq!(("cloudflare", node).target(answer), ("cloudflare", node));
+    }
 
     /// 3.4.3：下游黑潮自己關掉 CDN 置換時，問上游黑潮的查詢帶著私有選項；上游看到就照原樣回答
     #[test]

@@ -1086,7 +1086,12 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
             let Some(n) = name else { return bad("需要 name", 400) };
             let fam = if q.get("family").map(String::as_str) == Some("6") { 6 } else { 4 };
             match c.verify_now(&n, fam).await {
-                Some((err, v)) => ok(json!({ "result": v, "error": err, "entry": c.domain(&n) })),
+                // 3.5.0 F9：這一次驗證的握手分數（`score`、`origScore`、`weighted`、`slower`、`state`、`confirmAfter`）
+                // 只放在回應裡、不存檔；CDN 那一層把它放在回傳值的 `speed`，這裡搬到最上層（沒有是 null）
+                Some((err, v)) => {
+                    let speed = v.get("speed").cloned().unwrap_or(Value::Null);
+                    ok(json!({ "result": v, "error": err, "entry": c.domain(&n), "speed": speed }))
+                }
                 None => bad("資料庫裡沒有這個網域（先查詢一次）", 404),
             }
         }
