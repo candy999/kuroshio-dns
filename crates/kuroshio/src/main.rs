@@ -1381,7 +1381,10 @@ fn sysinfo_report(config: &std::path::Path, uci: bool) -> Result<()> {
     );
     let user = user_config(config, uci)?;
     println!("依 CPU 核心數（resolver.parallel、cdn.verifyPerMin 另看 AES 指令）換算的設定（你在設定檔寫了的以你的為準）：");
-    let keys = kuroshio_config::PER_CORE.iter().map(|x| x.0).chain(["resolver.parallel", "cdn.verifyPerMin"]);
+    let keys = kuroshio_config::PER_CORE
+        .iter()
+        .map(|x| x.0)
+        .chain(["resolver.parallel", "cdn.verifyPerMin"]);
     for k in keys {
         let mine = kuroshio_config::num_or_auto(kuroshio_config::get(&user, k)).is_some();
         println!(
