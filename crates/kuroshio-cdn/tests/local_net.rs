@@ -152,6 +152,51 @@ async fn probes_against_local_servers() {
     assert!(mbps > 1.0 && mbps < 1000.0, "{mbps}");
 }
 
+/// 3.5.0（B1、B2 的量測基礎）：探測與測速在同一條連線上順便記分段時間，不多連線
+#[tokio::test]
+async fn probe_result_splits_connect_tls_ttfb() {
+    let port = free_port(&["127.0.0.1"]).await;
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    https_server(addr, server_cfg(&["untrusted.test"], false), |_, _| http("200 OK", &[], "ok")).await;
+    let opts = HttpsOpts {
+        verify: false,
+        ..Default::default()
+    };
+    let r = probe::https_probe(addr, "untrusted.test", "/", &opts).await;
+    assert!(r.ok, "{r:?}");
+    let t = r.timing;
+    assert!(t.measured() && t.connect_ms > 0.0 && t.tls_ms > 0.0 && t.ttfb_ms > 0.0, "{t:?}");
+    let sum = t.request_ms().unwrap();
+    assert!(sum <= r.ms + 0.5, "分段加起來不超過整體：{t:?} / {}", r.ms);
+    // 失敗的探測沒有分段時間（不能拿半套的數字去評分）
+    let bad = probe::https_probe(addr, "untrusted.test", "/", &HttpsOpts::default()).await;
+    assert!(!bad.ok && !bad.timing.measured() && bad.timing.request_ms().is_none(), "{bad:?}");
+
+    // 測速樣本：位元組數、傳輸時間、連線、TTFB 都來自同一次下載
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hp = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        read_req(&mut s).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4194304\r\n\r\n").await;
+        let chunk = vec![7u8; 1 << 20];
+        for _ in 0..4 {
+            if s.write_all(&chunk).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+    });
+    let s = probe::download_sample(ip("127.0.0.1"), Some(hp), "http://speed.example.com/x", 2000, 2 << 20).await;
+    assert!(s.bytes >= 2 << 20 && s.bytes < 4 << 20, "收滿上限就停：{s:?}");
+    assert!(s.secs > 0.05 && s.mbps > 1.0, "{s:?}");
+    assert!(s.connect_ms > 0.0 && s.ttfb_ms >= 35.0, "伺服器 40 ms 後才回標頭：{s:?}");
+    // 連不上：全部是 0
+    let dead = probe::download_sample(ip("127.0.0.1"), Some(1), "http://speed.example.com/x", 200, 1 << 20).await;
+    assert_eq!(dead, Default::default());
+}
+
 #[tokio::test]
 async fn verify_and_rewrite_end_to_end() {
     // 127.0.0.1 = 網站原本的節點（日本）、127.0.0.2 = 台灣節點、127.0.0.3 = 憑證不是這個網站的

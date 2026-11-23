@@ -852,3 +852,12 @@ fn cdn_multi_cdn_and_app_layer_from_uci() {
     assert_eq!(g(&c, "cdn.multiCdn"), &json!(false));
     assert_eq!(g(&c, "cdn.appLayer"), &json!(false));
 }
+
+/// 3.5.0 B1：`pool.relativeSpeed` 預設開；UCI 的 `config pool` `option relative_speed '0'` 回到 3.4.x 的測速規則
+#[test]
+fn pool_relative_speed_from_uci() {
+    let c = load("config pool 'pool'\n", &env());
+    assert_eq!(g(&c, "pool.relativeSpeed"), &json!(true));
+    let c = load("config pool 'pool'\n\toption relative_speed '0'\n", &env());
+    assert_eq!(g(&c, "pool.relativeSpeed"), &json!(false));
+}

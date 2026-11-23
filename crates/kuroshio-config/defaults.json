@@ -531,6 +531,7 @@
     "poolSize": 12,
     "speedTop": 16,
     "speedSeconds": 5,
+    "relativeSpeed": true,
     "latencyConcurrency": "auto",
     "probeConcurrency": "auto",
     "nearestProbeTop": 1500,

@@ -6,7 +6,7 @@
 use crate::cidr::CidrSet;
 use crate::config::CdnConfig;
 use crate::providers::{self, is_tw_pop};
-use crate::util::{self, de_ip, de_opt_arc, de_opt_bool, de_opt_u64, now_ms, ser_opt_arc, Extra, Num};
+use crate::util::{self, de_ip, de_opt_arc, de_opt_bool, de_opt_u64, de_u64, now_ms, ser_opt_arc, Extra, Num};
 use crate::v6store::V6Store;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -61,8 +61,56 @@ pub struct PoolNode {
     pub peak_loss: Num,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_u64")]
     pub peak_at: Option<u64>,
+    /// 相對評分的「慢」（3.5.0 B1）：跟同一家其他節點比，由節點池工作算好存下來。
+    /// 沒有這個欄位（舊的 `pools.json`、沒量到速度的節點）沿用舊規則：量到的速度低於 1 MB/s 算慢
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_bool")]
+    pub slow: Option<bool>,
+    /// 測速的量測樣本（3.5.0：B1 的誤差範圍、B2 工作負載分數的量測基礎；只有量過速度的節點才有）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<Box<NodeSample>>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+/// 節點的量測樣本（全部來自既有的那一次下載測速，不多連線、不多收資料）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSample {
+    /// 收到的位元組數（上限 8 MiB；快測 1 MiB）
+    #[serde(default, deserialize_with = "de_u64")]
+    pub bytes: u64,
+    /// 收內容花的秒數
+    #[serde(default, skip_serializing_if = "Num::is_absent")]
+    pub secs: Num,
+    /// 連線＋握手（毫秒）
+    #[serde(default, skip_serializing_if = "Num::is_absent")]
+    pub connect_ms: Num,
+    /// 送出請求到收完標頭（毫秒，TTFB）
+    #[serde(default, skip_serializing_if = "Num::is_absent")]
+    pub ttfb_ms: Num,
+    /// 快測（量到瓶頸之後只收 1 MiB 確認不慢）：`speed` 記的是瓶頸的速度，不是這個節點自己量到的
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_bool")]
+    pub quick: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl NodeSample {
+    pub fn of(s: &kuroshio_net::probe::SpeedSample, quick: bool) -> NodeSample {
+        let ms = |v: f64| if v > 0.0 { Num::V(util::round(v, 1)) } else { Num::Absent };
+        NodeSample {
+            bytes: s.bytes,
+            secs: if s.secs > 0.0 {
+                Num::V(util::round(s.secs, 3))
+            } else {
+                Num::Absent
+            },
+            connect_ms: ms(s.connect_ms),
+            ttfb_ms: ms(s.ttfb_ms),
+            quick: quick.then_some(true),
+            extra: Extra::default(),
+        }
+    }
 }
 
 impl PoolNode {
@@ -81,8 +129,15 @@ impl PoolNode {
             peak_jitter: Num::Absent,
             peak_loss: Num::Absent,
             peak_at: None,
+            slow: None,
+            sample: None,
             extra: Extra::default(),
         }
+    }
+
+    /// 慢不慢：有相對評分的旗標就用它；沒有（舊資料）沿用舊規則。None = 沒量過速度
+    pub fn is_slow(&self) -> Option<bool> {
+        self.slow.or_else(|| self.speed.get().map(|s| s < crate::speed::LEGACY_SLOW_MBPS))
     }
 
     pub fn pop_str(&self) -> &str {
@@ -117,8 +172,14 @@ pub fn qscore_of(ms: Num, jitter: Num, loss: Num, speed: Num) -> f64 {
     ms + 2.0 * jitter.or(0.0) + 400.0 * loss.or(0.0) + if slow { 80.0 } else { 0.0 }
 }
 
+/// 同 [`qscore_of`]，「慢」由呼叫端算好傳進來（3.5.0 B1 的相對評分）
+pub fn qscore_rel(ms: Num, jitter: Num, loss: Num, slow: bool) -> f64 {
+    // 速度只用來決定要不要加懲罰：借 `qscore_of` 的舊門檻表示（慢 = 0，不慢 = 沒量）
+    qscore_of(ms, jitter, loss, if slow { Num::V(0.0) } else { Num::Absent })
+}
+
 pub fn qscore(x: &PoolNode) -> f64 {
-    qscore_of(x.ms, x.jitter, x.loss, x.speed)
+    qscore_rel(x.ms, x.jitter, x.loss, x.is_slow() == Some(true))
 }
 
 /// 加上尖峰時段權重的分數：有 3 天內的尖峰量測時，（平時 + w × 尖峰）/（1 + w）
@@ -127,7 +188,7 @@ pub fn weighted_qscore(x: &PoolNode, w: f64, now: u64) -> f64 {
     if !x.peak_fresh(now) || w <= 0.0 {
         return s;
     }
-    let sp = qscore_of(x.peak_ms, x.peak_jitter, x.peak_loss, x.speed);
+    let sp = qscore_rel(x.peak_ms, x.peak_jitter, x.peak_loss, x.is_slow() == Some(true));
     if !s.is_finite() || !sp.is_finite() {
         return s.max(sp);
     }
@@ -833,15 +894,16 @@ impl Pools {
             }
             let pop = pop3(x.pop_str());
             let sc = node_score(x);
-            let speed = x.speed.get();
+            // 慢不慢：相對評分的旗標（3.5.0 B1），舊資料沿用 1 MB/s
+            let slow = x.is_slow();
             match best.get_mut(&pop) {
                 Some(b) if sc >= b.0 => {
-                    if speed.map(|s| s >= 1.0).unwrap_or(false) {
+                    if slow == Some(false) {
                         b.1 = false;
                     }
                 }
                 _ => {
-                    best.insert(pop, (sc, speed.map(|s| s < 1.0).unwrap_or(false)));
+                    best.insert(pop, (sc, slow == Some(true)));
                 }
             }
         }
@@ -1163,6 +1225,8 @@ impl Pools {
                 name.to_string(),
                 json!({
                     "v4": list(&d.pool4), "v6": list(&d.pool6),
+                    // 這一次節點池工作的參考速度（MB/s，3.5.0 B1）：節點的 `slow` 是跟它比出來的
+                    "speedRef": d.rest.get("speedRef"),
                     "scan": { "tw": d.tw.v4_len(), "global": d.global.v4_len(), "dead": d.dead.v4_len() },
                     "ranges": { "v4": d.range4.v4_len(), "v6": d.range6.v6_len() },
                 }),

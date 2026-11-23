@@ -10,6 +10,7 @@ mod parity;
 mod queue;
 mod selftest;
 mod share;
+mod speed;
 mod state;
 
 use crate::cdn::{Cdn, Paths};
@@ -35,6 +36,8 @@ pub struct MockNet {
     pub ping: Mutex<F<IpAddr, Latency>>,
     pub quality: Mutex<F<IpAddr, Quality>>,
     pub speed: Mutex<F<IpAddr, f64>>,
+    /// 測速樣本（IP，最多收幾個位元組）；沒設就用 `speed` 的速度回推
+    pub sample: Mutex<Option<F<(IpAddr, u64), kuroshio_net::probe::SpeedSample>>>,
     /// （解析器，名稱，類型，ECS）→ 回應
     pub dns: Mutex<F<DnsArgs, Option<Message>>>,
     pub cache: Mutex<HashMap<IpAddr, Latency>>,
@@ -58,6 +61,7 @@ pub fn resp(status: u16, headers: &[(&str, &str)], body: &str) -> ProbeResult {
         ms: 5.0,
         error: None,
         tls_error: false,
+        timing: Default::default(),
     }
 }
 
@@ -81,6 +85,7 @@ impl MockNet {
                 n: 1,
             })),
             speed: Mutex::new(Box::new(|_| 0.0)),
+            sample: Mutex::new(None),
             dns: Mutex::new(Box::new(|_| None)),
             cache: Mutex::new(HashMap::new()),
             hosts: Mutex::new(HashMap::new()),
@@ -104,6 +109,9 @@ impl MockNet {
     }
     pub fn on_speed(&self, f: impl Fn(IpAddr) -> f64 + Send + Sync + 'static) {
         *self.speed.lock().unwrap() = Box::new(f);
+    }
+    pub fn on_sample(&self, f: impl Fn(IpAddr, u64) -> kuroshio_net::probe::SpeedSample + Send + Sync + 'static) {
+        *self.sample.lock().unwrap() = Some(Box::new(move |(ip, max)| f(ip, max)));
     }
     pub fn on_dns(&self, f: impl Fn(&str, &str, u16, Option<(IpAddr, u8)>) -> Option<Message> + Send + Sync + 'static) {
         *self.dns.lock().unwrap() = Box::new(move |(r, n, t, e)| f(&r, &n, t, e));
@@ -133,6 +141,14 @@ impl Net for MockNet {
     fn download_speed<'a>(&'a self, ip: IpAddr, _url: &'a str, _max: u64, max_bytes: u64) -> BoxFut<'a, f64> {
         self.note(format!("speed {ip} {max_bytes}"));
         let r = (self.speed.lock().unwrap())(ip);
+        Box::pin(async move { r })
+    }
+    fn download_sample<'a>(&'a self, ip: IpAddr, _url: &'a str, _max: u64, max_bytes: u64) -> BoxFut<'a, kuroshio_net::probe::SpeedSample> {
+        self.note(format!("speed {ip} {max_bytes}"));
+        let r = match self.sample.lock().unwrap().as_ref() {
+            Some(f) => f((ip, max_bytes)),
+            None => kuroshio_net::probe::SpeedSample::from_mbps((self.speed.lock().unwrap())(ip), max_bytes),
+        };
         Box::pin(async move { r })
     }
     fn tcp_ping(&self, ip: IpAddr, _t: Duration, _s: u32) -> BoxFut<'_, Latency> {

@@ -301,6 +301,10 @@ return view.extend({
 		num('pool_size', _('節點池大小'), 'pool.poolSize');
 		num('speed_top', _('取前幾名測下載速度'), 'pool.speedTop');
 		num('speed_seconds', _('每次下載測速秒數'), 'pool.speedSeconds');
+		o = s.option(form.Flag, 'relative_speed', _('測速用相對評分'),
+			_('節點慢不慢跟同一家其他節點比（低於中位數的一半才算慢），「幾乎一樣」的範圍依實際傳輸時間決定，速度分不出來的節點由延遲決定名次。關掉＝3.4.x：低於 1 MB/s 算慢、5% 以內才算一樣、直接比速度。'));
+		o.default = common.def('pool.relativeSpeed') === false ? '0' : '1';
+		o.rmempty = false;
 
 		// ---------------- 評測名單檔案 ----------------
 		s = m.section(form.NamedSection, 'benchmark', 'benchmark', _('評測名單'), _('修改後下一次評測生效，可以到狀態頁「立即執行」DNS 評測。'));

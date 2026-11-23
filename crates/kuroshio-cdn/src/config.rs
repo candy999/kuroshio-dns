@@ -274,6 +274,9 @@ pub struct JobsConfig {
     pub pool_size: usize,
     pub speed_top: usize,
     pub speed_seconds: u64,
+    /// 測速的相對評分（3.5.0 B1，`pool.relativeSpeed`，預設開）：慢不慢跟同一家其他節點比、誤差範圍依傳輸時間、
+    /// 排序先分級。關掉＝3.4.x（絕對的 1 MB/s、5% 門檻、直接比速度）
+    pub relative_speed: bool,
     pub nearest_probe_top: usize,
     pub nearest_pops: usize,
     pub nearest_keep_pops: usize,
@@ -295,6 +298,7 @@ impl JobsConfig {
             pool_size: or(cfg, "pool.poolSize", 12.0) as usize,
             speed_top: or(cfg, "pool.speedTop", 16.0) as usize,
             speed_seconds: or(cfg, "pool.speedSeconds", 5.0) as u64,
+            relative_speed: lite_value(kuroshio_config::get(cfg, "pool.relativeSpeed")) != Some(false),
             nearest_probe_top: or(cfg, "pool.nearestProbeTop", 1500.0) as usize,
             nearest_pops: or(cfg, "pool.nearestPops", 6.0) as usize,
             nearest_keep_pops: or(cfg, "pool.nearestKeepPops", 5.0) as usize,

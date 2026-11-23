@@ -613,7 +613,8 @@
             { "key": "pool.candidatesPerProvider", "type": "int", "label": "每家 CDN 候選 IP 數", "min": 1 },
             { "key": "pool.poolSize", "type": "int", "label": "節點池大小", "min": 1 },
             { "key": "pool.speedTop", "type": "int", "label": "取前幾名測下載速度", "min": 0 },
-            { "key": "pool.speedSeconds", "type": "int", "label": "每次下載測速秒數", "min": 1 }
+            { "key": "pool.speedSeconds", "type": "int", "label": "每次下載測速秒數", "min": 1 },
+            { "key": "pool.relativeSpeed", "type": "bool", "label": "測速用相對評分", "help": "節點慢不慢跟同一家其他節點比（低於中位數的一半才算慢），「幾乎一樣」的範圍依實際傳輸時間決定，速度分不出來的節點由延遲決定名次。關掉＝3.4.x：低於 1 MB/s 算慢、5% 以內才算一樣、直接比速度。" }
           ]
         }
       ]

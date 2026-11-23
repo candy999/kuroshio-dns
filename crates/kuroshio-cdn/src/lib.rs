@@ -20,6 +20,7 @@ pub mod net;
 pub mod optimizer;
 pub mod pools;
 pub mod providers;
+pub mod speed;
 pub mod statefile;
 pub mod svcb;
 pub mod util;

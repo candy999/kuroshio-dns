@@ -693,6 +693,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `benchmark.concurrency` | 每日評測同時測幾個候選 |
 | `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
 | `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`（UCI 是 `config cdn` 的 `option lite '1'`／`'0'`）。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped`（都是次數：還沒驗證完的網域每查一次就再算一次，不是網域數） |
+| `pool.relativeSpeed` | 3.5.0：節點測速用相對評分（預設 `true`；UCI 是 `config pool` 的 `option relative_speed '0'`／`'1'`）。關掉＝3.4.x：低於 1 MB/s 算慢、差 5% 以內才算瓶頸、直接比速度 |
 | `cdn.multiCdn` | 3.5.0：尊重多來源 CDN、第一層 CNAME 變了就失效（預設 `true`；UCI 是 `config cdn` 的 `option multi_cdn '0'`／`'1'`）。關掉＝3.4.x：每個網域只記一家、業者欄位直接改寫 |
 | `cdn.appLayer` | 3.5.0：App 自己選節點的服務（目前 Google、Apple）只辨識、不改寫（預設 `true`；UCI 是 `option app_layer`） |
 | `cdn.dbDiskBudgetKB` | 3.5.0：CDN 網域資料在磁碟上的預算。`auto`（預設：狀態目錄所在的檔案系統小於 64 MB 時用總容量的 30%，64 MB 以上或讀不到大小時不限）／數字（KB，下限 512）／`0`（不限）。UCI 是 `config cdn` 的 `option db_disk_budget_kb`。超過時在背景分批淘汰最久沒用的網域（一天內查過的、手動設定策略的不動），不會一次重寫全部分片。狀態：`cdn.dbBudgetKB`、`dbBudgetEntries`、`dbEntries`、`dbDiskKB`（實際）、`dbDiskEstKB`、`prunedForBudget` |
@@ -752,5 +753,9 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   - `provs`：最近看到的業者，最多 3 個：`[{ "provider": "cloudfront", "lastSeen": 毫秒, "verified": true }]`。`verified: true` 是有自己一格驗證結果的（最多兩家），`false` 是沒有格子、照原始答案回的。
   - `/api/cdn/domain` 的 `src`：原始的來源紀錄（`alt` 是另一家的那一格：`provider`、`v4`、`v6`、`base`、`last`；`seen`、`pend` 是第一層 CNAME 的防抖動狀態；`multiAt`、`invalAt`、`slotAt` 是毫秒時間）。這些欄位 3.4.x 讀到會原樣保留。
   - `/api/status` 的 `cdn.stats`：`srcInvalidated`（來源變了而清掉跨 CDN／ECS 的次數）、`multiHeld`（多來源沒有格子、照原始答案回的次數）、`appLayer`（App 層不改寫的次數）。
+- **節點池的測速欄位**（3.5.0）：`GET /api/cdn/pools` 每家多 `speedRef`（這一次節點池工作量到速度的節點的中位數，MB/s；量到的不到 3 個時是 `null`），每個節點多：
+  - `slow`：`true`／`false`＝相對評分的結果（連加上誤差範圍都不到 `speedRef` 的一半、或低於 0.1 MB/s）；沒有這個欄位＝沒量過速度，或舊資料（那時照舊規則：`speed` 低於 1 MB/s 算慢）。
+  - `sample`：`{ "bytes": 8388608, "secs": 0.144, "connectMs": 4.1, "ttfbMs": 9.3, "quick": true }`——那一次下載收到的位元組數、收內容的秒數、連線（含 TLS 握手）與送出請求到收完標頭的毫秒數；`quick` 是量到瓶頸之後只收 1 MiB 的快測（這時節點的 `speed` 記的是瓶頸的速度）。這些是 3.6 工作負載分數的量測基礎，3.5.0 只收集、不參與排序。
+  - 3.4.x 讀到這些欄位會原樣保留。
 - **通訊類網域**（3.5.0）：推播服務的網域（內建 Apple 推播、Firebase 雲端訊息；`resolver.keepNames` 自己加，最多 64 個後綴）不被訂閱清單誤擋（`filter.protectComm`，預設開；自訂規則照樣優先，`/api/filter/check` 的 `rule` 是 `builtin-comm`）、快到期就預取（同時最多 16 個）、記憶體控制縮快取時優先留下、不換到別家 CDN。`/api/status` 的 `comm` 有內建與自己加的數量、預取中的數量；`filter.commSpared` 是清單本來要擋、照樣放行的次數（每天第一次會記一行 INFO，寫明是哪份清單，方便回報給清單維護者）。
 
