@@ -497,6 +497,11 @@ pub struct Audit {
     probe_times: VecDeque<u64>,
     /// 已經抽查過的節點（每個節點只量一次；量不到機房的也不再問）
     asked: VecDeque<IpAddr>,
+    /// 3.5.0 F7：拿到名額時答案的 IP 不是待確認的節點，改挑一個待確認的前幾名——各家、各位址族輪流（下一次從哪一組開始）
+    rr: u32,
+    /// 拿到名額、但已經沒有要量的（前幾名都確認了）
+    no_target: u32,
+    last_probe_at: u64,
 }
 
 impl Audit {
@@ -535,11 +540,8 @@ impl Audit {
         now < self.unreliable_until
     }
 
-    /// 要不要用一個抽查名額量這個節點（10 分鐘 1 個、24 小時 24 個、每個節點一次；`lite` 30 分鐘 1 個、8 個）
-    pub fn take_slot(&mut self, ip: IpAddr, now: u64, lite: bool) -> bool {
-        if self.asked.contains(&ip) {
-            return false;
-        }
+    /// 現在有沒有抽查名額（不用掉）：10 分鐘 1 個、24 小時 24 個（`lite` 30 分鐘 1 個、8 個）
+    pub fn slot_free(&mut self, now: u64, lite: bool) -> bool {
         while self.probe_times.front().is_some_and(|t| now.saturating_sub(*t) >= DAY_MS) {
             self.probe_times.pop_front();
         }
@@ -548,10 +550,20 @@ impl Audit {
         } else {
             (AUDIT_GAP_MS, AUDIT_DAY_MAX)
         };
-        if self.probe_times.len() >= max || self.probe_times.back().is_some_and(|t| now.saturating_sub(*t) < gap) {
+        self.probe_times.len() < max && !self.probe_times.back().is_some_and(|t| now.saturating_sub(*t) < gap)
+    }
+
+    pub fn asked(&self, ip: IpAddr) -> bool {
+        self.asked.contains(&ip)
+    }
+
+    /// 要不要用一個抽查名額量這個節點（10 分鐘 1 個、24 小時 24 個、每個節點一次；`lite` 30 分鐘 1 個、8 個）
+    pub fn take_slot(&mut self, ip: IpAddr, now: u64, lite: bool) -> bool {
+        if self.asked.contains(&ip) || !self.slot_free(now, lite) {
             return false;
         }
         self.probe_times.push_back(now);
+        self.last_probe_at = now;
         self.probes = self.probes.saturating_add(1);
         if self.asked.len() >= AUDIT_ASKED_MAX {
             self.asked.pop_front();
@@ -855,6 +867,21 @@ impl Line {
     }
 }
 
+/// 前幾名（每一家、每個位址族排在前 `serve_count` 名）裡還在等確認（`upPop`）的節點數（3.5.0 F7 的 `pendingServed`）
+fn pending_served(pools: &Pools) -> usize {
+    let mut n = 0;
+    for (name, d) in &pools.p {
+        for fam in [4u8, 6] {
+            n += pools
+                .serve_ips(name, fam)
+                .into_iter()
+                .filter(|ip| d.pool(fam).iter().any(|x| x.ip == *ip && x.up_pop().is_some()))
+                .count();
+        }
+    }
+    n
+}
+
 /// 節點池工作換上新的節點池之前（3.5.0 E4）：舊池裡還在等確認（`upPop`）的節點，這次節點池工作在本機量到了
 /// （新節點是重新建的、沒有 `upPop`）就比對、計數。保留舊節點池時（節點照舊、`upPop` 還在）不算
 pub(crate) fn audit_rebuilt(st: &mut crate::cdn::State, name: &str, pool4: &[PoolNode], pool6: &[PoolNode], now: u64) {
@@ -979,6 +1006,9 @@ impl Cdn {
             "enabled": cfg.pop_audit, "pending": reach.pending, "confirmed": l.audit.confirmed, "mismatch": l.audit.mismatch,
             "probes24h": l.audit.probes_24h(now), "lastMismatchAt": ms_or_null(l.audit.mismatch_at),
             "chainPopUnreliable": l.audit.unreliable(now),
+            // 3.5.0 F7：前幾名（解除串接後馬上會回給裝置的）裡還沒確認的、最近一次抽查、拿到名額卻沒有要量的
+            "pendingServed": pending_served(&st.pools), "lastProbeAt": ms_or_null(l.audit.last_probe_at),
+            "noTarget": l.audit.no_target,
         });
         let fuse = l.fuse.until(now);
         drop(st);
@@ -1028,29 +1058,71 @@ impl Cdn {
 
     /// 串接中的機房抽查（E4）：這個 IP 是節點池裡上游宣稱機房（`upPop`）還沒確認的節點、而且還有抽查名額時，
     /// 回那家 CDN 的名稱；呼叫端用同一個抽查名額對它做一次機房探測，結果交給 [`Cdn::note_local_pop`]。
+    /// 3.5.0 F7 之前的介面：答案的 IP 不是待確認的節點時不量別的（名額沒有對象）；新的呼叫端用 [`Cdn::pop_audit_pick`]。
     ///
     /// 名額：10 分鐘 1 個、24 小時 24 個、每個節點一次（`cdn.lite`：30 分鐘 1 個、8 個）。
     /// `cdn.popAudit` 關、CDN 關、系統時間沒對時、記憶體壓力不是 `Normal` 時一律不抽查。
     /// 回 `Some` 就算用掉一個名額（探測失敗也不還）
     pub fn pop_audit_wanted(&self, ip: IpAddr) -> Option<&'static str> {
+        self.pop_audit_take(ip, false).map(|x| x.0)
+    }
+
+    /// 串接中的機房抽查（E4；3.5.0 F7）：回（CDN，要量的節點 IP），呼叫端量回傳的那個 IP。
+    /// 1. 答案的 IP 是待確認的節點 → 量它（同 [`Cdn::pop_audit_wanted`]）。
+    /// 2. 不是 → 從節點池挑一個待確認的：每一家、每個位址族排在前 `serve_count` 名的（解除串接後馬上會回給裝置的），
+    ///    各家、各位址族輪流。
+    /// 3. 前幾名都確認了 → 不挑（`noTarget` 加 1；剩下的是排在後面的節點，解除串接後由健檢一次量完）。
+    ///
+    /// 名額完全不變（同 [`Cdn::pop_audit_wanted`]）；呼叫端照舊要先有一次答案抽查通過（沒有查詢就沒有探測）
+    pub fn pop_audit_pick(&self, ip: IpAddr) -> Option<(&'static str, IpAddr)> {
+        self.pop_audit_take(ip, true)
+    }
+
+    fn pop_audit_take(&self, ip: IpAddr, other: bool) -> Option<(&'static str, IpAddr)> {
         if !self.cfg.enabled || !self.cfg.pop_audit || !kuroshio_net::clock::synced() || !self.line_env().memory_normal {
             return None;
         }
         let ip = unmap(ip);
         let family = if ip.is_ipv6() { 6 } else { 4 };
         let now = now_ms();
+        let lite = self.cfg.lite;
         let mut st = self.state();
         let st = &mut *st;
-        let name = st
+        let own = st
             .pools
             .p
             .iter()
             .find(|(_, d)| d.pool(family).iter().any(|x| x.ip == ip && x.up_pop().is_some()))
-            .map(|(n, _)| *n)?;
-        if !st.line.audit.take_slot(ip, now, self.cfg.lite) {
+            .map(|(n, _)| *n);
+        if let Some(name) = own.filter(|_| !st.line.audit.asked(ip)) {
+            if !st.line.audit.take_slot(ip, now, lite) {
+                return None;
+            }
+            return providers::get(name).map(|p| (p.name, ip));
+        }
+        if !other || !st.line.audit.slot_free(now, lite) {
             return None;
         }
-        providers::get(name).map(|p| p.name)
+        let pairs: Vec<(&str, u8)> = st.pools.p.keys().flat_map(|n| [(*n, 4u8), (*n, 6u8)]).collect();
+        let n = pairs.len();
+        let start = st.line.audit.rr as usize;
+        for k in 0..n {
+            let (name, fam) = pairs[(start + k) % n];
+            let Some(d) = st.pools.p.get(name) else { continue };
+            let target = st
+                .pools
+                .serve_ips(name, fam)
+                .into_iter()
+                .find(|x| !st.line.audit.asked(*x) && d.pool(fam).iter().any(|y| y.ip == *x && y.up_pop().is_some()));
+            let Some(target) = target else { continue };
+            if !st.line.audit.take_slot(target, now, lite) {
+                return None;
+            }
+            st.line.audit.rr = ((start + k + 1) % n) as u32;
+            return providers::get(name).map(|p| (p.name, target));
+        }
+        st.line.audit.no_target = st.line.audit.no_target.saturating_add(1);
+        None
     }
 
     /// 本機量到某個節點的機房（E4）：只處理上游宣稱機房（`upPop`）還沒確認的節點——

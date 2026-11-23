@@ -386,6 +386,130 @@ fn chained_pop_probe_uses_audit_slot_and_is_capped() {
     assert_eq!(n, crate::reach::AUDIT_DAY_MAX_LITE);
 }
 
+/// 上游宣稱機房（`upPop`）還沒確認的節點
+fn up(i: &str, pop: &str, ms: f64) -> PoolNode {
+    let mut n = node(i, pop, ms);
+    n.set_up_pop(pop);
+    n
+}
+
+/// 3.5.0 F7：Cloudflare v4 前 4 名（serveCount 4）＋ v6、Fastly v4 的待確認節點
+fn f7_setup(over: Value) -> (Arc<Cdn>, Arc<MockNet>) {
+    let (c, net) = setup(over);
+    set_pool(
+        &c,
+        "cloudflare",
+        4,
+        (1..=6).map(|i| up(&format!("192.0.2.{i}"), "KHH", i as f64)).collect(),
+    );
+    set_pool(&c, "cloudflare", 6, vec![up("2001:db8:1::1", "TPE", 3.0)]);
+    set_pool(&c, "fastly", 4, vec![up("151.101.1.10", "HKG", 30.0)]);
+    (c, net)
+}
+
+fn gap(c: &Cdn) {
+    c.with_state(|st| st.line.age(crate::reach::AUDIT_GAP_MS));
+}
+
+#[test]
+fn pop_audit_picks_pending_top_node_when_answer_ip_is_not_pending() {
+    let (c, net) = f7_setup(json!({}));
+    // 答案的 IP 不是待確認的節點（W17：21 次答案抽查都抽不中）：改量一個待確認的前幾名
+    let (p, target) = c.pop_audit_pick(ip("198.51.100.99")).unwrap();
+    assert_eq!((p, target), ("cloudflare", ip("192.0.2.1")));
+    assert!(net.log.lock().unwrap().is_empty(), "只回要量誰，探測由呼叫端做");
+    assert_eq!(c.observe_counters().pop_probes, 1);
+    let o = c.observe_json();
+    assert!(o["popAudit"]["lastProbeAt"].as_u64().unwrap() > 0);
+    assert_eq!(o["popAudit"]["pendingServed"], 6, "前 4 名 ＋ v6 1 個 ＋ Fastly 1 個");
+    c.note_local_pop("cloudflare", target, "KHH");
+    assert_eq!(c.observe_json()["popAudit"]["pendingServed"], 5);
+    // 答案的 IP 剛好是待確認的節點：照舊量它
+    gap(&c);
+    assert_eq!(c.pop_audit_pick(ip("192.0.2.3")), Some(("cloudflare", ip("192.0.2.3"))));
+    // 舊的介面不挑別的
+    gap(&c);
+    assert_eq!(c.pop_audit_wanted(ip("198.51.100.99")), None);
+}
+
+#[test]
+fn pop_audit_round_robins_providers_and_families() {
+    let (c, _) = f7_setup(json!({}));
+    let mut got = Vec::new();
+    for _ in 0..6 {
+        let (p, t) = c.pop_audit_pick(ip("198.51.100.99")).unwrap();
+        got.push((p, t.is_ipv6()));
+        gap(&c);
+    }
+    // 每一組（CDN、位址族）輪一次：Cloudflare v4、v6、Fastly v4、Cloudflare v4…（Fastly 沒有 v6）
+    assert!(got.contains(&("cloudflare", true)) && got.contains(&("fastly", false)), "{got:?}");
+    assert_eq!(got.iter().filter(|x| **x == ("cloudflare", false)).count(), 4, "{got:?}");
+    assert_ne!(got[0], got[1], "不會一直抽同一組");
+}
+
+#[test]
+fn pop_audit_stops_when_served_nodes_confirmed() {
+    let (c, _) = f7_setup(json!({}));
+    let mut n = 0;
+    while let Some((p, t)) = c.pop_audit_pick(ip("198.51.100.99")) {
+        c.note_local_pop(p, t, "TPE");
+        gap(&c);
+        n += 1;
+        assert!(n <= 10);
+    }
+    assert_eq!(n, 6, "前幾名都確認了就不再挑（排在後面的第 5、6 名留給解除串接後的健檢）");
+    let o = c.observe_json();
+    assert_eq!(o["popAudit"]["pendingServed"], 0);
+    assert_eq!(o["popAudit"]["pending"], 2);
+    assert_eq!(o["popAudit"]["noTarget"], 1);
+}
+
+#[test]
+fn pop_audit_caps_unchanged() {
+    let (c, _) = setup(json!({}));
+    set_pool(
+        &c,
+        "cloudflare",
+        4,
+        (1..=40).map(|i| up(&format!("192.0.2.{i}"), "TPE", 1.0)).collect(),
+    );
+    assert!(c.pop_audit_pick(ip("198.51.100.99")).is_some());
+    assert_eq!(c.pop_audit_pick(ip("198.51.100.99")), None, "10 分鐘 1 個");
+    assert_eq!(c.observe_json()["popAudit"]["noTarget"], 0, "名額不夠不算「沒有對象」");
+    let mut n = 1;
+    for _ in 0..40 {
+        gap(&c);
+        if let Some((p, t)) = c.pop_audit_pick(ip("198.51.100.99")) {
+            n += 1;
+            // 量完上游的機房跟著換（serveCount 4 的前幾名一直有新的待確認節點）
+            c.note_local_pop(p, t, "TPE");
+            c.with_state(|st| {
+                let d = st.pools.p.get_mut("cloudflare").unwrap();
+                let x = d.pool4.iter().position(|x| x.ip == t).unwrap();
+                let moved = d.pool4.remove(x);
+                d.pool4.push(moved);
+            });
+        }
+    }
+    assert_eq!(n, crate::reach::AUDIT_DAY_MAX, "24 小時 24 個");
+}
+
+#[test]
+fn pop_audit_off_never_probes() {
+    let (c, net) = f7_setup(json!({ "popAudit": false }));
+    assert_eq!(c.pop_audit_pick(ip("198.51.100.99")), None);
+    assert_eq!(c.pop_audit_pick(ip("192.0.2.1")), None);
+    assert!(net.log.lock().unwrap().is_empty());
+    assert_eq!(c.observe_counters().pop_probes, 0);
+    // 記憶體壓力也不做
+    let (c, _) = f7_setup(json!({}));
+    c.set_line_env(|| crate::reach::LineEnv {
+        chained: true,
+        memory_normal: false,
+    });
+    assert_eq!(c.pop_audit_pick(ip("198.51.100.99")), None);
+}
+
 #[test]
 fn pop_audit_off_matches_previous_behaviour() {
     let (c, net) = setup(json!({ "popAudit": false }));
