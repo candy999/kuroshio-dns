@@ -3,6 +3,7 @@
 use crate::config::CdnConfig;
 use crate::db::{self, Db};
 use crate::net::Net;
+use crate::pace::{Cat, Transition};
 use crate::pools::{self, Classifier, PoolNode, Pools, PoolsFile, ProvEntry};
 use crate::util::{self, now_ms};
 use crate::v6store::{self, V6Store};
@@ -199,7 +200,6 @@ impl Drop for StateGuard<'_> {
     }
 }
 
-#[derive(Default)]
 struct Bg {
     record: Option<Vec<Task>>,
     verify: HashSet<String>,
@@ -209,6 +209,9 @@ struct Bg {
     latency: usize,
     /// 排隊已滿、這次沒有排的背景工作數（3.4.1；之後的查詢會再排）
     deferred: u64,
+    /// 驗證節流（3.5.0 F12；`cdn.verifyPacing` 關掉時只有 `cdn.lite` 用它的每分鐘上限）。
+    /// 跟排隊的名單同一把鎖：`schedule()` 本來就拿，不另外加鎖（取代 3.4.2 的 `lite_rate`）
+    pace: crate::pace::Pace,
 }
 
 /// 每種背景工作（驗證、ECS、跨 CDN）最多排幾個在等（含進行中）：同時可以做的數量 × 這個倍數，至少 [`QUEUE_MIN`]。
@@ -219,12 +222,24 @@ const QUEUE_MIN: usize = 32;
 /// 同時進行的節點延遲量測上限
 const LATENCY_MAX: usize = 64;
 
+/// 驗證每分鐘上限 `Rmax`（3.5.0 F12）：`cdn.lite` 是 30（填的數字更小時用填的）；其他照 `cdn.verifyPerMin`
+/// （`auto` 在設定載入時已經依核心數與 AES 換算）。`cdn.verifyPacing` 關掉時只有 `cdn.lite` 的 30 有作用
+pub(crate) fn pace_rmax(c: &CdnConfig) -> u32 {
+    if c.lite && c.verify_pacing {
+        crate::config::LITE_VERIFY_PER_MIN.min(c.verify_per_min)
+    } else if c.lite {
+        crate::config::LITE_VERIFY_PER_MIN
+    } else {
+        c.verify_per_min
+    }
+}
+
 fn queue_cap(concurrency: usize) -> usize {
     (concurrency.max(1) * QUEUE_PER_PERMIT).max(QUEUE_MIN)
 }
 
 #[derive(Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
     Verify,
     Ecs,
     Cross,
@@ -274,8 +289,15 @@ pub struct Cdn {
     pub(crate) line_env: RwLock<Option<LineEnvFn>>,
     /// 移出記憶體的冷資料筆數（`Db::evicted_count` 的副本）：0 時查詢路徑完全不必檢查
     evicted_n: AtomicU32,
-    /// 小機器減量：這一分鐘（Unix 分鐘）排了幾個驗證
-    lite_rate: Mutex<(u64, u32)>,
+    /// 驗證節流的「減量中」（3.5.0 F12）：查詢路徑只讀這一個（`apply()` 判斷要不要先不排只問過一次的網域）
+    paced: std::sync::atomic::AtomicBool,
+    /// 減量中時，查詢路徑每分鐘最多一次順便檢查要不要離開（Unix 分鐘；沒有主程式的 CPU 讀數時也會自己恢復）
+    pace_tick: AtomicU32,
+    /// 減量中只問過一次、所以先不排的查詢數（3.5.0 F12 的 `pace.waited`）
+    pace_waited: AtomicU32,
+    /// 背景工作開始與完成的累計（3.5.0 F12 的 `cdn.bg`：驗證、ECS、跨 CDN、延遲量測）
+    bg_started: [AtomicU32; 4],
+    bg_done: [AtomicU32; 4],
     /// 磁碟預算（3.5.0 C5）：因為預算淘汰的網域累計筆數、上次量到分片目錄實際佔多少（KB；`u32::MAX` = 還沒量）
     budget_pruned: AtomicU32,
     disk_kb: AtomicU32,
@@ -433,12 +455,17 @@ impl Cdn {
         let mut line = crate::reach::Line::default();
         line.recompute_reach(&pools, now_ms());
         pools.reach_dirty = false;
+        let rmax = pace_rmax(&c);
         let me = Cdn {
             classifier: RwLock::new(classifier.clone()),
             cls_gen: AtomicU32::new(0),
             cls_id: NEXT_CLS_ID.fetch_add(1, Ordering::Relaxed),
             verify_sem: Arc::new(Semaphore::new(c.verify_concurrency.max(1))),
-            lite_rate: Mutex::new((0, 0)),
+            paced: std::sync::atomic::AtomicBool::new(false),
+            pace_tick: AtomicU32::new(0),
+            pace_waited: AtomicU32::new(0),
+            bg_started: Default::default(),
+            bg_done: Default::default(),
             ecs_sem: Arc::new(Semaphore::new(c.ecs.concurrency.max(1))),
             cross_sem: Arc::new(Semaphore::new(c.cross.concurrency.max(1))),
             state: Mutex::new(State {
@@ -457,7 +484,15 @@ impl Cdn {
             cfg: c,
             paths,
             net,
-            bg: Mutex::new(Bg::default()),
+            bg: Mutex::new(Bg {
+                record: None,
+                verify: HashSet::new(),
+                ecs: HashSet::new(),
+                cross: HashSet::new(),
+                latency: 0,
+                deferred: 0,
+                pace: crate::pace::Pace::new(rmax),
+            }),
             hints: RwLock::new(None),
             on_low_pool: RwLock::new(None),
             line_env: RwLock::new(None),
@@ -1055,32 +1090,64 @@ impl Cdn {
         self.bg.lock().unwrap().record.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    /// 排入背景（同一個網域同時只跑一個；沒有 tokio runtime 時略過）
+    /// 排入背景（同一個網域同時只跑一個；沒有 tokio runtime 時略過）。
+    /// 驗證算第 2 類名額（重驗、問過 2 次以上；3.5.0 F12）、跨 CDN 探索算跨 CDN 的名額
     pub fn schedule(self: &Arc<Self>, t: Task) {
-        // 小機器減量（3.4.2）：驗證每分鐘最多 LITE_VERIFY_PER_MIN 個；排不進的跟排隊已滿一樣，下一次查詢再排
-        if self.cfg.lite && matches!(t, Task::Verify { .. }) {
-            let minute = now_ms() / 60_000;
-            let over = {
-                let mut r = self.lite_rate.lock().unwrap();
-                if r.0 != minute {
-                    *r = (minute, 0);
-                }
-                if r.1 >= crate::config::LITE_VERIFY_PER_MIN {
-                    true
-                } else {
-                    r.1 += 1;
-                    false
-                }
-            };
-            if over {
-                self.state().stats.lite_capped += 1;
-                return;
+        let cat = if matches!(t, Task::Cross { .. }) {
+            Cat::Cross
+        } else {
+            Cat::Regular
+        };
+        self.schedule_cat(t, cat);
+    }
+
+    /// 要不要用一個驗證名額（3.5.0 F12；`cdn.verifyPacing` 關掉＝3.4.2：只有 `cdn.lite` 的每分鐘 30 個）。
+    /// 回（排不排，狀態轉換，小機器減量的上限擋下）
+    fn take_token(&self, bg: &mut Bg, kind: Option<Kind>, cat: Cat) -> (bool, Option<Transition>, bool) {
+        let now = now_ms();
+        let c = &self.cfg;
+        match kind {
+            Some(Kind::Verify) if c.verify_pacing => {
+                let (ok, tr) = bg.pace.take(cat, now);
+                (ok, tr, !ok && c.lite)
             }
+            Some(Kind::Verify) if c.lite => {
+                let (ok, _) = bg.pace.take(Cat::Regular, now);
+                (ok, None, !ok)
+            }
+            Some(Kind::Cross) if c.verify_pacing => {
+                let (ok, tr) = bg.pace.take(Cat::Cross, now);
+                (ok, tr, false)
+            }
+            _ => (true, None, false),
         }
+    }
+
+    pub(crate) fn schedule_cat(self: &Arc<Self>, t: Task, cat: Cat) {
+        let mut lite_capped = false;
+        let mut tr = None;
+        self.schedule_locked(t, cat, &mut lite_capped, &mut tr);
+        if lite_capped {
+            self.state().stats.lite_capped += 1;
+        }
+        self.after_pace(tr);
+    }
+
+    fn schedule_locked(self: &Arc<Self>, t: Task, cat: Cat, lite_capped: &mut bool, tr: &mut Option<Transition>) {
         let mut bg = self.bg.lock().unwrap();
-        if let Some(r) = bg.record.as_mut() {
-            if r.len() < 10_000 {
-                r.push(t);
+        if bg.record.is_some() {
+            // 測試用的記錄模式：沒有去重與排隊，名額照算
+            let kind = match t {
+                Task::Verify { .. } => Some(Kind::Verify),
+                Task::Cross { .. } => Some(Kind::Cross),
+                _ => None,
+            };
+            let (ok, x, lc) = self.take_token(&mut bg, kind, cat);
+            (*tr, *lite_capped) = (x, lc);
+            if let (true, Some(r)) = (ok, bg.record.as_mut()) {
+                if r.len() < 10_000 {
+                    r.push(t);
+                }
             }
             return;
         }
@@ -1090,6 +1157,7 @@ impl Cdn {
         }
         let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
         let me = self.clone();
+        // 名額（3.5.0 F12）在去重與排隊上限之後才拿：同一個網域已經在排、排隊已滿的不用掉名額
         match t {
             Task::Verify {
                 name,
@@ -1098,17 +1166,25 @@ impl Cdn {
                 orig,
             } => {
                 let key = format!("{name}|{family}");
-                if bg.verify.len() >= queue_cap(self.cfg.verify_concurrency) && !bg.verify.contains(&key) {
+                if bg.verify.contains(&key) {
+                    return;
+                }
+                if bg.verify.len() >= queue_cap(self.cfg.verify_concurrency) {
                     bg.deferred += 1;
                     return;
                 }
-                if !bg.verify.insert(key.clone()) {
+                let (ok, x, lc) = self.take_token(&mut bg, Some(Kind::Verify), cat);
+                (*tr, *lite_capped) = (x, lc);
+                if !ok {
                     return;
                 }
+                bg.verify.insert(key.clone());
                 rt.spawn(async move {
                     let g = BgSlot(me, Kind::Verify, key);
                     let _permit = g.0.verify_sem.clone().acquire_owned().await;
+                    g.0.bg_count(Kind::Verify, false);
                     g.0.verify(&name, &provider, family, orig).await;
+                    g.0.bg_count(Kind::Verify, true);
                 });
             }
             Task::Ecs { name, ips4, ips6 } => {
@@ -1122,24 +1198,31 @@ impl Cdn {
                 rt.spawn(async move {
                     let g = BgSlot(me, Kind::Ecs, name);
                     let _permit = g.0.ecs_sem.clone().acquire_owned().await;
+                    g.0.bg_count(Kind::Ecs, false);
                     g.0.ecs_probe(&g.2, &ips4, &ips6).await;
+                    g.0.bg_count(Kind::Ecs, true);
                 });
             }
             Task::Cross { name, from, orig } => {
-                if !self.cfg.cross.enabled {
+                if !self.cfg.cross.enabled || bg.cross.contains(&name) {
                     return;
                 }
-                if bg.cross.len() >= queue_cap(self.cfg.cross.concurrency) && !bg.cross.contains(&name) {
+                if bg.cross.len() >= queue_cap(self.cfg.cross.concurrency) {
                     bg.deferred += 1;
                     return;
                 }
-                if !bg.cross.insert(name.clone()) {
+                let (ok, x, _) = self.take_token(&mut bg, Some(Kind::Cross), Cat::Cross);
+                *tr = x;
+                if !ok {
                     return;
                 }
+                bg.cross.insert(name.clone());
                 rt.spawn(async move {
                     let g = BgSlot(me, Kind::Cross, name);
                     let _permit = g.0.cross_sem.clone().acquire_owned().await;
+                    g.0.bg_count(Kind::Cross, false);
                     g.0.cross_explore(&g.2, &from, orig).await;
+                    g.0.bg_count(Kind::Cross, true);
                 });
             }
             Task::TryV6 { provider, ip } => {
@@ -1153,10 +1236,86 @@ impl Cdn {
                 bg.latency += 1;
                 rt.spawn(async move {
                     let g = BgSlot(me, Kind::Latency, String::new());
+                    g.0.bg_count(Kind::Latency, false);
                     g.0.net.latency(ip).await;
+                    g.0.bg_count(Kind::Latency, true);
                 });
             }
         }
+    }
+
+    fn bg_count(&self, k: Kind, done: bool) {
+        let a = if done { &self.bg_done } else { &self.bg_started };
+        a[k as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `apply()` 產生的背景工作（3.5.0 F12）：只問過一次的網域的驗證用「新網域」的名額（最多一半）
+    pub(crate) fn schedule_from_apply(self: &Arc<Self>, tasks: Vec<Task>, first_seen: bool) {
+        for t in tasks {
+            let cat = match t {
+                Task::Cross { .. } => Cat::Cross,
+                Task::Verify { .. } if first_seen => Cat::FirstSeen,
+                _ => Cat::Regular,
+            };
+            self.schedule_cat(t, cat);
+        }
+        // 減量中：每分鐘最多一次順便看要不要離開（沒有主程式交 CPU 讀數時也會自己恢復；平常只讀一個 AtomicBool）
+        if self.paced.load(Ordering::Relaxed) {
+            let m = (now_ms() / 60_000) as u32;
+            if self.pace_tick.swap(m, Ordering::Relaxed) != m {
+                let tr = self.bg.lock().unwrap().pace.roll(now_ms());
+                self.after_pace(tr);
+            }
+        }
+    }
+
+    /// 減量中（3.5.0 F12）：查詢路徑用，只讀一個 AtomicBool
+    pub(crate) fn pacing_first_seen(&self) -> bool {
+        self.cfg.verify_pacing && (self.cfg.lite || self.paced.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn note_pace_waited(&self) {
+        self.pace_waited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 節流的狀態轉換：更新查詢路徑讀的旗標、寫日誌（進入、離開各一行；`cdn.lite` 永遠在減量，不寫）
+    fn after_pace(&self, tr: Option<Transition>) {
+        let Some(tr) = tr else { return };
+        if !self.cfg.verify_pacing {
+            return;
+        }
+        let rate = {
+            let bg = self.bg.lock().unwrap();
+            self.paced.store(bg.pace.paced, Ordering::Relaxed);
+            bg.pace.rate
+        };
+        if self.cfg.lite {
+            return;
+        }
+        match tr {
+            Transition::Enter => {
+                info!("CDN 驗證：新網域很多（或 CPU 很忙），先只驗證問過 2 次以上的網域，每分鐘最多 {rate} 個；還沒驗證的照常回原本的答案")
+            }
+            Transition::Leave => info!("CDN 驗證：恢復正常的速度"),
+        }
+    }
+
+    /// 測試用：直接看或改節流的狀態
+    #[cfg(test)]
+    pub(crate) fn with_pace<R>(&self, f: impl FnOnce(&mut crate::pace::Pace) -> R) -> R {
+        f(&mut self.bg.lock().unwrap().pace)
+    }
+
+    /// 手動驗證（`POST /api/cdn/verify`，3.5.0 F12）：不受名額限制，但算進用量
+    pub(crate) fn pace_manual(&self) {
+        let tr = {
+            let mut bg = self.bg.lock().unwrap();
+            if !self.cfg.verify_pacing {
+                return;
+            }
+            bg.pace.take(Cat::Manual, now_ms()).1
+        };
+        self.after_pace(tr);
     }
 
     pub(crate) fn schedule_all(self: &Arc<Self>, tasks: Vec<Task>) {
@@ -1177,15 +1336,53 @@ impl Cdn {
     }
 
     /// 這台黑潮最近 10 秒用掉的 CPU 佔整台機器的百分比（3.5.0 F12，規格 11 第 6 節；主程式每 10 秒量一次交進來）。
-    /// `None` = 量不到（驗證節流不依 CPU 調，維持每分鐘上限）。
-    /// 規格 11 第 6.2 節骨架：先不做事（驗證照現在的規則排），甲批接上節流
+    /// `None` = 量不到：速率不依 CPU 調（維持 `Rmax`）。記憶體壓力不是 Normal（[`Cdn::set_line_env`]）時速率是 `Rmin`。
+    /// 從來沒有呼叫（主程式還沒接上、測試）時：速率一直是 `Rmax`，只有每分鐘上限與名額的順序；
+    /// 減量中由查詢路徑每分鐘順便檢查一次，壓力解除後照樣自己離開
     pub fn set_load(&self, pct: Option<u8>) {
-        let _ = pct;
+        let memory_normal = self.line_env().memory_normal;
+        let now = now_ms();
+        let tr = {
+            let mut bg = self.bg.lock().unwrap();
+            if self.cfg.verify_pacing {
+                bg.pace.load(pct, memory_normal, now)
+            } else {
+                bg.pace.cpu = pct;
+                None
+            }
+        };
+        self.after_pace(tr);
     }
 
-    /// `/api/status` 的 `cdn.pace`（3.5.0 F12：驗證節流的狀態）。規格 11 第 6.2 節骨架：先回空的，還沒接到 API
+    /// `/api/status` 的 `cdn.pace`（3.5.0 F12：驗證節流的狀態；也放在 [`Cdn::status_lite`] 裡）
     pub fn pace_json(&self) -> Value {
-        json!({})
+        let now = now_ms();
+        let bg = self.bg.lock().unwrap();
+        let p = &bg.pace;
+        let (last, this) = p.used(now);
+        let on = self.cfg.verify_pacing;
+        let limited = on || self.cfg.lite;
+        json!({
+            "enabled": on,
+            "lite": self.cfg.lite,
+            "perMin": limited.then_some(p.rate),
+            "maxPerMin": limited.then_some(p.rmax),
+            "minPerMin": on.then_some(p.rmin),
+            "paced": on && (self.cfg.lite || p.paced),
+            "usedLastMin": last,
+            "usedThisMin": this,
+            "cpuPct": p.cpu,
+            "waited": self.pace_waited.load(Ordering::Relaxed),
+            "capped": p.capped,
+            "since": (on && p.paced && p.since > 0).then_some(p.since),
+        })
+    }
+
+    /// `/api/status` 的 `cdn.bg`（3.5.0 F12，量測用）：驗證、ECS、跨 CDN、延遲量測各自開始幾個、完成幾個（累計）
+    pub fn bg_json(&self) -> Value {
+        let k =
+            |i: usize| json!({ "started": self.bg_started[i].load(Ordering::Relaxed), "done": self.bg_done[i].load(Ordering::Relaxed) });
+        json!({ "verify": k(0), "ecs": k(1), "cross": k(2), "latency": k(3) })
     }
 
     // ------------------------------------------------------------ 查詢（給解析流程與管理介面）
@@ -1235,6 +1432,8 @@ impl Cdn {
                 "background": { "verify": verify, "ecs": ecs, "cross": cross, "deferred": deferred } });
         drop(st);
         self.budget_json(&mut v);
+        v["pace"] = self.pace_json();
+        v["bg"] = self.bg_json();
         // 3.5.0 E3～E5、E7：reach、popHealth、popSwitch、popAudit、slowerFuseUntil（背景算好的，這裡只複製）
         if let (Some(m), Value::Object(o)) = (v.as_object_mut(), self.observe_json()) {
             m.extend(o);
@@ -1328,6 +1527,7 @@ impl Cdn {
             };
             (p, o)
         };
+        self.pace_manual();
         let r = self.verify(&name, &provider, family, orig).await;
         Some((r, self.domain(&name).unwrap_or(Value::Null)))
     }

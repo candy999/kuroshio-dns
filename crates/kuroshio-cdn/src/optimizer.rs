@@ -266,13 +266,35 @@ impl Cdn {
         };
         let c1 = std::str::from_utf8(&c1_buf[..c1_len]).unwrap_or("");
         let mut tasks: Vec<Task> = Vec::new();
+        let first_seen;
         {
             let mut st = self.state();
             let st = &mut *st;
             self.apply_locked(st, msg, &name, qtype, provider, via, &cname, c1, &mut res, &mut tasks);
             // 小機器減量（3.4.2）：只問過一次的網域先不驗證（剛註冊、只出現一次的網域不值得驗）。
-            // 答案照樣是原始結果、試用期 TTL 10 秒，真的有人在用的話很快會再問，那時才排驗證
-            if self.cfg.lite && st.db.get(&name).map_or(0, |e| e.hits) < 2 {
+            // 答案照樣是原始結果、試用期 TTL 10 秒，真的有人在用的話很快會再問，那時才排驗證。
+            // 3.5.0 F12：新網域很多（減量中）時所有機器都套用，而且它的 ECS 探測、節點延遲量測、跨 CDN 探索也一起不排
+            // （都是為了一個可能再也不會出現的網域對外發請求）。`cdn.lite` 永遠在減量。查詢路徑只多讀一個 AtomicBool
+            first_seen = st.db.get(&name).map_or(0, |e| e.hits) < 2;
+            if first_seen && self.pacing_first_seen() {
+                let before = tasks.len();
+                let mut verifies = 0u32;
+                tasks.retain(|t| match t {
+                    Task::Verify { name: n, .. } if *n == name => {
+                        verifies += 1;
+                        false
+                    }
+                    Task::Ecs { name: n, .. } | Task::Cross { name: n, .. } if *n == name => false,
+                    Task::Latency(_) => false,
+                    _ => true,
+                });
+                if self.cfg.lite {
+                    st.stats.lite_waited += verifies;
+                }
+                if tasks.len() != before {
+                    self.note_pace_waited();
+                }
+            } else if first_seen && self.cfg.lite {
                 let before = tasks.len();
                 tasks.retain(|t| !matches!(t, Task::Verify { name: n, .. } if *n == name));
                 st.stats.lite_waited += (before - tasks.len()) as u32;
@@ -288,7 +310,7 @@ impl Cdn {
                 );
             }
         }
-        self.schedule_all(tasks);
+        self.schedule_from_apply(tasks, first_seen);
         res
     }
 

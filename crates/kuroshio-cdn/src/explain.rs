@@ -15,6 +15,8 @@ pub mod decision {
     pub const ALREADY_TW: &str = "already-tw";
     pub const TRIAL: &str = "trial";
     pub const LITE_WAITING: &str = "lite-waiting";
+    /// 新網域很多（驗證減量中）：只問過一次的網域先不驗證（3.5.0 F12）
+    pub const PACED_WAITING: &str = "paced-waiting";
     pub const VERIFY_FAILED: &str = "verify-failed";
     /// 台灣節點能用，但實測比原本的答案慢：暫時用原本的答案（3.5.0 E7）
     pub const SLOWER: &str = "slower";
@@ -57,6 +59,7 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::ALREADY_TW => format!("這個網域用 {label}，原本的答案就是台灣節點，不用換{detail}。"),
         d::TRIAL => format!("這個網域用 {label}，台灣節點還在驗證中（試用期先回原本的答案，TTL 10 秒）{detail}。"),
         d::LITE_WAITING => format!("這個網域用 {label}；這台是小記憶體減量模式，問過 2 次以上才驗證台灣節點，現在先回原本的答案。"),
+        d::PACED_WAITING => format!("這個網域用 {label}；新網域很多（或 CPU 很忙），CDN 驗證減量中，問過 2 次以上才驗證台灣節點，現在先回原本的答案。"),
         d::VERIFY_FAILED => format!("這個網域用 {label}，台灣節點驗證沒通過，暫時用原本的答案{detail}；到期後會重新驗證。"),
         d::SLOWER => format!("這個網域用 {label}，台灣節點能用，但實測比原本的答案慢{detail}，暫時用原本的答案；到期後重測。"),
         d::NO_TW_NODE => format!("這個網域用 {label}，找不到可用的台灣節點，跨 CDN 也沒有可用的替代{detail}。"),
@@ -243,6 +246,9 @@ impl Cdn {
             }
             if self.cfg.lite && e.hits < 2 {
                 return (d::LITE_WAITING, String::new());
+            }
+            if e.hits < 2 && self.pacing_first_seen() {
+                return (d::PACED_WAITING, String::new());
             }
             return (d::TRIAL, String::new());
         }
