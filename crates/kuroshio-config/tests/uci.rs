@@ -876,3 +876,45 @@ fn cdn_cross_request_score_from_uci() {
     let c = load("config cdn 'cdn'\n\toption cross_request_score '0'\n", &env());
     assert_eq!(g(&c, "cdn.cross.requestScore"), &json!(false));
 }
+
+/// 3.5.0 E4～E7：`cdn.popAudit`、`cdn.popSwitch`、`cdn.spreadPrefixes`、`cdn.slowerFallback` 預設開；
+/// UCI 的 `config cdn` 用 `option pop_audit '0'` 等關掉（snake_case → camelCase 自動轉換）
+#[test]
+fn cdn_line_awareness_switches_from_uci() {
+    let keys = ["cdn.popAudit", "cdn.popSwitch", "cdn.spreadPrefixes", "cdn.slowerFallback"];
+    let c = load("config cdn 'cdn'\n", &env());
+    for k in keys {
+        assert_eq!(g(&c, k), &json!(true), "{k}");
+    }
+    let c = load(
+        "config cdn 'cdn'\n\toption pop_audit '0'\n\toption pop_switch '0'\n\toption spread_prefixes '0'\n\toption slower_fallback '0'\n",
+        &env(),
+    );
+    for k in keys {
+        assert_eq!(g(&c, k), &json!(false), "{k}");
+    }
+    // 附帶的預設檔只放註解（不寫死，之後改預設時已安裝的機器也跟著新的預設）
+    let c = load(&shipped_text(), &env());
+    for k in keys {
+        assert_eq!(g(&c, k), &json!(true), "{k}");
+    }
+}
+
+/// 3.5.0 E10：`community.shareIspGroup` 預設關；UCI 的 `option share_isp_group '1'` 打開
+#[test]
+fn community_share_isp_group_from_uci() {
+    let c = load(&default_text(), &env());
+    assert_eq!(g(&c, "community.shareIspGroup"), &json!(false));
+    let text = default_text().replace(
+        "config community 'community'\n\toption enabled '0'",
+        "config community 'community'\n\toption enabled '0'\n\toption share_isp_group '1'",
+    );
+    assert_ne!(text, default_text());
+    let c = load(&text, &env());
+    assert_eq!(g(&c, "community.shareIspGroup"), &json!(true));
+    // 附帶的預設檔：明確寫出關著
+    let shipped = shipped_text();
+    assert_eq!(g(&load(&shipped, &env()), "community.shareIspGroup"), &json!(false));
+    let raw = overrides(&parse_text(&shipped).unwrap(), &env());
+    assert!(get(&raw, "community.shareIspGroup").is_some(), "預設 UCI 沒寫 share_isp_group");
+}

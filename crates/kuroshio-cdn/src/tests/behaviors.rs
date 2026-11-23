@@ -803,6 +803,23 @@ fn friend_nodes_become_harvest_candidates_only() {
 }
 
 #[test]
+fn friend_nodes_capped_per_batch_never_above_default() {
+    // 3.5.0 E10：每批上限只會變少（別群組的好友四分之一），超過 500 的照 500 算
+    let many: Vec<IpAddr> = (0..600u32)
+        .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x6811_0000 + i * 7)))
+        .collect();
+    let (c, _net) = setup(json!({}));
+    assert_eq!(c.add_friend_nodes_capped(many.iter().map(|i| ("cloudflare", *i)), 125), 125);
+    let (c, _net) = setup(json!({}));
+    assert_eq!(
+        c.add_friend_nodes_capped(many.iter().map(|i| ("cloudflare", *i)), 10_000),
+        crate::cdn::FRIEND_MAX_NODES
+    );
+    let (c, _net) = setup(json!({}));
+    assert_eq!(c.add_friend_nodes_capped(many.iter().map(|i| ("cloudflare", *i)), 0), 0);
+}
+
+#[test]
 fn imported_never_queried_domains_are_not_rechecked() {
     // 分享檔匯入的網域（lastSeen = 0、已過期的通過）：每小時的複驗不去驗證，等這台有人查到才驗證
     let (c, _net) = setup(json!({ "reverifyRatio": 0 }));

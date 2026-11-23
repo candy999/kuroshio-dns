@@ -25,6 +25,9 @@ pub struct Config {
     pub use_hints: bool,
     /// 使用好友給的上游 DNS（每日評測的候選）；關掉 = 照常收（有上限）但不放進評測
     pub use_upstreams: bool,
+    /// 好友同步時帶這台 WAN 的 ISP 群組（3.5.0 E10，`community.shareIspGroup`，預設關）；
+    /// 關著＝不送、收到也不看（3.4.x 的行為）。第 5.2 節骨架，丙批接上
+    pub share_isp_group: bool,
     pub rules: Vec<Value>,
     /// 收到的資料（解壓後）上限，依等級 4 / 8 / 32 MB
     pub max_bundle_mb: u32,
@@ -47,6 +50,7 @@ impl Default for Config {
             share_upstreams: true,
             use_hints: true,
             use_upstreams: true,
+            share_isp_group: false,
             rules: vec![],
             max_bundle_mb: 32,
         }
@@ -107,6 +111,7 @@ impl Config {
             share_upstreams: flag(c.get("shareUpstreams"), d.share_upstreams),
             use_hints: flag(c.get("useHints"), d.use_hints),
             use_upstreams: flag(c.get("useUpstreams"), d.use_upstreams),
+            share_isp_group: flag(c.get("shareIspGroup"), d.share_isp_group),
             rules: c.get("rules").and_then(Value::as_array).cloned().unwrap_or_default(),
             max_bundle_mb: num(c.get("maxBundleMB"))
                 .map(|x| x.clamp(1.0, 32.0) as u32)
@@ -226,5 +231,9 @@ mod tests {
         let off = Config::from_json(&json!({ "useHints": "0", "useUpstreams": false, "minHitRate": "0" }));
         assert!(!off.use_hints && !off.use_upstreams);
         assert_eq!(off.min_hit_rate, 0.0, "0 = 不檢查（照樣可以關掉）");
+        // 3.5.0 E10：ISP 群組預設不分享，UCI 的 "1" 才打開
+        assert!(!c.share_isp_group);
+        assert!(Config::from_json(&json!({ "shareIspGroup": "1" })).share_isp_group);
+        assert!(Config::from_json(&json!({ "shareIspGroup": true })).share_isp_group);
     }
 }

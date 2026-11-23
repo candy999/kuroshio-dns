@@ -897,6 +897,22 @@ impl Stats {
         })
     }
 
+    /// 24 小時歷史（3.5.0 E9）：每 5 分鐘一格、最多 288 格，欄位分開的陣列
+    /// （`stepSec`、`from`、`n`、`q`、`blocked`、`servfail`、`stale`、`miss`、`p50`、`p95`、`abroad`、`tw`）。
+    /// 從 `Day` 的累計值算差，查詢路徑上不加新的累加；不進快照。
+    ///
+    /// 第 5.2 節骨架，乙批接上（目前是空物件）。
+    pub fn history_json(&self) -> Value {
+        Value::Object(Map::new())
+    }
+
+    /// 過期快取的比率（3.5.0 E8）：`today`、`rateToday`、`rate15m`、`rate1h`（後兩個讀 E9 的環形陣列）。
+    ///
+    /// 第 5.2 節骨架，乙批接上（目前是空物件）。
+    pub fn stale_rates(&self) -> Value {
+        Value::Object(Map::new())
+    }
+
     /// 對齊 2.x `/api/status` 的 `stats`（`today` 的欄位維持不變，LuCI 會讀）
     pub fn summary(&self) -> Value {
         let (d, dom, blk, cli) = self.with(|i| {

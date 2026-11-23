@@ -611,6 +611,20 @@ mod tests {
             Some(&json!(true)),
             "App 自己選節點的服務不改寫（3.5.0 B3）"
         );
+        // 3.5.0 E 組（規格 11 第 5 節）：行為改變的四包預設開，關掉＝沒有這一包時的行為
+        for (k, why) in [
+            ("cdn.popAudit", "機房以本機量到的為準（E4）"),
+            ("cdn.popSwitch", "機房層級的健康與切換（E5）"),
+            ("cdn.spreadPrefixes", "同機房內的網段分散（E6）"),
+            ("cdn.slowerFallback", "台灣節點實測比原本慢就用原本的答案（E7）"),
+        ] {
+            assert_eq!(get(&d, k), Some(&json!(true)), "{k}：{why}");
+        }
+        assert_eq!(
+            get(&d, "community.shareIspGroup"),
+            Some(&json!(false)),
+            "ISP 群組預設不分享給好友（3.5.0 E10）"
+        );
     }
 
     #[test]

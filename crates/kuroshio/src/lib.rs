@@ -30,6 +30,7 @@ pub mod manifest;
 pub mod memgov;
 pub mod memplan;
 pub mod netif;
+pub mod observe;
 pub mod pathcheck;
 pub mod persist;
 pub mod presence;

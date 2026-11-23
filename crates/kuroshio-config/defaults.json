@@ -335,6 +335,10 @@
     "v6Policy": "drop",
     "multiCdn": true,
     "appLayer": true,
+    "popAudit": true,
+    "popSwitch": true,
+    "spreadPrefixes": true,
+    "slowerFallback": true,
     "dbFile": "./state/cdn-domains.json",
     "maxEntries": 200000,
     "dbDiskBudgetKB": "auto",
@@ -445,6 +449,7 @@
     "shareUpstreams": true,
     "useHints": true,
     "useUpstreams": true,
+    "shareIspGroup": false,
     "rules": [],
     "maxBundleMB": 32
   },

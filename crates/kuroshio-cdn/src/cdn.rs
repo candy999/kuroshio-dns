@@ -555,6 +555,11 @@ impl Cdn {
     /// 每家、每個家族一次最多 [`FRIEND_MAX_NODES`] 個，候選名單滿了就不放（不擠掉自己收集的）。
     /// 不會直接寫進節點池：每日節點池工作在本機量測、確認是台灣節點後才會使用。回傳新增幾個
     pub fn add_friend_nodes<'a>(&self, nodes: impl IntoIterator<Item = (&'a str, IpAddr)>) -> usize {
+        self.add_friend_nodes_upto(nodes, FRIEND_MAX_NODES)
+    }
+
+    /// 同 [`Cdn::add_friend_nodes`]，每家、每個家族一次最多 `cap` 個（呼叫端保證不超過 [`FRIEND_MAX_NODES`]）
+    pub(crate) fn add_friend_nodes_upto<'a>(&self, nodes: impl IntoIterator<Item = (&'a str, IpAddr)>, cap: usize) -> usize {
         let mut added = 0;
         let mut taken: HashMap<(String, bool), usize> = HashMap::new();
         self.with_state(|st| {
@@ -573,7 +578,7 @@ impl Cdn {
                     continue;
                 }
                 let n = taken.entry((p.to_string(), v6)).or_default();
-                if *n >= FRIEND_MAX_NODES {
+                if *n >= cap {
                     continue;
                 }
                 if st.db.add_harvest_candidate(p, ip) {

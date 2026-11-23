@@ -102,6 +102,16 @@ pub struct CdnConfig {
     pub multi_cdn: bool,
     /// App 自己選節點的服務只辨識、不改寫（3.5.0 B3，`cdn.appLayer`，預設開）
     pub app_layer: bool,
+    /// 機房以本機量到的為準（3.5.0 E4，`cdn.popAudit`，預設開）：記下上游宣稱的機房、串接中搭既有抽查量機房。
+    /// 關掉＝不記、不抽查（3.4.x 的行為）。第 5.2 節骨架，甲／乙批接上
+    pub pop_audit: bool,
+    /// 機房層級的健康與切換（3.5.0 E5，`cdn.popSwitch`，預設開）。關掉＝只彙總、不切換。第 5.2 節骨架，甲批接上
+    pub pop_switch: bool,
+    /// 同機房內的網段分散（3.5.0 E6，`cdn.spreadPrefixes`，預設開）。關掉＝健檢照延遲排序。第 5.2 節骨架，甲批接上
+    pub spread_prefixes: bool,
+    /// 台灣節點實測明顯比原本慢就暫時用原本的答案（3.5.0 E7，`cdn.slowerFallback`，預設開）。
+    /// 關掉＝驗證通過就換（3.4.x 的行為）。第 5.2 節骨架，甲批接上
+    pub slower_fallback: bool,
     pub providers: Vec<ProviderCfg>,
     pub ecs: EcsCfg,
     pub cross: CrossCfg,
@@ -190,6 +200,10 @@ impl CdnConfig {
             peak_weight: nn(c, "peak.weight", 2.0),
             multi_cdn: lite_value(c.get("multiCdn")) != Some(false),
             app_layer: lite_value(c.get("appLayer")) != Some(false),
+            pop_audit: lite_value(c.get("popAudit")) != Some(false),
+            pop_switch: lite_value(c.get("popSwitch")) != Some(false),
+            spread_prefixes: lite_value(c.get("spreadPrefixes")) != Some(false),
+            slower_fallback: lite_value(c.get("slowerFallback")) != Some(false),
             providers,
             ecs: EcsCfg {
                 resolvers: if resolvers.is_empty() {
@@ -358,5 +372,18 @@ mod tests {
             (u.serve_count_of("fastly"), u.v6_policy_of("fastly"), u.v6_policy_of("x")),
             (2, "drop", "keep")
         );
+    }
+
+    /// 3.5.0 E4～E7 的開關：預設（與沒寫）都開；false、UCI 的 "0" 都是關
+    #[test]
+    fn line_awareness_switches() {
+        let on = |c: &CdnConfig| (c.pop_audit, c.pop_switch, c.spread_prefixes, c.slower_fallback);
+        let d = CdnConfig::from_value(&build_for(&Host { cores: 2, aes: false }, &json!({})));
+        assert_eq!(on(&d), (true, true, true, true));
+        assert_eq!(on(&CdnConfig::from_value(&json!({ "cdn": {} }))), (true, true, true, true));
+        let off = CdnConfig::from_value(&json!({ "cdn": {
+            "popAudit": false, "popSwitch": "0", "spreadPrefixes": 0, "slowerFallback": "false"
+        } }));
+        assert_eq!(on(&off), (false, false, false, false));
     }
 }
