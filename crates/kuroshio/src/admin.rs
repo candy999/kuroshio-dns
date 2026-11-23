@@ -583,7 +583,7 @@ fn config_api(st: &Arc<AppState>, req: &Req) -> Response {
             "effective": effective,
             "defaults": kuroshio_config::build(&json!({})),
             // 依 CPU 核心數換算的欄位（沒填 = auto）
-            "auto": kuroshio_config::PER_CORE.iter().map(|x| x.0).chain(["resolver.parallel"]).collect::<Vec<_>>(),
+            "auto": kuroshio_config::PER_CORE.iter().map(|x| x.0).chain(["resolver.parallel", "cdn.verifyPerMin"]).collect::<Vec<_>>(),
         }));
     }
     let mut v: Value = match serde_json::from_slice(&req.body) {
