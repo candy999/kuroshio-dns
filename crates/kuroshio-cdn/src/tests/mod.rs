@@ -3,6 +3,7 @@
 mod behaviors;
 mod bench;
 mod crossscore;
+mod essential;
 mod explain;
 mod jobs;
 mod line;

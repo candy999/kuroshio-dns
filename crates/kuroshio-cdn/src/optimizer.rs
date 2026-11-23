@@ -252,6 +252,15 @@ impl Cdn {
         let Some((provider, via)) = self.with_classifier(|c| Self::detect(c, msg)) else {
             return res;
         };
+        // 3.5.0 F11：內建一定通過的服務（時間同步、連線偵測、憑證撤銷、地震速報）不改寫——不驗證、不跨 CDN、不做 ECS，
+        // 也不記進網域資料庫，只辨識、算一次統計就回去（判斷錯誤的最壞情況是「跟沒有黑潮一樣」）。
+        // 只在已經判斷是 CDN 的回應上比對靜態後綴表：不配置、沒有鎖。`filter.protectComm` 關掉時不比對
+        if crate::cdn::keep_untouched(qname) {
+            res.provider = Some(provider);
+            res.tags.push("內建服務:不改寫".into());
+            self.note_essential_kept();
+            return res;
+        }
         let name = normalize(qname);
         // 記憶體控制移出的冷資料：查到時從磁碟讀回來（沒有移出任何網域時不做任何事）
         self.ensure_loaded(&name);

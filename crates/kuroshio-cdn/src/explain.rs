@@ -30,6 +30,8 @@ pub mod decision {
     pub const MULTI_CDN: &str = "multi-cdn";
     /// App 自己選節點的服務：只辨識、不改寫（3.5.0 B3）
     pub const APP_LAYER: &str = "app-layer";
+    /// 內建一定通過的服務（時間同步、連線偵測、憑證撤銷、地震速報）：不改寫、不擋（3.5.0 F11）
+    pub const ESSENTIAL: &str = "essential";
     pub const CHAINED: &str = "chained";
     pub const CDN_DISABLED: &str = "cdn-disabled";
     pub const MEMORY_FLOOR: &str = "memory-floor";
@@ -70,6 +72,7 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::POLICY_ALWAYS => format!("這個網域被手動設成「一定換」，有 {label} 的台灣節點就換。"),
         d::MULTI_CDN => format!("這個網站自己在多家 CDN 之間分流（這次是 {label}）{detail}。黑潮不替它換到別家；回答來自驗證過的那一家時照常換成那一家的台灣節點。"),
         d::APP_LAYER => format!("這個網域用 {label}，節點由 App 或服務自己選（影音、系統更新這類），黑潮只辨識、不改寫。要換可以把這個網域手動設成「一定換」。"),
+        d::ESSENTIAL => format!("這個網域是內建的{label}服務：不改寫、不擋。"),
         d::CHAINED => "串接中：答案由上游黑潮換好台灣節點，這台不再做 CDN 處理。".into(),
         d::CDN_DISABLED => "這台沒有開 CDN 台灣節點。".into(),
         d::MEMORY_FLOOR => "記憶體控制的最低限度：暫停 CDN 調整，照原本的答案。".into(),
@@ -85,6 +88,19 @@ fn slower_text(label: &str, detail: &str, minutes: u64) -> String {
 
 /// 上一次驗證握手比原本慢、還沒確認時，`rewritten` 多的一句（3.5.0 F9）
 pub const SLOW1_NOTE: &str = "上一次驗證握手比原本慢，再確認一次才會退回。";
+
+/// 內建服務的類別（3.5.0 F11）
+fn essential_label(kind: Option<kuroshio_net::comm::CommKind>) -> &'static str {
+    use kuroshio_net::comm::CommKind as K;
+    match kind {
+        Some(K::Ntp) => "時間同步",
+        Some(K::NetCheck) => "連線偵測",
+        Some(K::Revocation) => "憑證撤銷",
+        Some(K::Quake) => "地震速報",
+        Some(K::Update) => "系統與安全更新",
+        _ => "一定通過的",
+    }
+}
 
 /// 驗證結果的一步（`v4`／`v6`）
 fn verdict_step(what: &str, v: Option<&Verdict>, now: u64) -> Value {
@@ -124,6 +140,14 @@ impl Cdn {
         let base = |decision: &str, label: &str, detail: &str| json!({ "name": name, "decision": decision, "text": text_of(decision, label, detail) });
         if !self.cfg.enabled {
             return base(d::CDN_DISABLED, "", "");
+        }
+        // 內建服務（3.5.0 F11）：apply() 不記進資料庫，這裡也不看資料庫
+        if crate::cdn::keep_untouched(&name) {
+            let kind = kuroshio_net::comm::kind_of(&name);
+            let mut v = base(d::ESSENTIAL, essential_label(kind), "");
+            v["known"] = json!(true);
+            v["essential"] = json!(kind.map(|k| k.as_str()));
+            return v;
         }
         // 冷資料讀回來（只讀：讀回來不算「用過」）
         self.ensure_loaded(&name);

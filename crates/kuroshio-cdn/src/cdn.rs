@@ -119,6 +119,9 @@ pub struct Stats {
     pub slower_first: u32,
     /// 退回之後重驗不慢、回到台灣節點的次數（3.5.0 F9）
     pub slower_returned: u32,
+    /// 內建服務（時間同步、連線偵測、憑證撤銷、地震速報）照原本的答案回、不改寫的次數（3.5.0 F11；
+    /// 計數在 `Cdn` 的原子計數器，查詢路徑不拿狀態鎖，讀的時候才填進來）
+    pub essential_kept: u32,
 }
 
 /// 背景工作
@@ -299,6 +302,8 @@ pub struct Cdn {
     pace_tick: AtomicU32,
     /// 減量中只問過一次、所以先不排的查詢數（3.5.0 F12 的 `pace.waited`）
     pace_waited: AtomicU32,
+    /// 內建服務不改寫的次數（3.5.0 F11 的 `essentialKept`；查詢路徑不拿狀態鎖）
+    essential_kept: AtomicU32,
     /// 背景工作開始與完成的累計（3.5.0 F12 的 `cdn.bg`：驗證、ECS、跨 CDN、延遲量測）
     bg_started: [AtomicU32; 4],
     bg_done: [AtomicU32; 4],
@@ -471,6 +476,7 @@ impl Cdn {
             paced: std::sync::atomic::AtomicBool::new(false),
             pace_tick: AtomicU32::new(0),
             pace_waited: AtomicU32::new(0),
+            essential_kept: AtomicU32::new(0),
             bg_started: Default::default(),
             bg_done: Default::default(),
             ecs_sem: Arc::new(Semaphore::new(c.ecs.concurrency.max(1))),
@@ -1417,7 +1423,20 @@ impl Cdn {
     }
 
     pub fn stats(&self) -> Stats {
-        self.state().stats
+        let st = self.state();
+        self.stats_of(&st)
+    }
+
+    /// 統計（狀態鎖裡的，加上查詢路徑不拿鎖的計數）
+    fn stats_of(&self, st: &State) -> Stats {
+        let mut s = st.stats;
+        s.essential_kept = self.essential_kept.load(Ordering::Relaxed);
+        s
+    }
+
+    /// 3.5.0 F11：內建服務照原本的答案回（`apply()` 在已經判斷是 CDN 之後呼叫；不配置、沒有鎖）
+    pub(crate) fn note_essential_kept(&self) {
+        self.essential_kept.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 記憶體裡的網域筆數（移出到磁碟的冷資料不算；記憶體控制的狀態用）
@@ -1442,7 +1461,7 @@ impl Cdn {
             let bg = self.bg.lock().unwrap();
             (bg.verify.len(), bg.ecs.len(), bg.cross.len(), bg.deferred)
         };
-        let mut v = json!({ "enabled": self.cfg.enabled, "lite": self.cfg.lite, "stats": st.stats, "domains": st.db.domains.len(),
+        let mut v = json!({ "enabled": self.cfg.enabled, "lite": self.cfg.lite, "stats": self.stats_of(&st), "domains": st.db.domains.len(),
                 "background": { "verify": verify, "ecs": ecs, "cross": cross, "deferred": deferred } });
         drop(st);
         self.budget_json(&mut v);
@@ -1459,7 +1478,7 @@ impl Cdn {
     pub fn status(&self) -> Value {
         let st = self.state();
         json!({
-            "enabled": self.cfg.enabled, "stats": st.stats, "pools": st.pools.status(), "domains": st.db.domains.len(),
+            "enabled": self.cfg.enabled, "stats": self.stats_of(&st), "pools": st.pools.status(), "domains": st.db.domains.len(),
             "cross": { "explored": st.cross_explored, "ok": st.cross_ok },
         })
     }
@@ -1969,6 +1988,47 @@ pub(crate) fn calibrated_limit(model: usize, shards: usize, total: usize, disk_b
     let room = budget_bytes.saturating_sub(overhead) as u128;
     let measured = (room * total as u128 / entry_bytes as u128).min(usize::MAX as u128) as usize;
     measured.clamp(model, model.saturating_mul(3) / 2)
+}
+
+/// 內建的「不改寫 CDN 答案」服務（3.5.0 F11：時間同步、連線偵測、憑證撤銷、地震速報；`filter.protectComm` 關掉時不比對）。
+/// 表在 `kuroshio_net::comm`；只在已經判斷是 CDN 的回應上呼叫，不配置、沒有鎖（使用者自己加的後綴不比對）
+pub(crate) fn keep_untouched(name: &str) -> bool {
+    kuroshio_net::comm::no_rewrite(name) || test_essential::matches(name)
+}
+
+/// 測試專用的內建表（`*.example.com`）：內建表是真實網域，測試只用 example.com
+#[cfg(test)]
+pub(crate) mod test_essential {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// 這個執行緒之後的 `keep_untouched()` 也把這些後綴當成「不改寫」（照樣受 `filter.protectComm` 的開關）
+    pub fn set(names: &[&str]) {
+        NAMES.with(|n| *n.borrow_mut() = names.iter().map(|s| s.to_string()).collect());
+    }
+
+    pub fn matches(name: &str) -> bool {
+        if !kuroshio_net::comm::enabled() {
+            return false;
+        }
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        NAMES.with(|n| {
+            n.borrow()
+                .iter()
+                .any(|s| name == *s || name.strip_suffix(s.as_str()).is_some_and(|p| p.ends_with('.')))
+        })
+    }
+}
+
+#[cfg(not(test))]
+mod test_essential {
+    #[inline(always)]
+    pub fn matches(_: &str) -> bool {
+        false
+    }
 }
 
 pub(crate) fn normalize(name: &str) -> String {
