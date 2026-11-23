@@ -67,8 +67,20 @@ pub fn auto_parallel(host: &Host) -> u64 {
     }
 }
 
+/// `cdn.verifyPerMin` 的 `"auto"`（3.5.0 F12，規格 11 第 6 節）：CDN 驗證每分鐘上限，定在「這台機器本來就做得到的量」附近。
+/// 沒有 AES 指令（MT7621 類）：核心數 × 30（D3 雙核心 60）；有 AES：核心數 × 60，最多 480。
+/// `cdn.lite`（依記憶體，主程式換算）的 30 由 CDN 端套用；使用者填的數字照填的（6～1,200，CDN 端夾）
+pub fn auto_verify_per_min(host: &Host) -> u64 {
+    let c = host.cores.max(1) as u64;
+    if host.aes {
+        (c * 60).min(480)
+    } else {
+        c * 30
+    }
+}
+
 /// 依 CPU 核心數換算的設定（`"auto"` 或沒寫時套用；規格 05 第 7 節）。
-/// 每一項：（路徑，每個核心多少，下限，上限）；`resolver.parallel` 另外處理
+/// 每一項：（路徑，每個核心多少，下限，上限）；`resolver.parallel`、`cdn.verifyPerMin` 也看 AES，另外處理
 pub const PER_CORE: [(&str, u64, u64, u64); 11] = [
     // 開機預熱每秒重問幾個名稱：單核心 5、四核心以上 20
     ("resolver.warmRate", 5, 5, 20),
@@ -120,6 +132,8 @@ pub fn derive_auto(cfg: &mut Value, host: &Host) {
     }
     // 同時問幾個上游（0 = 全部）：見 auto_parallel
     set("resolver.parallel", auto_parallel(host));
+    // CDN 驗證每分鐘上限（3.5.0 F12）：見 auto_verify_per_min
+    set("cdn.verifyPerMin", auto_verify_per_min(host));
 }
 
 /// 使用者設定裡已經不用的舊欄位（啟動時記一次說明，不算錯誤）
@@ -625,6 +639,41 @@ mod tests {
             Some(&json!(false)),
             "ISP 群組預設不分享給好友（3.5.0 E10）"
         );
+        // 3.5.0 F 組（規格 11 第 6 節）：行為改變的開關預設開，關掉＝沒有這一包時的行為
+        for (k, why) in [
+            (
+                "upstream.roundAwareFailures",
+                "上游成敗的記法：來不及回答的記得到、大家都答不出來的不算（F4）",
+            ),
+            ("benchmark.probeSample", "惡意網站探測的網域從已下載的清單抽樣（F10）"),
+            ("cdn.verifyPacing", "新網域很多時的 CDN 驗證節流（F12）"),
+        ] {
+            assert_eq!(get(&d, k), Some(&json!(true)), "{k}：{why}");
+        }
+        assert_eq!(
+            get(&d, "cdn.verifyPerMin"),
+            Some(&json!("auto")),
+            "CDN 驗證每分鐘上限依核心數與 AES 換算（F12）"
+        );
+    }
+
+    /// 3.5.0 F12：`cdn.verifyPerMin` 的 auto（沒有 AES：核心數 × 30；有 AES：核心數 × 60、最多 480）；使用者填的數字優先
+    #[test]
+    fn auto_verify_per_min_table() {
+        let per_min = |cores: usize, aes: bool, user: Value| {
+            let c = build_for(&Host { cores, aes }, &json!({ "cdn": user }));
+            get(&c, "cdn.verifyPerMin")
+                .and_then(Value::as_u64)
+                .expect("cdn.verifyPerMin 不是數字")
+        };
+        assert_eq!(per_min(2, false, json!({})), 60, "D3（MT7621：雙核心、沒有 AES）");
+        assert_eq!(per_min(1, false, json!({})), 30);
+        assert_eq!(per_min(4, true, json!({})), 240);
+        assert_eq!(per_min(16, true, json!({})), 480, "有 AES 最多 480");
+        assert_eq!(per_min(0, true, json!({})), 60, "偵測不到核心數當成單核心");
+        assert_eq!(per_min(2, false, json!({ "verifyPerMin": "auto" })), 60);
+        assert_eq!(per_min(2, false, json!({ "verifyPerMin": 100 })), 100);
+        assert_eq!(per_min(16, true, json!({ "verifyPerMin": "12" })), 12, "UCI 給的字串");
     }
 
     #[test]
@@ -642,7 +691,16 @@ mod tests {
         let new = get(&defaults(), "filter.lists").unwrap().as_array().unwrap().clone();
         let old: Vec<Value> = serde_json::from_str(OLD_DEFAULT_LISTS_3_2).unwrap();
         // 3.3：舊的清單原封不動排在前面，後面加的大清單一律預設停用
-        assert_eq!(&new[..old.len()], &old[..]);
+        // （3.5.0 F10 的 `probe` 標記不算：只影響惡意網站探測從哪幾份抽樣）
+        let no_probe = |l: &Value| {
+            let mut l = l.clone();
+            if let Some(m) = l.as_object_mut() {
+                m.remove("probe");
+            }
+            l
+        };
+        let new_unmarked: Vec<Value> = new.iter().map(no_probe).collect();
+        assert_eq!(&new_unmarked[..old.len()], &old[..]);
         assert!(new.len() > old.len());
         assert!(new[old.len()..].iter().all(|l| l["enabled"] == false), "新加的大清單預設不勾選");
         let user = json!({ "filter": { "lists": old } });

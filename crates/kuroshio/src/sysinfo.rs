@@ -64,6 +64,39 @@ pub fn rss_bytes() -> Option<u64> {
     }
 }
 
+/// 這個程式開機以來用掉的 CPU 時間（使用者＋核心，毫秒；3.5.0 F12，規格 11 第 6 節）。
+/// Linux：/proc/self/stat 的 utime＋stime（時脈數換成毫秒）；Windows：GetProcessTimes。量不到是 None。
+/// 呼叫端每 10 秒量一次、兩次相減，除以（經過的時間 × 核心數）就是佔整台機器的比例。
+/// 規格 11 第 6.2 節骨架：乙批（主程式每 10 秒量一次、交給 `Cdn::set_load()`）接上
+pub fn cpu_ms() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        win::cpu_ms()
+    }
+    #[cfg(unix)]
+    {
+        let t = std::fs::read_to_string("/proc/self/stat").ok()?;
+        // SAFETY: sysconf 只讀系統設定
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        parse_proc_stat_cpu_ms(&t, if hz > 0 { hz as u64 } else { 100 })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// /proc/self/stat 的 utime＋stime（第 14、15 欄，單位是時脈數）換成毫秒。
+/// 第 2 欄（程式名稱）在括號裡、可能有空白，從最後一個右括號之後開始數
+pub fn parse_proc_stat_cpu_ms(stat: &str, hz: u64) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut f = rest.split_whitespace();
+    // 右括號之後第 1 個是第 3 欄（state），utime 是第 14 欄
+    let utime: u64 = f.nth(11)?.parse().ok()?;
+    let stime: u64 = f.next()?.parse().ok()?;
+    Some((utime + stime).saturating_mul(1000) / hz.max(1))
+}
+
 /// 把配置器手上空著的記憶體還給系統（記憶體控制釋出之後呼叫）。只有 glibc 需要（musl 釋放大塊時會直接還）
 pub fn trim_heap() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -99,9 +132,10 @@ pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
 
 #[cfg(windows)]
 mod win {
+    use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
     pub fn rss() -> Option<u64> {
         // SAFETY: 結構由我們配置、大小正確；GetCurrentProcess 是虛擬代碼，不用關閉
@@ -110,6 +144,23 @@ mod win {
             c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
             if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
                 Some(c.WorkingSetSize as u64)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// 使用者＋核心 CPU 時間（毫秒）。FILETIME 的單位是 100 奈秒
+    pub fn cpu_ms() -> Option<u64> {
+        let v = |t: &FILETIME| (((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64) / 10_000;
+        // SAFETY: 四個 FILETIME 由我們配置；GetCurrentProcess 是虛擬代碼，不用關閉
+        unsafe {
+            let mut c: FILETIME = std::mem::zeroed();
+            let mut e: FILETIME = std::mem::zeroed();
+            let mut k: FILETIME = std::mem::zeroed();
+            let mut u: FILETIME = std::mem::zeroed();
+            if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) != 0 {
+                Some(v(&k) + v(&u))
             } else {
                 None
             }
@@ -271,6 +322,18 @@ overlayfs:/overlay / overlay rw,noatime,lowerdir=/,upperdir=/overlay/upper 0 0
         assert_eq!(classify_fs("/dev/mmcblk0p2", "ext4"), StorageClass::Flash);
         assert_eq!(classify_fs("/dev/nvme0n1p2", "ext4"), StorageClass::Disk);
         assert_eq!(classify_fs("/dev/mtdblock6", "jffs2"), StorageClass::Flash);
+    }
+
+    /// 3.5.0 F12：/proc/self/stat 的 utime＋stime；程式名稱裡有空白與括號也數得對
+    #[test]
+    fn proc_stat_cpu_ms() {
+        let stat = "1234 (kuro shio (x)) S 1 1234 1234 0 -1 4194560 500 0 0 0 250 50 0 0 20 0 4 0 100 0 0";
+        assert_eq!(parse_proc_stat_cpu_ms(stat, 100), Some(3000), "(250 + 50) 個時脈、每秒 100");
+        assert_eq!(parse_proc_stat_cpu_ms(stat, 1000), Some(300));
+        assert_eq!(parse_proc_stat_cpu_ms("garbage", 100), None);
+        assert_eq!(parse_proc_stat_cpu_ms("1 (a) S 1 2", 100), None);
+        #[cfg(target_os = "linux")]
+        assert!(cpu_ms().is_some());
     }
 
     #[test]

@@ -192,9 +192,23 @@ async fn probe_result_splits_connect_tls_ttfb() {
     assert!(s.bytes >= 2 << 20 && s.bytes < 4 << 20, "收滿上限就停：{s:?}");
     assert!(s.secs > 0.05 && s.mbps > 1.0, "{s:?}");
     assert!(s.connect_ms > 0.0 && s.ttfb_ms >= 35.0, "伺服器 40 ms 後才回標頭：{s:?}");
-    // 連不上：全部是 0
+    // 3.5.0 F15、F16 的量測基礎：狀態碼、前 1 MiB 的時間（同一條連線）
+    assert_eq!(s.status, 200, "{s:?}");
+    assert!(s.head_secs > 0.0 && s.head_secs <= s.secs, "{s:?}");
+    // 連不上：全部是 0（狀態碼 0 = 沒有連上或沒有收到標頭）
     let dead = probe::download_sample(ip("127.0.0.1"), Some(1), "http://speed.example.com/x", 200, 1 << 20).await;
     assert_eq!(dead, Default::default());
+    // 被限流（HTTP 429）：不算測速，但狀態碼記得到
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hp = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        read_req(&mut s).await;
+        let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n").await;
+    });
+    let s = probe::download_sample(ip("127.0.0.1"), Some(hp), "http://speed.example.com/x", 2000, 1 << 20).await;
+    assert_eq!((s.status, s.mbps, s.bytes, s.head_secs), (429, 0.0, 0, 0.0), "{s:?}");
+    assert!(s.connect_ms > 0.0, "{s:?}");
 }
 
 #[tokio::test]

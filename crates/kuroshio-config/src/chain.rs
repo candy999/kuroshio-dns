@@ -6,7 +6,8 @@
 //! - `upstream.allowDownstream`（上游）：要不要提供資料給接在後面的黑潮
 //!
 //! 其他相關的設定鍵（規格第 10 節）：`resolver.backfill`、`resolver.backfillSample`（背景補問，5.2）、
-//! `benchmark.coverageRegion`、`benchmark.nearMaxMs`（上游多樣性，6.2）、`filter.lists[].bypass`（繞過防護清單，4.1）。
+//! `benchmark.coverageRegion`、`benchmark.nearMaxMs`（上游多樣性，6.2）、`filter.lists[].bypass`（繞過防護清單，4.1）；
+//! 3.5.0 的 `filter.lists[].probe`（惡意網站探測抽樣，規格 11 F10）也放在這裡，跟 `bypass` 同一種寫法。
 //!
 //! UCI 的 `'0'` 轉換後可能是布林 `false`、數字 `0` 或字串 `"0"`（JSON 設定檔也可能這樣寫），
 //! 讀取一律經過這裡的函式，型別都接受。
@@ -181,6 +182,40 @@ pub fn is_bypass_list(list: &Value) -> bool {
 /// 沒寫 `bypass` 時也當成「繞過防護」清單的預設清單網址
 pub const KNOWN_BYPASS_URLS: &[&str] = &["https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/doh-vpn-proxy-bypass.txt"];
 
+/// 過濾清單（`filter.lists[]` 的一筆）能不能拿來抽惡意網站探測的網域（3.5.0 F10，規格 11 第 6 節，`probe`）。
+///
+/// - 停用的清單（`enabled` 是關）一律不抽。
+/// - 明確寫了 `probe` 就照寫的（UCI 的 `'0'`／`'1'` 也接受）。
+/// - 沒寫：`category` 是 `malware`、不是「繞過防護」類（[`is_bypass_list`]）、也不是 [`KNOWN_NO_PROBE_URLS`] 的才抽
+///   （舊設定沒有這個欄位，預設清單依網址認得，跟 `bypass` 一樣的做法，不用另外遷移）。
+///
+/// 規格 11 第 6.2 節骨架：F10 的抽樣（丙批）接上之前沒有地方讀
+pub fn is_probe_list(list: &Value) -> bool {
+    if !flex_bool(list.get("enabled"), true).0 {
+        return false;
+    }
+    match list.get("probe") {
+        Some(v) if !v.is_null() && v.as_str() != Some("") => flex_bool(Some(v), false).0,
+        _ => {
+            list.get("category").and_then(Value::as_str) == Some("malware")
+                && !is_bypass_list(list)
+                && !list
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|u| KNOWN_NO_PROBE_URLS.contains(&u))
+        }
+    }
+}
+
+/// 沒寫 `probe` 時也不抽的預設惡意類清單網址（3.5.0 F10）：
+/// TW165、TWNIC-RPZ 是台灣業者的 DNS 依法停止解析的網域（拿來探測會把台灣業者的 DNS 全部判成「有擋惡意網站」）；
+/// 新註冊網域不是惡意網域，沒有人擋
+pub const KNOWN_NO_PROBE_URLS: &[&str] = &[
+    "https://filter.futa.gg/TW165_abp.txt",
+    "https://filter.futa.gg/TWNIC-RPZ_abp.txt",
+    "https://filter.futa.gg/nrd/past-07day_abp.txt",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +229,81 @@ mod tests {
         assert!(!is_bypass_list(&json!({ "url": url, "bypass": false })), "明確關掉的照設定");
         assert!(is_bypass_list(&json!({ "url": "https://example.com/list.txt", "bypass": "1" })));
         assert!(!is_bypass_list(&json!({ "url": "https://example.com/list.txt" })));
+    }
+
+    /// 3.5.0 F10：哪些清單可以抽惡意網站探測的網域
+    #[test]
+    fn probe_list_marking() {
+        // 沒寫 probe：惡意類、啟用中、不是繞過防護、不是已知不抽的網址才抽
+        assert!(is_probe_list(&json!({ "url": "https://example.com/m.txt", "category": "malware" })));
+        assert!(!is_probe_list(&json!({ "url": "https://example.com/a.txt", "category": "ads" })));
+        assert!(!is_probe_list(&json!({ "url": "https://example.com/a.txt" })), "沒寫分類 = 廣告");
+        assert!(!is_probe_list(
+            &json!({ "url": "https://example.com/m.txt", "category": "malware", "enabled": false })
+        ));
+        assert!(!is_probe_list(
+            &json!({ "url": "https://example.com/m.txt", "category": "malware", "enabled": "0" })
+        ));
+        assert!(!is_probe_list(
+            &json!({ "url": "https://example.com/m.txt", "category": "malware", "bypass": true })
+        ));
+        assert!(!is_probe_list(&json!({ "url": KNOWN_BYPASS_URLS[0], "category": "malware" })));
+        for u in KNOWN_NO_PROBE_URLS {
+            assert!(!is_probe_list(&json!({ "url": u, "category": "malware" })), "舊設定沒有標記：{u}");
+            assert!(
+                is_probe_list(&json!({ "url": u, "category": "malware", "probe": true })),
+                "明確打開的照設定：{u}"
+            );
+        }
+        // 明確寫了就照寫的（UCI 的字串也接受）；停用的一律不抽
+        assert!(!is_probe_list(
+            &json!({ "url": "https://example.com/m.txt", "category": "malware", "probe": "0" })
+        ));
+        assert!(is_probe_list(
+            &json!({ "url": "https://example.com/a.txt", "category": "ads", "probe": "1" })
+        ));
+        assert!(!is_probe_list(
+            &json!({ "url": "https://example.com/m.txt", "probe": true, "enabled": false })
+        ));
+        // 空白 = 沒寫
+        assert!(is_probe_list(
+            &json!({ "url": "https://example.com/m.txt", "category": "malware", "probe": "" })
+        ));
+
+        // 預設清單：TW165、TWNIC-RPZ、新註冊網域、繞過防護標 probe: false；實際會抽的只有威脅情資類
+        let lists = get(&defaults(), "filter.lists").and_then(Value::as_array).unwrap().clone();
+        let mut got: Vec<&str> = lists
+            .iter()
+            .filter(|l| l.get("probe") == Some(&json!(false)))
+            .map(|l| l["url"].as_str().unwrap())
+            .collect();
+        let mut want: Vec<&str> = KNOWN_NO_PROBE_URLS.to_vec();
+        want.push(KNOWN_BYPASS_URLS[0]);
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert!(lists.iter().all(|l| l.get("probe").is_none() || l["probe"] == json!(false)));
+        let sampled: Vec<&str> = lists
+            .iter()
+            .filter(|l| is_probe_list(l))
+            .map(|l| l["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(sampled.len(), 1, "{sampled:?}");
+        assert!(sampled[0].ends_with("/tif.mini.txt"), "{sampled:?}");
+        // 拿掉 probe 標記（舊設定）結果一樣
+        let unmarked: Vec<Value> = lists
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                l.as_object_mut().unwrap().remove("probe");
+                l
+            })
+            .collect();
+        assert_eq!(
+            unmarked.iter().filter(|l| is_probe_list(l)).count(),
+            1,
+            "依網址認得，跟 bypass 一樣"
+        );
     }
 
     #[test]

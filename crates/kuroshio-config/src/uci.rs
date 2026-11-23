@@ -567,6 +567,11 @@ fn convert(uci: &Value, env: &Env, w: &Warns) -> Value {
                 if let Some(b) = l.get("bypass") {
                     o["bypass"] = json!(truthy(b));
                 }
+                // 惡意網站探測可不可以從這份抽網域（3.5.0 F10）：沒寫（或空白）就不加這個鍵，由分類與網址決定
+                // （`chain::is_probe_list`）
+                if let Some(p) = l.get("probe").filter(|p| p.as_str() != Some("")) {
+                    o["probe"] = json!(truthy(p));
+                }
                 o
             })
             .collect();

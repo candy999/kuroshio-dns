@@ -918,3 +918,119 @@ fn community_share_isp_group_from_uci() {
     let raw = overrides(&parse_text(&shipped).unwrap(), &env());
     assert!(get(&raw, "community.shareIspGroup").is_some(), "預設 UCI 沒寫 share_isp_group");
 }
+
+/// 3.5.0 F4、F10、F12（規格 11 第 6 節）：`upstream.roundAwareFailures`、`benchmark.probeSample`、`cdn.verifyPacing` 預設開，
+/// `cdn.verifyPerMin` 預設 auto；UCI 的 `option round_aware_failures '0'` 等關掉（各區段本來就自動轉駝峰式）
+#[test]
+fn f_group_switches_from_uci() {
+    let c = load(&default_text(), &env());
+    for k in ["upstream.roundAwareFailures", "benchmark.probeSample", "cdn.verifyPacing"] {
+        assert_eq!(g(&c, k), &json!(true), "{k}");
+    }
+    assert!(g(&c, "cdn.verifyPerMin").is_u64(), "沒填的依核心數與 AES 換算");
+    let text = default_text()
+        .replace(
+            "config upstream 'upstream'\n",
+            "config upstream 'upstream'\n\toption round_aware_failures '0'\n",
+        )
+        .replace(
+            "config benchmark 'benchmark'\n",
+            "config benchmark 'benchmark'\n\toption probe_sample '0'\n",
+        )
+        + "\nconfig cdn 'cdn'\n\toption verify_pacing '0'\n\toption verify_per_min '90'\n";
+    for opt in ["option round_aware_failures", "option probe_sample"] {
+        assert!(text.contains(opt), "測試用的預設 UCI 要有對應的區段：{opt}");
+    }
+    let (c, warns) = load_warn(&text);
+    assert!(warns.is_empty(), "{warns:?}");
+    assert_eq!(g(&c, "upstream.roundAwareFailures"), &json!(false));
+    assert_eq!(g(&c, "benchmark.probeSample"), &json!(false));
+    assert_eq!(g(&c, "cdn.verifyPacing"), &json!(false));
+    assert_eq!(g(&c, "cdn.verifyPerMin"), &json!(90));
+    let raw = overrides(&parse_text(&text).unwrap(), &env());
+    assert!(get(&raw, "upstream.round_aware_failures").is_none(), "不留 snake_case 的名稱");
+    assert!(get(&raw, "cdn.verify_per_min").is_none(), "不留 snake_case 的名稱");
+    // 'auto' 照樣換算
+    let c = load("config cdn 'cdn'\n\toption verify_per_min 'auto'\n", &env());
+    assert!(g(&c, "cdn.verifyPerMin").is_u64());
+    // 附帶的預設檔只放註解（不寫死，之後改預設時已安裝的機器也跟著新的預設）
+    let shipped = shipped_text();
+    let c = load(&shipped, &env());
+    let d = build(&json!({}));
+    for k in [
+        "upstream.roundAwareFailures",
+        "benchmark.probeSample",
+        "cdn.verifyPacing",
+        "cdn.verifyPerMin",
+    ] {
+        assert_eq!(g(&c, k), g(&d, k), "{k}");
+    }
+    let raw = overrides(&parse_text(&shipped).unwrap(), &env());
+    for k in [
+        "upstream.roundAwareFailures",
+        "benchmark.probeSample",
+        "cdn.verifyPacing",
+        "cdn.verifyPerMin",
+    ] {
+        assert!(get(&raw, k).is_none(), "預設 UCI 只寫註解：{k}");
+    }
+    for opt in [
+        "# option round_aware_failures '1'",
+        "# option probe_sample '1'",
+        "# option verify_pacing '1'",
+        "# option verify_per_min 'auto'",
+    ] {
+        assert!(shipped.contains(opt), "預設 UCI 要有註解：{opt}");
+    }
+}
+
+/// 3.5.0 F10：`config filter_list` 的 `option probe '0'` → `filter.lists[i].probe`；沒寫就沒有這個鍵，
+/// 由分類與網址決定（`chain::is_probe_list`）
+#[test]
+fn uci_filter_list_probe() {
+    use kuroshio_config::chain::is_probe_list;
+    let text = default_text()
+        + "\nconfig filter_list\n\toption name 'M'\n\toption url 'https://example.com/m.txt'\n\toption category 'malware'\n"
+        + "\nconfig filter_list\n\toption name 'P'\n\toption url 'https://example.com/p.txt'\n\toption category 'malware'\n\toption probe '0'\n"
+        + "\nconfig filter_list\n\toption name 'A'\n\toption url 'https://example.net/a.txt'\n\toption probe '1'\n"
+        + "\nconfig filter_list\n\toption name 'E'\n\toption url 'https://example.net/e.txt'\n\toption category 'malware'\n\toption probe ''\n";
+    let c = load(&text, &env());
+    let lists = g(&c, "filter.lists").as_array().unwrap();
+    let find = |u: &str| lists.iter().find(|l| l["url"] == u).unwrap_or_else(|| panic!("{u}"));
+    assert!(find("https://example.com/m.txt").get("probe").is_none());
+    assert_eq!(find("https://example.com/p.txt")["probe"], json!(false));
+    assert_eq!(find("https://example.net/a.txt")["probe"], json!(true));
+    assert!(find("https://example.net/e.txt").get("probe").is_none(), "空白 = 沒寫");
+    assert!(is_probe_list(find("https://example.com/m.txt")));
+    assert!(!is_probe_list(find("https://example.com/p.txt")));
+    assert!(is_probe_list(find("https://example.net/a.txt")), "明確打開的廣告類照設定");
+    assert!(is_probe_list(find("https://example.net/e.txt")));
+
+    // 附帶的預設檔：TW165、TWNIC-RPZ、新註冊網域、繞過防護明寫 probe '0'，跟 defaults.json 一樣
+    let shipped = shipped_text();
+    let v = parse_text(&shipped).unwrap();
+    let d = defaults();
+    let dl = g(&d, "filter.lists").as_array().unwrap();
+    for sec in v["values"].as_object().unwrap().values().filter(|s| s[".type"] == "filter_list") {
+        let url = sec["url"].as_str().unwrap();
+        let def = dl.iter().find(|l| l["url"] == url).unwrap_or_else(|| panic!("{url}"));
+        match def.get("probe") {
+            Some(p) => {
+                assert_eq!(p, &json!(false), "{url}");
+                assert_eq!(sec["probe"], json!("0"), "{url}");
+            }
+            None => assert!(sec.get("probe").is_none(), "{url}"),
+        }
+    }
+    // 轉換後（只留啟用中的）會抽的只有威脅情資精簡版
+    let c = load(&shipped, &env());
+    let sampled: Vec<&str> = g(&c, "filter.lists")
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| is_probe_list(l))
+        .map(|l| l["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(sampled.len(), 1, "{sampled:?}");
+    assert!(sampled[0].ends_with("/tif.mini.txt"), "{sampled:?}");
+}

@@ -363,6 +363,9 @@ struct BenchCfg {
     tiers: Option<tiers::Mode>,
     /// `benchmark.malwareProbe`：惡意網站探測（預設開；`probe.txt` 空的就不跑）
     malware_probe: bool,
+    /// `benchmark.probeSample`：探測的網域從已下載的惡意類清單抽樣（3.5.0 F10，預設開；關掉＝只用 `probe.txt`）
+    #[allow(dead_code)] // 規格 11 第 6.2 節骨架，丙批接上
+    probe_sample: bool,
 }
 
 fn pos_f64(cfg: &Value, k: &str) -> Option<f64> {
@@ -383,6 +386,7 @@ impl BenchCfg {
             near_max_ms: kuroshio_config::chain::coverage_region_of(cfg).1,
             tiers: get(cfg, "benchmark.tiers").and_then(Value::as_str).and_then(tiers::Mode::parse),
             malware_probe: kuroshio_config::chain::flex_bool(get(cfg, "benchmark.malwareProbe"), true).0,
+            probe_sample: kuroshio_config::chain::flex_bool(get(cfg, "benchmark.probeSample"), true).0,
         }
     }
 }

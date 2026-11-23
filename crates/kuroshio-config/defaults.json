@@ -148,7 +148,8 @@
     "interceptPolicy": "skip-plain",
     "pathCheck": true,
     "chain": true,
-    "allowDownstream": true
+    "allowDownstream": true,
+    "roundAwareFailures": true
   },
   "resolver": {
     "keepNames": [],
@@ -197,12 +198,14 @@
       {
         "url": "https://filter.futa.gg/TW165_abp.txt",
         "category": "malware",
-        "name": "FutaGuard TW165（台灣 165 反詐騙）"
+        "name": "FutaGuard TW165（台灣 165 反詐騙）",
+        "probe": false
       },
       {
         "url": "https://filter.futa.gg/TWNIC-RPZ_abp.txt",
         "category": "malware",
-        "name": "FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）"
+        "name": "FutaGuard TWNIC-RPZ（台灣網路資訊中心停止解析）",
+        "probe": false
       },
       {
         "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.mini.txt",
@@ -213,7 +216,8 @@
         "url": "https://filter.futa.gg/nrd/past-07day_abp.txt",
         "category": "malware",
         "name": "FutaGuard 新註冊網域（7 天，誤擋風險高）",
-        "enabled": false
+        "enabled": false,
+        "probe": false
       },
       {
         "url": "https://filter.futa.gg/hosts_abp.txt",
@@ -285,7 +289,8 @@
         "category": "malware",
         "name": "HaGeZi 加密 DNS／VPN／代理繞過（企業用：裝置無法自己改用其他 DNS）",
         "enabled": false,
-        "bypass": true
+        "bypass": true,
+        "probe": false
       }
     ],
     "updateIntervalHours": 24,
@@ -305,6 +310,8 @@
     "verifyFailMaxDays": 7,
     "verifyTimeoutMs": 5000,
     "verifyConcurrency": "auto",
+    "verifyPacing": true,
+    "verifyPerMin": "auto",
     "serveCount": 4,
     "minPool": 3,
     "healthIntervalMin": 30,
@@ -526,7 +533,8 @@
     "coverageRegion": "near",
     "nearMaxMs": 60,
     "tiers": "auto",
-    "malwareProbe": true
+    "malwareProbe": true,
+    "probeSample": true
   },
   "scan": {
     "samplesPerSubnet": 6,

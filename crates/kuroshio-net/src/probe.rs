@@ -54,6 +54,13 @@ impl Timing {
     pub fn request_ms(&self) -> Option<f64> {
         self.measured().then_some(self.connect_ms + self.tls_ms + self.ttfb_ms)
     }
+
+    /// 連線＋TLS 握手（毫秒，不含 TTFB；3.5.0 F9、F13 共用，規格 11 第 6 節）。
+    /// 兩個都量到才有：純 HTTP（沒有握手）、失敗、假的網路、舊資料回 None。
+    /// TTFB 由原站與快取冷熱決定、單次樣本差幾百毫秒；握手只看「離得多遠」與雙方算密碼的時間
+    pub fn handshake_ms(&self) -> Option<f64> {
+        (self.connect_ms > 0.0 && self.tls_ms > 0.0).then_some(self.connect_ms + self.tls_ms)
+    }
 }
 
 /// 一次下載測速的量測樣本（3.5.0）：相對評分、誤差範圍、之後的工作負載分數都用它。
@@ -70,10 +77,19 @@ pub struct SpeedSample {
     pub connect_ms: f64,
     /// 送出請求到收完標頭（毫秒；0 = 沒量到）
     pub ttfb_ms: f64,
+    /// HTTP 狀態碼（3.5.0 F15）：0 = 沒有連上或沒有收到標頭。429／503 = 被對方限流
+    pub status: u16,
+    /// 收到第 1 MiB（[`HEAD_BYTES`]）內容時花了幾秒（3.5.0 F16；從收到標頭後開始算，同一條連線、不多收任何東西）。
+    /// 0 = 沒量到（檔案不到 1 MiB、`max_bytes` 不到 1 MiB、失敗、假的網路、舊資料）
+    pub head_secs: f64,
 }
 
+/// [`SpeedSample::head_secs`] 量的是前幾個位元組（1 MiB：快測下載的量，快測門檻跟它同類相比）
+pub const HEAD_BYTES: u64 = 1024 * 1024;
+
 impl SpeedSample {
-    /// 只知道速度時（假的網路、舊的呼叫端）：當成收滿 `max_bytes`，時間用速度回推
+    /// 只知道速度時（假的網路、舊的呼叫端）：當成收滿 `max_bytes`，時間用速度回推。
+    /// 有速度時狀態碼當成 200（有收到內容），沒有速度時是 0；`head_secs` 沒量到（0）
     pub fn from_mbps(mbps: f64, max_bytes: u64) -> SpeedSample {
         let ok = mbps.is_finite() && mbps > 0.0;
         SpeedSample {
@@ -82,6 +98,8 @@ impl SpeedSample {
             secs: if ok { max_bytes as f64 / 1_048_576.0 / mbps } else { 0.0 },
             connect_ms: 0.0,
             ttfb_ms: 0.0,
+            status: if ok { 200 } else { 0 },
+            head_secs: 0.0,
         }
     }
 }
@@ -475,19 +493,28 @@ pub async fn download_sample(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u
             buf.extend_from_slice(&tmp[..n]);
         };
         let ttfb_ms = t_req.elapsed().as_secs_f64() * 1000.0;
-        if parse_head(&buf[..end]).status >= 300 {
-            // 轉址或錯誤都不算測速（連線與 TTFB 還是量到了）
+        let status = parse_head(&buf[..end]).status;
+        if status >= 300 {
+            // 轉址或錯誤都不算測速（連線、TTFB 與狀態碼還是量到了）
             return Ok(SpeedSample {
                 connect_ms,
                 ttfb_ms,
+                status,
                 ..Default::default()
             });
         }
         let start = Instant::now();
         let mut bytes = (buf.len() - end) as u64;
+        // 前 1 MiB 的時間（同一條連線順便記；標頭那一包已經超過 1 MiB 的話量不到）
+        let mut head: Option<f64> = None;
         while bytes < max_bytes {
             match tokio::time::timeout(left(), s.read(&mut tmp)).await {
-                Ok(Ok(n)) if n > 0 => bytes += n as u64,
+                Ok(Ok(n)) if n > 0 => {
+                    bytes += n as u64;
+                    if head.is_none() && bytes >= HEAD_BYTES {
+                        head = Some(start.elapsed().as_secs_f64());
+                    }
+                }
                 _ => break,
             }
         }
@@ -503,6 +530,8 @@ pub async fn download_sample(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u
             secs,
             connect_ms,
             ttfb_ms,
+            status,
+            head_secs: head.unwrap_or(0.0),
         })
     }
     .await;
@@ -532,6 +561,24 @@ mod tests {
         assert_eq!((b.as_slice(), done), (&b"hellowo"[..], true));
         assert_eq!(host_header("::1", 8443, 443), "[::1]:8443");
         assert_eq!(host_header("a.test", 443, 443), "a.test");
+    }
+
+    /// 3.5.0 F9、F13：握手時間＝連線＋TLS 握手，兩個都量到才有（純 HTTP、失敗回 None）
+    #[test]
+    fn handshake_ms_needs_connect_and_tls() {
+        let t = Timing {
+            connect_ms: 21.0,
+            tls_ms: 42.0,
+            ttfb_ms: 120.0,
+        };
+        assert_eq!(t.handshake_ms(), Some(63.0), "不含 TTFB");
+        assert_eq!(t.request_ms(), Some(183.0));
+        let plain = Timing { tls_ms: 0.0, ..t };
+        assert_eq!(plain.handshake_ms(), None, "純 HTTP 沒有握手");
+        assert_eq!(Timing::default().handshake_ms(), None);
+        let s = SpeedSample::from_mbps(2.0, 8 << 20);
+        assert_eq!((s.status, s.head_secs), (200, 0.0));
+        assert_eq!(SpeedSample::from_mbps(0.0, 8 << 20).status, 0);
     }
 
     /// 3.4.2：測速收滿上限就停（以前 30 MiB：網路快時每個節點都把整個測速檔收完）；收滿得很快也照算速度

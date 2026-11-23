@@ -68,6 +68,9 @@ pub struct Params {
     pub backfill_sample: u64,
     /// 同時最多幾個補問（1～2 核心 2、其他 4；拿不到名額就不補問，不排隊）
     pub backfill_max: usize,
+    /// 上游成敗的記法（3.5.0 F4，`upstream.roundAwareFailures`，預設開）：來不及回答（被取消）的上游記得到、
+    /// 大家都答不出來的那一輪不算個別上游失敗。關掉＝3.4.x 的記法。規格 11 第 6.2 節骨架，乙批接上
+    pub round_aware_failures: bool,
 }
 
 impl Params {
@@ -103,6 +106,7 @@ impl Params {
             backfill,
             backfill_sample,
             backfill_max: if kuroshio_config::Host::detect().cores <= 2 { 2 } else { 4 },
+            round_aware_failures: kuroshio_config::chain::flex_bool(kuroshio_config::get(cfg, "upstream.roundAwareFailures"), true).0,
         }
     }
 }
@@ -1654,6 +1658,18 @@ mod tests {
         assert!(p.backfill_max == 2 || p.backfill_max == 4);
         let p = params(json!({ "backfill": "off", "backfillSample": "4" }));
         assert_eq!((p.backfill, p.backfill_sample), (Backfill::Off, 4));
+    }
+
+    /// 3.5.0 F4：`upstream.roundAwareFailures` 預設開；false、UCI 的 "0" 是關
+    #[test]
+    fn round_aware_failures_from_config() {
+        assert!(params(json!({})).round_aware_failures);
+        assert!(Params::from_cfg(&json!({})).round_aware_failures, "沒寫 = 開");
+        for off in [json!(false), json!("0"), json!(0)] {
+            let mut c = kuroshio_config::defaults();
+            kuroshio_config::merge(&mut c, &json!({ "upstream": { "roundAwareFailures": off } }));
+            assert!(!Params::from_cfg(&c).round_aware_failures, "{c:?}");
+        }
     }
 
     #[test]

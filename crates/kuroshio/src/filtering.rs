@@ -100,6 +100,20 @@ pub struct ListSource {
     /// 「繞過防護」類的清單（設定 `filter.lists[].bypass`；沒寫時預設的 HaGeZi doh-vpn-proxy-bypass 依網址認得）。
     /// 串接模式（3.4.0）：登記中的下游查它登記的上游主機名稱時，這類清單不擋（規格 10 的 4.4）
     pub bypass: bool,
+    /// 惡意網站探測可以從這份抽網域（3.5.0 F10，設定 `filter.lists[].probe`；沒寫時依分類與網址，
+    /// 見 `kuroshio_config::chain::is_probe_list`）。規格 11 第 6.2 節骨架，丙批的抽樣接上
+    pub probe: bool,
+}
+
+/// 惡意網站探測可以抽樣的一份清單（3.5.0 F10，[`FilterService::probe_sources`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeSource {
+    pub url: String,
+    pub name: String,
+    /// 本機副本在磁碟上的位置（沒有副本、或還在等寫出時是 None：不為了抽樣多下載）
+    pub copy: Option<PathBuf>,
+    /// 被記憶體控制停用中（停用中不抽）
+    pub unloaded: bool,
 }
 
 /// 暫時停用的清單
@@ -746,6 +760,12 @@ impl FilterService {
 
     pub fn sources(&self) -> &[ListSource] {
         &self.sources
+    }
+
+    /// 惡意網站探測可以抽樣的清單（3.5.0 F10）：名稱、副本路徑、是不是停用中。唯讀，不下載、不重建。
+    /// 規格 11 第 6.2 節骨架：先回空的（＝抽不到，評測照現在只用 `probe.txt`），乙批補上實作
+    pub fn probe_sources(&self) -> Vec<ProbeSource> {
+        Vec::new()
     }
 
     /// 開始一次手動更新（重新讀自訂規則、強制檢查每份清單），在背景執行。
@@ -1874,12 +1894,14 @@ fn list_source(l: &Value) -> Option<ListSource> {
     // 惡意（含反詐騙，例如 TW165）預設是保護清單：記憶體不足也不停用
     let protect = l.get("protect").and_then(Value::as_bool).unwrap_or(category == Category::Malware);
     let bypass = kuroshio_config::chain::is_bypass_list(l);
+    let probe = kuroshio_config::chain::is_probe_list(l);
     Some(ListSource {
         url,
         name,
         category,
         protect,
         bypass,
+        probe,
     })
 }
 
@@ -2112,6 +2134,7 @@ mod tests {
             category: cat,
             protect,
             bypass: false,
+            probe: false,
         }
     }
 
@@ -2136,6 +2159,15 @@ mod tests {
         let lists = kuroshio_config::get(&cfg, "filter.lists").unwrap().as_array().unwrap().clone();
         let tw = lists.iter().find(|x| x["url"].as_str().unwrap().contains("TW165")).unwrap();
         assert!(list_source(tw).unwrap().protect);
+        // 3.5.0 F10：TW165 不抽惡意網站探測的網域；威脅情資類可以抽、廣告類不抽
+        assert!(!list_source(tw).unwrap().probe);
+        let tif = lists
+            .iter()
+            .find(|x| x["url"].as_str().unwrap().ends_with("/tif.mini.txt"))
+            .unwrap();
+        assert!(list_source(tif).unwrap().probe);
+        assert!(!l(json!({ "url": "u", "category": "ads" })).probe);
+        assert!(l(json!({ "url": "u", "category": "malware" })).probe);
     }
 
     #[test]

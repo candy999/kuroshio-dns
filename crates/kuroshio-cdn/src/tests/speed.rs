@@ -21,6 +21,8 @@ fn sample(mbps: f64, secs: f64) -> SpeedSample {
         secs,
         connect_ms: 4.0,
         ttfb_ms: 9.0,
+        status: 200,
+        head_secs: 0.0,
     }
 }
 

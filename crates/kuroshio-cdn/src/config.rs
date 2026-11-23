@@ -57,6 +57,9 @@ pub fn lite_value(v: Option<&Value>) -> Option<bool> {
 pub const LITE_VERIFY_PER_MIN: u32 = 30;
 /// 小機器減量：節點池下載測速最多幾個節點（一般是 `pool.speedTop` 16）
 pub const LITE_SPEED_TOP: usize = 4;
+/// `cdn.verifyPerMin` 填數字時的範圍（3.5.0 F12）
+pub const VERIFY_PER_MIN_MIN: u32 = 6;
+pub const VERIFY_PER_MIN_MAX: u32 = 1200;
 
 #[derive(Debug, Clone)]
 pub struct CdnConfig {
@@ -74,6 +77,13 @@ pub struct CdnConfig {
     pub verify_fail_max_days: f64,
     pub verify_timeout_ms: u64,
     pub verify_concurrency: usize,
+    /// 新網域很多時的 CDN 驗證節流（3.5.0 F12，`cdn.verifyPacing`，預設開）。關掉＝只有 `cdn.lite` 有每分鐘上限。
+    /// 規格 11 第 6.2 節骨架，甲批接上
+    pub verify_pacing: bool,
+    /// 驗證每分鐘上限 `Rmax`（3.5.0 F12，`cdn.verifyPerMin`）：`"auto"` 由設定載入時依核心數與 AES 換算
+    /// （`kuroshio_config::auto_verify_per_min`），填數字的夾在 6～1,200；沒換算過（只有 `cdn` 區塊的測試設定）用 60。
+    /// `cdn.lite` 的 30 由使用的地方套用。規格 11 第 6.2 節骨架，甲批接上
+    pub verify_per_min: u32,
     pub verify_candidates: usize,
     /// 每小時輪流複驗：還在有效期內、最近有改寫的「驗證通過」網域抽多少比例（0 = 不做）
     pub reverify_ratio: f64,
@@ -175,6 +185,11 @@ impl CdnConfig {
             verify_fail_max_days: or(c, "verifyFailMaxDays", 7.0),
             verify_timeout_ms: or(c, "verifyTimeoutMs", 5000.0) as u64,
             verify_concurrency: or(c, "verifyConcurrency", 8.0) as usize,
+            verify_pacing: lite_value(c.get("verifyPacing")) != Some(false),
+            verify_per_min: kuroshio_config::num_or_auto(c.get("verifyPerMin"))
+                .map(|n| n.min(u32::MAX as u64) as u32)
+                .unwrap_or(60)
+                .clamp(VERIFY_PER_MIN_MIN, VERIFY_PER_MIN_MAX),
             verify_candidates: or(c, "verifyCandidates", 4.0) as usize,
             reverify_ratio: nn(c, "reverifyRatio", 0.02).clamp(0.0, 1.0),
             reverify_min: nn(c, "reverifyMin", 5.0).max(0.0) as usize,
@@ -385,5 +400,24 @@ mod tests {
             "popAudit": false, "popSwitch": "0", "spreadPrefixes": 0, "slowerFallback": "false"
         } }));
         assert_eq!(on(&off), (false, false, false, false));
+    }
+
+    /// 3.5.0 F12 的開關與每分鐘上限：預設開、auto 依核心數與 AES；填的數字夾在 6～1,200
+    #[test]
+    fn verify_pacing_settings() {
+        let d3 = CdnConfig::from_value(&build_for(&Host { cores: 2, aes: false }, &json!({})));
+        assert!(d3.verify_pacing);
+        assert_eq!(d3.verify_per_min, 60, "MT7621：雙核心、沒有 AES");
+        let big = CdnConfig::from_value(&build_for(&Host { cores: 16, aes: true }, &json!({})));
+        assert_eq!(big.verify_per_min, 480);
+        let pm = |v: Value| CdnConfig::from_value(&json!({ "cdn": { "verifyPerMin": v } })).verify_per_min;
+        assert_eq!(pm(json!(100)), 100);
+        assert_eq!(pm(json!("90")), 90, "UCI 給的字串");
+        assert_eq!(pm(json!(1)), 6);
+        assert_eq!(pm(json!(99999)), 1200);
+        assert_eq!(pm(json!("auto")), 60, "沒換算過的 auto");
+        let off = CdnConfig::from_value(&json!({ "cdn": { "verifyPacing": "0" } }));
+        assert!(!off.verify_pacing);
+        assert!(CdnConfig::from_value(&json!({ "cdn": {} })).verify_pacing);
     }
 }
