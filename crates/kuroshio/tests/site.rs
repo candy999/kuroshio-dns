@@ -397,6 +397,10 @@ async fn public_stats_ranges() {
     assert_eq!(json_of(&r)["days"], 30);
     let body = text(&r);
     assert!(!body.contains("192.0.2."), "公開統計不含 IP");
+    // 3.5.0 E8、E9：兩條路比對、過期快取比率、24 小時歷史是營運狀態，公開頁不帶（paths_absent_from_public_stats）
+    for k in ["paths", "stale", "history"] {
+        assert!(t.get(k).is_none() && w.get(k).is_none(), "公開頁不該有 {k}");
+    }
 
     // 管理介面的儀表板（LuCI、Windows 設定頁）：同一份統計，但排行不受 site.minClients 限制
     let q = kuroshio::admin::parse_query("range=today");
@@ -404,6 +408,32 @@ async fn public_stats_ranges() {
     assert_eq!(a["range"], "today");
     assert_eq!(a["totals"]["queries"], 4);
     assert_eq!(a["privacy"]["minClients"], 1);
+    assert_eq!(a["paths"]["sites"], 0, "CDN 沒開：沒有網站");
+    assert!(a["stale"]["rateToday"].is_number());
+    assert_eq!(a["history"]["stepSec"], 300);
+    // existing_dashboard_fields_unchanged：3.4.4 的欄位都還在（LuCI 與公開頁在讀）
+    for k in [
+        "generatedAt",
+        "range",
+        "days",
+        "totals",
+        "acceleration",
+        "trend",
+        "cdn",
+        "routing",
+        "opportunity",
+        "flows",
+        "toPops",
+        "crossCdn",
+        "realtime",
+        "outcomes",
+        "topSites",
+        "topBlocked",
+        "privacy",
+        "system",
+    ] {
+        assert!(a.get(k).is_some() && t.get(k).is_some(), "{k}");
+    }
     let names: Vec<&str> = a["topSites"]
         .as_array()
         .unwrap()

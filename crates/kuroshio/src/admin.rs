@@ -94,6 +94,11 @@ pub fn parse_query(q: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// 查詢參數的開關：`1`、`true` 才算（`lite=1`、`history=1`）
+fn flag(q: &HashMap<String, String>, k: &str) -> bool {
+    matches!(q.get(k).map(String::as_str), Some("1" | "true"))
+}
+
 /// Host 標頭是不是本機（沒有 Host 的 HTTP/1.0 請求也算，uclient-fetch 會帶）
 pub fn local_host(host: Option<&str>) -> bool {
     let Some(h) = host else { return true };
@@ -694,7 +699,23 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             if let Some(i) = path.get_mut("interceptor").filter(|i| i.is_object()) {
                 i["chain"] = crate::chain::client::interceptor_api_json();
             }
-            ok(json!({
+            // `lite=1`（LuCI 的 rpcd、padavan 韌體每幾秒讀一次）：不回大的欄位（`perf`、`history`；規格 11 C12、E9）
+            let lite = flag(q, "lite");
+            // 線路感知（3.5.0 E3～E7）：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil`；
+            // `status_lite()` 自己已經帶的不蓋掉
+            let cdn = r
+                .cdn()
+                .map(|c| {
+                    let mut v = c.status_lite();
+                    if let (Some(o), Value::Object(extra)) = (v.as_object_mut(), c.observe_json()) {
+                        for (k, x) in extra {
+                            o.entry(k).or_insert(x);
+                        }
+                    }
+                    v
+                })
+                .unwrap_or_else(|| json!({ "enabled": false }));
+            let mut out = json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
                 "api": crate::integration::API_VERSION,
@@ -720,7 +741,7 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "autoUpstreams": crate::chain::share::auto_info(&r.upstreams),
                 "filter": filter,
                 // CDN 關掉時給 `{"enabled": false}`，不是 null（3.5.0；D3 3.4.3 回報 null 看不出是關掉還是讀不到）
-                "cdn": r.cdn().map(|c| c.status_lite()).unwrap_or_else(|| json!({ "enabled": false })),
+                "cdn": cdn,
                 "jobs": st.scheduler.as_ref().map(|s| s.status()),
                 "system": st.system_json(),
                 // 記憶體控制（規格 09）：狀態、預算、釋出中的項目（system.memory 是同一份）
@@ -743,7 +764,22 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                     "builtin": kuroshio_net::comm::COMM_SUFFIXES.len(), "user": kuroshio_net::comm::user_count(),
                     "prefetching": r.comm_prefetching(),
                 },
-            }))
+                // 3.5.0 E1：每一種會過期的資料的上次成功、失敗中、下次預定
+                "freshness": crate::observe::freshness(st),
+                // 3.5.0 E2：觀察到的現象與它的經過（`warnings` 照舊、不重複放）
+                "findings": crate::observe::findings(st),
+                // 3.5.0 E8：過期快取的比率（今天、最近 15 分鐘、最近 1 小時）
+                "stale": r.stats.stale_rates(),
+            });
+            if lite {
+                if let Some(o) = out.as_object_mut() {
+                    o.remove("perf");
+                }
+            } else if flag(q, "history") {
+                // 3.5.0 E9：24 小時歷史（約 6 KB，要明確要求才給）
+                out["history"] = r.stats.history_json();
+            }
+            ok(out)
         }
         // 來源 IP 存取控制（規格 08）；?ip= 說明這個 IP 的判斷結果
         "/api/access" => match (r.access.get(), q.get("ip")) {
@@ -841,7 +877,11 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 }
                 None => "disabled",
             };
-            crate::app::spawn_wan_subnet(r.clone(), 0);
+            // 線路感知（3.5.0 E3）：wanEpoch 加 1、reach 標成過期、清掉機房切換的連續計數與暫緩（不補跑健檢或掃描）
+            if let Some(c) = r.cdn() {
+                c.on_wan_changed();
+            }
+            crate::app::spawn_wan_subnet(r.clone(), 0, true);
             // 串接（3.4.0）：立刻拿掉串接上游，接著的路徑檢查重新偵測、自動接回
             let chain = match crate::chain::current() {
                 Some(c) if c.state().0 != crate::chain::client::State::None => {
@@ -961,6 +1001,7 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             q.get("range").map(String::as_str).unwrap_or("today"),
             1,
             crate::site::ADMIN_TOP,
+            crate::site::View::Admin,
         )),
         // 「為什麼沒換到台灣」（3.5.0）：只讀；CDN 沒開時也回答（說明沒開）
         "/api/cdn/explain" => {

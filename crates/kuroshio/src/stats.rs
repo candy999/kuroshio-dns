@@ -34,6 +34,9 @@ const ANON_CLIENTS: usize = 32;
 const DAY_SITES_KEPT: usize = 300;
 /// 快照格式版本
 const SNAPSHOT_VERSION: u64 = 1;
+/// 24 小時歷史（3.5.0 E9）：每格幾秒、幾格
+pub const HIST_STEP_SEC: u64 = 300;
+pub const HIST_SLOTS: usize = 288;
 
 #[derive(Debug, Default, Clone)]
 pub struct Histogram {
@@ -139,6 +142,183 @@ struct Minute {
     acc: u32,
 }
 
+/// 24 小時歷史的一格（3.5.0 E9）：5 分鐘內各計數的增加量。都是 32 位元（在既有的 `Mutex` 裡，
+/// 用 `u32` 是為了省空間；一格 32 位元組 × 288 格 ≈ 9.2 KB）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Slot {
+    q: u32,
+    blocked: u32,
+    servfail: u32,
+    stale: u32,
+    miss: u32,
+    /// 原本會出國的 CDN 回應（`Day.route` 各家 `abroad` 的增加量）與其中換成台灣的（`acc`）
+    abroad: u32,
+    tw: u32,
+    /// 問上游的延遲百分位（毫秒，無條件進位）：0 = 這一格沒有問上游；[`LAT_OVER`] = 超過 1 秒
+    p50: u16,
+    p95: u16,
+}
+
+/// 延遲超過直方圖最後一個有限區間（1000 毫秒）
+const LAT_OVER: u16 = 1001;
+
+/// 「上一格結束時」的 `Day` 累計值（算差用）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HistBase {
+    q: u64,
+    blocked: u64,
+    servfail: u64,
+    stale: u64,
+    miss: u64,
+    abroad: u64,
+    tw: u64,
+    lat: [u64; 12],
+}
+
+impl HistBase {
+    fn of(d: &Day) -> HistBase {
+        let (abroad, tw) = d.route.values().fold((0, 0), |(a, t), r| (a + r.abroad, t + r.acc));
+        HistBase {
+            q: d.query,
+            blocked: d.blocked,
+            servfail: d.servfail,
+            stale: d.stale,
+            miss: d.miss,
+            abroad,
+            tw,
+            lat: d.lat_miss.counts,
+        }
+    }
+}
+
+/// 24 小時歷史（3.5.0 E9）：固定大小的環形陣列，啟動時配置一次；不進快照、重新啟動清空
+#[derive(Debug)]
+struct Hist {
+    slots: Box<[Slot]>,
+    /// 下一格要寫的位置
+    head: usize,
+    /// 已經有幾格（最多 [`HIST_SLOTS`]）
+    n: usize,
+    /// 進行中的那一格的槽號（Unix 秒 ÷ 300）；`u64::MAX` = 還沒開始
+    cur: u64,
+    base: HistBase,
+}
+
+impl Default for Hist {
+    fn default() -> Self {
+        Hist {
+            slots: vec![Slot::default(); HIST_SLOTS].into_boxed_slice(),
+            head: 0,
+            n: 0,
+            cur: u64::MAX,
+            base: HistBase::default(),
+        }
+    }
+}
+
+fn sat32(x: u64) -> u32 {
+    x.min(u32::MAX as u64) as u32
+}
+
+/// 直方圖兩個時間點之間的百分位（毫秒，無條件進位；沒有資料是 0，超過 1 秒是 [`LAT_OVER`]）
+fn lat_ms(h: &Histogram, p: f64) -> u16 {
+    if h.n() == 0 {
+        return 0;
+    }
+    match h.percentile(p) {
+        Some(ms) => (ms.ceil() as u16).max(1),
+        None => LAT_OVER,
+    }
+}
+
+impl Hist {
+    fn clear(&mut self) {
+        self.head = 0;
+        self.n = 0;
+    }
+
+    fn push(&mut self, s: Slot) {
+        self.slots[self.head] = s;
+        self.head = (self.head + 1) % HIST_SLOTS;
+        self.n = (self.n + 1).min(HIST_SLOTS);
+    }
+
+    /// 槽號變了：關掉進行中的那一格（現在的累計值 − 上一格結束時的累計值），中間沒有查詢的格子補 0。
+    /// 第一次、時鐘倒退、或跳了超過 288 格：清空、基準重設（不補一整圈的 0）
+    fn advance(&mut self, slot: u64, day: &Day) {
+        let now = HistBase::of(day);
+        if self.cur == u64::MAX || slot < self.cur || slot - self.cur > HIST_SLOTS as u64 {
+            if self.cur != u64::MAX {
+                self.clear();
+            }
+            self.cur = slot;
+            self.base = now;
+            return;
+        }
+        let b = &self.base;
+        let mut lat = Histogram::default();
+        for (i, c) in lat.counts.iter_mut().enumerate() {
+            *c = now.lat[i].saturating_sub(b.lat[i]);
+        }
+        let d = |x: u64, y: u64| sat32(x.saturating_sub(y));
+        self.push(Slot {
+            q: d(now.q, b.q),
+            blocked: d(now.blocked, b.blocked),
+            servfail: d(now.servfail, b.servfail),
+            stale: d(now.stale, b.stale),
+            miss: d(now.miss, b.miss),
+            abroad: d(now.abroad, b.abroad),
+            tw: d(now.tw, b.tw),
+            p50: lat_ms(&lat, 0.5),
+            p95: lat_ms(&lat, 0.95),
+        });
+        for _ in 1..(slot - self.cur) {
+            self.push(Slot::default());
+        }
+        self.cur = slot;
+        self.base = now;
+    }
+
+    /// 由舊到新
+    fn iter(&self) -> impl Iterator<Item = &Slot> {
+        let start = (self.head + HIST_SLOTS - self.n) % HIST_SLOTS;
+        (0..self.n).map(move |i| &self.slots[(start + i) % HIST_SLOTS])
+    }
+
+    /// 最近 `k` 格（完整的 5 分鐘）的（過期快取, 查詢）總和
+    fn stale_window(&self, k: usize) -> (u64, u64) {
+        self.iter()
+            .skip(self.n.saturating_sub(k))
+            .fold((0, 0), |(s, q), x| (s + x.stale as u64, q + x.q as u64))
+    }
+
+    fn json(&self) -> Value {
+        let col = |f: fn(&Slot) -> u32| Value::Array(self.iter().map(|s| json!(f(s))).collect());
+        let lat = |f: fn(&Slot) -> u16| {
+            Value::Array(
+                self.iter()
+                    .map(|s| match f(s) {
+                        0 => Value::Null,
+                        v => json!(v),
+                    })
+                    .collect(),
+            )
+        };
+        let from = if self.cur == u64::MAX {
+            0
+        } else {
+            (self.cur - self.n as u64) * HIST_STEP_SEC
+        };
+        json!({
+            "stepSec": HIST_STEP_SEC, "from": from, "n": self.n,
+            "q": col(|s| s.q), "blocked": col(|s| s.blocked), "servfail": col(|s| s.servfail),
+            "stale": col(|s| s.stale), "miss": col(|s| s.miss),
+            "p50": lat(|s| s.p50), "p95": lat(|s| s.p95),
+            "abroad": col(|s| s.abroad), "tw": col(|s| s.tw),
+        })
+    }
+}
+
 /// 今天某個網站的匿名計數
 #[derive(Debug, Default)]
 struct Anon {
@@ -183,6 +363,8 @@ struct Inner {
     limits: Limits,
     /// 記憶體控制縮小排行之前的上限（恢復用）
     saved_top_max: Option<usize>,
+    /// 24 小時歷史（3.5.0 E9）
+    hist: Hist,
 }
 
 impl Default for Inner {
@@ -200,6 +382,7 @@ impl Default for Inner {
             blocked_sites: HashMap::new(),
             limits: Limits::default(),
             saved_top_max: None,
+            hist: Hist::default(),
         }
     }
 }
@@ -701,14 +884,26 @@ impl Inner {
 
 impl Stats {
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
-        let now = now_unix();
+        self.with_at(now_unix(), f)
+    }
+
+    /// 同 [`Stats::with`]，時間由呼叫端給（測試用）
+    fn with_at<R>(&self, now: u64, f: impl FnOnce(&mut Inner) -> R) -> R {
         let day_no = (now + 8 * 3600) / 86400;
+        let slot = now / HIST_STEP_SEC;
         let mut g = self.inner.lock().unwrap();
-        if g.day_no != day_no {
-            g.roll(&taipei_date(now));
-            g.day_no = day_no;
+        let i = &mut *g;
+        // 3.5.0 E9：每筆查詢只多這一次整數比較；先關格、再換日（台北午夜也是 5 分鐘的邊界，
+        // 換日前先用舊的 `Day` 算完差值，換日後基準歸零）
+        if i.hist.cur != slot {
+            i.hist.advance(slot, &i.day);
         }
-        f(&mut g)
+        if i.day_no != day_no {
+            i.roll(&taipei_date(now));
+            i.day_no = day_no;
+            i.hist.base = HistBase::of(&i.day);
+        }
+        f(i)
     }
 
     fn with_day<R>(&self, f: impl FnOnce(&mut Day) -> R) -> R {
@@ -901,16 +1096,37 @@ impl Stats {
     /// （`stepSec`、`from`、`n`、`q`、`blocked`、`servfail`、`stale`、`miss`、`p50`、`p95`、`abroad`、`tw`）。
     /// 從 `Day` 的累計值算差，查詢路徑上不加新的累加；不進快照。
     ///
-    /// 第 5.2 節骨架，乙批接上（目前是空物件）。
+    /// `from` 是第一格開始的 Unix 秒；最後一格是上一個完整的 5 分鐘（進行中的那一格不給）。
+    /// `p50`／`p95` 是問上游的延遲（毫秒）：`null` = 那一格沒有問上游，`1001` = 超過 1 秒。
     pub fn history_json(&self) -> Value {
-        Value::Object(Map::new())
+        self.history_at(now_unix())
     }
 
-    /// 過期快取的比率（3.5.0 E8）：`today`、`rateToday`、`rate15m`、`rate1h`（後兩個讀 E9 的環形陣列）。
-    ///
-    /// 第 5.2 節骨架，乙批接上（目前是空物件）。
+    fn history_at(&self, now: u64) -> Value {
+        self.with_at(now, |i| i.hist.json())
+    }
+
+    /// 過期快取的比率（3.5.0 E8）：`today`、`rateToday`（`Day.stale ÷ Day.query`）、`rate15m`、`rate1h`
+    /// （後兩個讀 E9 的環形陣列，只算完整的 5 分鐘）。沒有查詢時比率是 0。
     pub fn stale_rates(&self) -> Value {
-        Value::Object(Map::new())
+        self.stale_rates_at(now_unix())
+    }
+
+    fn stale_rates_at(&self, now: u64) -> Value {
+        let (today, query, w15, w60) = self.with_at(now, |i| (i.day.stale, i.day.query, i.hist.stale_window(3), i.hist.stale_window(12)));
+        let rate = |s: u64, q: u64| {
+            if q == 0 {
+                0.0
+            } else {
+                (s as f64 / q as f64 * 10_000.0).round() / 10_000.0
+            }
+        };
+        json!({ "today": today, "rateToday": rate(today, query), "rate15m": rate(w15.0, w15.1), "rate1h": rate(w60.0, w60.1) })
+    }
+
+    /// 最近 15 分鐘（3 格）的（過期快取, 查詢）總和（E2 的 `serve-stale-high` 用）
+    pub fn stale_15m(&self) -> (u64, u64) {
+        self.with(|i| i.hist.stale_window(3))
     }
 
     /// 對齊 2.x `/api/status` 的 `stats`（`today` 的欄位維持不變，LuCI 會讀）
@@ -1052,6 +1268,9 @@ impl Stats {
             }
         }
         g.trim_history();
+        // 3.5.0 E9：還原回來的累計值不算進下一格（不會出現一格「今天到目前為止的總和」）
+        let base = HistBase::of(&g.day);
+        g.hist.base = base;
         true
     }
 }
@@ -1218,5 +1437,179 @@ mod tests {
         i.roll("2001-01-01");
         assert_eq!(i.day.query, 3, "時鐘倒退：沿用原本那天");
         assert_eq!(i.sites["example.com"].base, 2);
+    }
+
+    // ---- 3.5.0 E9：24 小時歷史 ----
+
+    /// 台北某天 10:00 整（UTC 02:00），是 5 分鐘的邊界
+    const T0: u64 = 1_762_826_400;
+
+    fn bump_at(s: &Stats, now: u64, q: u64, stale: u64, miss_ms: &[f64]) {
+        s.with_at(now, |i| {
+            i.day.query += q;
+            i.day.stale += stale;
+            for ms in miss_ms {
+                i.day.miss += 1;
+                i.day.lat_miss.record(*ms);
+            }
+        });
+    }
+
+    #[test]
+    fn history_slot_closes_on_boundary_with_deltas() {
+        let s = Stats::default();
+        bump_at(&s, T0 + 1, 3, 1, &[]);
+        bump_at(&s, T0 + 299, 2, 0, &[]);
+        assert_eq!(s.history_at(T0 + 299)["n"], 0, "進行中的那一格不給");
+        bump_at(&s, T0 + 300, 7, 0, &[]);
+        let h = s.history_at(T0 + 301);
+        assert_eq!(h["n"], 1);
+        assert_eq!(h["from"], T0);
+        assert_eq!(h["stepSec"], 300);
+        assert_eq!(h["q"], json!([5]), "第一格：0～299 秒的增加量");
+        assert_eq!(h["stale"], json!([1]));
+        let h = s.history_at(T0 + 600);
+        assert_eq!(h["q"], json!([5, 7]));
+        assert_eq!(h["from"], T0);
+    }
+
+    #[test]
+    fn history_sum_matches_day_totals() {
+        let s = Stats::default();
+        // 台北 00:00 開始一整天
+        let midnight = 1_762_790_400; // 2025-11-11 00:00 台北
+        s.with_at(midnight, |_| {});
+        for k in 0..288u64 {
+            bump_at(&s, midnight + k * 300 + 7, k % 5, k % 2, &[]);
+            s.with_at(midnight + k * 300 + 10, |i| {
+                let r = i.day.route.entry("cloudflare".into()).or_default();
+                r.abroad += 2;
+                r.acc += 1;
+            });
+        }
+        let h = s.history_at(midnight + 86_399);
+        assert_eq!(h["n"], 287, "最後一格還在進行中");
+        let sum = |k: &str| h[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).sum::<u64>();
+        let (q, st) = s.with_at(midnight + 86_399, |i| (i.day.query, i.day.stale));
+        // 最後一格（第 287 格）還沒關：總和差最後一格
+        assert_eq!(sum("q") + 287 % 5, q);
+        assert_eq!(sum("stale") + 287 % 2, st);
+        assert_eq!(sum("abroad"), 287 * 2);
+        assert_eq!(sum("tw"), 287);
+    }
+
+    #[test]
+    fn history_closes_before_day_roll() {
+        let s = Stats::default();
+        let midnight = 1_762_790_400; // 台北 00:00
+        bump_at(&s, midnight - 200, 9, 0, &[]);
+        bump_at(&s, midnight + 5, 1, 0, &[]);
+        let h = s.history_at(midnight + 301);
+        assert_eq!(h["q"], json!([9, 1]), "跨午夜的那一格不遺失、不變成負的");
+        assert_eq!(s.with_at(midnight + 301, |i| i.day.query), 1, "換日了");
+    }
+
+    #[test]
+    fn history_fills_idle_slots_with_zero_and_caps_at_288() {
+        let s = Stats::default();
+        bump_at(&s, T0, 4, 0, &[]);
+        bump_at(&s, T0 + 3 * 300 + 1, 2, 0, &[]);
+        let h = s.history_at(T0 + 4 * 300);
+        assert_eq!(h["q"], json!([4, 0, 0, 2]));
+        // 一直跑 300 格：最多 288
+        for k in 5..310u64 {
+            bump_at(&s, T0 + k * 300, 1, 0, &[]);
+        }
+        let h = s.history_at(T0 + 310 * 300);
+        assert_eq!(h["n"], HIST_SLOTS);
+        assert_eq!(h["q"].as_array().unwrap().len(), HIST_SLOTS);
+        assert_eq!(h["from"], T0 + (310 - 288) * 300);
+    }
+
+    #[test]
+    fn history_first_slot_after_restore_is_not_whole_day() {
+        let s = Stats::default();
+        s.count(Kind::Query);
+        let today = taipei_date(now_unix());
+        let snap = json!({ "version": 1, "days": [ { "date": today, "query": 5000, "stale": 40 } ] });
+        assert!(s.restore(&serde_json::to_vec(&snap).unwrap()));
+        let now = now_unix();
+        let after = (now / 300 + 1) * 300;
+        bump_at(&s, now, 2, 0, &[]);
+        let h = s.history_at(after + 1);
+        let q: u64 = h["q"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).sum();
+        assert!(q <= 3, "還原的 5000 筆不算進一格：{h}");
+        assert_eq!(h["stale"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn history_resets_on_clock_jump_back_or_far_forward() {
+        let s = Stats::default();
+        for k in 0..5u64 {
+            bump_at(&s, T0 + k * 300, 1, 0, &[]);
+        }
+        assert_eq!(s.history_at(T0 + 5 * 300)["n"], 5);
+        // 時鐘倒退
+        bump_at(&s, T0 + 100, 1, 0, &[]);
+        let h = s.history_at(T0 + 100);
+        assert_eq!(h["n"], 0, "清空重來");
+        assert_eq!(s.history_at(T0 + 300)["q"], json!([1]));
+        // 跳了超過 288 格：清空，不補一整圈的 0
+        let far = T0 + 300 + 289 * 300 + 300;
+        bump_at(&s, far, 1, 0, &[]);
+        assert_eq!(s.history_at(far)["n"], 0);
+        assert_eq!(s.history_at(far + 300)["n"], 1);
+    }
+
+    #[test]
+    fn history_not_in_snapshot() {
+        let s = Stats::default();
+        bump_at(&s, now_unix(), 3, 0, &[]);
+        let snap = String::from_utf8(s.snapshot()).unwrap();
+        assert!(!snap.contains("stepSec") && !snap.contains("hist"), "{snap}");
+    }
+
+    #[test]
+    fn history_p50_from_histogram_delta() {
+        let s = Stats::default();
+        // 第一格：慢的（200 毫秒）
+        bump_at(&s, T0, 10, 0, &[150.0; 10]);
+        // 第二格：快的（2 毫秒）與一筆超過 1 秒
+        let mut fast = vec![1.5; 19];
+        fast.push(5000.0);
+        bump_at(&s, T0 + 300, 20, 0, &fast);
+        // 第三格：沒有問上游
+        bump_at(&s, T0 + 600, 1, 0, &[]);
+        let h = s.history_at(T0 + 900);
+        assert_eq!(h["p50"], json!([200, 2, null]), "用兩格之間的差，不是今天整天的");
+        assert_eq!(h["p95"], json!([200, 2, null]));
+        assert_eq!(h["miss"], json!([10, 20, 0]));
+        let mut over = Histogram::default();
+        over.record(5000.0);
+        assert_eq!(lat_ms(&over, 0.5), LAT_OVER);
+        let mut sub = Histogram::default();
+        sub.record(0.2);
+        assert_eq!(lat_ms(&sub, 0.5), 1, "0.5 毫秒的區間無條件進位成 1");
+    }
+
+    #[test]
+    fn stale_rates_from_history_ring() {
+        let s = Stats::default();
+        for k in 0..12u64 {
+            // 最後 3 格：每格 100 筆、10 筆過期；之前的：每格 100 筆、0 筆
+            bump_at(&s, T0 + k * 300, 100, if k >= 9 { 10 } else { 0 }, &[]);
+        }
+        let r = s.stale_rates_at(T0 + 12 * 300);
+        assert_eq!(r["today"], 30);
+        assert_eq!(r["rate15m"], 0.1);
+        assert_eq!(r["rate1h"], 0.025);
+        assert_eq!(r["rateToday"], 0.025);
+        let empty = Stats::default().stale_rates_at(T0);
+        assert_eq!(empty, json!({ "today": 0, "rateToday": 0.0, "rate15m": 0.0, "rate1h": 0.0 }));
+    }
+
+    #[test]
+    fn hist_slot_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<Slot>(), 32, "288 格 ≈ 9.2 KB");
     }
 }

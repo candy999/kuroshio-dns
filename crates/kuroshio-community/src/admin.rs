@@ -147,6 +147,38 @@ impl Community {
         })
     }
 
+    /// 好友同步的新鮮度（3.5.0 E1，主程式的 `/api/status.freshness` 用）：沒有好友是 `None`
+    pub fn sync_summary(&self) -> Option<SyncSummary> {
+        let interval_ms = self.config().sync_interval_min as u64 * 60_000;
+        let st = self.lock();
+        let mut s = SyncSummary {
+            friends: 0,
+            oldest_ok: None,
+            failing: 0,
+            max_fails: 0,
+            failing3: 0,
+            next_try: None,
+            interval_ms,
+        };
+        for p in st.store.friends() {
+            s.friends += 1;
+            if p.last_sync_ok > 0 {
+                s.oldest_ok = Some(s.oldest_ok.map_or(p.last_sync_ok, |t: u64| t.min(p.last_sync_ok)));
+            }
+            if p.fail_count > 0 {
+                s.failing += 1;
+                s.max_fails = s.max_fails.max(p.fail_count);
+                if p.fail_count >= 3 {
+                    s.failing3 += 1;
+                }
+            }
+            if p.next_try > 0 {
+                s.next_try = Some(s.next_try.map_or(p.next_try, |t: u64| t.min(p.next_try)));
+            }
+        }
+        (s.friends > 0).then_some(s)
+    }
+
     pub fn peers_json(&self) -> Value {
         let now = now_ms();
         let st = self.lock();
@@ -196,4 +228,21 @@ impl Community {
             .collect();
         json!({ "minHitRate": min, "windowDays": crate::score::WINDOW_DAYS, "minTries": crate::score::MIN_TRIES, "peers": peers })
     }
+}
+
+/// 好友同步的彙總（[`Community::sync_summary`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub friends: usize,
+    /// 所有好友裡最舊的上次同步成功（毫秒；都還沒成功過是 `None`）
+    pub oldest_ok: Option<u64>,
+    /// 同步失敗中（`fail_count > 0`）的好友數與最大的連續失敗次數
+    pub failing: usize,
+    pub max_fails: u32,
+    /// 連續 3 次以上同步失敗的好友數（E2 的 `friends-sync-failing`）
+    pub failing3: usize,
+    /// 最早的下一次重試（毫秒）
+    pub next_try: Option<u64>,
+    /// 設定的同步間隔（毫秒）
+    pub interval_ms: u64,
 }

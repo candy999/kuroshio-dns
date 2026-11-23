@@ -799,7 +799,94 @@ impl Site {
     }
 
     fn build_public_stats(&self, range: &str) -> Value {
-        dashboard_stats(&self.state, range, self.min_clients, PUBLIC_TOP)
+        dashboard_stats(&self.state, range, self.min_clients, PUBLIC_TOP, View::Public)
+    }
+}
+
+/// 儀表板給誰看（3.5.0 E8）：公開頁不帶營運狀態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Public,
+    Admin,
+}
+
+/// 兩條路比對（3.5.0 E8）：「原本的 CDN 答案」與「換成的台灣節點」各有幾個網站、成功與失敗、延遲中位數，
+/// 台灣比較快與比較慢的各幾個。在 `dashboard_stats()` 既有的那一個迴圈裡累計（不多走一遍、不發探測）；
+/// 只看記憶體裡的網域資料（被記憶體控制移到磁碟的冷資料不算）
+#[derive(Debug, Default)]
+pub struct PathAcc {
+    sites: u64,
+    orig_ok: u64,
+    orig_fail: u64,
+    orig_abroad: u64,
+    orig_ms: Vec<f64>,
+    tw_ok: u64,
+    tw_fail: u64,
+    tw_slower: u64,
+    tw_ms: Vec<f64>,
+    /// 兩邊都量到延遲的：原本 − 台灣（負的 = 台灣比較慢，也留著）
+    diff: Vec<f64>,
+}
+
+fn median(v: &mut [f64]) -> Option<f64> {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.get(v.len() / 2).copied()
+}
+
+impl PathAcc {
+    /// 一個網域：`abroad` = 原本的答案在國外機房
+    pub fn add(&mut self, base: Option<&kuroshio_cdn::db::Base>, v4: Option<&kuroshio_cdn::db::Verdict>, abroad: bool) {
+        if base.is_none() && v4.is_none() {
+            return;
+        }
+        self.sites += 1;
+        let ms = |n: &kuroshio_cdn::util::Num| n.get().filter(|m| m.is_finite() && *m > 0.0);
+        let bms = base.and_then(|b| ms(&b.ms));
+        if let Some(b) = base {
+            match b.ok {
+                Some(true) => {
+                    self.orig_ok += 1;
+                    if let Some(m) = bms {
+                        self.orig_ms.push(m);
+                    }
+                }
+                Some(false) => self.orig_fail += 1,
+                None => {}
+            }
+        }
+        if abroad {
+            self.orig_abroad += 1;
+        }
+        let vms = v4.and_then(|v| ms(&v.ms));
+        if let Some(v) = v4 {
+            if v.is("ok") {
+                self.tw_ok += 1;
+                if let Some(m) = vms {
+                    self.tw_ms.push(m);
+                }
+            } else if v.is("fail") {
+                self.tw_fail += 1;
+            }
+            // E7（甲批）判定「比原本慢」的，記在驗證結果的 extra
+            if v.extra.get("slower") == Some(&Value::Bool(true)) {
+                self.tw_slower += 1;
+            }
+        }
+        if let (Some(b), Some(t)) = (bms, vms) {
+            self.diff.push(b - t);
+        }
+    }
+
+    pub fn json(mut self) -> Value {
+        let faster = self.diff.iter().filter(|d| **d > 0.0).count();
+        let slower = self.diff.iter().filter(|d| **d < 0.0).count();
+        json!({
+            "sites": self.sites,
+            "orig": { "ok": self.orig_ok, "fail": self.orig_fail, "abroad": self.orig_abroad, "medianMs": median(&mut self.orig_ms).map(r1) },
+            "tw": { "ok": self.tw_ok, "fail": self.tw_fail, "slower": self.tw_slower, "medianMs": median(&mut self.tw_ms).map(r1) },
+            "both": self.diff.len(), "twFaster": faster, "twSlower": slower,
+            "medianSavedMs": median(&mut self.diff).map(r1),
+        })
     }
 }
 
@@ -811,7 +898,9 @@ pub const ADMIN_TOP: (usize, usize) = (30, 30);
 /// 儀表板的統計（公開頁 `/api/public/stats` 與管理 API `/api/dashboard` 共用）。
 /// `range`：today / 7d / 30d（其他當成 today）；`min_clients`：網站排行最少要有幾位不同使用者；
 /// `top`：（熱門網站, 被擋網站）各列幾筆。內容只有彙總數字與網站名稱，不含任何 IP
-pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (usize, usize)) -> Value {
+///
+/// `view`：公開頁不帶營運狀態（3.5.0 E8、E9 的 `paths`、`stale`、`history`），只有管理 API 的 `/api/dashboard` 有
+pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (usize, usize), view: View) -> Value {
     let range = match range {
         "7d" => "7d",
         "30d" => "30d",
@@ -887,6 +976,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     let mut from_pops: HashMap<String, (u64, u64)> = HashMap::new();
     let mut to_pops: BTreeMap<String, u64> = BTreeMap::new();
     let mut cs = json!({ "explored": 0, "ok": 0, "fail": 0, "byTo": {}, "byFrom": {}, "also": {} });
+    let mut paths = PathAcc::default();
     if let Some(c) = r.cdn() {
         use kuroshio_cdn::providers::is_tw_pop;
         let st = c.state();
@@ -900,6 +990,9 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
             let abroad = base_pop.is_some_and(|p| !is_tw_pop(p));
             if abroad {
                 was_abroad += 1;
+            }
+            if view == View::Admin {
+                paths.add(e.base.as_deref(), e.v4.as_deref(), abroad);
             }
             if ok4 && abroad {
                 let bms = e.base.as_ref().and_then(|b| b.ms.get()).filter(|m| *m != 0.0);
@@ -1013,7 +1106,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     let q = s("query");
     let blocked = s("blocked");
     let min_c = min_clients.max(1);
-    json!({
+    let mut out = json!({
         "generatedAt": crate::stats::iso_utc(now_ms()),
         "range": range, "days": keys.len(),
         "totals": {
@@ -1045,7 +1138,14 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
             "upstreams": r.upstreams.pinned.len() as u64 + auto.get("count").and_then(Value::as_u64).unwrap_or(0),
             "benchmarkAt": auto.get("generatedAt").cloned().unwrap_or(Value::Null),
         },
-    })
+    });
+    if view == View::Admin {
+        // 3.5.0 E8、E9：營運狀態只在管理 API
+        out["paths"] = paths.json();
+        out["stale"] = stats.stale_rates();
+        out["history"] = stats.history_json();
+    }
+    out
 }
 
 /// 區網、本機、連結本地之類不是公開網路的位址
@@ -1382,5 +1482,44 @@ mod tests {
             html_escape("<a href='x'>&\"</a>"),
             "&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;"
         );
+    }
+
+    /// 3.5.0 E8：原本與台灣兩邊都算，台灣比較慢的那一邊不丟掉
+    #[test]
+    fn paths_counts_orig_and_tw_including_slower_side() {
+        use kuroshio_cdn::db::{Base, Verdict};
+        use kuroshio_cdn::util::{Extra, Num};
+        let base = |ok: bool, ms: f64| Base {
+            ok: Some(ok),
+            ms: if ms > 0.0 { Num::V(ms) } else { Num::Absent },
+            ..Base::default()
+        };
+        let v4 = |verdict: &str, ms: f64, slower: bool| Verdict {
+            verdict: Some(verdict.into()),
+            ms: if ms > 0.0 { Num::V(ms) } else { Num::Absent },
+            extra: if slower {
+                Extra(Some(Box::new(serde_json::Map::from_iter([("slower".to_string(), json!(true))]))))
+            } else {
+                Extra::default()
+            },
+            ..Verdict::default()
+        };
+        let mut a = PathAcc::default();
+        a.add(Some(&base(true, 50.0)), Some(&v4("ok", 5.0, false)), true); // 台灣快 45
+        a.add(Some(&base(true, 40.0)), Some(&v4("ok", 10.0, false)), true); // 台灣快 30
+        a.add(Some(&base(true, 8.0)), Some(&v4("fail", 60.0, true)), false); // 台灣慢 52（E7 判定）
+        a.add(Some(&base(false, 0.0)), Some(&v4("fail", 0.0, false)), true); // 兩邊都失敗
+        a.add(Some(&base(true, 30.0)), None, true); // 只有原本
+        a.add(None, None, false); // 什麼都沒有：不算
+        let v = a.json();
+        assert_eq!(v["sites"], 5);
+        assert_eq!(v["orig"], json!({ "ok": 4, "fail": 1, "abroad": 4, "medianMs": 40.0 }));
+        assert_eq!(v["tw"], json!({ "ok": 2, "fail": 2, "slower": 1, "medianMs": 10.0 }));
+        assert_eq!(
+            (v["both"].clone(), v["twFaster"].clone(), v["twSlower"].clone()),
+            (json!(3), json!(2), json!(1))
+        );
+        assert_eq!(v["medianSavedMs"], 30.0, "中位數含台灣比較慢的那一筆（-52、30、45）");
+        assert_eq!(PathAcc::default().json()["medianSavedMs"], Value::Null);
     }
 }

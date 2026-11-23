@@ -864,6 +864,7 @@ fn register_twip_job(
         load: Arc::new(system_load),
         install: Arc::new(move |t, bytes: Vec<u8>| {
             a2.set_data(t, crate::ipfilter::LOCAL_SOURCE);
+            crate::observe::set_isp_tw_ip(a2.data());
             p2.lock().unwrap().stage(crate::ipfilter::STATE_FILE, bytes.clone());
             tokio::spawn(crate::ipfilter::after_update(runtime.clone(), bytes));
             Ok(())
@@ -1210,14 +1211,16 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
             c.recheck();
         })
     });
-    spawn_wan_subnet(resolver.clone(), 5);
+    spawn_wan_subnet(resolver.clone(), 5, false);
     Some(cdn)
 }
 
 /// 偵測本機對外 IPv4（Cloudflare /cdn-cgi/trace），用它的 /24 當 ECS 子網路。
 /// 第一次在 `first_delay` 秒後，失敗再試 4 次（間隔漸長）；系統時間沒對時（TLS 驗不過）時先等，不算一次失敗。
 /// WAN 變動（`kuroshio notify wan-changed`）時用 `first_delay = 0` 重新偵測
-pub fn spawn_wan_subnet(resolver: Arc<Resolver>, first_delay: u64) {
+/// 偵測對外 IP 的 /24（ECS、3.5.0 E10 的 ISP 群組）。`notified`：WAN 變動的通知已經呼叫過
+/// `Cdn::on_wan_changed()`；不是通知來的（啟動時）而偵測到的子網路跟上一次不一樣，才在這裡呼叫（E3）
+pub fn spawn_wan_subnet(resolver: Arc<Resolver>, first_delay: u64, notified: bool) {
     tokio::spawn(async move {
         for attempt in 0..5u64 {
             tokio::time::sleep(Duration::from_secs(if attempt == 0 { first_delay } else { 5 + attempt * 30 })).await;
@@ -1237,10 +1240,16 @@ pub fn spawn_wan_subnet(resolver: Arc<Resolver>, first_delay: u64) {
             };
             let o = ip.octets();
             let net = std::net::Ipv4Addr::new(o[0], o[1], o[2], 0);
-            *resolver.ecs_subnet.write().unwrap() = Some((IpAddr::V4(net), 24));
+            let subnet = (IpAddr::V4(net), 24);
+            let prev = resolver.ecs_subnet.write().unwrap().replace(subnet);
             if let Some(c) = resolver.cdn() {
                 c.ecs_add_subnet(&format!("{net}/24"));
+                if !notified && prev.is_some_and(|p| p != subnet) {
+                    c.on_wan_changed();
+                }
             }
+            // 3.5.0 E10：ISP 群組跟著對外 IP 重算（只在這裡與台灣 IP 資料換新時做一次區間查找）
+            crate::observe::set_isp_sources(Some(subnet), resolver.access.get().and_then(|a| a.data()));
             info!(
                 "本機對外 IP 的 ECS 子網路 {net}/24（Cloudflare 目前分配到 {}）",
                 field("colo=").unwrap_or_default()
@@ -1943,6 +1952,8 @@ fn spawn_persist_loop(
 pub async fn start(cfg: &Value) -> Result<Started> {
     // 新的一輪：監聽 socket 向行程層級的 listenbank 拿（重新載入時不拒絕連線，規格 10 第 7 節）
     crate::listenbank::begin();
+    // 3.5.0 E2：發現清單只在記憶體，重新載入設定時清空（狀態類的下一次評估就回來）
+    crate::observe::reset_findings();
     // 系統時間有沒有對時（沒有 RTC 的路由器開機時是 1970 年）：決定能不能用加密上游、背景工作要不要延後
     crate::clock::refresh();
     crate::clock::spawn_monitor();
@@ -2055,7 +2066,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     }
     let cdn = start_cdn(cfg, &resolver, &persister).await;
     if cdn.is_none() {
-        spawn_wan_subnet(resolver.clone(), 5);
+        spawn_wan_subnet(resolver.clone(), 5, false);
     }
     // 串接模式（3.4.0）：行程層級的下游狀態機，新的一輪接上新的 Manager（原本串接中就立刻接回）
     start_chain(cfg, &base_dir, &resolver);

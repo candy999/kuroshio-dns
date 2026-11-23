@@ -901,3 +901,87 @@ fn catch_up_puts_benchmark_before_scan_when_upstreams_not_benchmarked() {
         p(&[("cdn-ranges", 30), ("cdn-scan", 60), ("cdn-pool", 120), ("dns-benchmark", 300)])
     );
 }
+
+/// 3.5.0 E1：連續失敗次數，成功拿掉、失敗加 1（飽和到 9,999）
+#[tokio::test(start_paused = true)]
+async fn fail_streak_counts_and_resets() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let s = sched(json!({ "jobs": { "j": { "at": "04:10", "catchUp": false } } }), None, &clock);
+    let fail = Arc::new(AtomicBool::new(true));
+    let f = fail.clone();
+    s.register("j", move |_ctx: JobCtx| {
+        let f = f.clone();
+        async move {
+            if f.load(Ordering::SeqCst) {
+                anyhow::bail!("測試失敗")
+            }
+            Ok(())
+        }
+    });
+    let h = s.start();
+    for n in 1..=3u32 {
+        assert_eq!(s.request("j", "測試")["ok"], true);
+        idle(&s).await;
+        assert_eq!(s.status()["state"]["j"]["failStreak"], n);
+        let fr = s.freshness(&["j"]);
+        assert_eq!(fr[0].1.fails, n);
+        assert!(fr[0].1.failing);
+        assert_eq!(fr[0].1.last_ok, None, "從來沒成功過");
+    }
+    fail.store(false, Ordering::SeqCst);
+    assert_eq!(s.request("j", "測試")["ok"], true);
+    idle(&s).await;
+    let st = s.status()["state"]["j"].clone();
+    assert!(st.get("failStreak").is_none(), "成功就拿掉：{st}");
+    let fr = s.freshness(&["j"]);
+    assert_eq!((fr[0].1.fails, fr[0].1.failing), (0, false));
+    assert!(fr[0].1.last_ok.is_some());
+    assert_eq!(fr[0].1.period, Some(DAY_MS), "每天一次");
+    assert_eq!(fr[0].1.next, Some(tpe(2026, 11, 11, 4, 10)));
+    h.abort();
+    // 飽和
+    let saved = serde_json::to_vec(&json!({ "j": { "lastCode": 1, "failStreak": 9999 } })).unwrap();
+    let s = sched(
+        json!({ "jobs": { "j": { "at": "04:10", "catchUp": false } } }),
+        Some(&saved),
+        &clock,
+    );
+    s.register("j", |_ctx: JobCtx| async { anyhow::bail!("x") });
+    let h = s.start();
+    assert_eq!(s.request("j", "測試")["ok"], true);
+    idle(&s).await;
+    assert_eq!(s.status()["state"]["j"]["failStreak"], scheduler::FAIL_STREAK_MAX);
+    h.abort();
+}
+
+/// 3.5.0 E1：舊的狀態檔沒有 failStreak：lastCode == 0 當 0，否則當 1；停用、沒註冊的不列
+#[test]
+fn old_state_without_streak_is_inferred() {
+    assert_eq!(scheduler::fail_streak(&json!({ "lastCode": 0 })), 0);
+    assert_eq!(scheduler::fail_streak(&json!({ "lastCode": 124 })), 1);
+    assert_eq!(scheduler::fail_streak(&json!({})), 0);
+    assert_eq!(scheduler::fail_streak(&json!({ "lastCode": 1, "failStreak": 5 })), 5);
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let now = tpe(2026, 11, 10, 12, 0);
+    let saved = serde_json::to_vec(&json!({
+        "a": { "lastCode": 1, "lastEnd": now - HOUR_MS, "lastOkEnd": now - 3 * DAY_MS },
+        "b": { "lastCode": 0, "lastEnd": now - HOUR_MS },
+    }))
+    .unwrap();
+    let s = sched(
+        json!({ "jobs": { "a": { "at": "04:10" }, "b": { "at": "03:00", "weekdays": [0] }, "off": { "at": "04:10", "enabled": false }, "unreg": { "at": "04:10" } } }),
+        Some(&saved),
+        &clock,
+    );
+    for n in ["a", "b", "off"] {
+        s.register(n, noop);
+    }
+    let fr = s.freshness(&["b", "a", "off", "unreg"]);
+    let names: Vec<&str> = fr.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["b", "a"], "照呼叫的順序；停用、沒註冊的不列");
+    let a = &fr[1].1;
+    assert_eq!((a.failing, a.fails, a.last_ok), (true, 1, Some(now - 3 * DAY_MS)));
+    let b = &fr[0].1;
+    assert_eq!((b.failing, b.fails, b.last_ok), (false, 0, Some(now - HOUR_MS)), "舊版只有 lastEnd");
+    assert_eq!(b.period, Some(7 * DAY_MS));
+}

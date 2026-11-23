@@ -428,6 +428,38 @@ fn timeout_min(c: &Value) -> f64 {
     }
 }
 
+/// `failStreak` 的上限（3.5.0 E1）
+pub const FAIL_STREAK_MAX: u32 = 9_999;
+
+/// 一個工作的連續失敗次數（3.5.0 E1，排程狀態的 `failStreak`）。舊的狀態檔沒有這個欄位：
+/// `lastCode == 0`（或從來沒跑過）當 0，否則當 1
+pub fn fail_streak(st: &Value) -> u32 {
+    if let Some(n) = st.get("failStreak").and_then(Value::as_u64) {
+        return n.min(FAIL_STREAK_MAX as u64) as u32;
+    }
+    match st.get("lastCode").and_then(Value::as_i64) {
+        None | Some(0) => 0,
+        Some(_) => 1,
+    }
+}
+
+/// 一個排程工作的新鮮度（3.5.0 E1，`/api/status.freshness` 用）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFreshness {
+    /// 上次成功跑完（Unix 毫秒）；從來沒成功過是 `None`
+    pub last_ok: Option<u64>,
+    /// 上一次是失敗的
+    pub failing: bool,
+    /// 連續失敗次數（[`fail_streak`]）
+    pub fails: u32,
+    /// 下次排定（Unix 毫秒）
+    pub next: Option<u64>,
+    /// 排程的週期（毫秒）：下次排定 − 最近一次已經到的排定時間
+    pub period: Option<u64>,
+    /// 現在由上游黑潮提供（`catchUpProvided`）
+    pub provided: bool,
+}
+
 fn ms_field(st: Option<&Value>, k: &str) -> Option<u64> {
     st.and_then(|s| s.get(k))
         .and_then(Value::as_f64)
@@ -925,13 +957,19 @@ impl Scheduler {
                 *entry = json!({});
             }
             let o = entry.as_object_mut().unwrap();
+            // 3.5.0 E1：連續失敗次數（成功拿掉、失敗加 1，飽和到 9,999）；先用舊的 lastCode 推算舊檔沒有的欄位
+            let streak = fail_streak(&Value::Object(o.clone()));
             o.insert("lastEnd".into(), Value::from(now));
             o.insert("lastCode".into(), Value::from(code));
             if code == 0 {
                 o.insert("lastOkEnd".into(), Value::from(now));
                 o.remove("lastError");
-            } else if let Some(e) = err {
-                o.insert("lastError".into(), Value::String(e));
+                o.remove("failStreak");
+            } else {
+                o.insert("failStreak".into(), Value::from((streak + 1).min(FAIL_STREAK_MAX)));
+                if let Some(e) = err {
+                    o.insert("lastError".into(), Value::String(e));
+                }
             }
             st.running = None;
             info!("{name} 完成 (code {code})，耗時 {} 秒", (now.saturating_sub(started) + 500) / 1000);
@@ -987,6 +1025,49 @@ impl Scheduler {
             // 3.4.2：要補跑、但現在由上游黑潮提供（串接中）而暫不補跑的工作
             "catchUpProvided": provided,
         })
+    }
+
+    /// 資料新鮮度（3.5.0 E1）：`names` 裡有設定、沒停用、已經註冊的工作各一筆（順序同 `names`）。
+    /// 排程器的鎖只拿一次
+    pub fn freshness(&self, names: &[&str]) -> Vec<(String, JobFreshness)> {
+        let now = self.inner.opts.clock.now_ms();
+        let registered: HashSet<String> = {
+            let jobs = self.inner.jobs.lock().unwrap();
+            names.iter().filter(|n| jobs.contains_key(**n)).map(|n| n.to_string()).collect()
+        };
+        let st = self.inner.st.lock().unwrap();
+        let cfg = Self::jobs_cfg(&st.cfg);
+        names
+            .iter()
+            .filter(|n| registered.contains(**n))
+            .filter_map(|n| {
+                let c = cfg.get(*n).filter(|c| enabled(c))?;
+                let s = st.state.get(*n);
+                let code = s.and_then(|s| s.get("lastCode")).and_then(Value::as_i64);
+                let last_ok = if code == Some(0) {
+                    ms_field(s, "lastEnd")
+                } else {
+                    ms_field(s, "lastOkEnd")
+                };
+                let seed = seed_in(&st.state, n);
+                let next = next_run_seeded(c, now, seed);
+                let period = next
+                    .zip(last_slot_seeded(c, now, seed))
+                    .map(|(a, b)| a.saturating_sub(b))
+                    .filter(|p| *p > 0);
+                Some((
+                    n.to_string(),
+                    JobFreshness {
+                        last_ok,
+                        failing: code.is_some_and(|c| c != 0),
+                        fails: s.map(fail_streak).unwrap_or(0),
+                        next,
+                        period,
+                        provided: st.provided.contains(*n),
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// 排程狀態快照：（state 目錄裡的檔名, 內容），交給快照寫入器

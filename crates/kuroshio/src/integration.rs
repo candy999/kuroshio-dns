@@ -240,6 +240,9 @@ pub fn summarize_status(api: &Value) -> Value {
         "clock": { "synced": api["clock"]["synced"].as_bool().unwrap_or(true) },
         "data": { "dir": d["dir"], "format": d["format"], "version": d["version"], "ok": d["ok"].as_bool().unwrap_or(false), "warning": d["warning"] },
         "warnings": api.get("warnings").filter(|w| w.is_array()).cloned().unwrap_or(json!([])),
+        // 3.5.0 E1、E2：原樣帶出（舊版服務沒有就是空陣列）
+        "freshness": api.get("freshness").filter(|w| w.is_array()).cloned().unwrap_or(json!([])),
+        "findings": api.get("findings").filter(|w| w.is_array()).cloned().unwrap_or(json!([])),
     })
 }
 
@@ -276,6 +279,23 @@ pub fn status_text(s: &Value) -> String {
     );
     for w in s["warnings"].as_array().into_iter().flatten() {
         out.push_str(&format!("\n注意：{}", w.as_str().unwrap_or("")));
+    }
+    // 3.5.0 E1：過期或連續失敗的資料（一行）
+    let old: Vec<String> = s["freshness"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["stale"] == true || f["fails"].as_u64().unwrap_or(0) >= 3)
+        .map(|f| {
+            let label = f["label"].as_str().unwrap_or("?");
+            match f["fails"].as_u64().unwrap_or(0) {
+                0 => format!("{label}（過期）"),
+                n => format!("{label}（連續失敗 {n} 次）"),
+            }
+        })
+        .collect();
+    if !old.is_empty() {
+        out.push_str(&format!("\n資料：{}", old.join("、")));
     }
     out
 }
@@ -419,6 +439,34 @@ mod tests {
         assert_eq!(s["filter"]["enabled"], false);
         assert_eq!(s["cache"]["hitRate"], Value::Null);
         assert_eq!(s["warnings"], json!([]));
+        assert_eq!(s["freshness"], json!([]));
+        assert_eq!(s["findings"], json!([]));
+    }
+
+    /// 3.5.0 E2：`warnings`（padavan 韌體在讀）的格式與內容不因為 `findings` 而改變；同一件事不兩邊都放
+    #[test]
+    fn warnings_unchanged_by_findings() {
+        let w = vec!["過濾清單更新失敗：OISD（timeout）".to_string()];
+        let base = json!({ "version": "3.5.0", "warnings": w });
+        let mut with = base.clone();
+        with["findings"] = json!([{ "key": "upstream-failing", "sev": "warn", "text": "有 1 個上游連續失敗、暫停中", "count": 2,
+                                    "firstAt": 1, "lastAt": 2, "active": true }]);
+        with["freshness"] = json!([{ "key": "benchmark", "label": "每日評測", "stale": true, "fails": 0 },
+                                   { "key": "tw-ip", "label": "台灣 IP 資料", "stale": false, "fails": 4 }]);
+        let (a, b) = (summarize_status(&base), summarize_status(&with));
+        assert_eq!(a["warnings"], b["warnings"]);
+        assert_eq!(b["warnings"], json!(w), "還是字串陣列、內容一樣");
+        assert_eq!(b["findings"][0]["key"], "upstream-failing");
+        let t = status_text(&b);
+        assert!(t.contains("注意：過濾清單更新失敗"), "{t}");
+        assert!(t.contains("資料：每日評測（過期）、台灣 IP 資料（連續失敗 4 次）"), "{t}");
+        assert!(!status_text(&a).contains("資料："));
+        // warnings() 本身不看發現清單：同樣的輸入、同樣的結果（3.4.4 的內容）
+        let ok = crate::manifest::evaluate(Path::new("d"), Some(r#"{"dataFormat":1,"version":"x"}"#), 1, "x");
+        let f = json!({ "errors": [{ "name": "OISD", "error": "timeout" }] });
+        let ww = warnings(&ok, true, Pressure::Normal, &f, &Value::Null);
+        assert_eq!(ww.len(), 1, "{ww:?}");
+        assert!(ww[0].contains("OISD"));
     }
 
     #[test]

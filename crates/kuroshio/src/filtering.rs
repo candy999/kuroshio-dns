@@ -1538,6 +1538,33 @@ impl FilterService {
         self.hits.iter().map(|h| h.load(Ordering::Relaxed)).collect()
     }
 
+    /// 資料新鮮度（3.5.0 E1）：（上次成功的毫秒：重建好、或檢查過都沒變；失敗的清單數；更新間隔毫秒）
+    pub fn freshness(&self) -> (Option<u64>, usize, u64) {
+        let st = self.status.lock().unwrap();
+        let ms = |k: &str| st.get(k).and_then(Value::as_u64).filter(|t| *t > 0);
+        let last = match (ms("updatedAt"), ms("checkedAt")) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let errors = st.get("errors").and_then(Value::as_array).map_or(0, Vec::len);
+        (last, errors, self.interval.as_millis() as u64)
+    }
+
+    /// 發現清單（3.5.0 E2 的 `list-copy-no-room`）：載入中、但沒有本機副本的清單數
+    /// （空間不足時不留副本；下次重建要重新下載）。沒有副本功能（沒有快照目錄）是 `None`
+    pub fn lists_without_copy(&self) -> Option<usize> {
+        let c = self.copies.get()?;
+        let l = self.lists.read().unwrap().clone();
+        let st = l.stats();
+        Some(
+            st.sources
+                .iter()
+                .zip(&self.sources)
+                .filter(|(s, src)| s.status == SourceStatus::Loaded && c.meta(&src.url).is_none())
+                .count(),
+        )
+    }
+
     /// 目前可以停用的清單（依停用順序）
     pub fn shed_candidates(&self) -> Vec<usize> {
         let ex = self.excluded();

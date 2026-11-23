@@ -2,7 +2,7 @@
 
 use kuroshio::resolver::{Ctx, FilterCheck, Verdict};
 use kuroshio_proto::message::{rtype, Message, RData, Record};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -271,6 +271,22 @@ async fn admin_api() {
     let (code, st) = http_get(admin, "/api/status?lite=1", "127.0.0.1:8054").await;
     assert_eq!(code, 200);
     assert_eq!(st["stats"]["today"]["query"], 1);
+    // lite=1（LuCI 的 rpcd、padavan 每幾秒讀一次）：不回 perf、history（規格 11 C12、E9）；小的新欄位照給
+    assert!(st.get("perf").is_none(), "status_lite_omits_perf");
+    assert!(st.get("history").is_none());
+    assert!(st["freshness"].is_array() && st["findings"].is_array(), "{}", st["freshness"]);
+    assert!(st["stale"]["rate15m"].is_number());
+    assert!(
+        st["warnings"].as_array().unwrap().iter().all(Value::is_string),
+        "warnings 還是字串陣列"
+    );
+    let (_, lite_h) = http_get(admin, "/api/status?lite=1&history=1", "127.0.0.1:8054").await;
+    assert!(lite_h.get("history").is_none(), "lite=1 時 history=1 也不給");
+    let (_, st) = http_get(admin, "/api/status", "127.0.0.1:8054").await;
+    assert!(st.get("history").is_none(), "status_without_param_has_no_history");
+    let (_, h) = http_get(admin, "/api/status?history=1", "127.0.0.1:8054").await;
+    assert_eq!(h["history"]["stepSec"], 300);
+    assert!(h["history"]["q"].is_array());
     // 效能計數器（3.5.0）：這筆查詢問了一個上游（計數器整個行程共用，只看有沒有）
     assert!(st["perf"]["fanout"]["1"].as_u64().unwrap() >= 1, "{}", st["perf"]);
     assert!(st["perf"]["tls"]["dot"]["full"].is_u64());
