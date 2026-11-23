@@ -678,6 +678,12 @@ impl Community {
     ) -> std::result::Result<(Value, Received), Value> {
         let full = resp.full.unwrap_or(true);
         let cfg = self.config();
+        // 3.5.0 E10：這台沒開 shareIspGroup 時，收到的 ISP 群組也不看（不存、不用）
+        if !cfg.share_isp_group {
+            if let Some(c) = resp.ctx.as_mut() {
+                c.isp = None;
+            }
+        }
         // 全部好友的資料合計有上限（跟著記憶體縮放），每個好友平分；滿了之後新的記錄不收（舊的照常更新），
         // 等記錄過期或對方下次給完整集合時自己恢復
         let budget = crate::share::friend_budget(crate::share::record_budget(cfg.max_plain_bytes()), st.store.friends().count());
@@ -760,6 +766,7 @@ impl Community {
 
         // 品質分數：格式錯誤算 invalid；被暫停的 kind 只放一小批
         let p = st.store.get_mut(domain).unwrap();
+        p.info.isp = resp.ctx.as_ref().and_then(|c| c.isp.clone());
         for (k, n) in &invalid {
             score::entry(&mut p.score, *k).add(Outcome::Invalid, *n, now);
         }
@@ -1003,8 +1010,11 @@ impl Community {
 
     fn collect_hints(&self, kind: &str, key: &str, k: Kind, filter: impl Fn(&WireRecord) -> bool) -> Vec<Hint> {
         let now = now_ms();
+        // 3.5.0 E10：同一個 ISP 群組的好友給的 IP 排在前面（只改先後，回傳幾個、驗證幾個照舊）；
+        // 這台沒開 shareIspGroup、或偵測不到自己的群組時不做
+        let mine = self.my_isp();
         let st = self.lock();
-        let mut m: HashMap<IpAddr, (Vec<String>, f64)> = HashMap::new();
+        let mut m: HashMap<IpAddr, (Vec<String>, f64, bool)> = HashMap::new();
         for (d, r) in &st.remote {
             if !usable(&st, d, k) {
                 continue;
@@ -1013,21 +1023,23 @@ impl Community {
                 continue;
             };
             let s = st.store.get(d).map(|p| score::score_of(&p.score, k, now)).unwrap_or(0.5);
+            let same = mine.is_some() && r.ctx.isp == mine;
             for ip in rec.ips.iter().flatten().filter_map(|s| s.parse::<IpAddr>().ok()) {
-                let e = m.entry(ip).or_insert((vec![], 0.0));
+                let e = m.entry(ip).or_insert((vec![], 0.0, false));
                 e.0.push(d.clone());
                 e.1 = e.1.max(s);
+                e.2 |= same;
             }
         }
-        let mut v: Vec<(IpAddr, Vec<String>, f64)> = m.into_iter().map(|(ip, (f, s))| (ip, f, s)).collect();
+        let mut v: Vec<(IpAddr, Vec<String>, f64, bool)> = m.into_iter().map(|(ip, (f, s, g))| (ip, f, s, g)).collect();
         v.sort_by(|a, b| {
-            b.1.len()
-                .cmp(&a.1.len())
+            b.3.cmp(&a.3)
+                .then(b.1.len().cmp(&a.1.len()))
                 .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
                 .then(a.0.cmp(&b.0))
         });
         v.into_iter()
-            .map(|(ip, mut from, _)| {
+            .map(|(ip, mut from, _, _)| {
                 from.sort();
                 Hint { ip, from }
             })

@@ -84,6 +84,9 @@ pub struct PeerInfo {
     pub proto: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub caps: Vec<String>,
+    /// 對方在同步回應裡給的 ISP 群組（3.5.0 E10；對方有給、而且這台也開了 `shareIspGroup` 才有）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isp: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

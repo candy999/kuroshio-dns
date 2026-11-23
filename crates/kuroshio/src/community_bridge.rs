@@ -146,10 +146,18 @@ impl DataProvider for CdnData {
         if batch.nodes.is_empty() {
             return;
         }
-        let n = cdn.add_friend_nodes(batch.nodes.iter().map(|x| (x.p.as_str(), x.ip)));
+        // 3.5.0 E10：確定是別的 ISP 群組的好友，這一批每家每個家族的上限降成四分之一（500 → 125）；
+        // 同群組與「不知道」（舊版好友、沒開分享的好友、這台自己偵測不到）照舊。只會變少，候選名單總上限不變
+        let cap = friend_node_cap(crate::observe::isp_group().as_deref(), batch.ctx.isp.as_deref());
+        let n = cdn.add_friend_nodes_capped(batch.nodes.iter().map(|x| (x.p.as_str(), x.ip)), cap);
         if n > 0 {
             tracing::debug!("社群：{} 給的台灣節點 {n} 個放進候選名單（每日節點池工作量測後才使用）", batch.from);
         }
+    }
+
+    /// 這台 WAN 的 ISP 群組（3.5.0 E10）；要不要送由社群那邊看 `community.shareIspGroup`
+    fn isp_group(&self) -> Option<String> {
+        crate::observe::isp_group()
     }
 
     fn in_range(&self, provider: &str, ip: IpAddr) -> RangeCheck {
@@ -161,6 +169,14 @@ impl DataProvider for CdnData {
             Some(c) if c.provider == provider => RangeCheck::InRange,
             _ => RangeCheck::OutOfRange,
         }
+    }
+}
+
+/// 好友節點候選的每批上限（3.5.0 E10）：雙方的群組都知道、而且不一樣才降成四分之一
+pub fn friend_node_cap(mine: Option<&str>, theirs: Option<&str>) -> usize {
+    match (mine, theirs) {
+        (Some(a), Some(b)) if a != b => kuroshio_cdn::cdn::FRIEND_MAX_NODES / 4,
+        _ => kuroshio_cdn::cdn::FRIEND_MAX_NODES,
     }
 }
 
@@ -406,5 +422,22 @@ mod access_tests {
         let (d, ips) = friend_targets(&peers);
         assert_eq!(d, vec!["a.example.com", "c.example.net"]);
         assert_eq!(ips, vec!["203.0.113.5".parse::<std::net::IpAddr>().unwrap()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 3.5.0 E10：確定是別群組的降成四分之一；同群組、「不知道」（任一邊沒有）照舊
+    #[test]
+    fn other_group_quota_is_quarter_unknown_is_full() {
+        let full = kuroshio_cdn::cdn::FRIEND_MAX_NODES;
+        assert_eq!(friend_node_cap(Some("cht"), Some("twm")), full / 4);
+        assert_eq!(friend_node_cap(Some("cht"), Some("twm")), 125);
+        assert_eq!(friend_node_cap(Some("cht"), Some("cht")), full);
+        assert_eq!(friend_node_cap(Some("cht"), None), full, "舊版好友、沒開分享的好友不被懲罰");
+        assert_eq!(friend_node_cap(None, Some("twm")), full, "這台自己偵測不到群組：不做");
+        assert_eq!(friend_node_cap(None, None), full);
     }
 }

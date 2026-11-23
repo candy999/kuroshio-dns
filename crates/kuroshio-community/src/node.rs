@@ -245,6 +245,14 @@ impl Community {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// 這台要送給好友的 ISP 群組（3.5.0 E10）：`community.shareIspGroup` 開著、而且偵測得到才有
+    pub fn my_isp(&self) -> Option<String> {
+        if !self.config().share_isp_group {
+            return None;
+        }
+        self.provider.isp_group().filter(|s| crate::envelope::valid_isp(s))
+    }
+
     pub fn config(&self) -> Config {
         self.cfg.read().unwrap().clone()
     }
@@ -428,7 +436,11 @@ impl Community {
             proto: vec![PROTO],
             caps: vec!["sync-delta".into(), "poke".into(), "zstd".into()],
             since: id.since,
-            net: self.provider.net_ctx(),
+            // 身分文件（加好友之前對方就看得到）不放 ISP 群組（3.5.0 E10）
+            net: NetInfo {
+                isp: None,
+                ..self.provider.net_ctx()
+            },
             friends,
             rot: id.rotation_stmts(now),
         };
@@ -574,6 +586,7 @@ impl Community {
             net: NetInfo {
                 asn: b.net.asn,
                 colo: crate::util::clip(&b.net.colo, 8),
+                isp: None,
             },
             friends: b.friends.into_iter().take(200).map(|f| f.into_vec()).collect(),
             rot: b.rot.into_iter().take(4).collect(),
@@ -1103,7 +1116,10 @@ impl Community {
         if mutual {
             self.later(self.tuning.mutual_sync_ms, Job::Sync(from.clone()));
         }
-        resp.ctx = Some(self.provider.net_ctx());
+        resp.ctx = Some(NetInfo {
+            isp: self.my_isp(),
+            ..self.provider.net_ctx()
+        });
         if d.unchanged {
             resp.status = "unchanged".into();
             return Ok(self.sealed("sync", to_cbor(&resp)));

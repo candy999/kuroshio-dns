@@ -38,6 +38,8 @@ pub fn tmpdir(name: &str) -> PathBuf {
 pub struct Fake {
     pub records: Mutex<Vec<LocalRecord>>,
     pub received: Mutex<Vec<Received>>,
+    /// 這台 WAN 的 ISP 群組（3.5.0 E10）
+    pub isp: Mutex<Option<String>>,
 }
 
 impl Fake {
@@ -57,7 +59,11 @@ impl DataProvider for Fake {
         kuroshio_community::envelope::NetInfo {
             asn: Some(3462),
             colo: "TPE".into(),
+            isp: None,
         }
+    }
+    fn isp_group(&self) -> Option<String> {
+        self.isp.lock().unwrap().clone()
     }
     fn in_range(&self, provider: &str, ip: IpAddr) -> RangeCheck {
         if provider != "cloudflare" {
@@ -184,6 +190,8 @@ pub struct Spec {
     /// 用 serve_stream / serve_quic（整合端會用的 API），不經過故障注入
     pub direct: bool,
     pub key_dir: Option<PathBuf>,
+    /// `community.shareIspGroup`（3.5.0 E10）
+    pub share_isp: bool,
 }
 
 pub fn fast_tuning() -> Tuning {
@@ -215,6 +223,7 @@ impl Default for Spec {
             max_bundle_mb: 32,
             direct: false,
             key_dir: None,
+            share_isp: false,
         }
     }
 }
@@ -271,6 +280,7 @@ pub async fn node(domain: &str, r: &Arc<StaticResolver>, spec: Spec) -> Node {
         pow_bits: spec.pow_bits,
         rules: spec.rules,
         max_bundle_mb: spec.max_bundle_mb,
+        share_isp_group: spec.share_isp,
         ..Default::default()
     };
     let key_dir = spec.key_dir.unwrap_or_else(|| tmpdir(&format!("{domain}-key")));

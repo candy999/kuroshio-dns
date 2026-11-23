@@ -76,7 +76,19 @@ impl Community {
         drop(id);
         let check = self.check_json();
         let invite_at = self.invite_created_at();
+        let mine = self.my_isp();
         let st = self.lock();
+        let same = mine.as_ref().map_or(0, |m| {
+            st.store
+                .friends()
+                .filter(|p| st.remote.get(&p.domain).and_then(|r| r.ctx.isp.as_ref()) == Some(m))
+                .count()
+        });
+        let isp_json = if cfg.share_isp_group {
+            json!({ "share": true, "mine": mine, "sameGroupFriends": same })
+        } else {
+            json!({ "share": false, "sameGroupFriends": 0 })
+        };
         let peers: Vec<&Peer> = st.store.peers.values().collect();
         let count = |f: &dyn Fn(&&Peer) -> bool| peers.iter().filter(|p| f(p)).count();
         let mut site_keys = std::collections::HashSet::new();
@@ -111,6 +123,8 @@ impl Community {
             "share": { "epoch": hex(&st.share.epoch), "seq": st.share.seq, "records": st.share.len() },
             // 邀請碼本身只在 /api/community/invite 給
             "invite": { "createdAt": invite_at },
+            // 3.5.0 E10：ISP 群組（mine 只在開著時給；sameGroupFriends = 同群組的好友數）
+            "ispGroup": isp_json,
         })
     }
 

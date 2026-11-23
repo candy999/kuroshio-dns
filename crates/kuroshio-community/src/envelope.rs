@@ -223,6 +223,68 @@ pub struct NetInfo {
     pub asn: Option<u32>,
     #[serde(default)]
     pub colo: String,
+    /// 觀測者 WAN 的 ISP 群組（3.5.0 E10，`tw-ip.json` 的群組 id，例如 `cht`；只到群組、不帶 IP）。
+    /// 只放在同步回應的 `ctx`（已經是好友才拿得到），身分文件的 `net` 不放；沒開 `community.shareIspGroup`
+    /// 時不序列化，位元組跟以前一樣。收到格式不對的（太長、大寫、奇怪字元、不是字串）當成沒有
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_isp")]
+    pub isp: Option<String>,
+}
+
+/// ISP 群組 id 的格式：最長 16 個字元，只能是小寫英數、`-`、`_`
+pub fn valid_isp(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 16
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// 寬鬆讀 `isp`：不是字串、格式不對都當成沒有（不讓一個欄位毀掉整個同步回應）。
+/// 不認得的型別（數字、陣列、物件、位元組）照樣讀完再丟掉，後面的欄位不受影響
+fn de_isp<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("ISP 群組 id")
+        }
+        fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            Ok(valid_isp(v).then(|| v.to_string()))
+        }
+        fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_bytes<E>(self, _: &[u8]) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> std::result::Result<Self::Value, D2::Error> {
+            d.deserialize_any(V)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> std::result::Result<Self::Value, A::Error> {
+            while a.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> std::result::Result<Self::Value, A::Error> {
+            while a.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+    d.deserialize_any(V)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,5 +530,106 @@ mod tests {
         let b: Back = from_cbor(&to_cbor(&Raw { upserts: vec![good, bad] })).unwrap();
         assert!(b.upserts[0].0.is_some());
         assert!(b.upserts[1].0.is_none());
+    }
+
+    /// 3.5.0 E10：沒開時不序列化 isp，位元組跟 3.4.x 完全一樣；舊版（沒有這個欄位）讀得懂新版的；
+    /// 新版讀舊版是「不知道」
+    #[test]
+    fn ctx_isp_only_when_enabled_and_bytes_unchanged_when_off() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Old {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            asn: Option<u32>,
+            #[serde(default)]
+            colo: String,
+        }
+        let off = NetInfo {
+            asn: Some(3462),
+            colo: "TPE".into(),
+            isp: None,
+        };
+        let old = Old {
+            asn: Some(3462),
+            colo: "TPE".into(),
+        };
+        assert_eq!(to_cbor(&off), to_cbor(&old), "沒開：位元組不變");
+        let on = NetInfo {
+            isp: Some("cht".into()),
+            ..off.clone()
+        };
+        let b = to_cbor(&on);
+        assert_ne!(b, to_cbor(&old));
+        assert_eq!(from_cbor::<Old>(&b).unwrap(), old, "舊版忽略多的欄位");
+        assert_eq!(from_cbor::<NetInfo>(&b).unwrap(), on);
+        assert_eq!(from_cbor::<NetInfo>(&to_cbor(&old)).unwrap().isp, None, "舊版沒給 = 不知道");
+    }
+
+    #[test]
+    fn invalid_isp_string_dropped() {
+        #[derive(Serialize)]
+        struct Raw<T: Serialize> {
+            asn: u32,
+            colo: &'static str,
+            isp: T,
+        }
+        let parse = |b: Vec<u8>| from_cbor::<NetInfo>(&b).unwrap();
+        for bad in ["CHT", "abcdefghijklmnopq", "a.example", "", "台灣", "c ht"] {
+            let n = parse(to_cbor(&Raw {
+                asn: 1,
+                colo: "TPE",
+                isp: bad,
+            }));
+            assert_eq!((n.isp, n.colo.as_str(), n.asn), (None, "TPE", Some(1)), "{bad:?}");
+        }
+        // 型別不對：照樣讀完，其他欄位不受影響
+        assert_eq!(
+            parse(to_cbor(&Raw {
+                asn: 1,
+                colo: "TPE",
+                isp: 42
+            }))
+            .isp,
+            None
+        );
+        assert_eq!(
+            parse(to_cbor(&Raw {
+                asn: 1,
+                colo: "TPE",
+                isp: vec!["cht"]
+            }))
+            .colo,
+            "TPE"
+        );
+        assert_eq!(
+            parse(to_cbor(&Raw {
+                asn: 1,
+                colo: "TPE",
+                isp: serde_bytes::ByteBuf::from(vec![1u8, 2])
+            }))
+            .isp,
+            None
+        );
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("x", 1);
+        assert_eq!(
+            parse(to_cbor(&Raw {
+                asn: 7,
+                colo: "KHH",
+                isp: m
+            }))
+            .asn,
+            Some(7)
+        );
+        assert_eq!(
+            parse(to_cbor(&Raw {
+                asn: 1,
+                colo: "TPE",
+                isp: "so-net_2"
+            }))
+            .isp
+            .as_deref(),
+            Some("so-net_2")
+        );
+        assert!(valid_isp("cht") && !valid_isp("CHT"));
     }
 }

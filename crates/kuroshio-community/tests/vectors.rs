@@ -44,6 +44,7 @@ fn sync_response() -> SyncResponse {
         ctx: Some(NetInfo {
             asn: Some(3462),
             colo: "TPE".into(),
+            isp: None,
         }),
         upserts: vec![
             Lenient(Some(WireRecord {
@@ -100,6 +101,7 @@ fn build() -> Vec<Value> {
         net: NetInfo {
             asn: Some(3462),
             colo: "TPE".into(),
+            isp: None,
         },
         friends: vec![serde_bytes::ByteBuf::from(friend_hash("b.example").to_vec())],
         rot: vec![],

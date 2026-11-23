@@ -126,6 +126,10 @@ pub trait DataProvider: Send + Sync {
     fn net_ctx(&self) -> NetInfo {
         NetInfo::default()
     }
+    /// 這台 WAN 的 ISP 群組（3.5.0 E10）：偵測不到是 `None`。要不要送由 `community.shareIspGroup` 決定（這裡不管）
+    fn isp_group(&self) -> Option<String> {
+        None
+    }
     fn in_range(&self, _provider: &str, _ip: IpAddr) -> RangeCheck {
         RangeCheck::UnknownProvider
     }
