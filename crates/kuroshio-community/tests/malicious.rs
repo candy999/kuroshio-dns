@@ -195,9 +195,10 @@ async fn malicious_inputs() {
     recs.extend((10..40).map(|i| node_rec(&format!("192.168.1.{i}"))));
     y.data.set(recs);
     y.c.reset_share();
+    // y 換了內容會通知 m，m 可能已經自己拉過、封鎖了（這時手動同步回「不是好友」）：兩種都要封鎖
     let res = sync(&m, "y.test").await;
-    assert_eq!(res["status"], "blocked", "{res}");
-    assert!(m.peer("y.test").my_block);
+    assert!(res["status"] == "blocked" || m.peer("y.test").my_block, "{res}");
+    wait_for("m 封鎖 y", || m.peer("y.test").my_block).await;
 
     // _kuroshio TXT：有設定就一定要一致
     r.set_txt("_kuroshio.y.test", &["v=cd2; k=0000000000000000"]);
