@@ -75,6 +75,16 @@ return view.extend({
 			t('verify', 'verify_fail_max_days', _('重試間隔上限（天）'), 'cdn.verifyFailMaxDays');
 			t('verify', 'verify_timeout_ms', _('驗證逾時（毫秒）'), 'cdn.verifyTimeoutMs');
 			t('verify', 'verify_concurrency', _('同時驗證數'), 'cdn.verifyConcurrency');
+			// 新網域很多時的驗證節流（3.5.0 F12）
+			o = s.taboption('verify', form.Flag, 'verify_pacing', _('新網域很多時 CDN 驗證自動減量'),
+				_('每分鐘的驗證有上限，並依黑潮自己用掉的 CPU 自動調整（55% 以上減半、30% 以下慢慢加回）。名額用完或 CPU 很忙時只問過 1 次的網域先不驗證（照常回原本的答案），問過 2 次以上的照常驗證；壓力解除後幾分鐘自己恢復。關掉＝只有小機器有每分鐘 30 個的上限。'));
+			o.default = common.def('cdn.verifyPacing') === false ? '0' : '1';
+			o.rmempty = false;
+			o = s.taboption('verify', form.Value, 'verify_per_min', _('CDN 驗證每分鐘上限'),
+				_('留空 = 自動：小機器 30；沒有 AES 指令的（MT7621 類）核心數 × 30；有 AES 的核心數 × 60、最多 480。範圍 6～1200。'));
+			o.rmempty = true;
+			o.placeholder = _('自動（%s）').format(common.def('cdn.verifyPerMin') != null ? common.def('cdn.verifyPerMin') : 'auto');
+			o.validate = function(id, v) { return !v || v === 'auto' || (/^\d+$/.test(v) && +v >= 6 && +v <= 1200) || _('請填 6～1200 的整數，或留空（自動）'); };
 			t('verify', 'nearest_min_gain_ms', _('沒有台灣 POP 時最少快幾毫秒才換'), 'cdn.nearestMinGainMs', _('Fastly 等：換到鄰近國家節點的門檻。'));
 
 			t('pool', 'serve_count', _('每次回幾個台灣 IP'), 'cdn.serveCount');
@@ -86,8 +96,8 @@ return view.extend({
 				_('原本的 CDN 在台灣沒有節點（例如 Fastly）時，測試同一個網站是不是也放在 Cloudflare、CloudFront、Azure、Akamai 的台灣節點上；憑證與網頁內容都一致才採用。'));
 			o.default = common.def('cdn.cross.enabled') === false ? '0' : '1';
 			o.rmempty = false;
-			o = s.taboption('cross', form.Flag, 'cross_request_score', _('整個請求也要比較快才換'),
-				_('原本的條件都通過之後，再比一個請求從連線、握手到收到回應標頭的時間：比原站快 5% 以上才採用；已經在用的，差 10% 以內都留著。關掉＝3.4.x：只看 TCP 連線的延遲。'));
+			o = s.taboption('cross', form.Flag, 'cross_request_score', _('握手也要比較快才換'),
+				_('原本的條件都通過之後，再比連線＋TLS 握手的時間（不含網站自己產生內容的時間）：比原站快 5% 以上才採用；已經在用的，差 10% 以內都留著。關掉＝3.4.x：只看 TCP 連線的延遲。'));
 			o.default = common.def('cdn.cross.requestScore') === false ? '0' : '1';
 			o.rmempty = false;
 			t('cross', 'cross_min_orig_ms', _('原本延遲超過幾毫秒才嘗試'), 'cdn.cross.minOrigMs');

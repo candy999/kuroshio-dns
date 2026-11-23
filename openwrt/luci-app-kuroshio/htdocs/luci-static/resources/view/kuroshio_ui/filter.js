@@ -23,7 +23,8 @@ function currentLists() {
 	return uci.sections(CONF, 'filter_list').map(function(x) {
 		var p = x.protect;
 		return { ref: x['.name'], name: x.name, url: x.url, category: x.category, enabled: x.enabled !== '0',
-			protect: (p == null || p === '') ? undefined : p === '1', bypass: x.bypass === '1' };
+			protect: (p == null || p === '') ? undefined : p === '1', bypass: x.bypass === '1',
+			probe: (x.probe == null || x.probe === '') ? undefined : x.probe === '1' };
 	});
 }
 
@@ -70,6 +71,9 @@ return view.extend({
 			common.num(s, null, 'update_interval_hours', _('清單更新間隔（小時）'), 'filter.updateIntervalHours');
 			o = common.flag(s, null, 'relaxed_modifiers', _('寬鬆套用瀏覽器規則'), 'filter.relaxedModifiers',
 				_('EasyList 這類瀏覽器清單有很多帶 $third-party、$script 修飾詞的規則。關閉（預設，同 AdGuard Home）= 略過這些規則；打開 = 整個網域封鎖，擋得更多但可能誤殺。'));
+			// 內建一定通過的服務（3.5.0 F11）
+			o = common.flag(s, null, 'protect_comm', _('內建服務與通訊類網域不被清單誤擋'), 'filter.protectComm',
+				_('內建的六類服務就算被訂閱清單擋到也放行（自訂規則照樣優先）：推播（照常換台灣節點）；時間同步、連線偵測、憑證撤銷、地震速報（這四類也不改寫 CDN 答案）；系統與安全更新（照常換台灣節點，只保證不被誤擋）。關掉＝新的五類照清單擋、照常改寫。'));
 		}
 
 		// ---------------- 訂閱清單 ----------------
@@ -121,6 +125,13 @@ return view.extend({
 				_('這份是繞過防護類的清單。上游的 allow_downstream 開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。'));
 			o.default = '0';
 			o.rmempty = true;
+			// 3.5.0 F10：每日評測的惡意網站探測能不能從這份抽網域。自動 = 不寫這個選項（惡意類抽；TW165、TWNIC-RPZ、新註冊網域、繞過防護不抽）
+			o = s.option(form.ListValue, 'probe', _('探測抽樣'),
+				_('每日評測的惡意網站探測能不能從這份的本機副本抽網域。自動 = 啟用中的惡意 / 詐騙類才抽；TW165、TWNIC-RPZ（台灣業者的 DNS 依法停止解析）、新註冊網域、繞過防護預設不抽。'));
+			o.value('', _('自動'));
+			o.value('1', _('抽'));
+			o.value('0', _('不抽'));
+			o.optional = true;
 		}
 
 		// ---------------- 自訂規則 ----------------
@@ -292,7 +303,7 @@ return view.extend({
  * 第一次新增、改值、排順序；第二次才刪除區段與選項（LuCI 同一次存檔裡有刪除時不會送出順序）
  */
 function applyRestore(m, cur, plan) {
-	var order = [], unset = [], unsetBypass = [], keep = {};
+	var order = [], unset = [], unsetBypass = [], unsetProbe = [], keep = {};
 	plan.result.forEach(function(r) {
 		var sid;
 		if (r.own) {
@@ -309,6 +320,9 @@ function applyRestore(m, cur, plan) {
 			// 繞過防護的標記照預設值（restorePlan 整理過的 def 沒有這一欄，看原始的預設 raw）
 			if (r.raw && r.raw.bypass === true) uci.set(CONF, sid, 'bypass', '1');
 			else if (old && old.bypass) unsetBypass.push(sid);
+			// 惡意網站探測抽樣的標記（3.5.0 F10）：預設有寫就照寫，沒寫就拿掉
+			if (r.raw && (r.raw.probe === true || r.raw.probe === false)) uci.set(CONF, sid, 'probe', r.raw.probe ? '1' : '0');
+			else if (old && old.probe !== undefined) unsetProbe.push(sid);
 		}
 		if (r.from >= 0) keep[r.from] = true;
 		order.push(sid);
@@ -318,6 +332,7 @@ function applyRestore(m, cur, plan) {
 		cur.forEach(function(c, j) { if (!keep[j]) uci.remove(CONF, c.ref); });
 		unset.forEach(function(sid) { uci.unset(CONF, sid, 'protect'); });
 		unsetBypass.forEach(function(sid) { uci.unset(CONF, sid, 'bypass'); });
+		unsetProbe.forEach(function(sid) { uci.unset(CONF, sid, 'probe'); });
 		return uci.save();
 	}).then(function() { return m.load(); }).then(function() { return m.reset(); }).then(function() {
 		var ch = plan.changes;

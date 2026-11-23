@@ -222,7 +222,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
                 const j = await res.json();
                 j.chain = CASES[mode];
                 j.upstreams = [{ id: 'udp://192.168.1.1:53', type: 'udp', role: 'chain', ok: 10, fail: 0, avgMs: 2.1, reason: null, region: null, pathBlocked: false, via: null },
-                    { id: 'tls://dns.example.net', type: 'dot', role: 'auto', ok: 5, fail: 0, avgMs: 31, reason: '覆蓋', region: 'JP', regionSource: 'registered', near: true, pathBlocked: false, via: null }].concat(j.upstreams || []);
+                    { id: 'tls://dns.example.net', type: 'dot', role: 'auto', ok: 5, fail: 0, avgMs: 31, reason: '覆蓋', region: 'JP', regionSource: 'registered', near: true, pathBlocked: false, via: null,
+                        servfail: 2, late: 7, unanswered: 1 }].concat(j.upstreams || []);
+                // 3.5.0 F12、F8：CDN 驗證節流（減量中）與網域資料的磁碟用量
+                j.cdn = Object.assign({}, j.cdn || {}, { pace: { enabled: true, perMin: 30, maxPerMin: 60, paced: true, usedLastMin: 30, cpuPct: 41, waited: 12, capped: 3 },
+                    dbEntries: 2000, dbDiskKB: 2218, dbFileKB: 1722, dbBudgetKB: null, cdnDirKB: 2600 });
                 r.fulfill({ response: res, body: JSON.stringify(j) });
             });
             const show = async m => {
@@ -237,6 +241,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
                 '串接畫面：串接中（上游指紋、共用結果、略過的工作）', down.slice(0, 400));
             const upTable = await page.textContent('#st-up');
             check(/串接/.test(upTable) && /自動（覆蓋 · 鄰近（註冊地 JP））/.test(upTable), '上游表格：串接上游的角色、地區（3.5.0：註冊地）顯示在原因旁邊', upTable.slice(0, 300));
+            check(/SERVFAIL 2、來不及 7/.test(upTable), '上游表格：SERVFAIL 與來不及另外計（3.5.0 F4）', upTable.slice(0, 300));
+            const cdnInfo = (await page.textContent('#st-cdn-pace').catch(() => '')) + ' ' + (await page.textContent('#st-cdn-store').catch(() => ''));
+            check(/CDN 驗證減量中/.test(cdnInfo) && /磁碟佔用 2\.2 MB（檔案長度合計 1\.7 MB）/.test(cdnInfo) && await page.isVisible('#st-cdn-pace.msg.warn'),
+                'CDN 驗證節流（減量中，提醒樣式）與網域資料的磁碟用量（3.5.0 F12、F8）', cdnInfo.slice(0, 300));
             check(up.includes('不提供資料給下游（allow_downstream 關閉）：下游黑潮會自己重做評測、CDN 掃描、下載清單，重複使用網路（含這台的頻寬）') && /目前沒有下游連上來/.test(up) && !/建議關閉/.test(up),
                 '串接畫面：上游角色 allow_downstream 關閉的說明（整句）', up.slice(0, 400));
             check((await page.locator('#st-chain button').count()) === 0, '串接畫面：沒有任何按鈕');

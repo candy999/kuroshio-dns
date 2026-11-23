@@ -207,6 +207,7 @@
               { "value": "dot", "label": "DoT" },
               { "value": "doq", "label": "DoQ" }
             ] },
+            { "key": "upstream.roundAwareFailures", "type": "bool", "label": "上游成敗照整輪判斷", "help": "別的上游先答完、這台還沒回來就被取消的（來不及），也記下來：沒有延遲紀錄的不再永遠排第一，連續 8 次都來不及、而且沒成功過才算 1 次失敗。大家都答不出來的那一輪（網域本身壞掉、整台斷網）不算個別上游失敗；SERVFAIL 另外計。狀態頁的成功率旁邊會顯示「SERVFAIL N、來不及 M」。關掉＝3.4.x 的記法（被取消的不記、逾時一律算失敗）。", "pro": true },
             { "key": "upstream.pathCheck", "type": "bool", "label": "路徑檢查", "help": "啟動後、每 6 小時、WAN 變動時檢查路上有沒有人動手腳：一般 DNS 被接走（上游路由器、業者）、「不存在」被改成廣告頁、加密協定被擋、TLS 中途攔截、IPv6 能不能用。評測與上游選擇照結果調整。", "pro": true },
             { "key": "upstream.interceptPolicy", "type": "select", "label": "一般 DNS 被接走時", "fallbackDefault": "skip-plain", "help": "路上有人把 53 埠接走時，一般 DNS 的答案其實都是攔截者給的。", "pro": true, "options": [
               { "value": "skip-plain", "label": "評測不測一般 DNS（建議）" },
@@ -274,7 +275,7 @@
           "title": "過濾",
           "fields": [
             { "key": "filter.enabled", "type": "bool", "label": "啟用過濾" },
-            { "key": "filter.protectComm", "type": "bool", "label": "通訊類網域不被清單誤擋", "help": "推播（Apple 推播、Firebase 雲端訊息與自己加的通訊類網域）就算被訂閱清單擋到也放行，漏接通知比多一個連線嚴重。自訂規則照樣優先：自己明確要擋的照擋。" },
+            { "key": "filter.protectComm", "type": "bool", "label": "內建服務與通訊類網域不被清單誤擋", "help": "內建的六類服務就算被訂閱清單擋到也放行（自訂規則照樣優先：自己明確要擋的照擋）：推播（Apple 推播、Firebase 雲端訊息，照常換台灣節點）、時間同步（NTP）、連線偵測（手機判斷「有沒有網路」）、憑證撤銷（OCSP／CRL）、地震速報（政府的資料來源）這四類也不改寫 CDN 答案（換節點沒有好處、換錯代價很大）；系統與安全更新照常換台灣節點，只保證不被誤擋。自己加的通訊類網域（resolver.keepNames）不擋、快取優先。關掉＝新的五類照清單擋、照常改寫，推播回到 3.5.0 之前的規則。" },
             { "key": "filter.updateIntervalHours", "type": "int", "label": "清單更新間隔（小時）", "pro": true, "min": 1 },
             { "key": "filter.relaxedModifiers", "type": "bool", "label": "寬鬆套用瀏覽器規則", "help": "EasyList 這類瀏覽器清單有很多帶 $third-party、$script 修飾詞的規則。關閉（預設，同 AdGuard Home）= 略過這些規則；打開 = 整個網域封鎖，擋得更多但可能誤殺。", "pro": true },
             { "key": "filter.customRules", "type": "list", "label": "自訂規則檔", "help": "一行一個檔案（相對路徑以設定資料夾為準）。用記事本編輯即可，例：||ads.example.com^ 封鎖、@@||good.example.com^ 白名單、! 或 # 開頭是註解。存檔後 3 秒內生效，不用重啟。", "pro": true }
@@ -298,8 +299,13 @@
                 { "value": true, "label": "保護" },
                 { "value": false, "label": "不保護" }
               ] },
-              { "key": "bypass", "type": "bool", "label": "繞過防護", "default": false, "pro": true, "help": "這份是繞過防護類的清單。上游的 allow_downstream 開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。" }
-            ], "help": "「繞過防護」欄（專業模式）：這份是繞過防護類的清單（擋加密 DNS／VPN／代理）。「提供資料給下游的黑潮」（allow_downstream）開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。" }
+              { "key": "bypass", "type": "bool", "label": "繞過防護", "default": false, "pro": true, "help": "這份是繞過防護類的清單。上游的 allow_downstream 開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。" },
+              { "key": "probe", "type": "select", "label": "探測抽樣", "pro": true, "options": [
+                { "value": "", "label": "自動（惡意類抽）" },
+                { "value": true, "label": "抽" },
+                { "value": false, "label": "不抽" }
+              ] }
+            ], "help": "「繞過防護」欄（專業模式）：這份是繞過防護類的清單（擋加密 DNS／VPN／代理）。「提供資料給下游的黑潮」（allow_downstream）開著時，不擋已登記的下游黑潮解析它自己的上游主機名稱。「探測抽樣」欄（專業模式）：每日評測的惡意網站探測能不能從這份的本機副本抽網域。自動＝啟用中的惡意 / 詐騙類才抽；TW165、TWNIC-RPZ（台灣業者的 DNS 依法停止解析，拿來探測會把業者的 DNS 判成有過濾）、新註冊網域（不是惡意網域）、繞過防護預設不抽。" }
           ]
         },
         {
@@ -331,7 +337,7 @@
             { "key": "cdn.popAudit", "type": "bool", "label": "機房以這台量到的為準", "help": "上游黑潮（串接）給的節點，先記下它宣稱的機房，這台量到之後以自己量的為準；不一樣時列在狀態頁的「發現」。串接中搭答案抽查的名額量機房（10 分鐘最多 1 個、一天最多 24 個）。關掉＝照收上游的機房、串接中不量（3.4.x 的行為）。" },
             { "key": "cdn.popSwitch", "type": "bool", "label": "機房層級的健康與切換", "help": "只有這條線到得了兩個以上台灣機房時才會動：某個機房連續 3 輪健檢變差、另一個明顯正常，就把變差的機房的節點暫時排到後面 4 小時，到期自動恢復；一天最多 2 次。大多數線路只到得了一個機房，只彙總、不切換。關掉＝只彙總。" },
             { "key": "cdn.spreadPrefixes", "type": "bool", "label": "同機房內分散網段", "help": "回給裝置的那幾個台灣節點盡量來自不同的網段（IPv4 /24、IPv6 /48），一個網段出問題時不會全部一起壞；只換延遲差不多的節點（1.5 倍＋5 毫秒以內）。關掉＝照延遲排序。" },
-            { "key": "cdn.slowerFallback", "type": "bool", "label": "台灣節點比原本慢就先用原本的答案", "help": "驗證時台灣節點的請求時間明顯比原本的答案慢（1.5 倍＋30 毫秒，複測確認），這個網站暫時用原本的答案、6 小時後重測；太多網站都這樣時（量測可能有問題）自動停用 6 小時。只處理 IPv4。關掉＝驗證通過就換（3.4.x 的行為）。" },
+            { "key": "cdn.slowerFallback", "type": "bool", "label": "台灣節點比原本慢就先用原本的答案", "help": "比連線＋TLS 握手的時間（不含網站自己產生內容的時間），而且偏向台灣：台灣節點的握手 × 0.7 還比原本的慢 10 毫秒以上才算慢。第一次慢照樣換台灣節點，隔 10 分鐘以上、有人查時再驗一次還是慢，才暫時用原本的答案 15 分鐘（小機器 1 小時），到期後有人查才重驗，重驗一次不慢就回台灣節點。太多網站都這樣時（量測可能有問題）自動停用 6 小時。只處理 IPv4。關掉＝驗證通過就換（3.4.x 的行為）。" },
             { "key": "cdn.ecs.twSubnets", "type": "list", "label": "ECS 台灣網段", "help": "DNS 分流型 CDN 用。放你用戶實際所在的 ISP 網段效果最好；本機對外 IP 的 /24 會自動放在最前面。" }
           ]
         },
@@ -345,6 +351,8 @@
             { "key": "cdn.verifyFailMaxDays", "type": "int", "label": "重試間隔上限（天）", "min": 1 },
             { "key": "cdn.verifyTimeoutMs", "type": "int", "label": "驗證逾時（毫秒）", "min": 1 },
             { "key": "cdn.verifyConcurrency", "type": "int", "label": "同時驗證數", "min": 1 },
+            { "key": "cdn.verifyPacing", "type": "bool", "label": "新網域很多時 CDN 驗證自動減量", "help": "每分鐘的驗證有上限，並依這台黑潮自己用掉的 CPU 自動調整（55% 以上減半、30% 以下慢慢加回）。名額用完或 CPU 很忙時進入「減量中」：只問過 1 次的網域先不驗證（照常回原本的答案，真的有人在用的很快會再問），問過 2 次以上的、到期重驗的照常驗證；壓力解除後幾分鐘自己恢復。一般家用碰不到上限。關掉＝3.5.0 之前的行為（只有小機器有每分鐘 30 個的上限）。" },
+            { "key": "cdn.verifyPerMin", "type": "int", "label": "CDN 驗證每分鐘上限", "help": "留空 = 自動：小機器（cdn.lite）30；沒有 AES 指令的（MT7621 類）核心數 × 30；有 AES 的核心數 × 60、最多 480。上限定在這台機器本來就做得到的量附近，平常碰不到。手動按的驗證不受限制。", "min": 6, "max": 1200 },
             { "key": "cdn.nearestMinGainMs", "type": "int", "label": "沒有台灣 POP 時最少快幾毫秒才換", "help": "Fastly 等：換到鄰近國家節點的門檻。", "min": 0 }
           ]
         },
@@ -365,7 +373,7 @@
           "pro": true,
           "fields": [
             { "key": "cdn.cross.enabled", "type": "bool", "label": "啟用跨 CDN 備援", "help": "原本的 CDN 在台灣沒有節點（例如 Fastly）時，測試同一個網站是不是也放在 Cloudflare、CloudFront、Azure、Akamai 的台灣節點上；憑證與網頁內容都一致才採用。" },
-            { "key": "cdn.cross.requestScore", "type": "bool", "label": "整個請求也要比較快才換", "help": "原本的條件（憑證相符、確實是那一家、不是錯誤頁、同一個網站、TCP 連線比較近）都通過之後，再比一個請求從連線、握手到收到回應標頭的時間：比原站快 5% 以上才採用；已經在用的，差 10% 以內都留著。關掉＝3.4.x：只看 TCP 連線的延遲。" },
+            { "key": "cdn.cross.requestScore", "type": "bool", "label": "握手也要比較快才換", "help": "原本的條件（憑證相符、確實是那一家、不是錯誤頁、同一個網站、TCP 連線比較近）都通過之後，再比連線＋TLS 握手的時間（不含網站自己產生內容的時間，那一段兩家一樣、只會蓋掉差距）：比原站快 5% 以上才採用；已經在用的，差 10% 以內都留著。關掉＝3.4.x：只看 TCP 連線的延遲。" },
             { "key": "cdn.cross.minOrigMs", "type": "int", "label": "原本延遲超過幾毫秒才嘗試", "min": 0 },
             { "key": "cdn.cross.recheckHours", "type": "int", "label": "複驗間隔（小時）", "min": 1 },
             { "key": "cdn.cross.failDays", "type": "int", "label": "失敗後幾天再試", "min": 0 },
@@ -608,7 +616,8 @@
               { "value": "a", "label": "只測 A 級（加補位與探索）" },
               { "value": "ab", "label": "全部都測" }
             ] },
-            { "key": "benchmark.malwareProbe", "type": "bool", "label": "惡意網站探測", "help": "評測時用少數幾個人工確認過的探測網域（probe.txt）判出「有擋惡意網站的 DNS」，這類不選來用（不記可疑、不進黑名單）。名單是空的時不跑。評測只做 DNS 查詢、不連線；但查這類網域可能被上游或線路上的資安設備記錄，不想要可以關掉。" },
+            { "key": "benchmark.malwareProbe", "type": "bool", "label": "惡意網站探測", "help": "評測時用探測網域判出「有擋惡意網站的 DNS」，這類不選來用（不記可疑、不進黑名單）。探測網域是 probe.txt（手動指定，可以留空）加上從這台已下載的惡意類清單抽樣的。評測只做 DNS 查詢、不連線；但抽到的是還在活動的惡意網域，線路上的資安設備可能把這台記成「有裝置中毒」（每天十幾個查詢）。企業或學校網路建議關掉。" },
+            { "key": "benchmark.probeSample", "type": "bool", "label": "探測網域從已下載的清單抽樣", "help": "每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 40 個網域，先確認還解析得到（留最多 20 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）。抽到的網域不寫進 judge.log。關掉＝只用 probe.txt（A5 原本的規則）。", "dependsOn": { "key": "benchmark.malwareProbe", "values": [true] } },
             { "key": "benchmark.minAuto", "type": "int", "label": "至少選幾台", "min": 0 },
             { "key": "benchmark.maxAvgLatencyMs", "type": "int", "label": "平均延遲上限（毫秒）", "min": 1 },
             { "key": "benchmark.keepDays", "type": "int", "label": "報表保留天數", "min": 0 }

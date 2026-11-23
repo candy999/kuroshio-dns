@@ -12,6 +12,9 @@
  *   benchScope(b, tr)               /api/benchmark 的 tiers、probe（評測範圍、惡意網站探測）→ 一行摘要
  *   controlSummary(list, tr)        /api/benchmark 的 protected[]（對照組）→ 一行摘要
  *   regionLabel(u, tr)              上游的地區（region、regionSource、near）→「台灣」「鄰近（註冊地 GB）」「註冊地 GB」「鄰近」
+ *   upstreamExtra(u, tr)            上游的 servfail、late（3.5.0 F4）→「SERVFAIL 3、來不及 5」（都沒有回 ''）
+ *   paceView(pace, tr)              /api/status 的 cdn.pace（3.5.0 F12）→ CDN 驗證節流的一句話
+ *   cdnStoreText(cdn, tr)           /api/status 的 cdn（dbEntries、dbDiskKB、dbFileKB、dbBudgetKB、cdnDirKB；3.5.0 F8）→ 一行摘要
  *   agoText(t, now, tr)             多久以前（剛剛／5 分鐘前／3 小時前／2 天前；未來的是「…後」）
  *   freshnessView(list, tr, now)    /api/status 的 freshness（3.5.0 E1）→ 資料新鮮度表格的每一列
  *   findingsView(list, tr, now)     /api/status 的 findings（3.5.0 E2）→ 發現清單的每一筆
@@ -89,7 +92,8 @@
 
 	/**
 	 * 「恢復預設清單」要怎麼改：比對目前的過濾清單與這個版本的預設清單。
-	 * cur / defs：{ name, url, category, enabled(布林), protect(布林或 undefined), bypass(布林；'1' 也算) }；cur 可以多帶 ref（LuCI 的 UCI 區段 ID）。
+	 * cur / defs：{ name, url, category, enabled(布林), protect(布林或 undefined), bypass(布林；'1' 也算),
+ *   probe(布林或 undefined；'0'／'1' 也算，3.5.0 F10 惡意網站探測抽樣) }；cur 可以多帶 ref（LuCI 的 UCI 區段 ID）。
 	 * 對應方式：先用網址找，找不到再用名稱找（所以只改了網址的預設清單會被改回預設網址）。
 	 * 網址不在預設裡的是使用者自己加的：保留、排在預設清單後面（removeOwn = true 時移除）。
 	 * 回傳 { result, changes }：
@@ -97,13 +101,20 @@
 	 *           或 { own（整理過的自訂清單）, raw, from }]
 	 *   changes：{ add, remove, url, enabled, other, keep, reorder, count }（count = 變更項目數，0 = 不需要變更）
 	 */
+	function probeOf(v) {
+		if (v === true || v === 1 || v === '1') return true;
+		if (v === false || v === 0 || v === '0') return false;
+		return undefined;
+	}
 	function restorePlan(curRaw, defsRaw, removeOwn) {
 		var norm = function (x) {
 			var p = x.protect;
 			return { name: String(x.name || ''), url: String(x.url || '').trim(), category: x.category || 'ads', enabled: x.enabled !== false,
 				protect: (p === undefined || p === null || p === '') ? undefined : !!p,
 				// 繞過防護：只有標成 true 的才帶（沒有標 = undefined，跟 false 一樣；整理過的結果不多一欄）
-				bypass: (x.bypass === true || x.bypass === 1 || x.bypass === '1') ? true : undefined, ref: x.ref };
+				bypass: (x.bypass === true || x.bypass === 1 || x.bypass === '1') ? true : undefined,
+				// 惡意網站探測抽樣（3.5.0 F10）：沒寫 = 自動（依分類與網址）；明寫才帶
+				probe: probeOf(x.probe), ref: x.ref };
 		};
 		curRaw = curRaw || [];
 		defsRaw = defsRaw || [];
@@ -130,6 +141,7 @@
 			if (c.category !== d.category) o.push({ what: 'category', from: c.category, to: d.category });
 			if (c.protect !== d.protect) o.push({ what: 'protect', from: c.protect, to: d.protect });
 			if (c.bypass !== d.bypass) o.push({ what: 'bypass', from: c.bypass, to: d.bypass });
+			if (c.probe !== d.probe) o.push({ what: 'probe', from: c.probe, to: d.probe });
 			if (o.length) ch.other.push({ name: d.name, diffs: o });
 		});
 		cur.forEach(function (c, j) {
@@ -160,6 +172,7 @@
 		var prot = function (v) { return v === undefined ? t('自動') : v ? t('保護') : t('不保護'); };
 		var cat = function (v) { return CAT[v] ? t(CAT[v]) : v; };
 		var yes = function (v) { return v ? t('是') : t('否'); };
+		var probe = function (v) { return v === undefined ? t('自動') : v ? t('抽') : t('不抽'); };
 		var blocks = [];
 		var block = function (cls, title, items) { if (items.length) blocks.push({ cls: cls, title: title, items: items }); };
 		var otherText = function (o) {
@@ -167,6 +180,7 @@
 				if (x.what === 'name') return format(t('名稱「%s」→「%s」'), [x.from, x.to]);
 				if (x.what === 'category') return format(t('分類「%s」→「%s」'), [cat(x.from), cat(x.to)]);
 				if (x.what === 'bypass') return format(t('繞過防護「%s」→「%s」'), [yes(x.from), yes(x.to)]);
+				if (x.what === 'probe') return format(t('探測抽樣「%s」→「%s」'), [probe(x.from), probe(x.to)]);
 				return format(t('保護「%s」→「%s」'), [prot(x.from), prot(x.to)]);
 			}).join('、');
 		};
@@ -174,7 +188,7 @@
 		block('remove', format(t('會移除（%d）'), [ch.remove.length]), ch.remove.map(function (d) { return (d.name || d.url) + (d.own ? t('（自己加的）') : t('（重複的預設清單）')); }));
 		block('url', format(t('網址改回預設（%d）'), [ch.url.length]), ch.url.map(function (d) { return d.name + '：' + d.from + ' → ' + d.to; }));
 		block('enabled', format(t('啟用狀態改回預設（%d）'), [ch.enabled.length]), ch.enabled.map(function (d) { return d.name + '：' + onOff(d.from) + ' → ' + onOff(d.to); }));
-		block('other', format(t('名稱 / 分類 / 保護 / 繞過防護改回預設（%d）'), [ch.other.length]), ch.other.map(otherText));
+		block('other', format(t('名稱 / 分類 / 保護 / 繞過防護 / 探測抽樣改回預設（%d）'), [ch.other.length]), ch.other.map(otherText));
 		if (ch.reorder) block('reorder', t('順序'), [t('改回預設的順序（自己加的清單排在預設清單後面）')]);
 		block('keep', format(t('保留你自己加的清單（%d，排在預設清單後面）'), [ch.keep.length]), ch.keep.map(function (d) { return d.name || d.url; }));
 		return { empty: null, blocks: blocks };
@@ -303,7 +317,9 @@
 	/**
 	 * 每日評測測了哪些（/api/benchmark 的 tiers、probe，3.5.0）→ 一行摘要；舊版沒有 tiers 回 null。
 	 *   tiers.mode = 'a'：小機器的減量，只測 A 級加少數 B 級；'ab'：全部都測
-	 *   probe.malware.state：ok（有判斷）、invalid／fuse／no-reference（今天失效，沒拿來判斷）、off／empty（沒有跑，不顯示）
+	 *   probe.malware.state：ok（有判斷）、invalid／fuse／no-reference（今天失效，沒拿來判斷）、
+	 *     no-source（3.5.0 F10：probe.txt 沒有、也抽不到）、off／empty（沒有跑，不顯示）
+	 *   probe.malware.source（3.5.0 F10）：{ manual, sampled, alive, lists }，有判斷時加在後面；舊版沒有就不加
 	 */
 	function benchScope(b, tr) {
 		var t = typeof tr === 'function' ? tr : function (s) { return s; };
@@ -315,8 +331,13 @@
 				[n(ti.a), n(ti.promoted) + n(ti.trial), n(ti.incumbent), n(ti.fill), n(ti.explore), n(ti.skippedB)])
 			: t('評測範圍：全部都測');
 		var m = b.probe && b.probe.malware;
-		if (m && m.state === 'ok') out += format(t('；惡意網站探測：%d 台有擋（不選）'), [n(m.blockedBy)]);
-		else if (m && (m.state === 'invalid' || m.state === 'fuse' || m.state === 'no-reference')) out += t('；惡意網站探測今天失效，沒有拿來判斷');
+		var src = m && m.source;
+		if (m && m.state === 'ok') {
+			out += format(t('；惡意網站探測：%d 台有擋（不選）'), [n(m.blockedBy)]);
+			if (src && typeof src === 'object' && (n(src.manual) || n(src.sampled)))
+				out += format(t('（探測網域：probe.txt %d 個、從 %d 份清單抽樣 %d 個裡 %d 個還解析得到）'), [n(src.manual), n(src.lists), n(src.sampled), n(src.alive)]);
+		} else if (m && (m.state === 'invalid' || m.state === 'fuse' || m.state === 'no-reference')) out += t('；惡意網站探測今天失效，沒有拿來判斷');
+		else if (m && m.state === 'no-source') out += t('；惡意網站探測今天沒有探測網域（probe.txt 沒有、也沒有抽到），沒有判斷');
 		return out;
 	}
 
@@ -335,6 +356,64 @@
 		if (region && u.regionSource === 'tw-net') return t('台灣');
 		if (region) return format(t(near ? '鄰近（註冊地 %s）' : '註冊地 %s'), [region]);
 		return near ? t('鄰近') : '';
+	}
+
+	/**
+	 * 上游的 SERVFAIL 與來不及回答的次數（/api/status、/api/upstreams 的 upstreams[]：servfail、late；3.5.0 F4）→
+	 * 「SERVFAIL 3、來不及 5」，放在成功率旁邊。成功率照舊用 ok ÷ (ok + fail)。都是 0 或舊版沒有這兩欄時回 ''。
+	 *   servfail：這台正常回應了 SERVFAIL 的次數（多台都 SERVFAIL＝網域壞掉，不算任何一台失敗）
+	 *   late：別的上游先答完、這台還沒回來就被取消的次數（連續 8 次而且沒成功過才算 1 次失敗）
+	 */
+	function upstreamExtra(u, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!u) return '';
+		var out = [];
+		if (typeof u.servfail === 'number' && u.servfail > 0) out.push(format(t('SERVFAIL %d'), [u.servfail]));
+		if (typeof u.late === 'number' && u.late > 0) out.push(format(t('來不及 %d'), [u.late]));
+		return out.join('、');
+	}
+
+	/**
+	 * /api/status 的 cdn.pace（3.5.0 F12：新網域很多時的 CDN 驗證節流）→ { text, warn（減量中）} 或 null（舊版、CDN 關、空物件）。
+	 * pace：{ enabled, perMin（目前的速率）, maxPerMin, paced（減量中）, usedLastMin, cpuPct, waited（只問過一次所以沒排）,
+	 *         capped（名額用完沒排）, since（進入減量中的時間，毫秒）}
+	 */
+	function paceView(p, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!p || typeof p !== 'object' || typeof p.enabled !== 'boolean') return null;
+		if (!p.enabled) return { text: t('CDN 驗證節流已關閉（只有小機器有每分鐘上限）'), warn: false };
+		var num = function (v) { return typeof v === 'number' ? v : 0; };
+		var rate = format(t('每分鐘最多 %d 個（這台的上限 %d）'), [num(p.perMin), num(p.maxPerMin)]);
+		var text = p.paced
+			? format(t('CDN 驗證減量中：新網域很多（或 CPU 很忙），先只驗證問過 2 次以上的網域，%s；還沒驗證的照常回原本的答案'), [rate])
+			: format(t('CDN 驗證：正常速度，%s'), [rate]);
+		var more = [];
+		if (typeof p.usedLastMin === 'number') more.push(format(t('最近一分鐘 %d 個'), [p.usedLastMin]));
+		if (typeof p.cpuPct === 'number') more.push(format(t('CPU %d%%'), [p.cpuPct]));
+		if (num(p.waited)) more.push(format(t('只問過一次先不驗證 %d 次'), [p.waited]));
+		if (num(p.capped)) more.push(format(t('名額用完沒排 %d 次'), [p.capped]));
+		if (p.paced && msOf(p.since)) more.push(format(t('從 %s 起'), [fmtTime(msOf(p.since))]));
+		if (more.length) text += '（' + more.join('、') + '）';
+		return { text: text, warn: !!p.paced };
+	}
+
+	/**
+	 * /api/status 的 cdn（3.5.0 F8）→ CDN 網域資料的一行摘要；沒有 dbEntries（CDN 關、舊版）回 null。
+	 *   dbDiskKB：網域分片實際佔用的區塊（磁碟預算比的是這個）；dbFileKB：檔案長度合計（3.4.x 的量法）；
+	 *   dbBudgetKB：磁碟預算（null＝不限）；cdnDirKB：整個 cdn/ 目錄實際佔用（含節點池等，只顯示、不算進預算）
+	 */
+	function cdnStoreText(cdn, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		if (!cdn || typeof cdn.dbEntries !== 'number') return null;
+		var kb = function (v) { return fmtBytes(v * 1024); };
+		var out = [format(t('CDN 網域資料 %d 筆'), [cdn.dbEntries])];
+		if (typeof cdn.dbDiskKB === 'number') {
+			out.push(format(t('磁碟佔用 %s'), [kb(cdn.dbDiskKB)]) +
+				(typeof cdn.dbFileKB === 'number' && cdn.dbFileKB !== cdn.dbDiskKB ? format(t('（檔案長度合計 %s）'), [kb(cdn.dbFileKB)]) : ''));
+		}
+		if (typeof cdn.dbBudgetKB === 'number') out.push(format(t('預算 %s'), [kb(cdn.dbBudgetKB)]));
+		if (typeof cdn.cdnDirKB === 'number') out.push(format(t('cdn 目錄合計 %s（含節點池等，不算進預算）'), [kb(cdn.cdnDirKB)]));
+		return out.join(' · ');
 	}
 
 	// ---------------------------------------------------------------- 觀測（3.5.0 E 組）
@@ -443,7 +522,9 @@
 		};
 		var a = cdn.popAudit;
 		var audit = a && a.enabled !== false && (a.confirmed || a.mismatch || a.pending)
-			? format(t('上游給的節點：已確認機房 %d、量到不一樣 %d、還沒確認 %d'), [a.confirmed || 0, a.mismatch || 0, a.pending || 0]) : null;
+			? format(t('上游給的節點：已確認機房 %d、量到不一樣 %d、還沒確認 %d'), [a.confirmed || 0, a.mismatch || 0, a.pending || 0]) +
+				// 3.5.0 F7：前幾名（解除串接後馬上會回給裝置的）裡還沒確認的
+				(typeof a.pendingServed === 'number' ? format(t('（前幾名還沒確認 %d）'), [a.pendingServed]) : '') : null;
 		var fuseAt = msOf(cdn.slowerFuseUntil);
 		return {
 			lines: lines,
@@ -526,6 +607,9 @@
 		controlSummary: controlSummary,
 		benchScope: benchScope,
 		regionLabel: regionLabel,
+		upstreamExtra: upstreamExtra,
+		paceView: paceView,
+		cdnStoreText: cdnStoreText,
 		agoText: agoText,
 		freshnessView: freshnessView,
 		findingsView: findingsView,

@@ -953,11 +953,15 @@
       return p.then(s => {
         renderObserveStatus(s);
         if (sec.upTable) {
-          table(sec.upTable, s.upstreams, [
+          // 3.5.0 F4：SERVFAIL 與「來不及」（別的上游先答完、這台被取消）另外計；舊版核心沒有這兩欄時不顯示
+          const ups = s.upstreams || [];
+          const split = ups.some(u => u.servfail != null || u.late != null);
+          table(sec.upTable, ups, [
             { h: '上游', v: u => u.id, cls: 'mono' },
             // 3.5.0：從未成功、先不用的自動上游（benched）與候補（spare）標出來
             { h: '角色', v: u => tag(u.benched ? '從未成功，先不用' : u.spare ? '候補' : u.role === 'pinned' ? '固定' : u.role === 'auto' ? '自動' : u.role === 'fallback' ? '備援' : u.role === 'chain' ? '串接' : u.role, u.paused || u.benched ? 'bad' : '') },
             { h: '成功', v: u => nf.format(u.ok), num: 1 }, { h: '失敗', v: u => nf.format(u.fail), num: 1 },
+            ...(split ? [{ h: 'SERVFAIL', v: u => nf.format(u.servfail || 0), num: 1 }, { h: '來不及', v: u => nf.format(u.late || 0), num: 1 }] : []),
             { h: '平均 ms', v: u => u.avgMs ?? '—', num: 1 },
             { h: '地區', v: u => KD.regionLabel(u) || '—' }
           ]);
@@ -1010,8 +1014,12 @@
           box.appendChild(el('div', 'muted', `評測範圍：只測 A 級（A 級 ${ti.a || 0}、依歷史拉上來的 B 級 ${(ti.promoted || 0) + (ti.trial || 0)}、沿用 ${ti.incumbent || 0}、補位 ${ti.fill || 0}、探索 ${ti.explore || 0}；其餘 B 級 ${ti.skippedB || 0} 個今天不測）`));
         }
         const mp = b.probe && b.probe.malware;
-        if (mp && mp.state === 'ok') box.appendChild(el('div', 'muted', `惡意網站探測：${mp.blockedBy} 台有擋惡意網站（比照對照組，不選）${(mp.filtering || []).length ? '：' + mp.filtering.slice(0, 5).join('、') : ''}`));
+        // 3.5.0 F10：探測網域的來源（probe.txt 的、從已下載的惡意類清單抽樣的）；舊版沒有 source 就不寫
+        const ms = mp && mp.source && (mp.source.manual || mp.source.sampled)
+          ? `（探測網域：probe.txt ${mp.source.manual || 0} 個、從 ${mp.source.lists || 0} 份清單抽樣 ${mp.source.sampled || 0} 個裡 ${mp.source.alive || 0} 個還解析得到）` : '';
+        if (mp && mp.state === 'ok') box.appendChild(el('div', 'muted', `惡意網站探測：${mp.blockedBy} 台有擋惡意網站（比照對照組，不選）${(mp.filtering || []).length ? '：' + mp.filtering.slice(0, 5).join('、') : ''}${ms}`));
         else if (mp && ['invalid', 'fuse', 'no-reference'].includes(mp.state)) box.appendChild(el('div', 'muted', '惡意網站探測今天失效（自我檢查沒過），沒有拿來判斷'));
+        else if (mp && mp.state === 'no-source') box.appendChild(el('div', 'muted', '惡意網站探測今天沒有探測網域（probe.txt 沒有、也沒有從清單抽到），沒有判斷'));
         if (b.blocked && b.blocked.length) box.appendChild(el('div', 'muted', `封殺紀錄 ${b.blocked.length} 筆（例：${b.blocked.slice(0, 3).map(x => x.dns + ' → ' + x.domain).join('、')}）`));
         // 對照組（3.5.0）：有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選。摺疊起來，點開才看每一台
         const ctl = b.protected || [];
@@ -1045,6 +1053,9 @@
           const c = el('div', 'card glass');
           c.appendChild(el('h3', '', `${LABEL[name] || name}`));
           c.appendChild(el('div', 'muted', `掃描：TW / Global / Dead 共 ${d.scan.tw + d.scan.global + d.scan.dead} 段 · 官方範圍 v4 ${d.ranges.v4} / v6 ${d.ranges.v6} 段 · 永久 v6 ${Object.keys((v6.providers || {})[name] || {}).length} 個`));
+          // 測速參考（3.5.0 B1、F15、F16）：沒有這些欄位（舊版、還沒測過）時不顯示
+          const ref = [d.speedRef != null ? `測速參考 ${d.speedRef} MB/s` : '', d.quickRef != null ? `快測參考（前 1 MiB）${d.quickRef} MB/s` : '', d.speedRefWhy || ''].filter(Boolean);
+          if (ref.length) c.appendChild(el('div', 'muted', ref.join(' · ')));
           // 管理介面：節點可能有幾百個，表格限制高度、在框裡捲動（詳細頁維持原樣）
           const t = el('table'); const w = el('div', o.rich ? 'tbl scroll kd-mt8' : 'tbl kd-mt8'); w.appendChild(t); c.appendChild(w);
           const rows = [...d.v4.map(x => ({ ...x, fam: 'v4' })), ...d.v6.map(x => ({ ...x, fam: 'v6' }))];

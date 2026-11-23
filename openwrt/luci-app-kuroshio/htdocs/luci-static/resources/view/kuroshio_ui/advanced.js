@@ -188,6 +188,9 @@ return view.extend({
 		o.value('udp', 'UDP');
 		o.value('doh', 'DoH');
 		o.value('dot', 'DoT');
+		// 上游成敗照整輪判斷（3.5.0 F4）
+		common.flag(s, null, 'round_aware_failures', _('上游成敗照整輪判斷'), 'upstream.roundAwareFailures',
+			_('別的上游先答完、這台還沒回來就被取消的（來不及），也記下來：沒有延遲紀錄的不再永遠排第一，連續 8 次都來不及、而且沒成功過才算 1 次失敗。大家都答不出來的那一輪（網域本身壞掉、整台斷網）不算個別上游失敗；SERVFAIL 另外計。關掉＝3.4.x 的記法。'));
 		// 路徑檢查（3.3.6）
 		common.flag(s, null, 'path_check', _('路徑檢查'), 'upstream.pathCheck',
 			_('啟動後、每 6 小時、WAN 變動時檢查路上有沒有人動手腳：一般 DNS 被接走（上游路由器、業者）、「不存在」被改成廣告頁、加密協定被擋、TLS 中途攔截、IPv6 能不能用。評測與上游選擇照結果調整。'));
@@ -294,9 +297,13 @@ return view.extend({
 		o.default = 'auto';
 		// 惡意網站探測（3.5.0）
 		o = s.option(form.Flag, 'malware_probe', _('惡意網站探測'),
-			_('評測時用少數幾個人工確認過的探測網域（probe.txt）判出「有擋惡意網站的 DNS」，這類不選來用（不記可疑、不進黑名單）。名單是空的時不跑。評測只做 DNS 查詢、不連線；但查這類網域可能被上游或線路上的資安設備記錄，不想要可以關掉。'));
+			_('評測時用探測網域判出「有擋惡意網站的 DNS」，這類不選來用（不記可疑、不進黑名單）。探測網域是 probe.txt（手動指定，可以留空）加上從這台已下載的惡意類清單抽樣的。評測只做 DNS 查詢、不連線；但抽到的是還在活動的惡意網域，線路上的資安設備可能把這台記成「有裝置中毒」（每天十幾個查詢）。企業或學校網路建議關掉。'));
 		o.default = '1';
 		o.rmempty = false;
+		// 探測網域從已下載的清單抽樣（3.5.0 F10）
+		o = common.flag(s, null, 'probe_sample', _('探測網域從已下載的清單抽樣'), 'benchmark.probeSample',
+			_('每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 40 個網域，先確認還解析得到（留最多 20 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。TW165、TWNIC-RPZ、新註冊網域不抽。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）。關掉＝只用 probe.txt。'));
+		o.depends('malware_probe', '1');
 		num('near_max_ms', _('鄰近的延遲上限（毫秒）'), 'benchmark.nearMaxMs', _('最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。'));
 		num('min_auto', _('至少選幾台'), 'benchmark.minAuto');
 		num('max_avg_latency_ms', _('平均延遲上限（毫秒）'), 'benchmark.maxAvgLatencyMs');

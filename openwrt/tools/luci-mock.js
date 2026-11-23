@@ -87,7 +87,7 @@ const DDNS = () => (uci.kuroshio.ddns.enabled === '1' ? { enabled: true, lastRun
 const STATUS = {
     version: '3.5.0', stats: { uptimeSec: 3700, today: { date: '2026-11-11', query: 1234, hit: 900, hitRate: 72.9, blocked: 50, blockedAds: 40, blockedTelemetry: 8, blockedMalware: 2, route: {}, latency: { hit: { p50: 1, p95: 2 }, miss: { p50: 20, p95: 80 } } } },
     cacheEntries: 800, cacheBytes: 300000, errors: { count: 0, recent: [] }, ownIp: null,
-    upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ok: 100, fail: 1, avgMs: 12 },
+    upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ok: 100, fail: 1, avgMs: 12, servfail: 2, late: 5, unanswered: 1 },
       { id: 'https://doh.example/dns-query', role: 'auto', reason: '最快', ok: 50, fail: 0, avgMs: 20 },
       { id: 'quic://doq.example:853', role: 'auto', reason: '覆蓋', region: 'JP', ok: 0, fail: 0, avgMs: null, pathBlocked: true },
       { id: 'udp://8.8.4.4:53', role: 'fallback', ok: 0, fail: 0, avgMs: null, via: 'interceptor' }], autoUpstreams: null,
@@ -148,7 +148,10 @@ Object.assign(STATUS.cdn, {
         nearby: [{ provider: 'fastly', pop: 'NRT', prefixes: 6 }] },
     popHealth: [{ provider: 'cloudflare', family: 4, pop: 'TPE', nodes: 9, bad: 0, failRate: 0.0, medianMs: 4.2, badStreak: 0, held: false, heldUntil: null }],
     popSwitch: { enabled: true, eligible: false, reason: 'single-pop', switches24h: 0 },
-    popAudit: { enabled: true, pending: 0, confirmed: 31, mismatch: 0, probes24h: 0, lastMismatchAt: null, chainPopUnreliable: false }
+    popAudit: { enabled: true, pending: 0, confirmed: 31, mismatch: 0, probes24h: 0, lastMismatchAt: null, chainPopUnreliable: false, pendingServed: 0, lastProbeAt: null, noTarget: 0 },
+    // 3.5.0 F12：驗證節流（減量中）；F8：網域資料的三種量法
+    pace: { enabled: true, perMin: 30, maxPerMin: 60, paced: true, usedLastMin: 30, cpuPct: 41, waited: 1234, capped: 56, since: NOWMS - 300e3 },
+    dbEntries: 20000, dbDiskKB: 2218, dbFileKB: 1722, dbBudgetKB: 2303, cdnDirKB: 2600
 });
 STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, failClosed: false, warning: null, generatedAt: TWIP.generatedAt,
     ranges: 1003, memoryBytes: 16048, dataBytes: 21312, denied: { total: 57, byListener: { dot: 40, doh: 17 } }, topDenied: [] };
@@ -298,7 +301,10 @@ const DOMAINS_API = query => {
 };
 const BENCH = { generatedAt: Date.now() - 3 * 3600e3, counts: { total: 120, survivors: 40, eliminated: 80 }, coverage: 0.93,
     selected: [{ id: 'https://dns.example.org/dns-query', avgMs: 14.2, newItems: 12, reason: '涵蓋率最高', owner: 'Example_Org' }],
-    pinned: [{ id: 'udp://1.1.1.1', avgMs: 12.4, coverageItems: 3, issues: [] }], blocked: [] };
+    pinned: [{ id: 'udp://1.1.1.1', avgMs: 12.4, coverageItems: 3, issues: [] }], blocked: [],
+    // 3.5.0 A3、A5、F10：評測範圍與惡意網站探測（探測網域的來源）
+    tiers: { mode: 'ab' }, probe: { malware: { state: 'ok', domains: 17, used: 12, valid: 12, blockedBy: 2, probed: 40, queries: 900, rule: 'ratio',
+        source: { manual: 0, sampled: 40, alive: 17, lists: 1 }, filtering: [] } } };
 // 串接模式（3.4.0）：/__mock/chain?mode=chained（預設）/ released（上游不提供資料）/ off（這台的 chain 關、上游角色也關）切換
 const CHAIN_FP = '3F2A-91C0-77B1-0C4E-5D21-9A60-E3F8-12AB';
 const CHAIN_SERVING_ON = { allowDownstream: true, text: '提供資料給下游黑潮：目前 2 台',

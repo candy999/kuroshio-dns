@@ -291,6 +291,19 @@ return baseclass.extend({
 		var x = core();
 		return x && typeof x.reachView === 'function' ? x.reachView(cdn, function(s) { return _(s); }) : null;
 	},
+	/** 3.5.0 F 組：上游的 SERVFAIL／來不及、CDN 驗證節流、CDN 網域資料的磁碟用量（ui-core.js 的 upstreamExtra 等）；舊的 ui-core.js 回空的 */
+	upstreamExtra: function(u) {
+		var x = core();
+		return x && typeof x.upstreamExtra === 'function' ? x.upstreamExtra(u, function(s) { return _(s); }) : '';
+	},
+	paceView: function(pace) {
+		var x = core();
+		return x && typeof x.paceView === 'function' ? x.paceView(pace, function(s) { return _(s); }) : null;
+	},
+	cdnStoreText: function(cdn) {
+		var x = core();
+		return x && typeof x.cdnStoreText === 'function' ? x.cdnStoreText(cdn, function(s) { return _(s); }) : null;
+	},
 	ispGroupText: function(ig) {
 		var x = core();
 		return x && typeof x.ispGroupText === 'function' ? x.ispGroupText(ig, function(s) { return _(s); }) : null;

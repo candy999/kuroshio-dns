@@ -642,7 +642,8 @@
 				'保留 ' + mbOf(mem.reserveKB) + ' MB（' + (mem.reserveAuto ? '自動' : '設定') + '）' + (mem.headroomKB != null ? ' · 保留以上 ' + mbOf(mem.headroomKB) + ' MB' : '') +
 				(mem.enabled ? ' · ' + (mem.stateLabel || mem.state) + (mem.growth === false ? '（不再長大）' : '') : '') +
 				(mem.psi ? ' · PSI ' + mem.psi.someAvg10 + '%' : '')),
-			tile('本程式記憶體', sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', memSizes(mem.sizes)),
+			// system.rssKB 讀不到時（3.5.0 之前的 Windows）退回 memory.rssKB
+			tile('本程式記憶體', (sys.rssKB || mem.rssKB) ? ((sys.rssKB || mem.rssKB) / 1024).toFixed(1) + ' MB' : '-', memSizes(mem.sizes)),
 			tile('已執行', fmtUptime(st.stats && st.stats.uptimeSec), '今天：' + (d.date || '-')),
 			tile('今天查詢', fmtNum(d.query), '快取命中率 ' + (d.hitRate != null ? d.hitRate + '%' : '-')),
 			tile('攔截', fmtNum(d.blocked), '廣告 ' + fmtNum(d.blockedAds) + ' · 遙測 ' + fmtNum(d.blockedTelemetry) + ' · 惡意 ' + fmtNum(d.blockedMalware)),
@@ -709,6 +710,9 @@
 			else if (rate >= 0.9) h = badge('正常 ' + Math.round(rate * 100) + '%', 'ok');
 			else if (rate >= 0.5) h = badge('不穩 ' + Math.round(rate * 100) + '%', 'warn');
 			else h = badge('異常 ' + Math.round(rate * 100) + '%', 'err');
+			// SERVFAIL、來不及回答另外計（3.5.0 F4；ui-core.js 的 upstreamExtra）：成功率照舊用 ok ÷ (ok + fail)
+			var more = typeof core.upstreamExtra === 'function' ? core.upstreamExtra(u) : '';
+			if (more) h = el('span', {}, [h, el('span', { class: 'muted', text: ' ' + more })]);
 			// 選上的原因；上游所在地區放在原因旁邊（3.5.0：國別是 IP 的註冊地，標成「註冊地 GB」「鄰近（註冊地 GB）」，ui-core.js 的 regionLabel）
 			var place = typeof core.regionLabel === 'function' ? core.regionLabel(u) : u.region;
 			var why = [u.reason, place].filter(function (x) { return !!x; }).join(' · ');
@@ -744,6 +748,14 @@
 			rv.lines.concat([rv.note, rv.unconfirmed, rv.audit].filter(Boolean)).forEach(function (l) { ex.appendChild(el('p', { class: 'msg info', text: l })); });
 			if (rv.health.text) ex.appendChild(el('p', { class: 'msg info', text: rv.health.text }));
 			if (rv.fuse) ex.appendChild(el('p', { class: 'msg warn', text: rv.fuse }));
+		}
+		// CDN 驗證節流與網域資料的磁碟用量（3.5.0 F12、F8；ui-core.js 的 paceView、cdnStoreText）：舊版核心沒有欄位時不顯示
+		var pv = st.cdn && typeof core.paceView === 'function' ? core.paceView(st.cdn.pace) : null;
+		var store = st.cdn && typeof core.cdnStoreText === 'function' ? core.cdnStoreText(st.cdn) : null;
+		if (pv || store) {
+			ex.appendChild(el('h3', { text: 'CDN 驗證與資料' }));
+			if (pv) ex.appendChild(el('p', { class: 'msg ' + (pv.warn ? 'warn' : 'info'), id: 'st-cdn-pace', text: pv.text }));
+			if (store) ex.appendChild(el('p', { class: 'msg info', id: 'st-cdn-store', text: store }));
 		}
 		// 網路路徑（3.3.6）：一般 DNS 有沒有被接走、被誰；被擋的協定；IPv6
 		var np = st.network && st.network.path;

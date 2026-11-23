@@ -160,7 +160,8 @@ return view.extend({
 					(mem.headroomKB != null ? _(' · 保留以上 %s MB').format(mbOf(mem.headroomKB)) : '') +
 					(mem.enabled ? ' · ' + (mem.stateLabel || mem.state) + (mem.growth === false ? _('（不再長大）') : '') : '') +
 					(mem.psi ? ' · PSI ' + mem.psi.someAvg10 + '%' : '')),
-				tile(_('本程式記憶體'), sys.rssKB ? (sys.rssKB / 1024).toFixed(1) + ' MB' : '-', memSizes(mem.sizes)),
+				// system.rssKB 讀不到時退回 memory.rssKB（3.5.0 F6）
+				tile(_('本程式記憶體'), (sys.rssKB || mem.rssKB) ? ((sys.rssKB || mem.rssKB) / 1024).toFixed(1) + ' MB' : '-', memSizes(mem.sizes)),
 				tile(_('快取命中率'), d.hitRate != null ? d.hitRate + '%' : '-', _('預取 %s · 斷線回舊資料 %s').format(fmtNum(d.prefetch), fmtNum(d.stale))),
 				tile(_('回應時間 p50 / p95'), ms(lat.hit), _('問上游 ') + ms(lat.miss)),
 				tile(_('Flash 寫入（今天）'), per.bytesToday != null ? (per.bytesToday / 1024).toFixed(0) + ' KB' : '-', (per.storage || '') + _(' · 間隔 ') + (per.effectiveIntervalMin != null ? per.effectiveIntervalMin : (per.intervalMin || '-')) + _(' 分') +
@@ -256,6 +257,13 @@ return view.extend({
 				}), [3, 4, 5, 6]) : ''])] : []
 		), { 'id': 'kuroshio-reach' }) : '';
 
+		// CDN 驗證節流與網域資料的磁碟用量（3.5.0 F12、F8）：舊版核心沒有這些欄位時不顯示
+		var pv = api.cdn ? common.paceView(api.cdn.pace) : null, store = api.cdn ? common.cdnStoreText(api.cdn) : null;
+		var cdnSec = pv || store ? common.section(_('CDN 驗證與資料'), [
+			pv ? E('div', { 'class': pv.warn ? 'alert-message warning' : 'cbi-section-descr', 'id': 'kuroshio-cdn-pace' }, pv.text) : '',
+			store ? E('p', { 'class': 'cbi-section-descr', 'id': 'kuroshio-cdn-store' }, store) : ''
+		], { 'id': 'kuroshio-cdn-info' }) : '';
+
 		// 串接模式（3.4.0）：下游角色（這台向上游黑潮拿資料）與上游角色（提供資料給下游）兩個區塊都一定顯示。
 		// 主要的句子直接用 API 給的 text / serving.text / serving.note；沒有同意、核准這類按鈕。
 		// 只有「重新檢查」（3.5.0）：立刻重新偵測上游黑潮（跟路徑檢查後的重新偵測一樣），不改任何設定
@@ -294,6 +302,9 @@ return view.extend({
 			else if (u.paused) note.push(_('暫停中'));
 			if (u.pathBlocked) note.push(_('路徑不通，先不用'));
 			if (u.via === 'interceptor') note.push(_('經由攔截者'));
+			// SERVFAIL 與來不及回答另外計（3.5.0 F4）：成功率照舊用成功 ÷（成功＋失敗）
+			var more = common.upstreamExtra(u);
+			if (more) note.push(more);
 			return [u.id, role, fmtNum(u.ok), fmtNum(u.fail), u.avgMs != null ? u.avgMs + ' ms' : '-', note.join(' · ')];
 		});
 		var upSec = common.section(_('上游'), [
@@ -346,7 +357,7 @@ return view.extend({
 			common.pre(errs.slice(0, 10).map(function(e) { return fmtTime(e.at, 'sec') + '  ' + e.msg; }).join('\n'))
 		]) : '';
 
-		return E([], [head, tiles, findSec, freshSec, hw, memSec, accSec, lsSec, pathSec, reachSec, chainSec, upSec, jobSec, infoSec, actions, errSec]);
+		return E([], [head, tiles, findSec, freshSec, hw, memSec, accSec, lsSec, pathSec, reachSec, cdnSec, chainSec, upSec, jobSec, infoSec, actions, errSec]);
 	},
 
 	render: function(data) {
