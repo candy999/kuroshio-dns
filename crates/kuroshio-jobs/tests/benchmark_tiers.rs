@@ -4,9 +4,10 @@
 //!
 //! 本機假 DNS 伺服器（每台數自己收到幾筆查詢）、注入的時鐘
 
+use kuroshio_jobs::benchmark::learn::{Hist, HistState, Learn};
 use kuroshio_jobs::benchmark::probe::{AsnSource, NetProber, Prober, SiteCheck, StaticAsn};
 use kuroshio_jobs::benchmark::rules::AsnInfo;
-use kuroshio_jobs::benchmark::tiers::{Mode, B_EXPLORE_MAX};
+use kuroshio_jobs::benchmark::tiers::{Mode, B_EXPLORE_MAX, TRIAL_NEW_PER_DAY};
 use kuroshio_jobs::scheduler::BoxFuture;
 use kuroshio_jobs::time::{days_from_civil, ManualClock, DAY_MS, HOUR_MS, TPE_OFFSET_MS};
 use kuroshio_jobs::{BenchPaths, Benchmark, JobCtx};
@@ -26,7 +27,6 @@ use tokio::net::UdpSocket;
 struct Mock {
     id: String,
     hits: Arc<AtomicUsize>,
-    #[allow(dead_code)]
     up: Arc<AtomicBool>,
 }
 
@@ -221,14 +221,16 @@ async fn tier_a_tests_only_a_user_fill_and_explore() {
     assert_eq!(up["selected"][0]["id"], l.b[0].id.as_str(), "{up:#}");
     assert_eq!(up["selected"][0]["tier"], "B");
 
-    // 同一天再跑一次：測的是同一批（手動多跑幾次不會把 B 級測完）
-    let before: Vec<bool> = l.b.iter().map(|m| m.hits.load(Ordering::Relaxed) > 0).collect();
+    // 同一天再跑一次：探索的是同一組（手動多跑幾次不會把 B 級測完）；多出來的只有沿用、試用與補位（各有上限）
+    let before = l.b.iter().filter(|m| m.hits.load(Ordering::Relaxed) > 0).count();
     l.reset();
     let again = run(&p, "a", &clock).await;
-    let after: Vec<bool> = l.b.iter().map(|m| m.hits.load(Ordering::Relaxed) > 0).collect();
-    assert_eq!(before, after);
-    // 昨天選上或候補的 B 級今天沿用（算在沿用，不佔補位）
-    assert!(again["tiers"]["incumbent"].as_u64().unwrap() >= 1, "{}", again["tiers"]);
+    let after = l.b.iter().filter(|m| m.hits.load(Ordering::Relaxed) > 0).count();
+    assert!(after <= before + 8, "第二次多測了 {} 個 B 級", after as i64 - before as i64);
+    // 上一次選上的 B 級照測（沿用，或已經因為表現好開始試用）
+    assert!(l.b[0].hits.load(Ordering::Relaxed) > 0);
+    let t = &again["tiers"];
+    assert!(t["incumbent"].as_u64().unwrap() + t["trial"].as_u64().unwrap() >= 1, "{t}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -258,7 +260,7 @@ async fn tier_ab_matches_previous_behaviour() {
         );
         assert_eq!(t["auto"], tiers == "auto");
         assert!(l.a.iter().chain(&l.b).chain([&l.user]).all(|m| m.hits.load(Ordering::Relaxed) >= 3));
-        assert!(!report(&p, &up, "judge.log").contains("[分級]"));
+        assert!(!report(&p, &up, "judge.log").contains("[分級] 今天測"));
     }
     // auto 換算成 a（小機器）：只測一部分；設定寫明 ab 時不看換算
     let small = || Benchmark::with(p.clone(), Arc::new(LocalOnly), asn()).with_tier_auto(Mode::A);
@@ -270,5 +272,164 @@ async fn tier_ab_matches_previous_behaviour() {
     assert!(up["counts"]["total"].as_u64().unwrap() < 54);
     let up = run_with(small(), "ab", &clock).await;
     assert_eq!(up["counts"]["total"], 54);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn learn(p: &BenchPaths) -> Learn {
+    Learn::load(&p.learn_file.clone().unwrap())
+}
+
+async fn try_run(p: &BenchPaths, tiers: &str, clock: &Arc<ManualClock>) -> anyhow::Result<Value> {
+    let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(cfg(tiers))).with_clock(clock.clone());
+    Benchmark::with(p.clone(), Arc::new(LocalOnly), asn()).run(&ctx).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_run_does_not_touch_history() {
+    let root = tmp("hist");
+    let p = paths(&root);
+    let l = lists(&root).await;
+    let clock = Arc::new(ManualClock::new(day0()));
+    // 第 1 天：A 級第 1 台連不上，其他正常
+    l.a[0].up.store(false, Ordering::Relaxed);
+    run(&p, "ab", &clock).await;
+    let h = learn(&p).hist;
+    assert_eq!(h.len(), 53, "A 級 3、B 級 50；使用者自己加的不記");
+    assert!(!h.contains_key(&l.user.id));
+    let dead = h[&l.a[0].id];
+    assert_eq!((dead.tested(), dead.survived(), dead.suspect()), (1, 0, 0));
+    let ok = h[&l.a[1].id];
+    assert_eq!((ok.tested(), ok.survived()), (1, 1));
+    assert!(ok.ms > 0.0);
+    // 第 2 天：整台斷網（全部連不上）→ 評測失敗，歷史不動：不能把本機的問題記到候選頭上
+    clock.advance(DAY_MS);
+    for m in l.a.iter().chain(&l.b).chain([&l.user]) {
+        m.up.store(false, Ordering::Relaxed);
+    }
+    let e = try_run(&p, "ab", &clock).await.unwrap_err();
+    assert!(e.to_string().contains("沒有任何 DNS 通過資格賽"), "{e}");
+    assert_eq!(learn(&p).hist, h);
+    // 第 3 天恢復：正常的那台是「測到 2 天、倖存 2 天」，斷網那天不算
+    clock.advance(DAY_MS);
+    for m in l.a.iter().chain(&l.b).chain([&l.user]) {
+        m.up.store(true, Ordering::Relaxed);
+    }
+    run(&p, "ab", &clock).await;
+    let ok = learn(&p).hist[&l.a[1].id];
+    assert_eq!((ok.tested(), ok.survived(), ok.t), (2, 2, 0b101));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_demotes_a_and_pulls_up_b() {
+    let root = tmp("updown");
+    let p = paths(&root);
+    let l = lists(&root).await;
+    let clock = Arc::new(ManualClock::new(day0()));
+    // A 級第 1 台一直連不上
+    l.a[0].up.store(false, Ordering::Relaxed);
+    let mut up = run(&p, "a", &clock).await;
+    // 第 1 天：今天測到、倖存、沒失敗過的 B 級裡，延遲低的 8 個開始試用
+    let trial: Vec<String> = learn(&p)
+        .hist
+        .iter()
+        .filter(|(_, h)| h.e == HistState::Trial)
+        .map(|(k, _)| k.clone())
+        .collect();
+    assert_eq!(trial.len(), TRIAL_NEW_PER_DAY);
+    assert_eq!(up["tiers"]["trial"], 0, "今天的計畫裡還沒有");
+    for day in 2..=7 {
+        clock.advance(DAY_MS);
+        l.reset();
+        up = run(&p, "a", &clock).await;
+        // 試用中的每天都測（不靠補位或探索）
+        assert!(
+            up["tiers"]["trial"].as_u64().unwrap() >= TRIAL_NEW_PER_DAY as u64,
+            "第 {day} 天 {}",
+            up["tiers"]
+        );
+        for id in &trial {
+            let m = l.b.iter().find(|m| m.id == *id).unwrap();
+            assert!(m.hits.load(Ordering::Relaxed) > 0, "第 {day} 天沒測試用中的 {id}");
+        }
+        assert_eq!(up["tiers"]["a"], 3, "第 {day} 天：還沒降級");
+    }
+    // 第 7 天：連續 7 天沒倖存 → 降級（只影響測不測）
+    assert_eq!(up["tiers"]["demotedToday"], 1, "{}", up["tiers"]);
+    assert_eq!(learn(&p).hist[&l.a[0].id].e, HistState::Demoted);
+    let log = report(&p, &up, "judge.log");
+    assert!(
+        log.contains(&format!("[降級] {}：近 30 天測到 7 天、倖存 0 天", l.a[0].id)),
+        "{log}"
+    );
+    // 第 8 天：降級的 A 級不在 A 級裡了（只在探索時輪到）；跑到第 10 天，試用滿 10 天的升級
+    for day in 8..=11 {
+        clock.advance(DAY_MS);
+        up = run(&p, "a", &clock).await;
+        assert_eq!(
+            (up["tiers"]["a"].as_u64(), up["tiers"]["demoted"].as_u64()),
+            (Some(2), Some(1)),
+            "第 {day} 天"
+        );
+    }
+    assert!(
+        up["tiers"]["promoted"].as_u64().unwrap() >= TRIAL_NEW_PER_DAY as u64,
+        "{}",
+        up["tiers"]
+    );
+    let h = learn(&p).hist;
+    assert!(trial.iter().all(|id| h[id].e == HistState::Promoted));
+    // 選上游照常只看今天的結果：降級的那台本來就沒倖存，其他照選
+    assert!(!up["selected"].as_array().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn demotion_fuse_and_unreadable_learn_file_fall_back_to_manual_tiers() {
+    let root = tmp("fuse");
+    let p = paths(&root);
+    let l = lists(&root).await;
+    let clock = Arc::new(ManualClock::new(day0()));
+    let today = kuroshio_jobs::benchmark::learn::day_of(day0());
+    let demoted = Hist {
+        t: 0x7f,
+        s: 0,
+        e: HistState::Demoted,
+        last: today - 1,
+        ..Default::default()
+    };
+    // 3 台 A 級裡 1 台降級：照降（今天不測）
+    let mut lf = Learn::default();
+    lf.day = today - 1;
+    lf.hist.insert(l.a[0].id.clone(), demoted);
+    lf.save(&p.learn_file.clone().unwrap()).unwrap();
+    let up = run(&p, "a", &clock).await;
+    assert_eq!((up["tiers"]["a"].as_u64(), up["tiers"]["demoted"].as_u64()), (Some(2), Some(1)));
+    assert_eq!(up["tiers"]["demoteFuse"], false);
+    // 3 台裡 2 台降級（超過三分之一）：多半是線路的問題 → 今天不採用降級，全部照人工分級測
+    let mut lf = Learn::default();
+    lf.day = today - 1;
+    lf.hist.insert(l.a[0].id.clone(), demoted);
+    lf.hist.insert(l.a[1].id.clone(), demoted);
+    lf.save(&p.learn_file.clone().unwrap()).unwrap();
+    l.reset();
+    let up = run(&p, "a", &clock).await;
+    assert_eq!(
+        (up["tiers"]["a"].as_u64(), up["tiers"]["demoted"].as_u64()),
+        (Some(3), Some(0)),
+        "{}",
+        up["tiers"]
+    );
+    assert_eq!(up["tiers"]["demoteFuse"], true);
+    assert!(l.a.iter().all(|m| m.hits.load(Ordering::Relaxed) > 0));
+    assert!(report(&p, &up, "judge.log").contains("今天不採用降級"));
+    // 學習檔壞掉：當成空的，照人工分級跑，不失敗
+    let f = p.learn_file.clone().unwrap();
+    std::fs::write(format!("{}.zst", f.display()), b"not zstd").unwrap();
+    let up = run(&p, "a", &clock).await;
+    assert_eq!((up["tiers"]["a"].as_u64(), up["tiers"]["demoted"].as_u64()), (Some(3), Some(0)));
+    assert_eq!(up["tiers"]["promoted"], 0);
+    // 評測完重新寫出一份好的
+    assert_eq!(learn(&p).hist[&l.a[0].id].tested(), 1);
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -87,8 +87,10 @@ pub struct Item<'a> {
     pub incumbent: bool,
     /// 歷史分數（A4）：補位時高的先；沒有歷史是 None
     pub score: Option<f32>,
-    /// 歷史很差（A4：倖存率低或有可疑紀錄）：不拿來補位，只在探索時輪到
+    /// 歷史很差（A4：倖存率低或有可疑紀錄）：不拿來補位
     pub bad: bool,
+    /// 人工分級是 B 級（含沒標記的）：探索的分組用人工分級算，升降不會讓今天的那一組變動
+    pub manual_b: bool,
 }
 
 /// 為什麼今天測（或不測）
@@ -257,7 +259,7 @@ pub fn plan(items: &[Item], mode: Mode, day: u32, auto_types: &[String]) -> Plan
     }
 
     // 探索：今天輪到的那一組裡，還沒排進去的
-    let b_ids: Vec<&str> = items.iter().filter(|it| !it.always && is_b(it.tier)).map(|it| it.id).collect();
+    let b_ids: Vec<&str> = items.iter().filter(|it| !it.always && it.manual_b).map(|it| it.id).collect();
     let today: HashSet<&str> = explore_slice(&b_ids, day).into_iter().collect();
     for (i, it) in items.iter().enumerate() {
         if why[i] == Why::Skip && today.contains(it.id) {
@@ -268,6 +270,205 @@ pub fn plan(items: &[Item], mode: Mode, day: u32, auto_types: &[String]) -> Plan
         why,
         fill_reason: reasons.join("、"),
     }
+}
+
+// ---------------- 依評測歷史的升降（A4） ----------------
+//
+// 人工分級是起點；這台自己近 30 天的評測歷史（學習檔的 `hist`）決定「實際分級」：
+//
+// - **降級** A → B：測到 7 天以上，倖存率低於 50% 或有 2 天以上的汙染／可疑紀錄。只測 A 級的機器降下去之後就不測
+//   （也不拿來補位、不排進探索）；歷史滾出 30 天（測到不滿 7 天）就照人工分級重新測，還是不行就再降——
+//   一台壞掉的 A 級 30 天最多測 7 次左右。全部都測的機器照樣每天測，倖存率回到 80% 以上而且沒有可疑紀錄就恢復。
+// - **試用** B：今天測到（探索、補位、沿用）而且倖存、30 天內沒有失敗過、沒有可疑紀錄 → 先每天測，
+//   最多 [`TRIAL_MAX`] 個、每天最多新增 [`TRIAL_NEW_PER_DAY`] 個（今天延遲低的先）。試用中失敗 2 天或有可疑紀錄就結束。
+//   沒有這一步的話，只測 A 級的機器 B 級一個月才輪到一次，永遠累積不到 10 天的歷史。
+// - **升級** B → A：測到 10 天以上、倖存率 90% 以上、沒有可疑紀錄、延遲穩定，最多 [`PROMOTE_MAX`] 個（歷史分數高的先）。
+//   升上來之後倖存率掉到 75% 以下或有可疑紀錄才降回去。
+// - 升與降的門檻不一樣（90%／75%、50%／80%）：中間地帶維持原狀，不會每天來回。
+// - 只影響「測不測」，不影響「選不選」；固定上游、對照組、使用者自己加的不參與。
+
+use super::learn::{Hist, HistState};
+
+/// 降級至少要測到幾天
+pub const DEMOTE_MIN_DAYS: u32 = 7;
+/// 倖存率低於這個值就降級
+pub const DEMOTE_BELOW: f32 = 0.5;
+/// 汙染／可疑紀錄幾天以上就降級
+pub const DEMOTE_SUSPECT_DAYS: u32 = 2;
+/// 降級之後倖存率回到這個值以上（而且沒有可疑紀錄）才恢復
+pub const RESTORE_AT: f32 = 0.8;
+/// 升級至少要測到幾天
+pub const PROMOTE_MIN_DAYS: u32 = 10;
+/// 升級要的倖存率
+pub const PROMOTE_AT: f32 = 0.9;
+/// 升上來之後倖存率低於這個值才降回去
+pub const UNPROMOTE_BELOW: f32 = 0.75;
+/// 升上來的最多幾個
+pub const PROMOTE_MAX: usize = 64;
+/// 試用中的最多幾個
+pub const TRIAL_MAX: usize = 24;
+/// 每天最多新增幾個試用
+pub const TRIAL_NEW_PER_DAY: usize = 8;
+/// 試用中失敗幾天就結束
+pub const TRIAL_FAIL_DAYS: u32 = 2;
+
+/// 歷史很差（降級的條件；B 級也用它決定「不拿來補位」）
+pub fn history_bad(h: &Hist) -> bool {
+    h.tested() >= DEMOTE_MIN_DAYS && (h.rate() < DEMOTE_BELOW || h.suspect() >= DEMOTE_SUSPECT_DAYS)
+}
+
+/// 實際分級：人工分級加上歷史的升降。`h` 是學習檔裡的那一筆（還沒換算到今天）；沒有歷史就是人工分級
+pub fn effective_tier(manual: Tier, h: Option<&Hist>, today: u32) -> Tier {
+    let Some(h) = h else { return manual };
+    let aged = h.aged(today);
+    match manual {
+        // 降級的歷史滾出 30 天（測到不滿 7 天）就照人工分級重來
+        Tier::A if h.e == HistState::Demoted && aged.tested() >= DEMOTE_MIN_DAYS => Tier::B,
+        Tier::B | Tier::Unknown if matches!(h.e, HistState::Promoted | HistState::Trial) && aged.tested() > 0 => Tier::A,
+        t => t,
+    }
+}
+
+/// 保險絲：被降級的 A 級超過今天 A 級的三分之一時，多半是這條線路的問題（換線路、某一種協定時好時壞），
+/// 今天不採用降級（全部照人工分級測）
+pub fn demotion_fuse(manual_a: usize, demoted: usize) -> bool {
+    demoted * 3 > manual_a
+}
+
+/// 一個候選今天的評測結果（只有今天真的測到、而且評測成功時才有）
+#[derive(Debug, Clone)]
+pub struct Tested {
+    pub id: String,
+    /// 人工分級（A／B／Unknown；使用者的不參與）
+    pub manual: Tier,
+    /// 倖存到最後
+    pub survived: bool,
+    /// 被判汙染／可疑
+    pub suspect: bool,
+    /// 今天的平均延遲
+    pub ms: Option<f32>,
+    /// 可以試用：類型會被選用、不是執行時從未成功的
+    pub trial_ok: bool,
+}
+
+/// 今天的升降（寫進 judge.log）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Changes {
+    pub promoted: Vec<String>,
+    pub unpromoted: Vec<String>,
+    pub demoted: Vec<String>,
+    pub restored: Vec<String>,
+    pub trial_in: Vec<String>,
+    pub trial_out: Vec<String>,
+}
+
+impl Changes {
+    pub fn any(&self) -> bool {
+        [
+            &self.promoted,
+            &self.unpromoted,
+            &self.demoted,
+            &self.restored,
+            &self.trial_in,
+            &self.trial_out,
+        ]
+        .iter()
+        .any(|v| !v.is_empty())
+    }
+}
+
+/// 評測成功之後更新歷史與升降狀態。`listed`：這個 id 還在不在名單裡（不在的刪掉）
+pub fn update_history(
+    hist: &mut std::collections::BTreeMap<String, Hist>,
+    tested: &[Tested],
+    today: u32,
+    listed: impl Fn(&str) -> bool,
+) -> Changes {
+    let mut ch = Changes::default();
+    // 名單裡沒有的、30 天內都沒測到的：不用記了（試用／升級中但一直測不到的也放掉，不佔名額）
+    // （系統時間倒退、比那一筆舊的不動）
+    hist.retain(|k, h| listed(k) && (today < h.last || h.aged(today).tested() > 0));
+    let mut promote: Vec<(f32, &str)> = Vec::new();
+    let mut trial: Vec<(f32, &str)> = Vec::new();
+    for t in tested {
+        let h = hist.entry(t.id.clone()).or_default();
+        if !h.record(today, t.survived, t.suspect, t.ms) {
+            continue;
+        }
+        let (n, rate, q) = (h.tested(), h.rate(), h.suspect());
+        match t.manual {
+            Tier::A => match h.e {
+                HistState::Demoted => {
+                    if n < DEMOTE_MIN_DAYS {
+                        h.e = HistState::Normal;
+                    } else if rate >= RESTORE_AT && q == 0 {
+                        h.e = HistState::Normal;
+                        ch.restored.push(t.id.clone());
+                    }
+                }
+                _ => {
+                    h.e = HistState::Normal;
+                    if history_bad(h) {
+                        h.e = HistState::Demoted;
+                        ch.demoted.push(t.id.clone());
+                    }
+                }
+            },
+            Tier::B | Tier::Unknown => {
+                let good = n >= PROMOTE_MIN_DAYS && rate >= PROMOTE_AT && q == 0 && h.stable();
+                match h.e {
+                    HistState::Promoted => {
+                        if rate < UNPROMOTE_BELOW || q > 0 {
+                            h.e = HistState::Normal;
+                            ch.unpromoted.push(t.id.clone());
+                        }
+                    }
+                    HistState::Trial => {
+                        if n - h.survived() >= TRIAL_FAIL_DAYS || q > 0 || (n >= PROMOTE_MIN_DAYS && !good) {
+                            h.e = HistState::Normal;
+                            ch.trial_out.push(t.id.clone());
+                        } else if good {
+                            promote.push((h.score().unwrap_or(0.0), &t.id));
+                        }
+                    }
+                    _ => {
+                        h.e = HistState::Normal;
+                        if good {
+                            promote.push((h.score().unwrap_or(0.0), &t.id));
+                        } else if t.trial_ok && t.survived && n == h.survived() && q == 0 {
+                            trial.push((t.ms.filter(|x| x.is_finite()).unwrap_or(f32::MAX), &t.id));
+                        }
+                    }
+                }
+            }
+            Tier::User => h.e = HistState::Normal,
+        }
+    }
+    // 升級：分數高的先，總數不超過上限；試用期滿但名額滿了的回到一般 B 級
+    promote.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(b.1)));
+    let mut n_promoted = hist.values().filter(|h| h.e == HistState::Promoted).count();
+    for (_, id) in promote {
+        let Some(h) = hist.get_mut(id) else { continue };
+        if n_promoted < PROMOTE_MAX {
+            h.e = HistState::Promoted;
+            n_promoted += 1;
+            ch.promoted.push(id.to_string());
+        } else if h.e == HistState::Trial {
+            h.e = HistState::Normal;
+            ch.trial_out.push(id.to_string());
+        }
+    }
+    // 試用：今天延遲低的先
+    trial.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(b.1)));
+    let n_trial = hist.values().filter(|h| h.e == HistState::Trial).count();
+    let room = TRIAL_MAX.saturating_sub(n_trial).min(TRIAL_NEW_PER_DAY);
+    for (_, id) in trial.into_iter().take(room) {
+        if let Some(h) = hist.get_mut(id) {
+            h.e = HistState::Trial;
+            ch.trial_in.push(id.to_string());
+        }
+    }
+    ch
 }
 
 #[cfg(test)]
@@ -285,6 +486,7 @@ mod tests {
             incumbent: false,
             score: None,
             bad: false,
+            manual_b: is_b(tier),
         }
     }
 
@@ -432,5 +634,239 @@ mod tests {
         let off: Vec<Item> = (0..20).map(|i| item(b[i].as_str(), "dnscrypt", Tier::B, "s")).collect();
         let p = plan(&off, Mode::A, 1, &types(&["doh"]));
         assert_eq!(p.count(Why::Fill), 0);
+    }
+
+    // ---------------- A4 ----------------
+
+    use std::collections::BTreeMap as Map;
+
+    fn t(id: &str, manual: Tier, survived: bool) -> Tested {
+        Tested {
+            id: id.to_string(),
+            manual,
+            survived,
+            suspect: false,
+            ms: survived.then_some(20.0),
+            trial_ok: true,
+        }
+    }
+
+    /// 連續幾天、每天同一個結果
+    fn days(hist: &mut Map<String, Hist>, from: u32, n: u32, x: &Tested) -> Changes {
+        let mut last = Changes::default();
+        for d in from..from + n {
+            last = update_history(hist, std::slice::from_ref(x), d, |_| true);
+        }
+        last
+    }
+
+    #[test]
+    fn demote_needs_seven_days_and_low_survival() {
+        let mut h = Map::new();
+        let bad = t("a", Tier::A, false);
+        // 6 天都失敗：還不降
+        assert!(days(&mut h, 100, 6, &bad).demoted.is_empty());
+        assert_eq!(effective_tier(Tier::A, h.get("a"), 106), Tier::A);
+        // 第 7 天：降級
+        assert_eq!(days(&mut h, 106, 1, &bad).demoted, ["a"]);
+        assert_eq!(h["a"].e, HistState::Demoted);
+        assert_eq!(effective_tier(Tier::A, h.get("a"), 107), Tier::B);
+        // 倖存率剛好 50% 不降（低於才降）
+        let mut h = Map::new();
+        for d in 0..10 {
+            update_history(&mut h, &[t("a", Tier::A, d % 2 == 0)], 100 + d, |_| true);
+        }
+        assert_eq!(h["a"].e, HistState::Normal);
+        // 汙染／可疑 2 天：倖存率再高也降
+        let mut h = Map::new();
+        days(&mut h, 100, 8, &t("a", Tier::A, true));
+        let mut sus = t("a", Tier::A, false);
+        sus.suspect = true;
+        assert!(days(&mut h, 108, 1, &sus).demoted.is_empty(), "1 天還不降");
+        assert_eq!(days(&mut h, 109, 1, &sus).demoted, ["a"]);
+        // 使用者自己加的、沒有歷史的：照人工分級
+        assert_eq!(effective_tier(Tier::User, h.get("a"), 110), Tier::User);
+        assert_eq!(effective_tier(Tier::A, None, 110), Tier::A);
+        assert_eq!(effective_tier(Tier::B, None, 110), Tier::B);
+    }
+
+    #[test]
+    fn demoted_recovers_by_evidence_or_by_expiry() {
+        let mut h = Map::new();
+        let (bad, good) = (t("a", Tier::A, false), t("a", Tier::A, true));
+        days(&mut h, 100, 7, &bad);
+        assert_eq!(h["a"].e, HistState::Demoted);
+        // 全部都測的機器：每天還是測得到。倖存率回到 80% 以上才恢復（50%～80% 維持降級，不來回）
+        let mut restored_at = None;
+        for d in 107..160 {
+            let ch = update_history(&mut h, std::slice::from_ref(&good), d, |_| true);
+            if d == 107 + 6 {
+                assert_eq!(h["a"].e, HistState::Demoted, "倖存率 50%：還是降級");
+            }
+            if !ch.restored.is_empty() {
+                restored_at = Some(d);
+                break;
+            }
+        }
+        // 7 天失敗 + n 天成功，n/(n+7) >= 0.8 → n = 28；那時最舊的失敗已經滾出 30 天，實際更早
+        let d = restored_at.expect("會恢復");
+        assert!(h["a"].rate() >= RESTORE_AT, "{:?}", h["a"]);
+        assert!(d > 107 + 6);
+        // 只測 A 級的機器：降級後不測。歷史滾出 30 天（測到不滿 7 天）就照人工分級重來
+        let mut h = Map::new();
+        days(&mut h, 100, 7, &bad);
+        assert_eq!(effective_tier(Tier::A, h.get("a"), 107), Tier::B);
+        assert_eq!(effective_tier(Tier::A, h.get("a"), 129), Tier::B, "第 100 天還在 30 天內");
+        assert_eq!(effective_tier(Tier::A, h.get("a"), 130), Tier::A, "最舊的一天滾出去：重新測");
+        // 重新測還是失敗：又滿 7 天 → 維持降級（一個壞掉的 A 級 30 天最多測 7 次左右）
+        update_history(&mut h, std::slice::from_ref(&bad), 130, |_| true);
+        assert_eq!(h["a"].e, HistState::Demoted);
+        assert_eq!(effective_tier(Tier::A, h.get("a"), 131), Tier::A, "第 101 天也滾出去了");
+        // 修好了：之後每次重測都倖存，倖存率夠了就恢復
+        let mut d = 131;
+        while h["a"].e == HistState::Demoted && d < 200 {
+            if effective_tier(Tier::A, h.get("a"), d) == Tier::A {
+                update_history(&mut h, std::slice::from_ref(&good), d, |_| true);
+            }
+            d += 1;
+        }
+        assert_eq!(h["a"].e, HistState::Normal);
+        assert!(d < 140, "{d}");
+    }
+
+    #[test]
+    fn promote_needs_ten_days_clean_and_stable() {
+        let mut h = Map::new();
+        let good = t("b", Tier::B, true);
+        // 第 1 天倖存、沒有失敗過：開始試用（每天測）
+        assert_eq!(days(&mut h, 100, 1, &good).trial_in, ["b"]);
+        assert_eq!(effective_tier(Tier::B, h.get("b"), 101), Tier::A);
+        // 9 天還不升
+        assert!(days(&mut h, 101, 8, &good).promoted.is_empty());
+        assert_eq!(h["b"].e, HistState::Trial);
+        // 第 10 天：升級
+        assert_eq!(days(&mut h, 109, 1, &good).promoted, ["b"]);
+        assert_eq!(effective_tier(Tier::Unknown, h.get("b"), 110), Tier::A);
+        // 延遲不穩的：試用期滿不升，回到一般 B 級
+        let mut h = Map::new();
+        for d in 0..10u32 {
+            let mut x = t("j", Tier::B, true);
+            x.ms = Some(if d % 2 == 0 { 20.0 } else { 220.0 });
+            let ch = update_history(&mut h, &[x], 100 + d, |_| true);
+            assert!(ch.promoted.is_empty());
+            if d == 9 {
+                assert_eq!(ch.trial_out, ["j"]);
+            }
+        }
+        assert_eq!(h["j"].e, HistState::Normal);
+        assert!(!h["j"].stable());
+        // 有可疑紀錄的：不升、試用馬上結束
+        let mut h = Map::new();
+        days(&mut h, 100, 3, &t("q", Tier::B, true));
+        let mut sus = t("q", Tier::B, false);
+        sus.suspect = true;
+        assert_eq!(days(&mut h, 103, 1, &sus).trial_out, ["q"]);
+        // 30 天內失敗過、有可疑紀錄的不再試用（要等紀錄滾出去）
+        assert!(days(&mut h, 104, 5, &t("q", Tier::B, true)).trial_in.is_empty());
+        assert_eq!(effective_tier(Tier::B, h.get("q"), 110), Tier::B);
+        // 試用中失敗 1 天還留著，2 天就結束
+        let mut h = Map::new();
+        days(&mut h, 100, 3, &t("f", Tier::B, true));
+        assert!(days(&mut h, 103, 1, &t("f", Tier::B, false)).trial_out.is_empty());
+        assert_eq!(days(&mut h, 104, 1, &t("f", Tier::B, false)).trial_out, ["f"]);
+        // 類型不會被選用、執行時從未成功的：不試用
+        let mut no = t("n", Tier::B, true);
+        no.trial_ok = false;
+        assert!(days(&mut Map::new(), 100, 3, &no).trial_in.is_empty());
+    }
+
+    #[test]
+    fn middle_band_keeps_tier() {
+        // 升上來的：倖存率掉到 75%～90% 之間不降回去，低於 75% 才降
+        let mut h = Map::new();
+        days(&mut h, 100, 20, &t("b", Tier::B, true));
+        assert_eq!(h["b"].e, HistState::Promoted);
+        let fail = t("b", Tier::B, false);
+        // 20 天成功之後失敗 5 天：20/25 = 80%
+        assert!(days(&mut h, 120, 5, &fail).unpromoted.is_empty());
+        assert_eq!(h["b"].e, HistState::Promoted);
+        assert!(h["b"].rate() < PROMOTE_AT && h["b"].rate() >= UNPROMOTE_BELOW);
+        // 再失敗 2 天：20/27 = 74% → 降回去
+        assert!(days(&mut h, 125, 1, &fail).unpromoted.is_empty());
+        assert_eq!(days(&mut h, 126, 1, &fail).unpromoted, ["b"]);
+        // 回到 B 級之後不會馬上又升：倖存率在 75%～90% 之間維持 B 級
+        let ch = days(&mut h, 127, 2, &t("b", Tier::B, true));
+        assert!(ch.promoted.is_empty() && ch.trial_in.is_empty());
+        assert_eq!(effective_tier(Tier::B, h.get("b"), 129), Tier::B);
+        // A 級：倖存率 50%～90% 維持 A 級
+        let mut h = Map::new();
+        for d in 0..20 {
+            let ch = update_history(&mut h, &[t("a", Tier::A, d % 3 != 0)], 100 + d, |_| true);
+            assert!(!ch.any(), "{ch:?}");
+        }
+        assert_eq!(h["a"].e, HistState::Normal);
+    }
+
+    #[test]
+    fn promoted_capped_at_64_and_trial_capped() {
+        let ids: Vec<String> = (0..100).map(|i| format!("https://b{i:03}.example.net/dns-query")).collect();
+        let mut h = Map::new();
+        let mut seen_trial_max = 0usize;
+        for d in 0..60u32 {
+            let all: Vec<Tested> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let mut x = t(id, Tier::B, true);
+                    x.ms = Some(10.0 + i as f32);
+                    x
+                })
+                .collect();
+            let ch = update_history(&mut h, &all, 100 + d, |_| true);
+            assert!(ch.trial_in.len() <= TRIAL_NEW_PER_DAY, "{}", ch.trial_in.len());
+            if d == 0 {
+                // 今天延遲低的先試用
+                assert_eq!(ch.trial_in, ids[..TRIAL_NEW_PER_DAY]);
+            }
+            let trial = h.values().filter(|x| x.e == HistState::Trial).count();
+            seen_trial_max = seen_trial_max.max(trial);
+            assert!(trial <= TRIAL_MAX);
+            assert!(h.values().filter(|x| x.e == HistState::Promoted).count() <= PROMOTE_MAX);
+        }
+        assert_eq!(seen_trial_max, TRIAL_MAX);
+        assert_eq!(h.values().filter(|x| x.e == HistState::Promoted).count(), PROMOTE_MAX);
+        // 名額滿了：其他的回到一般 B 級，不會卡在試用
+        assert_eq!(h.values().filter(|x| x.e == HistState::Trial).count(), 0);
+    }
+
+    #[test]
+    fn path_skipped_not_counted_and_unlisted_dropped() {
+        let mut h = Map::new();
+        days(&mut h, 100, 8, &t("a", Tier::A, true));
+        let before = h["a"];
+        // 今天沒測到（路徑檢查略過、沒輪到）：那一筆不動，不算失敗
+        let ch = update_history(&mut h, &[t("other", Tier::A, true)], 108, |_| true);
+        assert!(!ch.any());
+        assert_eq!(h["a"], before);
+        assert_eq!(h["a"].aged(108).rate(), 1.0);
+        // 30 天都沒測到：整筆忘掉；名單裡沒有的也刪掉
+        update_history(&mut h, &[], 140, |_| true);
+        assert!(h.is_empty());
+        days(&mut h, 200, 3, &t("gone", Tier::B, true));
+        update_history(&mut h, &[], 203, |k| k != "gone");
+        assert!(h.is_empty());
+        // 系統時間倒退：不動
+        days(&mut h, 300, 3, &t("a", Tier::A, false));
+        let before = h.clone();
+        update_history(&mut h, &[t("a", Tier::A, true)], 250, |_| true);
+        assert_eq!(h, before);
+    }
+
+    #[test]
+    fn demotion_fuse_trips_above_a_third() {
+        assert!(!demotion_fuse(90, 30));
+        assert!(demotion_fuse(90, 31));
+        assert!(demotion_fuse(2, 1));
+        assert!(!demotion_fuse(100, 0));
     }
 }

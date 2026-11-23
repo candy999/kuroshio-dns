@@ -803,6 +803,16 @@ struct TierCounts {
     fill: usize,
     explore: usize,
     skipped_b: usize,
+    /// 依歷史拉上來每天測的 B 級（A4）：升級的、試用中的
+    promoted: usize,
+    trial: usize,
+    /// 依歷史降級的 A 級（`a` 模式今天不測）
+    demoted: usize,
+    /// 降級太多、今天不採用降級
+    demote_fuse: bool,
+    /// 今天評測之後的升降（A4）
+    promoted_today: usize,
+    demoted_today: usize,
 }
 
 impl TierCounts {
@@ -810,6 +820,8 @@ impl TierCounts {
         json!({
             "mode": self.mode.name(), "auto": self.auto, "a": self.a, "incumbent": self.incumbent,
             "fill": self.fill, "explore": self.explore, "skippedB": self.skipped_b,
+            "promoted": self.promoted, "trial": self.trial, "demoted": self.demoted, "demoteFuse": self.demote_fuse,
+            "promotedToday": self.promoted_today, "demotedToday": self.demoted_today,
         })
     }
 }
@@ -1159,25 +1171,66 @@ impl Benchmark {
         // 分級評測（3.5.0 A3）：`a` 模式只測 A 級、使用者的、沿用、補位、探索；其餘 B 級今天不測
         // （不算淘汰、不記任何紀錄）。在路徑檢查、黑名單略過之後才算：多樣性要看今天實際能測的
         let tier_mode = cfg.tiers.unwrap_or(self.tier_auto);
+        // 依評測歷史的升降（3.5.0 A4）：人工分級是起點，學習檔的 hist 決定實際分級；讀不到學習檔就照人工分級。
+        // 固定上游、對照組、使用者自己加的不參與
+        let hist_of = |s: &Srv| -> Option<&learn::Hist> {
+            if s.pinned || s.protected.is_some() {
+                return None;
+            }
+            learned.as_ref().filter(|l| today_n >= l.day).and_then(|l| l.hist.get(&s.id))
+        };
+        let eff: Vec<Tier> = all.iter().map(|s| tiers::effective_tier(s.tag.tier, hist_of(s), today_n)).collect();
+        let manual_a = all.iter().filter(|s| s.selectable() && s.tag.tier == Tier::A).count();
+        let demoted_now = (0..all.len()).filter(|&i| all[i].tag.tier == Tier::A && eff[i] != Tier::A).count();
+        // 保險絲：被降級的超過 A 級的三分之一，多半是線路的問題，今天不採用降級
+        let demote_fuse = demoted_now > 0 && tiers::demotion_fuse(manual_a, demoted_now);
+        if demote_fuse {
+            let line = format!(
+                "[分級] 依歷史要降級的 A 級有 {demoted_now} 個，超過 A 級 {manual_a} 個的三分之一：多半是這條線路的問題，今天不採用降級（照人工分級測）"
+            );
+            warn!("{line}");
+            journal.push(line);
+        }
+        let eff: Vec<Tier> = (0..all.len())
+            .map(|i| {
+                if demote_fuse && all[i].tag.tier == Tier::A {
+                    Tier::A
+                } else {
+                    eff[i]
+                }
+            })
+            .collect();
+        let pulled = |i: usize, st: learn::HistState| {
+            matches!(all[i].tag.tier, Tier::B | Tier::Unknown) && eff[i] == Tier::A && hist_of(&all[i]).is_some_and(|h| h.e == st)
+        };
         let tier_plan = {
             let incumbents = incumbent_ids(&self.paths.upstreams_file);
             let items: Vec<tiers::Item> = all
                 .iter()
-                .map(|s| tiers::Item {
-                    id: &s.id,
-                    kind: s.kind,
-                    tier: s.tag.tier,
-                    op: s.op_key(),
-                    ms: s.tag.ms,
-                    always: s.pinned || s.protected.is_some() || s.never_ok,
-                    incumbent: incumbents.contains(s.id.as_str()),
-                    score: None,
-                    bad: false,
+                .enumerate()
+                .map(|(i, s)| {
+                    let aged = hist_of(s).map(|h| h.aged(today_n));
+                    tiers::Item {
+                        id: &s.id,
+                        kind: s.kind,
+                        tier: eff[i],
+                        op: s.op_key(),
+                        ms: s.tag.ms,
+                        always: s.pinned || s.protected.is_some() || s.never_ok,
+                        incumbent: incumbents.contains(s.id.as_str()),
+                        score: aged.as_ref().and_then(learn::Hist::score),
+                        bad: aged.as_ref().is_some_and(tiers::history_bad),
+                        manual_b: matches!(s.tag.tier, Tier::B | Tier::Unknown),
+                    }
                 })
                 .collect();
             tiers::plan(&items, tier_mode, today_n, &cfg.select.auto_types)
         };
-        let tier_counts = TierCounts {
+        let mut tier_counts = TierCounts {
+            promoted: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Promoted)).count(),
+            trial: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Trial)).count(),
+            demoted: if demote_fuse { 0 } else { demoted_now },
+            demote_fuse,
             mode: tier_mode,
             auto: cfg.tiers.is_none(),
             a: (0..all.len())
@@ -1187,6 +1240,8 @@ impl Benchmark {
             fill: tier_plan.count(tiers::Why::Fill),
             explore: tier_plan.count(tiers::Why::Explore),
             skipped_b: tier_plan.count(tiers::Why::Skip),
+            promoted_today: 0,
+            demoted_today: 0,
         };
         if tier_mode == tiers::Mode::A {
             let mut k = 0usize;
@@ -1196,8 +1251,11 @@ impl Benchmark {
             });
             jinfo!(
                 journal,
-                "[分級] 今天測 A 級 {} 個、沿用昨天選上或候補的 B 級 {} 個、補位 {} 個{}、探索 {} 個；B 級其餘 {} 個今天不測（不算淘汰、不記紀錄）",
+                "[分級] 今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）、依歷史拉上來的 B 級 {} 個（試用 {}）、沿用昨天選上或候補的 B 級 {} 個、補位 {} 個{}、探索 {} 個；B 級其餘 {} 個今天不測（不算淘汰、不記紀錄）",
                 tier_counts.a,
+                tier_counts.demoted,
+                tier_counts.promoted + tier_counts.trial,
+                tier_counts.trial,
                 tier_counts.incumbent,
                 tier_counts.fill,
                 if tier_plan.fill_reason.is_empty() {
@@ -1748,6 +1806,74 @@ impl Benchmark {
                     c["id"].as_str().unwrap_or(""),
                     c["expect"].as_str().unwrap_or("")
                 );
+            }
+        }
+        // 評測歷史（3.5.0 A4）：今天真的測到的一般候選各記一筆，再依歷史升降。走到這裡表示評測成功
+        // （沒有任何 DNS 通過資格賽、沒有倖存時前面就結束了，不會記到候選頭上）；路徑檢查略過、今天沒輪到的不在 all 裡
+        if let Some(l) = learned.as_mut().filter(|l| today_n >= l.day) {
+            // 某一種類型今天整批過不了資格賽（3 個以上、一個都沒過）：多半是這條線路擋了那種協定而路徑檢查沒抓到，不記
+            let mut kinds: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+            for (i, s) in all.iter().enumerate().filter(|(_, s)| s.selectable()) {
+                let e = kinds.entry(s.kind).or_default();
+                e.0 += 1;
+                e.1 += (pf[i] == Some(Preflight::Pass)) as usize;
+            }
+            let dead: Vec<&'static str> = kinds.iter().filter(|(_, (n, ok))| *n >= 3 && *ok == 0).map(|(k, _)| *k).collect();
+            if !dead.is_empty() {
+                jinfo!(
+                    journal,
+                    "[分級] {} 今天整批過不了資格賽：多半是線路的問題，不記進評測歷史",
+                    dead.join("、")
+                );
+            }
+            let tested: Vec<tiers::Tested> = all
+                .iter()
+                .filter(|s| s.selectable() && s.tag.tier != Tier::User && !dead.contains(&s.kind))
+                .map(|s| tiers::Tested {
+                    id: s.id.clone(),
+                    manual: s.tag.tier,
+                    survived: s.alive,
+                    suspect: !s.alive && ["汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p)),
+                    ms: (s.alive && s.lat_count > 0).then(|| s.avg() as f32),
+                    trial_ok: !s.never_ok && cfg.select.auto_types.iter().any(|t| t == s.kind),
+                })
+                .collect();
+            let listed: HashSet<&str> = ids.iter().map(|c| c.id.as_str()).collect();
+            let ch = tiers::update_history(&mut l.hist, &tested, today_n, |k| listed.contains(k));
+            l.hist_cap(|k| listed.contains(k));
+            learn_dirty = true;
+            tier_counts.promoted_today = ch.promoted.len();
+            tier_counts.demoted_today = ch.demoted.len();
+            if ch.any() {
+                jinfo!(
+                    journal,
+                    "[分級] 依近 30 天的評測歷史：升級 {}、降回 {}、降級 {}、恢復 {}、開始試用 {}、結束試用 {}（只影響測不測，不影響選不選）",
+                    ch.promoted.len(),
+                    ch.unpromoted.len(),
+                    ch.demoted.len(),
+                    ch.restored.len(),
+                    ch.trial_in.len(),
+                    ch.trial_out.len()
+                );
+                for (what, list) in [
+                    ("升級", &ch.promoted),
+                    ("降級", &ch.demoted),
+                    ("恢復", &ch.restored),
+                    ("降回", &ch.unpromoted),
+                ] {
+                    for id in list.iter().take(20) {
+                        let h = l.hist.get(id).copied().unwrap_or_default();
+                        jinfo!(
+                            journal,
+                            "   [{what}] {id}：近 30 天測到 {} 天、倖存 {} 天、可疑 {} 天、延遲 {} ±{} ms",
+                            h.tested(),
+                            h.survived(),
+                            h.suspect(),
+                            to_fixed(h.ms as f64, 1),
+                            to_fixed(h.dv as f64, 1)
+                        );
+                    }
+                }
             }
         }
         let eliminated: Vec<(String, &'static str, String)> = all

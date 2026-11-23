@@ -105,7 +105,7 @@ kuroshio check-config <file>                     檢查設定檔
 |---|---|
 | `state/upstreams.json` | 每日評測結果（3.5.0 起 `selected[]` 多 `tier`、`op`，`counts` 多 `byTier`，另外有候補 `spares[]`；見[整合文件](../integration.md#每日評測與預設名單350-起)） |
 | `state/benchmark/` | 評測過程資料 |
-| `state/benchmark-learn.json.zst` | 評測學習資料（3.5.0，規格 11 第 0.3 節）：跨天的紀錄：`neverOk`（執行時從未成功的自動上游）、`h3skip`（不支援 HTTP/3 的 DoH，最多 512 筆）；有上限、可以重建（`Rebuildable`），讀不到當成空的 |
+| `state/benchmark-learn.json.zst` | 評測學習資料（3.5.0，規格 11 第 0.3 節）：跨天的紀錄：`neverOk`（執行時從未成功的自動上游）、`h3skip`（不支援 HTTP/3 的 DoH，最多 512 筆）、`control`（對照組近 30 天，最多 64 台）、`hist`（每個候選近 30 天的評測歷史與升降狀態，`[t, s, q, ms, dv, e, last]`，最多 2,000 筆；見[整合文件](../integration.md#分級評測)）；有上限、可以重建（`Rebuildable`），讀不到當成空的 |
 | `state/cdn/domains/`（`manifest.json`、`{N}-{i}.json.zst`） | 每個 CDN 網站的驗證 / ECS / 跨 CDN 結果，分片、zstd 壓縮（規格 05 第 5.3 節；舊版的 `state/cdn-domains.json` 啟動時自動搬過來） |
 | `state/cdn/pools.json(.zst)` | 台灣節點池 |
 | `state/cdn/v6-nodes.json(.zst)` | 永久保存的台灣 IPv6 節點 |
