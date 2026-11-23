@@ -917,7 +917,11 @@ impl Resolver {
             use kuroshio_net::probe::{verify_site, SiteCheck};
             let t = Duration::from_secs(3);
             let outcome = match verify_site(ip, &name, t).await.0 {
-                SiteCheck::Valid => Outcome::Valid,
+                SiteCheck::Valid => {
+                    // 3.5.0 E4：握手通過、這個 IP 是上游宣稱機房還沒確認的節點 → 用同一個名額量一次機房
+                    me.pop_audit(ip).await;
+                    Outcome::Valid
+                }
                 SiteCheck::Unverified => Outcome::Unverified,
                 SiteCheck::Invalid => {
                     // 自己的加密上游（不經攔截者）解析一次，看是網站本身的問題、還是上游給的答案不對
@@ -949,6 +953,37 @@ impl Resolver {
                 }
             }
         });
+    }
+
+    /// 串接中的機房抽查（3.5.0 E4，規格 11）：只在答案抽查握手通過之後、拿著同一個抽查名額時呼叫。
+    /// 節點池裡上游宣稱機房（`upPop`）還沒確認的節點才量（`Cdn::pop_audit_wanted()`），用健檢同一個探測
+    /// （那家 CDN 的 `probe` 路徑）拿到機房、交給 `Cdn::note_local_pop()` 比對。上限：10 分鐘 1 個、一天 24 個
+    /// （`cdn.lite`：30 分鐘 1 個、一天 8 個）、每個節點量到就不再量；記憶體壓力、沒對時、沒串接時 `maybe_audit` 本來就不做
+    async fn pop_audit(&self, ip: IpAddr) {
+        let Some(cdn) = self.cdn().filter(|c| c.cfg.pop_audit) else {
+            return;
+        };
+        if crate::app::pressure() != crate::sysinfo::Pressure::Normal {
+            return;
+        }
+        let audit = &crate::chain::audit::AUDIT;
+        let now_s = crate::memgov::steady_secs();
+        if !audit.pop_allowed(now_s, cdn.cfg.lite) {
+            return;
+        }
+        let Some(provider) = cdn.pop_audit_wanted(ip) else { return };
+        let Some((prov, (host, path))) = kuroshio_cdn::providers::get(provider).and_then(|p| Some((p, p.probe?))) else {
+            return;
+        };
+        audit.pop_note(now_s);
+        let r = cdn.net().http_probe(ip, host, path, Duration::from_secs(3)).await;
+        if !r.ok {
+            return;
+        }
+        let pop = prov.pop(&r.headers, &r.body);
+        if !pop.is_empty() {
+            cdn.note_local_pop(provider, ip, &pop);
+        }
     }
 
     /// 背景補問：條件符合就在背景問這次沒問到的上游，跟前面的回答合在一起重新 `decide()`、
