@@ -375,16 +375,25 @@
 
 	/**
 	 * /api/status 的 cdn.pace（3.5.0 F12：新網域很多時的 CDN 驗證節流）→ { text, warn（減量中）} 或 null（舊版、CDN 關、空物件）。
-	 * pace：{ enabled, perMin（目前的速率）, maxPerMin, paced（減量中）, usedLastMin, cpuPct, waited（只問過一次所以沒排）,
-	 *         capped（名額用完沒排）, since（進入減量中的時間，毫秒）}
+	 * pace：{ enabled（cdn.verifyPacing）, lite（cdn.lite）, perMin（目前的速率；關掉而且不是小機器是 null）, maxPerMin, minPerMin,
+	 *         paced（減量中；小機器永遠是 true）, usedLastMin, usedThisMin, cpuPct（null＝沒交或量不到）, waited（只問過一次所以沒排）,
+	 *         capped（名額用完沒排）, since（進入減量中的時間，毫秒；不在減量中是 null）}
+	 * 小機器（lite）永遠在減量，那是它的常態，不用提醒樣式
 	 */
 	function paceView(p, tr) {
 		var t = typeof tr === 'function' ? tr : function (s) { return s; };
 		if (!p || typeof p !== 'object' || typeof p.enabled !== 'boolean') return null;
-		if (!p.enabled) return { text: t('CDN 驗證節流已關閉（只有小機器有每分鐘上限）'), warn: false };
+		if (!p.enabled) {
+			return { text: p.lite === true && typeof p.perMin === 'number'
+				? format(t('CDN 驗證節流已關閉（小機器照舊：只驗證問過 2 次以上的網域，每分鐘最多 %d 個）'), [p.perMin])
+				: t('CDN 驗證節流已關閉（只有小機器有每分鐘上限）'), warn: false };
+		}
 		var num = function (v) { return typeof v === 'number' ? v : 0; };
+		var lite = p.lite === true;
 		var rate = format(t('每分鐘最多 %d 個（這台的上限 %d）'), [num(p.perMin), num(p.maxPerMin)]);
-		var text = p.paced
+		var text = lite
+			? format(t('CDN 驗證：小機器減量模式，只驗證問過 2 次以上的網域，%s'), [rate])
+			: p.paced
 			? format(t('CDN 驗證減量中：新網域很多（或 CPU 很忙），先只驗證問過 2 次以上的網域，%s；還沒驗證的照常回原本的答案'), [rate])
 			: format(t('CDN 驗證：正常速度，%s'), [rate]);
 		var more = [];
@@ -392,9 +401,9 @@
 		if (typeof p.cpuPct === 'number') more.push(format(t('CPU %d%%'), [p.cpuPct]));
 		if (num(p.waited)) more.push(format(t('只問過一次先不驗證 %d 次'), [p.waited]));
 		if (num(p.capped)) more.push(format(t('名額用完沒排 %d 次'), [p.capped]));
-		if (p.paced && msOf(p.since)) more.push(format(t('從 %s 起'), [fmtTime(msOf(p.since))]));
+		if (p.paced && !lite && msOf(p.since)) more.push(format(t('從 %s 起'), [fmtTime(msOf(p.since))]));
 		if (more.length) text += '（' + more.join('、') + '）';
-		return { text: text, warn: !!p.paced };
+		return { text: text, warn: !!p.paced && !lite };
 	}
 
 	/**

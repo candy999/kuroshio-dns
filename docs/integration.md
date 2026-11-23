@@ -307,7 +307,7 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 | `restoreSummary(changes, tr)` | 把 `changes` 變成要顯示的文字：`{ empty, blocks: [{ cls, title, items }] }`，畫面自己組；`tr` 是翻譯函式（可省略） |
 | `chainView(chain, tr, now)` | 3.4.0 起：`/api/status` 的 `chain` → 狀態頁顯示用的資料 `{ down, up }`（各有 `badge`、`text`、`warn`、`rows: [{ label, value }]`；`down` 另有 `objects`、`skipped`，`up` 另有 `note`、`downstreams`）。主要的句子照 API 原樣；`now` 用來判斷公鑰是不是 24 小時內換過（可省略） |
 | `upstreamExtra(u, tr)` | 3.5.0：上游的 `servfail`、`late` →「SERVFAIL 3、來不及 5」，放在成功率旁邊；都是 0 或沒有這兩欄回 `''` |
-| `paceView(pace, tr)` | 3.5.0：`/api/status` 的 `cdn.pace` →`{ text, warn }`（`warn` = 減量中）；舊版、空物件回 `null` |
+| `paceView(pace, tr)` | 3.5.0：`/api/status` 的 `cdn.pace` →`{ text, warn }`（`warn` = 減量中；小機器 `lite: true` 永遠在減量，是常態、`warn` 是 `false`）；舊版、空物件回 `null` |
 | `cdnStoreText(cdn, tr)` | 3.5.0：`/api/status` 的 `cdn`（`dbEntries`、`dbDiskKB`、`dbFileKB`、`dbBudgetKB`、`cdnDirKB`）→ 一行摘要；沒有 `dbEntries` 回 `null` |
 | `format(template, args)` | `%s` / `%d` 代換（`%%` 是百分比符號本身） |
 
@@ -822,7 +822,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 其他：`/api/cdn/pools` 還沒確認的節點多 `upPop`；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。
 
-3.5.0 F9（比原本慢的第二版）：`score`／`origScore` 的意義改成**連線＋TLS 握手**的毫秒數（台灣節點／原本的 IP；不含收到回應標頭的時間）。判斷是「台灣 × 0.7 > 原本 ＋ 10 毫秒」，要連續 2 次驗證、相隔 10 分鐘以上都慢才退回；第一次慢時 `v4` 多 `slow1: { at, score, origScore }`、照常換台灣節點（`explain` 的 `text` 多一句「上一次驗證握手比原本慢，再確認一次才會退回」）。退回 15 分鐘（`cdn.lite` 1 小時），到期後有人查才重驗，重驗一次不慢就回台灣節點並清掉 `slower`／`score`／`origScore`／`reason`。分數只存在 `slow1`／`slower` 的那幾筆。手動 `POST /api/cdn/verify` 走同一套，回應多 `"speed": { "score", "origScore", "weighted"（台灣 × 0.7）, "slower"（這一次慢不慢）, "state": "ok"｜"slow1"｜"slower", "confirmAfter"（毫秒） }`。`kuroshio notify wan-changed`（`/api/notify/wan-changed`）多做一件事：把 `reach` 標成過期、清掉機房切換的連續計數與暫緩，不補跑健檢或掃描。
+3.5.0 F9（比原本慢的第二版）：`score`／`origScore` 的意義改成**連線＋TLS 握手**的毫秒數（台灣節點／原本的 IP；不含收到回應標頭的時間）。判斷是「台灣 × 0.7 > 原本 ＋ 10 毫秒」，要連續 2 次驗證、相隔 10 分鐘以上都慢才退回；第一次慢時 `v4` 多 `slow1: { at, score, origScore }`、照常換台灣節點（`explain` 的 `text` 多一句「上一次驗證握手比原本慢，再確認一次才會退回」）。退回 15 分鐘（`cdn.lite` 1 小時），到期後有人查才重驗，重驗一次不慢就回台灣節點並清掉 `slower`／`score`／`origScore`／`reason`。分數只存在 `slow1`／`slower` 的那幾筆。手動 `POST /api/cdn/verify` 走同一套（不受 F12 的名額限制，但算進用量），回應是 `{ "result": 網域紀錄, "error": "ok"｜"fail"｜…, "entry": …, "speed": … }`，`speed` 是 `{ "score", "origScore", "weighted"（台灣 × 0.7）, "slower"（這一次慢不慢）, "state", "confirmAfter" }`：`state` 是 `ok`、`slow1`（第一次慢，或第一次慢之後不到 10 分鐘又驗：不算確認、`slow1` 的時間不重設）或 `slower`（確認退回）；`confirmAfter` 是 `slow1` 時還要等幾毫秒下一次驗證才算確認，其他是 0。沒有判的時候 `speed` 是 `null`：IPv6、Fastly 這類最近節點型、手動「一定換」、只能用 HTTP 驗證的網站、量不到握手、保險絲跳了、`cdn.slowerFallback` 關掉（這幾種都照驗證通過處理，並清掉 `slow1`）。第一次慢的日誌併在既有的 ✔ 那一行：「✔ example.com IPv4 台灣節點可用 (TPE 200 5ms)；握手比原本慢（250 對 100 毫秒），先照常換，10 分鐘後有人查再確認一次」；確認退回「↷ example.com IPv4 台灣節點能用，但握手連續兩次比原本慢（250 對 100 毫秒，相隔 12 分鐘）：暫時用原本的答案，15 分鐘後有人查再重驗」；退回後重驗還是慢「↷ … 重驗握手還是比原本慢（…）：繼續用原本的答案，15 分鐘後有人查再重驗」；回來「✔ … 台灣節點可用 (…)；重驗握手不比原本慢，回到台灣節點」。`kuroshio notify wan-changed`（`/api/notify/wan-changed`）多做一件事：把 `reach` 標成過期、清掉機房切換的連續計數與暫緩，不補跑健檢或掃描。
 
 ### `/api/community/status` 的 `ispGroup`
 
@@ -856,25 +856,26 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - `late`：已經送出、但別的上游先答完，這台還沒回來就被取消的次數。沒有延遲紀錄的上游用等了多久當下限（不再永遠排第一個問）；連續 8 次都來不及、而且這段期間沒成功過才算 1 次失敗（成功一次歸零）。第一次這樣時一行 INFO「`<id>` 每次都來不及回答（別的上游先答完），先排到後面；一直這樣的話可能是位址或協定不通」。
 - `unanswered`：整輪沒有任何上游正常回答（Ok、NODATA、NXDOMAIN 都算正常）、所以沒有算它失敗的次數。等了逾時 90% 以上的失敗與 SERVFAIL 先收著，這一輪有別台正常回答才記失敗；很快就回來的錯誤（連線被拒、TLS 失敗、HTTP 4xx）照舊立刻記。整台斷網時不記失敗、不暫停。
 
-成功率照舊用 `ok ÷ (ok + fail)`；ui-core.js 的 `upstreamExtra(u)` 把 `servfail`、`late` 寫成「SERVFAIL 3、來不及 5」（都是 0 不顯示）。
+成功率照舊用 `ok ÷ (ok + fail)`；ui-core.js 的 `upstreamExtra(u)` 把 `servfail`、`late` 寫成「SERVFAIL 3、來不及 5」（都是 0 不顯示）。`avgMs`：來不及回答時會被往上修（沒有延遲紀錄的設成等了多久），所以一直來不及的上游不再是 `null`。`upstream.roundAwareFailures` 關掉時不寫 `late`／`unanswered`（`servfail` 照數，只是顯示）。
 
 ### CDN 驗證節流（F12）
 
 `/api/status` 的 `cdn` 多：
 
 ```json
-"pace": { "enabled": true, "perMin": 30, "maxPerMin": 60, "paced": true, "usedLastMin": 30, "cpuPct": 41,
-          "waited": 1234, "capped": 56, "since": 1795486200000 },
+"pace": { "enabled": true, "lite": false, "perMin": 30, "maxPerMin": 60, "minPerMin": 7, "paced": true,
+          "usedLastMin": 30, "usedThisMin": 12, "cpuPct": 41, "waited": 1234, "capped": 56, "since": 1795486200000 },
 "bg": { "verify": { "started": 1200, "done": 1190 }, "ecs": { "started": 80, "done": 80 },
         "cross": { "started": 12, "done": 12 }, "latency": { "started": 300, "done": 300 } }
 ```
 
-- `perMin`：目前的速率（在 `max(6, maxPerMin ÷ 8)` 與 `maxPerMin` 之間）；主程式每 10 秒量一次黑潮自己這 10 秒用掉的 CPU 佔整台的比例（`cpuPct`，量不到是 `null`、速率維持 `maxPerMin`）：55% 以上減半、30% 以下加 `maxPerMin ÷ 10`；記憶體壓力不是 Normal 時是下限。
-- `paced`：減量中（名額用完、或速率低於上限時進入；連續 5 分鐘名額都沒用完而且速率回到上限才離開），進入、離開各一行 INFO。減量中只問過 1 次的網域不排驗證、ECS、延遲量測、跨 CDN 探索（照常回原本的答案）；`since` 是進入的時間。
-- `usedLastMin`：最近一分鐘用掉的名額（手動 `POST /api/cdn/verify` 不受限制但算進去）；`waited`：只問過一次所以沒排的次數；`capped`：名額用完沒排的次數（都是啟動後累計）。`cdn.lite` 照舊有 `stats.liteWaited`／`liteCapped`，`pace.waited`／`capped` 是所有機器的。
-- `bg`：驗證、ECS、跨 CDN、延遲量測各自「開始幾個、完成幾個」的累計，給壓測分辨成本在哪一種工作。
-- `findings` 多 `cdn-verify-paced`（info）「新網域很多，CDN 驗證減量中（每分鐘 N 個）」。
-- 舊版核心沒有 `pace`；`pace` 是空物件時介面不顯示（ui-core.js 的 `paceView`）。
+- `enabled`：`cdn.verifyPacing`；`lite`：`cdn.lite`。關掉節流時 `perMin`／`maxPerMin` 在小機器是 30（3.4.2 的上限照舊）、其他機器是 `null`，`minPerMin` 是 `null`，`paced` 是 `false`。
+- `perMin`：目前的速率，在 `minPerMin`（`max(6, maxPerMin ÷ 8)`）與 `maxPerMin` 之間；`maxPerMin` 依機器換算（小機器 30，或 `cdn.verifyPerMin` 比 30 小時照填的）。主程式每 10 秒量一次黑潮自己這 10 秒用掉的 CPU 佔整台的比例（`cpuPct`；還沒交或量不到是 `null`）：55% 以上減半、30% 以下加 `maxPerMin ÷ 10`、中間不動；記憶體壓力不是 Normal 時是 `minPerMin`。量不到 CPU 時不依 CPU 降，壓力解除後照「30% 以下」慢慢加回 `maxPerMin`。
+- `paced`：減量中。這一分鐘有任何一個排不進（名額用完、或只問過一次的網域碰到一半的上限）、或速率低於上限時進入；連續 5 分鐘名額都沒用完而且速率回到上限才離開（主程式沒接上 CPU 讀數時，查詢路徑每分鐘順便檢查一次，照樣會自己離開）。進入、離開各一行 INFO（小機器不寫進入那一行）。減量中只問過 1 次的網域不排驗證、ECS、延遲量測、跨 CDN 探索（照常回原本的答案，`/api/cdn/explain` 是 `paced-waiting`）；`since` 是進入的時間（毫秒，不在減量中是 `null`）。**小機器（`lite: true`）永遠在減量**，`paced` 一直是 `true`、`since` 是 `null`。
+- `usedLastMin`：上一個整分鐘用掉的名額，`usedThisMin`：這一分鐘到現在（手動 `POST /api/cdn/verify` 不受限制但算進去）；`waited`：減量中只問過一次、所以沒排的查詢次數；`capped`：名額用完沒排的工作數（都是啟動後累計）。名額在去重與排隊上限之後才用：同一個網域已經在排、或排隊已滿的不用掉名額。同一分鐘裡到期重驗與問過 2 次以上的新網域可以用到 `perMin`，跨 CDN 探索只能把這一分鐘的總用量推到 `perMin` × 3/4，只問過一次的新網域只能推到 `perMin` ÷ 2。`cdn.lite` 照舊有 `stats.liteWaited`／`liteCapped`，`pace.waited`／`capped` 是所有機器的。
+- `bg`：驗證、ECS、跨 CDN、延遲量測各自「開始幾個（拿到並行名額、開始做）、完成幾個（正常做完；被取消的不算）」的累計，給壓測分辨成本在哪一種工作。
+- `findings` 多 `cdn-verify-paced`（info）「新網域很多，CDN 驗證減量中（每分鐘 N 個）」；小機器永遠在減量，那是常態，不報。
+- 舊版核心沒有 `pace`；`pace` 是空物件時介面不顯示（ui-core.js 的 `paceView`；小機器不用提醒樣式）。
 
 ### 其他欄位與日誌
 
@@ -929,7 +930,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `cdn.verifyPerMin` | 3.5.0 F12：CDN 驗證每分鐘上限。`auto`（預設：`cdn.lite` 30；沒有 AES 的核心數 × 30；有 AES 的核心數 × 60、最多 480）／數字（6～1,200）。UCI 是 `config cdn` 的 `option verify_per_min`。`kuroshio sysinfo` 印出換算的值 |
 | `cdn.multiCdn` | 3.5.0：尊重多來源 CDN、第一層 CNAME 變了就失效（預設 `true`；UCI 是 `config cdn` 的 `option multi_cdn '0'`／`'1'`）。關掉＝3.4.x：每個網域只記一家、業者欄位直接改寫 |
 | `cdn.appLayer` | 3.5.0：App 自己選節點的服務（目前 Google、Apple）只辨識、不改寫（預設 `true`；UCI 是 `option app_layer`） |
-| `cdn.dbDiskBudgetKB` | 3.5.0：CDN 網域資料在磁碟上的預算。`auto`（預設：狀態目錄所在的檔案系統小於 64 MB 時用總容量的 30%，64 MB 以上或讀不到大小時不限）／數字（KB，下限 512）／`0`（不限）。UCI 是 `config cdn` 的 `option db_disk_budget_kb`。超過時在背景分批淘汰最久沒用的網域（一天內查過的、手動設定策略的不動），不會一次重寫全部分片。狀態：`cdn.dbBudgetKB`、`dbBudgetEntries`、`dbEntries`、`dbDiskKB`（實際）、`dbDiskEstKB`、`prunedForBudget`。3.5.0 F8：`dbDiskKB` 量的是網域分片**實際佔用的磁碟區塊**（Unix 是 `blocks × 512`；`blocks` 是 0 的檔案系統與 Windows 用檔案長度），預算比的就是它；`dbFileKB` 是檔案長度合計（F8 之前 `dbDiskKB` 的量法，小檔多時少算約兩成）；`cdnDirKB` 是整個 `cdn/` 目錄（含節點池、網段掃描等）實際佔用，只顯示、不算進預算 |
+| `cdn.dbDiskBudgetKB` | 3.5.0：CDN 網域資料在磁碟上的預算。`auto`（預設：狀態目錄所在的檔案系統小於 64 MB 時用總容量的 30%，64 MB 以上或讀不到大小時不限）／數字（KB，下限 512）／`0`（不限）。UCI 是 `config cdn` 的 `option db_disk_budget_kb`。超過時在背景分批淘汰最久沒用的網域（一天內查過的、手動設定策略的不動），不會一次重寫全部分片。狀態：`cdn.dbBudgetKB`、`dbBudgetEntries`、`dbEntries`、`dbDiskKB`（實際）、`dbDiskEstKB`、`prunedForBudget`。3.5.0 F8：`dbDiskKB` 量的是網域分片**實際佔用的磁碟區塊**（Unix 是 `blocks × 512`；`blocks` 是 0 的檔案系統與 Windows 用檔案長度），預算比的就是它；`dbFileKB` 是檔案長度合計（F8 之前 `dbDiskKB` 的量法，小檔多時少算約兩成）；`cdnDirKB` 是整個 `cdn/` 目錄（含節點池、網段掃描等，往下量兩層）實際佔用，只顯示、不算進預算。三個值在每一輪預算時量（不在查詢路徑上）：有預算的機器載入時就量，沒有預算的機器要等第一輪預算（每次登記快照之前）才有值。升級後小 Flash 的網域筆數上限會變低一些，多出來的照既有的方式分批淘汰 |
 | `system.oomScoreAdj` | 預設 -500；設 0 就跟一般程式一樣讓核心挑 |
 | `filter.lists` | 少開幾份訂閱清單（每份的大小在 `filter.sources`） |
 
@@ -972,6 +973,9 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   | `already-tw` | 原本的答案就是台灣節點 |
   | `trial` | 台灣節點還在驗證中（先回原本的答案，TTL 10 秒） |
   | `lite-waiting` | 小記憶體減量：問過 2 次以上才驗證 |
+  | `paced-waiting` | 3.5.0 F12：新網域很多（或 CPU 很忙），CDN 驗證減量中，問過 2 次以上才驗證，先回原本的答案（小機器照舊是 `lite-waiting`） |
+  | `slower` | 3.5.0 E7、F9：台灣節點能用，但握手連續兩次比原本的答案慢，暫時用原本的答案（15 分鐘、小機器 60 分鐘後有人查再重驗） |
+  | `essential` | 3.5.0 F11：內建的時間同步、連線偵測、憑證撤銷、地震速報服務：不改寫、不擋。多 `known: true` 與 `essential`（類別代碼 `ntp`、`netcheck`、`revocation`、`quake`），沒有 `provider`／`steps`（這些網域不記進資料庫，`/api/cdn/domain` 查不到） |
   | `verify-failed` | 台灣節點驗證沒通過（到期後重新驗證） |
   | `no-tw-node` | 找不到可用的台灣節點，跨 CDN 也沒有 |
   | `no-pool` | 這家 CDN 的台灣節點池還沒建好 |
@@ -996,8 +1000,8 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - **節點池的測速欄位**（3.5.0）：`GET /api/cdn/pools` 每家多 `speedRef`（這一次節點池工作量到速度的節點的中位數，MB/s；量到的不到 3 個時是 `null`），每個節點多：
   - `slow`：`true`／`false`＝相對評分的結果（連加上誤差範圍都不到 `speedRef` 的一半、或低於 0.1 MB/s）；沒有這個欄位＝沒量過速度，或舊資料（那時照舊規則：`speed` 低於 1 MB/s 算慢）。
   - `sample`：`{ "bytes": 8388608, "secs": 0.144, "connectMs": 4.1, "ttfbMs": 9.3, "quick": true }`——那一次下載收到的位元組數、收內容的秒數、連線（含 TLS 握手）與送出請求到收完標頭的毫秒數；`quick` 是量到瓶頸之後只收 1 MiB 的快測（這時節點的 `speed` 記的是瓶頸的速度）。這些是 3.6 工作負載分數的量測基礎，3.5.0 只收集、不參與排序。
-  - 3.5.0 F15、F16：每家多 `quickRef`（完整測的節點「前 1 MiB」速度的中位數，MB/s：快測的門檻跟它比；沒有時是 `null`、照舊公式）與 `speedRefWhy`（`speedRef` 沒算出來的原因，例如「量到速度的節點只有 2 個（要 3 個）」「被限流」）；`sample` 多 `headSecs`（收到第 1 MiB 的秒數）與 `status`（HTTP 狀態碼，0＝沒連上或沒收到標頭）。遇到 HTTP 429／503 時這一輪對那一家停止測速，沒量到的節點 `speed` 是 `null`（不再記成 0），上一輪有速度的沿用並記 `speedAge`（沿用了幾輪，最多 3）。
+  - 3.5.0 F15、F16：每家多 `quickRef`（完整測的節點「前 1 MiB」速度的中位數，MB/s：快測的門檻跟它比；沒有時是 `null`、照舊公式）與 `speedRefWhy`（`speedRef` 沒算出來的原因，例如「量到速度的節點只有 2 個（要 3 個）」「被限流」）；`sample` 多 `headSecs`（收到第 1 MiB 的秒數）與 `status`（HTTP 狀態碼，0＝沒連上或沒收到標頭）。遇到 HTTP 429／503 時這一輪對那一家停止測速，沒量到的節點 `speed` 是 `null`（不再記成 0），上一輪有速度的沿用並記 `speedAge`（沿用了幾輪，1～3；這一輪量的沒有這個欄位）：先找同一個 IP，沒有就找同一個 /24（節點池每輪在每個 /24 裡隨機抽一個位址，只比 IP 幾乎沿用不到）。Fastly 這類最近節點型被限流時只停測、不沿用（它的速度只影響品質分數裡的「慢」，沒量到就不罰）。`speedRef` 在被限流那一輪、量到＋沿用的不到 3 個時用上一輪的，`speedRefWhy` 是「被限流（HTTP 429），沿用上一輪」；上一輪也沒有時 `speedRef` 是 `null`、`speedRefWhy` 是「被限流（HTTP 429）」。`quickRef` 要前 4 個完整測的樣本裡至少 3 個量到 `headSecs` 才算，不夠就照舊的公式。`pool.relativeSpeed` 關掉時沒有 `quickRef`，「沒量到留 `null`」兩種規則都套用。
   - 3.4.x 讀到這些欄位會原樣保留。
 - **通訊類網域**（3.5.0）：推播服務的網域（內建 Apple 推播、Firebase 雲端訊息；`resolver.keepNames` 自己加，最多 64 個後綴）不被訂閱清單誤擋（`filter.protectComm`，預設開；自訂規則照樣優先，`/api/filter/check` 的 `rule` 是 `builtin-comm`）、快到期就預取（同時最多 16 個）、記憶體控制縮快取時優先留下、不換到別家 CDN。`/api/status` 的 `comm` 有內建與自己加的數量、預取中的數量；`filter.commSpared` 是清單本來要擋、照樣放行的次數（每天第一次會記一行 INFO，寫明是哪份清單，方便回報給清單維護者）。
-  - 3.5.0 F11：內建表多五類——時間同步（`ntp`）、連線偵測（`netcheck`）、憑證撤銷（`revocation`）、系統與安全更新（`update`）、地震速報（`quake`）。五類都不被訂閱清單擋（`/api/filter/check` 的 `rule` 是 `builtin-<類別>`，推播照舊 `builtin-comm`）；`ntp`、`netcheck`、`revocation`、`quake` 也不改寫 CDN 答案（不排驗證、不做 ECS 與跨 CDN，`cdn.stats.essentialKept` 加 1，`/api/cdn/explain` 的決定代碼是 `essential`）；`update` 照常換台灣節點。快到期就預取的只有推播、地震速報、自己加的；記憶體吃緊時先留的是推播、`ntp`、`netcheck`、`quake`、自己加的。`/api/status` 的 `comm` 多 `kinds`（每一類內建表的筆數，例如 `{ "apns": 1, "fcm": 3, "ntp": 17, … }`），`filter` 多 `commSparedByKind`（每一類放行的次數；`commSpared` 照舊是合計）。`filter.protectComm` 關掉＝新的五類一律不比對、推播回到 B6 原本的規則。`resolver.keepNames`（自己加的）只有不擋＋快取優先，不影響 CDN 改寫。內建表是編譯進執行檔的資料（`crates/kuroshio-net/src/comm.rs`）。
+  - 3.5.0 F11：內建表多五類——時間同步（`ntp`）、連線偵測（`netcheck`）、憑證撤銷（`revocation`）、系統與安全更新（`update`）、地震速報（`quake`）。五類都不被訂閱清單擋（`/api/filter/check` 的 `rule` 是 `builtin-<類別>`，推播照舊 `builtin-comm`）；`ntp`、`netcheck`、`revocation`、`quake` 也不改寫 CDN 答案（不排驗證、不做 ECS 與跨 CDN，`cdn.stats.essentialKept` 加 1，`/api/cdn/explain` 的決定代碼是 `essential`）；`update` 照常換台灣節點。快到期就預取的只有推播、地震速報、自己加的；記憶體吃緊時先留的是推播、`ntp`、`netcheck`、`quake`、自己加的。`/api/status` 的 `comm` 多 `kinds`（每一類內建表的筆數，例如 `{ "apns": 1, "fcm": 3, "ntp": 17, … }`），`essential`（新加的五類有沒有在比對，就是 `filter.protectComm`），`filter` 多 `commSparedByKind`（每一類放行的次數，沒有放行過的類別不列；`commSpared` 照舊是合計）。每一類每天第一次放行寫一行 INFO：「過濾：清單「X」擋到時間同步網域 `<name>`，照樣放行（filter.protectComm；可以回報給清單維護者）」（類別：推播、自己加的通訊類、時間同步、連線偵測、憑證撤銷、系統與安全更新、地震速報）。`filter.protectComm` 關掉＝新的五類一律不比對、推播回到 B6 原本的規則。`resolver.keepNames`（自己加的）只有不擋＋快取優先，不影響 CDN 改寫。內建表是編譯進執行檔的資料（`crates/kuroshio-net/src/comm.rs`）。
 

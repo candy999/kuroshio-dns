@@ -163,7 +163,11 @@
     {"name":"關掉","args":[{"enabled":false}],"expect":{"text":"CDN 驗證節流已關閉（只有小機器有每分鐘上限）","warn":false}},
     {"name":"正常速度","args":[{"enabled":true,"perMin":60,"maxPerMin":60,"paced":false,"usedLastMin":12,"cpuPct":21,"waited":0,"capped":0}],"expect":{"text":"CDN 驗證：正常速度，每分鐘最多 60 個（這台的上限 60）（最近一分鐘 12 個、CPU 21%）","warn":false}},
     {"name":"減量中","args":[{"enabled":true,"perMin":30,"maxPerMin":60,"paced":true,"usedLastMin":30,"cpuPct":41,"waited":1234,"capped":56,"since":1795400000000}],"expect":{"text":"CDN 驗證減量中：新網域很多（或 CPU 很忙），先只驗證問過 2 次以上的網域，每分鐘最多 30 個（這台的上限 60）；還沒驗證的照常回原本的答案（最近一分鐘 30 個、CPU 41%、只問過一次先不驗證 1234 次、名額用完沒排 56 次、從 2026-11-23 10:13 起）","warn":true}},
-    {"name":"翻譯函式","args":[{"enabled":false},"bracket"],"expect":{"text":"[CDN 驗證節流已關閉（只有小機器有每分鐘上限）]","warn":false}}
+    {"name":"翻譯函式","args":[{"enabled":false},"bracket"],"expect":{"text":"[CDN 驗證節流已關閉（只有小機器有每分鐘上限）]","warn":false}},
+    {"name":"核心實際的形狀（減量中）","args":[{"enabled":true,"lite":false,"perMin":30,"maxPerMin":60,"minPerMin":7,"paced":true,"usedLastMin":30,"usedThisMin":12,"cpuPct":null,"waited":5,"capped":0,"since":1795400000000}],"expect":{"text":"CDN 驗證減量中：新網域很多（或 CPU 很忙），先只驗證問過 2 次以上的網域，每分鐘最多 30 個（這台的上限 60）；還沒驗證的照常回原本的答案（最近一分鐘 30 個、只問過一次先不驗證 5 次、從 2026-11-23 10:13 起）","warn":true}},
+    {"name":"小機器（永遠在減量，不提醒）","args":[{"enabled":true,"lite":true,"perMin":30,"maxPerMin":30,"minPerMin":6,"paced":true,"usedLastMin":4,"usedThisMin":1,"cpuPct":12,"waited":0,"capped":0,"since":null}],"expect":{"text":"CDN 驗證：小機器減量模式，只驗證問過 2 次以上的網域，每分鐘最多 30 個（這台的上限 30）（最近一分鐘 4 個、CPU 12%）","warn":false}},
+    {"name":"關掉的小機器","args":[{"enabled":false,"lite":true,"perMin":30,"maxPerMin":30,"minPerMin":null,"paced":false,"usedLastMin":0,"usedThisMin":0,"cpuPct":null,"waited":0,"capped":0,"since":null}],"expect":{"text":"CDN 驗證節流已關閉（小機器照舊：只驗證問過 2 次以上的網域，每分鐘最多 30 個）","warn":false}},
+    {"name":"關掉的一般機器","args":[{"enabled":false,"lite":false,"perMin":null,"maxPerMin":null,"minPerMin":null,"paced":false,"usedLastMin":3,"usedThisMin":0,"cpuPct":20,"waited":0,"capped":0,"since":null}],"expect":{"text":"CDN 驗證節流已關閉（只有小機器有每分鐘上限）","warn":false}}
   ],
   "cdnStoreText": [
     {"name":"CDN 關或舊版","args":[null],"expect":null},

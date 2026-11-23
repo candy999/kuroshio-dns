@@ -225,7 +225,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
                     { id: 'tls://dns.example.net', type: 'dot', role: 'auto', ok: 5, fail: 0, avgMs: 31, reason: '覆蓋', region: 'JP', regionSource: 'registered', near: true, pathBlocked: false, via: null,
                         servfail: 2, late: 7, unanswered: 1 }].concat(j.upstreams || []);
                 // 3.5.0 F12、F8：CDN 驗證節流（減量中）與網域資料的磁碟用量
-                j.cdn = Object.assign({}, j.cdn || {}, { pace: { enabled: true, perMin: 30, maxPerMin: 60, paced: true, usedLastMin: 30, cpuPct: 41, waited: 12, capped: 3 },
+                j.cdn = Object.assign({}, j.cdn || {}, { pace: { enabled: true, lite: false, perMin: 30, maxPerMin: 60, minPerMin: 7, paced: true, usedLastMin: 30, usedThisMin: 4, cpuPct: 41, waited: 12, capped: 3, since: Date.now() - 300e3 },
                     dbEntries: 2000, dbDiskKB: 2218, dbFileKB: 1722, dbBudgetKB: null, cdnDirKB: 2600 });
                 r.fulfill({ response: res, body: JSON.stringify(j) });
             });

@@ -140,7 +140,7 @@ STATUS.findings = [
     { key: 'reach-single-pop', sev: 'info', text: '這條線目前只到得了台北機房', count: 1, firstAt: NOWMS - 26 * HMS, lastAt: NOWMS - 60e3, active: true },
     { key: 'upstream-failing', sev: 'warn', text: '有 1 個上游連續失敗、暫停中（會逐次拉長暫停時間，恢復後自動接回）', count: 2, firstAt: NOWMS - 9 * HMS, lastAt: NOWMS - 5 * HMS, active: false }
 ];
-STATUS.stale = { today: 120, rateToday: 0.004, rate15m: 0.0, rate1h: 0.001 };
+STATUS.stale = { today: 120, rateToday: 0.004, rate15m: 0.0, rate1h: 0.001, refreshFail15m: 0 };
 Object.assign(STATUS.cdn, {
     reach: { at: NOWMS - 600e3, wanEpoch: 1, stale: false, unconfirmed: 0,
         v4: { text: '這條線目前只到得了台北機房', multi: false, pops: [{ pop: 'TPE', city: '台北', nodes: 31, prefixes: 22, providers: 4, medianMs: 4.1 }] },
@@ -150,7 +150,8 @@ Object.assign(STATUS.cdn, {
     popSwitch: { enabled: true, eligible: false, reason: 'single-pop', switches24h: 0 },
     popAudit: { enabled: true, pending: 0, confirmed: 31, mismatch: 0, probes24h: 0, lastMismatchAt: null, chainPopUnreliable: false, pendingServed: 0, lastProbeAt: null, noTarget: 0 },
     // 3.5.0 F12：驗證節流（減量中）；F8：網域資料的三種量法
-    pace: { enabled: true, perMin: 30, maxPerMin: 60, paced: true, usedLastMin: 30, cpuPct: 41, waited: 1234, capped: 56, since: NOWMS - 300e3 },
+    pace: { enabled: true, lite: false, perMin: 30, maxPerMin: 60, minPerMin: 7, paced: true, usedLastMin: 30, usedThisMin: 12, cpuPct: 41, waited: 1234, capped: 56, since: NOWMS - 300e3 },
+    bg: { verify: { started: 776, done: 770 }, ecs: { started: 12, done: 12 }, cross: { started: 3, done: 3 }, latency: { started: 40, done: 40 } },
     dbEntries: 20000, dbDiskKB: 2218, dbFileKB: 1722, dbBudgetKB: 2303, cdnDirKB: 2600
 });
 STATUS.access = { mode: 'taiwan', applyTo: ['dot', 'doh', 'doq', 'doh3', 'site'], active: true, dataOk: true, failOpen: false, failClosed: false, warning: null, generatedAt: TWIP.generatedAt,
@@ -285,10 +286,11 @@ function HISTORY(now) {
         abroad: col(i => Math.round(q[i] * 0.2)), tw: col(i => Math.round(q[i] * 0.16)) };
 }
 const POOLS = {
-    cloudflare: { ranges: { v4: 14, v6: 7 }, scan: { tw: 78, global: 56, dead: 89 },
-        v4: [{ ip: '104.18.22.203', pop: 'TPE', ms: 2.68, speed: 55.3 }, { ip: '104.18.143.105', pop: 'TPE', ms: 2.95, speed: 56.8 }, { ip: '172.67.70.39', pop: 'KHH', ms: 3.29, speed: null, bad: '速度太慢' }],
+    // 3.5.0 F15、F16：speedRefWhy（算得出來時是 null）、quickRef（快測的參考）、節點的 speedAge（沿用前幾輪）與 sample.headSecs
+    cloudflare: { ranges: { v4: 14, v6: 7 }, scan: { tw: 78, global: 56, dead: 89 }, speedRef: 55.3, speedRefWhy: null, quickRef: 35.2,
+        v4: [{ ip: '104.18.22.203', pop: 'TPE', ms: 2.68, speed: 55.3, sample: { bytes: 8388608, secs: 0.152, headSecs: 0.028, connectMs: 4, ttfbMs: 9 } }, { ip: '104.18.143.105', pop: 'TPE', ms: 2.95, speed: 56.8, speedAge: 1 }, { ip: '172.67.70.39', pop: 'KHH', ms: 3.29, speed: null, bad: '速度太慢' }],
         v6: [{ ip: '2606:4700:4408::9bd1', pop: 'TPE', ms: 3.36, permanent: true }] },
-    fastly: { ranges: { v4: 17, v6: 3 }, scan: { tw: 0, global: 87, dead: 0 }, v4: [{ ip: '151.101.203.124', pop: 'IAD', ms: 0.08, speed: null }], v6: [] }
+    fastly: { ranges: { v4: 17, v6: 3 }, scan: { tw: 0, global: 87, dead: 0 }, speedRefWhy: '被限流（HTTP 429）', v4: [{ ip: '151.101.203.124', pop: 'IAD', ms: 0.08, speed: null }], v6: [] }
 };
 const V6NODES = { providers: { cloudflare: { '2606:4700:4408::9bd1': { ms: 3.36, pop: 'TPE', fails: 0 } } } };
 const DOMAINS = Array.from({ length: 12 }, (_, i) => ({ name: `www${i}.example.com`, provider: i % 3 ? 'cloudflare' : 'fastly', via: i % 2 ? 'cname' : 'ip', hits: 5000 - i * 300,

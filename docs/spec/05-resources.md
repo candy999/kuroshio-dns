@@ -322,7 +322,7 @@ USB 隨身碟也算 Flash，但通常容量大、可以更換，判定為 `disk`
 **狀態**（`/api/status` 的 `cdn`）：`dbBudgetKB`（沒有預算是 `null`）、`dbBudgetEntries`（換算的筆數）、`dbEntries`（總筆數，含移出記憶體的）、
 `dbDiskKB`（分片目錄實際佔用；有預算時啟動就量一次，之後每 5 分鐘量一次；沒有預算時第一輪之前是 `null`）、
 `dbDiskEstKB`（用上面的模型估的，沒有校正；實際以 `dbDiskKB` 為準）、`prunedForBudget`（啟動以來淘汰幾筆）、
-`dbFileKB`（3.5.0 F8：分片檔案長度合計）、`cdnDirKB`（3.5.0 F8：整個 `cdn/` 目錄實際佔用，只顯示）。
+`dbFileKB`（3.5.0 F8：分片檔案長度合計）、`cdnDirKB`（3.5.0 F8：整個 `cdn/` 目錄實際佔用，往下量兩層，只顯示）。三個都在每一輪預算時量，不在查詢路徑上。
 
 **實際佔用怎麼量**（3.5.0 F8，D12 實測）：D3 同一時間 `dbDiskKB` 1,722、`du -sk state/cdn` 2,218 KB，差 496 KB。原因是 `shard_dir_bytes()`
 原本只加總檔案長度（`metadata().len()`），而 `du` 算的是**佔用的區塊**：257 個小檔、4 KB 區塊，每個檔平均浪費半個區塊（約 500 KB），
@@ -391,14 +391,17 @@ D9 實測（D3 單獨運作、每秒 20 個不重複的新網域）：中位 409
 - 每分鐘上限 `Rmax`（token bucket，放在 `schedule()` 本來就拿的 `bg` 鎖裡，取代另外一把 `lite_rate`）：`cdn.lite` 30；沒有 AES 的核心數 × 30（D3：60）；
   有 AES 的核心數 × 60、最多 480；設了數字照填的（6～1,200）。定在「這台本來就做得到的量」附近（D3 自然上限約 78），平常碰不到。
 - 依 CPU 自己調：主程式每 10 秒量一次黑潮自己這 10 秒用掉的 CPU 佔整台的比例（Linux `/proc/self/stat`、Windows `GetProcessTimes`），
-  55% 以上速率減半、30% 以下加 `Rmax ÷ 10`，中間不動；速率在 `max(6, Rmax ÷ 8)` 與 `Rmax` 之間；量不到不調；記憶體壓力不是 Normal 時用下限。
-- 名額用完、或速率低於上限 → 「減量中」：只問過 1 次的網域不排驗證（它的 ECS、延遲量測、跨 CDN 探索也一起不排）；連續 5 分鐘名額都沒用完、速率回到上限才離開。
-  進入、離開各一行 INFO。
-- 名額的順序：手動 `POST /api/cdn/verify` 不受限制但算進用量；已經有結果、到期重驗的與問過 2 次以上的可以用全部名額；只問過 1 次的只在不是減量中時排、最多用一半；
-  跨 CDN 探索每次算 1 個，排在第 2 類之後。
+  55% 以上速率減半、30% 以下加 `Rmax ÷ 10`，中間不動；速率在 `max(6, Rmax ÷ 8)` 與 `Rmax` 之間；記憶體壓力不是 Normal 時用下限（CDN 那一層讀既有的 `set_line_env()`）。
+  量不到 CPU 時不依 CPU 降，速率低於上限時照「30% 以下」慢慢加回（不然記憶體壓力解除後會卡在下限）。
+- 這一分鐘有任何一個排不進、或速率低於上限 → 「減量中」：只問過 1 次的網域不排驗證（它的 ECS、延遲量測、跨 CDN 探索也一起不排）；連續 5 分鐘名額都沒用完、速率回到上限才離開。
+  進入、離開各一行 INFO。減量中時查詢路徑每分鐘最多一次順便檢查能不能離開（一個原子操作），主程式沒有交 CPU 讀數也會自己恢復。
+- 名額的順序（沒有佇列，用「這一分鐘的總用量推到多少為止」實作；固定的分鐘窗，同 3.4.2 的 `lite`）：手動 `POST /api/cdn/verify` 不受限制但算進用量；
+  已經有結果、到期重驗的與問過 2 次以上的可以用到 `r`；跨 CDN 探索每次算 1 個，只能推到 `r × 3/4`；只問過 1 次的只在不是減量中時排、只能推到 `r ÷ 2`。
+  名額在去重與排隊上限之後才用（同一個網域已經在排、排隊已滿的不用掉名額）。
 - 沒有持久的佇列：排不進的丟掉、下一次查詢再排，壓力解除後不會湧出一波積壓。`cdn.lite` 等於「永遠減量、上限 30」，`liteWaited`／`liteCapped` 照舊累加。
-- 狀態：`/api/status` 的 `cdn.pace`（`enabled`、`perMin`、`maxPerMin`、`paced`、`usedLastMin`、`cpuPct`、`waited`、`capped`、`since`）、`cdn.bg`（各種背景工作開始與完成的累計）、
-  `findings` 的 `cdn-verify-paced`。細節見[規格 11 的 F12](11-v3.5.0.md)。
+- 狀態：`/api/status` 的 `cdn.pace`（`enabled`、`lite`、`perMin`、`maxPerMin`、`minPerMin`、`paced`、`usedLastMin`、`usedThisMin`、`cpuPct`、`waited`、`capped`、`since`）、
+  `cdn.bg`（`verify`／`ecs`／`cross`／`latency` 各自的 `{ started, done }`：拿到並行名額開始做、正常做完；被取消的不算完成）、
+  `findings` 的 `cdn-verify-paced`（小機器永遠在減量，不報）、`/api/cdn/explain` 的 `paced-waiting`。細節見[規格 11 的 F12](11-v3.5.0.md) 與它的實作備註。
 
 **每日評測的小機器減量**（`benchmark.tiers`，3.5.0）：`auto`（預設）時實體記憶體小於 256 MB 只測 A 級（`a`），`a`／`ab` 強制。不是不評測：A 級（約 470 個候選）與使用者自己加的每天測，B 級只測沿用（昨天選上或候補，最多 16）、補位（A 級的經營者不到 12 家或某一種類型不到 8 個時，最多 32）、探索（每天 40），合計約是全部 1,800 個的三成。細節見[規格 11 的 A3](11-v3.5.0.md)。
 
