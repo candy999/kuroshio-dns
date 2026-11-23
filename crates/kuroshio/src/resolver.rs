@@ -557,8 +557,9 @@ impl Resolver {
                 let threshold = p.prefetch_threshold.max(e.ttl as f64 * 0.1);
                 if stale || (remain <= threshold && (recent || popular)) {
                     self.refresh(key.clone(), query.clone());
-                } else if remain <= threshold && kuroshio_net::comm::is_comm(&qname) {
-                    // 通訊類網域（推播，3.5.0）：快到期就預取，不要求最近問過或很熱門（同時最多 COMM_PREFETCH_MAX 個）
+                } else if remain <= threshold && kuroshio_net::comm::flags_of(&qname).prefetch {
+                    // 通訊類網域（推播，3.5.0）：快到期就預取，不要求最近問過或很熱門（同時最多 COMM_PREFETCH_MAX 個）。
+                    // 3.5.0 F11：只有推播、地震速報、使用者自己加的用這些名額（`prefetch` 旗標）
                     self.refresh_comm(key.clone(), query.clone());
                 }
                 if stale {

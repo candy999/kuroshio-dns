@@ -752,6 +752,12 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "comm": {
                     "builtin": kuroshio_net::comm::COMM_SUFFIXES.len(), "user": kuroshio_net::comm::user_count(),
                     "prefetching": r.comm_prefetching(),
+                    // 3.5.0 F11：內建表每一類幾個後綴；新加的五類有沒有在比對（filter.protectComm）
+                    "kinds": kuroshio_net::comm::builtin_kinds()
+                        .into_iter()
+                        .map(|(k, n)| (k.to_string(), json!(n)))
+                        .collect::<serde_json::Map<String, Value>>(),
+                    "essential": kuroshio_net::comm::enabled(),
                 },
                 // 3.5.0 E1：每一種會過期的資料的上次成功、失敗中、下次預定
                 "freshness": crate::observe::freshness(st),

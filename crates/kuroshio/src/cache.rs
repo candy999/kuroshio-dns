@@ -249,8 +249,9 @@ impl Cache {
             let hits = e.hits.load(Ordering::Relaxed);
             u64::from(e.last_access.load(Ordering::Relaxed)) + HOT_BONUS_DS * u64::from(32 - hits.leading_zeros())
         };
-        // 通訊類網域（推播，3.5.0）優先留下：分數加一個比任何時間都大的值（記憶體控制縮快取時才算，不在查詢路徑上）
-        let comm = |k: &str| kuroshio_net::comm::is_comm(k.rsplit('|').next().unwrap_or(k));
+        // 通訊類網域（推播，3.5.0）與時間同步、連線偵測、地震速報（3.5.0 F11 的 `hold`）優先留下：分數加一個比任何時間都大的值
+        // （記憶體控制縮快取時才算，不在查詢路徑上）
+        let comm = |k: &str| kuroshio_net::comm::flags_of(k.rsplit('|').next().unwrap_or(k)).hold;
         let mut v: Vec<(u64, &String)> = self
             .map
             .iter()
@@ -322,6 +323,39 @@ mod tests {
         c.shed_to(1);
         assert_eq!(c.len(), 1);
         assert!(c.peek(&comm).is_some(), "通訊類網域留下");
+    }
+
+    /// 3.5.0 F11：記憶體控制縮快取時，`hold` 的類別（推播、時間同步、連線偵測、地震速報）先留；憑證撤銷、系統更新照一般規則
+    #[test]
+    fn floor_keeps_hold_kinds_first() {
+        use kuroshio_net::comm::{set_test_entries, CommKind, TEST_ENTRIES};
+        set_test_entries(TEST_ENTRIES);
+        let now = Instant::now();
+        let mut c = Cache::new(100);
+        let key = |k: CommKind| {
+            let s = TEST_ENTRIES.iter().find(|x| x.1 == k).unwrap().0;
+            format!("1|gw.{s}")
+        };
+        for k in [
+            CommKind::Ntp,
+            CommKind::NetCheck,
+            CommKind::Revocation,
+            CommKind::Update,
+            CommKind::Quake,
+        ] {
+            c.insert(key(k), entry(300, false), now);
+        }
+        for i in 0..20 {
+            let e = c.insert(format!("1|n{i}.example.com"), entry(300, false), now);
+            e.hits.store(100, Ordering::Relaxed);
+        }
+        c.shed_to(3);
+        assert_eq!(c.len(), 3);
+        for k in [CommKind::Ntp, CommKind::NetCheck, CommKind::Quake] {
+            assert!(c.peek(&key(k)).is_some(), "{k:?} 留下");
+        }
+        assert!(c.peek(&key(CommKind::Revocation)).is_none());
+        assert!(c.peek(&key(CommKind::Update)).is_none());
     }
 
     #[test]

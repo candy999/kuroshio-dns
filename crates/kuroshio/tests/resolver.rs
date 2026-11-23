@@ -1530,3 +1530,39 @@ async fn round_aware_off_matches_previous_behaviour() {
     );
     drop(hole);
 }
+
+/// 3.5.0 F11：快到期就預取的名額（同時最多 16 個）只給推播、地震速報、使用者自己加的；時間同步、憑證撤銷、系統更新照一般規則。
+/// （使用者自己加的那一組在 `comm.rs` 的單元測試：`keepNames` 是整個行程共用的，這裡其他測試建解析器時會清掉）
+#[tokio::test]
+async fn only_push_quake_and_user_names_use_prefetch_slots() {
+    use kuroshio_net::comm::TEST_ENTRIES;
+    kuroshio_net::comm::set_test_entries(TEST_ENTRIES);
+    let (up, n) = upstream(0, short_ttl).await;
+    let c = cfg(
+        &[up],
+        json!({ "resolver": { "prefetchRecentSec": 1, "fastPath": false, "rankIps": false } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let cases: Vec<(String, usize)> = vec![
+        (format!("gw.{}", kuroshio_net::comm::COMM_SUFFIXES[0].0), 2),
+        ("gw.quake.essential.example.com".into(), 2),
+        ("gw.ntp.essential.example.com".into(), 1),
+        ("gw.ocsp.essential.example.com".into(), 1),
+        ("gw.update.essential.example.com".into(), 1),
+    ];
+    // 同時跑：每個名稱各自的時間軸一樣（查一次、1.2 秒後再查一次）
+    let mut set = tokio::task::JoinSet::new();
+    let before = n.load(Ordering::SeqCst);
+    for (name, _) in cases.clone() {
+        let r = r.clone();
+        set.spawn(async move {
+            r.handle(&q(1, &name, 1), &CTX).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            r.handle(&q(2, &name, 1), &CTX).await.unwrap();
+        });
+    }
+    while set.join_next().await.is_some() {}
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let want: usize = cases.iter().map(|c| c.1).sum();
+    assert_eq!(n.load(Ordering::SeqCst) - before, want, "只有推播、地震速報有預取");
+}

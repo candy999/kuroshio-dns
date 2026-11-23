@@ -956,3 +956,82 @@ async fn comm_not_blocked_by_list_but_blocked_by_custom_rule() {
     assert!(f.check(&comm, 1).unwrap().block, "protectComm 關掉：照清單擋");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 3.5.0 F11：內建一定通過的服務（五類各一，測試用 `*.essential.example.com` 注入）：清單要擋時放行、
+/// `rule` 是 `builtin-<類別>`、每一類分開計；自訂規則要擋照擋（使用者明確要擋 NTP 也照擋）；`filter.protectComm` 關掉照清單擋
+#[tokio::test]
+async fn essential_not_blocked_by_list_but_blocked_by_custom_rule() {
+    use kuroshio::resolver::FilterCheck;
+    use kuroshio_net::comm::{CommKind, TEST_ENTRIES};
+    kuroshio_net::comm::set_test_entries(TEST_ENTRIES);
+    let list: String = TEST_ENTRIES.iter().map(|(s, _)| format!("||{s}^\n")).collect();
+    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let srv = lists_by_path(vec![("mal.txt", format!("{list}||bad.example.net^\n"))], down).await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-filter-essential-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 自訂規則擋時間同步那一個的子網域
+    std::fs::write(dir.join("custom.txt"), "||blocked.ntp.essential.example.com^\n").unwrap();
+    let make = |protect: bool| {
+        kuroshio_config::with_overrides(&json!({
+            "filter": {
+                "protectComm": protect,
+                "customRules": ["./custom.txt"],
+                "lists": [{ "name": "惡意", "url": format!("http://{srv}/mal.txt"), "category": "malware" }]
+            }
+        }))
+    };
+    let f = kuroshio::filtering::FilterService::from_cfg(&make(true), &dir).unwrap();
+    f.reload_custom(true);
+    f.update_lists(true).await.unwrap();
+    for (s, k) in TEST_ENTRIES {
+        let v = f.check(&format!("gw.{s}"), 1).unwrap();
+        assert!(!v.block && v.allow, "{k:?}：清單要擋照樣放行：{v:?}");
+        assert_eq!(v.rule, format!("builtin-{}", k.as_str()));
+    }
+    assert!(f.check("bad.example.net", 1).unwrap().block, "其他網域照擋");
+    assert!(f.check("blocked.ntp.essential.example.com", 1).unwrap().block, "自訂規則照樣優先");
+    let st = f.stats();
+    assert_eq!(st["commSpared"], 5);
+    assert_eq!(st["commSparedByKind"]["ntp"], 1);
+    assert_eq!(st["commSparedByKind"]["quake"], 1);
+    assert!(st["commSparedByKind"].get("apns").is_none(), "沒有放行過的不列");
+    assert_eq!(CommKind::Apns.rule(), "builtin-comm", "推播照舊");
+    // 關掉保護：照清單擋
+    let f = kuroshio::filtering::FilterService::from_cfg(&make(false), &dir).unwrap();
+    f.update_lists(true).await.unwrap();
+    for (s, _) in TEST_ENTRIES {
+        assert!(f.check(&format!("gw.{s}"), 1).unwrap().block, "protectComm 關掉：照清單擋 {s}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 3.5.0 F11：自訂規則放行的照樣放行（內建表只在清單要擋時介入，`rule` 是自訂規則的）
+#[tokio::test]
+async fn custom_allow_still_wins() {
+    use kuroshio::resolver::FilterCheck;
+    use kuroshio_net::comm::TEST_ENTRIES;
+    kuroshio_net::comm::set_test_entries(TEST_ENTRIES);
+    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let srv = lists_by_path(vec![("ads.txt", "||essential.example.com^\n".to_string())], down).await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-filter-essential-allow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("custom.txt"), "@@||ocsp.essential.example.com^\n").unwrap();
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "filter": {
+            "customRules": ["./custom.txt"],
+            "lists": [{ "name": "廣告", "url": format!("http://{srv}/ads.txt"), "category": "ads" }]
+        }
+    }));
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.reload_custom(true);
+    f.update_lists(true).await.unwrap();
+    let v = f.check("gw.ocsp.essential.example.com", 1).unwrap();
+    assert!(!v.block && v.allow, "{v:?}");
+    assert!(!v.rule.starts_with("builtin-"), "自訂規則先判：{v:?}");
+    assert_eq!(f.stats()["commSpared"], 0);
+    // 不在內建表裡的同網域：照清單擋
+    assert!(f.check("www.essential.example.com", 1).unwrap().block);
+    let _ = std::fs::remove_dir_all(&dir);
+}
