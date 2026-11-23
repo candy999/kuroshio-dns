@@ -373,7 +373,7 @@ fn noisy_inputs() -> FindInputs {
         },
         cdn_observe: json!({
             "reach": { "unconfirmed": 2, "v4": { "text": "www.example.com 192.0.2.7", "pops": [ { "pop": "TPE" } ] }, "v6": { "pops": [] } },
-            "popHealth": [ { "provider": "cdn.example.net", "pop": "192.0.2.1", "family": 4, "held": true, "heldUntil": NOW / 1000 + 600 } ],
+            "popSwitch": { "holds": [ { "provider": "cdn.example.net", "pop": "192.0.2.1", "family": 4, "until": NOW + 600_000, "other": "198.51.100.2" } ] },
         }),
         cdn_pruned: Some(12),
         chain: json!({ "state": "released", "reason": "tampered", "upstream": { "via": "intercept", "since": NOW - 3_600_000, "address": "192.168.1.1" },
@@ -386,6 +386,7 @@ fn noisy_inputs() -> FindInputs {
             ..FreshItem::default()
         }],
         friends_failing3: 1,
+        pool_nodes: 0,
     }
 }
 
@@ -491,7 +492,8 @@ fn rules_quiet_when_everything_is_fine() {
 fn reach_none_needs_an_hour() {
     let inp = |now| FindInputs {
         now,
-        cdn_observe: json!({ "reach": { "unconfirmed": 0, "nodes": 8, "v4": { "pops": [] }, "v6": { "pops": [] } } }),
+        cdn_observe: json!({ "reach": { "unconfirmed": 0, "v4": { "pops": [] }, "v6": { "pops": [] } } }),
+        pool_nodes: 8,
         ..FindInputs::default()
     };
     let mut e = Engine::new();
@@ -501,6 +503,43 @@ fn reach_none_needs_an_hour() {
     let (obs, _) = rules(&inp(NOW + 3_600_000), &[]);
     e.apply(&obs, NOW + 3_600_000);
     assert!(find(&e.json(), "reach-none").is_some(), "持續 1 小時");
+    // WAN 剛變動、串接中（reach.stale）不算
+    let mut stale = inp(NOW);
+    stale.cdn_observe["reach"]["stale"] = json!(true);
+    let (obs, _) = rules(&stale, &[]);
+    assert!(obs.iter().any(|o| matches!(
+        o,
+        Obs::State {
+            key: "reach-none",
+            on: false,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn pop_switched_text_reads_holds() {
+    let mut inp = FindInputs {
+        now: NOW,
+        ..FindInputs::default()
+    };
+    inp.counters.pop_switches = 1;
+    inp.counters.pop_switch_at = (NOW / 1000) as u32;
+    inp.cdn_observe = json!({ "popSwitch": { "holds": [ { "provider": "cloudflare", "family": 4, "pop": "KHH", "until": NOW + 3_600_000, "other": "TPE" } ] } });
+    let (obs, _) = rules(&inp, &[]);
+    let t = obs
+        .iter()
+        .find_map(|o| match o {
+            Obs::Event {
+                key: "pop-switched", text, ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        t.starts_with("機房切換：cloudflare 的 IPv4 把 KHH 機房的節點暫時排到後面（到 "),
+        "{t}"
+    );
 }
 
 #[test]

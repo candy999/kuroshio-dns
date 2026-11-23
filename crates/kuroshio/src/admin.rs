@@ -701,20 +701,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             }
             // `lite=1`（LuCI 的 rpcd、padavan 韌體每幾秒讀一次）：不回大的欄位（`perf`、`history`；規格 11 C12、E9）
             let lite = flag(q, "lite");
-            // 線路感知（3.5.0 E3～E7）：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil`；
-            // `status_lite()` 自己已經帶的不蓋掉
-            let cdn = r
-                .cdn()
-                .map(|c| {
-                    let mut v = c.status_lite();
-                    if let (Some(o), Value::Object(extra)) = (v.as_object_mut(), c.observe_json()) {
-                        for (k, x) in extra {
-                            o.entry(k).or_insert(x);
-                        }
-                    }
-                    v
-                })
-                .unwrap_or_else(|| json!({ "enabled": false }));
+            // 線路感知（3.5.0 E3～E7）：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil` 由 `status_lite()` 帶出
+            let cdn = r.cdn().map(|c| c.status_lite()).unwrap_or_else(|| json!({ "enabled": false }));
             let mut out = json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1

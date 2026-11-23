@@ -956,26 +956,16 @@ impl Resolver {
     }
 
     /// 串接中的機房抽查（3.5.0 E4，規格 11）：只在答案抽查握手通過之後、拿著同一個抽查名額時呼叫。
-    /// 節點池裡上游宣稱機房（`upPop`）還沒確認的節點才量（`Cdn::pop_audit_wanted()`），用健檢同一個探測
-    /// （那家 CDN 的 `probe` 路徑）拿到機房、交給 `Cdn::note_local_pop()` 比對。上限：10 分鐘 1 個、一天 24 個
-    /// （`cdn.lite`：30 分鐘 1 個、一天 8 個）、每個節點量到就不再量；記憶體壓力、沒對時、沒串接時 `maybe_audit` 本來就不做
+    /// 節點池裡上游宣稱機房（`upPop`）還沒確認的節點才量（`Cdn::pop_audit_wanted()`；上限在 CDN 那一層：
+    /// 10 分鐘 1 個、24 小時 24 個、每個節點一次，`cdn.lite` 30 分鐘 1 個、8 個；`cdn.popAudit` 關、記憶體壓力時回 None），
+    /// 用健檢同一個探測（那家 CDN 的 `probe` 路徑）拿到機房、交給 `Cdn::note_local_pop()` 比對。
+    /// 不動答案抽查的可疑計數、不解除串接（機房不同是線路拓樸，不是不可信）
     async fn pop_audit(&self, ip: IpAddr) {
-        let Some(cdn) = self.cdn().filter(|c| c.cfg.pop_audit) else {
-            return;
-        };
-        if crate::app::pressure() != crate::sysinfo::Pressure::Normal {
-            return;
-        }
-        let audit = &crate::chain::audit::AUDIT;
-        let now_s = crate::memgov::steady_secs();
-        if !audit.pop_allowed(now_s, cdn.cfg.lite) {
-            return;
-        }
+        let Some(cdn) = self.cdn() else { return };
         let Some(provider) = cdn.pop_audit_wanted(ip) else { return };
         let Some((prov, (host, path))) = kuroshio_cdn::providers::get(provider).and_then(|p| Some((p, p.probe?))) else {
             return;
         };
-        audit.pop_note(now_s);
         let r = cdn.net().http_probe(ip, host, path, Duration::from_secs(3)).await;
         if !r.ok {
             return;

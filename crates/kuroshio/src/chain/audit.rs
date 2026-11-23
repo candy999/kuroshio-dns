@@ -20,12 +20,6 @@ pub const MIN_GAP_SECS: u64 = 30;
 pub const SUSPICIOUS_LIMIT: usize = 3;
 /// 可疑的累積期間（毫秒）
 pub const WINDOW_MS: u64 = 3600 * 1000;
-/// 串接中的機房抽查（3.5.0 E4）：搭答案抽查的名額，另外再限兩次之間的間隔（秒）與每天幾個；
-/// `cdn.lite`（小機器減量）時放寬間隔、減少個數（減量，不是關掉）
-pub const POP_GAP_SECS: u64 = 600;
-pub const POP_DAY_MAX: u32 = 24;
-pub const POP_GAP_SECS_LITE: u64 = 1800;
-pub const POP_DAY_MAX_LITE: u32 = 8;
 
 /// 一次抽查的結果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,11 +46,6 @@ struct State {
     last: Option<Value>,
     /// 因為抽查解除串接的次數
     releases: u64,
-    /// 機房抽查（E4）：上一次的單調時鐘秒、今天（單調時鐘的日序）做了幾個、累計
-    pop_last: Option<u64>,
-    pop_day: u64,
-    pop_today: u32,
-    pop_probes: u64,
 }
 
 pub struct Audit {
@@ -94,10 +83,6 @@ impl Audit {
                 recent: VecDeque::new(),
                 last: None,
                 releases: 0,
-                pop_last: None,
-                pop_day: 0,
-                pop_today: 0,
-                pop_probes: 0,
             }),
         }
     }
@@ -144,32 +129,6 @@ impl Audit {
         false
     }
 
-    /// 機房抽查（3.5.0 E4）還有沒有名額：10 分鐘最多 1 個、一天最多 24 個（`lite`：30 分鐘 1 個、一天 8 個）。
-    /// 只在拿著答案抽查的名額（[`Audit::claim`]，同時一個）時呼叫，所以「看名額 → 記一次」不會兩個同時
-    pub fn pop_allowed(&self, now_s: u64, lite: bool) -> bool {
-        let (gap, max) = if lite {
-            (POP_GAP_SECS_LITE, POP_DAY_MAX_LITE)
-        } else {
-            (POP_GAP_SECS, POP_DAY_MAX)
-        };
-        let st = self.st.lock().unwrap();
-        let today = if st.pop_day == now_s / 86_400 { st.pop_today } else { 0 };
-        today < max && st.pop_last.map_or(true, |t| now_s >= t + gap)
-    }
-
-    /// 做了一次機房抽查
-    pub fn pop_note(&self, now_s: u64) {
-        let mut st = self.st.lock().unwrap();
-        let day = now_s / 86_400;
-        if st.pop_day != day {
-            st.pop_day = day;
-            st.pop_today = 0;
-        }
-        st.pop_today += 1;
-        st.pop_probes += 1;
-        st.pop_last = Some(now_s);
-    }
-
     /// `/api/status` 的 `chain.audit`
     pub fn status_json(&self) -> Value {
         let st = self.st.lock().unwrap();
@@ -182,9 +141,6 @@ impl Audit {
             "recentSuspicious": st.recent.len(),
             "releases": st.releases,
             "last": st.last,
-            // 3.5.0 E4：串接中的機房抽查（累計、今天）
-            "popProbes": st.pop_probes,
-            "popProbesToday": st.pop_today,
         })
     }
 }
@@ -238,35 +194,5 @@ mod tests {
         assert!(!a.record(Outcome::SiteInvalid, "g.example", "192.0.2.7", 1_000 + h + 50));
         assert!(!a.record(Outcome::Unverified, "h.example", "192.0.2.8", 1_000 + h + 60));
         assert_eq!(a.status_json()["siteInvalid"], 1);
-    }
-
-    /// 3.5.0 E4：機房抽查搭答案抽查的名額，另外 10 分鐘 1 個、一天 24 個；cdn.lite 是 30 分鐘 1 個、一天 8 個
-    #[test]
-    fn chained_pop_probe_uses_audit_slot_and_is_capped() {
-        let a = Audit::new();
-        let t0 = 10 * 86_400;
-        assert!(a.pop_allowed(t0, false));
-        a.pop_note(t0);
-        assert!(!a.pop_allowed(t0 + 599, false), "10 分鐘內不再一個");
-        assert!(a.pop_allowed(t0 + 600, false));
-        let mut t = t0;
-        for _ in 1..POP_DAY_MAX {
-            t += 600;
-            assert!(a.pop_allowed(t, false));
-            a.pop_note(t);
-        }
-        assert!(!a.pop_allowed(t + 600, false), "一天最多 24 個");
-        assert_eq!(a.status_json()["popProbes"], 24);
-        assert!(a.pop_allowed(t0 + 86_400, false), "隔天重新算");
-        // 小機器減量
-        let b = Audit::new();
-        b.pop_note(t0);
-        assert!(!b.pop_allowed(t0 + 600, true));
-        assert!(b.pop_allowed(t0 + 1800, true));
-        for k in 1..POP_DAY_MAX_LITE as u64 {
-            b.pop_note(t0 + k * 1800);
-        }
-        assert!(!b.pop_allowed(t0 + 20 * 1800, true), "lite 一天 8 個");
-        assert!(b.pop_allowed(t0 + 20 * 1800, false));
     }
 }

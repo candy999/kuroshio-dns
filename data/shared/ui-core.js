@@ -447,7 +447,7 @@
 		var fuseAt = msOf(cdn.slowerFuseUntil);
 		return {
 			lines: lines,
-			note: r.stale ? t('WAN 變動後還沒重新確認（下一輪健檢會更新）') : null,
+			note: r.stale ? t('還沒重新確認（WAN 剛變動、或串接中節點由上游處理；下一輪健檢會更新）') : null,
 			unconfirmed: r.unconfirmed ? format(t('另有 %d 個上游給的節點還沒在這台確認機房'), [r.unconfirmed]) : null,
 			pops: pops,
 			nearby: (r.nearby || []).map(function (n) { return { provider: n.provider || '-', pop: n.pop || '-', prefixes: n.prefixes || 0 }; }),

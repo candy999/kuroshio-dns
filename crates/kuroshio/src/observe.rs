@@ -541,6 +541,8 @@ pub struct FindInputs {
     pub fresh: Vec<FreshItem>,
     /// 好友：連續 3 次以上同步失敗的有幾個
     pub friends_failing3: usize,
+    /// 節點池裡可用的節點數（不含壞的、最近節點型；`reach-none` 用）
+    pub pool_nodes: usize,
 }
 
 fn state(key: &'static str, sev: Sev, on: bool, text: String) -> Obs {
@@ -710,11 +712,11 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
             single,
             format!("這條線目前只到得了{}機房", c4.first().copied().unwrap_or("")),
         ));
-        let nodes = reach["nodes"].as_u64().unwrap_or(0) + reach["unconfirmed"].as_u64().unwrap_or(0);
+        // 節點池有節點（不含壞的、最近節點型）但沒有任何一個確認在台灣機房；WAN 剛變動、串接中（reach.stale）不算
         out.push(Obs::State {
             key: "reach-none",
             sev: Sev::Warn,
-            on: p4.is_empty() && p6.is_empty() && nodes > 0,
+            on: p4.is_empty() && p6.is_empty() && i.pool_nodes > 0 && reach["stale"] != true,
             text: "節點池有節點，但超過 1 小時沒有任何一個確認在台灣機房".into(),
             hold_ms: HOUR_MS,
         });
@@ -733,13 +735,14 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
         });
     }
     if c.pop_switches > 0 {
-        let held = i.cdn_observe["popHealth"]
+        // 目前暫緩哪個機房、到幾點（`popSwitch.holds[]`：provider、family、pop、until 毫秒、other）
+        let held = i.cdn_observe["popSwitch"]["holds"]
             .as_array()
-            .and_then(|a| a.iter().find(|h| h["held"] == true))
+            .and_then(|a| a.first())
             .and_then(|h| {
                 let p = safe_name(h["provider"].as_str()?)?;
                 let pop = safe_pop(h["pop"].as_str()?)?;
-                let until = h["heldUntil"].as_u64().map(|t| {
+                let until = h["until"].as_u64().map(|t| {
                     let t = if t < 10_000_000_000 { t * 1000 } else { t };
                     kuroshio_jobs::time::fmt_date_time(t)
                 });
@@ -813,6 +816,15 @@ fn find_inputs(st: &AppState, now: u64) -> FindInputs {
         stale_15m: r.stats.stale_15m(),
         counters: cdn.as_ref().map(|c| c.observe_counters()).unwrap_or_default(),
         cdn_observe: cdn.as_ref().map(|c| c.observe_json()).unwrap_or(Value::Null),
+        pool_nodes: cdn.as_ref().map_or(0, |c| {
+            let st = c.state();
+            st.pools
+                .p
+                .iter()
+                .filter(|(name, _)| kuroshio_cdn::providers::get(name).is_some_and(|p| !p.nearest))
+                .map(|(_, d)| d.pool4.iter().chain(&d.pool6).filter(|x| !d.bad.contains_key(&x.ip)).count())
+                .sum()
+        }),
         cdn_pruned: cdn
             .as_ref()
             .and_then(|c| c.status_lite()["prunedForBudget"].as_u64())

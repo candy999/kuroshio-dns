@@ -963,6 +963,11 @@ fn register_cdn_jobs(sched: &Arc<kuroshio_jobs::Scheduler>, cdn: &Arc<kuroshio_c
             Ok(())
         }
     });
+    // 3.5.0 E4、E5：這台目前的情況（串接中、記憶體壓力）。每輪健檢與抽查詢問時才讀，不在查詢路徑上
+    cdn.set_line_env(|| kuroshio_cdn::LineEnv {
+        chained: crate::chain::cdn_by_upstream(),
+        memory_normal: pressure() == crate::sysinfo::Pressure::Normal,
+    });
     // 某一家的節點不夠：提早跑節點池。同一家一直不夠（重建也補不起來，例如沒有 IPv6 對外連線）時退避：
     // 距上次執行至少 1 小時 → 6 小時 → 24 小時；超過 26 小時沒再發生就回到 1 小時
     let weak = Arc::downgrade(sched);
