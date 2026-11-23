@@ -41,12 +41,12 @@ fn ranked(ms: f64, mbps: Option<f64>) -> Ranked {
     }
 }
 
+/// 3.5.0 F16：誤差範圍 `clamp(0.05 + 0.035 ÷ √秒, 0.06, 0.18)`，規格的表
 #[test]
-fn tolerance_shrinks_with_duration_and_is_clamped() {
-    // 傳輸時間越短，誤差範圍越大；有上下限
-    assert!((tolerance(0.13) - 0.337).abs() < 0.005, "{}", tolerance(0.13));
-    assert!((tolerance(1.5) - 0.142).abs() < 0.005, "{}", tolerance(1.5));
-    assert!((tolerance(5.0) - 0.105).abs() < 0.005, "{}", tolerance(5.0));
+fn tolerance_v2_table() {
+    for (secs, want) in [(0.13, 0.147), (0.5, 0.099), (1.5, 0.079), (3.8, 0.068)] {
+        assert!((tolerance(secs) - want).abs() < 0.001, "{secs} 秒：{}", tolerance(secs));
+    }
     assert_eq!(tolerance(0.01), speed::TOL_MAX);
     assert_eq!(tolerance(0.0), speed::TOL_MAX, "沒有時間：當成最不準");
     assert_eq!(tolerance(f64::NAN), speed::TOL_MAX);
@@ -56,24 +56,105 @@ fn tolerance_shrinks_with_duration_and_is_clamped() {
         assert!(tolerance(s) <= last, "{s}");
         last = tolerance(s);
     }
+    // 每一段都留實測最大差距的 1.5 倍以上（0.13 秒 9%、1.5 秒 4%、3.8 秒 5%）
+    assert!(tolerance(0.13) >= 0.09 * 1.5 && tolerance(1.5) >= 0.04 * 1.5 && tolerance(3.8) >= 0.045 * 1.5);
+}
+
+/// 3.5.0 F16：W3、D7 的實測（不含 TTFB）收緊之後照樣判成瓶頸
+#[test]
+fn bottleneck_still_detected_on_w3_and_d7_samples() {
+    // W3 Cloudflare 連測：56.7～61.9 MB/s（約 0.13 秒，差 9%）
+    let w3 = [sample(56.7, 0.141), sample(61.9, 0.129), sample(59.0, 0.136), sample(60.2, 0.133)];
+    assert_eq!(same_speed(&w3), Some(60.2));
+    let w3b = [sample(61.8, 0.129), sample(62.4, 0.128), sample(62.0, 0.129), sample(62.1, 0.129)];
+    assert!(same_speed(&w3b).is_some());
+    // W3 CloudFront：5.38～5.58（約 1.5 秒）
+    let cfr = [sample(5.38, 1.49), sample(5.58, 1.43), sample(5.45, 1.47), sample(5.5, 1.45)];
+    assert!(same_speed(&cfr).is_some());
+    // D7：Cloudflare 2.07～2.15、CloudFront 2.07～2.18（約 3.8 秒）
+    let d7cf = [sample(2.07, 3.86), sample(2.15, 3.72), sample(2.12, 3.77), sample(2.1, 3.81)];
+    let d7cfr = [sample(2.07, 3.86), sample(2.18, 3.67), sample(2.1, 3.81), sample(2.12, 3.77)];
+    assert!(same_speed(&d7cf).is_some() && same_speed(&d7cfr).is_some());
+    // 3.4.x 看到的「差 27%」（把 TTFB 算進速度）收緊之後不再算瓶頸：那麼大的差距在不含 TTFB 的量法裡是真的差別
+    let v = [sample(61.5, 0.13), sample(48.0, 0.166), sample(65.7, 0.122), sample(55.0, 0.145)];
+    assert_eq!(same_speed(&v), None);
+    // 原本就判得出來的照舊
+    assert_eq!(same_speed(&[full(61.2), full(61.4), full(60.9), full(61.3)]), Some(61.3));
+    assert_eq!(same_speed(&[full(5.5), full(5.4), full(5.6), full(5.5)]), Some(5.5));
+}
+
+/// 3.5.0 F16：W3「關」的那一輪看得到 40.8～63.5 的節點；前 4 個裡有一個 45 MB/s 就不啟動減量（那個節點是真的比較慢）
+#[test]
+fn bottleneck_not_detected_with_one_45_among_61() {
+    let v = [sample(61.3, 0.13), sample(61.4, 0.13), sample(45.0, 0.178), sample(61.2, 0.131)];
+    assert_eq!(same_speed(&v), None);
+    let ok = [sample(61.3, 0.13), sample(61.4, 0.13), sample(61.1, 0.131), sample(61.2, 0.131)];
+    assert!(same_speed(&ok).is_some());
+}
+
+/// 帶「前 1 MiB」時間的完整測樣本
+fn full_head(mbps: f64, head_secs: f64) -> SpeedSample {
+    SpeedSample { head_secs, ..full(mbps) }
+}
+
+/// 3.5.0 F16：快測門檻跟完整測的「前 1 MiB」比。CloudFront 快測 1 MiB 花 0.89 秒（1.15 MB/s，完整測的 21%：開頭慢）
+#[test]
+fn quick_floor_uses_first_mib_reference() {
+    let first = [
+        full_head(5.45, 0.87),
+        full_head(5.4, 0.88),
+        full_head(5.5, 0.86),
+        full_head(5.46, 0.87),
+    ];
+    let q = speed::quick_ref(&first).unwrap();
+    assert!((q - 1.15).abs() < 0.01, "{q}");
+    let floor = speed::quick_floor_ref(q, 0.89);
+    assert!((0.50..0.55).contains(&floor), "{floor}");
+    assert!(1.15 / floor >= 2.0, "餘裕 2 倍以上（舊公式只有 1.4 倍）");
+    // 舊公式：min(參考 × 0.5, 1) × (1 − 誤差)
+    let old = speed::quick_floor(5.45, 0.89);
+    assert!(1.15 / old < 1.4, "{old}");
+    // Cloudflare：前 1 MiB 約 35～50 MB/s → 門檻約 15～21
+    let cf = [
+        full_head(61.0, 0.025),
+        full_head(61.2, 0.024),
+        full_head(60.9, 0.026),
+        full_head(61.1, 0.025),
+    ];
+    let f = speed::quick_floor_ref(speed::quick_ref(&cf).unwrap(), 0.025);
+    assert!((15.0..=21.0).contains(&f), "{f}");
 }
 
 #[test]
-fn bottleneck_detected_on_fast_line_27_percent_spread() {
-    // Windows 實測：Cloudflare 4 個節點 8 MiB 各約 0.13 秒、速度差 27%。以前（5%）不算瓶頸，每個節點都收滿
-    let v = [sample(61.5, 0.13), sample(48.0, 0.166), sample(65.7, 0.122), sample(55.0, 0.145)];
+fn quick_floor_falls_back_without_head_secs() {
+    assert_eq!(
+        speed::quick_ref(&[full(5.45), full(5.4), full(5.5), full(5.46)]),
+        None,
+        "假的網路、舊資料"
+    );
+    // 只有 2 個量到前 1 MiB：不夠
+    assert_eq!(
+        speed::quick_ref(&[full_head(5.45, 0.87), full_head(5.4, 0.88), full(5.5), full(5.46)]),
+        None
+    );
+    assert!(
+        (speed::quick_floor(5.45, 0.89) - (1.0 - tolerance(0.89))).abs() < 1e-9,
+        "照 B1 的公式"
+    );
+}
+
+#[test]
+fn bottleneck_detected_on_fast_line_9_percent_spread() {
+    let v = [sample(61.5, 0.13), sample(57.0, 0.14), sample(61.9, 0.129), sample(59.0, 0.136)];
     assert_eq!(same_speed(&v), Some(61.5), "中位數");
     assert_eq!(
         same_speed_legacy(&v.iter().map(|s| s.mbps).collect::<Vec<_>>()),
         None,
-        "3.4.x：減量不啟動"
+        "3.4.x（5%）：減量不啟動"
     );
-    // 傳輸時間長（量得準）的時候，27% 就是真的差別
-    let slow_line = [sample(6.15, 1.3), sample(4.8, 1.66), sample(6.57, 1.22), sample(5.5, 1.45)];
+    // 傳輸時間長（量得準）的時候，11% 就是真的差別
+    let slow_line = [sample(6.15, 1.3), sample(5.5, 1.45), sample(6.19, 1.29), sample(5.9, 1.36)];
     assert_eq!(same_speed(&slow_line), None);
-    // 原本就判得出來的照舊
-    assert_eq!(same_speed(&[full(61.2), full(61.4), full(60.9), full(61.3)]), Some(61.3));
-    assert_eq!(same_speed(&[full(5.5), full(5.4), full(5.6), full(5.5)]), Some(5.5));
 }
 
 #[test]
@@ -93,12 +174,12 @@ fn zeros_not_counted() {
     assert_eq!(same_speed(&[full(61.0), full(0.0), full(61.0), full(61.0)]), None);
     assert_eq!(same_speed(&[sample(0.05, 8.0); 4]), None);
     assert_eq!(same_speed(&[]), None);
-    // 慢的線路（每個都 0.25 MB/s）：以前「都在 1 MB/s 以下不算瓶頸」，現在一樣是瓶頸
+    // 慢的線路（每個都約 0.25 MB/s）：以前「都在 1 MB/s 以下不算瓶頸」，現在一樣是瓶頸
     assert_eq!(
-        same_speed(&[sample(0.25, 8.0), sample(0.24, 8.0), sample(0.26, 8.0), sample(0.25, 8.0)]),
+        same_speed(&[sample(0.25, 8.0), sample(0.245, 8.0), sample(0.255, 8.0), sample(0.25, 8.0)]),
         Some(0.25)
     );
-    assert_eq!(same_speed_legacy(&[0.25, 0.24, 0.26, 0.25]), None);
+    assert_eq!(same_speed_legacy(&[0.25, 0.245, 0.255, 0.25]), None);
 }
 
 #[test]
@@ -167,14 +248,16 @@ fn speed_classes_then_latency() {
     let mut x = v.to_vec();
     x[1].loss = 0.2;
     assert_eq!(order(&x, true)[3], 1);
-    // 級別：每慢一個誤差範圍多一級
-    assert_eq!(speed_class(Some(60.0), false, 61.0, 0.3), 0);
-    assert_eq!(speed_class(Some(43.0), false, 61.0, 0.3), 0);
-    assert_eq!(speed_class(Some(42.0), false, 61.0, 0.3), 1);
-    assert_eq!(speed_class(Some(29.0), false, 61.0, 0.3), 2);
-    assert_eq!(speed_class(None, false, 61.0, 0.3), speed::CLASS_UNMEASURED);
-    assert_eq!(speed_class(Some(0.0), false, 61.0, 0.3), speed::CLASS_UNMEASURED);
-    assert_eq!(speed_class(Some(60.0), true, 61.0, 0.3), speed::CLASS_SLOW);
+    // 級別：每慢一個誤差範圍多一級（3.5.0 F16：差 15% 以上才算不同級）
+    assert_eq!(speed_class(Some(60.0), false, 61.0, 0.15), 0);
+    assert_eq!(speed_class(Some(52.0), false, 61.0, 0.15), 0);
+    assert_eq!(speed_class(Some(51.0), false, 61.0, 0.15), 1);
+    assert_eq!(speed_class(Some(40.0), false, 61.0, 0.15), 2);
+    assert_eq!(speed_class(Some(60.8), false, 61.2, 0.15), 0, "61.2 與 60.8 仍然同一級");
+    assert_eq!(speed_class(Some(40.0), false, 61.0, 0.3), 2, "誤差範圍最多 0.18");
+    assert_eq!(speed_class(None, false, 61.0, 0.15), speed::CLASS_UNMEASURED);
+    assert_eq!(speed_class(Some(0.0), false, 61.0, 0.15), speed::CLASS_UNMEASURED);
+    assert_eq!(speed_class(Some(60.0), true, 61.0, 0.15), speed::CLASS_SLOW);
 }
 
 #[test]
@@ -288,9 +371,9 @@ fn calls(net: &MockNet) -> (usize, usize) {
 
 #[tokio::test]
 async fn pool_job_fast_line_noisy_speeds_start_reduction() {
-    // 快的線路：8 MiB 約 0.13 秒，各節點差到 27%。3.5.0 判成瓶頸，其餘只收 1 MiB；
+    // 快的線路：8 MiB 約 0.13 秒，各節點差到 9%（W3）。3.5.0 判成瓶頸，其餘只收 1 MiB；
     // 節點依延遲排（不是依雜訊），每個節點最多一次下載（流量只少不多）
-    const MBPS: [f64; 8] = [61.5, 48.0, 65.7, 55.0, 58.0, 50.0, 63.0, 52.0];
+    const MBPS: [f64; 8] = [61.5, 57.0, 61.9, 59.0, 58.0, 60.0, 56.7, 61.0];
     let run = |relative: bool| async move {
         let (ctx, net) = pool_ctx(8, json!({ "pool": { "relativeSpeed": relative } }));
         net.on_sample(|i, max| SpeedSample::from_mbps(MBPS[third(i)], max));
@@ -312,7 +395,7 @@ async fn pool_job_fast_line_noisy_speeds_start_reduction() {
     // 3.4.x 的規則：5% 門檻不成立，8 個都收滿；名次由雜訊決定
     let (c, order, bytes, pool, sref) = run(false).await;
     assert_eq!(c, (8, 0));
-    assert_eq!(order, [2, 6, 0, 4, 3, 7, 5, 1], "速度大的在前");
+    assert_eq!(order, [2, 0, 7, 5, 3, 4, 1, 6], "速度大的在前");
     assert_eq!(bytes, 8 * 8 * MIB);
     assert!(pool.iter().all(|n| n.slow.is_none()), "舊規則不寫旗標");
     assert_eq!(sref, None);
@@ -324,7 +407,7 @@ async fn pool_job_slow_line_is_bottleneck_and_nobody_is_penalized() {
     // 3.5.0：判成瓶頸、其餘快測（確認「不低於參考的一半」），沒有人被標成慢
     let (ctx, net) = pool_ctx(6, json!({}));
     net.on_sample(|i, max| {
-        let mbps = [0.25, 0.24, 0.26, 0.25, 0.20, 0.05][third(i)];
+        let mbps = [0.25, 0.245, 0.255, 0.25, 0.20, 0.05][third(i)];
         let secs = (max as f64 / MIB as f64 / mbps).min(8.0);
         sample(mbps, secs)
     });
@@ -460,4 +543,245 @@ fn replay_seed_fastly_slow_marks_on_three_lines() {
     let (old, new) = marks(10.0);
     assert_eq!(old, [false, false, false, false, false]);
     assert_eq!(new, [false, false, true, true, false]);
+}
+
+// ------------------------------------------------------------ 3.5.0 F15：測速被對方限流
+
+/// 第 `limit_at` 次下載（從 0 算）起回 `status`；之前照 `mbps` 回（完整測、時間由速度回推）
+fn limited_net(net: &MockNet, mbps: f64, limit_at: usize, status: u16) {
+    let k = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    net.on_sample(move |_, max| {
+        if k.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= limit_at {
+            SpeedSample {
+                status,
+                connect_ms: 4.0,
+                ttfb_ms: 9.0,
+                ..Default::default()
+            }
+        } else {
+            SpeedSample::from_mbps(mbps, max)
+        }
+    });
+}
+
+fn pool_of(ctx: &crate::jobs::JobCtx) -> Vec<PoolNode> {
+    ctx.cdn.state().pools.p["cloudflare"].pool4.clone()
+}
+
+#[tokio::test]
+async fn speed_test_stops_for_provider_after_first_429() {
+    for status in [429, 503] {
+        let (ctx, net) = pool_ctx(8, json!({}));
+        limited_net(&net, 5.0, 2, status);
+        pool::run(&ctx).await.unwrap();
+        assert_eq!(net.calls("speed").len(), 3, "第 3 個被限流：之後 0 次下載（HTTP {status}）");
+        let pool = pool_of(&ctx);
+        assert_eq!(pool.len(), 8, "節點池照建（照延遲）");
+        let measured = pool.iter().filter(|n| n.speed.get().is_some()).count();
+        assert_eq!(measured, 2, "沒量到的不記成 0 MB/s");
+        assert!(pool.iter().all(|n| n.speed != Num::V(0.0)));
+    }
+}
+
+#[tokio::test]
+async fn unmeasured_nodes_keep_speed_none_in_both_rule_sets() {
+    for relative in [true, false] {
+        let (ctx, net) = pool_ctx(5, json!({ "pool": { "relativeSpeed": relative } }));
+        net.on_sample(|i, max| {
+            if third(i) == 1 {
+                SpeedSample {
+                    status: 403,
+                    ..Default::default()
+                }
+            } else {
+                SpeedSample::from_mbps(11.8, max)
+            }
+        });
+        pool::run(&ctx).await.unwrap();
+        assert_eq!(net.calls("speed").len(), 5, "其他失敗不停測");
+        let pool = pool_of(&ctx);
+        let n1 = pool.iter().find(|n| third(n.ip) == 1).unwrap();
+        assert_eq!(n1.speed.get(), None, "relative {relative}");
+        assert_eq!(n1.is_slow(), None, "沒量到不是慢");
+        assert_eq!(qscore(n1), n1.ms.or(0.0), "舊規則也不再加 80 分");
+        let order: Vec<usize> = pool.iter().map(|n| third(n.ip)).collect();
+        assert_eq!(*order.last().unwrap(), 1, "排在量到的後面（{order:?}）");
+    }
+}
+
+#[tokio::test]
+async fn rate_limited_round_reuses_previous_speed_up_to_three_rounds() {
+    let (ctx, net) = pool_ctx(5, json!({}));
+    net.on_sample(|i, max| SpeedSample::from_mbps([11.8, 4.0, 11.7, 11.9, 9.0][third(i)], max));
+    pool::run(&ctx).await.unwrap();
+    let first = pool_of(&ctx);
+    let slow1 = first.iter().find(|n| third(n.ip) == 1).unwrap().slow;
+    assert_eq!(slow1, Some(true));
+    // 之後每一輪一開始就被限流：沿用上一輪的速度與 slow，標第幾輪；參考速度沿用
+    for round in 1..=4u32 {
+        net.on_sample(|_, _| SpeedSample {
+            status: 429,
+            ..Default::default()
+        });
+        pool::run(&ctx).await.unwrap();
+        let pool = pool_of(&ctx);
+        let n1 = pool.iter().find(|n| third(n.ip) == 1).unwrap();
+        let n0 = pool.iter().find(|n| third(n.ip) == 0).unwrap();
+        if round <= 3 {
+            assert_eq!((n0.speed, n0.speed_age), (Num::V(11.8), Some(round)), "第 {round} 輪");
+            assert_eq!((n1.speed, n1.slow), (Num::V(4.0), Some(true)), "旗標照舊");
+            assert_eq!(*pool.last().unwrap(), *n1, "慢的照樣排最後");
+            assert_eq!(ctx.cdn.state().pools.p["cloudflare"].rest["speedRef"], 11.7);
+        } else {
+            assert_eq!((n0.speed.get(), n0.speed_age), (None, None), "最多沿用 3 輪");
+            assert!(
+                ctx.cdn.state().pools.p["cloudflare"].rest.get("speedRef").is_some(),
+                "參考值沿用上一輪的"
+            );
+        }
+    }
+    // 下一輪沒被限流：自己恢復，speedAge 拿掉
+    net.on_sample(|i, max| SpeedSample::from_mbps([11.8, 4.0, 11.7, 11.9, 9.0][third(i)], max));
+    pool::run(&ctx).await.unwrap();
+    assert!(pool_of(&ctx).iter().all(|n| n.speed_age.is_none() && n.speed.get().is_some()));
+    assert!(ctx.cdn.pools_status()["cloudflare"]["speedRefWhy"].is_null());
+}
+
+#[tokio::test]
+async fn speed_ref_missing_reason_is_logged_and_reported() {
+    // 限流、上一輪也沒有參考速度
+    let (ctx, net) = pool_ctx(5, json!({}));
+    limited_net(&net, 5.0, 1, 429);
+    pool::run(&ctx).await.unwrap();
+    let st = ctx.cdn.pools_status();
+    assert_eq!(st["cloudflare"]["speedRef"], Value::Null);
+    assert_eq!(st["cloudflare"]["speedRefWhy"], "被限流（HTTP 429）");
+    // 量到的不夠 3 個
+    let (ctx, net) = pool_ctx(5, json!({}));
+    net.on_sample(|i, max| {
+        if third(i) < 2 {
+            SpeedSample::from_mbps(5.0, max)
+        } else {
+            SpeedSample::default()
+        }
+    });
+    pool::run(&ctx).await.unwrap();
+    assert_eq!(
+        ctx.cdn.pools_status()["cloudflare"]["speedRefWhy"],
+        "量到速度的節點只有 2 個（要 3 個）"
+    );
+}
+
+#[test]
+fn log_prints_status_not_zero_mbps() {
+    let ip = ip("192.0.2.1");
+    let s403 = SpeedSample {
+        status: 403,
+        connect_ms: 4.0,
+        ttfb_ms: 9.0,
+        ..Default::default()
+    };
+    let line = pool::speed_line(ip, "TPE", 3.0, &s403, None);
+    assert!(line.contains("沒量到（HTTP 403）") && !line.contains("0 MB/s"), "{line}");
+    let line = pool::speed_line(ip, "TPE", 3.0, &SpeedSample::default(), None);
+    assert!(line.contains("沒量到（連線失敗）"), "{line}");
+    let ok = SpeedSample {
+        head_secs: 0.87,
+        ..full(5.45)
+    };
+    let line = pool::speed_line(ip, "TPE", 3.0, &ok, None);
+    assert!(line.contains("5.45 MB/s（8192 KB／") && line.contains("前 1 MiB 0.87 秒"), "{line}");
+    assert!(pool::rate_limited(429) && pool::rate_limited(503) && !pool::rate_limited(403));
+}
+
+/// 3.5.0 F6（H12）：快測那一行印實際量到的速度，排序用的另外寫
+#[test]
+fn quick_test_log_shows_measured_speed() {
+    let q = sample(1.15, 0.89);
+    let line = pool::speed_line(ip("192.0.2.1"), "TPE", 3.0, &q, Some((true, 5.45)));
+    assert!(line.contains("1.15 MB/s（快測，通過；排序用 5.45）"), "{line}");
+    let line = pool::speed_line(ip("192.0.2.1"), "TPE", 3.0, &sample(0.3, 3.3), Some((false, 0.52)));
+    assert!(line.contains("0.3 MB/s（快測，低於門檻 0.52，算慢）"), "{line}");
+}
+
+/// 3.5.0 F16：節點池工作的快測門檻用完整測的前 1 MiB（`quickRef`），CloudFront 開頭慢的節點照樣通過
+#[tokio::test]
+async fn pool_job_quick_test_uses_first_mib_reference() {
+    let run = |relative: bool| async move {
+        let (ctx, net) = pool_ctx(6, json!({ "pool": { "relativeSpeed": relative } }));
+        net.on_sample(|i, max| {
+            if max <= MIB {
+                // 快測：1 MiB 花 0.89 秒（1.15 MB/s）；最後一個真的很慢
+                let secs = if third(i) == 5 { 4.0 } else { 0.89 };
+                SpeedSample {
+                    mbps: (1.0 / secs * 100.0f64).round() / 100.0,
+                    bytes: MIB,
+                    secs,
+                    status: 200,
+                    head_secs: secs,
+                    ..Default::default()
+                }
+            } else {
+                full_head([5.45, 5.4, 5.5, 5.46, 0.0, 0.0][third(i)], 0.87)
+            }
+        });
+        pool::run(&ctx).await.unwrap();
+        let (pool, q) = {
+            let st = ctx.cdn.state();
+            let d = &st.pools.p["cloudflare"];
+            (d.pool4.clone(), d.rest.get("quickRef").cloned())
+        };
+        (pool, q, ctx.cdn.pools_status())
+    };
+    let (pool, qref, status) = run(true).await;
+    assert_eq!(qref, Some(json!(1.15)));
+    assert_eq!(status["cloudflare"]["quickRef"], 1.15);
+    let by = |k: usize| pool.iter().find(|n| third(n.ip) == k).unwrap().clone();
+    assert_eq!(
+        (by(4).speed, by(4).slow),
+        (Num::V(5.46), Some(false)),
+        "1.15 對門檻約 0.52：通過（記成瓶頸的速度）"
+    );
+    assert_eq!((by(5).speed, by(5).slow), (Num::V(0.25), Some(true)));
+    assert_eq!(by(0).sample.as_ref().unwrap().head_secs, Num::V(0.87), "樣本多 headSecs");
+    // pool.relativeSpeed 關：3.4.x 的規則（1 MB/s），沒有 quickRef
+    let (pool, qref, _) = run(false).await;
+    assert_eq!(qref, None);
+    let by = |k: usize| pool.iter().find(|n| third(n.ip) == k).unwrap().clone();
+    assert_eq!(by(5).speed, Num::V(0.25));
+    assert_eq!(by(5).slow, None, "舊規則不寫旗標");
+}
+
+/// 3.5.0 F16：W3（開／關）、D7（開／關）的測速（`/api/cdn/pools` 原始檔不在 repo 裡，照規格 11 F16 的表重建；
+/// IP 是文件用位址）重播：收緊之後，W3「開」與 D7 的前 4 個照樣判成瓶頸；W3「關」那一輪有 45 MB/s 的節點就不啟動
+#[test]
+fn replay_w3_d7_samples_with_tighter_tolerance() {
+    let w3_on = [sample(61.2, 0.131), sample(61.5, 0.13), sample(61.35, 0.13), sample(61.4, 0.13)];
+    let w3_off = [sample(63.5, 0.126), sample(45.0, 0.178), sample(40.8, 0.196), sample(61.0, 0.131)];
+    let d7_on = [sample(2.07, 3.86), sample(2.15, 3.72), sample(2.12, 3.77), sample(2.1, 3.81)];
+    let d7_cfr = [sample(2.07, 3.86), sample(2.18, 3.67), sample(2.1, 3.81), sample(2.12, 3.77)];
+    let show = |v: &[SpeedSample]| v.iter().map(|s| s.mbps.to_string()).collect::<Vec<_>>().join(" / ");
+    for (tag, v, want) in [
+        ("W3 開", &w3_on, true),
+        ("W3 關", &w3_off, false),
+        ("D7 Cloudflare", &d7_on, true),
+        ("D7 CloudFront", &d7_cfr, true),
+    ] {
+        println!("[{tag}] {} → {:?}", show(v), same_speed(v));
+        assert_eq!(same_speed(v).is_some(), want, "{tag}");
+    }
+    // 排序：61.2 與 60.8 同一級（延遲決定），45 慢一級以上
+    let r = [ranked(6.0, Some(61.2)), ranked(3.0, Some(60.8)), ranked(2.0, Some(45.0))];
+    assert_eq!(order(&r, true), [1, 0, 2]);
+}
+
+/// 3.5.0 F16：`pool.relativeSpeed: false`＝3.4.x 的規則，不受誤差範圍收緊與快測門檻影響
+#[test]
+fn relative_speed_off_unchanged() {
+    assert_eq!(same_speed_legacy(&[61.2, 61.4, 60.9, 61.3]), Some(61.3));
+    assert_eq!(same_speed_legacy(&[61.5, 57.0, 61.9, 59.0]), None, "5% 門檻不變");
+    // 節點池工作：沒有 quickRef、沒有 slow 旗標（見 pool_job_quick_test_uses_first_mib_reference、
+    // pool_job_fast_line_noisy_speeds_start_reduction 的「關」）
+    let o = order(&[ranked(6.0, Some(61.2)), ranked(3.0, Some(60.8))], false);
+    assert_eq!(o, [0, 1], "直接比速度");
 }

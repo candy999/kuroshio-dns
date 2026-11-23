@@ -6,7 +6,7 @@
 use crate::cidr::CidrSet;
 use crate::config::CdnConfig;
 use crate::providers::{self, is_tw_pop};
-use crate::util::{self, de_ip, de_opt_arc, de_opt_bool, de_opt_u64, de_u64, now_ms, ser_opt_arc, Extra, Num};
+use crate::util::{self, de_ip, de_opt_arc, de_opt_bool, de_opt_u32, de_opt_u64, de_u64, now_ms, ser_opt_arc, Extra, Num};
 use crate::v6store::V6Store;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,9 @@ pub const ZONE_FILE: &str = "cdn/ip-zone.json";
 pub const BAD24_MS: u64 = 30 * 60_000;
 /// 尖峰時段的量測多久內有效
 pub const PEAK_FRESH_MS: u64 = 3 * util::DAY_MS;
+
+/// 測速被限流的那一輪，沒量到的節點最多沿用前幾輪的速度（3.5.0 F15）
+pub const SPEED_AGE_MAX: u32 = 3;
 
 /// 節點池裡的一個節點
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +68,9 @@ pub struct PoolNode {
     /// 沒有這個欄位（舊的 `pools.json`、沒量到速度的節點）沿用舊規則：量到的速度低於 1 MB/s 算慢
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_bool")]
     pub slow: Option<bool>,
+    /// 速度是沿用前幾輪的（3.5.0 F15：那一輪測速被對方限流；最多沿用 [`SPEED_AGE_MAX`] 輪）。沒有 = 這一輪量的
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_u32")]
+    pub speed_age: Option<u32>,
     /// 測速的量測樣本（3.5.0：B1 的誤差範圍、B2 工作負載分數的量測基礎；只有量過速度的節點才有）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<Box<NodeSample>>,
@@ -91,6 +97,9 @@ pub struct NodeSample {
     /// 快測（量到瓶頸之後只收 1 MiB 確認不慢）：`speed` 記的是瓶頸的速度，不是這個節點自己量到的
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_bool")]
     pub quick: Option<bool>,
+    /// 收到第 1 MiB 花幾秒（3.5.0 F16：快測門檻的參考；同一條連線順便記）
+    #[serde(default, skip_serializing_if = "Num::is_absent")]
+    pub head_secs: Num,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -108,6 +117,11 @@ impl NodeSample {
             connect_ms: ms(s.connect_ms),
             ttfb_ms: ms(s.ttfb_ms),
             quick: quick.then_some(true),
+            head_secs: if s.head_secs > 0.0 {
+                Num::V(util::round(s.head_secs, 3))
+            } else {
+                Num::Absent
+            },
             extra: Extra::default(),
         }
     }
@@ -130,6 +144,7 @@ impl PoolNode {
             peak_loss: Num::Absent,
             peak_at: None,
             slow: None,
+            speed_age: None,
             sample: None,
             extra: Extra::default(),
         }
@@ -1257,6 +1272,9 @@ impl Pools {
                     "v4": list(&d.pool4), "v6": list(&d.pool6),
                     // 這一次節點池工作的參考速度（MB/s，3.5.0 B1）：節點的 `slow` 是跟它比出來的
                     "speedRef": d.rest.get("speedRef"),
+                    // 參考速度沒有算出來的原因（3.5.0 F15）、快測的參考速度（前 1 MiB 的中位數，3.5.0 F16）
+                    "speedRefWhy": d.rest.get("speedRefWhy"),
+                    "quickRef": d.rest.get("quickRef"),
                     "scan": { "tw": d.tw.v4_len(), "global": d.global.v4_len(), "dead": d.dead.v4_len() },
                     "ranges": { "v4": d.range4.v4_len(), "v6": d.range6.v6_len() },
                 }),
