@@ -1,8 +1,8 @@
 //! 新網域很多時的 CDN 驗證節流（3.5.0 F12，規格 11 第 6 節）：純邏輯，時間與 CPU 讀數由呼叫端給（測試可以注入）。
 //!
 //! - 每分鐘上限 `Rmax`（固定一分鐘一格，不留佇列：排不進的丟掉，下一次查詢再排）。
-//! - 目前的速率 `r` 依 CPU 自己調：55% 以上減半、30% 以下加 `Rmax ÷ 10`、中間不動；永遠在 `[Rmin, Rmax]`，
-//!   `Rmin = max(6, Rmax ÷ 8)`；記憶體壓力不是 Normal → `Rmin`；量不到 CPU 不調。每 10 秒最多調一次。
+//! - 目前的速率 `r` 依 CPU 自己調：55% 以上減半、30% 以下（或量不到）加 `Rmax ÷ 10`、中間不動；永遠在 `[Rmin, Rmax]`，
+//!   `Rmin = max(6, Rmax ÷ 8)`；記憶體壓力不是 Normal → `Rmin`。每 10 秒最多調一次。
 //! - 名額的順序（不排隊，用「留給前面的」實作）：手動不受限但算進用量；第 2 類（重驗、問過 2 次以上）用全部名額；
 //!   跨 CDN 探索用到四分之三（最後四分之一留給第 2 類）；只問過一次的新網域用到一半（另一半留給第 2 類），
 //!   而且減量中根本不排（在 `apply()` 就拿掉）。
@@ -138,7 +138,7 @@ impl Pace {
         (false, self.busy(now).or(t))
     }
 
-    /// 主程式每 10 秒交一次 CPU 佔比（`None` = 量不到：不調）與記憶體壓力
+    /// 主程式每 10 秒交一次 CPU 佔比（`None` = 量不到：不依 CPU 降，低於 Rmax 時照「CPU 低」慢慢升回去）與記憶體壓力
     pub fn load(&mut self, pct: Option<u8>, memory_normal: bool, now: u64) -> Option<Transition> {
         self.cpu = pct;
         if self.last_adjust != 0 && now.saturating_sub(self.last_adjust) < ADJUST_GAP_MS {
@@ -153,6 +153,9 @@ impl Pace {
             } else if p < CPU_LOW {
                 self.rate = self.rate.saturating_add((self.rmax / 10).max(1)).min(self.rmax);
             }
+        } else if self.rate < self.rmax {
+            // 量不到 CPU：不依 CPU 降，但記憶體壓力解除之後要回得去 Rmax（跟 CPU 低的時候一樣慢慢升，不會卡在 Rmin）
+            self.rate = self.rate.saturating_add((self.rmax / 10).max(1)).min(self.rmax);
         }
         let t = self.roll(now);
         if self.rate < self.rmax {
@@ -288,6 +291,17 @@ mod tests {
         // 壓力解除：照 CPU 慢慢升回來
         p.load(Some(10), true, T0 + 10_000);
         assert_eq!(p.rate, p.rmin + 6);
+        // CPU 量不到也會回到 Rmax（不卡在 Rmin），然後 5 分鐘後離開減量中
+        let mut p = Pace::new(60);
+        p.load(None, false, T0);
+        let mut t = T0;
+        let mut left = false;
+        for _ in 0..60 {
+            t += 10_000;
+            left |= p.load(None, true, t) == Some(Transition::Leave);
+        }
+        assert_eq!(p.rate, 60);
+        assert!(left && !p.paced);
     }
 
     #[test]
