@@ -305,6 +305,9 @@ pub struct Cdn {
     /// 磁碟預算（3.5.0 C5）：因為預算淘汰的網域累計筆數、上次量到分片目錄實際佔多少（KB；`u32::MAX` = 還沒量）
     budget_pruned: AtomicU32,
     disk_kb: AtomicU32,
+    /// 分片目錄裡檔案長度的合計（KB；3.5.0 F8 之前的 `dbDiskKB`）、整個 `cdn/` 目錄實際佔用（KB，只顯示）。`u32::MAX` = 還沒量
+    file_kb: AtomicU32,
+    cdn_dir_kb: AtomicU32,
 }
 
 /// 一輪磁碟預算淘汰的結果（[`Cdn::budget_round`]）
@@ -503,14 +506,14 @@ impl Cdn {
             evicted_n: AtomicU32::new(0),
             budget_pruned: AtomicU32::new(0),
             disk_kb: AtomicU32::new(u32::MAX),
+            file_kb: AtomicU32::new(u32::MAX),
+            cdn_dir_kb: AtomicU32::new(u32::MAX),
         };
         me.reset_octet_verdicts();
         // 啟動時先量一次實際的磁碟用量（3.5.0 D3 回報：重新啟動後到第一輪預算之前 dbDiskKB 是 null，
         // 預算換算的筆數也沒辦法用實測校正）。只有設了預算（小 Flash）才量：讀分片目錄裡每個檔的大小
         if me.cfg.db_disk_budget.is_some() {
-            let disk = me.shard_dir_bytes();
-            me.disk_kb
-                .store(disk.div_ceil(1024).min(u32::MAX as u64 - 1) as u32, Ordering::Relaxed);
+            me.measure_disk();
         }
         Arc::new(me)
     }
@@ -939,17 +942,21 @@ impl Cdn {
 
     // ------------------------------------------------------------ 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）
 
-    /// 分片目錄在磁碟上實際佔多少（bytes；目錄不存在是 0）
-    fn shard_dir_bytes(&self) -> u64 {
-        std::fs::read_dir(self.paths.state_dir.join(db::SHARD_DIR))
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| e.metadata().ok())
-                    .filter(|m| m.is_file())
-                    .map(|m| m.len())
-                    .sum()
-            })
-            .unwrap_or(0)
+    /// 分片目錄在磁碟上實際佔多少：（實際佔用的區塊，檔案長度的合計），bytes；目錄不存在是 0。
+    /// 3.5.0 F8：以前只算長度，`du` 算的是佔用的區塊（D3：257 個小檔、4 KB 區塊，少算約兩成）
+    fn shard_dir_bytes(&self) -> (u64, u64) {
+        dir_usage(&self.paths.state_dir.join(db::SHARD_DIR), 0)
+    }
+
+    /// 量一次磁碟用量（3.5.0 F8）：網域分片（預算用實際佔用）、檔案長度合計、整個 `cdn/` 目錄（只顯示）。回分片的實際佔用
+    fn measure_disk(&self) -> u64 {
+        let kb = |b: u64| b.div_ceil(1024).min(u32::MAX as u64 - 1) as u32;
+        let (alloc, len) = self.shard_dir_bytes();
+        self.disk_kb.store(kb(alloc), Ordering::Relaxed);
+        self.file_kb.store(kb(len), Ordering::Relaxed);
+        let (all, _) = dir_usage(&self.paths.state_dir.join("cdn"), CDN_DIR_DEPTH);
+        self.cdn_dir_kb.store(kb(all), Ordering::Relaxed);
+        alloc
     }
 
     /// 磁碟預算換算的筆數上限（沒有預算時 None）。
@@ -976,9 +983,7 @@ impl Cdn {
     /// 沒有設定預算（大磁碟、`cdn.dbDiskBudgetKB: 0`）時只量一下實際大小給狀態頁，什麼都不刪
     pub fn budget_round(&self) -> BudgetRound {
         let mut out = BudgetRound::default();
-        let disk = self.shard_dir_bytes();
-        self.disk_kb
-            .store(disk.div_ceil(1024).min(u32::MAX as u64 - 1) as u32, Ordering::Relaxed);
+        let disk = self.measure_disk();
         let (Some(limit), Some(budget)) = (self.budget_limit(), self.cfg.db_disk_budget) else {
             return out;
         };
@@ -1053,7 +1058,12 @@ impl Cdn {
         v["dbBudgetKB"] = json!(self.cfg.db_disk_budget.map(|b| b / 1024));
         v["dbBudgetEntries"] = json!(self.budget_limit());
         v["dbEntries"] = json!(total);
-        v["dbDiskKB"] = json!((disk != u32::MAX).then_some(disk));
+        // 3.5.0 F8：dbDiskKB 是實際佔用的區塊（預算用它）；dbFileKB 是檔案長度合計（以前的 dbDiskKB）；
+        // cdnDirKB 是整個 cdn/ 目錄（含節點池、範圍、掃描結果；各有自己的上限，只顯示，不算進預算）
+        let opt = |x: u32| (x != u32::MAX).then_some(x);
+        v["dbDiskKB"] = json!(opt(disk));
+        v["dbFileKB"] = json!(opt(self.file_kb.load(Ordering::Relaxed)));
+        v["cdnDirKB"] = json!(opt(self.cdn_dir_kb.load(Ordering::Relaxed)));
         v["dbDiskEstKB"] = json!(db::budget_disk_estimate(total, shards).div_ceil(1024));
         v["prunedForBudget"] = json!(self.budget_pruned.load(Ordering::Relaxed));
     }
@@ -1903,6 +1913,49 @@ impl Cdn {
 ///
 /// 每片固定的部分（模型的 1.1 KB）先扣掉，剩下的照實測換算。實測要夠多（2,000 筆以上、磁碟上 512 KB 以上）才採用；只往上調（不會因為校正而多刪）、最多到模型的 1.5 倍
 /// （量錯或檔案落後記憶體時不會整個放開）。沒有實測（`disk_bytes` 是 0）就照模型
+/// `cdn/` 目錄往下量幾層（`domains/`、`ranges/`、`scan/` 都在第一層）
+const CDN_DIR_DEPTH: u32 = 2;
+
+/// 一個檔案在磁碟上實際佔多少（3.5.0 F8）：有區塊數就用區塊數 × 512（`du` 的算法）；
+/// 沒有（Windows）或是 0（有些壓縮型的 Flash 檔案系統、檔案內容放在 inode 裡）時用長度
+pub(crate) fn alloc_bytes(len: u64, blocks: Option<u64>) -> u64 {
+    match blocks {
+        Some(b) if b > 0 => b.saturating_mul(512),
+        _ => len,
+    }
+}
+
+fn file_alloc(m: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        alloc_bytes(m.len(), Some(m.blocks()))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 沒有區塊數：用長度（Windows 上沒有磁碟預算，只是顯示）
+        alloc_bytes(m.len(), None)
+    }
+}
+
+/// 目錄裡的檔案：（實際佔用，長度合計），往下 `depth` 層子目錄（目錄本身不算）
+pub(crate) fn dir_usage(dir: &Path, depth: u32) -> (u64, u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return (0, 0) };
+    let mut out = (0u64, 0u64);
+    for e in rd.flatten() {
+        let Ok(m) = e.metadata() else { continue };
+        if m.is_file() {
+            out.0 = out.0.saturating_add(file_alloc(&m));
+            out.1 = out.1.saturating_add(m.len());
+        } else if m.is_dir() && depth > 0 {
+            let (a, l) = dir_usage(&e.path(), depth - 1);
+            out.0 = out.0.saturating_add(a);
+            out.1 = out.1.saturating_add(l);
+        }
+    }
+    out
+}
+
 pub(crate) fn calibrated_limit(model: usize, shards: usize, total: usize, disk_bytes: u64, budget_bytes: u64) -> usize {
     if total < db::BUDGET_MIN_ENTRIES || disk_bytes < db::BUDGET_MIN_BYTES {
         return model;

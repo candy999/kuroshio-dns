@@ -751,5 +751,63 @@ fn budget_disk_measured_at_load() {
     let disk = shard_dir_size(&paths.state_dir);
     let c = Cdn::load(&budget_cfg(4096), paths, MockNet::new());
     let st = c.status_lite();
-    assert_eq!(st["dbDiskKB"], json!(disk.div_ceil(1024)), "{st}");
+    // 3.5.0 F8：dbFileKB 是檔案長度合計（以前的 dbDiskKB），dbDiskKB 是實際佔用的區塊
+    assert_eq!(st["dbFileKB"], json!(disk.div_ceil(1024)), "{st}");
+    let (alloc, _) = crate::cdn::dir_usage(&c.paths.state_dir.join(crate::db::SHARD_DIR), 0);
+    assert_eq!(st["dbDiskKB"], json!(alloc.div_ceil(1024)), "{st}");
+}
+
+/// 3.5.0 F8：實際佔用的區塊（`du` 的算法）；沒有區塊數（Windows）或是 0（壓縮型的 Flash 檔案系統）時用長度
+#[test]
+fn db_disk_uses_allocated_blocks_and_falls_back_to_len() {
+    use crate::cdn::alloc_bytes;
+    assert_eq!(alloc_bytes(100, Some(8)), 4096, "4 KB 區塊上 100 bytes 的檔佔一整個區塊");
+    assert_eq!(alloc_bytes(100, Some(0)), 100, "區塊數是 0：退回長度");
+    assert_eq!(alloc_bytes(100, None), 100, "Windows：長度");
+    assert_eq!(alloc_bytes(0, Some(0)), 0);
+    // 真的檔案：實際佔用不少於長度（除非檔案系統有壓縮）
+    let d = tmpdir("alloc");
+    std::fs::write(d.join("a"), [7u8; 100]).unwrap();
+    std::fs::write(d.join("b"), [7u8; 5000]).unwrap();
+    let (alloc, len) = crate::cdn::dir_usage(&d, 0);
+    assert_eq!(len, 5100);
+    assert!(alloc >= len || cfg!(not(unix)), "{alloc}");
+}
+
+/// 3.5.0 F8：D3 的 257 個小檔（4 KB 區塊）平均浪費半個區塊：長度 1,722 KB、實際約 2,200 KB。
+/// 用實際佔用校正，每筆的估計變大，上限跟著降（約 24,900 → 約 2 萬筆）；只往上調、最多 1.5 倍不變
+#[test]
+fn budget_calibration_with_block_overhead() {
+    use crate::cdn::{alloc_bytes, calibrated_limit};
+    let budget = 2303 * 1024;
+    let model = crate::db::budget_entries(Some(budget), 256).unwrap();
+    let len: u64 = 1722 * 1024;
+    // 257 個檔：每個檔的長度取平均，實際佔用是無條件進位到 4 KB 區塊
+    let per = len / 257;
+    let alloc: u64 = (0..257u64)
+        .map(|i| alloc_bytes(per + (i % 2) * 2048, Some((per + (i % 2) * 2048).div_ceil(4096) * 8)))
+        .sum();
+    assert!(alloc > len * 11 / 10, "{alloc} 對 {len}");
+    let by_len = calibrated_limit(model, 256, 23_158, len, budget);
+    let by_alloc = calibrated_limit(model, 256, 23_158, alloc, budget);
+    assert!(by_alloc < by_len, "{by_alloc} 對 {by_len}");
+    assert!(by_alloc >= model, "只往上調");
+}
+
+/// 3.5.0 F8：cdnDirKB 是整個 cdn/ 目錄（含節點池、範圍、掃描結果），只顯示，不算進預算
+#[test]
+fn cdn_dir_kb_is_informational_only() {
+    let (paths, _, n0) = seeded_shards("budget-cdndir");
+    let cdn = paths.state_dir.join("cdn");
+    std::fs::create_dir_all(cdn.join("scan")).unwrap();
+    std::fs::write(cdn.join("scan/cloudflare-ipv4-TW.txt"), vec![b'x'; 300 * 1024]).unwrap();
+    std::fs::write(cdn.join("pools.json"), vec![b' '; 100 * 1024]).unwrap();
+    let c = Cdn::load(&budget_cfg(100_000), paths, MockNet::new());
+    c.budget_round();
+    let st = c.status_lite();
+    let dir = st["cdnDirKB"].as_u64().unwrap();
+    let db = st["dbDiskKB"].as_u64().unwrap();
+    assert!(dir >= db + 400, "{st}");
+    assert_eq!(c.state().db.domains.len(), n0, "其他檔再大也不淘汰網域資料");
+    assert_eq!(st["prunedForBudget"], 0);
 }
