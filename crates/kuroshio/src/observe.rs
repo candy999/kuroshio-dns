@@ -535,6 +535,8 @@ pub struct FindInputs {
     pub cdn_observe: Value,
     /// `cdn.prunedForBudget`
     pub cdn_pruned: Option<u32>,
+    /// `Cdn::pace_json()`（3.5.0 F12：CDN 驗證節流；CDN 關著是 `null`）
+    pub cdn_pace: Value,
     /// `/api/chain`（含 `audit`）
     pub chain: Value,
     /// 載入中、但沒有本機副本的清單數
@@ -791,6 +793,16 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
             kuroshio_jobs::time::fmt_date_time(fuse)
         ),
     ));
+
+    // 3.5.0 F12：新網域很多（或 CPU 很忙），CDN 驗證減量中（狀態類；欄位不齊時不報）
+    let paced = i.cdn_pace["paced"] == true;
+    let per_min = i.cdn_pace["perMin"].as_u64().unwrap_or(0);
+    out.push(state(
+        "cdn-verify-paced",
+        Sev::Info,
+        paced && per_min > 0,
+        format!("新網域很多，CDN 驗證減量中（每分鐘 {per_min} 個）"),
+    ));
     (out, sample)
 }
 
@@ -822,6 +834,7 @@ fn find_inputs(st: &AppState, now: u64) -> FindInputs {
         stale_fail_15m: r.stats.stale_refresh_fail_15m(),
         counters: cdn.as_ref().map(|c| c.observe_counters()).unwrap_or_default(),
         cdn_observe: cdn.as_ref().map(|c| c.observe_json()).unwrap_or(Value::Null),
+        cdn_pace: cdn.as_ref().map(|c| c.pace_json()).unwrap_or(Value::Null),
         pool_nodes: cdn.as_ref().map_or(0, |c| {
             let st = c.state();
             st.pools

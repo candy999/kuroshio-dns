@@ -377,6 +377,7 @@ fn noisy_inputs() -> FindInputs {
             "popSwitch": { "holds": [ { "provider": "cdn.example.net", "pop": "192.0.2.1", "family": 4, "until": NOW + 600_000, "other": "198.51.100.2" } ] },
         }),
         cdn_pruned: Some(12),
+        cdn_pace: json!({ "enabled": true, "perMin": 30, "maxPerMin": 60, "paced": true }),
         chain: json!({ "state": "released", "reason": "tampered", "upstream": { "via": "intercept", "since": NOW - 3_600_000, "address": "192.168.1.1" },
                        "audit": { "releases": 1, "last": { "name": "www.example.com", "ip": "198.51.100.9" } } }),
         lists_without_copy: Some(2),
@@ -420,6 +421,7 @@ fn finding_text_has_no_domain_or_client_ip() {
         "pop-flapping",
         "slower-fallback",
         "slower-fuse",
+        "cdn-verify-paced",
     ] {
         assert!(keys.contains(&k), "{k} 沒出現：{keys:?}");
     }
@@ -734,4 +736,26 @@ fn cdn_db_pruning_text() {
         "CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 3645 筆）"
     );
     assert!(!f["text"].as_str().unwrap().contains("磁碟預算不夠"));
+}
+
+/// 3.5.0 F12：CDN 驗證減量中是 info 的狀態類；不在減量中、欄位不齊（甲批合併前 `pace_json()` 是空物件）不報
+#[test]
+fn cdn_verify_paced_finding() {
+    let with = |pace: Value| {
+        let inp = FindInputs {
+            now: NOW,
+            cdn_pace: pace,
+            ..FindInputs::default()
+        };
+        let (obs, _) = rules(&inp, &[]);
+        let mut e = Engine::new();
+        e.apply(&obs, NOW);
+        find(&e.json(), "cdn-verify-paced").cloned()
+    };
+    let f = with(json!({ "enabled": true, "perMin": 30, "maxPerMin": 60, "paced": true })).unwrap();
+    assert_eq!(f["sev"], "info");
+    assert_eq!(f["text"], "新網域很多，CDN 驗證減量中（每分鐘 30 個）");
+    assert!(with(json!({ "enabled": true, "perMin": 60, "paced": false })).is_none());
+    assert!(with(json!({})).is_none(), "還沒有欄位");
+    assert!(with(Value::Null).is_none(), "CDN 關著");
 }

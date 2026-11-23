@@ -1794,7 +1794,7 @@ pub fn new_persister(cfg: &Value) -> Persister {
 
 /// 記憶體監看（規格 09）：依系統保留量更新整個程式的壓力訊號，記憶體控制開著時順便跑一輪控制。
 /// 離保留量近（兩倍以內）或 PSI 看得到等待時每 2–3 秒量一次，遠的時候 30 秒
-fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov::Governor>>) {
+fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov::Governor>>, cdn: Option<Arc<kuroshio_cdn::Cdn>>) {
     use crate::memgov::{poll_interval, pressure_of, Reading};
     // 記憶體控制另外一個工作：它可能要等清單重建（幾十秒），壓力訊號不能跟著停住。
     // 量測只留最新一筆，控制跑完一輪再拿最新的
@@ -1813,6 +1813,8 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
         let mut last = Pressure::Normal;
         // 記憶體控制關掉時自己判斷「於事無補」（開著時由記憶體控制判斷，狀態頁看得到同一份）
         let mut gate = crate::memgov::FutileGate::default();
+        // 3.5.0 F12：每 10 秒量一次黑潮自己用掉的 CPU（佔整台機器），交給 CDN 驗證的節流依 CPU 調整速率
+        let mut cpu = sysinfo::CpuMeter::new(kuroshio_config::Host::detect().cores);
         loop {
             let r = match &gov {
                 Some(g) => g.read(),
@@ -1832,6 +1834,11 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             // 好友資料（社群共享）：解壓後不超過保留量以上可用空間的 1/4（至少 1 MB）
             let cap = crate::memgov::headroom(&r, &reserve).map_or(0, |h| ((h >> 20) / 4).clamp(1, u32::MAX as u64) as u32);
             kuroshio_community::config::set_memory_cap_mb(cap);
+            if let Some(c) = &cdn {
+                if let Some(pct) = cpu.tick(Instant::now(), sysinfo::cpu_ms) {
+                    c.set_load(pct);
+                }
+            }
             if p != last {
                 let (a, res) = (
                     crate::memgov::mb_round(r.avail.unwrap_or(0)),
@@ -1856,7 +1863,12 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             if gov.is_some() {
                 tx.send_replace(Some(r));
             }
-            tokio::time::sleep(Duration::from_secs(poll_interval(&r, &reserve))).await;
+            // 離保留量遠時記憶體 30 秒量一次；有 CDN 時最多 10 秒（CPU 每 10 秒量一次，3.5.0 F12）
+            let mut wait = poll_interval(&r, &reserve);
+            if cdn.is_some() {
+                wait = wait.min(sysinfo::CPU_SAMPLE_SECS);
+            }
+            tokio::time::sleep(Duration::from_secs(wait)).await;
         }
     });
 }
@@ -2199,7 +2211,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         warn!("system.testHooks 關掉了：取消進行中的記憶體模擬");
     }
     if governor_on || get(cfg, "system.memoryWatchdog").and_then(Value::as_bool).unwrap_or(true) {
-        spawn_monitor(reserve.clone(), memgov.clone());
+        spawn_monitor(reserve.clone(), memgov.clone(), cdn.clone());
     }
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));

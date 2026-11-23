@@ -86,6 +86,59 @@ pub fn cpu_ms() -> Option<u64> {
     }
 }
 
+/// 這台黑潮自己用掉的 CPU 佔整台機器的百分比（3.5.0 F12）：兩次 [`cpu_ms`] 之差 ÷（經過的時間 × 核心數）。
+/// 量不到、時間沒有前進、計數倒退時是 None；最多 100
+pub fn cpu_pct(prev_cpu_ms: u64, now_cpu_ms: u64, wall_ms: u64, cores: usize) -> Option<u8> {
+    if wall_ms == 0 || cores == 0 || now_cpu_ms < prev_cpu_ms {
+        return None;
+    }
+    let used = (now_cpu_ms - prev_cpu_ms) as u128 * 100;
+    let total = wall_ms as u128 * cores as u128;
+    Some(((used + total / 2) / total).min(100) as u8)
+}
+
+/// 每 10 秒量一次自己的 CPU 用量（3.5.0 F12；放在記憶體監看的迴圈裡，不另外開背景工作）
+#[derive(Debug)]
+pub struct CpuMeter {
+    cores: usize,
+    last: Option<(u64, std::time::Instant)>,
+    next: Option<std::time::Instant>,
+}
+
+/// 量 CPU 的間隔
+pub const CPU_SAMPLE_SECS: u64 = 10;
+
+impl CpuMeter {
+    pub fn new(cores: usize) -> CpuMeter {
+        CpuMeter {
+            cores,
+            last: None,
+            next: None,
+        }
+    }
+
+    /// 到了要量的時候回 `Some(這 10 秒的百分比)`（量不到是 `Some(None)`），還沒到回 `None`。
+    /// `cpu` 是這一刻的 [`cpu_ms`]（呼叫端傳進來，測試可以注入）
+    pub fn tick(&mut self, now: std::time::Instant, cpu: impl FnOnce() -> Option<u64>) -> Option<Option<u8>> {
+        if self.next.is_some_and(|t| now < t) {
+            return None;
+        }
+        self.next = Some(now + std::time::Duration::from_secs(CPU_SAMPLE_SECS));
+        let cur = cpu();
+        let pct = match (self.last, cur) {
+            (Some((p, t)), Some(c)) => cpu_pct(p, c, now.saturating_duration_since(t).as_millis() as u64, self.cores),
+            _ => None,
+        };
+        let first = self.last.is_none();
+        self.last = cur.map(|c| (c, now));
+        // 第一次只記起點（還沒有區間可以算），不回報
+        if first && cur.is_some() {
+            return None;
+        }
+        Some(pct)
+    }
+}
+
 /// /proc/self/stat 的 utime＋stime（第 14、15 欄，單位是時脈數）換成毫秒。
 /// 第 2 欄（程式名稱）在括號裡、可能有空白，從最後一個右括號之後開始數
 pub fn parse_proc_stat_cpu_ms(stat: &str, hz: u64) -> Option<u64> {
@@ -322,6 +375,31 @@ overlayfs:/overlay / overlay rw,noatime,lowerdir=/,upperdir=/overlay/upper 0 0
         assert_eq!(classify_fs("/dev/mmcblk0p2", "ext4"), StorageClass::Flash);
         assert_eq!(classify_fs("/dev/nvme0n1p2", "ext4"), StorageClass::Disk);
         assert_eq!(classify_fs("/dev/mtdblock6", "jffs2"), StorageClass::Flash);
+    }
+
+    /// 3.5.0 F12：CPU 百分比 = 用掉的 CPU 時間 ÷（經過的時間 × 核心數），四捨五入、最多 100；量不到不調
+    #[test]
+    fn cpu_pct_of_whole_machine() {
+        // 2 核心、10 秒：用掉 11 秒 CPU = 55%
+        assert_eq!(cpu_pct(1000, 12_000, 10_000, 2), Some(55));
+        assert_eq!(cpu_pct(0, 6_000, 10_000, 2), Some(30));
+        assert_eq!(cpu_pct(0, 50_000, 10_000, 2), Some(100), "最多 100");
+        assert_eq!(cpu_pct(5, 4, 10_000, 2), None, "計數倒退");
+        assert_eq!(cpu_pct(0, 1, 0, 2), None);
+        assert_eq!(cpu_pct(0, 1, 10, 0), None);
+        // 每 10 秒量一次；第一次只記起點；量不到時回 Some(None)（不調）
+        let t0 = std::time::Instant::now();
+        let mut m = CpuMeter::new(2);
+        assert_eq!(m.tick(t0, || Some(0)), None, "第一次只記起點");
+        assert_eq!(m.tick(t0 + std::time::Duration::from_secs(5), || Some(1)), None, "還沒到 10 秒");
+        assert_eq!(m.tick(t0 + std::time::Duration::from_secs(10), || Some(11_000)), Some(Some(55)));
+        assert_eq!(m.tick(t0 + std::time::Duration::from_secs(20), || None), Some(None), "量不到");
+        assert_eq!(
+            m.tick(t0 + std::time::Duration::from_secs(30), || Some(20_000)),
+            None,
+            "上一次量不到：重新記起點"
+        );
+        assert_eq!(m.tick(t0 + std::time::Duration::from_secs(40), || Some(26_000)), Some(Some(30)));
     }
 
     /// 3.5.0 F12：/proc/self/stat 的 utime＋stime；程式名稱裡有空白與括號也數得對

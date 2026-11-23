@@ -703,7 +703,17 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             // 規格 11 C12、E9、F2）
             let lite = flag(q, "lite");
             // 線路感知（3.5.0 E3～E7）：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil` 由 `status_lite()` 帶出
-            let cdn = r.cdn().map(|c| c.status_lite()).unwrap_or_else(|| json!({ "enabled": false }));
+            let cdn = r
+                .cdn()
+                .map(|c| {
+                    let mut v = c.status_lite();
+                    // 3.5.0 F12：CDN 驗證節流的狀態（`status_lite()` 已經帶就不重複放）
+                    if let Some(o) = v.as_object_mut() {
+                        o.entry("pace").or_insert_with(|| c.pace_json());
+                    }
+                    v
+                })
+                .unwrap_or_else(|| json!({ "enabled": false }));
             let mut out = json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
