@@ -19,6 +19,7 @@ fn client(chain: bool, dir: &std::path::Path) -> Arc<Client> {
         retry_min: Duration::from_millis(200),
         retry_max: Duration::from_millis(800),
         fail_limit: 3,
+        ..Timing::default()
     };
     Client::new(s, Arc::new(NodeKey::new(dir.join("community"))), timing)
 }

@@ -11,6 +11,8 @@
 //! - `chain` 關、沒有攔截、攔截者不是黑潮、版本低於 3.4.0：**不發任何 `chain.kuroshio` 查詢**。
 //! - 不存檔：綁定與「公鑰換過」的時間只在行程層級的 [`Client`] 裡（跨重新載入、不跨重開機）。
 //! - 不用時間戳判斷回應有沒有過期（下游的時鐘可能還沒對時）：只靠一次性的 nonce 與簽章。
+//! - 經攔截綁定後改成直連閘道（3.5.0 C2，規格 1.6）：之後的路徑檢查或心跳知道閘道了，就對閘道直連探測一次；
+//!   簽章驗證通過、同一把金鑰才換位址（[`Event::GatewayProbed`]）。直連沒多久就失敗 → 一段時間不用直連（[`note_direct_end`]）。
 //! - 登記（規格 4.2，[`Client::register`]）：探測／驗證／心跳之後，上游 `allow = true` 而且 `caps` 有 `reg` 時送出
 //!   （不必等串接成立）；登記失敗不影響串接狀態，只記在 `chain.upstream.registered`。
 
@@ -131,6 +133,15 @@ pub struct Timing {
     pub retry_max: Duration,
     /// 心跳連續幾次沒回應就解除
     pub fail_limit: u32,
+    /// 經攔截綁定後試著改成直連閘道（3.5.0 C2）：兩次嘗試最少隔多久；探測沒過時每次加倍，最多 `upgrade_every_max`
+    pub upgrade_every: Duration,
+    pub upgrade_every_max: Duration,
+    /// 直連沒多久就失敗之後多久不用直連（退回經攔截）；連續 `direct_fail_limit` 次之後改用 `direct_block_long`
+    pub direct_block: Duration,
+    pub direct_block_long: Duration,
+    pub direct_fail_limit: u32,
+    /// 直連維持這麼久才算穩定（之前的失敗次數歸零）
+    pub direct_stable: Duration,
 }
 
 impl Default for Timing {
@@ -143,13 +154,20 @@ impl Default for Timing {
             retry_min: Duration::from_secs(60),
             retry_max: Duration::from_secs(600),
             fail_limit: 3,
+            upgrade_every: Duration::from_secs(600),
+            upgrade_every_max: Duration::from_secs(6 * 3600),
+            direct_block: Duration::from_secs(3600),
+            direct_block_long: Duration::from_secs(24 * 3600),
+            direct_fail_limit: 3,
+            direct_stable: Duration::from_secs(3600),
         }
     }
 }
 
 impl Timing {
     /// 環境變數 `KUROSHIO_CHAIN_TIMING`（JSON，毫秒）覆寫，只給整合測試用：
-    /// `{"heartbeat":2000,"earlyMin":200,"earlyMax":400,"retryMin":500,"retryMax":2000}`（另外可以有 `ask`、`failLimit`）
+    /// `{"heartbeat":2000,"earlyMin":200,"earlyMax":400,"retryMin":500,"retryMax":2000}`（另外可以有 `ask`、`failLimit`、
+    /// `upgradeEvery`、`directBlock`、`directStable`）
     pub fn from_env() -> Timing {
         let mut t = Timing::default();
         let Some(v) = std::env::var("KUROSHIO_CHAIN_TIMING")
@@ -166,6 +184,9 @@ impl Timing {
             ("earlyMax", &mut t.early_max),
             ("retryMin", &mut t.retry_min),
             ("retryMax", &mut t.retry_max),
+            ("upgradeEvery", &mut t.upgrade_every),
+            ("directBlock", &mut t.direct_block),
+            ("directStable", &mut t.direct_stable),
         ] {
             if let Some(d) = ms(k) {
                 *f = d;
@@ -326,6 +347,46 @@ struct Bound {
     last_ok_ms: u64,
     failures: u32,
     via_nat: bool,
+    /// 直連閘道從什麼時候開始（經攔截是 None）：沒多久就失敗的話記一次直連失敗
+    direct_since: Option<Instant>,
+}
+
+/// 經攔截 ↔ 直連閘道的切換紀錄（3.5.0 C2）。只在行程層級，跟著串接狀態跨重新載入；WAN 變動、`chain` 關掉時清掉
+#[derive(Debug, Clone, Default)]
+struct Direct {
+    /// 這之前不再試著升級（兩次嘗試的最短間隔；探測沒過時逐次拉長）
+    next_try: Option<Instant>,
+    /// 升級探測沒過時目前的間隔
+    probe_backoff: Option<Duration>,
+    /// 直連沒多久就失敗過：這之前不用直連（初次綁定與升級都一樣），用經攔截
+    blocked_until: Option<Instant>,
+    blocked_until_ms: Option<u64>,
+    /// 連續幾次「直連沒多久就失敗」
+    failures: u32,
+    /// 最近一次升級嘗試與結果（狀態頁）
+    last_try_ms: Option<u64>,
+    last_result: Option<&'static str>,
+    /// 最近一次從經攔截改成直連的時間
+    upgraded_at_ms: Option<u64>,
+}
+
+impl Direct {
+    fn blocked(&self, now: Now) -> bool {
+        self.blocked_until.is_some_and(|t| now.at < t)
+    }
+
+    fn json(&self) -> Value {
+        if self.last_try_ms.is_none() && self.blocked_until_ms.is_none() && self.failures == 0 {
+            return Value::Null;
+        }
+        json!({
+            "lastTryAt": self.last_try_ms,
+            "lastResult": self.last_result,
+            "upgradedAt": self.upgraded_at_ms,
+            "failures": self.failures,
+            "blockedUntil": self.blocked_until_ms,
+        })
+    }
 }
 
 struct Inner {
@@ -357,6 +418,8 @@ struct Inner {
     /// 因為抽查不通過而解除的上游公鑰與次數（同一把金鑰一再不通過，重試間隔逐次拉長；3.4.3）
     audit_key: Option<[u8; 32]>,
     audit_strikes: u32,
+    /// 經攔截 ↔ 直連閘道的切換紀錄（3.5.0 C2）
+    direct: Direct,
 }
 
 /// 最近一次登記的結果
@@ -403,6 +466,7 @@ impl Inner {
             registered: None,
             audit_key: None,
             audit_strikes: 0,
+            direct: Direct::default(),
         }
     }
 }
@@ -423,6 +487,10 @@ enum Event {
     HeartbeatDue,
     /// 心跳的結果
     Heartbeat(Probe),
+    /// 經攔截綁定中，對閘道直連探測的結果（3.5.0 C2）
+    GatewayProbed(SocketAddr, Probe),
+    /// 這次沒有探測閘道（串接上游正在暫停）：沒有發查詢，不必等整個間隔，過一下再試
+    GatewayProbeSkipped,
     /// 重試時間到
     Retry,
     WanChanged,
@@ -447,6 +515,11 @@ enum Io {
         gateway: Option<SocketAddr>,
     },
     Heartbeat {
+        addr: SocketAddr,
+        tcp: bool,
+    },
+    /// 經攔截綁定中：對閘道直連發一次挑戰，看是不是同一台上游（3.5.0 C2）
+    ProbeGateway {
         addr: SocketAddr,
         tcp: bool,
     },
@@ -524,7 +597,8 @@ fn set_state(i: &mut Inner, st: State, reason: Option<Reason>) {
 /// 解除：拿掉綁定，排重試（`retry` = None：跟著下一次路徑檢查）
 fn release(i: &mut Inner, reason: Reason, retry: Option<Duration>, now: Now) -> Vec<Io> {
     let mut io = Vec::new();
-    if i.bound.take().is_some() {
+    if let Some(b) = i.bound.take() {
+        note_direct_end(i, &b, reason, now);
         io.push(Io::Unbind);
     }
     set_state(i, State::Released, Some(reason));
@@ -535,6 +609,55 @@ fn release(i: &mut Inner, reason: Reason, retry: Option<Duration>, now: Now) -> 
     i.retry_at_ms = retry.map(|d| now.ms + d.as_millis() as u64);
     io.push(Io::Wake);
     io
+}
+
+/// 直連閘道的綁定結束了（3.5.0 C2）：沒多久就因為沒回應／驗證不過而解除，記一次「直連失敗」，接下來一段時間
+/// 不用直連（重新綁定時用經攔截，也不升級）：1 小時；連續 3 次之後每次 24 小時。維持夠久才中斷的不算（歸零）。
+/// 這樣「經攔截 → 直連 → 失敗 → 經攔截 → 直連 …」最快一小時一輪、三輪之後一天一輪，不會來回切換
+fn note_direct_end(i: &mut Inner, b: &Bound, reason: Reason, now: Now) {
+    let Some(since) = b.direct_since else { return };
+    if !matches!(reason, Reason::NoResponse | Reason::VerifyFailed) {
+        return;
+    }
+    if now.at.saturating_duration_since(since) >= i.timing.direct_stable {
+        i.direct.failures = 0;
+        return;
+    }
+    i.direct.failures = i.direct.failures.saturating_add(1);
+    let block = if i.direct.failures >= i.timing.direct_fail_limit {
+        i.timing.direct_block_long
+    } else {
+        i.timing.direct_block
+    };
+    i.direct.blocked_until = Some(now.at + block);
+    i.direct.blocked_until_ms = Some(now.ms + block.as_millis() as u64);
+    i.direct.last_result = Some("direct-failed");
+    warn!(
+        "串接：直連閘道 {} 沒多久就中斷（連續第 {} 次），{} 分鐘內不用直連，重新串接時改經攔截",
+        b.addr.ip(),
+        i.direct.failures,
+        block.as_secs().div_ceil(60)
+    );
+}
+
+/// 經攔截綁定中、知道閘道、沒有被擋、離上次嘗試夠久：對閘道直連探測一次（3.5.0 C2）。
+/// 一次嘗試只有一筆 CH TXT 查詢（沒回應再一筆）；先把下一次最早的時間記好，探測結果回來再依結果調整
+fn upgrade_io(i: &mut Inner, now: Now) -> Option<Io> {
+    if i.state != State::Chained {
+        return None;
+    }
+    let b = i.bound.as_ref()?;
+    if b.via != Via::Intercept {
+        return None;
+    }
+    let g = i.view.as_ref()?.gateway.filter(|g| *g != b.addr)?;
+    if i.direct.blocked(now) || i.direct.next_try.is_some_and(|t| now.at < t) {
+        return None;
+    }
+    let tcp = b.tcp;
+    i.direct.next_try = Some(now.at + i.timing.upgrade_every);
+    i.direct.last_try_ms = Some(now.ms);
+    Some(Io::ProbeGateway { addr: g, tcp })
 }
 
 /// 回到未偵測
@@ -613,6 +736,7 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             i.probe = None;
             i.remembered = None;
             i.last_addr = None;
+            i.direct = Direct::default();
             to_none(i, None)
         }
         // 抽查不通過：解除串接、改用自己的加密上游；10～15 分鐘後重試（同 loop，加亂數）
@@ -644,9 +768,16 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             i.probe = None;
             i.remembered = None;
             i.last_addr = None;
+            // 換了網路：直連失敗的紀錄不適用了
+            i.direct = Direct::default();
             to_none(i, None)
         }
         Event::Report(v) => {
+            // 閘道換了（或剛知道閘道）：升級探測的間隔重新算；直連失敗的紀錄留著（保守）
+            if i.view.as_ref().and_then(|o| o.gateway) != v.gateway {
+                i.direct.next_try = None;
+                i.direct.probe_backoff = None;
+            }
             i.view = Some(v.clone());
             if !i.settings.downstream_enabled() {
                 i.probe = None;
@@ -668,7 +799,9 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
                 return release(i, Reason::Tampered, None, now);
             }
             match i.state {
-                State::Chained | State::Detected | State::Verifying => Vec::new(),
+                // 串接中、綁的是經攔截、這次知道閘道了：試著改成直連（3.5.0 C2；以前什麼都不做，一直經攔截）
+                State::Chained => upgrade_io(i, now).into_iter().collect(),
+                State::Detected | State::Verifying => Vec::new(),
                 State::None | State::Released => start_probe(i),
             }
         }
@@ -685,7 +818,12 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
                 return to_none(i, None);
             };
             set_state(i, State::Verifying, None);
-            let gateway = i.view.as_ref().and_then(|v| v.gateway).filter(|g| *g != addr);
+            // 直連沒多久就失敗過：這段時間不試直連，綁經攔截（3.5.0 C2）
+            let gateway = i
+                .view
+                .as_ref()
+                .and_then(|v| v.gateway)
+                .filter(|g| *g != addr && !i.direct.blocked(now));
             vec![Io::Verify { addr, tcp, gateway }]
         }
         Event::Verified { again, gateway } => {
@@ -743,6 +881,7 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
                 last_ok_ms: now.ms,
                 failures: 0,
                 via_nat: false,
+                direct_since: (via == Via::Gateway).then_some(now.at),
             });
             set_state(i, State::Chained, None);
             // 5～15 秒後（隨機）提早做一次心跳：縮短兩台同時互相綁定時的迴圈時間
@@ -818,9 +957,16 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
                 return reject(i, r, now);
             }
             i.hb_fail = 0;
+            let stable = i.timing.direct_stable;
+            let mut settled = false;
             if let Some(b) = i.bound.as_mut() {
                 b.last_ok_ms = now.ms;
                 b.failures = 0;
+                settled = b.direct_since.is_some_and(|t| now.at.saturating_duration_since(t) >= stable);
+            }
+            if settled {
+                // 直連穩定了：之前的直連失敗不再算
+                i.direct.failures = 0;
             }
             let jitter = i.timing.heartbeat.mul_f64(0.1);
             i.next_hb = Some(now.at + lerp(i.timing.heartbeat - jitter, i.timing.heartbeat + jitter, now.rnd));
@@ -828,7 +974,72 @@ fn step(i: &mut Inner, ev: Event, own: &[[u8; 8]], now: Now) -> Vec<Io> {
             if changed {
                 io.push(Io::SetPath(path));
             }
+            // 經攔截綁定中：心跳成功時順便看能不能改成直連閘道（有間隔下限）
+            io.extend(upgrade_io(i, now));
             io
+        }
+        Event::GatewayProbeSkipped => {
+            i.direct.next_try = Some(now.at + i.timing.retry_min);
+            i.direct.last_result = Some("suspended");
+            Vec::new()
+        }
+        Event::GatewayProbed(addr, p) => {
+            // 結果回來時情況變了（已經解除、已經是直連、閘道換了、剛被擋）：不理
+            let same = i.state == State::Chained
+                && i.bound.as_ref().is_some_and(|b| b.via == Via::Intercept)
+                && i.view.as_ref().and_then(|v| v.gateway) == Some(addr)
+                && !i.direct.blocked(now);
+            if !same {
+                return Vec::new();
+            }
+            let bound_pub = i.bound.as_ref().map(|b| b.public);
+            // 跟初次綁定同一個標準：簽章驗證通過、同一把金鑰（＝同一台上游）、allow、鏈上沒有自己、不會太深、chainPin
+            let why = if p.error.is_some() || p.public.is_none() {
+                Some(if p.supported { "verify-failed" } else { "no-response" })
+            } else if p.public != bound_pub {
+                Some("other-key")
+            } else if let Err(r) = judge(&p, own) {
+                Some(r.code())
+            } else if !p.public.is_some_and(|k| i.settings.pin_ok(&short_fp(&k))) {
+                Some("pin-mismatch")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                // 閘道不是那台上游（兩層 NAT、攔截者在更上游）或沒回應：維持經攔截，什麼都不改。
+                // 下一次嘗試的間隔加倍（10 分鐘 → … → 6 小時），不對同一台一直發
+                let d = match i.direct.probe_backoff {
+                    Some(b) => (b * 2).min(i.timing.upgrade_every_max),
+                    None => i.timing.upgrade_every,
+                }
+                .max(i.timing.upgrade_every);
+                i.direct.probe_backoff = Some(d);
+                i.direct.next_try = Some(now.at + d);
+                if i.direct.last_result != Some(why) {
+                    info!("串接：閘道 {} 不能直連（{why}），維持經攔截", addr.ip());
+                }
+                i.direct.last_result = Some(why);
+                return Vec::new();
+            }
+            // 驗證通過才換：同一台上游、只換位址，串接沒有中斷（`since`、公鑰、心跳的計時都不動）
+            let path = p.path.clone();
+            let Some(b) = i.bound.as_mut() else { return Vec::new() };
+            let (old, tcp) = (b.addr, b.tcp);
+            b.addr = addr;
+            b.via = Via::Gateway;
+            b.tcp_ok = true;
+            b.direct_since = Some(now.at);
+            i.last_addr = Some((addr, tcp, Via::Gateway));
+            i.probe = Some(p);
+            i.direct.probe_backoff = None;
+            i.direct.last_result = Some("upgraded");
+            i.direct.upgraded_at_ms = Some(now.ms);
+            info!(
+                "串接：閘道 {} 就是同一台上游黑潮（指紋相同），從經攔截（{}）改成直連閘道",
+                addr.ip(),
+                old.ip()
+            );
+            vec![Io::Bind { addr, tcp, path }, Io::Wake]
         }
         Event::Retry => {
             i.retry_at = None;
@@ -983,7 +1194,7 @@ impl Client {
                     }
                 }
                 Io::Wake => self.wake.notify_one(),
-                Io::Probe { .. } | Io::Verify { .. } | Io::Heartbeat { .. } => {
+                Io::Probe { .. } | Io::Verify { .. } | Io::Heartbeat { .. } | Io::ProbeGateway { .. } => {
                     debug_assert!(false, "需要網路的 Io 不能在這裡執行")
                 }
             }
@@ -1015,6 +1226,14 @@ impl Client {
                         queue.push(Event::Verified { again, gateway: gw });
                     }
                     Io::Heartbeat { addr, tcp } => queue.push(Event::Heartbeat(probe(addr, tcp, ask).await)),
+                    Io::ProbeGateway { addr, tcp } => {
+                        // 串接上游正在暫停（查詢連續失敗）：這時候不換位址、不發探測，等它穩定再試
+                        if self.manager().is_some_and(|m| m.chain_suspended()) {
+                            queue.push(Event::GatewayProbeSkipped);
+                        } else {
+                            queue.push(Event::GatewayProbed(addr, probe(addr, tcp, ask).await));
+                        }
+                    }
                     Io::Bind { addr, tcp, path } => {
                         self.bind(addr, tcp, path);
                         self.note_nat();
@@ -1382,6 +1601,7 @@ impl Client {
             "keyChangedAt": i.key_changed_at,
             "previousFingerprint": i.previous_fp,
             "registered": i.registered.as_ref().map(Registered::json),
+            "direct": i.direct.json(),
             "error": p.error,
         })
     }
@@ -1792,6 +2012,410 @@ mod tests {
         assert_eq!(i.state, State::Chained);
         assert_eq!(i.previous_fp.as_deref(), Some(fingerprint(&a).as_str()));
         assert!(i.key_changed_at.is_some());
+    }
+
+    // ---------------- 經攔截 → 直連閘道（3.5.0 C2）----------------
+
+    fn gw() -> SocketAddr {
+        "192.168.1.1:53".parse().unwrap()
+    }
+
+    /// `base` 之後 `secs` 秒
+    fn at(base: Now, secs: u64) -> Now {
+        Now {
+            at: base.at + Duration::from_secs(secs),
+            ms: base.ms + secs * 1000,
+            rnd: 0.5,
+        }
+    }
+
+    fn view_no_gateway() -> View {
+        View {
+            gateway: None,
+            gateway_ip: None,
+            ..view(Some("3.4.0"))
+        }
+    }
+
+    /// 開機時還不知道閘道：綁成經攔截
+    fn chained_via_intercept(i: &mut Inner, public: [u8; 32], t: Now) {
+        assert_eq!(
+            step(i, Event::Report(view_no_gateway()), &[], t),
+            vec![Io::Probe { addr: hit(), tcp: false }]
+        );
+        let io = step(i, Event::Probed(ok_probe(public, vec![])), &[], t);
+        assert_eq!(
+            io,
+            vec![Io::Verify {
+                addr: hit(),
+                tcp: false,
+                gateway: None
+            }]
+        );
+        step(
+            i,
+            Event::Verified {
+                again: ok_probe(public, vec![]),
+                gateway: None,
+            },
+            &[],
+            t,
+        );
+        assert_eq!(i.state, State::Chained);
+        let b = i.bound.as_ref().unwrap();
+        assert_eq!((b.addr, b.via), (hit(), Via::Intercept));
+    }
+
+    fn probe_gw() -> Vec<Io> {
+        vec![Io::ProbeGateway { addr: gw(), tcp: false }]
+    }
+
+    #[test]
+    fn intercept_bound_upgrades_to_gateway_when_gateway_appears() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        // 還不知道閘道：路徑檢查、心跳都不探測
+        assert!(step(&mut i, Event::Report(view_no_gateway()), &[], at(t0, 10)).is_empty());
+        let io = step(&mut i, Event::Heartbeat(ok_probe(a, vec![])), &[], at(t0, 20));
+        assert!(!io.iter().any(|x| matches!(x, Io::ProbeGateway { .. })), "{io:?}");
+        // 之後的路徑檢查拿到閘道了：對閘道直連探測一次（以前什麼都不做）
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60)), probe_gw());
+        assert_eq!(i.bound.as_ref().unwrap().via, Via::Intercept, "驗證通過之前不換");
+        // 同一把金鑰：換成直連，上游的鏈跟著新的回應
+        let path = vec![vec![3u8; 8]];
+        let io = step(&mut i, Event::GatewayProbed(gw(), ok_probe(a, path.clone())), &[], at(t0, 61));
+        assert_eq!(
+            io,
+            vec![
+                Io::Bind {
+                    addr: gw(),
+                    tcp: false,
+                    path
+                },
+                Io::Wake
+            ]
+        );
+        assert!(!io.contains(&Io::Unbind), "中間沒有解除");
+        let b = i.bound.as_ref().unwrap();
+        assert_eq!((b.addr, b.via, b.tcp_ok), (gw(), Via::Gateway, true));
+        assert_eq!(i.state, State::Chained);
+        let j = Client::upstream_json(&i);
+        assert_eq!((j["via"].as_str(), j["address"].as_str()), (Some("gateway"), Some("192.168.1.1")));
+        assert_eq!(j["direct"]["lastResult"], "upgraded");
+        assert_eq!(j["direct"]["upgradedAt"], at(t0, 61).ms);
+        assert!(Client::text(&i, t0.ms).starts_with("串接中：上游 192.168.1.1（"));
+        // 已經是直連：之後不再探測，心跳對閘道發
+        assert!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 4000)).is_empty());
+        assert_eq!(
+            step(&mut i, Event::HeartbeatDue, &[], at(t0, 4001)),
+            vec![Io::Heartbeat { addr: gw(), tcp: false }]
+        );
+        let io = step(&mut i, Event::Heartbeat(ok_probe(a, vec![vec![3u8; 8]])), &[], at(t0, 4002));
+        assert_eq!(io, vec![Io::Wake]);
+    }
+
+    /// 心跳成功時也會試（不必等 6 小時一次的路徑檢查）
+    #[test]
+    fn heartbeat_triggers_upgrade_probe() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        // 閘道是後來才知道的（例如另一輪路徑檢查在重新載入時進來）：直接改 view 模擬
+        i.view = Some(view(Some("3.4.0")));
+        let io = step(&mut i, Event::Heartbeat(ok_probe(a, vec![])), &[], at(t0, 300));
+        assert_eq!(io, [vec![Io::Wake], probe_gw()].concat());
+    }
+
+    #[test]
+    fn no_upgrade_when_gateway_key_differs() {
+        let mut i = inner(true);
+        let (a, other) = ([7u8; 32], [8u8; 32]);
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60)), probe_gw());
+        // 閘道上是別台黑潮（兩層 NAT、攔截者在更上游）：維持經攔截，什麼都不改
+        let io = step(&mut i, Event::GatewayProbed(gw(), ok_probe(other, vec![])), &[], at(t0, 61));
+        assert!(io.is_empty(), "{io:?}");
+        let b = i.bound.as_ref().unwrap();
+        assert_eq!((b.addr, b.via, b.public), (hit(), Via::Intercept, a));
+        assert_eq!(i.probe.as_ref().unwrap().public, Some(a), "最近一次的探測結果不被別台的蓋掉");
+        assert_eq!(i.remembered, Some(a));
+        assert!(i.key_changed_at.is_none(), "不算上游換了金鑰");
+        assert_eq!(Client::upstream_json(&i)["direct"]["lastResult"], "other-key");
+        assert_eq!(Client::upstream_json(&i)["via"], "intercept");
+    }
+
+    #[test]
+    fn no_upgrade_when_gateway_silent() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60)), probe_gw());
+        for (p, why) in [
+            (Probe::failed(false, "逾時".into()), "no-response"),
+            (Probe::failed(true, "簽章不對".into()), "verify-failed"),
+        ] {
+            let io = step(&mut i, Event::GatewayProbed(gw(), p), &[], at(t0, 61));
+            assert!(io.is_empty());
+            assert_eq!(i.bound.as_ref().unwrap().via, Via::Intercept);
+            assert_eq!(i.state, State::Chained, "探測閘道失敗不影響串接");
+            assert_eq!(i.hb_fail, 0, "不算心跳失敗");
+            assert_eq!(Client::upstream_json(&i)["direct"]["lastResult"], why);
+        }
+        // 閘道同一把金鑰、但不開放或鏈上有自己：一樣不換
+        let own = [[1u8; 8]];
+        let mut closed = ok_probe(a, vec![]);
+        closed.allow = false;
+        for (p, why) in [(closed, "not-allowed"), (ok_probe(a, vec![own[0].to_vec()]), "loop")] {
+            assert!(step(&mut i, Event::GatewayProbed(gw(), p), &own, at(t0, 62)).is_empty());
+            assert_eq!(i.bound.as_ref().unwrap().via, Via::Intercept);
+            assert_eq!(Client::upstream_json(&i)["direct"]["lastResult"], why);
+        }
+    }
+
+    #[test]
+    fn no_upgrade_when_pin_mismatch() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        // 綁定之後設定改成鎖定別台（重新載入）：探測回來的金鑰跟綁定的一樣也不換
+        i.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&[9u8; 32])));
+        assert!(!i.settings.pin_ok(&short_fp(&a)));
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60)), probe_gw());
+        assert!(step(&mut i, Event::GatewayProbed(gw(), ok_probe(a, vec![])), &[], at(t0, 61)).is_empty());
+        assert_eq!(i.bound.as_ref().unwrap().via, Via::Intercept);
+        assert_eq!(Client::upstream_json(&i)["direct"]["lastResult"], "pin-mismatch");
+        // 鎖定的就是這台：可以換
+        i.settings.pin = Some(kuroshio_config::chain::normalize_fp(&fingerprint(&a)));
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 4000)), probe_gw());
+        let io = step(&mut i, Event::GatewayProbed(gw(), ok_probe(a, vec![])), &[], at(t0, 4001));
+        assert!(matches!(io[0], Io::Bind { .. }));
+    }
+
+    /// 過期的結果不採用：已經解除、已經是直連、閘道換了
+    #[test]
+    fn stale_gateway_probe_is_ignored() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60)), probe_gw());
+        let elsewhere: SocketAddr = "192.168.1.254:53".parse().unwrap();
+        assert!(step(&mut i, Event::GatewayProbed(elsewhere, ok_probe(a, vec![])), &[], at(t0, 61)).is_empty());
+        assert_eq!(i.bound.as_ref().unwrap().via, Via::Intercept, "不是目前的閘道");
+        step(&mut i, Event::AuditFailed, &[], at(t0, 62));
+        assert_eq!(i.state, State::Released);
+        assert!(step(&mut i, Event::GatewayProbed(gw(), ok_probe(a, vec![])), &[], at(t0, 63)).is_empty());
+        assert!(i.bound.is_none() && i.state == State::Released, "解除之後回來的結果不會把它綁回去");
+    }
+
+    #[test]
+    fn upgrade_attempts_rate_limited() {
+        let mut i = inner(true);
+        let (a, other) = ([7u8; 32], [8u8; 32]);
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        let report = |i: &mut Inner, secs: u64| step(i, Event::Report(view(Some("3.4.0"))), &[], at(t0, secs));
+        let beat = |i: &mut Inner, secs: u64| {
+            step(i, Event::Heartbeat(ok_probe(a, vec![])), &[], at(t0, secs))
+                .iter()
+                .any(|x| matches!(x, Io::ProbeGateway { .. }))
+        };
+        let fail = |i: &mut Inner, secs: u64| {
+            assert!(step(i, Event::GatewayProbed(gw(), ok_probe(other, vec![])), &[], at(t0, secs)).is_empty());
+        };
+        assert_eq!(report(&mut i, 0), probe_gw());
+        // 結果還沒回來、或剛試過：10 分鐘內路徑檢查、心跳都不再試
+        assert!(report(&mut i, 1).is_empty());
+        assert!(!beat(&mut i, 300));
+        fail(&mut i, 2);
+        assert!(report(&mut i, 599).is_empty());
+        assert!(!beat(&mut i, 601), "探測沒過：從結果回來起算 10 分鐘");
+        // 之後每次沒過間隔加倍：10、20、40 分鐘 …，最多 6 小時
+        let mut t = 2;
+        let mut gaps = Vec::new();
+        for _ in 0..8 {
+            let mut gap = 0;
+            // 每 5 分鐘一次心跳，數到下一次探測
+            loop {
+                gap += 300;
+                if beat(&mut i, t + gap) {
+                    break;
+                }
+                assert!(gap < 8 * 3600, "要會再試");
+            }
+            t += gap;
+            fail(&mut i, t);
+            gaps.push(gap / 60);
+        }
+        assert_eq!(gaps, vec![10, 20, 40, 80, 160, 320, 360, 360]);
+        // 串接上游暫停中、這次沒有發探測：不必等整個間隔，一分鐘後再試
+        assert!(step(&mut i, Event::GatewayProbeSkipped, &[], at(t0, t + 1)).is_empty());
+        assert!(!beat(&mut i, t + 60));
+        assert!(beat(&mut i, t + 62));
+        fail(&mut i, t + 63);
+        let t = t + 63;
+        // 閘道換了（剛知道新的閘道）：間隔重新算
+        let mut v = view(Some("3.4.0"));
+        v.gateway = Some("192.168.1.254:53".parse().unwrap());
+        let io = step(&mut i, Event::Report(v), &[], at(t0, t + 1));
+        assert!(matches!(io[..], [Io::ProbeGateway { .. }]), "{io:?}");
+    }
+
+    #[test]
+    fn upgrade_blocked_for_an_hour_after_direct_failure() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60)), probe_gw());
+        step(&mut i, Event::GatewayProbed(gw(), ok_probe(a, vec![])), &[], at(t0, 61));
+        assert_eq!(i.bound.as_ref().unwrap().via, Via::Gateway);
+        // 直連 5 分鐘後心跳連續 3 次沒回應 → 解除（既有流程）
+        for n in 0..3 {
+            step(&mut i, Event::Heartbeat(Probe::failed(false, "逾時".into())), &[], at(t0, 360 + n));
+        }
+        assert_eq!((i.state, i.reason), (State::Released, Some(Reason::NoResponse)));
+        assert_eq!(i.direct.failures, 1);
+        let j = Client::upstream_json(&i);
+        assert_eq!(j["direct"]["lastResult"], "direct-failed");
+        assert_eq!(j["direct"]["blockedUntil"], at(t0, 362).ms + 3600 * 1000);
+        // 重試：這一小時內驗證時不試閘道，綁回經攔截
+        let t1 = 430;
+        assert!(matches!(step(&mut i, Event::Retry, &[], at(t0, t1))[0], Io::Probe { .. }));
+        let io = step(&mut i, Event::Probed(ok_probe(a, vec![])), &[], at(t0, t1));
+        assert_eq!(
+            io,
+            vec![Io::Verify {
+                addr: hit(),
+                tcp: false,
+                gateway: None
+            }],
+            "被擋的期間不直連"
+        );
+        step(
+            &mut i,
+            Event::Verified {
+                again: ok_probe(a, vec![]),
+                gateway: None,
+            },
+            &[],
+            at(t0, t1),
+        );
+        assert_eq!(i.bound.as_ref().unwrap().via, Via::Intercept, "退回經攔截");
+        // 一小時內：路徑檢查、心跳都不升級
+        for secs in [t1 + 10, t1 + 1800, 362 + 3599] {
+            assert!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, secs)).is_empty());
+            let io = step(&mut i, Event::Heartbeat(ok_probe(a, vec![])), &[], at(t0, secs));
+            assert!(!io.iter().any(|x| matches!(x, Io::ProbeGateway { .. })), "{secs}：{io:?}");
+        }
+        // 過了一小時：再試一次
+        assert_eq!(
+            step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 362 + 3601)),
+            probe_gw()
+        );
+    }
+
+    /// 連續 3 次「升級後沒多久又失敗」：之後一天才試一次（不是一小時），不會一直來回；直連穩定之後歸零
+    #[test]
+    fn upgrade_gives_up_after_three_failed_cycles() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        // 之後知道閘道了
+        i.view = Some(view(Some("3.4.0")));
+        let mut t = 0u64;
+        let mut switches = 0;
+        // 模擬 3 天：每 5 分鐘一次心跳；直連的心跳一律沒回應，經攔截的正常
+        while t < 3 * 86400 {
+            t += 300;
+            match i.state {
+                State::Chained if i.bound.as_ref().unwrap().via == Via::Gateway => {
+                    step(&mut i, Event::Heartbeat(Probe::failed(false, "逾時".into())), &[], at(t0, t));
+                }
+                State::Chained => {
+                    let io = step(&mut i, Event::Heartbeat(ok_probe(a, vec![])), &[], at(t0, t));
+                    if io.iter().any(|x| matches!(x, Io::ProbeGateway { .. })) {
+                        // 閘道的挑戰有回（同一把金鑰），但直連的查詢／心跳之後就不通
+                        let io = step(&mut i, Event::GatewayProbed(gw(), ok_probe(a, vec![])), &[], at(t0, t));
+                        assert!(matches!(io[0], Io::Bind { .. }));
+                        switches += 1;
+                    }
+                }
+                State::Released => {
+                    step(&mut i, Event::Retry, &[], at(t0, t));
+                    let io = step(&mut i, Event::Probed(ok_probe(a, vec![])), &[], at(t0, t));
+                    let Io::Verify { gateway, .. } = &io[0] else { panic!("{io:?}") };
+                    assert_eq!(*gateway, None, "直連剛失敗過：重新綁定時不直連");
+                    step(
+                        &mut i,
+                        Event::Verified {
+                            again: ok_probe(a, vec![]),
+                            gateway: None,
+                        },
+                        &[],
+                        at(t0, t),
+                    );
+                }
+                s => panic!("{s:?}"),
+            }
+        }
+        // 第 1、2 次失敗各擋 1 小時，第 3 次起每次擋 24 小時：3 天裡最多 3 + 3 次
+        assert!((4..=6).contains(&switches), "3 天裡換成直連 {switches} 次");
+        assert!(i.direct.failures >= 3);
+        // 直連穩定一小時（心跳都正常）：失敗次數歸零
+        let mut j = inner(true);
+        chained_via_intercept(&mut j, a, t0);
+        j.direct.failures = 2;
+        step(&mut j, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60));
+        step(&mut j, Event::GatewayProbed(gw(), ok_probe(a, vec![])), &[], at(t0, 61));
+        step(&mut j, Event::Heartbeat(ok_probe(a, vec![])), &[], at(t0, 61 + 1800));
+        assert_eq!(j.direct.failures, 2, "還不到一小時");
+        step(&mut j, Event::Heartbeat(ok_probe(a, vec![])), &[], at(t0, 61 + 3600));
+        assert_eq!(j.direct.failures, 0);
+        // 穩定之後才中斷的（上游重開機）：不算直連失敗、不擋
+        for n in 0..3 {
+            step(&mut j, Event::Heartbeat(Probe::failed(false, "逾時".into())), &[], at(t0, 9000 + n));
+        }
+        assert_eq!(j.state, State::Released);
+        assert!(j.direct.blocked_until.is_none() && j.direct.failures == 0);
+    }
+
+    /// 換成直連只換位址：串接開始的時間、公鑰、心跳失敗的計數、金鑰換過的紀錄都不動
+    #[test]
+    fn upgrade_keeps_since_and_trip_count() {
+        let mut i = inner(true);
+        let a = [7u8; 32];
+        let t0 = now();
+        chained_via_intercept(&mut i, a, t0);
+        i.key_changed_at = Some(t0.ms - 1000);
+        let since = i.bound.as_ref().unwrap().since_ms;
+        // 心跳失敗過 1 次（還沒到 3 次）
+        step(&mut i, Event::Heartbeat(Probe::failed(false, "逾時".into())), &[], at(t0, 30));
+        assert_eq!(i.hb_fail, 1);
+        let hb = i.next_hb;
+        assert_eq!(step(&mut i, Event::Report(view(Some("3.4.0"))), &[], at(t0, 60)), probe_gw());
+        step(&mut i, Event::GatewayProbed(gw(), ok_probe(a, vec![])), &[], at(t0, 61));
+        let b = i.bound.as_ref().unwrap();
+        assert_eq!(b.via, Via::Gateway);
+        assert_eq!(b.since_ms, since, "串接沒有中斷");
+        assert_eq!(b.public, a);
+        assert_eq!((i.hb_fail, b.failures), (1, 1), "心跳失敗的計數不歸零");
+        assert_eq!(i.next_hb, hb, "心跳的時間不動");
+        assert_eq!(i.key_changed_at, Some(t0.ms - 1000), "金鑰換過的紀錄（24 小時不收共用資料）照舊");
+        assert!(changed_within(i.key_changed_at, at(t0, 61).ms, KEY_CHANGE_WARN_MS));
+        assert_eq!(i.remembered, Some(a));
+        // WAN 變動：直連的紀錄清掉
+        i.direct.failures = 2;
+        step(&mut i, Event::WanChanged, &[], at(t0, 100));
+        assert_eq!(i.direct.failures, 0);
+        assert!(Client::upstream_json(&i).is_null());
     }
 
     #[test]
