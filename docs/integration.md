@@ -694,6 +694,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
 | `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`（UCI 是 `config cdn` 的 `option lite '1'`／`'0'`）。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped`（都是次數：還沒驗證完的網域每查一次就再算一次，不是網域數） |
 | `pool.relativeSpeed` | 3.5.0：節點測速用相對評分（預設 `true`；UCI 是 `config pool` 的 `option relative_speed '0'`／`'1'`）。關掉＝3.4.x：低於 1 MB/s 算慢、差 5% 以內才算瓶頸、直接比速度 |
+| `cdn.cross.requestScore` | 3.5.0：跨 CDN 加實測分數（預設 `true`；UCI 是 `config cdn` 的 `option cross_request_score '0'`／`'1'`）。關掉＝3.4.x：只看 TCP 延遲 |
 | `cdn.multiCdn` | 3.5.0：尊重多來源 CDN、第一層 CNAME 變了就失效（預設 `true`；UCI 是 `config cdn` 的 `option multi_cdn '0'`／`'1'`）。關掉＝3.4.x：每個網域只記一家、業者欄位直接改寫 |
 | `cdn.appLayer` | 3.5.0：App 自己選節點的服務（目前 Google、Apple）只辨識、不改寫（預設 `true`；UCI 是 `option app_layer`） |
 | `cdn.dbDiskBudgetKB` | 3.5.0：CDN 網域資料在磁碟上的預算。`auto`（預設：狀態目錄所在的檔案系統小於 64 MB 時用總容量的 30%，64 MB 以上或讀不到大小時不限）／數字（KB，下限 512）／`0`（不限）。UCI 是 `config cdn` 的 `option db_disk_budget_kb`。超過時在背景分批淘汰最久沒用的網域（一天內查過的、手動設定策略的不動），不會一次重寫全部分片。狀態：`cdn.dbBudgetKB`、`dbBudgetEntries`、`dbEntries`、`dbDiskKB`（實際）、`dbDiskEstKB`、`prunedForBudget` |
@@ -753,6 +754,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   - `provs`：最近看到的業者，最多 3 個：`[{ "provider": "cloudfront", "lastSeen": 毫秒, "verified": true }]`。`verified: true` 是有自己一格驗證結果的（最多兩家），`false` 是沒有格子、照原始答案回的。
   - `/api/cdn/domain` 的 `src`：原始的來源紀錄（`alt` 是另一家的那一格：`provider`、`v4`、`v6`、`base`、`last`；`seen`、`pend` 是第一層 CNAME 的防抖動狀態；`multiAt`、`invalAt`、`slotAt` 是毫秒時間）。這些欄位 3.4.x 讀到會原樣保留。
   - `/api/status` 的 `cdn.stats`：`srcInvalidated`（來源變了而清掉跨 CDN／ECS 的次數）、`multiHeld`（多來源沒有格子、照原始答案回的次數）、`appLayer`（App 層不改寫的次數）。
+- **跨 CDN 的實測分數**（3.5.0）：`/api/cdn/domain` 的 `cross4` 多 `score`（換過去那一家）與 `origScore`（原站）：一個請求的連線＋TLS 握手＋收到回應標頭的毫秒數，各取兩次探測裡比較小的；`cross4.tried[]` 每一家多 `score`（第一次探測的）。`verdict` 是 `fail` 而且兩個分數都有＝「連線比較近，但整個請求沒有比較快」。`/api/cdn/explain` 的 `cross` 步驟一樣多這兩個欄位；`GET /api/cdn/cross` 多 `scoreRejected`（因為這個原因沒有採用的網域數）。探測量不到分段時間時沒有這些欄位，照 3.4.x 的規則判斷。
 - **節點池的測速欄位**（3.5.0）：`GET /api/cdn/pools` 每家多 `speedRef`（這一次節點池工作量到速度的節點的中位數，MB/s；量到的不到 3 個時是 `null`），每個節點多：
   - `slow`：`true`／`false`＝相對評分的結果（連加上誤差範圍都不到 `speedRef` 的一半、或低於 0.1 MB/s）；沒有這個欄位＝沒量過速度，或舊資料（那時照舊規則：`speed` 低於 1 MB/s 算慢）。
   - `sample`：`{ "bytes": 8388608, "secs": 0.144, "connectMs": 4.1, "ttfbMs": 9.3, "quick": true }`——那一次下載收到的位元組數、收內容的秒數、連線（含 TLS 握手）與送出請求到收完標頭的毫秒數；`quick` 是量到瓶頸之後只收 1 MiB 的快測（這時節點的 `speed` 記的是瓶頸的速度）。這些是 3.6 工作負載分數的量測基礎，3.5.0 只收集、不參與排序。

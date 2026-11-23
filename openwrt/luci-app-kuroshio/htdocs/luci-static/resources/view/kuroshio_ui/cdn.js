@@ -86,6 +86,10 @@ return view.extend({
 				_('原本的 CDN 在台灣沒有節點（例如 Fastly）時，測試同一個網站是不是也放在 Cloudflare、CloudFront、Azure、Akamai 的台灣節點上；憑證與網頁內容都一致才採用。'));
 			o.default = common.def('cdn.cross.enabled') === false ? '0' : '1';
 			o.rmempty = false;
+			o = s.taboption('cross', form.Flag, 'cross_request_score', _('整個請求也要比較快才換'),
+				_('原本的條件都通過之後，再比一個請求從連線、握手到收到回應標頭的時間：比原站快 5% 以上才採用；已經在用的，差 10% 以內都留著。關掉＝3.4.x：只看 TCP 連線的延遲。'));
+			o.default = common.def('cdn.cross.requestScore') === false ? '0' : '1';
+			o.rmempty = false;
 			t('cross', 'cross_min_orig_ms', _('原本延遲超過幾毫秒才嘗試'), 'cdn.cross.minOrigMs');
 			t('cross', 'cross_recheck_hours', _('複驗間隔（小時）'), 'cdn.cross.recheckHours');
 			t('cross', 'cross_fail_days', _('失敗後幾天再試'), 'cdn.cross.failDays');

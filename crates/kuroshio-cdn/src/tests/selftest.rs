@@ -529,7 +529,7 @@ async fn fastly_quality_check_switches_pop() {
 }
 
 /// 跨 CDN 用的設定：Cloudflare、CloudFront、Azure 的台北節點各一個
-fn cross_setup() -> (Arc<Cdn>, Arc<MockNet>) {
+pub(super) fn cross_setup() -> (Arc<Cdn>, Arc<MockNet>) {
     let net = MockNet::new();
     let cfg = json!({
         "providers": { "cloudflare": {"enabled": true}, "cloudfront": {"enabled": true}, "azure": {"enabled": true}, "fastly": {"enabled": true} },

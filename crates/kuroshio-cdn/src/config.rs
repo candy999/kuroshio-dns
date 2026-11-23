@@ -34,6 +34,9 @@ pub struct CrossCfg {
     pub fail_days: f64,
     pub akamai_max_ms: f64,
     pub concurrency: usize,
+    /// 跨 CDN 加實測分數（3.5.0 B4，`cdn.cross.requestScore`，預設開）：原本的條件都過了之後，
+    /// 還要「整個請求（連線＋握手＋TTFB）不比原站慢」才採用。關掉＝3.4.x（只看 TCP 延遲）
+    pub request_score: bool,
 }
 
 /// `cdn.lite` 的值：true／false，或 UCI 的 "1"／"0"（"true"／"false"、"on"／"off"）；其他（"auto"、沒寫）是 None
@@ -207,6 +210,7 @@ impl CdnConfig {
                 fail_days: or(c, "cross.failDays", 3.0),
                 akamai_max_ms: or(c, "cross.akamaiMaxMs", 15.0),
                 concurrency: or(c, "cross.concurrency", 2.0) as usize,
+                request_score: lite_value(kuroshio_config::get(c, "cross.requestScore")) != Some(false),
             },
         }
     }

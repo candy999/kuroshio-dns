@@ -142,7 +142,8 @@ impl Cdn {
         if let Some(x) = e.cross4.as_deref() {
             steps.push(
                 json!({ "what": "cross", "result": Cdn::cross_state(Some(e), now), "to": x.to.as_deref(),
-                               "ms": x.ms.get(), "origMs": x.orig_ms.get(), "reason": x.reason, "at": x.at, "until": x.until }),
+                               "ms": x.ms.get(), "origMs": x.orig_ms.get(), "score": x.score.get(), "origScore": x.orig_score.get(),
+                               "reason": x.reason, "at": x.at, "until": x.until }),
             );
         }
         v["steps"] = Value::Array(steps);

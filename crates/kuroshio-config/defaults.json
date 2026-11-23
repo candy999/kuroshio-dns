@@ -329,7 +329,8 @@
       "recheckHours": 24,
       "failDays": 3,
       "akamaiMaxMs": 15,
-      "concurrency": 2
+      "concurrency": 2,
+      "requestScore": true
     },
     "v6Policy": "drop",
     "multiCdn": true,

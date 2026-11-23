@@ -861,3 +861,12 @@ fn pool_relative_speed_from_uci() {
     let c = load("config pool 'pool'\n\toption relative_speed '0'\n", &env());
     assert_eq!(g(&c, "pool.relativeSpeed"), &json!(false));
 }
+
+/// 3.5.0 B4：`cdn.cross.requestScore` 預設開；UCI 的 `config cdn` `option cross_request_score '0'` 回到只看 TCP 延遲
+#[test]
+fn cdn_cross_request_score_from_uci() {
+    let c = load("config cdn 'cdn'\n", &env());
+    assert_eq!(g(&c, "cdn.cross.requestScore"), &json!(true));
+    let c = load("config cdn 'cdn'\n\toption cross_request_score '0'\n", &env());
+    assert_eq!(g(&c, "cdn.cross.requestScore"), &json!(false));
+}

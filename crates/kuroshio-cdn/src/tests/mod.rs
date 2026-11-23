@@ -2,6 +2,7 @@
 
 mod behaviors;
 mod bench;
+mod crossscore;
 mod explain;
 mod jobs;
 mod lite;

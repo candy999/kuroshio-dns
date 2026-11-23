@@ -460,6 +460,9 @@ pub struct Tried {
     pub ok: Option<bool>,
     #[serde(default, skip_serializing_if = "Num::is_absent")]
     pub ms: Num,
+    /// 實測分數（3.5.0 B4）：一個請求的連線＋握手＋TTFB（毫秒），通過的節點裡最好的
+    #[serde(default, skip_serializing_if = "Num::is_absent")]
+    pub score: Num,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -495,6 +498,12 @@ pub struct Cross {
     pub ms: Num,
     #[serde(default, skip_serializing_if = "Num::is_absent")]
     pub orig_ms: Num,
+    /// 實測分數（3.5.0 B4）：換過去那一家／原站的「連線＋握手＋TTFB」（毫秒；各取兩次裡比較小的）。
+    /// 判定失敗時兩個都有＝「連線比較近，但整個請求沒有比較快」
+    #[serde(default, skip_serializing_if = "Num::is_absent")]
+    pub score: Num,
+    #[serde(default, skip_serializing_if = "Num::is_absent")]
+    pub orig_score: Num,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_ip")]
     pub orig_ip: Option<IpAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2017,6 +2026,8 @@ impl Db {
     /// 跨 CDN 統計：試了幾個、成功幾個、各轉去哪一家
     pub fn cross_summary(&self) -> Value {
         let (mut explored, mut ok, mut fail, mut none) = (0u32, 0u32, 0u32, 0u32);
+        // 連線比較近、但整個請求沒有比較快而沒有採用的（3.5.0 B4）
+        let mut score_rejected = 0u32;
         let mut by_to: IndexMap<String, u32> = IndexMap::new();
         let mut by_from: IndexMap<String, (u32, u32)> = IndexMap::new();
         let mut also: IndexMap<String, u32> = IndexMap::new();
@@ -2040,10 +2051,13 @@ impl Db {
                 }
             } else {
                 fail += 1;
+                if x.score.get().is_some() && x.orig_score.get().is_some() {
+                    score_rejected += 1;
+                }
             }
         }
         json!({
-            "explored": explored, "ok": ok, "fail": fail, "none": none, "byTo": by_to,
+            "explored": explored, "ok": ok, "fail": fail, "none": none, "scoreRejected": score_rejected, "byTo": by_to,
             "byFrom": by_from.into_iter().map(|(k, (e, o))| (k, json!({ "explored": e, "ok": o }))).collect::<serde_json::Map<_, _>>(),
             "also": also,
         })
