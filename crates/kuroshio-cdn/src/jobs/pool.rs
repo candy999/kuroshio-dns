@@ -574,7 +574,10 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                 v6: vec![],
                 kept_old: kept,
             });
-            cdn.with_state(|st| st.pools.replace(name, pool4, vec![], rest));
+            cdn.with_state(|st| {
+                crate::reach::audit_rebuilt(st, name, &pool4, &[], now_ms());
+                st.pools.replace(name, pool4, vec![], rest)
+            });
             continue;
         }
 
@@ -976,7 +979,10 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             v6: pool6.iter().map(|x| x.ip).collect(),
             kept_old: kept,
         });
-        cdn.with_state(|st| st.pools.replace(name, pool4, pool6, rest));
+        cdn.with_state(|st| {
+            crate::reach::audit_rebuilt(st, name, &pool4, &pool6, now_ms());
+            st.pools.replace(name, pool4, pool6, rest)
+        });
     }
     Ok(report)
 }

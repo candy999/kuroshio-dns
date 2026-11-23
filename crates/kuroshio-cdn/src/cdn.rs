@@ -109,6 +109,11 @@ pub struct Stats {
     pub multi_held: u32,
     /// App 自己選節點的服務：只辨識、不改寫的次數（3.5.0 B3）
     pub app_layer: u32,
+    /// 台灣節點驗證通過／沒通過的次數（3.5.0 E2 用；在 `verifier.rs` 的 `done()` 累加，各只算一次）
+    pub verify_ok: u32,
+    pub verify_fail: u32,
+    /// 台灣節點實測明顯比原本慢、暫時用原本答案的次數（3.5.0 E7；不算在 `verify_fail`）
+    pub slower_fallback: u32,
 }
 
 /// 背景工作
@@ -148,6 +153,8 @@ pub struct State {
     pub ecs_subnets: Vec<String>,
     /// 每個網段成功找到更近節點的次數
     pub ecs_wins: HashMap<String, u32>,
+    /// 線路感知（3.5.0 E3～E5、E7）：只在記憶體、有上限
+    pub line: crate::reach::Line,
     /// 目前公布給查詢用的分類快照（跟 `Cdn::classifier` 是同一份；用來判斷範圍有沒有換過）
     classifier: Arc<Classifier>,
 }
@@ -182,6 +189,12 @@ impl Drop for StateGuard<'_> {
             *self.cdn.classifier.write().unwrap_or_else(|e| e.into_inner()) = c;
             // 先換內容、再加版本號（讀的那邊順序相反）：不會有人把舊內容記成新版本
             self.cdn.cls_gen.fetch_add(1, Ordering::Release);
+        }
+        // 節點池換過（節點池工作、串接匯入）：順便重算這條線到得了哪些機房（3.5.0 E3；背景工作才會換節點池）
+        if self.mutated && self.g.pools.reach_dirty {
+            let g = &mut *self.g;
+            g.pools.reach_dirty = false;
+            g.line.recompute_reach(&g.pools, now_ms());
         }
     }
 }
@@ -257,6 +270,8 @@ pub struct Cdn {
     pub(crate) cross_sem: Arc<Semaphore>,
     hints: RwLock<Option<Arc<dyn Hints>>>,
     on_low_pool: RwLock<Option<LowPoolFn>>,
+    /// 這台目前的情況（串接中、記憶體壓力；3.5.0 E4／E5，`set_line_env()`）
+    pub(crate) line_env: RwLock<Option<LineEnvFn>>,
     /// 移出記憶體的冷資料筆數（`Db::evicted_count` 的副本）：0 時查詢路徑完全不必檢查
     evicted_n: AtomicU32,
     /// 小機器減量：這一分鐘（Unix 分鐘）排了幾個驗證
@@ -292,6 +307,7 @@ thread_local! {
 }
 
 type LowPoolFn = Arc<dyn Fn(&str) + Send + Sync>;
+type LineEnvFn = Arc<dyn Fn() -> crate::reach::LineEnv + Send + Sync>;
 
 /// 拿狀態鎖之前先空轉試幾次（一次幾奈秒；單核心的機器上最多白等幾微秒）
 const SPIN_TRIES: u32 = 200;
@@ -414,6 +430,9 @@ impl Cdn {
         }
 
         let classifier = Arc::new(pools.classifier());
+        let mut line = crate::reach::Line::default();
+        line.recompute_reach(&pools, now_ms());
+        pools.reach_dirty = false;
         let me = Cdn {
             classifier: RwLock::new(classifier.clone()),
             cls_gen: AtomicU32::new(0),
@@ -432,6 +451,7 @@ impl Cdn {
                 ecs_preferred: Vec::new(),
                 ecs_subnets: c.ecs.tw_subnets.clone(),
                 ecs_wins: HashMap::new(),
+                line,
                 classifier,
             }),
             cfg: c,
@@ -440,6 +460,7 @@ impl Cdn {
             bg: Mutex::new(Bg::default()),
             hints: RwLock::new(None),
             on_low_pool: RwLock::new(None),
+            line_env: RwLock::new(None),
             evicted_n: AtomicU32::new(0),
             budget_pruned: AtomicU32::new(0),
             disk_kb: AtomicU32::new(u32::MAX),
@@ -1202,6 +1223,10 @@ impl Cdn {
                 "background": { "verify": verify, "ecs": ecs, "cross": cross, "deferred": deferred } });
         drop(st);
         self.budget_json(&mut v);
+        // 3.5.0 E3～E5、E7：reach、popHealth、popSwitch、popAudit、slowerFuseUntil（背景算好的，這裡只複製）
+        if let (Some(m), Value::Object(o)) = (v.as_object_mut(), self.observe_json()) {
+            m.extend(o);
+        }
         v
     }
 
@@ -1445,12 +1470,20 @@ impl Cdn {
         let built = st.pools.p.values().any(|d| d.rest.get("updatedAt").is_some_and(Value::is_string));
         let pools = built.then(|| {
             let mut providers: IndexMap<String, ProvEntry> = IndexMap::new();
+            // 上游宣稱的機房（3.5.0 E4 的 `upPop`）是這台的查核狀態，不是資料：不傳給下游
+            let strip = |pool: &Vec<PoolNode>| {
+                let mut v = pool.clone();
+                for x in v.iter_mut() {
+                    x.take_up_pop();
+                }
+                v
+            };
             for (name, d) in &st.pools.p {
                 providers.insert(
                     name.to_string(),
                     ProvEntry {
-                        v4: (d.has_v4 || !d.pool4.is_empty()).then(|| d.pool4.clone()),
-                        v6: (d.has_v6 || !d.pool6.is_empty()).then(|| d.pool6.clone()),
+                        v4: (d.has_v4 || !d.pool4.is_empty()).then(|| strip(&d.pool4)),
+                        v6: (d.has_v6 || !d.pool6.is_empty()).then(|| strip(&d.pool6)),
                         rest: d.rest.clone(),
                     },
                 );
@@ -1531,6 +1564,17 @@ impl Cdn {
                     warn!("共用的節點池：{name} 的節點都不在官方範圍裡，保留原本的節點池");
                     continue;
                 }
+                // 上游宣稱的機房（3.5.0 E4）：記在 `upPop`，本機量到之前不算確認。上游帶來的 `upPop` 一律拿掉
+                for (pool, fam) in [(&mut pool4, 4u8), (&mut pool6, 6u8)] {
+                    for n in pool.iter_mut() {
+                        if self.cfg.pop_audit {
+                            let own = st.pools.p.get(name).and_then(|d| d.pool(fam).iter().find(|o| o.ip == n.ip));
+                            crate::reach::mark_incoming(n, own);
+                        } else {
+                            n.take_up_pop();
+                        }
+                    }
+                }
                 // 這台永久紀錄的台灣 v6 節點一律併入（同節點池工作的做法）
                 for k in st.v6.list(name) {
                     if !pool6.iter().any(|x| x.ip == k.ip) && st.pools.in_ranges(name, k.ip) {
@@ -1602,11 +1646,16 @@ impl Cdn {
                             p.ms = k.node.ms;
                             p.pop = k.node.pop.as_deref().map(util::intern);
                             p.permanent = Some(true);
+                            // 上游的永久 IPv6 節點：機房也是上游量的（3.5.0 E4）
+                            if self.cfg.pop_audit {
+                                crate::reach::mark_incoming(&mut p, None);
+                            }
                             d.pool6.push(p);
                         }
                     }
                 }
                 st.pools.dirty = true;
+                st.pools.reach_dirty = true;
                 st.v6.set_provider(name, keep);
                 match out.iter_mut().find(|(p, _)| p == name) {
                     Some(x) => x.1 += n,

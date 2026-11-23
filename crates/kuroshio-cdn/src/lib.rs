@@ -36,4 +36,4 @@ pub use config::CdnConfig;
 pub use net::{Net, RealNet};
 pub use optimizer::{ApplyResult, Baseline, Rewrite};
 pub use pools::{Class, Cls};
-pub use reach::ObserveCounters;
+pub use reach::{LineEnv, ObserveCounters};

@@ -91,8 +91,31 @@ struct HResult {
     ip: IpAddr,
     status: HStatus,
     pop: String,
+    /// 檢查前的機房（3.5.0 E5：壞掉的節點算在它原本的機房頭上）
+    old_pop: String,
     ms: f64,
     reason: String,
+}
+
+/// 健檢排序（3.5.0 E5／E6）：壞的在後 → 暫緩機房（E5）的在後 → `key`（延遲或品質分數）；
+/// 接著（`spread` 有值時）調整前幾名讓網段分散（E6）。`held` 是 None、`spread` 是 None 時就是 3.4.x 的排序
+pub(crate) fn order_pool(
+    pool: &mut [pools::PoolNode],
+    bad: &std::collections::HashMap<IpAddr, Bad>,
+    held: Option<&str>,
+    key: &dyn Fn(&pools::PoolNode) -> f64,
+    spread: Option<usize>,
+) {
+    let is_held = |x: &pools::PoolNode| held.is_some_and(|h| !bad.contains_key(&x.ip) && pools::pop3_is(x.pop_str(), h));
+    pool.sort_by(|a, b| {
+        (bad.contains_key(&a.ip) as u8)
+            .cmp(&(bad.contains_key(&b.ip) as u8))
+            .then((is_held(a) as u8).cmp(&(is_held(b) as u8)))
+            .then(key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    if let Some(n) = spread {
+        pools::spread_head(pool, &|x| bad.contains_key(&x.ip) || is_held(x), n, key);
+    }
 }
 
 impl Cdn {
@@ -138,6 +161,7 @@ impl Cdn {
                             ip,
                             status,
                             pop,
+                            old_pop,
                             ms: lat.ms,
                             reason,
                         }
@@ -150,16 +174,32 @@ impl Cdn {
                 let w = self.cfg.peak_weight;
                 let min_pool = self.cfg.min_pool;
                 let v6_ok = self.net.v6_usable() == Some(true);
+                let env = self.line_env();
+                let (switch_on, spread) = (self.cfg.pop_switch, self.cfg.spread_prefixes && !nearest);
+                let serve_n = self.cfg.serve_count_of(name);
                 changed |= self.with_state(|st| {
                     let st = &mut *st;
                     let mut changed = false;
                     // 這一輪有沒有把節點移出池（POP 移出台灣、永久失效）
                     let mut shrunk = false;
                     let Some(d) = st.pools.p.get_mut(name) else { return false };
+                    // 上游宣稱的機房跟這一輪本機量到的比（3.5.0 E4）：（一樣，不一樣）
+                    let (mut same, mut moved) = (0u32, 0u32);
                     for r in &results {
                         let Some(x) = d.pool_mut(family).iter_mut().find(|x| x.ip == r.ip) else {
                             continue;
                         };
+                        if r.status != HStatus::Dead && !r.pop.is_empty() {
+                            if let Some(up) = x.take_up_pop() {
+                                let check = crate::reach::compare_pop(&up, &r.pop, nearest);
+                                st.line.audit.note(check != crate::reach::PopCheck::Same, now);
+                                if check == crate::reach::PopCheck::Same {
+                                    same += 1;
+                                } else {
+                                    moved += 1;
+                                }
+                            }
+                        }
                         if r.status == HStatus::Tw {
                             x.pop = Some(util::intern(&r.pop));
                             x.ms = Num::V(util::round(r.ms, 2));
@@ -217,14 +257,35 @@ impl Cdn {
                             shrunk = true;
                         }
                     }
-                    // 最近節點型（Fastly）依品質分數排序；一般 CDN 依延遲（有尖峰時段量測時加權）
+                    if same + moved > 0 {
+                        info!(
+                            "{} IPv{family}：上游給的節點這台量到機房一樣 {same} 個、不一樣 {moved} 個{}",
+                            prov.label,
+                            if moved > 0 { "（改用這台量到的）" } else { "" }
+                        );
+                    }
+                    // 機房層級的健康（3.5.0 E5）：依檢查前的機房彙總這一輪，最近節點型（Fastly）不碰
+                    let held = if nearest {
+                        None
+                    } else {
+                        let round: Vec<crate::reach::RoundNode> = results
+                            .iter()
+                            .map(|r| crate::reach::RoundNode {
+                                pop: if is_tw_pop(&r.old_pop) { r.old_pop.clone() } else { r.pop.clone() },
+                                ok: r.status == HStatus::Tw,
+                                ms: r.ms,
+                                ip: r.ip,
+                            })
+                            .collect();
+                        let aggs = crate::reach::aggregate(name, family, &round);
+                        let block = st.line.block(name, family, switch_on, env, now);
+                        st.line.pop_round(name, family, aggs, block, now)
+                    };
+                    // 最近節點型（Fastly）依品質分數排序；一般 CDN 依延遲（有尖峰時段量測時加權）。
+                    // 3.5.0：暫緩的機房（E5）排在可用節點的最後，前幾名的網段分散（E6）
                     let bad = d.bad.clone();
                     let key = |x: &pools::PoolNode| if nearest { node_score(x) } else { weighted_ms(x, w, now) };
-                    d.pool_mut(family).sort_by(|a, b| {
-                        (bad.contains_key(&a.ip) as u8)
-                            .cmp(&(bad.contains_key(&b.ip) as u8))
-                            .then(key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal))
-                    });
+                    order_pool(d.pool_mut(family), &bad, held.as_deref(), &key, spread.then_some(serve_n));
                     let total = d.pool(family).len();
                     let alive = d.pool(family).iter().filter(|x| !bad.contains_key(&x.ip)).count();
                     // 只有「有節點壞掉或被移出」才重建：節點本來就少（例如 Azure 在台灣只有 2 個 IPv6 節點）而且全部正常時，
@@ -237,7 +298,13 @@ impl Cdn {
                 });
             }
         }
-        self.with_state(|st| st.pools.dirty = true);
+        let now = now_ms();
+        self.with_state(|st| {
+            st.pools.dirty = true;
+            // 這條線到得了哪些台灣機房（3.5.0 E3）：每一輪健檢結束時重算
+            st.pools.reach_dirty = false;
+            st.line.after_health(&st.pools, now);
+        });
         changed
     }
 
@@ -410,11 +477,10 @@ impl Cdn {
             n.checked_at = Some(now_ms());
             d.pool6.push(n);
             let bad = d.bad.clone();
-            d.pool6.sort_by(|a, b| {
-                (bad.contains_key(&a.ip) as u8)
-                    .cmp(&(bad.contains_key(&b.ip) as u8))
-                    .then(a.ms.or(999.0).partial_cmp(&b.ms.or(999.0)).unwrap_or(std::cmp::Ordering::Equal))
-            });
+            // 同健檢的排序（3.5.0 E5 暫緩的機房在後、E6 網段分散）
+            let held = st.line.held_pop(provider, 6, now_ms()).map(String::from);
+            let spread = (self.cfg.spread_prefixes && !prov.nearest).then(|| self.cfg.serve_count_of(provider));
+            order_pool(&mut d.pool6, &bad, held.as_deref(), &|x| x.ms.or(999.0), spread);
             let mut tw48 = (*d.tw48).clone();
             tw48.add(&util::subnet_key(ip));
             tw48.finalize();

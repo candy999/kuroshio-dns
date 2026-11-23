@@ -138,6 +138,8 @@ struct Done {
     http: Option<bool>,
     reason: Option<String>,
     retry_at: Option<u64>,
+    /// 台灣節點能用、但實測比原本慢（3.5.0 E7）：（台灣，原本）的請求時間。記成 `fail` 但不增加 `fails`
+    slower: Option<(f64, f64)>,
 }
 
 /// 驗證時內容最多讀多少：判斷只看狀態碼與標頭（內容只用來找 Cloudflare 的 `colo=`，那在 /cdn-cgi/trace，
@@ -162,6 +164,32 @@ fn slot_of<'a>(e: &'a crate::db::Domain, provider: &str, multi_cdn: bool) -> Slo
 }
 
 const VERIFY_MAX_BODY: usize = 4096;
+
+/// 驗證結果 `extra` 裡「比原本慢」的欄位（3.5.0 E7；`score`、`origScore` 同 B4 的 `Cross`）
+pub const SLOWER: &str = "slower";
+
+/// 寫入或拿掉「比原本慢」的欄位（沒有的時候不配置）
+fn set_slower(extra: &mut util::Extra, slower: Option<(f64, f64)>) {
+    match slower {
+        Some((tw, og)) => {
+            let m = extra.0.get_or_insert_with(Default::default);
+            m.insert(SLOWER.into(), serde_json::Value::Bool(true));
+            m.insert("score".into(), serde_json::json!(tw));
+            m.insert("origScore".into(), serde_json::json!(og));
+        }
+        None => {
+            if let Some(m) = extra.0.as_mut() {
+                if m.remove(SLOWER).is_some() {
+                    m.remove("score");
+                    m.remove("origScore");
+                }
+                if m.is_empty() {
+                    extra.0 = None;
+                }
+            }
+        }
+    }
+}
 
 impl Cdn {
     fn until(&self, ok: bool, fails: u32) -> u64 {
@@ -236,17 +264,26 @@ impl Cdn {
     ) -> Option<&'static str> {
         let prov = providers::get(provider);
         let label = providers::label(provider);
-        let prev_fails = {
+        // （上一次的失敗次數，上一次是不是「比原本慢」（3.5.0 E7），手動設成「一定換」）
+        let (prev_fails, was_slower, always) = {
             let st = self.state();
+            let of = |v: Option<&crate::db::Verdict>| {
+                (
+                    v.and_then(|v| v.fails).unwrap_or(0),
+                    v.is_some_and(|v| v.extra.get(SLOWER).and_then(serde_json::Value::as_bool) == Some(true)),
+                )
+            };
             // 多來源（3.5.0 B3）：這一家已經沒有格子（被別家擠掉、過期）→ 不驗證，結果沒有地方放
-            match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
-                Some((e, Slot::Main)) => e.verdict(family).and_then(|v| v.fails).unwrap_or(0),
-                Some((_, Slot::Alt(a))) => if family == 6 { a.v6.as_deref() } else { a.v4.as_deref() }
-                    .and_then(|v| v.fails)
-                    .unwrap_or(0),
+            let ((f, w), always) = match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
+                Some((e, Slot::Main)) => (of(e.verdict(family)), e.policy() == crate::db::Policy::Always),
+                Some((e, Slot::Alt(a))) => (
+                    of(if family == 6 { a.v6.as_deref() } else { a.v4.as_deref() }),
+                    e.policy() == crate::db::Policy::Always,
+                ),
                 Some((_, Slot::None)) => return None,
-                None => 0,
-            }
+                None => ((0, false), false),
+            };
+            (f, w, always)
         };
         let t = Duration::from_millis(self.cfg.verify_timeout_ms);
 
@@ -430,6 +467,7 @@ impl Cdn {
                                 http: None,
                                 reason: Some("原站同樣錯誤".into()),
                                 retry_at: None,
+                                slower: None,
                             },
                             false,
                         ));
@@ -461,6 +499,7 @@ impl Cdn {
                         http: None,
                         reason: Some(broken),
                         retry_at: None,
+                        slower: None,
                     },
                     false,
                 ));
@@ -483,6 +522,7 @@ impl Cdn {
                             http: None,
                             reason: Some(format!("狀態不同 原始 {} / 台灣 {}", b.status, r.status)),
                             retry_at: None,
+                            slower: None,
                         },
                         false,
                     ));
@@ -502,6 +542,33 @@ impl Cdn {
                 continue;
             }
             self.with_state(|st| st.pools.zone_note(provider, ip, true));
+            // 3.5.0 E7：台灣節點能用，但實測明顯比原本慢 → 暫時用原本的答案（既有的「驗證失敗 → 原始」），6 小時後重測。
+            // 節點沒有壞：不標壞、不增加失敗次數；好友的提示照樣算命中（上面已經記了）
+            if let Some((tw, og)) = self
+                .slower_check(name, provider, family, orig, ip, http_mode, base_ok, &r, was_slower, always)
+                .await
+            {
+                return Some(self.done(
+                    name,
+                    provider,
+                    family,
+                    false,
+                    prev_fails,
+                    Done {
+                        pop: Some(pop),
+                        ms: Some(r.ms),
+                        status: Some(r.status),
+                        ip,
+                        ips: None,
+                        tried: None,
+                        http: None,
+                        reason: Some(format!("台灣節點實測比原本慢（{tw} 毫秒對 {og} 毫秒）")),
+                        retry_at: Some(now_ms() + crate::reach::SLOWER_RETEST_MS),
+                        slower: Some((tw, og)),
+                    },
+                    false,
+                ));
+            }
             // 其餘候選也逐一確認：回給用戶端的每個 IP 都要驗證過（Cloudflare 有些網站只能用特定 IP）
             let mut ips = vec![ip];
             if !octet {
@@ -550,6 +617,7 @@ impl Cdn {
                     http: http_mode.then_some(true),
                     reason: None,
                     retry_at: None,
+                    slower: None,
                 },
                 true,
             ));
@@ -574,6 +642,7 @@ impl Cdn {
                     http: None,
                     reason: Some(format!("{}（試了 {} 個網段）", z.reason, candidates.len())),
                     retry_at: retry,
+                    slower: None,
                 },
                 false,
             ));
@@ -590,6 +659,48 @@ impl Cdn {
         });
         warn!("{name} IPv{family} 暫無法判定：{last_reason}");
         Some("unknown")
+    }
+
+    /// 台灣節點的請求時間（連線＋握手＋TTFB）是不是明顯比原本的慢（3.5.0 E7）：是的話回（台灣，原本）。
+    ///
+    /// 只處理 IPv4、非最近節點型、原本的 IP 探測成功、兩邊都量到、不是手動「一定換」的；保險絲跳了不判。
+    /// 第一次量到明顯較慢時兩邊各再探測一次、各取小的再比（最多多 [`crate::reach::SLOWER_EXTRA_PROBES`] 條連線）
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn slower_check(
+        &self,
+        name: &str,
+        provider: &str,
+        family: u8,
+        orig: Option<IpAddr>,
+        ip: IpAddr,
+        http_mode: bool,
+        base: Option<&ProbeResult>,
+        r: &ProbeResult,
+        was_slower: bool,
+        always: bool,
+    ) -> Option<(f64, f64)> {
+        if !self.cfg.slower_fallback || family != 4 || always || Cdn::is_nearest(provider) {
+            return None;
+        }
+        let o = orig.filter(IpAddr::is_ipv4)?;
+        let (mut tw, mut og) = (r.timing.request_ms()?, base?.timing.request_ms()?);
+        let now = now_ms();
+        if self.state().line.fuse.active(now) {
+            return None;
+        }
+        let mut slower = crate::reach::slower_than(tw, og, was_slower);
+        if slower {
+            for (target, slot) in [(ip, &mut tw), (o, &mut og)].into_iter().take(crate::reach::SLOWER_EXTRA_PROBES) {
+                let x = self.probe_site(target, name, http_mode).await;
+                if let Some(ms) = x.timing.request_ms().filter(|_| x.ok) {
+                    *slot = slot.min(ms);
+                }
+            }
+            slower = crate::reach::slower_than(tw, og, was_slower);
+        }
+        // 保險絲：這一次跳的也照驗證通過處理
+        let tripped = self.with_state(|st| st.line.fuse.note(slower, now));
+        (slower && !tripped).then(|| (util::round(tw, 1), util::round(og, 1)))
     }
 
     /// 額外候選 IP 能不能服務這個網站（同樣的判斷，只是不寫判定）
@@ -645,10 +756,26 @@ impl Cdn {
     /// 寫入判定（合併到舊紀錄，同 2.x）；`full` = 驗證成功的完整結果（ips / tried / http 一併更新）
     #[allow(clippy::too_many_arguments)]
     fn done(&self, name: &str, provider: &str, family: u8, ok: bool, prev_fails: u32, d: Done, full: bool) -> &'static str {
-        let fails = if ok { 0 } else { prev_fails + 1 };
+        // 比原本慢（3.5.0 E7）：節點沒有壞，失敗次數不加
+        let fails = if ok {
+            0
+        } else if d.slower.is_some() {
+            prev_fails
+        } else {
+            prev_fails + 1
+        };
         let until = d.retry_at.unwrap_or_else(|| self.until(ok, fails));
         let reason = d.reason.clone();
+        let now = now_ms();
         self.with_state(|st| {
+            if ok {
+                st.stats.verify_ok = st.stats.verify_ok.saturating_add(1);
+            } else if d.slower.is_some() {
+                st.stats.slower_fallback = st.stats.slower_fallback.saturating_add(1);
+                st.line.note_slower(now);
+            } else {
+                st.stats.verify_fail = st.stats.verify_fail.saturating_add(1);
+            }
             st.db.with_slot(name, provider, |db| {
                 db.set_verdict(name, family, |v| {
                     v.verdict = Some(intern(if ok { "ok" } else { "fail" }));
@@ -673,10 +800,13 @@ impl Cdn {
                     if let Some(r) = &d.reason {
                         v.reason = Some(r.clone());
                     }
+                    set_slower(&mut v.extra, d.slower);
                 })
             })
         });
-        if ok {
+        if let Some((tw, og)) = d.slower {
+            info!("↷ {name} IPv{family} 台灣節點能用，但實測比原本慢（{tw} 毫秒對 {og} 毫秒）：暫時用原本的答案，6 小時後重測");
+        } else if ok {
             info!(
                 "✔ {name} IPv{family} 台灣節點可用 ({} {} {}ms)",
                 d.pop.as_deref().filter(|p| !p.is_empty()).unwrap_or("?"),
