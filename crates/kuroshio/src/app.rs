@@ -127,6 +127,17 @@ fn answer_fingerprint(cfg: &Value) -> String {
     json!([pick("upstream"), res, cdn, pick("domain"), pick("system.persistDir")]).to_string()
 }
 
+/// 重新載入設定時交給下一輪的背景工作（3.5.0 F14）：（快照目錄, 交出的時間, 排隊中與執行中的工作）。
+/// 快照目錄不同（另一個實例）不接手；60 秒內沒人接手就過期（下一輪接手時每一個都寫一行「取消」）
+type JobHandoffSlot = (PathBuf, Instant, kuroshio_jobs::scheduler::JobHandoff);
+static JOB_HANDOFF: Mutex<Option<JobHandoffSlot>> = Mutex::new(None);
+
+/// 有沒有等下一輪接手的背景工作（3.5.0 F14；測試用）
+#[doc(hidden)]
+pub fn job_handoff_pending() -> bool {
+    JOB_HANDOFF.lock().unwrap().is_some()
+}
+
 /// 過濾相關的設定：`filter` 整段（含清單的 `bypass` 標記），加上決定「繞過防護清單放不放行下游」的
 /// `upstream.allowDownstream`（3.4.0，規格第 10 節）
 fn filter_fingerprint(cfg: &Value) -> String {
@@ -849,6 +860,17 @@ fn start_scheduler(
     tokio::spawn(async move {
         crate::clock::wait_synced().await;
         s2.start();
+        // 3.5.0 F14：接手上一輪（重新載入前）排隊中與執行到一半的工作
+        let handed = {
+            let mut g = JOB_HANDOFF.lock().unwrap();
+            match g.as_ref() {
+                Some((dir, ..)) if *dir == state_dir => g.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, at, h)) = handed {
+            s2.adopt(h, at.elapsed());
+        }
     });
     sched
 }
@@ -1589,9 +1611,21 @@ impl StopReason {
 }
 
 impl Started {
-    /// 關機：把有變動的快照全部寫出（規格 05 第 5.3 節），最多 10 秒
+    /// 重新載入設定時結束這一輪：把有變動的快照全部寫出（規格 05 第 5.3 節），最多 10 秒；
+    /// 排隊中與執行中的背景工作交給下一輪（3.5.0 F14）。程式結束走 [`Started::shutdown_for`]，不交接工作
     pub fn shutdown(&self) {
+        self.hand_over_jobs();
         self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
+    }
+
+    /// 3.5.0 F14：排隊中與執行中的工作交給下一輪（沒有就不放）
+    fn hand_over_jobs(&self) {
+        let Some(s) = &self.state.scheduler else { return };
+        let h = s.handoff();
+        if h.queued.is_empty() && h.running.is_none() {
+            return;
+        }
+        *JOB_HANDOFF.lock().unwrap() = Some((persist_dir(&self.state.cfg), Instant::now(), h));
     }
 
     /// 關機，時間上限依停止的原因（[`StopReason::flush_budget`]）

@@ -334,6 +334,56 @@ async fn status_full_keeps_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 3.5.0 F14：重新載入（`shutdown()`）把排隊中與執行中的工作交給下一輪；程式結束（`shutdown_for()`）不交接
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_does_not_hand_off() {
+    let dir = tmp("handoff");
+    let cfg = kuroshio_config::with_overrides(&user_cfg(&dir, 0, 0, false));
+    // 一個一直跑的工作與一個排隊中的（本機的假工作，不連外）
+    let busy = |started: &kuroshio::app::Started| {
+        let s = started.state.scheduler.clone().unwrap();
+        s.register("test-wait", |_ctx: kuroshio_jobs::JobCtx| async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        s.register("test-next", |_ctx: kuroshio_jobs::JobCtx| async { Ok(()) });
+        assert_eq!(s.request("test-wait", "測試"), json!({ "ok": true }));
+        assert_eq!(s.request("test-next", "測試"), json!({ "ok": true }));
+        s
+    };
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let s = busy(&started);
+    let t0 = std::time::Instant::now();
+    while s.running().is_none() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    started.shutdown_for(kuroshio::app::StopReason::Quit);
+    assert!(!kuroshio::app::job_handoff_pending(), "程式結束：不交接");
+    drop(started);
+    // 重新載入：交接
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let s = busy(&started);
+    let t0 = std::time::Instant::now();
+    while s.running().is_none() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    started.shutdown();
+    assert!(kuroshio::app::job_handoff_pending(), "重新載入：交給下一輪");
+    drop(started);
+    // 下一輪（同一個快照目錄）接手：假工作在新的一輪沒有註冊，取消並寫日誌，交接清空
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let t0 = std::time::Instant::now();
+    while kuroshio::app::job_handoff_pending() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "下一輪沒有接手");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    started.shutdown_for(kuroshio::app::StopReason::Quit);
+    drop(started);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `kuroshio run`：KUROSHIO_INIT_CONFIG 建立設定檔；SIGUSR1 寫出快照、SIGHUP 重新載入（都不結束）；SIGTERM 結束
 #[cfg(unix)]
 #[test]

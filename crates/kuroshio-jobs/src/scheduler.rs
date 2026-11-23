@@ -491,7 +491,23 @@ struct St {
     provided: HashSet<String>,
     /// 佇列裡優先的工作（手動觸發的，3.5.0）：開始執行時拿掉
     priority: HashSet<String>,
+    /// 因為重新載入被中斷、排回來重跑的工作：已經連續中斷幾次（3.5.0 F14；跑完拿掉）
+    reload_interrupts: HashMap<String, u32>,
 }
+
+/// 重新載入設定時交給下一輪排程器的工作（3.5.0 F14；比照 DNS 快取的交接）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobHandoff {
+    /// 排隊中的：（名稱、原因、是不是手動優先），照佇列的順序
+    pub queued: Vec<(String, String, bool)>,
+    /// 執行中、這一輪結束時被中斷的：（名稱、已經因為重新載入連續中斷幾次（含這一次））
+    pub running: Option<(String, u32)>,
+}
+
+/// 交接多久之內有效（跟 DNS 快取一樣 60 秒）
+pub const HANDOFF_TTL: Duration = Duration::from_secs(60);
+/// 同一個工作連續因為重新載入被中斷這麼多次就不再自動排回（避免「工作 → 觸發重新載入 → 重排」的迴圈）
+pub const RELOAD_INTERRUPT_MAX: u32 = 2;
 
 struct Inner {
     opts: Options,
@@ -531,6 +547,7 @@ impl Scheduler {
                     waiting: HashSet::new(),
                     provided: HashSet::new(),
                     priority: HashSet::new(),
+                    reload_interrupts: HashMap::new(),
                 }),
                 notify: Notify::new(),
             }),
@@ -858,6 +875,94 @@ impl Scheduler {
         json!({ "ok": true })
     }
 
+    /// 重新載入設定、這一輪結束時（3.5.0 F14）：排隊中的工作（名稱、原因、手動優先）與執行中的工作，交給下一輪
+    pub fn handoff(&self) -> JobHandoff {
+        let st = self.inner.st.lock().unwrap();
+        JobHandoff {
+            queued: st
+                .queue
+                .iter()
+                .map(|(n, r)| (n.clone(), r.clone(), st.priority.contains(n)))
+                .collect(),
+            running: st
+                .running
+                .as_ref()
+                .map(|r| (r.name.clone(), st.reload_interrupts.get(&r.name).copied().unwrap_or(0) + 1)),
+        }
+    }
+
+    /// 新的一輪接手上一輪交出的工作（3.5.0 F14）。`age` 是交出到現在多久。
+    /// - 排隊中的：工作還在、沒有停用 → 照原本的順序排回去（排在這一輪自己排的前面；手動的維持優先）。
+    /// - 執行中被中斷的：排回佇列最前面，原因「重新載入時中斷，重新執行」；連續中斷 [`RELOAD_INTERRUPT_MAX`] 次就不再排回（WARN）。
+    /// - 保留不了的（工作停用、不存在、交接超過 60 秒）：每一個寫一行 INFO。沒有任何一個工作會無聲消失。
+    ///
+    /// 回傳寫了哪些日誌（測試用）
+    pub fn adopt(&self, h: JobHandoff, age: Duration) -> Vec<String> {
+        let mut lines: Vec<(bool, String)> = Vec::new();
+        {
+            let mut st = self.inner.st.lock().unwrap();
+            let cfg = Self::jobs_cfg(&st.cfg);
+            let jobs = self.inner.jobs.lock().unwrap();
+            let why_not = |name: &str| -> Option<&'static str> {
+                if age > HANDOFF_TTL {
+                    Some("交接超過 60 秒")
+                } else if !jobs.contains_key(name) {
+                    Some("工作不存在")
+                } else if !enabled(cfg.get(name).unwrap_or(&Value::Null)) {
+                    Some("工作已停用")
+                } else {
+                    None
+                }
+            };
+            let busy = |st: &St, name: &str| st.running.as_ref().is_some_and(|r| r.name == name) || st.queue.iter().any(|(n, _)| n == name);
+            let mut kept = Vec::new();
+            for (name, reason, prio) in &h.queued {
+                match why_not(name) {
+                    Some(w) => lines.push((false, format!("重新載入：取消排隊中的 {name}（{w}）"))),
+                    None if busy(&st, name) => {}
+                    None => kept.push((name.clone(), reason.clone(), *prio)),
+                }
+            }
+            // 照原本的順序排在這一輪自己排的前面（交出來的本來就等得比較久）
+            for (name, reason, prio) in kept.iter().rev() {
+                st.queue.push_front((name.clone(), reason.clone()));
+                if *prio {
+                    st.priority.insert(name.clone());
+                }
+            }
+            if !kept.is_empty() {
+                let names: Vec<&str> = kept.iter().map(|k| k.0.as_str()).collect();
+                lines.push((
+                    false,
+                    format!("重新載入：保留排隊中的工作 {} 個（{}）", kept.len(), names.join("、")),
+                ));
+            }
+            if let Some((name, n)) = h.running {
+                match why_not(&name) {
+                    Some(w) => lines.push((false, format!("重新載入：取消重跑被中斷的 {name}（{w}）"))),
+                    None if n >= RELOAD_INTERRUPT_MAX => {
+                        lines.push((true, format!("{name} 已經因為重新載入中斷 {n} 次，不再自動重排；要跑請手動執行")))
+                    }
+                    None if busy(&st, &name) => {}
+                    None => {
+                        st.queue.push_front((name.clone(), "重新載入時中斷，重新執行".to_string()));
+                        st.reload_interrupts.insert(name.clone(), n);
+                        lines.push((false, format!("重新載入：{name} 執行到一半被中斷，排回佇列最前面重新執行")));
+                    }
+                }
+            }
+        }
+        for (w, l) in &lines {
+            if *w {
+                warn!("{l}");
+            } else {
+                info!("{l}");
+            }
+        }
+        self.inner.notify.notify_one();
+        lines.into_iter().map(|x| x.1).collect()
+    }
+
     /// 佇列裡有工作、目前沒在跑、系統不吃緊 → 啟動下一個。回傳有沒有啟動。
     pub fn try_start_next(&self) -> bool {
         let defer = self.inner.opts.should_defer.as_ref().map(|f| f()).unwrap_or(false);
@@ -972,6 +1077,7 @@ impl Scheduler {
                 }
             }
             st.running = None;
+            st.reload_interrupts.remove(name);
             info!("{name} 完成 (code {code})，耗時 {} 秒", (now.saturating_sub(started) + 500) / 1000);
         }
         self.changed();
