@@ -293,6 +293,7 @@ sig = Ed25519( 節點私鑰, "kuroshio-chain/1\0" || kind || 0x00 || body )
 
 ```json
 "chain": {
+  "self": { "nodeId": "0f1e2d3c4b5a6978", "fingerprint": "…", "version": "3.5.0", "depth": 2 },
   "enabled": true,
   "state": "chained", "reason": null,
   "text": "串接中：上游 192.168.1.1（黑潮 3.4.0），評測結果與 CDN 節點由上游提供",
@@ -313,6 +314,7 @@ sig = Ed25519( 節點私鑰, "kuroshio-chain/1\0" || kind || 0x00 || body )
 }
 ```
 
+- `self`（3.5.0 E13）：這台自己的節點 ID、指紋、版本、層數（串接中等於 `upstream.depth`，沒有串接是 1）。`chain` 關著、回應器沒有建立時也有；還沒有節點金鑰時 `nodeId`、`fingerprint` 是 `null`（不為了這個建立金鑰檔）。畫拓樸圖（自己＋往上每一層＋直接的下游）時跟 `upstream.path`、`serving.downstreams[].nodeId` 對起來；下游的下游、`path` 裡更上層的版本與位址不提供。
 - `enabled`：下游的 `chain` 開關。
 - `text` 是給狀態頁直接顯示的一行白話，**每一種情況都要看得出原因與影響**：
 
@@ -565,6 +567,13 @@ Object：
 - 1 小時內累積 3 次可疑 → 解除串接，原因 `audit-failed`（「上游給的答案查核不通過」），6 小時後重試；同一把金鑰再不通過就 12、24 小時（最多 24 小時，3.4.3；3.4.2 是固定 10～15 分鐘，說謊的上游會讓下游一直「串接、解除」）。解除時清掉累積的次數。
 - 因為「不可信」解除（`audit-failed`、`tampered`、`upstream-changed`、`verify-failed`、`pin-mismatch`）：請排程器補跑 `dns-benchmark`、`cdn-ranges`、`cdn-pool`（最小間隔照舊；3.4.3）。
 - 狀態：`/api/status` 的 `chain.audit`：`sampled`（抽查）、`valid`、`unverified`、`siteInvalid`、`suspicious`、`last`（最近一次可疑：名稱、IP、時間）。
+
+**機房以本機量到的為準**（3.5.0 E4，`cdn.popAudit`，預設開；關掉＝照收上游的機房、串接中不量）
+- 匯入的節點（`import_shared()`）：上游帶來的 `upPop` 一律拿掉；這台原本就有、本機量過的節點，機房一樣就不記，不一樣就用這台的；其他記 `upPop`＝上游給的 `pop`（種子不記），上游的永久 IPv6 節點併進節點池時也記。`upPop` 跟著 `pools.json` 存，舊版讀到原樣保留。往下再分享（`export_shared()`）不帶 `upPop`。
+- 比對時機（都是既有的量測）：定時健檢套用結果時、節點池工作換新節點池前（只比重新量過的節點）、**串接中的機房抽查**：上面的答案抽查握手通過之後，用同一個抽查名額（不多佔同時數、不縮短 30 秒的間隔），如果那個 IP 是 `upPop` 還在的節點（`Cdn::pop_audit_wanted()`），對它做一次那家 CDN 的機房探測（同健檢：`Net::http_probe()` 打 `Provider.probe`），量到的交給 `Cdn::note_local_pop()`。抽查另外的上限在 CDN 那一層：10 分鐘最多 1 個、24 小時 24 個、每個節點一次（`cdn.lite`：30 分鐘 1 個、8 個）；`pop_audit_wanted()` 回 `Some` 就算用掉一個名額（探測失敗也不還）；記憶體壓力不是 `Normal`、沒對時、CDN 關、`cdn.popAudit` 關時不做。匯入一次之後抽查量自己歸零。
+- 比對：一樣 → 確認、拿掉 `upPop`；不一樣但在台灣 → 改用本機的、拿掉 `upPop`、計一次不一致；不在台灣 → 照既有流程標成壞節點（`POP=xxx`）。
+- 不一致**不解除串接、不記可疑**（憑證是對的、節點在官方範圍裡，機房不同是線路拓樸，例如上游有多條對外線路），列入 `findings` 的 `pop-mismatch`；24 小時內比對過的一半以上不一樣（至少 4 個）→ `chainPopUnreliable`，只暫停機房切換（規格 11 E5），24 小時沒有新的不一致自己解除。
+- 狀態：`/api/status` 的 `cdn.popAudit`（`pending`、`confirmed`、`mismatch`、`probes24h`、`lastMismatchAt`、`chainPopUnreliable`）。
 
 **不會造成的事**
 - 每 30 秒最多 1 次 TLS 握手，D3 上大約是 3.4.0 下游 CPU 負擔的幾百分之一；交叉確認一次最多再多 1 筆查詢。

@@ -127,6 +127,8 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 | `data.ok` | bool | data/ 跟執行檔相容（有版本標記而且格式相同） |
 | `data.warning` | string \| null | data/ 的問題 |
 | `warnings` | array of string | 需要注意的事：data/ 不相容、系統時間沒對時、記憶體吃緊、訂閱清單因為記憶體不足被停用、訂閱清單下載失敗、存取控制的台灣 IP 資料讀不到（公網來源擋下中）、新設定無法套用。沒有是 `[]`。文字內容不是約定，只約定「空陣列 = 沒事」 |
+| `freshness` | array | 3.5.0：資料新鮮度，同 `/api/status` 的 `freshness`（見下面「觀測與線路感知」）；舊版服務沒有是 `[]` |
+| `findings` | array | 3.5.0：發現清單，同 `/api/status` 的 `findings`；舊版服務沒有是 `[]`。`warnings` 不受影響（同一件事不兩邊都放） |
 
 ### `kuroshio notify`
 
@@ -500,6 +502,7 @@ UCI 是清單區段的 `option bypass '1'`，JSON 是 `filter.lists[].bypass: tr
 
 | 欄位 | 說明 |
 |---|---|
+| `self` | 3.5.0：這台自己 `{ nodeId, fingerprint, version, depth }`。`depth` 串接中等於 `upstream.depth`（含這台的層數），沒有串接是 `1`。`chain` 關著、回應器沒有建立時也有；還沒有節點金鑰時 `nodeId`、`fingerprint` 是 `null`（不會為了這個建立金鑰檔）。畫拓樸圖時用它跟 `upstream.path`、別台的 `serving.downstreams[].nodeId` 對起來 |
 | `enabled` | 這台的 `chain` 開關 |
 | `state` | `none`（沒有偵測到）/ `detected`（偵測到，驗證中）/ `verifying`（做最後確認）/ `chained`（串接中）/ `released`（偵測到但沒有串接，原因在 `reason`） |
 | `reason` | `released` 的原因：`not-allowed`（上游的 `allow_downstream` 關）、`upstream-too-old`、`unsupported`（上游沒有回應串接查詢）、`verify-failed`、`pin-mismatch`（3.4.4：上游的指紋跟 `upstream.chainPin` 不符）、`upstream-changed`、`no-response`、`gone`（一般 DNS 不再被接走）、`loop`、`too-deep`、`tampered`（攔截者竄改答案）、`audit-failed`（3.4.2：抽查上游給的答案，1 小時內 3 次憑證不符、而自己的上游的答案正常；10～15 分鐘後重試） |
@@ -571,7 +574,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 `/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。3.4.3 起另有 `chainRetry`：上游黑潮解析不到（SERVFAIL）、改用自己的加密上游解析到的次數。`memory.pressure`（3.4.3）：當下的記憶體量測（`normal`／`low`／`critical`）；`memory.state` 放鬆前要穩定幾分鐘，兩者會差幾分鐘。
 
-3.5.0：`/api/status` 的 `cdn` 在 CDN 關掉時是 `{"enabled": false}`（以前是 `null`，看不出是關掉還是讀不到）。`/api/status` 多 `perf`（效能計數器，找出沒有 AES 指令的機器把 CPU 花在哪裡）：`perf.tls.dot`／`perf.tls.doh` 各有 `full`（完整握手）、`resumed`（續用 session）、`aes`／`chacha`（協商到的密碼套件）、`fail`（連線或握手失敗）；`perf.tls.quic` 有 `new`、`fail`；`perf.fanout` 是每次詢問送出 1、2、3、4 個以上上游查詢的次數（一筆查詢可能詢問兩次：先問主要的，再問備援），`perf.backfillQueries` 是背景補問送出的上游查詢數。都是啟動以來的累計，32 位元，溢位就從 0 重來。`/api/trace` 的 `upstreams[]` 多 `viaInterceptor`：一般 DNS 被路上的攔截者（路由器）接走時是 `true`，並附一句 `note`，表示回答的其實是攔截者、不是那個位址。
+3.5.0：`/api/status` 的 `cdn` 在 CDN 關掉時是 `{"enabled": false}`（以前是 `null`，看不出是關掉還是讀不到）。`/api/status` 多 `perf`（效能計數器，找出沒有 AES 指令的機器把 CPU 花在哪裡）：`perf.tls.dot`／`perf.tls.doh` 各有 `full`（完整握手）、`resumed`（續用 session）、`aes`／`chacha`（協商到的密碼套件）、`fail`（連線或握手失敗）；`perf.tls.quic` 有 `new`、`fail`；`perf.fanout` 是每次詢問送出 1、2、3、4 個以上上游查詢的次數（一筆查詢可能詢問兩次：先問主要的，再問備援），`perf.backfillQueries` 是背景補問送出的上游查詢數。都是啟動以來的累計，32 位元，溢位就從 0 重來。`/api/status?lite=1` 不回 `perf`（3.5.0 起；見「觀測與線路感知」）。`/api/trace` 的 `upstreams[]` 多 `viaInterceptor`：一般 DNS 被路上的攔截者（路由器）接走時是 `true`，並附一句 `note`，表示回答的其實是攔截者、不是那個位址。
 
 ## 上游多樣性（3.4.0 起）
 
@@ -692,6 +695,129 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 - `/api/jobs` 的 `queue[]` 每筆多 `priority`（`true` = 手動、排在最前面的）。
 - 正在跑 `cdn-scan`（網段分類，一跑十幾分鐘）時，有手動的工作在等，它在「一家 CDN 掃完」的時候讓出：掃完的那幾家照寫，5 分鐘後續跑（原因「續跑（讓給手動執行的工作）」），續跑時跳過 6 小時內已經掃完的那幾家；一家掃到一半不讓出，最多讓出 3 次，之後跑到完。手動的工作最多等一家 CDN 的時間。
 - 補跑的先後：自動上游還沒評測過（`upstreams.json` 沒有 `generatedAt`，例如剛安裝、來自預設名單）時，`dns-benchmark` 的補跑排在 `cdn-scan` 前面（`cdn-scan` 的補跑延到評測之後 1 秒排入；`startDelaySec` 的預設值不變）。
+
+## 觀測與線路感知（3.5.0 起）
+
+都放在既有的路徑裡（`/api/status`、`/api/dashboard`、`/api/chain`、`/api/community/status`），**沒有新的路徑**：OpenWrt 的 rpcd 白名單、padavan 韌體都不用改。新欄位舊韌體不認得就不顯示；`warnings` 的格式與內容不變。全部是拉取式（被讀時才算），不新增背景工作、不發探測、不寫新檔。
+
+### `/api/status` 的查詢參數
+
+| 參數 | 說明 |
+|---|---|
+| `lite=1` | 不回大的欄位：`perf`（效能計數器）、`history`。LuCI 的 rpcd（`status` 方法）、padavan 韌體每幾秒讀一次用這個。`freshness`、`findings`、`stale`、`cdn.reach` 這些很小，照樣有。（規格 C12 一直寫「`lite=1` 時不回 `perf`」，3.5.0 之前的版本其實沒有處理 `lite`。） |
+| `history=1` | 多帶 `history`（24 小時歷史，約 6 KB）；不帶參數時沒有。跟 `lite=1` 一起時以 `lite` 為準（不帶） |
+
+### `freshness`（資料新鮮度）
+
+```json
+"freshness": [
+  { "key": "benchmark", "label": "每日評測", "lastOkAt": 1795382000000, "failing": false, "fails": 0,
+    "nextAt": 1795450200000, "stale": false, "pending": false, "source": "own", "failingItems": null, "note": null },
+  { "key": "tw-ip", "label": "台灣 IP 資料", "lastOkAt": null, "failing": true, "fails": 2,
+    "nextAt": 1797000000000, "stale": false, "pending": true, "source": "own", "failingItems": null, "note": "資料產生於 2026-11-01" }
+]
+```
+
+- 固定順序、最多 16 項：`benchmark`、`cdn-ranges`、`cdn-scan`、`cdn-pool`、`tw-ip`（排程工作，CDN 關著時沒有 `cdn-*`；停用、沒註冊的工作不列）、`filter-lists`（過濾有開才有）、`path-check`（路徑檢查有開才有）、`chain-sync`（串接中才有）、`friends-sync`（有好友才有）。
+- `key` 是約定；`label`、`note` 是給人看的白話（內容不是約定）。
+- `lastOkAt`：上次成功（毫秒）；從來沒成功過是 `null`，同時 `pending: true`、`stale: false`。過濾清單的「成功」含「檢查過都沒變（304）」。好友同步是所有好友裡最舊的那一次。
+- `failing`、`fails`：上一次是失敗的、連續失敗幾次。排程工作的 `fails` 來自排程狀態檔的 `failStreak`（成功拿掉、失敗加 1、飽和到 9,999；3.4.x 留下的狀態檔沒有這個欄位時，上一次失敗當 1）；過濾清單、串接同步沒有連續次數，失敗中記 1；好友同步是最大的連續失敗次數。
+- `failingItems`：失敗的清單數（過濾清單）、同步失敗中的好友數（好友同步）；其他是 `null`。
+- `stale`：上次成功距今超過週期的 2 倍。排程工作的週期是「下次排定 − 最近一次排定」；過濾清單用 `filter.updateIntervalHours`、路徑檢查 6 小時、串接同步 6 小時、好友同步 `community.syncIntervalMin`。
+- `source`：`chain` = 現在由上游黑潮提供（串接中、略過這個工作），不算失敗，上次成功取「自己跑完」與「從上游匯入」比較新的那一個；`own` = 這台自己做。
+
+### `findings`（發現清單）
+
+```json
+"findings": [
+  { "key": "upstream-failing", "sev": "warn", "text": "有 1 個上游連續失敗、暫停中（會逐次拉長暫停時間，恢復後自動接回）",
+    "count": 2, "firstAt": 1795400000000, "lastAt": 1795486200000, "active": true },
+  { "key": "reach-single-pop", "sev": "info", "text": "這條線目前只到得了台北機房",
+    "count": 1, "firstAt": 1795400000000, "lastAt": 1795486200000, "active": true }
+]
+```
+
+- 分工：`warnings` = 現在需要處理的；`findings` = 觀察到的現象與經過。同一件事不兩邊都放。
+- `key`（約定）：`upstream-failing`、`upstream-all-down`、`serve-stale-high`、`cdn-verify-fail-high`、`chain-intercepted`、`chain-released-untrusted`、`chain-audit-released`、`list-copy-no-room`、`cdn-db-pruning`、`job-failing`、`friends-sync-failing`、`reach-single-pop`、`reach-none`、`pop-mismatch`、`pop-switched`、`pop-flapping`、`slower-fallback`、`slower-fuse`。之後可能會加，不認得的 `key` 請照 `text` 顯示。
+- `sev`：`warn` / `info`。排序：`warn` 在前，同級 `lastAt` 新的在前。
+- `text`：一句話（最長 200 個字元，內容不是約定）；只放數量、CDN 名稱、機房代碼，不放網域與用戶端 IP。
+- `count`：次數（飽和到 9,999）。狀態類（例如上游暫停中）是「從不成立變成立」的次數；事件類（例如機房切換）用來源模組自己的計數算，沒人開狀態頁的那幾天也是對的。
+- `firstAt`：這台第一次看到的時間（沒人讀狀態時可能比實際晚）；`lastAt`：最近一次（狀態類成立時每次評估更新）。`active`：這一次評估條件還成立（事件類是最近一小時內發生過）。
+- 上限與過期：最多 32 筆；`lastAt` 超過 24 小時（`info` 6 小時）沒再發生就拿掉；30 秒最多評估一次；只在記憶體，重新啟動、重新載入設定清空；系統時間還沒對時是 `[]`。
+
+### `stale`（過期快取的比率）
+
+```json
+"stale": { "today": 120, "rateToday": 0.004, "rate15m": 0.0, "rate1h": 0.001 }
+```
+
+`today` = 今天回了過期資料的次數（同 `stats.today.stale`）；`rateToday` = `today ÷ 今天的查詢數`；`rate15m`、`rate1h` 讀 24 小時歷史的最近 3、12 格（只算完整的 5 分鐘）。沒有查詢時是 0。`/api/dashboard` 也有同一份。
+
+### `history`（24 小時歷史，`/api/dashboard` 與 `/api/status?history=1`）
+
+```json
+"history": { "stepSec": 300, "from": 1795400100, "n": 288,
+  "q": [12, 9], "blocked": [1, 0], "servfail": [0, 0], "stale": [0, 0], "miss": [5, 4],
+  "p50": [20, null], "p95": [100, null], "abroad": [3, 2], "tw": [3, 2] }
+```
+
+- 每 5 分鐘一格、最多 288 格，欄位分開的陣列（每個陣列 `n` 個）。`from` = 第一格開始的 **Unix 秒**；最後一格是上一個完整的 5 分鐘（進行中的那一格不給）。剛啟動時 `n` 不到 288。
+- `q` 查詢、`blocked` 攔截、`servfail` 失敗、`stale` 過期快取、`miss` 問上游、`abroad` 原本會出國的 CDN 回應、`tw` 其中換成台灣的（比率 = `tw ÷ abroad`）。
+- `p50`、`p95`：問上游的延遲（毫秒，直方圖的區間上限、無條件進位）；`null` = 那一格沒有問上游，`1001` = 超過 1 秒。直方圖只有 12 個區間，圖是階梯狀的。
+- 只在記憶體、重新啟動清空；時鐘倒退或跳了超過 24 小時就清空重來。
+
+### `/api/dashboard` 的 `paths`（兩條路比對）
+
+```json
+"paths": { "sites": 412,
+  "orig": { "ok": 398, "fail": 14, "abroad": 301, "medianMs": 48.0 },
+  "tw":   { "ok": 371, "fail": 22, "slower": 5, "medianMs": 6.5 },
+  "both": 350, "twFaster": 338, "twSlower": 12, "medianSavedMs": 37.5 }
+```
+
+- 來自 CDN 網域資料裡驗證時已經量的兩個數字（原本的 IP、台灣節點），不另外探測。只算在記憶體裡的網域資料（被記憶體控制移到磁碟的冷資料不算）。
+- `sites`：有原本或台灣結果的網域數；`orig.ok`／`fail`：原本的 IP 探測成功／失敗；`orig.abroad`：原本在國外機房；`tw.ok`／`fail`：台灣節點驗證通過／沒通過；`tw.slower`：台灣節點能用但實測比原本慢、暫時用原本的答案（E7）；`medianMs` 只算成功的。
+- `both`：兩邊都量到延遲的；`twFaster`／`twSlower`：其中台灣比較快／慢的；`medianSavedMs`：原本 − 台灣的中位數（負的 = 台灣比較慢；以前的 `acceleration.medianSavedMs` 只收台灣比較快的，照舊不變）。
+- `paths`、`stale`、`history` 是營運狀態，**公開頁（`/api/public/stats`）不帶**。
+
+### `cdn` 的線路感知欄位
+
+`/api/status` 的 `cdn`（`Cdn::status_lite()`）多下面幾個；CDN 關著時 `cdn` 照舊是 `{"enabled": false}`。**`/api/cdn/pools` 不帶 `reach`**（它的最上層鍵是各家 CDN，介面逐一當成 CDN 畫）。
+
+```json
+"reach": {
+  "at": 1795486200000, "wanEpoch": 0, "stale": false, "unconfirmed": 0,
+  "v4": { "text": "這條線目前只到得了台北機房", "multi": false,
+          "pops": [ { "pop": "TPE", "city": "台北", "nodes": 31, "prefixes": 22, "providers": 4, "medianMs": 4.1 } ] },
+  "v6": { "text": "這條線的 IPv6 目前量不到台灣機房（節點池還沒建立，或節點都連不上）", "multi": false, "pops": [] },
+  "nearby": [ { "provider": "fastly", "pop": "NRT", "prefixes": 6 } ]
+},
+"popHealth": [ { "provider": "cloudflare", "family": 4, "pop": "TPE", "nodes": 9, "bad": 0, "failRate": 0.0,
+                 "medianMs": 4.2, "badStreak": 0, "held": false, "heldUntil": null } ],
+"popSwitch": { "enabled": true, "eligible": false, "reason": "single-pop", "switches24h": 0,
+               "eligibleFamilies": [], "holds": [], "excluded": [ { "provider": "fastly", "reason": "nearest-provider" } ] },
+"popAudit": { "enabled": true, "pending": 0, "confirmed": 31, "mismatch": 0, "probes24h": 0,
+              "lastMismatchAt": null, "chainPopUnreliable": false }
+```
+
+| 欄位 | 說明 |
+|---|---|
+| `reach` | 這條線到得了哪些台灣機房（只算這台自己確認過的節點：不在壞節點裡、是台灣機房、不是種子、沒有 `upPop`）。`at` 毫秒或 `null`；`wanEpoch` 每次 WAN 變動加 1（重新啟動歸 0）；`stale` = WAN 變動後、下一輪健檢之前，或串接中；`unconfirmed` = 上游給的、這台還沒量過機房的節點。`v4`／`v6.text` 一句白話（內容不是約定）；`multi` = 兩個以上城市、每個城市至少 2 個節點分在 2 個以上網段（機房切換的資格）；`pops[]` 最多 8 個，依節點數排序，`pop` 是代碼前三碼（TPE、TSA 分開列、城市都是台北），`prefixes` 是 IPv4 /24、IPv6 /48 的數目，`medianMs` 可能是 `null`；`nearby[]` 是 Fastly 這類最近節點型（沒有台灣機房），最多 8 個 |
+| `popHealth` | 每一輪健檢依（CDN、家族、檢查前的機房）彙總，最多 64 筆；最近節點型不列。`badStreak` 連續幾輪「變差」（失敗率 ≥ 20%，而且節點數 ≥ 3 或壞的 ≥ 2）；`held`／`heldUntil`（毫秒）= 暫時排到後面 |
+| `popSwitch` | 機房切換（`cdn.popSwitch`）。`reason`：`disabled`、`chained`、`chain-pop-unreliable`、`memory`、`single-pop`（沒有家族符合資格）、`ok`；`nearest-provider` 只出現在 `excluded[]`。`eligibleFamilies`：符合資格的家族；`holds[]`：`{ provider, family, pop, until（毫秒）, other }`；`switches24h`：24 小時內暫緩的次數 |
+| `popAudit` | 機房以這台量到的為準（`cdn.popAudit`）。`pending`：`upPop` 還在的節點；`confirmed`／`mismatch`：啟動後累計的比對次數；`probes24h`：24 小時內用掉的機房抽查名額（一天最多 24 個、`cdn.lite` 8 個）；`lastMismatchAt` 毫秒或 `null`；`chainPopUnreliable`：24 小時內比對過的一半以上不一樣（至少 4 個），期間不做機房切換 |
+| `slowerFuseUntil` | 跳了才有（毫秒）：一小時裡「台灣節點比原本慢」超過 30%（至少 10 次），之前照常換台灣節點 |
+| `stats.verifyOk`／`verifyFail`／`slowerFallback` | 台灣節點驗證通過／沒通過（不含比原本慢）／比原本慢暫時用原本答案的次數（啟動後累計，32 位元） |
+
+其他：`/api/cdn/pools` 還沒確認的節點多 `upPop`；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。`kuroshio notify wan-changed`（`/api/notify/wan-changed`）多做一件事：把 `reach` 標成過期、清掉機房切換的連續計數與暫緩，不補跑健檢或掃描。
+
+### `/api/community/status` 的 `ispGroup`
+
+```json
+"ispGroup": { "share": true, "mine": "cht", "sameGroupFriends": 2 }
+```
+
+`community.shareIspGroup`（UCI `share_isp_group`，預設關）開著時才有 `mine`（這台 WAN 的 ISP 群組，偵測不到是 `null`）；關著是 `{ "share": false, "sameGroupFriends": 0 }`。`/api/community/peers` 每個好友的 `info` 多 `isp`（對方有給、而且這台也開著才有）。協定：只放在同步回應的 `ctx`（`NetInfo.isp`，最長 16 個字元、小寫英數與 `-`、`_`，不符當沒有），身分文件不放；沒開時不序列化，位元組跟 3.4.x 一樣。
 
 ## 重新載入不斷線（3.4.0 起）
 
