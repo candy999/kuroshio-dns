@@ -28,6 +28,59 @@ pub const SHARD_TARGET_BYTES: usize = 128 * 1024;
 pub const COMPRESSED_BYTES_PER_ENTRY: usize = 115;
 /// 分片數上限
 pub const MAX_SHARDS: usize = 256;
+
+// ---- 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）----
+// 小 Flash 上分片數還是照 `cdn.maxEntries` 算（改分片數會重寫全部分片），每片的筆數很少，每個檔固定的開銷不能忽略。
+// `bench_persist`（`BENCH_SHARDS=256`）實測 256 片：5,000 筆 0.84 MB、10,000 筆 1.50 MB、20,000 筆 2.75 MB、
+// 40,000 筆 5.21 MB ≈ 每片 1.1 KB ＋ 每筆 123 bytes。
+
+/// 磁碟預算換算筆數：每個分片檔固定的開銷（bytes）
+pub const BUDGET_SHARD_OVERHEAD: u64 = 1100;
+/// 磁碟預算換算筆數：小分片裡每筆壓縮後約幾 bytes
+pub const BUDGET_BYTES_PER_ENTRY: u64 = 125;
+/// 磁碟預算的下限（bytes）：再小就不照預算了（算錯也不會把資料刪光）
+pub const BUDGET_MIN_BYTES: u64 = 512 * 1024;
+/// 磁碟預算換算出來的筆數下限
+pub const BUDGET_MIN_ENTRIES: usize = 2000;
+/// 超過預算這個比例（110%）才為了淘汰主動重寫沒有其他變動的分片；以下只順便整理本來就要寫的分片
+pub const BUDGET_SWEEP_PERCENT: usize = 110;
+/// 淘汰到每片額度的這個比例（90%）：留一點空間，不會每新增一筆就淘汰一次
+pub const BUDGET_KEEP_PERCENT: usize = 90;
+/// 最近這段時間出現過的網域排在最後才淘汰（正在用；也讓剛出現的網域有機會被問第二次、被驗證）
+pub const BUDGET_RECENT_MS: u64 = 24 * 3600 * 1000;
+/// 驗證失敗的網域超過這麼久沒再出現就優先淘汰
+pub const BUDGET_FAILED_STALE_MS: u64 = 7 * 24 * 3600 * 1000;
+/// 驗證成功過的網域，這段時間內出現過的排在後面才淘汰
+pub const BUDGET_VERIFIED_FRESH_MS: u64 = 30 * 24 * 3600 * 1000;
+
+/// 磁碟預算（bytes）在 `shards` 個分片下大約放得下幾筆；`None` = 不限
+pub fn budget_entries(budget_bytes: Option<u64>, shards: usize) -> Option<usize> {
+    let b = budget_bytes?.max(BUDGET_MIN_BYTES);
+    let n = b.saturating_sub(shards as u64 * BUDGET_SHARD_OVERHEAD) / BUDGET_BYTES_PER_ENTRY;
+    Some((n.min(usize::MAX as u64) as usize).max(BUDGET_MIN_ENTRIES))
+}
+
+/// 估計 `entries` 筆在 `shards` 個分片下佔多少磁碟（bytes；狀態頁用）
+pub fn budget_disk_estimate(entries: usize, shards: usize) -> u64 {
+    if entries == 0 {
+        return 0;
+    }
+    shards as u64 * BUDGET_SHARD_OVERHEAD + entries as u64 * BUDGET_BYTES_PER_ENTRY
+}
+
+/// 一輪磁碟預算淘汰的計畫（[`Db::budget_plan`]）
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BudgetPlan {
+    /// 這一輪要整理的分片：（編號，留幾筆）
+    pub shards: Vec<(usize, usize)>,
+    /// 其中為了淘汰主動重寫的（本來沒有重要變動）
+    pub forced: usize,
+    /// 目前的總筆數（記憶體裡的＋移出記憶體的）與預算換算的筆數
+    pub total: usize,
+    pub limit: usize,
+    /// 這一輪剛開始主動重寫（寫日誌用）
+    pub sweep_started: bool,
+}
 pub const HARVEST_FILE: &str = "cdn/harvest.json";
 /// 每家 CDN 每個家族最多收集幾個候選 IP（同 2.x）
 pub const HARVEST_MAX: usize = 3000;
@@ -686,6 +739,8 @@ pub struct Db {
     /// 記憶體控制暫時移出記憶體的冷資料（規格 09）：只留名稱的 32 位元雜湊（排序、可重複），內容還在磁碟的分片裡。
     /// 查到這些網域時從分片讀回來；寫分片時把它們從舊檔接回去，所以磁碟上不會少
     evicted: Vec<u32>,
+    /// 磁碟預算：正在一輪一輪主動重寫超過額度的分片（超過 110% 開始，回到預算以內結束）
+    budget_sweep: bool,
 }
 
 /// 冷資料移出記憶體的結果
@@ -710,6 +765,7 @@ impl Db {
             marks: vec![Mark::Clean; shards_for(max_entries.max(100))],
             manifest_pending: None,
             evicted: Vec::new(),
+            budget_sweep: false,
         }
     }
 
@@ -1151,6 +1207,154 @@ impl Db {
             self.domains.remove(&n);
             self.mark(&n);
         }
+    }
+
+    // ------------------------------------------------------------ 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）
+
+    /// 總筆數：記憶體裡的＋移出記憶體（還在磁碟上）的
+    pub fn total_entries(&self) -> usize {
+        self.domains.len() + self.evicted.len()
+    }
+
+    /// 磁碟預算淘汰時的順位（小的先淘汰）；手動設定策略的不在這裡（絕不淘汰）。
+    ///
+    /// | 順位 | 是什麼 | 為什麼 |
+    /// |---|---|---|
+    /// | 0 | 只問過 1 次、沒有成功的驗證結果、超過一天沒再出現 | 一次性的網域：留著也用不到 |
+    /// | 1 | 沒有成功的驗證結果、驗證失敗、超過 7 天沒再出現 | 換不到台灣節點，也沒有人在問 |
+    /// | 2 | 其他超過一天沒出現的（沒驗證過、或驗證成功但超過 30 天沒出現） | |
+    /// | 3 | 驗證成功過、30 天內出現過 | 每筆省下一次重新驗證（對 CDN 發 HTTPS 探測） |
+    /// | 4 | 一天內出現過 | 正在用；剛出現的也要留到被問第二次、驗證完 |
+    pub fn budget_rank(d: &Domain, now_ms: u64) -> u8 {
+        let age = now_ms.saturating_sub(d.last_seen);
+        if age < BUDGET_RECENT_MS {
+            return 4;
+        }
+        let ok = d.v4.as_ref().is_some_and(|v| v.is("ok"))
+            || d.v6.as_ref().is_some_and(|v| v.is("ok"))
+            || d.ecs.as_ref().is_some_and(|e| e.is("ok"))
+            || d.cross4.as_ref().is_some_and(|c| c.is("ok"));
+        if ok {
+            return if age < BUDGET_VERIFIED_FRESH_MS { 3 } else { 2 };
+        }
+        if d.hits <= 1 {
+            return 0;
+        }
+        let failed = d.v4.as_ref().is_some_and(|v| v.is("fail")) || d.v6.as_ref().is_some_and(|v| v.is("fail"));
+        if failed && age >= BUDGET_FAILED_STALE_MS {
+            return 1;
+        }
+        2
+    }
+
+    /// 決定這一輪要整理哪些分片（`limit` = 預算換算的筆數；最多 `shards / 8` 片，至少 1 片）：
+    ///
+    /// 1. 總筆數沒超過預算：什麼都不做。
+    /// 2. 超過額度（`limit / 分片數`）而且**本來就有重要變動、反正要寫**的分片：順便淘汰到額度的 90%（不多寫一個檔）。
+    /// 3. 總筆數超過預算的 110%、而且 `disk_over`（磁碟上的分片實際量起來也超過預算；升級後第一次啟用、匯入大量資料）：
+    ///    另外每輪主動重寫最多 `shards / 16` 片（超過最多的先），一輪一輪做到總筆數回到預算以內為止。
+    ///    每個分片在一次整理裡只重寫一次
+    ///
+    /// 整個資料庫要重寫（`dirty`：種子、舊版搬家、分片數改變）時所有分片反正都要寫：全部算第 2 種、不限片數
+    /// （寫之前就淘汰好，不必先寫一份大的再寫一份小的）。
+    pub fn budget_plan(&mut self, limit: usize, disk_over: bool) -> BudgetPlan {
+        let total = self.total_entries();
+        let mut plan = BudgetPlan {
+            total,
+            limit,
+            ..BudgetPlan::default()
+        };
+        if total <= limit {
+            self.budget_sweep = false;
+            return plan;
+        }
+        let n = self.shards;
+        let quota = (limit / n).max(1);
+        let keep = (quota * BUDGET_KEEP_PERCENT / 100).max(1);
+        let mut counts = vec![0usize; n];
+        for k in self.domains.keys() {
+            counts[shard_of(k, n)] += 1;
+        }
+        for h in &self.evicted {
+            counts[(*h as usize) & (n - 1)] += 1;
+        }
+        let cap = if self.dirty { n } else { (n / 8).max(1) };
+        let mut over: Vec<(usize, usize)> = (0..n).filter(|i| counts[*i] > quota).map(|i| (counts[i], i)).collect();
+        // 超過最多的先
+        over.sort_unstable_by(|a, b| b.cmp(a));
+        // 反正要寫的
+        for (_, i) in &over {
+            if plan.shards.len() >= cap {
+                break;
+            }
+            if self.dirty || self.marks[*i] == Mark::Important {
+                plan.shards.push((*i, keep));
+            }
+        }
+        if !self.budget_sweep && disk_over && total.saturating_mul(100) > limit.saturating_mul(BUDGET_SWEEP_PERCENT) {
+            self.budget_sweep = true;
+            plan.sweep_started = true;
+        }
+        if self.budget_sweep {
+            let forced_cap = (n / 16).max(1);
+            for (_, i) in &over {
+                if plan.shards.len() >= cap || plan.forced >= forced_cap {
+                    break;
+                }
+                if !plan.shards.iter().any(|(s, _)| s == i) {
+                    plan.shards.push((*i, keep));
+                    plan.forced += 1;
+                }
+            }
+        }
+        plan
+    }
+
+    /// 正在一輪一輪主動重寫超過額度的分片
+    pub fn budget_sweeping(&self) -> bool {
+        self.budget_sweep
+    }
+
+    /// 照計畫淘汰：每個分片留 `keep` 筆（手動設定策略的不淘汰、算在筆數裡），依 [`Db::budget_rank`]、
+    /// 同一順位最久沒出現的先。有淘汰的分片標成重要變動。回傳淘汰幾筆。
+    /// 分片裡還有移出記憶體的冷資料時這片不動（呼叫端要先把它們讀回來，不然不知道誰比較舊）
+    pub fn budget_prune(&mut self, plan: &[(usize, usize)], now_ms: u64) -> usize {
+        if plan.is_empty() {
+            return 0;
+        }
+        let n = self.shards;
+        let mut keep_of: Vec<Option<usize>> = vec![None; n];
+        for (i, keep) in plan {
+            if *i < n && !self.evicted.iter().any(|h| (*h as usize) & (n - 1) == *i) {
+                keep_of[*i] = Some(*keep);
+            }
+        }
+        // （分片，順位，最後出現，名稱）；手動策略的只算筆數
+        let mut counts = vec![0usize; n];
+        let mut cand: Vec<(usize, u8, u64, Arc<str>)> = Vec::new();
+        for d in self.domains.values() {
+            let i = shard_of(&d.name, n);
+            if keep_of[i].is_none() {
+                continue;
+            }
+            counts[i] += 1;
+            if d.policy() == Policy::Auto {
+                cand.push((i, Self::budget_rank(d, now_ms), d.last_seen, d.name.clone()));
+            }
+        }
+        cand.sort_unstable();
+        let mut dropped = 0;
+        for (i, _, _, name) in cand {
+            let Some(keep) = keep_of[i] else { continue };
+            if counts[i] <= keep {
+                continue;
+            }
+            self.domains.remove(&name);
+            self.marks[i] = Mark::Important;
+            counts[i] -= 1;
+            dropped += 1;
+        }
+        dropped
     }
 
     pub fn get(&self, name: &str) -> Option<&Domain> {
@@ -1602,6 +1806,221 @@ mod tests {
         assert!(db.get("d1.test").is_none(), "最久沒出現的先刪");
         assert!(db.get("d99.test").is_some());
         assert!(db.get("new.test").is_some());
+    }
+
+    // ---- 磁碟預算（3.5.0 C5）----
+
+    const DAY: u64 = 24 * 3600 * 1000;
+    const NOW: u64 = 400 * DAY;
+
+    /// 放一筆：`age_days` 天前最後出現、問過 `hits` 次、v4 的驗證結果 `verdict`
+    fn put(db: &mut Db, name: &str, age_days: u64, hits: u32, verdict: Option<&str>) {
+        db.touch(name, "cloudflare", "ip", &[], &[], None);
+        let d = db.get_mut(name).unwrap();
+        d.last_seen = NOW - age_days * DAY;
+        d.hits = hits;
+        if let Some(v) = verdict {
+            d.v4 = Some(Box::new(Verdict {
+                verdict: Some(Arc::from(v)),
+                ..Default::default()
+            }));
+        }
+    }
+
+    /// 一個分片的資料庫（順序只看順位與時間，不受雜湊影響）
+    fn one_shard() -> Db {
+        let mut db = Db::new(1000);
+        db.set_shards(1);
+        db
+    }
+
+    #[test]
+    fn budget_entries_model() {
+        assert_eq!(budget_entries(None, 256), None, "沒有預算 = 不限");
+        // D3：7.5 MB 的 30% ≈ 2.25 MB、256 片 → 約 1.6 萬筆（每片 1.1 KB 的固定開銷先扣掉）
+        let n = budget_entries(Some(2_250 * 1024), 256).unwrap();
+        assert!((16_000..17_000).contains(&n), "{n}");
+        // 下限：預算小於 512 KB 當 512 KB；換算出來不到 2,000 筆也給 2,000 筆
+        assert_eq!(budget_entries(Some(1), 256), budget_entries(Some(BUDGET_MIN_BYTES), 256));
+        assert_eq!(budget_entries(Some(BUDGET_MIN_BYTES), 256), Some(BUDGET_MIN_ENTRIES));
+        // 估計的磁碟用量跟換算互為反函數（實測 256 片 20,000 筆 2.75 MB）
+        let est = budget_disk_estimate(20_000, 256);
+        assert!((2_600_000..2_900_000).contains(&est), "{est}");
+        assert_eq!(budget_disk_estimate(0, 256), 0);
+    }
+
+    /// 分片數只看 `cdn.maxEntries`，不跟著預算變（改分片數會重寫所有分片）
+    #[test]
+    fn shard_count_unchanged_by_budget() {
+        let mut db = Db::new(200_000);
+        assert_eq!(db.shards, 256);
+        for i in 0..3000 {
+            put(&mut db, &format!("d{i}.example.com"), 2, 3, None);
+        }
+        let limit = budget_entries(Some(BUDGET_MIN_BYTES), db.shards).unwrap();
+        let plan = db.budget_plan(limit, true);
+        db.budget_prune(&plan.shards, NOW);
+        assert_eq!(db.shards, 256);
+        assert_eq!(db.marks().len(), 256);
+        assert!(db.manifest_pending.is_none() && !db.dirty, "不重寫分片清單、不整個重寫");
+    }
+
+    #[test]
+    fn prune_order_one_shot_then_failed_then_oldest() {
+        let mut db = one_shard();
+        put(&mut db, "oneshot.example.com", 3, 1, None);
+        put(&mut db, "failed-stale.example.com", 9, 5, Some("fail"));
+        put(&mut db, "plain-old.example.com", 20, 5, None);
+        put(&mut db, "plain-newer.example.com", 4, 5, None);
+        put(&mut db, "failed-recent.example.com", 3, 5, Some("fail"));
+        put(&mut db, "ok-long-gone.example.com", 40, 9, Some("ok"));
+        put(&mut db, "ok.example.com", 25, 9, Some("ok"));
+        put(&mut db, "today.example.com", 0, 1, None);
+        let rank = |db: &Db, n: &str| Db::budget_rank(db.get(n).unwrap(), NOW);
+        assert_eq!(rank(&db, "oneshot.example.com"), 0);
+        assert_eq!(rank(&db, "failed-stale.example.com"), 1);
+        assert_eq!(rank(&db, "plain-old.example.com"), 2);
+        assert_eq!(rank(&db, "failed-recent.example.com"), 2, "失敗但 7 天內還有人問：跟一般的一樣");
+        assert_eq!(rank(&db, "ok-long-gone.example.com"), 2, "驗證成功但超過 30 天沒出現：跟一般的一樣");
+        assert_eq!(rank(&db, "ok.example.com"), 3);
+        assert_eq!(rank(&db, "today.example.com"), 4, "今天才出現、只問過一次：不能當成一次性的");
+        // 一筆一筆淘汰，看順序
+        let mut gone = Vec::new();
+        for keep in (0..8).rev() {
+            let before: Vec<Arc<str>> = db.domains.keys().cloned().collect();
+            assert_eq!(db.budget_prune(&[(0, keep)], NOW), 1);
+            let dropped = before.iter().find(|k| db.get(k).is_none()).unwrap();
+            gone.push(dropped.to_string());
+        }
+        assert_eq!(
+            gone,
+            [
+                "oneshot.example.com",
+                "failed-stale.example.com",
+                "ok-long-gone.example.com",
+                "plain-old.example.com",
+                "plain-newer.example.com",
+                "failed-recent.example.com",
+                "ok.example.com",
+                "today.example.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_policy_and_recent_verified_kept() {
+        let mut db = one_shard();
+        for i in 0..20 {
+            put(&mut db, &format!("old{i}.example.com"), 10 + i, 3, None);
+        }
+        put(&mut db, "verified.example.com", 29, 9, Some("ok"));
+        put(&mut db, "in-use.example.com", 0, 2, None);
+        // 手動策略：很舊、一次性，也絕不淘汰
+        put(&mut db, "manual.example.com", 300, 1, None);
+        db.set_policy("manual.example.com", Policy::Never);
+        db.take_marks(false);
+        assert_eq!(db.budget_prune(&[(0, 3)], NOW), 20);
+        let mut left: Vec<&str> = db.domains.keys().map(|k| &**k).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["in-use.example.com", "manual.example.com", "verified.example.com"]);
+        assert_eq!(db.marks()[0], Mark::Important, "有淘汰的分片要重寫");
+        // 額度比手動的還少：能淘汰的淘汰完就停，手動的留著
+        assert_eq!(db.budget_prune(&[(0, 0)], NOW), 2);
+        assert!(db.get("manual.example.com").is_some());
+        // 沒超過就不動、也不標變動
+        db.take_marks(false);
+        assert_eq!(db.budget_prune(&[(0, 5)], NOW), 0);
+        assert_eq!(db.marks()[0], Mark::Clean);
+    }
+
+    /// 平常（沒有超過預算 110%）只順便整理「本來就要寫」的分片，不為了淘汰多寫一個檔；
+    /// 總筆數在預算以內時什麼都不做
+    #[test]
+    fn budget_piggybacks_on_shards_already_being_written() {
+        let mut db = Db::new(100_000);
+        db.set_shards(16);
+        for i in 0..1040 {
+            put(&mut db, &format!("d{i}.example.com"), 2 + (i % 50) as u64, 3, None);
+        }
+        db.take_marks(false);
+        assert!(db.budget_plan(2000, true).shards.is_empty(), "在預算以內");
+        // 預算 1,000 筆（每片 62）：超過 4%，沒有分片要寫 → 不動
+        let plan = db.budget_plan(1000, true);
+        assert!(plan.shards.is_empty() && !plan.sweep_started && plan.total == 1040, "{plan:?}");
+        // 其中一片有新網域（重要變動）→ 只整理那一片
+        db.touch("new.example.com", "cloudflare", "ip", &[], &[], None);
+        let i = shard_of("new.example.com", 16);
+        let plan = db.budget_plan(1000, true);
+        assert_eq!(plan.forced, 0);
+        assert_eq!(plan.shards, vec![(i, 62 * 9 / 10)]);
+        let before = db.domains.len();
+        let dropped = db.budget_prune(&plan.shards, now_ms());
+        assert!(dropped > 0 && db.domains.len() == before - dropped);
+        assert!(db.get("new.example.com").is_some(), "剛出現的不淘汰");
+        let marked: Vec<usize> = (0..16).filter(|k| db.marks()[*k] != Mark::Clean).collect();
+        assert_eq!(marked, vec![i], "其他分片沒有被動到");
+    }
+
+    /// 超過預算很多（升級後第一次套用、要淘汰超過一半）：一輪一輪來，每輪主動重寫最多 分片數 / 16 片，
+    /// 每個分片只重寫一次，最後回到預算以內就停；磁碟上實際沒超過預算時不主動重寫
+    #[test]
+    fn first_prune_over_half_is_spread_over_rounds() {
+        let mut db = Db::new(100_000);
+        db.set_shards(64);
+        for i in 0..6400 {
+            put(&mut db, &format!("d{i}.example.com"), 2 + (i % 90) as u64, 3, None);
+        }
+        db.take_marks(false);
+        let limit = 2560; // 每片 40 筆
+                          // 磁碟上量起來沒超過預算（模型高估了）：不主動重寫
+        let plan = db.budget_plan(limit, false);
+        assert!(plan.shards.is_empty() && !plan.sweep_started && !db.budget_sweeping());
+        let mut rewritten = vec![0u32; 64];
+        let mut rounds = 0;
+        loop {
+            let plan = db.budget_plan(limit, true);
+            assert_eq!(plan.sweep_started, rounds == 0, "只在開始時提醒一次");
+            if plan.shards.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert!(plan.forced <= 4 && plan.shards.len() <= 8, "每輪上限：{plan:?}");
+            let before = db.domains.len();
+            let dropped = db.budget_prune(&plan.shards, NOW);
+            assert!(dropped <= before / 8, "一輪最多動八分之一的分片：{dropped} / {before}");
+            for (i, important) in db.take_marks(false) {
+                assert!(important);
+                rewritten[i] += 1;
+            }
+            assert!(rounds <= 64, "要會結束");
+        }
+        // 64 片、每輪 4 片；每片淘汰到額度的 90%，所以最後一兩輪還沒輪到的分片可以不動
+        assert!((14..=16).contains(&rounds), "{rounds}");
+        assert!(rewritten.iter().all(|n| *n <= 1), "每個分片最多重寫一次：{rewritten:?}");
+        assert!(
+            db.domains.len() <= limit && db.domains.len() >= limit * 8 / 10,
+            "{}",
+            db.domains.len()
+        );
+        assert!(!db.budget_sweeping(), "回到預算以內就結束");
+        // 留下來的是比較新的（原本 2～91 天平均分布；最後沒輪到的一兩片還有舊的）
+        let old = db.domains.values().filter(|d| NOW - d.last_seen > 45 * DAY).count();
+        assert!(old * 10 < db.domains.len(), "最舊的那批先淘汰：{old} / {}", db.domains.len());
+    }
+
+    /// 整個資料庫本來就要重寫（種子、舊版搬家、分片數改變）：寫之前一次淘汰好，不必先寫大的再寫小的
+    #[test]
+    fn dirty_db_is_pruned_before_the_full_rewrite() {
+        let mut db = Db::new(100_000);
+        db.set_shards(64);
+        for i in 0..6400 {
+            put(&mut db, &format!("d{i}.example.com"), 2 + (i % 90) as u64, 3, None);
+        }
+        db.dirty = true;
+        let plan = db.budget_plan(2560, false);
+        assert_eq!((plan.shards.len(), plan.forced), (64, 0));
+        db.budget_prune(&plan.shards, NOW);
+        assert!(db.domains.len() <= 2560);
     }
 
     #[test]

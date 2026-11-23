@@ -203,7 +203,7 @@ kuroshio notify simulate-memory --avail-mb MB [--minutes 分鐘] | --off [-c 設
 
 | 訊號 | 行為 |
 |---|---|
-| `SIGTERM`、`SIGINT` | 把還沒寫出的快照寫出後結束（結束碼 0）。Flash 上快照可能要幾秒，請給至少 15 秒再強制結束。日誌會記一行「關機前寫出 N 份快照，X KB，Y ms」，可以依實際數字調整等待時間 |
+| `SIGTERM`、`SIGINT` | 把還沒寫出的快照寫出後結束（結束碼 0）。Flash 上快照可能要幾秒，請給至少 15 秒再強制結束。日誌會記一行「關機前寫出 N 份快照，X KB，Y ms」，可以依實際數字調整等待時間。3.5.0 起重要變動先寫、只有計數變動的 CDN 分片只用時限的一半，來不及時多一行「關機時間有限（10.0 秒）：重要變動 N 份寫了 M 份、只有計數變動的 K 份有 J 份沒寫」（重要變動都寫完時是 info，不是 WARN） |
 | `SIGHUP` | 重新載入設定：效果跟設定頁按儲存、主控台輸入 `reload` 一樣（在同一個行程裡重新啟動所有監聽與工作，快照先寫出）。用 `--uci` 時重新讀 UCI（`KUROSHIO_UCI_JSON` 有設定就讀那個檔，所以要先更新它）。**新設定讀不進來或啟動不了時不會結束**，見下面 |
 | `SIGUSR1` | 立刻把所有還沒寫出的快照寫進快照目錄，不結束（例如路由器要斷電、要備份之前）。效果同 `kuroshio notify save`（Windows 用那個） |
 
@@ -664,6 +664,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `benchmark.concurrency` | 每日評測同時測幾個候選 |
 | `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
 | `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`（UCI 是 `config cdn` 的 `option lite '1'`／`'0'`）。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped`（都是次數：還沒驗證完的網域每查一次就再算一次，不是網域數） |
+| `cdn.dbDiskBudgetKB` | 3.5.0：CDN 網域資料在磁碟上的預算。`auto`（預設：狀態目錄所在的檔案系統小於 64 MB 時用總容量的 30%，64 MB 以上或讀不到大小時不限）／數字（KB，下限 512）／`0`（不限）。UCI 是 `config cdn` 的 `option db_disk_budget_kb`。超過時在背景分批淘汰最久沒用的網域（一天內查過的、手動設定策略的不動），不會一次重寫全部分片。狀態：`cdn.dbBudgetKB`、`dbBudgetEntries`、`dbEntries`、`dbDiskKB`（實際）、`dbDiskEstKB`、`prunedForBudget` |
 | `system.oomScoreAdj` | 預設 -500；設 0 就跟一般程式一樣讓核心挑 |
 | `filter.lists` | 少開幾份訂閱清單（每份的大小在 `filter.sources`） |
 

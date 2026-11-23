@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 檔案位置
 #[derive(Debug, Clone)]
@@ -255,6 +255,19 @@ pub struct Cdn {
     evicted_n: AtomicU32,
     /// 小機器減量：這一分鐘（Unix 分鐘）排了幾個驗證
     lite_rate: Mutex<(u64, u32)>,
+    /// 磁碟預算（3.5.0 C5）：因為預算淘汰的網域累計筆數、上次量到分片目錄實際佔多少（KB；`u32::MAX` = 還沒量）
+    budget_pruned: AtomicU32,
+    disk_kb: AtomicU32,
+}
+
+/// 一輪磁碟預算淘汰的結果（[`Cdn::budget_round`]）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetRound {
+    /// 淘汰幾筆
+    pub dropped: usize,
+    /// 整理了幾個分片，其中幾個是為了淘汰主動重寫的
+    pub shards: usize,
+    pub forced: usize,
 }
 
 /// 冷資料移出 / 讀回的結果（記憶體控制，規格 09）
@@ -421,6 +434,8 @@ impl Cdn {
             hints: RwLock::new(None),
             on_low_pool: RwLock::new(None),
             evicted_n: AtomicU32::new(0),
+            budget_pruned: AtomicU32::new(0),
+            disk_kb: AtomicU32::new(u32::MAX),
         };
         me.reset_octet_verdicts();
         Arc::new(me)
@@ -808,27 +823,149 @@ impl Cdn {
             (st.db.shards, st.db.evicted_shards())
         };
         for i in shards {
-            let hashes = self.state().db.evicted_hashes(n, i);
-            let mut found = Vec::new();
-            if let Some(b) = self.read_shard(n, i) {
-                let _ = db::scan_shard(&b, &mut |d| {
-                    if hashes.binary_search(&db::name_hash(&d.name)).is_ok() {
-                        found.push(d);
-                    }
-                });
-            }
-            let mut st = self.state();
-            for d in found {
-                let bytes = d.approx_bytes();
-                if st.db.insert_reloaded(d) {
-                    out.entries += 1;
-                    out.bytes += bytes;
-                }
-            }
-            st.db.unevict_shard(i);
+            let r = self.restore_shard_cold(n, i);
+            out.entries += r.entries;
+            out.bytes += r.bytes;
         }
         self.sync_evicted();
         out
+    }
+
+    /// 把第 `i` 個分片移出記憶體的冷資料讀回來（讀不到的就從移出名單拿掉）
+    fn restore_shard_cold(&self, n: usize, i: usize) -> ColdReport {
+        let mut out = ColdReport::default();
+        let hashes = self.state().db.evicted_hashes(n, i);
+        if hashes.is_empty() {
+            return out;
+        }
+        let mut found = Vec::new();
+        if let Some(b) = self.read_shard(n, i) {
+            let _ = db::scan_shard(&b, &mut |d| {
+                if hashes.binary_search(&db::name_hash(&d.name)).is_ok() {
+                    found.push(d);
+                }
+            });
+        }
+        let mut st = self.state();
+        for d in found {
+            let bytes = d.approx_bytes();
+            if st.db.insert_reloaded(d) {
+                out.entries += 1;
+                out.bytes += bytes;
+            }
+        }
+        st.db.unevict_shard(i);
+        out
+    }
+
+    // ------------------------------------------------------------ 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）
+
+    /// 分片目錄在磁碟上實際佔多少（bytes；目錄不存在是 0）
+    fn shard_dir_bytes(&self) -> u64 {
+        std::fs::read_dir(self.paths.state_dir.join(db::SHARD_DIR))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// 磁碟預算換算的筆數上限（沒有預算時 None）
+    pub fn budget_limit(&self) -> Option<usize> {
+        let shards = self.state().db.shards;
+        db::budget_entries(self.cfg.db_disk_budget, shards).map(|n| n.min(self.cfg.max_entries.max(100)))
+    }
+
+    /// 磁碟預算的一輪（背景：每次定時登記快照之前呼叫一次，關機時不呼叫；不在查詢路徑上）。
+    ///
+    /// 小 Flash 上網域資料超過預算時，淘汰最不值得留的（[`Db::budget_rank`]）。為了不在一次重寫所有分片：
+    /// 平常只順便整理「本來就要寫」的分片；超過預算 110%、磁碟上實際也超過時，才一輪主動重寫幾片（[`Db::budget_plan`]）。
+    /// 沒有設定預算（大磁碟、`cdn.dbDiskBudgetKB: 0`）時只量一下實際大小給狀態頁，什麼都不刪
+    pub fn budget_round(&self) -> BudgetRound {
+        let mut out = BudgetRound::default();
+        let disk = self.shard_dir_bytes();
+        self.disk_kb
+            .store(disk.div_ceil(1024).min(u32::MAX as u64 - 1) as u32, Ordering::Relaxed);
+        let (Some(limit), Some(budget)) = (self.budget_limit(), self.cfg.db_disk_budget) else {
+            return out;
+        };
+        let (plan, n) = {
+            let mut st = self.state();
+            (st.db.budget_plan(limit, disk > budget), st.db.shards)
+        };
+        if plan.sweep_started {
+            warn!(
+                "CDN 網域資料超過磁碟預算（{} 筆、磁碟上 {} KB；預算 {} KB ≈ {} 筆）：開始淘汰最久沒用的網域，\
+                 每 5 分鐘最多重寫 {} 個分片，不會一次重寫全部{}。不想淘汰可以把 cdn.dbDiskBudgetKB 設成 0",
+                plan.total,
+                disk.div_ceil(1024),
+                budget / 1024,
+                plan.limit,
+                (n / 16).max(1),
+                if plan.total > plan.limit.saturating_mul(2) {
+                    "（要淘汰的超過一半：升級後第一次套用預算時會這樣）"
+                } else {
+                    ""
+                }
+            );
+        }
+        if plan.shards.is_empty() {
+            return out;
+        }
+        // 移出記憶體的冷資料先讀回來才比得出誰比較舊（一次一片；讀檔不拿鎖）
+        if self.evicted_n.load(Ordering::Relaxed) > 0 {
+            for (i, _) in &plan.shards {
+                self.restore_shard_cold(n, *i);
+            }
+            self.sync_evicted();
+        }
+        let (dropped, left, sweeping) = {
+            let mut st = self.state();
+            let d = st.db.budget_prune(&plan.shards, now_ms());
+            (d, st.db.total_entries(), st.db.budget_sweeping())
+        };
+        out.dropped = dropped;
+        out.shards = plan.shards.len();
+        out.forced = plan.forced;
+        if dropped > 0 {
+            let total = self
+                .budget_pruned
+                .load(Ordering::Relaxed)
+                .saturating_add(dropped.min(u32::MAX as usize) as u32);
+            self.budget_pruned.store(total, Ordering::Relaxed);
+            if plan.forced > 0 || sweeping {
+                info!(
+                    "CDN 網域資料磁碟預算：淘汰 {dropped} 筆（整理 {} 個分片，其中 {} 個是為了淘汰重寫的），剩 {left} 筆（預算約 {} 筆）",
+                    plan.shards.len(),
+                    plan.forced,
+                    plan.limit
+                );
+            } else {
+                debug!(
+                    "CDN 網域資料磁碟預算：順便淘汰 {dropped} 筆（{} 個本來就要寫的分片），剩 {left} 筆",
+                    plan.shards.len()
+                );
+            }
+        }
+        out
+    }
+
+    /// `/api/status` 的 `cdn` 裡跟磁碟預算有關的欄位
+    fn budget_json(&self, v: &mut Value) {
+        let (total, shards) = {
+            let st = self.state();
+            (st.db.total_entries(), st.db.shards)
+        };
+        let disk = self.disk_kb.load(Ordering::Relaxed);
+        v["dbBudgetKB"] = json!(self.cfg.db_disk_budget.map(|b| b / 1024));
+        v["dbBudgetEntries"] = json!(self.budget_limit());
+        v["dbEntries"] = json!(total);
+        v["dbDiskKB"] = json!((disk != u32::MAX).then_some(disk));
+        v["dbDiskEstKB"] = json!(db::budget_disk_estimate(total, shards).div_ceil(1024));
+        v["prunedForBudget"] = json!(self.budget_pruned.load(Ordering::Relaxed));
     }
 
     /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，
@@ -1031,8 +1168,11 @@ impl Cdn {
             let bg = self.bg.lock().unwrap();
             (bg.verify.len(), bg.ecs.len(), bg.cross.len(), bg.deferred)
         };
-        json!({ "enabled": self.cfg.enabled, "lite": self.cfg.lite, "stats": st.stats, "domains": st.db.domains.len(),
-                "background": { "verify": verify, "ecs": ecs, "cross": cross, "deferred": deferred } })
+        let mut v = json!({ "enabled": self.cfg.enabled, "lite": self.cfg.lite, "stats": st.stats, "domains": st.db.domains.len(),
+                "background": { "verify": verify, "ecs": ecs, "cross": cross, "deferred": deferred } });
+        drop(st);
+        self.budget_json(&mut v);
+        v
     }
 
     /// 狀態（同 2.x `optimizer.status()`）

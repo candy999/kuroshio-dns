@@ -830,3 +830,14 @@ fn scan_max_per_sec_from_uci() {
     assert_eq!(g(&raw, "scan.maxPerSec"), &json!(80));
     assert!(get(&raw, "scan.max_per_sec").is_none(), "不留 snake_case 的名稱");
 }
+
+/// 3.5.0 C5：`cdn.dbDiskBudgetKB` 預設是 "auto"；UCI 的 `option db_disk_budget_kb` 填數字就是數字（0 = 關）
+#[test]
+fn cdn_db_disk_budget_from_uci() {
+    let c = load("config cdn 'cdn'\n\toption db_disk_budget_kb '3000'\n", &env());
+    assert_eq!(g(&c, "cdn.dbDiskBudgetKB"), &json!(3000));
+    let c = load("config cdn 'cdn'\n\toption db_disk_budget_kb '0'\n", &env());
+    assert_eq!(g(&c, "cdn.dbDiskBudgetKB"), &json!(0));
+    let c = load("config cdn 'cdn'\n", &env());
+    assert_eq!(g(&c, "cdn.dbDiskBudgetKB"), &json!("auto"));
+}

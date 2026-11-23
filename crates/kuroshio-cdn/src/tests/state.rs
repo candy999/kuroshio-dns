@@ -539,3 +539,179 @@ fn cold_entries_evicted_after_persist_and_lazily_reloaded() {
     assert_eq!(c.evicted_count(), 0);
     assert_eq!(c.state().db.domains.len(), n + 1);
 }
+
+// ---- 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）----
+
+/// 種子資料（約 3,960 筆）不帶預算寫成分片，回傳（路徑，分片數，筆數）
+fn seeded_shards(tag: &str) -> (Paths, usize, usize) {
+    let paths = paths_no_seed(tag);
+    let dir = paths.state_dir.clone();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(repo().join("data/seed/cdn-domains.json"), dir.join(crate::db::FILE)).unwrap();
+    let c = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
+    assert_eq!(c.budget_limit(), None, "預設（auto 還沒換算、或大磁碟）沒有預算");
+    let (_, ch) = c.snapshots_sharded(false);
+    write_changes(&c, &dir, &ch);
+    let n = c.state().db.domains.len();
+    assert!(n > 3900, "{n}");
+    (paths, ch.shards, n)
+}
+
+fn budget_cfg(kb: u64) -> Value {
+    let mut cfg = full_cfg();
+    cfg["cdn"]["dbDiskBudgetKB"] = json!(kb);
+    cfg
+}
+
+fn shard_dir_size(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir.join(crate::db::SHARD_DIR))
+        .unwrap()
+        .flatten()
+        .map(|e| e.metadata().unwrap().len())
+        .sum()
+}
+
+#[test]
+fn budget_zero_disables() {
+    // 沒有預算（`cdn.dbDiskBudgetKB` 是 0、或 "auto" 在大磁碟上換算成 0）：一筆都不淘汰、不標任何變動，只量大小
+    let (paths, _, n0) = seeded_shards("budget-off");
+    for cfg in [budget_cfg(0), full_cfg()] {
+        let c = Cdn::load(&cfg, paths.clone(), MockNet::new());
+        let n = c.state().db.domains.len();
+        assert_eq!(n, n0);
+        assert_eq!(c.budget_round(), crate::cdn::BudgetRound::default());
+        assert_eq!(c.state().db.domains.len(), n);
+        assert!(!c.state().db.changed());
+        let st = c.status_lite();
+        assert!(st["dbBudgetKB"].is_null() && st["dbBudgetEntries"].is_null(), "{st}");
+        assert_eq!(st["dbEntries"], json!(n));
+        assert!(st["dbDiskKB"].as_u64().unwrap() > 300, "實際大小照樣量：{st}");
+        assert_eq!(st["prunedForBudget"], json!(0));
+    }
+}
+
+#[test]
+fn budget_round_sweeps_in_rounds_and_survives_restart() {
+    // 升級後第一次套用預算、要淘汰快一半：一輪一輪來（每輪主動重寫最多 16 片），每個分片只重寫一次；
+    // 寫出去之後磁碟上真的變小，重新啟動讀回來的就是淘汰後的內容，不會再淘汰一次
+    let (paths, shards, n0) = seeded_shards("budget-sweep");
+    let dir = paths.state_dir.clone();
+    assert_eq!(shards, 256);
+    let before_disk = shard_dir_size(&dir);
+    assert!(before_disk > 512 * 1024, "{before_disk}");
+    let c = Cdn::load(&budget_cfg(512), paths.clone(), MockNet::new());
+    let limit = c.budget_limit().unwrap();
+    assert_eq!(limit, crate::db::BUDGET_MIN_ENTRIES);
+    assert!(!c.state().db.changed(), "載入時不淘汰");
+    let mut rewritten = vec![0u32; shards];
+    let mut rounds = 0;
+    let mut dropped = 0;
+    loop {
+        let r = c.budget_round();
+        if r.shards == 0 {
+            break;
+        }
+        rounds += 1;
+        assert!(r.forced <= 16 && r.shards <= 32, "每輪上限：{r:?}");
+        dropped += r.dropped;
+        let (_, ch) = c.snapshots_sharded(false);
+        assert!(ch.manifest.is_none(), "不動分片清單");
+        assert!(ch.changed.len() <= 32, "一輪最多重寫 32 片：{}", ch.changed.len());
+        for (i, _) in &ch.changed {
+            rewritten[*i] += 1;
+        }
+        write_changes(&c, &dir, &ch);
+        assert!(rounds <= 64, "要會結束");
+    }
+    assert!(rounds >= 8, "不是一次做完：{rounds} 輪");
+    assert!(rewritten.iter().all(|n| *n <= 1), "每個分片最多重寫一次");
+    let left = c.state().db.domains.len();
+    assert_eq!(left, n0 - dropped);
+    assert!(left <= limit && left >= limit * 8 / 10, "{left} / {limit}");
+    let after_disk = shard_dir_size(&dir);
+    assert!(after_disk < before_disk * 3 / 4, "磁碟上變小：{before_disk} → {after_disk}");
+    let st = c.status_lite();
+    assert_eq!(st["dbBudgetKB"], json!(512));
+    assert_eq!(st["dbBudgetEntries"], json!(limit));
+    assert_eq!(st["prunedForBudget"], json!(dropped));
+    assert_eq!(st["dbEntries"], json!(left));
+    // 重新啟動：內容一樣，在預算以內，不再淘汰
+    let c2 = Cdn::load(&budget_cfg(512), paths, MockNet::new());
+    assert_eq!(c2.state().db.domains.len(), left);
+    assert_eq!(c2.budget_round(), crate::cdn::BudgetRound::default());
+    assert!(!c2.state().db.changed());
+}
+
+#[test]
+fn prune_counts_evicted_cold_entries() {
+    // 記憶體控制把冷資料移出記憶體之後，它們還在磁碟上：預算要算它們，淘汰時先讀回來比新舊，
+    // 重寫分片時被淘汰的冷資料不會又從舊檔接回去
+    let (paths, shards, n0) = seeded_shards("budget-cold");
+    let dir = paths.state_dir.clone();
+    let c = Cdn::load(&budget_cfg(512), paths.clone(), MockNet::new());
+    let limit = c.budget_limit().unwrap();
+    let r = c.evict_cold(3_600_000, &|_| true);
+    assert!(r.entries > 3000, "{}", r.entries);
+    assert!(c.state().db.domains.len() < limit, "記憶體裡的不到預算");
+    assert_eq!(c.state().db.total_entries(), n0, "總筆數要算移出去的");
+    let mut rounds = 0;
+    loop {
+        let r = c.budget_round();
+        if r.shards == 0 {
+            break;
+        }
+        rounds += 1;
+        let (_, ch) = c.snapshots_sharded(false);
+        write_changes(&c, &dir, &ch);
+        assert!(rounds <= 64);
+    }
+    assert!(rounds >= 8);
+    let total = c.state().db.total_entries();
+    assert!(total <= limit && total >= limit * 8 / 10, "{total}");
+    // 磁碟上的筆數跟算的一樣（沒有被接回去）
+    let mut on_disk = 0;
+    for i in 0..shards {
+        let b = crate::statefile::read(&dir.join(crate::db::shard_file(shards, i))).unwrap();
+        crate::db::scan_shard(&b, &mut |_| on_disk += 1).unwrap();
+    }
+    assert_eq!(on_disk, total);
+    let c2 = Cdn::load(&budget_cfg(512), paths, MockNet::new());
+    assert_eq!(c2.state().db.domains.len(), total);
+}
+
+#[test]
+fn budget_keeps_what_is_in_use() {
+    // 淘汰的是最久沒人查的：今天查過的網域、手動設定策略的網域一筆都不會少
+    let (paths, _, _) = seeded_shards("budget-keep");
+    let dir = paths.state_dir.clone();
+    let c = Cdn::load(&budget_cfg(512), paths, MockNet::new());
+    let mut names: Vec<String> = c.state().db.domains.keys().map(|k| k.to_string()).collect();
+    names.sort();
+    let now = now_ms();
+    // 每片的額度只有 7 筆（測試用的最小預算）：正在用的取少一點，不會有哪一片光是正在用的就超過額度
+    let in_use: Vec<String> = names.iter().step_by(13).take(300).cloned().collect();
+    let manual = names[1].clone();
+    c.with_state(|st| {
+        for d in st.db.domains.values_mut() {
+            d.last_seen = now - 20 * 24 * 3600 * 1000;
+        }
+        for n in &in_use {
+            st.db.get_mut(n).unwrap().last_seen = now - 3_600_000;
+        }
+        st.db.set_policy(&manual, crate::db::Policy::Always);
+        st.db.take_marks(false);
+    });
+    for _ in 0..64 {
+        if c.budget_round().shards == 0 {
+            break;
+        }
+        let (_, ch) = c.snapshots_sharded(false);
+        write_changes(&c, &dir, &ch);
+    }
+    let limit = c.budget_limit().unwrap();
+    let st = c.state();
+    assert!(st.db.domains.len() <= limit);
+    assert!(st.db.get(&manual).is_some());
+    let kept = in_use.iter().filter(|n| st.db.get(n).is_some()).count();
+    assert_eq!(kept, in_use.len(), "今天查過的都在");
+}

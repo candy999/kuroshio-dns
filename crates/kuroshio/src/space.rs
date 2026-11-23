@@ -82,6 +82,28 @@ pub fn total_bytes(dir: &Path) -> Option<u64> {
     fs_impl(&p).map(|x| x.1)
 }
 
+/// 狀態分割區小於這個大小（bytes）才算「小 Flash」：CDN 網域資料的磁碟預算只在這種機器自動啟用
+pub const SMALL_FS_BYTES: u64 = 64 << 20;
+/// 小 Flash 上 CDN 網域資料最多佔檔案系統的百分之幾（`cdn.dbDiskBudgetKB` = `"auto"`；比例待 D3 實測，規格 11 的 Q3）
+pub const CDN_DB_PERCENT: u64 = 30;
+/// 磁碟預算的下限（KB）：算出來或填的比這個小就用這個（預算算錯也不會把累積的資料刪光）
+pub const CDN_DB_BUDGET_MIN_KB: u64 = 512;
+
+/// CDN 網域資料的磁碟預算（KB；0 = 不限、只受 `cdn.maxEntries`）。規格 05 第 5.7 節（3.5.0 C5）
+///
+/// - `setting`（`cdn.dbDiskBudgetKB`）是數字：0 = 關掉；其他照填的（下限 512 KB）。
+/// - `"auto"`（預設）或沒寫：狀態目錄所在的檔案系統**小於 64 MB** 才啟用，預算＝總容量的 30%（下限 512 KB）；
+///   64 MB 以上、或讀不到檔案系統大小（回 0 也算讀不到）＝不限。大磁碟（Windows、Docker、x86）完全不受影響。
+pub fn cdn_db_budget_kb(setting: Option<&serde_json::Value>, fs_total: Option<u64>) -> u64 {
+    if let Some(n) = kuroshio_config::num_or_auto(setting) {
+        return if n == 0 { 0 } else { n.max(CDN_DB_BUDGET_MIN_KB) };
+    }
+    match fs_total {
+        Some(t) if t > 0 && t < SMALL_FS_BYTES => (t / 100 * CDN_DB_PERCENT / 1024).max(CDN_DB_BUDGET_MIN_KB),
+        _ => 0,
+    }
+}
+
 fn free_impl(p: &Path) -> Option<u64> {
     fs_impl(p).map(|x| x.0)
 }
@@ -309,6 +331,39 @@ mod tests {
             assert!(d.join(core).exists(), "核心資料 {core} 不能刪");
         }
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// 3.5.0 C5：CDN 網域資料的磁碟預算。只在小 Flash 自動啟用；讀不到大小不啟用；有下限；0 = 關
+    #[test]
+    fn budget_auto_from_fs_total() {
+        use serde_json::json;
+        let auto = json!("auto");
+        let mb = |x: f64| Some((x * 1024.0 * 1024.0) as u64);
+        // D3：7.5 MB → 30% ≈ 2.2 MB
+        let kb = cdn_db_budget_kb(Some(&auto), mb(7.5));
+        assert!((2200..=2310).contains(&kb), "{kb}");
+        assert_eq!(cdn_db_budget_kb(None, mb(7.5)), kb, "沒寫 = auto");
+        // 64 MB 以上不限（大磁碟不受影響）
+        assert_eq!(cdn_db_budget_kb(Some(&auto), mb(64.0)), 0);
+        assert_eq!(cdn_db_budget_kb(Some(&auto), Some(500 << 30)), 0);
+        assert!(cdn_db_budget_kb(Some(&auto), mb(63.9)) > 19_000);
+        // 讀不到（或回 0）：不啟用
+        assert_eq!(cdn_db_budget_kb(Some(&auto), None), 0);
+        assert_eq!(cdn_db_budget_kb(Some(&auto), Some(0)), 0);
+        // 下限 512 KB：很小的分割區、填太小的數字
+        assert_eq!(cdn_db_budget_kb(Some(&auto), mb(1.0)), 512);
+        assert_eq!(cdn_db_budget_kb(Some(&json!(100)), mb(7.5)), 512);
+        // 填數字：照填的（大磁碟也可以自己設）；UCI 來的字串數字也算
+        assert_eq!(cdn_db_budget_kb(Some(&json!(3000)), Some(500 << 30)), 3000);
+        assert_eq!(cdn_db_budget_kb(Some(&json!("3000")), None), 3000);
+    }
+
+    /// `cdn.dbDiskBudgetKB: 0` 關掉（不管檔案系統多小）
+    #[test]
+    fn budget_zero_disables() {
+        use serde_json::json;
+        assert_eq!(cdn_db_budget_kb(Some(&json!(0)), Some(7 << 20)), 0);
+        assert_eq!(cdn_db_budget_kb(Some(&json!("0")), Some(7 << 20)), 0);
     }
 
     #[test]

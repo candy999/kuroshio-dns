@@ -348,7 +348,8 @@
             { "key": "cdn.minPool", "type": "int", "label": "可用節點少於幾個就重建", "min": 1 },
             { "key": "cdn.healthIntervalMin", "type": "int", "label": "節點池健檢間隔（分鐘）", "min": 1 },
             { "key": "cdn.qualityIntervalMin", "type": "int", "label": "鄰近節點品質重測（分鐘）", "help": "Fastly：海纜壅塞、掉包變多時自動換 POP。", "min": 1 },
-            { "key": "cdn.maxEntries", "type": "int", "label": "CDN 網域資料庫上限（筆）", "help": "記憶體較小的機器可以調低。", "min": 0 }
+            { "key": "cdn.maxEntries", "type": "int", "label": "CDN 網域資料庫上限（筆）", "help": "記憶體較小的機器可以調低。", "min": 0 },
+            { "key": "cdn.dbDiskBudgetKB", "type": "int", "label": "CDN 網域資料的磁碟預算（KB）", "help": "留空 = 自動：狀態目錄所在的儲存空間小於 64 MB（路由器的 Flash）時用總容量的 30%，超過時淘汰最久沒用的網域，把空間留給過濾清單的本機副本；64 MB 以上不限。0 = 不限。下限 512 KB。", "min": 0 }
           ]
         },
         {

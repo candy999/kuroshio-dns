@@ -1152,6 +1152,17 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
             info!("CDN：記憶體小於 {LITE_BELOW_MB} MB，減量（只驗證問過 2 次以上的網域、每分鐘最多驗證 30 個、節點池測速 4 個節點）");
         }
     }
+    // 小 Flash 的磁碟預算（3.5.0 C5）：`cdn.dbDiskBudgetKB` 是 "auto"（預設）時依狀態目錄所在的檔案系統大小換算成數字
+    // （64 MB 以上、讀不到大小 = 0 = 不限）
+    let budget_kb = crate::space::cdn_db_budget_kb(get(&c2, "cdn.dbDiskBudgetKB"), crate::space::total_bytes(&persist_dir(cfg)));
+    if let Some(c) = c2.get_mut("cdn").and_then(Value::as_object_mut) {
+        c.insert("dbDiskBudgetKB".into(), json!(budget_kb));
+    }
+    if budget_kb > 0 {
+        info!(
+            "CDN：網域資料的磁碟預算 {budget_kb} KB（cdn.dbDiskBudgetKB；超過時淘汰最久沒用的網域，把空間留給過濾清單的本機副本；0 = 不限）"
+        );
+    }
     let cdn = tokio::task::spawn_blocking(move || kuroshio_cdn::Cdn::load_with(&c2, paths, net, &|rel| p2.lock().unwrap().load(rel)))
         .await
         .ok()?;
@@ -1900,10 +1911,21 @@ fn mem_now(reserve: &crate::memgov::Reserve) -> Mem {
     }
 }
 
-fn spawn_persist_loop(p: Arc<Mutex<Persister>>, sources: Vec<SnapSource>, reserve: crate::memgov::Reserve) {
+fn spawn_persist_loop(
+    p: Arc<Mutex<Persister>>,
+    sources: Vec<SnapSource>,
+    reserve: crate::memgov::Reserve,
+    cdn: Option<Arc<kuroshio_cdn::Cdn>>,
+) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(300)).await;
+            // CDN 網域資料的磁碟預算（3.5.0 C5）：登記之前先淘汰，這一輪要重寫的分片跟著這次登記。
+            // 只在這裡做（關機、手動儲存都不淘汰）；跟記憶體控制移出冷資料用同一把鎖，不會交錯
+            if let Some(c) = &cdn {
+                let _g = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                c.budget_round();
+            }
             stage_sources(&p, &sources);
             let mut p = p.lock().unwrap();
             // 記憶體越多、留在記憶體越久；記憶體吃緊時提早寫出、放掉待寫內容
@@ -2070,7 +2092,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         let c = c.clone();
         snap_sources.push(bytes_source(move || c.snapshots()));
     }
-    spawn_persist_loop(persister.clone(), snap_sources.clone(), reserve.clone());
+    spawn_persist_loop(persister.clone(), snap_sources.clone(), reserve.clone(), cdn.clone());
     let memgov = governor_on.then(|| start_governor(reserve.clone(), &resolver, &persister, &snap_sources, cdn.as_ref(), filter.as_ref()));
     // 測試開關（3.5.0 C9）：開著時明顯提醒；重新載入設定時關掉了就連進行中的模擬一起取消
     if crate::memgov::test_hooks(cfg) {
