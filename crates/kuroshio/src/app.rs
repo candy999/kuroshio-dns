@@ -1462,7 +1462,8 @@ impl AppState {
         json!({
             "memTotalMB": total.or(self.info.mem_total_mb),
             "memAvailableMB": avail,
-            "rssKB": sysinfo::rss_kb(),
+            // 3.5.0 F6／H12：用有 Windows 實作的 rss_bytes()（跟 memory.rssKB 同一個來源；以前 Windows 上是 null）
+            "rssKB": sysinfo::rss_bytes().map(|b| b / 1024),
             "pressure": format!("{:?}", pressure()).to_lowercase(),
             "memory": self.memory_json(),
             "cores": self.info.cores,

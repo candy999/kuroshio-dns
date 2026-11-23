@@ -699,7 +699,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             if let Some(i) = path.get_mut("interceptor").filter(|i| i.is_object()) {
                 i["chain"] = crate::chain::client::interceptor_api_json();
             }
-            // `lite=1`（LuCI 的 rpcd、padavan 韌體每幾秒讀一次）：不回大的欄位（`perf`、`history`；規格 11 C12、E9）
+            // `lite=1`（LuCI 的 rpcd、padavan 韌體每幾秒讀一次）：不回大的欄位（`perf`、`history`、`system.persist.files`；
+            // 規格 11 C12、E9、F2）
             let lite = flag(q, "lite");
             // 線路感知（3.5.0 E3～E7）：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil` 由 `status_lite()` 帶出
             let cdn = r.cdn().map(|c| c.status_lite()).unwrap_or_else(|| json!({ "enabled": false }));
@@ -762,6 +763,10 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             if lite {
                 if let Some(o) = out.as_object_mut() {
                     o.remove("perf");
+                }
+                // 3.5.0 F2（D32）：每個快照檔一筆的 `system.persist.files` 不帶（D3 上 37 KB），`filesSummary` 照帶
+                if let Some(p) = out.pointer_mut("/system/persist").and_then(Value::as_object_mut) {
+                    p.remove("files");
                 }
             } else if flag(q, "history") {
                 // 3.5.0 E9：24 小時歷史（約 6 KB，要明確要求才給）

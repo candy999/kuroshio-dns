@@ -1087,6 +1087,36 @@ impl Persister {
             "freedBytes": st.freed_bytes,
             "skipped": st.skipped,
             "files": files,
+            "filesSummary": self.files_summary(),
+        })
+    }
+
+    /// 快照檔的加總（3.5.0 F2）：`/api/status?lite=1` 不帶每個檔一筆的 `files`（D3 上 37 KB，CDN 網域資料就有 256 片），
+    /// 改帶這一份。`count` 檔數、`bytes` 上次寫入的大小合計、`compressed` 壓縮的檔數、`pending` 有變動還沒寫的檔數、
+    /// `oldestWriteAt` 最久沒寫的那個檔上次寫入的時間（毫秒；都還沒寫過是 null）
+    pub fn files_summary(&self) -> Value {
+        let mut bytes = 0u64;
+        let mut compressed = 0usize;
+        let mut pending = 0usize;
+        let mut oldest: Option<u64> = None;
+        for (k, e) in &self.entries {
+            bytes = bytes.saturating_add(e.written_size);
+            if (self.compress)(k) {
+                compressed += 1;
+            }
+            if e.pending.is_some() {
+                pending += 1;
+            }
+            if e.written_at > 0 {
+                oldest = Some(oldest.map_or(e.written_at, |o| o.min(e.written_at)));
+            }
+        }
+        json!({
+            "count": self.entries.len(),
+            "bytes": bytes,
+            "compressed": compressed,
+            "pending": pending,
+            "oldestWriteAt": oldest.map(|t| t * 1000),
         })
     }
 }
