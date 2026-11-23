@@ -27,7 +27,7 @@ use serde_json::{json, Map, Value};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderPool {
@@ -139,6 +139,10 @@ struct Scored {
     quick: bool,
     /// 相對評分的「慢」；None = 沒量到速度，或用舊規則（`pool.relativeSpeed: false`）
     slow: Option<bool>,
+    /// 這一輪對這一家停止測速之後沒輪到的（3.5.0 F15）
+    skipped: bool,
+    /// 速度是沿用前幾輪的（3.5.0 F15）：第幾輪
+    age: Option<u32>,
 }
 
 impl Scored {
@@ -174,6 +178,7 @@ impl Scored {
             _ => Num::Null,
         };
         n.slow = self.slow.filter(|_| self.speed.is_some_and(|s| s > 0.0));
+        n.speed_age = self.age;
         n.sample = self
             .sample
             .filter(|s| s.bytes > 0)
@@ -181,19 +186,36 @@ impl Scored {
     }
 }
 
-/// 這一次節點池工作的參考速度（`speedRef`，MB/s）：每次重算，沒有就拿掉（不跨工作沿用）
-fn set_speed_ref(rest: &mut Map<String, Value>, r: Option<f64>) {
+/// 這一次節點池工作的參考速度（`speedRef`，MB/s）：每次重算，沒有就拿掉（不跨工作沿用；
+/// 3.5.0 F15：被限流的那一輪沿用上一輪的）。沒算出來時 `speedRefWhy` 寫原因
+fn set_speed_ref(rest: &mut Map<String, Value>, r: Option<f64>, why: Option<String>) {
     match r {
         Some(r) => rest.insert("speedRef".into(), json!(r)),
         None => rest.remove("speedRef"),
     };
+    match why {
+        Some(w) => rest.insert("speedRefWhy".into(), json!(w)),
+        None => rest.remove("speedRefWhy"),
+    };
+}
+
+/// 快測的參考速度（`quickRef`，3.5.0 F16）：每次重算，沒有就拿掉
+fn set_quick_ref(rest: &mut Map<String, Value>, r: Option<f64>) {
+    match r {
+        Some(r) => rest.insert("quickRef".into(), json!(r)),
+        None => rest.remove("quickRef"),
+    };
 }
 
 /// 量完速度之後：算這一家的參考速度，標出相對的「慢」（3.5.0 B1）。回傳參考速度。
-/// 快測沒過的節點已經標成慢（它連「不低於參考的一半」都確認不了），這裡不改
-fn mark_slow(list: &mut [Scored]) -> Option<f64> {
-    let reference = speed::speed_ref(list.iter().filter_map(|x| x.speed));
+/// 快測沒過的節點已經標成慢（它連「不低於參考的一半」都確認不了），這裡不改；
+/// 沿用前幾輪速度的節點（3.5.0 F15）照它原本的旗標，不重算。量到速度的不到 3 個時用 `fallback`（被限流時是上一輪的）
+fn mark_slow(list: &mut [Scored], fallback: Option<f64>) -> Option<f64> {
+    let reference = speed::speed_ref(list.iter().filter_map(|x| x.speed)).or(fallback);
     for x in list.iter_mut() {
+        if x.age.is_some() {
+            continue;
+        }
         let Some(s) = x.speed.filter(|s| *s > 0.0) else {
             x.slow = None;
             continue;
@@ -203,6 +225,73 @@ fn mark_slow(list: &mut [Scored]) -> Option<f64> {
         }
     }
     reference
+}
+
+/// 對方限流（3.5.0 F15）：這一輪對這一家停止測速
+pub(crate) fn rate_limited(status: u16) -> bool {
+    status == 429 || status == 503
+}
+
+/// 沒量到速度的原因（日誌用；3.5.0 F15：不印「0 MB/s」）
+pub(crate) fn unmeasured_why(s: &SpeedSample) -> String {
+    match s.status {
+        0 => "連線失敗".into(),
+        200..=299 => format!("HTTP {}，收到的內容太少", s.status),
+        n => format!("HTTP {n}"),
+    }
+}
+
+/// 測速的一行日誌（3.5.0 F6、F15、F16）：量到的速度、快測印實際量到的（通過時另外寫排序用的速度）、
+/// 沒量到的寫狀態碼；給誤差範圍回歸用的紀錄（收了多少、花多久、前 1 MiB、連線與 TTFB）
+pub(crate) fn speed_line(ip: IpAddr, pop: &str, ms: f64, s: &SpeedSample, quick: Option<(bool, f64)>) -> String {
+    let head = if s.head_secs > 0.0 {
+        format!("，前 1 MiB {:.2} 秒", s.head_secs)
+    } else {
+        String::new()
+    };
+    let detail = format!(
+        "（{} KB／{:.2} 秒{head}，連線 {:.0} ms，TTFB {:.0} ms）",
+        s.bytes / 1024,
+        s.secs,
+        s.connect_ms,
+        s.ttfb_ms
+    );
+    let what = if s.mbps <= 0.0 {
+        format!("沒量到（{}）", unmeasured_why(s))
+    } else {
+        match quick {
+            Some((true, c)) => format!("{} MB/s（快測，通過；排序用 {c}）{detail}", s.mbps),
+            Some((false, floor)) => format!("{} MB/s（快測，低於門檻 {:.2}，算慢）{detail}", s.mbps, floor),
+            None => format!("{} MB/s{detail}", s.mbps),
+        }
+    };
+    format!("  測速 {:<16} {pop}  {ms:.1}ms  {what}", ip.to_string())
+}
+
+/// 被限流的那一輪（3.5.0 F15）：沒量到的節點沿用上一輪節點池裡同一個節點（同一個 IP，或同一個 /24）的速度與 `slow`
+/// （最多沿用 3 輪）
+fn reuse_previous(list: &mut [Scored], prev: &[PoolNode]) -> usize {
+    let mut n = 0;
+    for x in list.iter_mut().filter(|x| x.skipped && x.speed.is_none()) {
+        // 同一個 IP；沒有的話同一個 /24（候選每次在網段裡隨機抽一個位址，同一個 /24 是同一批機器）
+        let Some(p) = prev
+            .iter()
+            .find(|p| p.ip == x.ip)
+            .or_else(|| prev.iter().find(|p| p24(p.ip).is_some() && p24(p.ip) == p24(x.ip)))
+        else {
+            continue;
+        };
+        let age = p.speed_age.unwrap_or(0) + 1;
+        let Some(s) = p.speed.get().filter(|s| *s > 0.0) else { continue };
+        if age > crate::pools::SPEED_AGE_MAX {
+            continue;
+        }
+        x.speed = Some(s);
+        x.slow = p.slow;
+        x.age = Some(age);
+        n += 1;
+    }
+    n
 }
 
 /// 沒有台灣 POP 的 CDN（Fastly）：掃過官方所有 /24，找出各鄰近 POP（香港 / 東京 / 大阪 / 新加坡…），
@@ -349,6 +438,8 @@ async fn build_nearest(
                 sample: None,
                 quick: false,
                 slow: None,
+                skipped: false,
+                age: None,
             });
         }
     }
@@ -382,7 +473,11 @@ async fn build_nearest(
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             top.truncate(5);
+            let mut limited = false;
             for pop in top {
+                if limited {
+                    break;
+                }
                 ctx.checkpoint().await;
                 let mut idx: Vec<usize> = (0..scored.len()).filter(|&i| scored[i].pop == pop).collect();
                 idx.sort_by(|&a, &b| qs(&scored[a]).partial_cmp(&qs(&scored[b])).unwrap_or(std::cmp::Ordering::Equal));
@@ -396,7 +491,19 @@ async fn build_nearest(
                         .net()
                         .download_sample(target, url, jc.speed_seconds * 1000, kuroshio_net::probe::SPEED_MAX_BYTES)
                         .await;
-                    scored[i].speed = Some(sm.mbps);
+                    // 3.5.0 F15：被對方限流就停（這一輪不再對它測速）；沒量到的留 None（不是 0 MB/s）
+                    if rate_limited(sm.status) {
+                        warn!(
+                            "[{name}] 測速被對方限流（HTTP {}）：這一輪不再對它測速；沒量到的節點照延遲與丟包排",
+                            sm.status
+                        );
+                        limited = true;
+                        break;
+                    }
+                    if sm.mbps <= 0.0 {
+                        info!("  測速 {target} {pop}：沒量到（{}）", unmeasured_why(&sm));
+                    }
+                    scored[i].speed = (sm.mbps > 0.0).then_some(sm.mbps);
                     scored[i].sample = Some(sm);
                 }
             }
@@ -405,7 +512,7 @@ async fn build_nearest(
     // 相對評分（3.5.0 B1）：慢不慢跟這一家量到速度的其他節點比（不到 3 個量到時只看絕對下限）
     let mut speed_ref = None;
     if jc.relative_speed {
-        speed_ref = mark_slow(&mut scored);
+        speed_ref = mark_slow(&mut scored, None);
         if let Some(r) = speed_ref {
             info!("測速參考速度 {r} MB/s（中位數）；低於一半的節點算慢");
         }
@@ -539,7 +646,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             let (mut pool4, built_prefixes, speed_ref) = build_nearest(ctx, prov, &prev, &mut rng).await;
             let mut rest = prev.rest.clone();
             rest.insert("updatedAt".into(), json!(updated));
-            set_speed_ref(&mut rest, speed_ref);
+            set_speed_ref(&mut rest, speed_ref, None);
             rest.insert("tw48".into(), json!([]));
             if !built_prefixes.is_empty() {
                 let pf: Map<String, Value> = built_prefixes
@@ -668,6 +775,8 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                 sample: None,
                 quick: false,
                 slow: None,
+                skipped: false,
+                age: None,
             })
             .collect();
         let mut pops_seen: Vec<&str> = Vec::new();
@@ -679,6 +788,9 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         info!("階段 B POP：{} 個確認在台灣（{}）", good.len(), pops_seen.join(", "));
 
         // ---------- 階段 C：下載測速 ----------
+        // 3.5.0 F15：被對方限流的狀態碼（這一輪對這一家停止測速）；F16：快測的參考速度（前 1 MiB）
+        let mut limited: Option<u16> = None;
+        let mut quick_ref: Option<f64> = None;
         if let Some(url) = prov.speed_url {
             // 小機器減量（3.4.2）：最多測 LITE_SPEED_TOP 個節點
             let top = if cdn.cfg.lite {
@@ -694,11 +806,31 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             let mut first: Vec<SpeedSample> = Vec::new();
             let mut ceiling: Option<f64> = None;
             for x in good.iter_mut().take(top) {
+                // 3.5.0 F15：被對方限流（429／503）之後，這一輪對這一家不再發任何測速請求
+                if limited.is_some() {
+                    x.skipped = true;
+                    continue;
+                }
                 ctx.checkpoint().await;
                 let ms = jc.speed_seconds * 1000;
+                let bytes = if ceiling.is_some() {
+                    SPEED_QUICK_BYTES
+                } else {
+                    kuroshio_net::probe::SPEED_MAX_BYTES
+                };
+                let sm = cdn.net().download_sample(x.ip, url, ms, bytes).await;
+                if rate_limited(sm.status) {
+                    limited = Some(sm.status);
+                    x.skipped = true;
+                    warn!(
+                        "[{name}] 測速被對方限流（HTTP {}）：這一輪不再對它測速，沿用上一輪的速度與參考值；排序照延遲",
+                        sm.status
+                    );
+                    continue;
+                }
+                let mut quick_log = None;
                 match ceiling {
                     None => {
-                        let sm = cdn.net().download_sample(x.ip, url, ms, kuroshio_net::probe::SPEED_MAX_BYTES).await;
                         // 0 MB/s 是連不上／回錯誤，不是速度：不算進判斷瓶頸的那幾個（3.4.2 Windows 壓力測試：
                         // CloudFront 前 4 個是 5.45、0、5.46、0，其餘 13 個都在 5.3～5.7，減量因為兩個 0 沒有啟動）
                         let counts = if relative {
@@ -716,49 +848,37 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                                 speed::same_speed_legacy(&first.iter().map(|s| s.mbps).collect::<Vec<_>>())
                             };
                             if let Some(c) = ceiling {
-                                info!("  測速：前 {SPEED_PROBE} 個節點都約 {c} MB/s（線路或對方的上限），其餘節點只確認不慢");
+                                quick_ref = if relative { speed::quick_ref(&first) } else { None };
+                                info!(
+                                    "  測速：前 {SPEED_PROBE} 個節點都約 {c} MB/s（線路或對方的上限），其餘節點只確認不慢{}",
+                                    quick_ref.map(|q| format!("（快測的參考：前 1 MiB {q} MB/s）")).unwrap_or_default()
+                                );
                             }
                         }
-                        x.speed = Some(sm.mbps);
-                        x.sample = Some(sm);
+                        // 3.5.0 F15：沒量到的留 None（不是 0 MB/s；兩種規則都一樣）
+                        x.speed = (sm.mbps > 0.0).then_some(sm.mbps);
                     }
                     Some(c) => {
-                        let q = cdn.net().download_sample(x.ip, url, ms, SPEED_QUICK_BYTES).await;
-                        // 快測的門檻：3.5.0 是相對的（參考速度的一半，最高 1 MB/s，再用它自己的誤差範圍放寬）；
-                        // 沒過的記它自己量到的速度，直接算慢
-                        let floor = if relative {
-                            speed::quick_floor(c, q.secs)
-                        } else {
+                        // 快測的門檻：3.5.0 F16 跟完整測的「前 1 MiB」比（同類相比）；量不到前 1 MiB 時照 B1 的退路
+                        // （參考速度的一半，最高 1 MB/s，再用它自己的誤差範圍放寬）。沒過的記它自己量到的速度，直接算慢
+                        let floor = if !relative {
                             speed::LEGACY_SLOW_MBPS
+                        } else if let Some(q) = quick_ref {
+                            speed::quick_floor_ref(q, sm.secs)
+                        } else {
+                            speed::quick_floor(c, sm.secs)
                         };
-                        let pass = q.mbps > 0.0 && q.mbps >= floor;
-                        x.speed = Some(if pass { c } else { q.mbps });
+                        let pass = sm.mbps > 0.0 && sm.mbps >= floor;
+                        x.speed = if pass { Some(c) } else { (sm.mbps > 0.0).then_some(sm.mbps) };
                         x.quick = true;
-                        x.sample = Some(q);
-                        if relative && !pass && q.mbps > 0.0 {
+                        if relative && !pass && sm.mbps > 0.0 {
                             x.slow = Some(true);
                         }
+                        quick_log = Some(if pass { (true, c) } else { (false, floor) });
                     }
                 };
-                info!(
-                    "  測速 {:<16} {}  {:.1}ms  {} MB/s{}",
-                    x.ip.to_string(),
-                    x.pop,
-                    x.ms,
-                    x.speed.unwrap_or(0.0),
-                    // 給誤差範圍回歸用的紀錄（規格 11 的 D7、W3）：收了多少、花多久、連線與 TTFB
-                    x.sample
-                        .filter(|s| s.bytes > 0)
-                        .map(|s| format!(
-                            "（{} KB／{:.2} 秒{}，連線 {:.0} ms，TTFB {:.0} ms）",
-                            s.bytes / 1024,
-                            s.secs,
-                            if x.quick { "，快測" } else { "" },
-                            s.connect_ms,
-                            s.ttfb_ms
-                        ))
-                        .unwrap_or_default()
-                );
+                x.sample = Some(sm);
+                info!("{}", speed_line(x.ip, &x.pop, x.ms, &sm, quick_log));
             }
         }
         // 階段 A 同時測很多個，本機會塞車、延遲偏高：決選名單用低並行重新量一次
@@ -785,10 +905,30 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         }
         // 排序：丟包 → 速度 → 延遲。3.5.0 B1：速度先分級（差在誤差範圍內的同一級），同一級之間由延遲決定；
         // 慢不慢跟這一家其他節點比。`pool.relativeSpeed: false` 是 3.4.x 的直接比速度
-        let speed_ref = if jc.relative_speed { mark_slow(&mut good) } else { None };
+        // 3.5.0 F15：被限流的那一輪，沒量到的節點沿用上一輪的速度（最多 3 輪），參考速度不夠就沿用上一輪的
+        if let Some(st) = limited {
+            let n = reuse_previous(&mut good, &prev.v4);
+            if n > 0 {
+                info!("  測速被限流（HTTP {st}）：{n} 個節點沿用上一輪的速度");
+            }
+        }
+        let prev_ref = limited.and_then(|_| prev.rest.get("speedRef").and_then(Value::as_f64));
+        let speed_ref = if jc.relative_speed { mark_slow(&mut good, prev_ref) } else { None };
+        let mut ref_why = None;
         if let Some(r) = speed_ref {
             let slow = good.iter().filter(|x| x.slow == Some(true)).count();
             info!("  測速參考速度 {r} MB/s（中位數）；{slow} 個節點低於一半，算慢");
+            if let Some(st) = limited.filter(|_| prev_ref == Some(r)) {
+                ref_why = Some(format!("被限流（HTTP {st}），沿用上一輪"));
+            }
+        } else if jc.relative_speed && prov.speed_url.is_some() {
+            let n = good.iter().filter(|x| x.speed.is_some_and(|s| s > 0.0)).count();
+            let why = match limited {
+                Some(st) => format!("被限流（HTTP {st}）"),
+                None => format!("量到速度的節點只有 {n} 個（要 {} 個）", speed::REF_MIN_NODES),
+            };
+            info!("  測速參考速度沒有算出來：{why}");
+            ref_why = Some(why);
         }
         let ranked: Vec<speed::Ranked> = good.iter().map(Scored::ranked).collect();
         let order = speed::order(&ranked, jc.relative_speed);
@@ -971,7 +1111,8 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         rest.insert("tw48".into(), json!(tw48));
         // 沒有換新的節點池（保留舊的）時，舊的參考速度也留著
         if !kept {
-            set_speed_ref(&mut rest, speed_ref);
+            set_speed_ref(&mut rest, speed_ref, ref_why);
+            set_quick_ref(&mut rest, quick_ref);
         }
         report.providers.push(ProviderPool {
             provider: name.to_string(),

@@ -1,4 +1,4 @@
-//! 跨 CDN 替換加實測評分（3.5.0，規格 11 B4）：原本的五個條件不變，另外要「整個請求沒有比原站慢」
+//! 跨 CDN 替換加實測評分（3.5.0，規格 11 B4；F13 起分數是握手時間）：原本的五個條件不變，另外要「握手比原站快」
 
 use super::selftest::cross_setup;
 use super::*;
@@ -13,15 +13,19 @@ const ORIG: &str = "151.101.1.1";
 const CF: &str = "104.16.1.1";
 const AZ: &str = "13.107.1.1";
 
-/// 同一個網站的回應，帶分段時間（連線＋握手＋TTFB＝`score` 毫秒）
+/// 同一個網站的回應，帶分段時間（連線＋TLS 握手＝`score` 毫秒；TTFB 固定 120 毫秒，由原站決定）
 fn page(headers: &[(&str, &str)], score: f64) -> ProbeResult {
+    page_t(headers, score * 0.4, score * 0.6, 120.0)
+}
+
+fn page_t(headers: &[(&str, &str)], connect: f64, tls: f64, ttfb: f64) -> ProbeResult {
     let mut hh = vec![("content-type", "text/html; charset=utf-8")];
     hh.extend_from_slice(headers);
     let mut r = resp(200, &hh, "<html><head><title>X</title></head></html>");
     r.timing = Timing {
-        connect_ms: score * 0.2,
-        tls_ms: score * 0.3,
-        ttfb_ms: score * 0.5,
+        connect_ms: connect,
+        tls_ms: tls,
+        ttfb_ms: ttfb,
     };
     r
 }
@@ -87,7 +91,7 @@ fn score_pick_and_threshold() {
 
 #[tokio::test]
 async fn cross_prefers_lower_request_score_over_lower_tcp() {
-    // Cloudflare 的 TCP 延遲比較低（4 ms 對 6 ms），但整個請求 Azure 快一倍：挑 Azure。以前只看 TCP，挑 Cloudflare
+    // Cloudflare 的 TCP 延遲比較低（4 ms 對 6 ms），但握手 Azure 快一倍：挑 Azure。以前只看 TCP，挑 Cloudflare
     let (c, _) = setup(100.0, (4.0, 60.0), (6.0, 30.0), Value::Null);
     assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "ok");
     let r = rec(&c);
@@ -110,14 +114,14 @@ async fn cross_prefers_lower_request_score_over_lower_tcp() {
 
 #[tokio::test]
 async fn cross_rejected_when_request_not_faster() {
-    // TCP 連線近很多（4 ms 對 62 ms），但整個請求（握手、TTFB）沒有比原站快：不換
+    // TCP 連線近很多（4 ms 對 62 ms），但握手沒有比原站快：不換
     let (c, _) = setup(100.0, (4.0, 120.0), (6.0, 130.0), Value::Null);
     assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "fail");
     let r = rec(&c);
     assert!(r.is("fail"));
     let reason = r.reason.clone().unwrap();
     assert!(
-        reason.contains("連線比較近，但整個請求沒有比較快") && reason.contains("Cloudflare"),
+        reason.contains("連線比較近，但握手沒有比較快") && reason.contains("Cloudflare"),
         "{reason}"
     );
     assert_eq!((r.score, r.orig_score, r.orig_ms), (Num::V(120.0), Num::V(100.0), Num::V(62.0)));
@@ -132,8 +136,8 @@ async fn cross_rejected_when_request_not_faster() {
 }
 
 #[tokio::test]
-async fn score_never_relaxes_the_original_conditions() {
-    // 條件只增不減：TCP 延遲沒有快 8 ms 以上的，整個請求再快也不換
+async fn cross_score_never_relaxes_tcp_condition() {
+    // 條件只增不減：TCP 延遲沒有快 8 ms 以上的，握手再快也不換
     let (c, _) = setup(100.0, (60.0, 10.0), (61.0, 10.0), Value::Null);
     assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "fail");
     let r = rec(&c);
@@ -258,5 +262,56 @@ async fn explain_shows_request_scores() {
         (json!(120.0), json!(100.0)),
         "{v}"
     );
-    assert!(step["reason"].as_str().unwrap().contains("整個請求沒有比較快"));
+    assert!(step["reason"].as_str().unwrap().contains("握手沒有比較快"));
+}
+
+/// 3.5.0 F13（W11 的網站丙）：原站 Fastly 連線 33、TLS 75、TTFB 約 130；Cloudflare 台灣 21、42、約 120。
+/// TTFB 兩邊一樣（原站決定），以前「連線＋握手＋TTFB」238 對 183 只差 23%、第二次樣本又可能蓋掉；握手 63 對 108：採用
+#[tokio::test]
+async fn cross_score_is_handshake_only() {
+    let (c, net) = setup(100.0, (4.0, 60.0), (60.0, 10.0), Value::Null);
+    net.on_https(move |i, _| match i.to_string().as_str() {
+        ORIG => page_t(&[], 33.0, 75.0, 130.0),
+        CF => page_t(&[("cf-ray", "abc-TPE")], 21.0, 42.0, 120.0),
+        AZ => page(&[("x-azure-ref", "r")], 10.0),
+        _ => ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true),
+    });
+    assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "ok");
+    let r = rec(&c);
+    assert_eq!(
+        (r.to.as_deref(), r.score, r.orig_score),
+        (Some("cloudflare"), Num::V(63.0), Num::V(108.0))
+    );
+}
+
+#[tokio::test]
+async fn cross_same_ttfb_no_longer_masks_handshake_gain() {
+    // 握手快很多（50 對 100），但 TTFB 由原站決定而且這一次台灣那邊剛好慢 400 毫秒：照握手判斷，採用
+    let (c, net) = setup(100.0, (4.0, 50.0), (60.0, 10.0), Value::Null);
+    net.on_https(move |i, _| match i.to_string().as_str() {
+        ORIG => page_t(&[], 40.0, 60.0, 100.0),
+        CF => page_t(&[("cf-ray", "abc-TPE")], 20.0, 30.0, 500.0),
+        AZ => page(&[("x-azure-ref", "r")], 10.0),
+        _ => ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true),
+    });
+    assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "ok");
+    assert_eq!(rec(&c).score, Num::V(50.0));
+    // 反過來：TTFB 台灣快很多，握手沒有比較快 → 不換（TTFB 不算）
+    let (c, net) = setup(100.0, (4.0, 100.0), (60.0, 10.0), Value::Null);
+    net.on_https(move |i, _| match i.to_string().as_str() {
+        ORIG => page_t(&[], 40.0, 60.0, 600.0),
+        CF => page_t(&[("cf-ray", "abc-TPE")], 40.0, 60.0, 20.0),
+        AZ => page(&[("x-azure-ref", "r")], 10.0),
+        _ => ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true),
+    });
+    assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "fail");
+}
+
+#[tokio::test]
+async fn cross_no_taiwan_weight() {
+    // F9 的台灣加權（× 0.7）不套用：96 對 100 不到快 5%，不換（加權的話 67 會過）
+    let (c, _) = setup(100.0, (4.0, 96.0), (60.0, 10.0), Value::Null);
+    assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "fail");
+    let (c, _) = setup(100.0, (4.0, 95.0), (60.0, 10.0), Value::Null);
+    assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "ok");
 }

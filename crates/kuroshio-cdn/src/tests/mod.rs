@@ -3,11 +3,13 @@
 mod behaviors;
 mod bench;
 mod crossscore;
+mod essential;
 mod explain;
 mod jobs;
 mod line;
 mod lite;
 mod multi;
+mod pace;
 mod parity;
 mod queue;
 mod selftest;

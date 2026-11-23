@@ -371,7 +371,8 @@ impl Cdn {
                 continue;
             }
             let mut pass = Vec::new();
-            // 實測分數（3.5.0 B4）：條件 ①～④ 的探測本來就要做，把它的分段時間留下來，不多連線
+            // 實測分數（3.5.0 B4；F13 起是握手時間＝連線＋TLS 握手，不含 TTFB）：條件 ①～④ 的探測本來就要做，
+            // 把它的分段時間留下來，不多連線
             let mut score: Option<(f64, IpAddr)> = None;
             let mut why: Option<String> = None;
             for ip in ips {
@@ -400,7 +401,7 @@ impl Cdn {
                     why = Some(d);
                     continue;
                 }
-                if let Some(ms) = r.timing.request_ms() {
+                if let Some(ms) = r.timing.handshake_ms() {
                     if score.map_or(true, |s| ms < s.0) {
                         score = Some((ms, ip));
                     }
@@ -456,7 +457,9 @@ impl Cdn {
             .filter(|&i| orig_ms.map(|o| ok_list[i].ms + min_gain <= o).unwrap_or(true))
             .collect();
         // 實測分數（3.5.0 B4）：原站與通過的每一家都量到了才用；量不到（舊的探測、假的網路）照原本的規則
-        let base_score = base.timing.request_ms();
+        // 3.5.0 F13：握手時間（`Timing::handshake_ms()`，跟 F9 同一個函式）。TTFB 由原站決定、單次差幾百毫秒，
+        // 會把握手的差距蓋掉；不套用 F9 的台灣加權（這裡是「要不要換到另一家」，條件只能比 3.4.x 嚴）
+        let base_score = base.timing.handshake_ms();
         let use_score = self.cfg.cross.request_score
             && base_score.is_some()
             && !eligible.is_empty()
@@ -474,7 +477,7 @@ impl Cdn {
             let (mut new_score, ip) = ok_list[i].score.unwrap();
             for (target, slot) in [(ip, &mut new_score), (orig, &mut orig_score)].into_iter().take(SCORE_EXTRA_PROBES) {
                 let r = self.net.https_probe(target, name, "/", opts.clone()).await;
-                if let Some(ms) = r.timing.request_ms().filter(|_| r.ok) {
+                if let Some(ms) = r.timing.handshake_ms().filter(|_| r.ok) {
                     *slot = slot.min(ms);
                 }
             }
@@ -515,17 +518,15 @@ impl Cdn {
                 providers::label(&to),
                 ms,
                 orig_ms.map(|m| m.to_string()).unwrap_or_else(|| "?".into()),
-                scores
-                    .map(|(n, o)| format!("；整個請求 {n:.0}ms，原本 {o:.0}ms"))
-                    .unwrap_or_default()
+                scores.map(|(n, o)| format!("；握手 {n:.0}ms，原本 {o:.0}ms")).unwrap_or_default()
             );
             return "ok";
         }
         let om = orig_ms.map(|m| m.to_string()).unwrap_or_else(|| "null".into());
         let reason = match (pick, scores, ok_list.first()) {
-            // 原本的條件都過了，但整個請求沒有比較快（3.5.0 B4）
+            // 原本的條件都過了，但握手沒有比較快（3.5.0 B4；F13 起比握手時間）
             (Some(i), Some((n, o)), _) => format!(
-                "{} 連線比較近，但整個請求沒有比較快（{n:.0}ms／原本 {o:.0}ms）",
+                "{} 連線比較近，但握手沒有比較快（{n:.0}ms／原本 {o:.0}ms）",
                 providers::label(&ok_list[i].to)
             ),
             (_, _, Some(b)) => format!("{} 可用但沒有比較快（{:.0}ms／原本 {om}ms）", providers::label(&b.to), b.ms),

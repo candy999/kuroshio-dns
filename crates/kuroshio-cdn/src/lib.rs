@@ -18,6 +18,7 @@ mod health;
 pub mod jobs;
 pub mod net;
 pub mod optimizer;
+pub mod pace;
 pub mod pools;
 pub mod providers;
 pub mod reach;

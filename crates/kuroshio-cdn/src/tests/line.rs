@@ -386,6 +386,130 @@ fn chained_pop_probe_uses_audit_slot_and_is_capped() {
     assert_eq!(n, crate::reach::AUDIT_DAY_MAX_LITE);
 }
 
+/// 上游宣稱機房（`upPop`）還沒確認的節點
+fn up(i: &str, pop: &str, ms: f64) -> PoolNode {
+    let mut n = node(i, pop, ms);
+    n.set_up_pop(pop);
+    n
+}
+
+/// 3.5.0 F7：Cloudflare v4 前 4 名（serveCount 4）＋ v6、Fastly v4 的待確認節點
+fn f7_setup(over: Value) -> (Arc<Cdn>, Arc<MockNet>) {
+    let (c, net) = setup(over);
+    set_pool(
+        &c,
+        "cloudflare",
+        4,
+        (1..=6).map(|i| up(&format!("192.0.2.{i}"), "KHH", i as f64)).collect(),
+    );
+    set_pool(&c, "cloudflare", 6, vec![up("2001:db8:1::1", "TPE", 3.0)]);
+    set_pool(&c, "fastly", 4, vec![up("151.101.1.10", "HKG", 30.0)]);
+    (c, net)
+}
+
+fn gap(c: &Cdn) {
+    c.with_state(|st| st.line.age(crate::reach::AUDIT_GAP_MS));
+}
+
+#[test]
+fn pop_audit_picks_pending_top_node_when_answer_ip_is_not_pending() {
+    let (c, net) = f7_setup(json!({}));
+    // 答案的 IP 不是待確認的節點（W17：21 次答案抽查都抽不中）：改量一個待確認的前幾名
+    let (p, target) = c.pop_audit_pick(ip("198.51.100.99")).unwrap();
+    assert_eq!((p, target), ("cloudflare", ip("192.0.2.1")));
+    assert!(net.log.lock().unwrap().is_empty(), "只回要量誰，探測由呼叫端做");
+    assert_eq!(c.observe_counters().pop_probes, 1);
+    let o = c.observe_json();
+    assert!(o["popAudit"]["lastProbeAt"].as_u64().unwrap() > 0);
+    assert_eq!(o["popAudit"]["pendingServed"], 6, "前 4 名 ＋ v6 1 個 ＋ Fastly 1 個");
+    c.note_local_pop("cloudflare", target, "KHH");
+    assert_eq!(c.observe_json()["popAudit"]["pendingServed"], 5);
+    // 答案的 IP 剛好是待確認的節點：照舊量它
+    gap(&c);
+    assert_eq!(c.pop_audit_pick(ip("192.0.2.3")), Some(("cloudflare", ip("192.0.2.3"))));
+    // 舊的介面不挑別的
+    gap(&c);
+    assert_eq!(c.pop_audit_wanted(ip("198.51.100.99")), None);
+}
+
+#[test]
+fn pop_audit_round_robins_providers_and_families() {
+    let (c, _) = f7_setup(json!({}));
+    let mut got = Vec::new();
+    for _ in 0..6 {
+        let (p, t) = c.pop_audit_pick(ip("198.51.100.99")).unwrap();
+        got.push((p, t.is_ipv6()));
+        gap(&c);
+    }
+    // 每一組（CDN、位址族）輪一次：Cloudflare v4、v6、Fastly v4、Cloudflare v4…（Fastly 沒有 v6）
+    assert!(got.contains(&("cloudflare", true)) && got.contains(&("fastly", false)), "{got:?}");
+    assert_eq!(got.iter().filter(|x| **x == ("cloudflare", false)).count(), 4, "{got:?}");
+    assert_ne!(got[0], got[1], "不會一直抽同一組");
+}
+
+#[test]
+fn pop_audit_stops_when_served_nodes_confirmed() {
+    let (c, _) = f7_setup(json!({}));
+    let mut n = 0;
+    while let Some((p, t)) = c.pop_audit_pick(ip("198.51.100.99")) {
+        c.note_local_pop(p, t, "TPE");
+        gap(&c);
+        n += 1;
+        assert!(n <= 10);
+    }
+    assert_eq!(n, 6, "前幾名都確認了就不再挑（排在後面的第 5、6 名留給解除串接後的健檢）");
+    let o = c.observe_json();
+    assert_eq!(o["popAudit"]["pendingServed"], 0);
+    assert_eq!(o["popAudit"]["pending"], 2);
+    assert_eq!(o["popAudit"]["noTarget"], 1);
+}
+
+#[test]
+fn pop_audit_caps_unchanged() {
+    let (c, _) = setup(json!({}));
+    set_pool(
+        &c,
+        "cloudflare",
+        4,
+        (1..=40).map(|i| up(&format!("192.0.2.{i}"), "TPE", 1.0)).collect(),
+    );
+    assert!(c.pop_audit_pick(ip("198.51.100.99")).is_some());
+    assert_eq!(c.pop_audit_pick(ip("198.51.100.99")), None, "10 分鐘 1 個");
+    assert_eq!(c.observe_json()["popAudit"]["noTarget"], 0, "名額不夠不算「沒有對象」");
+    let mut n = 1;
+    for _ in 0..40 {
+        gap(&c);
+        if let Some((p, t)) = c.pop_audit_pick(ip("198.51.100.99")) {
+            n += 1;
+            // 量完上游的機房跟著換（serveCount 4 的前幾名一直有新的待確認節點）
+            c.note_local_pop(p, t, "TPE");
+            c.with_state(|st| {
+                let d = st.pools.p.get_mut("cloudflare").unwrap();
+                let x = d.pool4.iter().position(|x| x.ip == t).unwrap();
+                let moved = d.pool4.remove(x);
+                d.pool4.push(moved);
+            });
+        }
+    }
+    assert_eq!(n, crate::reach::AUDIT_DAY_MAX, "24 小時 24 個");
+}
+
+#[test]
+fn pop_audit_off_never_probes() {
+    let (c, net) = f7_setup(json!({ "popAudit": false }));
+    assert_eq!(c.pop_audit_pick(ip("198.51.100.99")), None);
+    assert_eq!(c.pop_audit_pick(ip("192.0.2.1")), None);
+    assert!(net.log.lock().unwrap().is_empty());
+    assert_eq!(c.observe_counters().pop_probes, 0);
+    // 記憶體壓力也不做
+    let (c, _) = f7_setup(json!({}));
+    c.set_line_env(|| crate::reach::LineEnv {
+        chained: true,
+        memory_normal: false,
+    });
+    assert_eq!(c.pop_audit_pick(ip("198.51.100.99")), None);
+}
+
 #[test]
 fn pop_audit_off_matches_previous_behaviour() {
     let (c, net) = setup(json!({ "popAudit": false }));
@@ -834,20 +958,24 @@ async fn spread_off_keeps_latency_order() {
     }
 }
 
-// ============================================================ E7
+// ============================================================ E7 第二版（3.5.0 F9）
 
-/// 同一個網站的回應，帶分段時間（連線＋握手＋TTFB ≈ `ms`）
-fn page(colo: &str, ms: f64) -> ProbeResult {
+/// 同一個網站的回應，帶分段時間：握手（連線＋TLS）＝`hs` 毫秒、TTFB 固定 100 毫秒
+fn page(colo: &str, hs: f64) -> ProbeResult {
+    page_t(colo, hs, 100.0)
+}
+
+fn page_t(colo: &str, hs: f64, ttfb: f64) -> ProbeResult {
     let mut r = cf_ok(colo);
     r.timing = Timing {
-        connect_ms: ms * 0.25,
-        tls_ms: ms * 0.25,
-        ttfb_ms: ms * 0.5,
+        connect_ms: hs * 0.4,
+        tls_ms: hs * 0.6,
+        ttfb_ms: ttfb,
     };
     r
 }
 
-/// 原站（`ORIG`）與台灣節點（192.0.2.1、198.51.100.1）的請求時間；每個 IP 依序回清單裡的值（最後一個重複）
+/// 原站（`ORIG`）與台灣節點（192.0.2.1、198.51.100.1）的握手時間；每個 IP 依序回清單裡的值（最後一個重複）
 fn e7(over: Value, orig: Vec<f64>, tw: Vec<f64>) -> (Arc<Cdn>, Arc<MockNet>) {
     let (c, net) = setup(over);
     set_pool(
@@ -888,65 +1016,278 @@ fn is_slower(v: &crate::db::Verdict) -> bool {
     v.extra.get("slower") == Some(&json!(true))
 }
 
-#[tokio::test]
-async fn slower_needs_ratio_and_abs_and_second_sample() {
-    // 第一次慢（200 > 100 × 1.5 + 30）、複測不慢（150）→ 照常換；兩邊各多一條連線
-    let (c, net) = e7(json!({}), vec![100.0], vec![200.0, 150.0]);
-    assert_eq!(verify(&c).await, Some("ok"));
-    assert!(!is_slower(&v4(&c)));
-    assert_eq!(net.calls(&format!("https {ORIG}")).len(), 2);
-    assert_eq!(net.calls("https 192.0.2.1").len(), 2);
-    // 在 1.5 倍＋30 毫秒以內：不複測
-    let (c, net) = e7(json!({}), vec![100.0], vec![180.0]);
-    assert_eq!(verify(&c).await, Some("ok"));
-    assert_eq!(net.calls("https 192.0.2.1").len(), 1);
-    // 倍數很大但絕對差不到 30 毫秒（快線路上的小差異）：不算
-    let (c, _) = e7(json!({}), vec![10.0], vec![40.0]);
-    assert_eq!(verify(&c).await, Some("ok"));
-    // 兩次都慢：判「比原本慢」
-    let (c, net) = e7(json!({}), vec![100.0], vec![250.0]);
-    assert_eq!(verify(&c).await, Some("fail"));
-    assert!(is_slower(&v4(&c)));
-    assert_eq!(net.calls("https 198.51.100.1").len(), 0, "判慢之後其餘候選不必再確認");
+fn slow1(v: &crate::db::Verdict) -> Option<Value> {
+    v.extra.get("slow1").cloned()
+}
+
+/// 時間過了 `ms`：`slow1` 的時間與到期時間往前推
+fn age(c: &Cdn, ms: u64) {
+    c.with_state(|st| {
+        st.db.set_verdict(SITE, 4, |v| {
+            if let Some(m) = v.extra.0.as_mut() {
+                if let Some(at) = m.get_mut("slow1").and_then(|x| x.get_mut("at")) {
+                    *at = json!(at.as_u64().unwrap().saturating_sub(ms));
+                }
+            }
+            v.until = v.until.map(|u| u.saturating_sub(ms));
+        })
+    });
+}
+
+/// 第一次慢 → 10 分鐘後第二次還是慢：確認退回
+async fn confirm_slow(c: &Arc<Cdn>) {
+    assert_eq!(verify(c).await, Some("ok"), "第一次慢：照常換台灣節點");
+    assert!(slow1(&v4(c)).is_some());
+    age(c, crate::reach::SLOWER_CONFIRM_GAP_MS);
+    assert_eq!(verify(c).await, Some("fail"), "相隔 10 分鐘還是慢：退回");
+    assert!(is_slower(&v4(c)));
 }
 
 #[tokio::test]
-async fn slower_verdict_serves_original_and_retests_in_6h() {
+async fn slower_v2_uses_handshake_not_ttfb() {
+    // TTFB 差 600 毫秒（原站的動態頁），握手台灣比較快 → 不慢（第一版會判慢）
+    let (c, net) = e7(json!({}), vec![], vec![]);
+    net.on_https(|i, _| {
+        if i == ip(ORIG) {
+            page_t("NRT", 60.0, 100.0)
+        } else {
+            page_t("TPE", 20.0, 700.0)
+        }
+    });
+    assert_eq!(verify(&c).await, Some("ok"));
+    let v = v4(&c);
+    assert!(slow1(&v).is_none() && !is_slower(&v), "{:?}", v.extra);
+    // W18 的兩個例子（照比例）：網站甲台灣 0.29～0.40 秒、原本 0.37～0.52 秒；網站乙台灣 0.06～0.09、原本 0.72～0.75
+    for (tw, og) in [(29.0, 37.0), (40.0, 37.0), (6.0, 72.0), (9.0, 75.0)] {
+        let (c, _) = e7(json!({}), vec![og], vec![tw]);
+        assert_eq!(verify(&c).await, Some("ok"));
+        assert!(slow1(&v4(&c)).is_none(), "{tw} 對 {og}：加權後不慢");
+    }
+}
+
+#[tokio::test]
+async fn slower_v2_taiwan_weight_0_7_and_abs_10ms() {
+    // 台灣 × 0.7 > 原本 ＋ 10：110 × 0.7 = 77 對 67 ＋ 10 = 77 → 不算；66.9 → 算
+    let (c, _) = e7(json!({}), vec![67.0], vec![110.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert!(slow1(&v4(&c)).is_none());
+    let (c, _) = e7(json!({}), vec![66.9], vec![110.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    let s = slow1(&v4(&c)).unwrap();
+    assert_eq!((s["score"].clone(), s["origScore"].clone()), (json!(110.0), json!(66.9)));
+    // 快線路上的小差距：台灣 20、原本 5（4 倍）→ 14 對 15：不算
+    let (c, _) = e7(json!({}), vec![5.0], vec![20.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert!(slow1(&v4(&c)).is_none());
+}
+
+#[tokio::test]
+async fn slower_v2_first_time_still_serves_taiwan() {
     let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    let v = v4(&c);
+    assert!(!is_slower(&v));
+    assert_eq!(v.ips, Some(ips(&["192.0.2.1", "198.51.100.1"])), "其餘候選照樣確認");
+    assert_eq!(slow1(&v).unwrap()["score"], json!(250.0));
+    assert_eq!(c.stats().slower_first, 1);
+    assert_eq!(c.stats().verify_ok, 1);
+    let mut m = msg(SITE, 1, &[ORIG], vec![]);
+    let r = c.apply(&mut m, SITE, 1);
+    assert_eq!(r.rewritten, Some(crate::Rewrite::Alias), "照常換台灣節點");
+    assert!(
+        c.take_tasks().iter().all(|t| !matches!(t, crate::cdn::Task::Verify { .. })),
+        "不到 10 分鐘：不排確認"
+    );
+    let e = c.explain(SITE, Context::default());
+    assert_eq!(e["decision"], "rewritten");
+    assert!(e["text"].as_str().unwrap().ends_with(crate::explain::SLOW1_NOTE), "{e}");
+    assert_eq!(e["steps"][0]["slow1"]["origScore"], json!(100.0));
+}
+
+#[tokio::test]
+async fn slower_v2_confirm_needs_10_minutes_gap() {
+    let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    let at = slow1(&v4(&c)).unwrap()["at"].clone();
+    // 9 分鐘後（例如手動驗證）：不算確認、slow1 不動
+    age(&c, 9 * 60_000);
+    let at9 = slow1(&v4(&c)).unwrap()["at"].clone();
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert_eq!(slow1(&v4(&c)).unwrap()["at"], at9, "不重設第一次的時間");
+    assert_ne!(at, at9);
+    assert_eq!(c.stats().slower_first, 1);
+    // 再 1 分鐘：確認
+    age(&c, 60_000);
     assert_eq!(verify(&c).await, Some("fail"));
     let v = v4(&c);
-    assert_eq!(v.reason.as_deref(), Some("台灣節點實測比原本慢（250 毫秒對 100 毫秒）"));
+    assert!(is_slower(&v) && slow1(&v).is_none());
+    assert_eq!(v.reason.as_deref(), Some("台灣節點握手連續兩次比原本慢（250 毫秒對 100 毫秒）"));
+    // 中間不慢：清掉，重來
+    let (c, net) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    age(&c, crate::reach::SLOWER_CONFIRM_GAP_MS);
+    set_times(&net, vec![100.0], vec![120.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert!(slow1(&v4(&c)).is_none());
+}
+
+#[tokio::test]
+async fn slower_v2_second_slow_falls_back_15min_lite_60min() {
+    for (over, mins) in [(json!({}), 15u64), (json!({ "lite": true }), 60)] {
+        let (c, _) = e7(over, vec![100.0], vec![250.0]);
+        confirm_slow(&c).await;
+        let until = v4(&c).until.unwrap();
+        let want = now_ms() + mins * 60_000;
+        assert!(until > want - 60_000 && until <= want, "{mins} 分鐘後重驗（不走逐次拉長）");
+        // 查詢路徑走既有的「驗證失敗 → 原始」
+        let mut m = msg(SITE, 1, &[ORIG], vec![]);
+        let r = c.apply(&mut m, SITE, 1);
+        assert_eq!(answer_ips(&m, 1), [ORIG]);
+        assert!(r.tags.iter().any(|t| t.contains("驗證失敗→原始")), "{:?}", r.tags);
+        assert!(
+            c.take_tasks()
+                .iter()
+                .all(|t| !matches!(t, crate::cdn::Task::Verify { .. } | crate::cdn::Task::Cross { .. })),
+            "到期前不重驗、不排跨 CDN（不會退回 → 換別家 → 換回）"
+        );
+        let k = c.observe_counters();
+        assert_eq!((k.slower_fallback, k.verify_ok, k.verify_fail), (1, 1, 0));
+        let e = c.explain(SITE, Context::default());
+        assert_eq!(e["decision"], "slower");
+        assert_eq!(
+            e["text"],
+            format!("這個網域用 Cloudflare，台灣節點能用，但握手連續兩次比原本的答案慢（250 對 100 毫秒），暫時用原本的答案；{mins} 分鐘後有人查再重驗。")
+        );
+        assert_eq!(c.domain(SITE).unwrap()["v4"]["slower"], true);
+    }
+}
+
+#[tokio::test]
+async fn slower_v2_first_mark_expires_after_24h() {
+    let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    age(&c, crate::reach::SLOWER_FIRST_TTL_MS + 1);
+    // 超過 24 小時沒確認：作廢，這一次算新的第一次
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert!(slow1(&v4(&c)).is_some());
+    assert_eq!(c.stats().slower_first, 2);
+    assert_eq!(c.stats().slower_fallback, 0);
+    // 查詢路徑也不排確認（驗證通過的有效期還在）
+    age(&c, crate::reach::SLOWER_FIRST_TTL_MS + 1);
+    c.with_state(|st| st.db.set_verdict(SITE, 4, |v| v.until = Some(now_ms() + HOUR_MS)));
+    let mut m = msg(SITE, 1, &[ORIG], vec![]);
+    c.apply(&mut m, SITE, 1);
+    assert!(c.take_tasks().iter().all(|t| !matches!(t, crate::cdn::Task::Verify { .. })));
+}
+
+#[tokio::test]
+async fn slower_v2_retest_only_on_query_after_expiry() {
+    let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    // slow1 過了 10 分鐘：沒有人查就沒有任何工作；有人查才排一次驗證（答案照常是台灣節點）
+    age(&c, crate::reach::SLOWER_CONFIRM_GAP_MS);
+    assert!(c.take_tasks().is_empty());
+    let mut m = msg(SITE, 1, &[ORIG], vec![]);
+    let r = c.apply(&mut m, SITE, 1);
+    assert_eq!(r.rewritten, Some(crate::Rewrite::Alias));
+    let t = c.take_tasks();
     assert_eq!(
-        (v.extra.get("score"), v.extra.get("origScore")),
-        (Some(&json!(250.0)), Some(&json!(100.0)))
+        t.iter().filter(|t| matches!(t, crate::cdn::Task::Verify { .. })).count(),
+        1,
+        "{t:?}"
     );
-    let until = v.until.unwrap();
-    assert!(
-        until > now_ms() + 6 * HOUR_MS - 60_000 && until <= now_ms() + 6 * HOUR_MS,
-        "6 小時後重測（不走逐次拉長）"
-    );
-    // 查詢路徑走既有的「驗證失敗 → 原始」
+    // 確認退回之後：到期前不排；到期後有人查才排（既有的試用期）
+    assert_eq!(verify(&c).await, Some("fail"));
+    c.take_tasks();
+    age(&c, crate::reach::SLOWER_RETEST_MS);
+    assert!(c.take_tasks().is_empty(), "沒人查：不驗證");
     let mut m = msg(SITE, 1, &[ORIG], vec![]);
     let r = c.apply(&mut m, SITE, 1);
     assert_eq!(answer_ips(&m, 1), [ORIG]);
-    assert!(r.tags.iter().any(|t| t.contains("驗證失敗→原始")), "{:?}", r.tags);
-    assert!(
+    assert_eq!(r.ttl_cap, Some(10));
+    assert_eq!(
         c.take_tasks()
             .iter()
-            .all(|t| !matches!(t, crate::cdn::Task::Verify { .. } | crate::cdn::Task::Cross { .. })),
-        "不重驗、不排跨 CDN"
+            .filter(|t| matches!(t, crate::cdn::Task::Verify { .. }))
+            .count(),
+        1
     );
-    let k = c.observe_counters();
-    assert_eq!((k.slower_fallback, k.verify_ok, k.verify_fail), (1, 0, 0));
-    assert!(k.slower_fallback_at > 0);
-    assert_eq!(c.stats().slower_fallback, 1);
-    assert_eq!(c.stats().src_invalidated, 0, "不算來源變動");
+}
+
+#[tokio::test]
+async fn slower_v2_one_good_retest_returns_and_clears_reason() {
+    let (c, net) = e7(json!({}), vec![100.0], vec![250.0]);
+    confirm_slow(&c).await;
+    // 退回之後重驗還是慢：再 15 分鐘
+    age(&c, crate::reach::SLOWER_RETEST_MS);
+    assert_eq!(verify(&c).await, Some("fail"));
+    assert_eq!(c.stats().slower_fallback, 2);
+    // 重驗一次不慢就回台灣（進去要兩次、回來只要一次）
+    age(&c, crate::reach::SLOWER_RETEST_MS);
+    set_times(&net, vec![100.0], vec![150.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    let v = v4(&c);
+    assert!(!is_slower(&v) && v.extra.get("score").is_none() && slow1(&v).is_none());
+    assert_eq!(v.reason, None, "reason 一起清掉（H12）");
+    assert!(v.extra.is_empty());
+    assert_eq!(c.stats().slower_returned, 1);
+}
+
+#[tokio::test]
+async fn slower_v2_no_extra_probes_in_same_verification() {
+    let (c, net) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert_eq!(net.calls(&format!("https {ORIG}")).len(), 1, "不複測");
+    assert_eq!(net.calls("https 192.0.2.1").len(), 1);
+    age(&c, crate::reach::SLOWER_CONFIRM_GAP_MS);
+    assert_eq!(verify(&c).await, Some("fail"));
+    assert_eq!(net.calls(&format!("https {ORIG}")).len(), 2);
+    assert_eq!(net.calls("https 192.0.2.1").len(), 2);
+    assert_eq!(net.calls("https 198.51.100.1").len(), 1, "判慢之後其餘候選不必再確認");
+}
+
+#[tokio::test]
+async fn slower_v2_fuse_counts_confirmed_only() {
+    let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
+    let names: Vec<String> = (0..14).map(|i| format!("s{i}.example.com")).collect();
+    c.with_state(|st| {
+        for n in &names {
+            st.db.touch(n, "cloudflare", "ip", &ips(&[ORIG]), &[], None);
+        }
+    });
+    // 第一次慢（slow1）不算：14 個都只是第一次，保險絲不跳
+    for n in &names {
+        assert_eq!(c.verify(n, "cloudflare", 4, Some(ip(ORIG))).await, Some("ok"));
+    }
+    assert_eq!(c.observe_counters().slower_fuse_until, 0);
+    let age_all = |c: &Cdn| {
+        c.with_state(|st| {
+            for n in &names {
+                st.db.set_verdict(n, 4, |v| {
+                    let m = v.extra.0.as_mut().unwrap();
+                    let at = m["slow1"]["at"].as_u64().unwrap();
+                    m["slow1"]["at"] = json!(at - crate::reach::SLOWER_CONFIRM_GAP_MS);
+                })
+            }
+        })
+    };
+    age_all(&c);
+    let mut got = Vec::new();
+    for n in &names {
+        got.push(c.verify(n, "cloudflare", 4, Some(ip(ORIG))).await.unwrap());
+    }
+    // 前 14 次（第一次慢）算進總數、不算慢；第 k 次確認時慢的是 k 個、總數 14 ＋ k：第 10 次（10 > 30% × 24）跳，那一次照驗證通過處理
+    let fails = got.iter().filter(|r| **r == "fail").count();
+    assert_eq!(fails, 9, "{got:?}");
+    assert!(c.observe_counters().slower_fuse_until > 0);
 }
 
 #[tokio::test]
 async fn slower_does_not_mark_node_bad_or_bump_fails() {
     let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
     c.with_state(|st| st.db.set_verdict(SITE, 4, |v| v.fails = Some(2)));
+    age(&c, crate::reach::SLOWER_CONFIRM_GAP_MS);
     assert_eq!(verify(&c).await, Some("fail"));
     assert_eq!(v4(&c).fails, Some(2), "失敗次數不加");
     let st = c.state();
@@ -955,29 +1296,17 @@ async fn slower_does_not_mark_node_bad_or_bump_fails() {
 }
 
 #[tokio::test]
-async fn slower_hysteresis_needs_1_2x_to_return() {
-    let (c, net) = e7(json!({}), vec![100.0], vec![250.0]);
-    assert_eq!(verify(&c).await, Some("fail"));
-    // 160：沒有超過 1.5 倍＋30，但上一次是慢的 → 要 ≤ 1.2 倍＋30（150）才換回來
-    set_times(&net, vec![100.0], vec![160.0]);
-    assert_eq!(verify(&c).await, Some("fail"));
-    assert!(is_slower(&v4(&c)));
-    set_times(&net, vec![100.0], vec![140.0]);
-    assert_eq!(verify(&c).await, Some("ok"));
-    let v = v4(&c);
-    assert!(!is_slower(&v) && v.extra.get("score").is_none(), "換回來之後拿掉");
-}
-
-#[tokio::test]
 async fn slower_skipped_for_v6_nearest_policy_always_and_unmeasured() {
     // 手動「一定換」
     let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
     c.set_policy(SITE, "always");
     assert_eq!(verify(&c).await, Some("ok"));
+    assert!(v4(&c).extra.is_empty());
     // 沒量到分段時間
     let (c, net) = e7(json!({}), vec![100.0], vec![250.0]);
     net.on_https(|i, _| cf_ok(if i == ip(ORIG) { "NRT" } else { "TPE" }));
     assert_eq!(verify(&c).await, Some("ok"));
+    assert!(v4(&c).extra.is_empty());
     // IPv6
     let (c, net) = setup(json!({}));
     set_pool(&c, "cloudflare", 6, vec![node("2001:db8:1::1", "TPE", 3.0)]);
@@ -986,100 +1315,71 @@ async fn slower_skipped_for_v6_nearest_policy_always_and_unmeasured() {
     });
     net.on_https(|i, _| page("TPE", if i == ip("2001:db8:9::1") { 100.0 } else { 250.0 }));
     assert_eq!(c.verify(SITE, "cloudflare", 6, Some(ip("2001:db8:9::1"))).await, Some("ok"));
-    // 最近節點型（Fastly）
+    // 最近節點型（Fastly）、只能用 HTTP 驗證（沒有握手）
     let r = page("NRT", 250.0);
     let base = page("HKG", 100.0);
+    let prev = crate::verifier::PrevSlow::default();
+    let chk = |provider: &str, http: bool| c.slower_check(provider, 4, Some(ip(ORIG)), http, Some(&base), &r, prev, false);
+    assert_eq!(chk("fastly", false).mark, crate::verifier::SlowMark::Clear);
+    assert!(chk("fastly", false).speed.is_none());
+    assert!(chk("cloudflare", true).speed.is_none());
     assert_eq!(
-        c.slower_check(
-            SITE,
-            "fastly",
-            4,
-            Some(ip(ORIG)),
-            ip("192.0.2.1"),
-            false,
-            Some(&base),
-            &r,
-            false,
-            false
-        )
-        .await,
-        None
+        chk("cloudflare", false).mark,
+        crate::verifier::SlowMark::First { tw: 250.0, og: 100.0 }
     );
-    assert!(c
-        .slower_check(
-            SITE,
-            "cloudflare",
-            4,
-            Some(ip(ORIG)),
-            ip("192.0.2.1"),
-            false,
-            Some(&base),
-            &r,
-            false,
-            false
-        )
-        .await
-        .is_some());
-}
-
-#[tokio::test]
-async fn slower_fuse_trips_above_30_percent_and_recovers() {
-    let (c, net) = e7(json!({}), vec![100.0], vec![250.0]);
-    let names: Vec<String> = (0..12).map(|i| format!("s{i}.example.com")).collect();
-    c.with_state(|st| {
-        for n in &names {
-            st.db.touch(n, "cloudflare", "ip", &ips(&[ORIG]), &[], None);
-        }
-    });
-    let mut got = Vec::new();
-    for n in &names {
-        got.push(c.verify(n, "cloudflare", 4, Some(ip(ORIG))).await.unwrap());
-    }
-    // 第 10 次跳保險絲（那一次也照驗證通過處理），之後 6 小時內不判
-    assert_eq!(got.iter().filter(|r| **r == "fail").count(), 9, "{got:?}");
-    assert_eq!(&got[9..], ["ok", "ok", "ok"]);
-    let k = c.observe_counters();
-    assert!(k.slower_fuse_until > k.slower_fallback_at);
-    assert!(c.observe_json()["slowerFuseUntil"].as_u64().unwrap() > now_ms());
-    // 保險絲期間連複測都不做
-    let before = net.calls("https 192.0.2.1").len();
-    assert_eq!(verify(&c).await, Some("ok"));
-    assert_eq!(net.calls("https 192.0.2.1").len(), before + 1);
-    // 6 小時後恢復
-    c.with_state(|st| st.line.age(crate::reach::FUSE_MS));
-    assert!(c.observe_json().get("slowerFuseUntil").is_none());
-    assert_eq!(c.observe_counters().slower_fuse_until, 0);
-    assert_eq!(c.verify(&names[0], "cloudflare", 4, Some(ip(ORIG))).await, Some("fail"));
 }
 
 #[tokio::test]
 async fn slower_off_matches_previous_behaviour() {
     let (c, net) = e7(json!({ "slowerFallback": false }), vec![100.0], vec![250.0]);
     assert_eq!(verify(&c).await, Some("ok"));
-    assert_eq!(net.calls("https 192.0.2.1").len(), 1, "不複測");
+    age(&c, crate::reach::SLOWER_CONFIRM_GAP_MS);
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert_eq!(net.calls("https 192.0.2.1").len(), 2, "不複測");
     let v = v4(&c);
     assert!(v.extra.is_empty());
     assert_eq!(v.ips, Some(ips(&["192.0.2.1", "198.51.100.1"])));
-    assert_eq!(c.observe_counters().verify_ok, 1);
+    assert_eq!(c.observe_counters().verify_ok, 2);
+    assert_eq!(c.stats().slower_first, 0);
 }
 
 #[tokio::test]
-async fn explain_reports_slower() {
+async fn manual_verify_reports_speed_and_follows_same_rules() {
     let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
-    assert_eq!(verify(&c).await, Some("fail"));
-    let v = c.explain(SITE, Context::default());
-    assert_eq!(v["decision"], "slower", "{v}");
+    let (r, entry, speed) = c.verify_now_speed(SITE, 4).await.unwrap();
+    assert_eq!(r, Some("ok"));
+    let s = speed.unwrap();
     assert_eq!(
-        v["text"],
-        "這個網域用 Cloudflare，台灣節點能用，但實測比原本的答案慢（250 對 100 毫秒），暫時用原本的答案；到期後重測。"
+        s,
+        json!({ "score": 250.0, "origScore": 100.0, "weighted": 175.0, "slower": true, "state": "slow1",
+                "confirmAfter": crate::reach::SLOWER_CONFIRM_GAP_MS })
     );
-    assert_eq!(v["steps"][0]["slower"], true);
-    assert_eq!(
-        (v["steps"][0]["score"].clone(), v["steps"][0]["origScore"].clone()),
-        (json!(250.0), json!(100.0))
-    );
-    // /api/cdn/domain 也看得到
-    assert_eq!(c.domain(SITE).unwrap()["v4"]["slower"], true);
+    assert!(entry["v4"]["slow1"].is_object());
+    // 馬上再按一次：不到 10 分鐘，不算確認
+    let (r, _, speed) = c.verify_now_speed(SITE, 4).await.unwrap();
+    assert_eq!(r, Some("ok"));
+    let s = speed.unwrap();
+    assert_eq!(s["state"], "slow1");
+    assert!(s["confirmAfter"].as_u64().unwrap() > 0);
+    age(&c, crate::reach::SLOWER_CONFIRM_GAP_MS);
+    let (r, _, speed) = c.verify_now_speed(SITE, 4).await.unwrap();
+    assert_eq!(r, Some("fail"));
+    assert_eq!(speed.unwrap()["state"], "slower");
+    // 舊的 verify_now 照舊
+    assert!(c.verify_now(SITE, 4).await.is_some());
+}
+
+#[tokio::test]
+async fn scores_persisted_only_for_slow_states() {
+    let (c, _) = e7(json!({}), vec![100.0], vec![120.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    let v = v4(&c);
+    assert!(v.extra.is_empty(), "不慢：不存分數（小 Flash 的磁碟預算）");
+    let j = serde_json::to_value(&v).unwrap();
+    assert!(j.get("score").is_none() && j.get("slow1").is_none());
+    let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
+    assert_eq!(verify(&c).await, Some("ok"));
+    assert!(serde_json::to_value(v4(&c)).unwrap().get("slow1").is_some());
 }
 
 struct OneHint(Mutex<Vec<(String, bool)>>);
@@ -1104,11 +1404,9 @@ async fn slower_never_reports_friend_hint_failure() {
     let (c, _) = e7(json!({}), vec![100.0], vec![250.0]);
     let h = Arc::new(OneHint(Mutex::new(Vec::new())));
     c.set_hints(Some(h.clone()));
-    assert_eq!(verify(&c).await, Some("fail"));
-    assert!(is_slower(&v4(&c)));
-    assert_eq!(
-        h.0.lock().unwrap().as_slice(),
-        [("friend".to_string(), true)],
+    confirm_slow(&c).await;
+    assert!(
+        h.0.lock().unwrap().iter().all(|x| x == &("friend".to_string(), true)),
         "好友給的節點服務得了這個網站"
     );
 }

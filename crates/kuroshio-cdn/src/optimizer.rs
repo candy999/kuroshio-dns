@@ -252,6 +252,15 @@ impl Cdn {
         let Some((provider, via)) = self.with_classifier(|c| Self::detect(c, msg)) else {
             return res;
         };
+        // 3.5.0 F11：內建一定通過的服務（時間同步、連線偵測、憑證撤銷、地震速報）不改寫——不驗證、不跨 CDN、不做 ECS，
+        // 也不記進網域資料庫，只辨識、算一次統計就回去（判斷錯誤的最壞情況是「跟沒有黑潮一樣」）。
+        // 只在已經判斷是 CDN 的回應上比對靜態後綴表：不配置、沒有鎖。`filter.protectComm` 關掉時不比對
+        if crate::cdn::keep_untouched(qname) {
+            res.provider = Some(provider);
+            res.tags.push("內建服務:不改寫".into());
+            self.note_essential_kept();
+            return res;
+        }
         let name = normalize(qname);
         // 記憶體控制移出的冷資料：查到時從磁碟讀回來（沒有移出任何網域時不做任何事）
         self.ensure_loaded(&name);
@@ -266,13 +275,35 @@ impl Cdn {
         };
         let c1 = std::str::from_utf8(&c1_buf[..c1_len]).unwrap_or("");
         let mut tasks: Vec<Task> = Vec::new();
+        let first_seen;
         {
             let mut st = self.state();
             let st = &mut *st;
             self.apply_locked(st, msg, &name, qtype, provider, via, &cname, c1, &mut res, &mut tasks);
             // 小機器減量（3.4.2）：只問過一次的網域先不驗證（剛註冊、只出現一次的網域不值得驗）。
-            // 答案照樣是原始結果、試用期 TTL 10 秒，真的有人在用的話很快會再問，那時才排驗證
-            if self.cfg.lite && st.db.get(&name).map_or(0, |e| e.hits) < 2 {
+            // 答案照樣是原始結果、試用期 TTL 10 秒，真的有人在用的話很快會再問，那時才排驗證。
+            // 3.5.0 F12：新網域很多（減量中）時所有機器都套用，而且它的 ECS 探測、節點延遲量測、跨 CDN 探索也一起不排
+            // （都是為了一個可能再也不會出現的網域對外發請求）。`cdn.lite` 永遠在減量。查詢路徑只多讀一個 AtomicBool
+            first_seen = st.db.get(&name).map_or(0, |e| e.hits) < 2;
+            if first_seen && self.pacing_first_seen() {
+                let before = tasks.len();
+                let mut verifies = 0u32;
+                tasks.retain(|t| match t {
+                    Task::Verify { name: n, .. } if *n == name => {
+                        verifies += 1;
+                        false
+                    }
+                    Task::Ecs { name: n, .. } | Task::Cross { name: n, .. } if *n == name => false,
+                    Task::Latency(_) => false,
+                    _ => true,
+                });
+                if self.cfg.lite {
+                    st.stats.lite_waited += verifies;
+                }
+                if tasks.len() != before {
+                    self.note_pace_waited();
+                }
+            } else if first_seen && self.cfg.lite {
                 let before = tasks.len();
                 tasks.retain(|t| !matches!(t, Task::Verify { name: n, .. } if *n == name));
                 st.stats.lite_waited += (before - tasks.len()) as u32;
@@ -288,7 +319,7 @@ impl Cdn {
                 );
             }
         }
-        self.schedule_all(tasks);
+        self.schedule_from_apply(tasks, first_seen);
         res
     }
 
@@ -722,6 +753,19 @@ impl Cdn {
             } else {
                 format!("{label}→TW")
             });
+            // 3.5.0 F9：上一次驗證握手比原本慢（`slow1`）、已經過了 10 分鐘（24 小時內）→ 照常回台灣節點，同時排一次驗證確認。
+            // 幾乎所有網域的 `extra` 是空的（一個指標比較）；排程有重複檢查與 F12 的名額，排不進就下一次查詢再排
+            if let Some(at) = st.db.get(name).and_then(|e| e.verdict(family)).and_then(crate::verifier::slow1_at) {
+                let age = now.saturating_sub(at);
+                if (crate::reach::SLOWER_CONFIRM_GAP_MS..=crate::reach::SLOWER_FIRST_TTL_MS).contains(&age) {
+                    tasks.push(Task::Verify {
+                        name: name.to_string(),
+                        provider: provider.to_string(),
+                        family,
+                        orig: Some(orig_ip),
+                    });
+                }
+            }
         }
         if serve.is_empty() {
             // 驗證過的網段所在 POP 變差了，或驗證過的 IP 都已不在節點池 → 重新驗證，先回原始結果

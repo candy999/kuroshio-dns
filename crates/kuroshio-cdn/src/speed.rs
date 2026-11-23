@@ -16,11 +16,13 @@
 use kuroshio_net::probe::SpeedSample;
 use std::cmp::Ordering;
 
-/// 誤差範圍的係數（規格 11 的 Q6：等 D7、W3 的實測紀錄回歸之後再定案）
-pub const TOL_BASE: f64 = 0.06;
-pub const TOL_PER_SQRT_SEC: f64 = 0.10;
-pub const TOL_MIN: f64 = 0.08;
-pub const TOL_MAX: f64 = 0.35;
+/// 誤差範圍的係數（3.5.0 F16，規格 11 的 Q6 定案）：`clamp(0.05 + 0.035 ÷ √秒, 0.06, 0.18)`。
+/// 依據 W3、D7 的實測（不含 TTFB 的速度）：0.13 秒差到 9%、1.5 秒 4%、3.8 秒 4～5%，每一段都留 1.5 倍以上。
+/// 3.4.x 看到的「差 27%」是把 TTFB 算進速度造成的（3.5.0 的 `download_sample()` 收到標頭之後才開始算）
+pub const TOL_BASE: f64 = 0.05;
+pub const TOL_PER_SQRT_SEC: f64 = 0.035;
+pub const TOL_MIN: f64 = 0.06;
+pub const TOL_MAX: f64 = 0.18;
 /// 「慢」：低於這一家參考速度（中位數）的幾成
 pub const SLOW_RATIO: f64 = 0.5;
 /// 絕對下限（MB/s）：低於它不管別人多慢都算慢（真的壞掉的）
@@ -30,11 +32,12 @@ pub const REF_MIN_NODES: usize = 3;
 /// 舊規則的門檻（MB/s）：舊的 `pools.json`（節點沒有 `slow`）與 `pool.relativeSpeed: false` 沿用
 pub const LEGACY_SLOW_MBPS: f64 = 1.0;
 /// 快測（只收 1 MiB）能確認的上限（MB/s）：1 MiB 大半在 TCP 慢啟動階段，量到的速度比完整測低，
-/// 不能直接跟參考速度的一半比；只能確認「不低於 min(參考 × 0.5, 這個值)」
+/// 不能直接跟參考速度的一半比；只能確認「不低於 min(參考 × 0.5, 這個值)」。
+/// 3.5.0 F16 起只在沒有「前 1 MiB」參考（[`quick_ref`]）時的退路裡用
 pub const QUICK_CAP_MBPS: f64 = 1.0;
 
 /// 「幾乎一樣」的誤差範圍（比例）：傳輸時間越短越大。
-/// 0.13 秒 → 約 0.34、1.5 秒 → 約 0.14、5 秒 → 約 0.10
+/// 0.13 秒 → 約 0.147、0.5 秒 → 約 0.099、1.5 秒 → 約 0.079、3.8 秒 → 約 0.068
 pub fn tolerance(secs: f64) -> f64 {
     if !secs.is_finite() || secs <= 0.0 {
         return TOL_MAX;
@@ -98,9 +101,26 @@ pub fn is_slow(mbps: f64, secs: f64, reference: Option<f64>) -> bool {
     }
 }
 
-/// 快測（1 MiB）的門檻：速度不低於它才算「確認不慢」
+/// 快測（1 MiB）的門檻（退路：沒有 [`quick_ref`] 時）：速度不低於它才算「確認不慢」
 pub fn quick_floor(reference: f64, secs: f64) -> f64 {
     (reference * SLOW_RATIO).min(QUICK_CAP_MBPS) * (1.0 - tolerance(secs))
+}
+
+/// 快測的參考速度（3.5.0 F16）：完整測的樣本「收到第 1 MiB」時的速度（同一條連線順便記的 `head_secs`）的中位數。
+/// 同類相比：快測量的也是前 1 MiB（大半在 TCP 慢啟動，每一家 CDN 開頭的快慢不一樣）。
+/// 量到 `head_secs` 的樣本不到 [`REF_MIN_NODES`] 個（假的網路、檔案不到 1 MiB、舊資料）回 None：照 [`quick_floor`] 的退路
+pub fn quick_ref(samples: &[SpeedSample]) -> Option<f64> {
+    let v: Vec<f64> = samples
+        .iter()
+        .filter(|s| s.head_secs > 0.0 && s.head_secs.is_finite())
+        .map(|s| (kuroshio_net::probe::HEAD_BYTES as f64 / 1_048_576.0 / s.head_secs * 100.0).round() / 100.0)
+        .collect();
+    (v.len() >= REF_MIN_NODES).then(|| median(v))
+}
+
+/// 快測的門檻（3.5.0 F16）：`quick_ref × 0.5 × (1 − tolerance(快測的秒數))`
+pub fn quick_floor_ref(quick_ref: f64, secs: f64) -> f64 {
+    quick_ref * SLOW_RATIO * (1.0 - tolerance(secs))
 }
 
 /// 沒量到速度的節點排在量到的後面、慢的前面

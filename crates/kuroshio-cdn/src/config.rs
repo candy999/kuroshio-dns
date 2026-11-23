@@ -35,7 +35,7 @@ pub struct CrossCfg {
     pub akamai_max_ms: f64,
     pub concurrency: usize,
     /// 跨 CDN 加實測分數（3.5.0 B4，`cdn.cross.requestScore`，預設開）：原本的條件都過了之後，
-    /// 還要「整個請求（連線＋握手＋TTFB）不比原站慢」才採用。關掉＝3.4.x（只看 TCP 延遲）
+    /// 還要「握手（連線＋TLS 握手，3.5.0 F13 起不含 TTFB）比原站快 5% 以上」才採用。關掉＝3.4.x（只看 TCP 延遲）
     pub request_score: bool,
 }
 

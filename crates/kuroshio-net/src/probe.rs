@@ -617,6 +617,45 @@ mod tests {
         assert_eq!(speed_mbs(0, 0.0), 0.0);
     }
 
+    /// 3.5.0 F15、F16：測速樣本記狀態碼（429 = 被對方限流，速度 0）與收到第 1 MiB 的時間（同一條連線，不多收）
+    #[tokio::test]
+    async fn speed_sample_records_status_and_first_mib() {
+        async fn serve(head: &'static str, body: usize) -> SocketAddr {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                s.write_all(head.as_bytes()).await.unwrap();
+                let chunk = vec![0u8; 65536];
+                let mut sent = 0;
+                while sent < body {
+                    if s.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                    sent += chunk.len();
+                }
+            });
+            addr
+        }
+        let addr = serve("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n", 0).await;
+        let url = format!("http://speed.example.com:{}/file", addr.port());
+        let s = download_sample(addr.ip(), Some(addr.port()), &url, 2000, SPEED_MAX_BYTES).await;
+        assert_eq!((s.status, s.mbps, s.bytes), (429, 0.0, 0), "沒量到不記成速度");
+        assert!(s.ttfb_ms > 0.0);
+        let addr = serve("HTTP/1.1 200 OK\r\nContent-Length: 2097152\r\n\r\n", 2 << 20).await;
+        let url = format!("http://speed.example.com:{}/file", addr.port());
+        let s = download_sample(addr.ip(), Some(addr.port()), &url, 2000, 2 << 20).await;
+        assert_eq!(s.status, 200);
+        assert!(s.head_secs > 0.0 && s.head_secs <= s.secs, "{s:?}");
+        // 收不到 1 MiB：量不到
+        let addr = serve("HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n", 65536).await;
+        let url = format!("http://speed.example.com:{}/file", addr.port());
+        let s = download_sample(addr.ip(), Some(addr.port()), &url, 2000, 2 << 20).await;
+        assert_eq!(s.head_secs, 0.0);
+    }
+
     /// 3.4.2：探測用的連線接收緩衝區小（只讀前段就關，對方先送進來的資料也算流量）
     #[tokio::test]
     async fn probe_socket_has_small_receive_buffer() {
