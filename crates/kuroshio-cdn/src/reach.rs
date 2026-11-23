@@ -567,22 +567,28 @@ impl Audit {
 
 // ============================================================ E7 比原本慢就退回
 
-/// 「明顯較慢」：台灣 > 原本 × 1.5 + 30 毫秒；上一次已經是「比原本慢」時，回來要 台灣 ≤ 原本 × 1.2 + 30 毫秒
-pub const SLOWER_RATIO: f64 = 1.5;
-pub const SLOWER_BACK_RATIO: f64 = 1.2;
-pub const SLOWER_ABS_MS: f64 = 30.0;
-/// 判「比原本慢」之後多久重測（不走失敗的逐次拉長）
-pub const SLOWER_RETEST_MS: u64 = 6 * HOUR_MS;
-/// 複測最多多幾條連線（兩邊各一次）
-pub const SLOWER_EXTRA_PROBES: usize = 2;
+// 3.5.0 F9（E7 第二版）：比握手時間（連線＋TLS 握手，`Timing::handshake_ms()`，跟 F13 同一個函式）、台灣加權、
+// 連續兩次（相隔 10 分鐘以上）才退回、退回 15 分鐘（`cdn.lite` 1 小時）、到期後有人查才重驗、重驗一次不慢就回台灣
+
+/// 台灣加權：`台灣握手 × 0.7 > 原本握手 ＋ 10 毫秒` 才算慢（偏向台灣）
+pub const SLOWER_TW_WEIGHT: f64 = 0.7;
+pub const SLOWER_ABS_MS: f64 = 10.0;
+/// 第一次慢之後，至少隔多久的第二次驗證才算確認
+pub const SLOWER_CONFIRM_GAP_MS: u64 = 10 * 60_000;
+/// 第一次慢的紀錄（`slow1`）多久沒確認就作廢、重來
+pub const SLOWER_FIRST_TTL_MS: u64 = DAY_MS;
+/// 確認比原本慢之後退回多久（不走失敗的逐次拉長）；到期後有人查這個網域才重驗
+pub const SLOWER_RETEST_MS: u64 = 15 * 60_000;
+pub const SLOWER_RETEST_LITE_MS: u64 = HOUR_MS;
 /// 保險絲：最近一小時兩邊都量到的驗證裡「比原本慢」超過 30%（至少 10 次）→ 6 小時內不判
 pub const FUSE_RATE: f64 = 0.30;
 pub const FUSE_MIN: u32 = 10;
 pub const FUSE_MS: u64 = 6 * HOUR_MS;
 
-/// 台灣節點的請求時間算不算「明顯比原本慢」
-pub fn slower_than(tw: f64, orig: f64, was_slower: bool) -> bool {
-    tw > orig * if was_slower { SLOWER_BACK_RATIO } else { SLOWER_RATIO } + SLOWER_ABS_MS
+/// 台灣節點的握手時間算不算比原本慢（3.5.0 F9：加權 0.7、多 10 毫秒以上；進去要兩次、回來只要一次，沒有另外的遲滯）
+pub fn slower_than(tw: f64, orig: f64) -> bool {
+    // 浮點數的邊界：剛好相等（例如 110 × 0.7 對 67 ＋ 10）不算慢
+    tw * SLOWER_TW_WEIGHT - (orig + SLOWER_ABS_MS) > 1e-9
 }
 
 /// 每分鐘一格、60 格（固定大小）
@@ -1446,10 +1452,10 @@ mod tests {
 
     #[test]
     fn slower_threshold_and_fuse() {
-        assert!(!slower_than(180.0, 100.0, false), "1.5 倍＋30 毫秒以內不算");
-        assert!(slower_than(181.0, 100.0, false));
-        assert!(slower_than(151.0, 100.0, true), "上次已經是慢的：回來要 1.2 倍＋30 毫秒以內");
-        assert!(!slower_than(150.0, 100.0, true));
+        // 3.5.0 F9：台灣 × 0.7 > 原本 ＋ 10 毫秒
+        assert!(!slower_than(110.0, 67.0), "77 對 77：不算");
+        assert!(slower_than(110.0, 66.9));
+        assert!(!slower_than(100.0, 60.0), "台灣比較慢 40 毫秒，但加權後 70 對 70：不算（偏向台灣）");
         let mut f = SlowerFuse::default();
         let t0 = 10 * DAY_MS;
         for _ in 0..20 {

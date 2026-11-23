@@ -744,6 +744,19 @@ impl Cdn {
             } else {
                 format!("{label}→TW")
             });
+            // 3.5.0 F9：上一次驗證握手比原本慢（`slow1`）、已經過了 10 分鐘（24 小時內）→ 照常回台灣節點，同時排一次驗證確認。
+            // 幾乎所有網域的 `extra` 是空的（一個指標比較）；排程有重複檢查與 F12 的名額，排不進就下一次查詢再排
+            if let Some(at) = st.db.get(name).and_then(|e| e.verdict(family)).and_then(crate::verifier::slow1_at) {
+                let age = now.saturating_sub(at);
+                if (crate::reach::SLOWER_CONFIRM_GAP_MS..=crate::reach::SLOWER_FIRST_TTL_MS).contains(&age) {
+                    tasks.push(Task::Verify {
+                        name: name.to_string(),
+                        provider: provider.to_string(),
+                        family,
+                        orig: Some(orig_ip),
+                    });
+                }
+            }
         }
         if serve.is_empty() {
             // 驗證過的網段所在 POP 變差了，或驗證過的 IP 都已不在節點池 → 重新驗證，先回原始結果

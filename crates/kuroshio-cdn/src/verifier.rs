@@ -138,8 +138,10 @@ struct Done {
     http: Option<bool>,
     reason: Option<String>,
     retry_at: Option<u64>,
-    /// 台灣節點能用、但實測比原本慢（3.5.0 E7）：（台灣，原本）的請求時間。記成 `fail` 但不增加 `fails`
-    slower: Option<(f64, f64)>,
+    /// 握手比原本慢的判斷（3.5.0 F9）：確認比原本慢（`Fallback`）記成 `fail` 但不增加 `fails`
+    slow: SlowMark,
+    /// 上一次是「比原本慢」，這一次回到台灣節點（3.5.0 F9 的 `slowerReturned`）
+    returned: bool,
 }
 
 /// 驗證時內容最多讀多少：判斷只看狀態碼與標頭（內容只用來找 Cloudflare 的 `colo=`，那在 /cdn-cgi/trace，
@@ -165,29 +167,93 @@ fn slot_of<'a>(e: &'a crate::db::Domain, provider: &str, multi_cdn: bool) -> Slo
 
 const VERIFY_MAX_BODY: usize = 4096;
 
-/// 驗證結果 `extra` 裡「比原本慢」的欄位（3.5.0 E7；`score`、`origScore` 同 B4 的 `Cross`）
+/// 驗證結果 `extra` 裡「比原本慢」的欄位（3.5.0 E7；`score`、`origScore` 同 B4 的 `Cross`，3.5.0 F9 起是握手時間）
 pub const SLOWER: &str = "slower";
+/// 第一次握手比原本慢、還沒確認（3.5.0 F9）：`{ "at": 毫秒, "score": 台灣, "origScore": 原本 }`
+pub const SLOW1: &str = "slow1";
 
-/// 寫入或拿掉「比原本慢」的欄位（沒有的時候不配置）
-fn set_slower(extra: &mut util::Extra, slower: Option<(f64, f64)>) {
-    match slower {
-        Some((tw, og)) => {
+/// 握手比原本慢的判斷結果（3.5.0 F9）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SlowMark {
+    /// 沒有判、或不慢：清掉 `slow1`／`slower`
+    Clear,
+    /// 第一次慢：照常換台灣節點，記 `slow1`
+    First { tw: f64, og: f64 },
+    /// 第一次慢到現在還不到 10 分鐘（手動驗證、別的原因提早重驗）：不算確認，`slow1` 不動
+    Keep,
+    /// 確認比原本慢：暫時用原本的答案。`gap_min` = 跟第一次相隔幾分鐘；None = 退回之後重驗還是慢
+    Fallback { tw: f64, og: f64, gap_min: Option<u64> },
+}
+
+/// [`Cdn::slower_check`] 的結果
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SlowCheck {
+    pub mark: SlowMark,
+    /// 上一次是「比原本慢」，這一次不慢：回到台灣節點
+    pub returned: bool,
+    /// 手動驗證回應的 `speed`（沒有判的時候 None）
+    pub speed: Option<serde_json::Value>,
+}
+
+impl SlowCheck {
+    fn skipped() -> SlowCheck {
+        SlowCheck {
+            mark: SlowMark::Clear,
+            returned: false,
+            speed: None,
+        }
+    }
+}
+
+/// 上一次驗證留下的狀態（3.5.0 F9）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PrevSlow {
+    /// 上一次是「比原本慢」（退回中，或退回已經到期）
+    pub was_slower: bool,
+    /// 第一次慢的時間
+    pub slow1_at: Option<u64>,
+}
+
+impl PrevSlow {
+    pub(crate) fn of(v: Option<&crate::db::Verdict>) -> PrevSlow {
+        PrevSlow {
+            was_slower: v.is_some_and(|v| v.extra.get(SLOWER).and_then(serde_json::Value::as_bool) == Some(true)),
+            slow1_at: v.and_then(slow1_at),
+        }
+    }
+}
+
+/// `slow1` 的時間（沒有、或格式不對回 None）
+pub(crate) fn slow1_at(v: &crate::db::Verdict) -> Option<u64> {
+    v.extra.get(SLOW1).and_then(|x| x.get("at")).and_then(serde_json::Value::as_u64)
+}
+
+/// 依判斷結果寫入或拿掉 `slower`／`slow1`（只有這兩種狀態存分數；沒有的時候不配置）
+fn apply_slow(extra: &mut util::Extra, mark: SlowMark, now: u64) {
+    if let Some(m) = extra.0.as_mut() {
+        if !matches!(mark, SlowMark::Keep) {
+            m.remove(SLOW1);
+        }
+        if m.remove(SLOWER).is_some() {
+            m.remove("score");
+            m.remove("origScore");
+        }
+    }
+    match mark {
+        SlowMark::Clear | SlowMark::Keep => {}
+        SlowMark::First { tw, og } => {
+            let m = extra.0.get_or_insert_with(Default::default);
+            m.insert(SLOW1.into(), serde_json::json!({ "at": now, "score": tw, "origScore": og }));
+        }
+        SlowMark::Fallback { tw, og, .. } => {
             let m = extra.0.get_or_insert_with(Default::default);
             m.insert(SLOWER.into(), serde_json::Value::Bool(true));
             m.insert("score".into(), serde_json::json!(tw));
             m.insert("origScore".into(), serde_json::json!(og));
         }
-        None => {
-            if let Some(m) = extra.0.as_mut() {
-                if m.remove(SLOWER).is_some() {
-                    m.remove("score");
-                    m.remove("origScore");
-                }
-                if m.is_empty() {
-                    extra.0 = None;
-                }
-            }
-        }
+    }
+    if extra.0.as_ref().is_some_and(|m| m.is_empty()) {
+        extra.0 = None;
     }
 }
 
@@ -229,8 +295,23 @@ impl Cdn {
         if !kuroshio_net::clock::synced() {
             return Some("deferred");
         }
+        self.verify_with_speed(name, provider, family, orig).await.0
+    }
+
+    /// 同 [`Cdn::verify`]，另外回這一次握手比原本慢的判斷（3.5.0 F9，手動驗證回應的 `speed`；沒有判的時候 None）
+    pub(crate) async fn verify_with_speed(
+        self: &Arc<Self>,
+        name: &str,
+        provider: &str,
+        family: u8,
+        orig: Option<IpAddr>,
+    ) -> (Option<&'static str>, Option<serde_json::Value>) {
+        if !kuroshio_net::clock::synced() {
+            return (Some("deferred"), None);
+        }
         let mut hinted: Vec<Hinted> = Vec::new();
-        let r = self.verify_inner(name, provider, family, orig, &mut hinted).await;
+        let mut speed = None;
+        let r = self.verify_inner(name, provider, family, orig, &mut hinted, &mut speed).await;
         // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗（沒輪到試的不算）
         if !hinted.is_empty() {
             if let Some(h) = self.hints() {
@@ -241,7 +322,7 @@ impl Cdn {
                 }
             }
         }
-        r
+        (r, speed)
     }
 
     /// 只用 HTTP 驗證的網站（原始節點的 HTTPS 連不上）：候選節點的 HTTPS 也要「跟原始節點一樣」或「可以用」。
@@ -261,18 +342,14 @@ impl Cdn {
         family: u8,
         orig: Option<IpAddr>,
         hinted_out: &mut Vec<Hinted>,
+        speed_out: &mut Option<serde_json::Value>,
     ) -> Option<&'static str> {
         let prov = providers::get(provider);
         let label = providers::label(provider);
-        // （上一次的失敗次數，上一次是不是「比原本慢」（3.5.0 E7），手動設成「一定換」）
-        let (prev_fails, was_slower, always) = {
+        // （上一次的失敗次數，上一次的握手比原本慢的狀態（3.5.0 F9），手動設成「一定換」）
+        let (prev_fails, prev_slow, always) = {
             let st = self.state();
-            let of = |v: Option<&crate::db::Verdict>| {
-                (
-                    v.and_then(|v| v.fails).unwrap_or(0),
-                    v.is_some_and(|v| v.extra.get(SLOWER).and_then(serde_json::Value::as_bool) == Some(true)),
-                )
-            };
+            let of = |v: Option<&crate::db::Verdict>| (v.and_then(|v| v.fails).unwrap_or(0), PrevSlow::of(v));
             // 多來源（3.5.0 B3）：這一家已經沒有格子（被別家擠掉、過期）→ 不驗證，結果沒有地方放
             let ((f, w), always) = match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
                 Some((e, Slot::Main)) => (of(e.verdict(family)), e.policy() == crate::db::Policy::Always),
@@ -281,7 +358,7 @@ impl Cdn {
                     e.policy() == crate::db::Policy::Always,
                 ),
                 Some((_, Slot::None)) => return None,
-                None => ((0, false), false),
+                None => ((0, PrevSlow::default()), false),
             };
             (f, w, always)
         };
@@ -467,7 +544,8 @@ impl Cdn {
                                 http: None,
                                 reason: Some("原站同樣錯誤".into()),
                                 retry_at: None,
-                                slower: None,
+                                slow: SlowMark::Clear,
+                                returned: false,
                             },
                             false,
                         ));
@@ -499,7 +577,8 @@ impl Cdn {
                         http: None,
                         reason: Some(broken),
                         retry_at: None,
-                        slower: None,
+                        slow: SlowMark::Clear,
+                        returned: false,
                     },
                     false,
                 ));
@@ -522,7 +601,8 @@ impl Cdn {
                             http: None,
                             reason: Some(format!("狀態不同 原始 {} / 台灣 {}", b.status, r.status)),
                             retry_at: None,
-                            slower: None,
+                            slow: SlowMark::Clear,
+                            returned: false,
                         },
                         false,
                     ));
@@ -542,12 +622,11 @@ impl Cdn {
                 continue;
             }
             self.with_state(|st| st.pools.zone_note(provider, ip, true));
-            // 3.5.0 E7：台灣節點能用，但實測明顯比原本慢 → 暫時用原本的答案（既有的「驗證失敗 → 原始」），6 小時後重測。
-            // 節點沒有壞：不標壞、不增加失敗次數；好友的提示照樣算命中（上面已經記了）
-            if let Some((tw, og)) = self
-                .slower_check(name, provider, family, orig, ip, http_mode, base_ok, &r, was_slower, always)
-                .await
-            {
+            // 3.5.0 F9（E7 第二版）：台灣節點能用，但握手連續兩次（相隔 10 分鐘以上）比原本慢 → 暫時用原本的答案
+            // （既有的「驗證失敗 → 原始」），15 分鐘後有人查再重驗。節點沒有壞：不標壞、不增加失敗次數；好友的提示照樣算命中
+            let chk = self.slower_check(provider, family, orig, http_mode, base_ok, &r, prev_slow, always);
+            speed_out.clone_from(&chk.speed);
+            if let SlowMark::Fallback { tw, og, .. } = chk.mark {
                 return Some(self.done(
                     name,
                     provider,
@@ -562,9 +641,10 @@ impl Cdn {
                         ips: None,
                         tried: None,
                         http: None,
-                        reason: Some(format!("台灣節點實測比原本慢（{tw} 毫秒對 {og} 毫秒）")),
-                        retry_at: Some(now_ms() + crate::reach::SLOWER_RETEST_MS),
-                        slower: Some((tw, og)),
+                        reason: Some(format!("台灣節點握手連續兩次比原本慢（{tw} 毫秒對 {og} 毫秒）")),
+                        retry_at: Some(now_ms() + self.slower_retest_ms()),
+                        slow: chk.mark,
+                        returned: false,
                     },
                     false,
                 ));
@@ -617,7 +697,8 @@ impl Cdn {
                     http: http_mode.then_some(true),
                     reason: None,
                     retry_at: None,
-                    slower: None,
+                    slow: chk.mark,
+                    returned: chk.returned,
                 },
                 true,
             ));
@@ -642,7 +723,8 @@ impl Cdn {
                     http: None,
                     reason: Some(format!("{}（試了 {} 個網段）", z.reason, candidates.len())),
                     retry_at: retry,
-                    slower: None,
+                    slow: SlowMark::Clear,
+                    returned: false,
                 },
                 false,
             ));
@@ -661,46 +743,88 @@ impl Cdn {
         Some("unknown")
     }
 
-    /// 台灣節點的請求時間（連線＋握手＋TTFB）是不是明顯比原本的慢（3.5.0 E7）：是的話回（台灣，原本）。
+    /// 確認比原本慢之後退回多久（3.5.0 F9：15 分鐘；`cdn.lite` 1 小時）
+    pub(crate) fn slower_retest_ms(&self) -> u64 {
+        if self.cfg.lite {
+            crate::reach::SLOWER_RETEST_LITE_MS
+        } else {
+            crate::reach::SLOWER_RETEST_MS
+        }
+    }
+
+    /// 台灣節點的握手時間是不是比原本的慢（3.5.0 F9，E7 第二版）。
     ///
-    /// 只處理 IPv4、非最近節點型、原本的 IP 探測成功、兩邊都量到、不是手動「一定換」的；保險絲跳了不判。
-    /// 第一次量到明顯較慢時兩邊各再探測一次、各取小的再比（最多多 [`crate::reach::SLOWER_EXTRA_PROBES`] 條連線）
+    /// 只處理 IPv4、非最近節點型、不是手動「一定換」、不是只能用 HTTP 驗證的網站（沒有握手）、原本的 IP 探測成功、
+    /// 兩邊的握手時間（`Timing::handshake_ms()`，連線＋TLS，不含 TTFB）都量到的；保險絲跳了不判。
+    /// `慢 = 台灣 × 0.7 > 原本 ＋ 10 毫秒`。同一次驗證裡不複測（不多連線）：
+    /// - 第一次慢（沒有 `slow1`、或超過 24 小時）→ 照常換台灣節點，記 `slow1`
+    /// - `slow1` 已經 10 分鐘以上（24 小時內）還是慢、或上一次已經退回、重驗還是慢 → 確認，退回原本的答案
+    /// - `slow1` 不到 10 分鐘（手動驗證等）→ 不算確認，`slow1` 不動
+    /// - 不慢 → 清掉；上一次是退回的就回到台灣節點（進去要兩次、回來只要一次）
+    ///
+    /// 保險絲只算確認的那幾次（`slow1` 不算）
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn slower_check(
+    pub(crate) fn slower_check(
         &self,
-        name: &str,
         provider: &str,
         family: u8,
         orig: Option<IpAddr>,
-        ip: IpAddr,
         http_mode: bool,
         base: Option<&ProbeResult>,
         r: &ProbeResult,
-        was_slower: bool,
+        prev: PrevSlow,
         always: bool,
-    ) -> Option<(f64, f64)> {
-        if !self.cfg.slower_fallback || family != 4 || always || Cdn::is_nearest(provider) {
-            return None;
+    ) -> SlowCheck {
+        if !self.cfg.slower_fallback || family != 4 || always || http_mode || Cdn::is_nearest(provider) {
+            return SlowCheck::skipped();
         }
-        let o = orig.filter(IpAddr::is_ipv4)?;
-        let (mut tw, mut og) = (r.timing.request_ms()?, base?.timing.request_ms()?);
+        if orig.filter(IpAddr::is_ipv4).is_none() {
+            return SlowCheck::skipped();
+        }
+        let (Some(tw), Some(og)) = (r.timing.handshake_ms(), base.and_then(|b| b.timing.handshake_ms())) else {
+            return SlowCheck::skipped();
+        };
         let now = now_ms();
         if self.state().line.fuse.active(now) {
-            return None;
+            return SlowCheck::skipped();
         }
-        let mut slower = crate::reach::slower_than(tw, og, was_slower);
-        if slower {
-            for (target, slot) in [(ip, &mut tw), (o, &mut og)].into_iter().take(crate::reach::SLOWER_EXTRA_PROBES) {
-                let x = self.probe_site(target, name, http_mode).await;
-                if let Some(ms) = x.timing.request_ms().filter(|_| x.ok) {
-                    *slot = slot.min(ms);
-                }
+        let (tw, og) = (util::round(tw, 1), util::round(og, 1));
+        let slow = crate::reach::slower_than(tw, og);
+        let age = prev
+            .slow1_at
+            .map(|a| now.saturating_sub(a))
+            .filter(|a| *a <= crate::reach::SLOWER_FIRST_TTL_MS);
+        let gap = crate::reach::SLOWER_CONFIRM_GAP_MS;
+        let confirmed = slow && (prev.was_slower || age.is_some_and(|a| a >= gap));
+        // 保險絲（只算確認的）：這一次跳的也照驗證通過處理
+        let tripped = self.with_state(|st| st.line.fuse.note(confirmed, now));
+        let mark = if !slow || tripped {
+            SlowMark::Clear
+        } else if confirmed {
+            SlowMark::Fallback {
+                tw,
+                og,
+                gap_min: if prev.was_slower { None } else { age.map(|a| a / 60_000) },
             }
-            slower = crate::reach::slower_than(tw, og, was_slower);
+        } else if age.is_some() {
+            SlowMark::Keep
+        } else {
+            SlowMark::First { tw, og }
+        };
+        let (state, confirm_after) = match mark {
+            SlowMark::Fallback { .. } => ("slower", 0),
+            SlowMark::First { .. } => ("slow1", gap),
+            SlowMark::Keep => ("slow1", gap.saturating_sub(age.unwrap_or(0))),
+            SlowMark::Clear => ("ok", 0),
+        };
+        SlowCheck {
+            mark,
+            returned: prev.was_slower && mark == SlowMark::Clear,
+            speed: Some(serde_json::json!({
+                "score": tw, "origScore": og, "weighted": util::round(tw * crate::reach::SLOWER_TW_WEIGHT, 1),
+                "slower": slow, "state": state, "confirmAfter": confirm_after,
+            })),
         }
-        // 保險絲：這一次跳的也照驗證通過處理
-        let tripped = self.with_state(|st| st.line.fuse.note(slower, now));
-        (slower && !tripped).then(|| (util::round(tw, 1), util::round(og, 1)))
     }
 
     /// 額外候選 IP 能不能服務這個網站（同樣的判斷，只是不寫判定）
@@ -756,10 +880,12 @@ impl Cdn {
     /// 寫入判定（合併到舊紀錄，同 2.x）；`full` = 驗證成功的完整結果（ips / tried / http 一併更新）
     #[allow(clippy::too_many_arguments)]
     fn done(&self, name: &str, provider: &str, family: u8, ok: bool, prev_fails: u32, d: Done, full: bool) -> &'static str {
-        // 比原本慢（3.5.0 E7）：節點沒有壞，失敗次數不加
+        // 比原本慢（3.5.0 E7／F9）：節點沒有壞，失敗次數不加
+        let fallback = matches!(d.slow, SlowMark::Fallback { .. });
+        let returned = ok && d.returned;
         let fails = if ok {
             0
-        } else if d.slower.is_some() {
+        } else if fallback {
             prev_fails
         } else {
             prev_fails + 1
@@ -770,11 +896,17 @@ impl Cdn {
         self.with_state(|st| {
             if ok {
                 st.stats.verify_ok = st.stats.verify_ok.saturating_add(1);
-            } else if d.slower.is_some() {
+            } else if fallback {
                 st.stats.slower_fallback = st.stats.slower_fallback.saturating_add(1);
                 st.line.note_slower(now);
             } else {
                 st.stats.verify_fail = st.stats.verify_fail.saturating_add(1);
+            }
+            if matches!(d.slow, SlowMark::First { .. }) {
+                st.stats.slower_first = st.stats.slower_first.saturating_add(1);
+            }
+            if returned {
+                st.stats.slower_returned = st.stats.slower_returned.saturating_add(1);
             }
             st.db.with_slot(name, provider, |db| {
                 db.set_verdict(name, family, |v| {
@@ -797,18 +929,36 @@ impl Cdn {
                         v.tried = d.tried;
                         v.http = d.http;
                     }
-                    if let Some(r) = &d.reason {
+                    // 變成 ok 時連 reason 一起清掉（3.5.0 F9／H12：以前只在有新值時才寫，「比原本慢」會一直留著）
+                    if ok {
+                        v.reason.clone_from(&d.reason);
+                    } else if let Some(r) = &d.reason {
                         v.reason = Some(r.clone());
                     }
-                    set_slower(&mut v.extra, d.slower);
+                    apply_slow(&mut v.extra, d.slow, now);
                 })
             })
         });
-        if let Some((tw, og)) = d.slower {
-            info!("↷ {name} IPv{family} 台灣節點能用，但實測比原本慢（{tw} 毫秒對 {og} 毫秒）：暫時用原本的答案，6 小時後重測");
+        let minutes = self.slower_retest_ms() / 60_000;
+        if let SlowMark::Fallback { tw, og, gap_min } = d.slow {
+            match gap_min {
+                Some(k) => info!(
+                    "↷ {name} IPv{family} 台灣節點能用，但握手連續兩次比原本慢（{tw} 對 {og} 毫秒，相隔 {k} 分鐘）：暫時用原本的答案，{minutes} 分鐘後有人查再重驗"
+                ),
+                None => info!(
+                    "↷ {name} IPv{family} 重驗握手還是比原本慢（{tw} 對 {og} 毫秒）：繼續用原本的答案，{minutes} 分鐘後有人查再重驗"
+                ),
+            }
         } else if ok {
+            let note = match d.slow {
+                SlowMark::First { tw, og } => {
+                    format!("；握手比原本慢（{tw} 對 {og} 毫秒），先照常換，10 分鐘後有人查再確認一次")
+                }
+                _ if returned => "；重驗握手不比原本慢，回到台灣節點".to_string(),
+                _ => String::new(),
+            };
             info!(
-                "✔ {name} IPv{family} 台灣節點可用 ({} {} {}ms)",
+                "✔ {name} IPv{family} 台灣節點可用 ({} {} {}ms){note}",
                 d.pop.as_deref().filter(|p| !p.is_empty()).unwrap_or("?"),
                 d.status.map(|s| s.to_string()).unwrap_or_default(),
                 d.ms.map(|m| util::round(m, 1).to_string()).unwrap_or_default()

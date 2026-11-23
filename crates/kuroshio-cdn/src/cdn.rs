@@ -113,8 +113,12 @@ pub struct Stats {
     /// 台灣節點驗證通過／沒通過的次數（3.5.0 E2 用；在 `verifier.rs` 的 `done()` 累加，各只算一次）
     pub verify_ok: u32,
     pub verify_fail: u32,
-    /// 台灣節點實測明顯比原本慢、暫時用原本答案的次數（3.5.0 E7；不算在 `verify_fail`）
+    /// 台灣節點確認比原本慢、暫時用原本答案的次數（3.5.0 E7；F9 起是握手連續兩次比原本慢；不算在 `verify_fail`）
     pub slower_fallback: u32,
+    /// 第一次握手比原本慢（還沒確認、照常換台灣節點）的次數（3.5.0 F9）
+    pub slower_first: u32,
+    /// 退回之後重驗不慢、回到台灣節點的次數（3.5.0 F9）
+    pub slower_returned: u32,
 }
 
 /// 背景工作
@@ -1512,8 +1516,18 @@ impl Cdn {
         Some(serde_json::to_value(st.db.set_policy(&normalize(name), p)).unwrap_or_default())
     }
 
-    /// `/api/cdn/verify`：立即驗證（網域要先解析過一次）。回傳（結果，網域紀錄）；資料庫沒有這個網域回 None
+    /// `/api/cdn/verify`：立即驗證（網域要先解析過一次）。回傳（結果，網域紀錄）；資料庫沒有這個網域回 None。
+    /// 同 [`Cdn::verify_now_speed`]，不回握手的判斷
     pub async fn verify_now(self: &Arc<Self>, name: &str, family: u8) -> Option<(Option<&'static str>, Value)> {
+        self.verify_now_speed(name, family).await.map(|(r, v, _)| (r, v))
+    }
+
+    /// 同 [`Cdn::verify_now`]，另外回這一次握手比原本慢的判斷（3.5.0 F9，`POST /api/cdn/verify` 的 `speed`）：
+    /// `{ "score": 台灣握手, "origScore": 原本握手, "weighted": 台灣 × 0.7, "slower": 這一次慢不慢,
+    ///    "state": "ok"｜"slow1"｜"slower", "confirmAfter": 毫秒 }`；沒有判（IPv6、最近節點型、一定換、只能用 HTTP、
+    /// 量不到握手、保險絲）時是 None。手動驗證走同一套規則：跟第一次慢相隔不到 10 分鐘的不算確認。
+    /// 不受驗證節流的名額限制，但算進用量（3.5.0 F12）
+    pub async fn verify_now_speed(self: &Arc<Self>, name: &str, family: u8) -> Option<(Option<&'static str>, Value, Option<Value>)> {
         let name = normalize(name);
         self.ensure_loaded(&name);
         let (provider, orig) = {
@@ -1528,8 +1542,8 @@ impl Cdn {
             (p, o)
         };
         self.pace_manual();
-        let r = self.verify(&name, &provider, family, orig).await;
-        Some((r, self.domain(&name).unwrap_or(Value::Null)))
+        let (r, speed) = self.verify_with_speed(&name, &provider, family, orig).await;
+        Some((r, self.domain(&name).unwrap_or(Value::Null), speed))
     }
 
     /// `/api/cdn/ecs`：立即做一次 ECS 突破

@@ -18,7 +18,7 @@ pub mod decision {
     /// 新網域很多（驗證減量中）：只問過一次的網域先不驗證（3.5.0 F12）
     pub const PACED_WAITING: &str = "paced-waiting";
     pub const VERIFY_FAILED: &str = "verify-failed";
-    /// 台灣節點能用，但實測比原本的答案慢：暫時用原本的答案（3.5.0 E7）
+    /// 台灣節點能用，但握手連續兩次比原本的答案慢：暫時用原本的答案（3.5.0 E7；F9 起比握手時間）
     pub const SLOWER: &str = "slower";
     pub const NO_TW_NODE: &str = "no-tw-node";
     pub const NO_POOL: &str = "no-pool";
@@ -61,7 +61,7 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::LITE_WAITING => format!("這個網域用 {label}；這台是小記憶體減量模式，問過 2 次以上才驗證台灣節點，現在先回原本的答案。"),
         d::PACED_WAITING => format!("這個網域用 {label}；新網域很多（或 CPU 很忙），CDN 驗證減量中，問過 2 次以上才驗證台灣節點，現在先回原本的答案。"),
         d::VERIFY_FAILED => format!("這個網域用 {label}，台灣節點驗證沒通過，暫時用原本的答案{detail}；到期後會重新驗證。"),
-        d::SLOWER => format!("這個網域用 {label}，台灣節點能用，但實測比原本的答案慢{detail}，暫時用原本的答案；到期後重測。"),
+        d::SLOWER => slower_text(label, &detail, crate::reach::SLOWER_RETEST_MS / 60_000),
         d::NO_TW_NODE => format!("這個網域用 {label}，找不到可用的台灣節點，跨 CDN 也沒有可用的替代{detail}。"),
         d::NO_POOL => format!("這個網域用 {label}，但這台還沒有 {label} 的台灣節點池（節點池工作還沒跑完），先用原本的答案。"),
         d::CROSS => format!("這個網域用 {label}，同一個網站也放在別家 CDN 上，已經換成那家的台灣節點{detail}。"),
@@ -78,6 +78,14 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
     }
 }
 
+/// `slower` 的白話（3.5.0 F9；`cdn.lite` 是 60 分鐘）。`detail` 已經加上括號
+fn slower_text(label: &str, detail: &str, minutes: u64) -> String {
+    format!("這個網域用 {label}，台灣節點能用，但握手連續兩次比原本的答案慢{detail}，暫時用原本的答案；{minutes} 分鐘後有人查再重驗。")
+}
+
+/// 上一次驗證握手比原本慢、還沒確認時，`rewritten` 多的一句（3.5.0 F9）
+pub const SLOW1_NOTE: &str = "上一次驗證握手比原本慢，再確認一次才會退回。";
+
 /// 驗證結果的一步（`v4`／`v6`）
 fn verdict_step(what: &str, v: Option<&Verdict>, now: u64) -> Value {
     match v {
@@ -89,11 +97,15 @@ fn verdict_step(what: &str, v: Option<&Verdict>, now: u64) -> Value {
                 "verdict": v.verdict.as_deref(),
                 "pop": v.pop.as_deref(), "ms": v.ms.get(), "reason": v.reason, "at": v.at, "until": v.until,
             });
-            // 比原本慢（3.5.0 E7）：兩邊的請求時間（毫秒）
+            // 比原本慢（3.5.0 E7）：兩邊的握手時間（毫秒；3.5.0 F9 起不含 TTFB）
             if is_slower(v) {
                 j["slower"] = json!(true);
                 j["score"] = v.extra.get("score").cloned().unwrap_or(Value::Null);
                 j["origScore"] = v.extra.get("origScore").cloned().unwrap_or(Value::Null);
+            }
+            // 第一次慢、還沒確認（3.5.0 F9）：`{ at, score, origScore }`
+            if let Some(x) = v.extra.get(crate::verifier::SLOW1) {
+                j["slow1"] = x.clone();
             }
             j
         }
@@ -136,6 +148,23 @@ impl Cdn {
             self.decide(e, &provider, st.pools.has(&provider), now)
         };
         let mut v = base(decision, &label, &detail);
+        if decision == d::SLOWER && self.cfg.lite {
+            let detail = if detail.is_empty() {
+                String::new()
+            } else {
+                format!("（{detail}）")
+            };
+            v["text"] = json!(slower_text(&label, &detail, crate::reach::SLOWER_RETEST_LITE_MS / 60_000));
+        }
+        // 第一次慢、還沒確認：決定照舊是換台灣節點，多一句說明（3.5.0 F9）
+        if decision == d::REWRITTEN
+            && e.v4
+                .as_deref()
+                .and_then(crate::verifier::slow1_at)
+                .is_some_and(|at| now.saturating_sub(at) <= crate::reach::SLOWER_FIRST_TTL_MS)
+        {
+            v["text"] = json!(format!("{}{SLOW1_NOTE}", v["text"].as_str().unwrap_or("")));
+        }
         v["known"] = json!(true);
         v["provider"] = json!(provider);
         v["providerLabel"] = json!(label);
