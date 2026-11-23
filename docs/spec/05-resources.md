@@ -321,7 +321,20 @@ USB 隨身碟也算 Flash，但通常容量大、可以更換，判定為 `disk`
 
 **狀態**（`/api/status` 的 `cdn`）：`dbBudgetKB`（沒有預算是 `null`）、`dbBudgetEntries`（換算的筆數）、`dbEntries`（總筆數，含移出記憶體的）、
 `dbDiskKB`（分片目錄實際佔用；有預算時啟動就量一次，之後每 5 分鐘量一次；沒有預算時第一輪之前是 `null`）、
-`dbDiskEstKB`（用上面的模型估的，沒有校正；實際以 `dbDiskKB` 為準）、`prunedForBudget`（啟動以來淘汰幾筆）。
+`dbDiskEstKB`（用上面的模型估的，沒有校正；實際以 `dbDiskKB` 為準）、`prunedForBudget`（啟動以來淘汰幾筆）、
+`dbFileKB`（3.5.0 F8：分片檔案長度合計）、`cdnDirKB`（3.5.0 F8：整個 `cdn/` 目錄實際佔用，只顯示）。
+
+**實際佔用怎麼量**（3.5.0 F8，D12 實測）：D3 同一時間 `dbDiskKB` 1,722、`du -sk state/cdn` 2,218 KB，差 496 KB。原因是 `shard_dir_bytes()`
+原本只加總檔案長度（`metadata().len()`），而 `du` 算的是**佔用的區塊**：257 個小檔、4 KB 區塊，每個檔平均浪費半個區塊（約 500 KB），
+跟差距幾乎一樣；另外 `state/cdn` 還有 `pools.json`、`ip-zone.json`、`v6-nodes.json`、`harvest.json`、`ranges/`、`scan/`。
+
+- **預算仍然只管網域分片**：`cdn/` 目錄裡其他的檔各有自己的上限，預算淘汰不了它們；`ranges/`、`scan/`、`harvest`、`ip-zone` 是「可重建」，
+  空間不夠時由空間管理刪。把它們算進預算只會讓網域資料被多淘汰，卻騰不出它們佔的空間。
+- **但「磁碟上用了多少」量實際佔用**，不然預算保護不到清單副本（長度會少算約兩成），校正（`calibrated_limit`）也跟著偏高：
+  Unix 用 `MetadataExt::blocks() × 512`；`blocks()` 是 0（有些壓縮型的 Flash 檔案系統）時退回長度；其他平台用長度（Windows 上沒有預算，只是顯示）。
+- 校正只往上調、最多模型的 1.5 倍不變。改量法之後 D3 的上限從約 24,900 降到約 2 萬筆，超過的照上面的分輪淘汰（每 5 分鐘最多 16 片），
+  不會一次重寫；`findings` 的 `cdn-db-pruning` 會出現，文字是「CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算）…」。
+- `dbFileKB` 就是 F8 之前 `dbDiskKB` 的數字；`cdnDirKB` 只顯示、不參與任何判斷。
 
 ## 6. 防止低階硬體被拖垮
 
@@ -345,6 +358,7 @@ c = CPU 核心數（`available_parallelism`）：
 | `resolver.warmRate`（開機預熱每秒幾筆） | clamp(5c, 5, 20) | 5 | 10 | 20 | 20 |
 | `iprank.concurrency` | clamp(8c, 8, 64) | 8 | 16 | 32 | 64 |
 | `cdn.verifyConcurrency`（每個都是 TLS 握手） | clamp(2c, 2, 8) | 2 | 4 | 8 | 8 |
+| `cdn.verifyPerMin`（CDN 驗證每分鐘上限，3.5.0 F12；也看 AES，在 `derive_auto()` 另外換算） | `cdn.lite` 30；沒有 AES 30c；有 AES min(60c, 480) | 30／60 | 60／120 | 120／240 | 240／480 |
 | `benchmark.concurrency` | clamp(8c, 8, 50) | 8 | 16 | 32 | 50 |
 | `scan.concurrency` | clamp(50c, 32, 400) | 50 | 100 | 200 | 400 |
 | `scan.maxPerSec`（每秒最多開始幾個探測，3.5.0；`cdn.lite` 時再減半） | clamp(50c, 50, 200) | 50 | 100 | 200 | 200 |
@@ -369,6 +383,22 @@ c = CPU 核心數（`available_parallelism`）：
 - 節點池下載測速最多 4 個節點（一般 16 個）。
 - 依據：padavan-tw 的 128 MB 模擬，單獨運作時流量幾乎跟 CDN 驗證次數成正比（每次約 90 KB），CPU 也主要花在驗證的 TLS 握手。
 - 狀態：`cdn.lite`、`cdn.stats.liteWaited`（只問過一次、先不驗證）、`cdn.stats.liteCapped`（超過每分鐘上限）。兩個都是**次數**，不是網域數：還沒驗證完的網域每查一次就再試著排一次，所以同一批網域被重複查得多（A＋AAAA、多個用戶端）時 `liteCapped` 會衝得很高，網域批次不同時差很多是正常的。
+
+**新網域很多時的 CDN 驗證節流**（`cdn.verifyPacing`，預設開；`cdn.verifyPerMin`，預設 `auto`；3.5.0 F12）：`cdn.lite` 這一套規則自動套用到所有機器，只在需要時。
+D9 實測（D3 單獨運作、每秒 20 個不重複的新網域）：中位 409 ms、CPU 閒置 21.6%，關掉 CDN 是 101 ms、94.3%——每個驗證是好幾次 HTTPS 握手，
+在沒有 AES 的 MIPS 上約 1 核心秒，每分鐘 78 個驗證吃掉七成多的 CPU。
+
+- 每分鐘上限 `Rmax`（token bucket，放在 `schedule()` 本來就拿的 `bg` 鎖裡，取代另外一把 `lite_rate`）：`cdn.lite` 30；沒有 AES 的核心數 × 30（D3：60）；
+  有 AES 的核心數 × 60、最多 480；設了數字照填的（6～1,200）。定在「這台本來就做得到的量」附近（D3 自然上限約 78），平常碰不到。
+- 依 CPU 自己調：主程式每 10 秒量一次黑潮自己這 10 秒用掉的 CPU 佔整台的比例（Linux `/proc/self/stat`、Windows `GetProcessTimes`），
+  55% 以上速率減半、30% 以下加 `Rmax ÷ 10`，中間不動；速率在 `max(6, Rmax ÷ 8)` 與 `Rmax` 之間；量不到不調；記憶體壓力不是 Normal 時用下限。
+- 名額用完、或速率低於上限 → 「減量中」：只問過 1 次的網域不排驗證（它的 ECS、延遲量測、跨 CDN 探索也一起不排）；連續 5 分鐘名額都沒用完、速率回到上限才離開。
+  進入、離開各一行 INFO。
+- 名額的順序：手動 `POST /api/cdn/verify` 不受限制但算進用量；已經有結果、到期重驗的與問過 2 次以上的可以用全部名額；只問過 1 次的只在不是減量中時排、最多用一半；
+  跨 CDN 探索每次算 1 個，排在第 2 類之後。
+- 沒有持久的佇列：排不進的丟掉、下一次查詢再排，壓力解除後不會湧出一波積壓。`cdn.lite` 等於「永遠減量、上限 30」，`liteWaited`／`liteCapped` 照舊累加。
+- 狀態：`/api/status` 的 `cdn.pace`（`enabled`、`perMin`、`maxPerMin`、`paced`、`usedLastMin`、`cpuPct`、`waited`、`capped`、`since`）、`cdn.bg`（各種背景工作開始與完成的累計）、
+  `findings` 的 `cdn-verify-paced`。細節見[規格 11 的 F12](11-v3.5.0.md)。
 
 **每日評測的小機器減量**（`benchmark.tiers`，3.5.0）：`auto`（預設）時實體記憶體小於 256 MB 只測 A 級（`a`），`a`／`ab` 強制。不是不評測：A 級（約 470 個候選）與使用者自己加的每天測，B 級只測沿用（昨天選上或候補，最多 16）、補位（A 級的經營者不到 12 家或某一種類型不到 8 個時，最多 32）、探索（每天 40），合計約是全部 1,800 個的三成。細節見[規格 11 的 A3](11-v3.5.0.md)。
 

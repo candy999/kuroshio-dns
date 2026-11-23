@@ -303,10 +303,13 @@ KUROSHIO_ON_CONFIG_WRITE="mtd_storage.sh save" kuroshio run --uci
 | `fmtTime(t, mode, tzOffsetMin)` | 日期時間固定格式：`2026-11-12 10:22`；`mode` = `'sec'`（加秒）、`'date'`、`'time'`、`'timesec'`。`t` 是毫秒、毫秒字串或 ISO 字串，空的回 `-`。`tzOffsetMin` 指定時區（UTC 往東幾分鐘，台灣 = 480），不給 = 瀏覽器的本地時區 |
 | `fmtBytes(b)` | `1023 B`、`12 KB`、`1.5 MB` |
 | `certCovers(info, domain)` | 憑證（`san` = `DNS:a.example.com, DNS:*.example.net`）有沒有涵蓋這個網域，含萬用字元 |
-| `restorePlan(cur, defs, removeOwn)` | 「恢復預設清單」：比對目前的過濾清單與預設清單（先比網址、再比名稱），回傳新的順序 `result` 與變更 `changes`（新增、移除、網址、啟用、其他、保留、順序、`count`）。名稱、分類、保護、繞過防護（`bypass`，3.4.0 起）不同都算「其他」 |
+| `restorePlan(cur, defs, removeOwn)` | 「恢復預設清單」：比對目前的過濾清單與預設清單（先比網址、再比名稱），回傳新的順序 `result` 與變更 `changes`（新增、移除、網址、啟用、其他、保留、順序、`count`）。名稱、分類、保護、繞過防護（`bypass`，3.4.0 起）、探測抽樣（`probe`，3.5.0 起）不同都算「其他」 |
 | `restoreSummary(changes, tr)` | 把 `changes` 變成要顯示的文字：`{ empty, blocks: [{ cls, title, items }] }`，畫面自己組；`tr` 是翻譯函式（可省略） |
 | `chainView(chain, tr, now)` | 3.4.0 起：`/api/status` 的 `chain` → 狀態頁顯示用的資料 `{ down, up }`（各有 `badge`、`text`、`warn`、`rows: [{ label, value }]`；`down` 另有 `objects`、`skipped`，`up` 另有 `note`、`downstreams`）。主要的句子照 API 原樣；`now` 用來判斷公鑰是不是 24 小時內換過（可省略） |
-| `format(template, args)` | `%s` / `%d` 代換 |
+| `upstreamExtra(u, tr)` | 3.5.0：上游的 `servfail`、`late` →「SERVFAIL 3、來不及 5」，放在成功率旁邊；都是 0 或沒有這兩欄回 `''` |
+| `paceView(pace, tr)` | 3.5.0：`/api/status` 的 `cdn.pace` →`{ text, warn }`（`warn` = 減量中）；舊版、空物件回 `null` |
+| `cdnStoreText(cdn, tr)` | 3.5.0：`/api/status` 的 `cdn`（`dbEntries`、`dbDiskKB`、`dbFileKB`、`dbBudgetKB`、`cdnDirKB`）→ 一行摘要；沒有 `dbEntries` 回 `null` |
+| `format(template, args)` | `%s` / `%d` 代換（`%%` 是百分比符號本身） |
 
 - 也可以在 Node 用 `require('data/shared/ui-core.js')`（有 `module.exports`）。語法是 ES5，舊瀏覽器也能用。
 - 每個函式的輸入與預期輸出在 `data/shared/ui-core.tests.json`，自己移植或改寫時可以拿來對照；CI 用 `node tools/ui-core-test.js` 逐一檢查（`dashboard.js` 的 `fmtTime` 也用同一組向量檢查）。
@@ -574,7 +577,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 `/api/status` 的 `stats.today` 多 `backfill`（補問次數）與 `backfillMismatch`（抽樣比對不一致的次數）。3.4.2 起另有 `chainBypass`：串接中上游黑潮擋掉、這台自己的過濾沒擋，改用自己的加密上游解析的次數（快取命中不算；自己的上游也沒有答案、照上游擋的也不算）。3.4.3 起另有 `chainRetry`：上游黑潮解析不到（SERVFAIL）、改用自己的加密上游解析到的次數。`memory.pressure`（3.4.3）：當下的記憶體量測（`normal`／`low`／`critical`）；`memory.state` 放鬆前要穩定幾分鐘，兩者會差幾分鐘。
 
-3.5.0：`/api/status` 的 `cdn` 在 CDN 關掉時是 `{"enabled": false}`（以前是 `null`，看不出是關掉還是讀不到）。`/api/status` 多 `perf`（效能計數器，找出沒有 AES 指令的機器把 CPU 花在哪裡）：`perf.tls.dot`／`perf.tls.doh` 各有 `full`（完整握手）、`resumed`（續用 session）、`aes`／`chacha`（協商到的密碼套件）、`fail`（連線或握手失敗）；`perf.tls.quic` 有 `new`、`fail`；`perf.fanout` 是每次詢問送出 1、2、3、4 個以上上游查詢的次數（一筆查詢可能詢問兩次：先問主要的，再問備援），`perf.backfillQueries` 是背景補問送出的上游查詢數。都是啟動以來的累計，32 位元，溢位就從 0 重來。`/api/status?lite=1` 不回 `perf`（3.5.0 起；見「觀測與線路感知」）。`/api/trace` 的 `upstreams[]` 多 `viaInterceptor`：一般 DNS 被路上的攔截者（路由器）接走時是 `true`，並附一句 `note`，表示回答的其實是攔截者、不是那個位址。
+3.5.0：`/api/status` 的 `cdn` 在 CDN 關掉時是 `{"enabled": false}`（以前是 `null`，看不出是關掉還是讀不到）。`/api/status` 多 `perf`（效能計數器，找出沒有 AES 指令的機器把 CPU 花在哪裡）：`perf.tls.dot`／`perf.tls.doh` 各有 `full`（完整握手）、`resumed`（續用 session）、`aes`／`chacha`（協商到的密碼套件）、`fail`（連線或握手失敗）；`perf.tls.quic` 有 `new`（新建的連線數；QUIC 連線每 10 秒送 keep-alive、會一直重複使用，所以前後相減常常是 0）、`fail`、`open`（目前開著的連線數，3.5.0 F4）；`perf.fanout` 是每次詢問送出 1、2、3、4 個以上上游查詢的次數（一筆查詢可能詢問兩次：先問主要的，再問備援），`perf.backfillQueries` 是背景補問送出的上游查詢數。都是啟動以來的累計，32 位元，溢位就從 0 重來。`/api/status?lite=1` 不回 `perf`（3.5.0 起；見「觀測與線路感知」）。`/api/trace` 的 `upstreams[]` 多 `viaInterceptor`：一般 DNS 被路上的攔截者（路由器）接走時是 `true`，並附一句 `note`，表示回答的其實是攔截者、不是那個位址。
 
 ## 上游多樣性（3.4.0 起）
 
@@ -666,7 +669,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   - `preflight`：資格賽網域被擋的說明（例如 `封殺 one.one.one.one（資格賽：NXDOMAIN）`），沒有是 `null`。網域判斷也判出時 `result`／`reason` 用網域判斷的，這個欄位照樣留著。
   - `recent`：近 7 天的結果（7 個字元以內，最左邊是今天；`d` 判出、`p` 沒判出、`u` 沒測到、`-` 那天沒跑）。
   - `regress`：`true` = 過去 7 天（不含今天）裡有 3 天以上判出、今天沒判出（`u`、`-` 不算）。
-  - `expectMet`：`filter=` 的類型裡至少有一種今天有對應的判斷時，那些類型有沒有判出（`true`／`false`）。廣告、追蹤、成人看評測網域（資格賽網域被擋不算）；惡意網站看惡意網站探測（這一台有回答、而且探測今天有效才算有判斷）。都沒有對應判斷（例如只擋惡意網站、而 `probe.txt` 是空的或探測今天失效）或沒測到是 `null`。
+  - `expectMet`：`filter=` 的類型裡至少有一種今天有對應的判斷時，那些類型有沒有判出（`true`／`false`）。廣告、追蹤、成人看評測網域（資格賽網域被擋不算）；惡意網站看惡意網站探測（這一台有回答、而且探測今天有效才算有判斷）。都沒有對應判斷（例如只擋惡意網站、而今天沒有探測網域或探測今天失效）或沒測到是 `null`。
 - 回歸只報告，不改變選出來的上游：`judge.log` 與日誌各一行 WARN（「對照組 X 以前判得出過濾，今天沒判出」）。今天判出的比例比過去 7 天的中位數少一半以上（今天測到 8 台以上、過去有測到 8 台以上的天數）時另外一行 WARN（評測網域檔或判斷規則可能改壞了）。
 - 報表的 `protected.csv` 最後多 `stage,preflight,recent,regress,expectMet`（舊的欄位順序不變）。
 - 跨天的紀錄在評測學習檔的 `control`（每台最近 30 天，字串第一個字元是 `controlDay` 那天；最多 64 台，名單裡沒有的刪掉）。
@@ -674,20 +677,25 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 ### 惡意網站探測
 
-`benchmark.malwareProbe`（UCI `option malware_probe`，預設 `true`）；探測網域在評測名單目錄的 `probe.txt`（使用者的與程式附帶的合併）。**附帶的 `probe.txt` 是空的：整段不跑，評測跟 3.4.4 一樣**。
+`benchmark.malwareProbe`（UCI `option malware_probe`，預設 `true`；關掉＝整段不跑，跟 3.4.4 一樣）。探測網域有兩個來源（3.5.0 F10）：
 
-- `probe.txt` 格式：`<網域>  # probe=malware src=<出處> checked=<日期>`；沒寫 `probe=malware` 的行不採用；跟 `web.txt` 或資格賽網域重複的不採用；最多讀 8 個。探測網域要人工確認（挑選標準在檔頭）。
+- **`probe.txt`**（評測名單目錄，使用者的與程式附帶的合併；**可以留空**，附帶的是空的）：格式 `<網域>  # probe=malware src=<出處> checked=<日期>`；沒寫 `probe=malware` 的行不採用；跟 `web.txt` 或資格賽網域重複的不採用；最多讀 8 個。有內容時排最前面、一定參加自我檢查。
+- **抽樣**（`benchmark.probeSample`，UCI `option probe_sample`，預設 `true`；`false`＝只用 `probe.txt`、規則也是這一包之前的）：每日評測啟動前，主程式從這台已經下載的惡意類清單的**本機副本**串流解壓、水塘抽樣留 40 個。只收單純的網域規則（`||example.com^` 或只有網域的一行：沒有萬用字元、修飾、不是例外規則、不是 IP、至少兩段、100 個字元以內），排除評測網域、資格賽網域、內建一定通過的服務、`resolver.keepNames`。哪些清單可以抽看 `filter.lists[].probe`（UCI 清單區段的 `option probe '0'`／`'1'`）：沒寫時啟用中、`category` 是 `malware`、不是繞過防護的才抽；預設清單的 TW165、TWNIC-RPZ、新註冊網域、繞過防護明寫 `probe: false`（舊設定沒有這個欄位時依網址認得）。以下情況這次不抽（日誌一行 INFO，評測照樣跑、只用 `probe.txt`）：記憶體壓力不是 Normal、那份清單被記憶體控制停用中、沒有本機副本（**不為了抽樣多下載**；副本還在等寫出時也不讀）。
+- 抽樣結果放進傳給評測的那一份設定的 `benchmark._probeSample`（`{ "names": [...], "lists": 份數, "skipped": "沒抽的原因" }`）。**底線開頭＝內部用**：只在主程式交給評測子程序的那一份（標準輸入的第一行），不存檔、`/api/config` 看不到；不用子程序時同一份設定直接給。
 - 流程：
-  1. 資格賽之後、收集之前做**自我檢查**：參照是對照組裡 `filter=` 含 `malware`、資格賽有回答的（不同經營者，最多 6 台），與通過資格賽的一般候選（A 級優先、不同經營者，最多 6 台）。參照不足（對照組不到 2 家、候選不到 3 家）→ `no-reference`，不問。每台參照用一條連線把探測網域問一輪（最多 12 台 × 8 個 = 96 筆）。
-  2. 一個探測網域有效的條件：至少 2 家不同經營者的對照組回封鎖（NXDOMAIN、沒有 A 記錄、`0.0.0.0` 之類），而且不過濾那一邊至少 3 台有回答、其中 70% 以上解析得到。取有效的前 4 個；都沒有 → `invalid`。
-  3. 有效的探測網域接在 `web.txt` 的網域後面，每個候選在收集階段用同一條連線順便問（不另外連線、照 `benchmark.paceMs` 的間隔）。
-  4. 全部問完之後用全部候選的資料再驗一次同樣的兩個條件。一般候選在 2 個以上有效的探測都回封鎖 → 判為「有擋惡意網站」；有效的不到 2 個時不判斷一般候選（對照組擋 1 個就算）。
-  5. 保險絲：判出的超過有回答的一半 → `fuse`，整段作廢。
+  1. **確認還解析得到**（只有抽樣的）：問一台不過濾的參照（通過資格賽、A 級優先、沒有 `filter` 標記的第一台；一個都沒回答就換下一台，最多換一次），每秒最多 5 筆。NXDOMAIN、沒有位址、封鎖位址、沒回答的丟掉，留最多 20 個。
+  2. **自我檢查**：參照是對照組裡 `filter=` 含 `malware`、資格賽有回答的（不同經營者，最多 6 台），與通過資格賽的一般候選（A 級優先、不同經營者，最多 6 台）。參照不足（對照組不到 2 家、候選不到 3 家）→ `no-reference`，不問。每台參照用一條連線把探測網域（`probe.txt` 的在前）問一輪（最多 12 台 × 28 個 = 336 筆）。
+  3. 一個探測網域有效的條件：至少 2 家不同經營者的對照組回封鎖（NXDOMAIN、沒有 A 記錄、`0.0.0.0` 之類），而且不過濾那一邊至少 3 台有回答、其中 70% 以上解析得到。取有效的前 12 個（抽樣關掉時前 4 個）；都沒有 → `invalid`。
+  4. 有效的探測網域接在 `web.txt` 的網域後面，每個候選在收集階段用同一條連線順便問（不另外連線、照 `benchmark.paceMs` 的間隔）。
+  5. 全部問完之後用全部候選的資料再驗一次同樣的兩個條件。一般候選怎麼算「有擋惡意網站」：抽樣開著時，在有效的探測裡**有回答的至少 6 個、而且擋了一半以上**；有效的不到 6 個時不判斷一般候選。抽樣關掉時照這一包之前的規則：2 個以上有效的探測都擋；有效的不到 2 個時不判斷一般候選。對照組都是「有效的探測裡擋了 min(2, 有效數) 個以上」。
+  6. 保險絲：判出的超過有回答的一半 → `fuse`，整段作廢。
 - 判出的一般候選比照對照組：照常測評測網域、今天不選、不當候補、不算覆蓋、不參加多數決、不呼叫可疑紀錄、不進永久黑名單；不在 `eliminated.csv`。`judge.log` 建議把它移到 `protected.txt`。評測歷史裡那一天算沒倖存。固定上游不判。
 - 只認明確的阻擋；回「另一個位址」（業者自己的警告頁）不判。探測網域不做憑證驗證、不查業者、不算延遲。
-- `upstreams.json`（`/api/benchmark`）多 `probe.malware`：`{ "state": "off"｜"empty"｜"no-reference"｜"invalid"｜"fuse"｜"ok", "domains": probe.txt 裡幾個, "used": 這次用幾個, "valid": 問完之後還有效幾個, "blockedBy": 判出幾台, "filtering": [判出的上游，最多 100], "probed": 有回答的一般候選數, "queries": 探測多送的查詢數 }`；`counts` 多 `malwareFilter`。
-- 對照組：`protected[].stage` 可能是 `probe`（`reason` 是 `封殺 惡意網站探測`）。探測有設定但今天判不出來（`no-reference`／`invalid`／`fuse`）時，預期會擋惡意網站、其他都沒判出的對照組在 `recent` 記成 `u`（沒測到），不算回歸。
-- 介面：ui-core.js 的 `benchScope(b)` 把 `tiers` 與 `probe` 寫成一行（LuCI 狀態頁、Windows 設定頁的上游區塊；共用儀表板在評測區塊）。
+- **不寫出抽到的網域**：`judge.log` 的 `[惡意網站探測]` 段只寫來源份數與各階段的數量（「來源：probe.txt 0 個；從 1 份惡意類清單抽樣 40 個」「抽樣的 40 個裡 17 個還解析得到，留 17 個」「自我檢查：17 個（probe.txt 0、抽樣 17）裡 15 個通過，這次用 12 個」），抽樣的探測網域失效時寫「抽樣第 N 個」；`probe.txt` 的照舊寫網域。要看抽到哪些用 DEBUG 等級的日誌。`upstreams.json` 也不帶。
+- `upstreams.json`（`/api/benchmark`）多 `probe.malware`：`{ "state": "off"｜"empty"｜"no-source"｜"no-reference"｜"invalid"｜"fuse"｜"ok", "domains": 參加自我檢查的個數, "used": 這次用幾個, "valid": 問完之後還有效幾個, "blockedBy": 判出幾台, "filtering": [判出的上游，最多 100], "probed": 有回答的一般候選數, "queries": 探測多送的查詢數, "rule": "ratio"（抽樣開著）｜"count"（抽樣關掉）, "source": { "manual": probe.txt 幾個, "sampled": 抽到幾個, "alive": 其中還解析得到幾個, "lists": 抽了幾份清單 } }`；`counts` 多 `malwareFilter`。`empty` 是 `probe.txt` 沒有、抽樣關掉；`no-source` 是抽樣開著、但 `probe.txt` 沒有也抽不到（或抽到的都解析不到）。
+- 對照組：`protected[].stage` 可能是 `probe`（`reason` 是 `封殺 惡意網站探測`）。探測有設定但今天判不出來（`no-source`／`no-reference`／`invalid`／`fuse`）時，預期會擋惡意網站、其他都沒判出的對照組在 `recent` 記成 `u`（沒測到），不算回歸。
+- 介面：ui-core.js 的 `benchScope(b)` 把 `tiers` 與 `probe`（含 `source`）寫成一行（LuCI 狀態頁、Windows 設定頁的上游區塊；共用儀表板在評測區塊）。
+- 隱私：抽到的是還在活動的惡意網域，線路上的資安設備可能把這台記成「有裝置中毒」；企業或學校網路建議關掉 `benchmark.malwareProbe`。
 
 ### 手動執行的工作優先
 
@@ -704,7 +712,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 | 參數 | 說明 |
 |---|---|
-| `lite=1` | 不回大的欄位：`perf`（效能計數器）、`history`。LuCI 的 rpcd（`status` 方法）、padavan 韌體每幾秒讀一次用這個。`freshness`、`findings`、`stale`、`cdn.reach` 這些很小，照樣有。（規格 C12 一直寫「`lite=1` 時不回 `perf`」，3.5.0 之前的版本其實沒有處理 `lite`。） |
+| `lite=1` | 不回大的欄位：`perf`（效能計數器）、`history`、`system.persist.files`（每個快照檔一筆，CDN 網域資料就有 256 片，D3 上約 37 KB；3.5.0 F2）——改帶加總 `system.persist.filesSummary`：`{ "count": 檔數, "bytes": 合計, "compressed": 壓縮的檔數, "pending": 等寫出的檔數, "oldestWriteAt": 最舊的寫出時間（毫秒） }`。LuCI 的 rpcd（`status` 方法）、padavan 韌體每幾秒讀一次用這個。`freshness`、`findings`、`stale`、`cdn.reach`、`cdn.pace` 這些很小，照樣有；`persist` 的其他加總欄位（`bytesToday`、`oldestUnsavedSec`、`maxAgeHours`、`space`…）全部保留。不帶 `lite` 的完整回應 `files` 與 `filesSummary` 都有。（規格 C12 一直寫「`lite=1` 時不回 `perf`」，3.5.0 之前的版本其實沒有處理 `lite`。`persist.files` 文件沒寫過、repo 裡的介面也沒有讀；第三方韌體有讀的話請改讀 `filesSummary` 或不帶 `lite`。） |
 | `history=1` | 多帶 `history`（24 小時歷史，約 6 KB）；不帶參數時沒有。跟 `lite=1` 一起時以 `lite` 為準（不帶） |
 
 ### `freshness`（資料新鮮度）
@@ -738,7 +746,8 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 ```
 
 - 分工：`warnings` = 現在需要處理的；`findings` = 觀察到的現象與經過。同一件事不兩邊都放。
-- `key`（約定）：`upstream-failing`、`upstream-all-down`、`serve-stale-high`、`cdn-verify-fail-high`、`chain-intercepted`、`chain-released-untrusted`、`chain-audit-released`、`list-copy-no-room`、`cdn-db-pruning`、`job-failing`、`friends-sync-failing`、`reach-single-pop`、`reach-none`、`pop-mismatch`、`pop-switched`、`pop-flapping`、`slower-fallback`、`slower-fuse`。之後可能會加，不認得的 `key` 請照 `text` 顯示。
+- `key`（約定）：`upstream-failing`、`upstream-all-down`、`serve-stale-high`、`cdn-verify-fail-high`、`chain-intercepted`、`chain-released-untrusted`、`chain-audit-released`、`list-copy-no-room`、`cdn-db-pruning`、`job-failing`、`friends-sync-failing`、`reach-single-pop`、`reach-none`、`pop-mismatch`、`pop-switched`、`pop-flapping`、`slower-fallback`、`slower-fuse`、`cdn-verify-paced`（3.5.0 F12：新網域很多，CDN 驗證減量中）。之後可能會加，不認得的 `key` 請照 `text` 顯示。
+- 3.5.0 F3：`serve-stale-high` 要四個條件都成立才出現——最近 15 分鐘查詢 100 筆以上、過期快取回答的佔 5% 以上、背景更新失敗 5 次以上、而且過期回答裡至少四分之一是更新失敗（查詢少、重複多的家裡過期比例本來就高，不代表上游有狀況）；文字寫「…其中 M 次背景更新失敗：上游可能有狀況」。`cdn-db-pruning` 的文字改成「CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 N 筆）」。
 - `sev`：`warn` / `info`。排序：`warn` 在前，同級 `lastAt` 新的在前。
 - `text`：一句話（最長 200 個字元，內容不是約定）；只放數量、CDN 名稱、機房代碼，不放網域與用戶端 IP。
 - `count`：次數（飽和到 9,999）。狀態類（例如上游暫停中）是「從不成立變成立」的次數；事件類（例如機房切換）用來源模組自己的計數算，沒人開狀態頁的那幾天也是對的。
@@ -750,6 +759,8 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 ```json
 "stale": { "today": 120, "rateToday": 0.004, "rate15m": 0.0, "rate1h": 0.001 }
 ```
+
+3.5.0 F3 多 `refreshFail15m`：最近 15 分鐘背景更新做完、結果還是失敗（上游全部失敗、或 SERVFAIL）的次數，加上上游全部失敗、直接回舊資料的次數（比率的定義不變）。
 
 `today` = 今天回了過期資料的次數（同 `stats.today.stale`）；`rateToday` = `today ÷ 今天的查詢數`；`rate15m`、`rate1h` 讀 24 小時歷史的最近 3、12 格（只算完整的 5 分鐘）。沒有查詢時是 0。`/api/dashboard` 也有同一份。
 
@@ -797,7 +808,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 "popSwitch": { "enabled": true, "eligible": false, "reason": "single-pop", "switches24h": 0,
                "eligibleFamilies": [], "holds": [], "excluded": [ { "provider": "fastly", "reason": "nearest-provider" } ] },
 "popAudit": { "enabled": true, "pending": 0, "confirmed": 31, "mismatch": 0, "probes24h": 0,
-              "lastMismatchAt": null, "chainPopUnreliable": false }
+              "lastMismatchAt": null, "chainPopUnreliable": false, "pendingServed": 0, "lastProbeAt": null, "noTarget": 0 }
 ```
 
 | 欄位 | 說明 |
@@ -805,11 +816,13 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `reach` | 這條線到得了哪些台灣機房（只算這台自己確認過的節點：不在壞節點裡、是台灣機房、不是種子、沒有 `upPop`）。`at` 毫秒或 `null`；`wanEpoch` 每次 WAN 變動加 1（重新啟動歸 0）；`stale` = WAN 變動後、下一輪健檢之前，或串接中；`unconfirmed` = 上游給的、這台還沒量過機房的節點。`v4`／`v6.text` 一句白話（內容不是約定）；`multi` = 兩個以上城市、每個城市至少 2 個節點分在 2 個以上網段（機房切換的資格）；`pops[]` 最多 8 個，依節點數排序，`pop` 是代碼前三碼（TPE、TSA 分開列、城市都是台北），`prefixes` 是 IPv4 /24、IPv6 /48 的數目，`medianMs` 可能是 `null`；`nearby[]` 是 Fastly 這類最近節點型（沒有台灣機房），最多 8 個 |
 | `popHealth` | 每一輪健檢依（CDN、家族、檢查前的機房）彙總，最多 64 筆；最近節點型不列。`badStreak` 連續幾輪「變差」（失敗率 ≥ 20%，而且節點數 ≥ 3 或壞的 ≥ 2）；`held`／`heldUntil`（毫秒）= 暫時排到後面 |
 | `popSwitch` | 機房切換（`cdn.popSwitch`）。`reason`：`disabled`、`chained`、`chain-pop-unreliable`、`memory`、`single-pop`（沒有家族符合資格）、`ok`；`nearest-provider` 只出現在 `excluded[]`。`eligibleFamilies`：符合資格的家族；`holds[]`：`{ provider, family, pop, until（毫秒）, other }`；`switches24h`：24 小時內暫緩的次數 |
-| `popAudit` | 機房以這台量到的為準（`cdn.popAudit`）。`pending`：`upPop` 還在的節點；`confirmed`／`mismatch`：啟動後累計的比對次數；`probes24h`：24 小時內用掉的機房抽查名額（一天最多 24 個、`cdn.lite` 8 個）；`lastMismatchAt` 毫秒或 `null`；`chainPopUnreliable`：24 小時內比對過的一半以上不一樣（至少 4 個），期間不做機房切換 |
+| `popAudit` | 機房以這台量到的為準（`cdn.popAudit`）。`pending`：`upPop` 還在的節點；`confirmed`／`mismatch`：啟動後累計的比對次數；`probes24h`：24 小時內用掉的機房抽查名額（一天最多 24 個、`cdn.lite` 8 個）；`lastMismatchAt` 毫秒或 `null`；`chainPopUnreliable`：24 小時內比對過的一半以上不一樣（至少 4 個），期間不做機房切換。3.5.0 F7：抽到的答案 IP 不是待確認的節點時，改量一個待確認的前幾名節點（每家 CDN、每個位址族排在前 `serveCount` 名的，各家輪流；名額不變）——`pendingServed`：前幾名裡還沒確認的；`lastProbeAt`：上次量機房的時間（毫秒或 `null`）；`noTarget`：拿到名額、但已經沒有要量的次數 |
 | `slowerFuseUntil` | 跳了才有（毫秒）：一小時裡「台灣節點比原本慢」超過 30%（至少 10 次），之前照常換台灣節點 |
-| `stats.verifyOk`／`verifyFail`／`slowerFallback` | 台灣節點驗證通過／沒通過（不含比原本慢）／比原本慢暫時用原本答案的次數（啟動後累計，32 位元） |
+| `stats.verifyOk`／`verifyFail`／`slowerFallback` | 台灣節點驗證通過／沒通過（不含比原本慢）／比原本慢暫時用原本答案的次數（啟動後累計，32 位元）。3.5.0 F9 多 `slowerFirst`（第一次量到慢，照樣換台灣節點）、`slowerReturned`（退回之後重驗不慢、回台灣節點） |
 
-其他：`/api/cdn/pools` 還沒確認的節點多 `upPop`；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。`kuroshio notify wan-changed`（`/api/notify/wan-changed`）多做一件事：把 `reach` 標成過期、清掉機房切換的連續計數與暫緩，不補跑健檢或掃描。
+其他：`/api/cdn/pools` 還沒確認的節點多 `upPop`；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。
+
+3.5.0 F9（比原本慢的第二版）：`score`／`origScore` 的意義改成**連線＋TLS 握手**的毫秒數（台灣節點／原本的 IP；不含收到回應標頭的時間）。判斷是「台灣 × 0.7 > 原本 ＋ 10 毫秒」，要連續 2 次驗證、相隔 10 分鐘以上都慢才退回；第一次慢時 `v4` 多 `slow1: { at, score, origScore }`、照常換台灣節點（`explain` 的 `text` 多一句「上一次驗證握手比原本慢，再確認一次才會退回」）。退回 15 分鐘（`cdn.lite` 1 小時），到期後有人查才重驗，重驗一次不慢就回台灣節點並清掉 `slower`／`score`／`origScore`／`reason`。分數只存在 `slow1`／`slower` 的那幾筆。手動 `POST /api/cdn/verify` 走同一套，回應多 `"speed": { "score", "origScore", "weighted"（台灣 × 0.7）, "slower"（這一次慢不慢）, "state": "ok"｜"slow1"｜"slower", "confirmAfter"（毫秒） }`。`kuroshio notify wan-changed`（`/api/notify/wan-changed`）多做一件事：把 `reach` 標成過期、清掉機房切換的連續計數與暫緩，不補跑健檢或掃描。
 
 ### `/api/community/status` 的 `ispGroup`
 
@@ -818,6 +831,58 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 ```
 
 `community.shareIspGroup`（UCI `share_isp_group`，預設關）開著時才有 `mine`（這台 WAN 的 ISP 群組，偵測不到是 `null`）；關著是 `{ "share": false, "sameGroupFriends": 0 }`。`/api/community/peers` 每個好友的 `info` 多 `isp`（對方有給、而且這台也開著才有）。協定：只放在同步回應的 `ctx`（`NetInfo.isp`，最長 16 個字元、小寫英數與 `-`、`_`，不符當沒有），身分文件不放；沒開時不序列化，位元組跟 3.4.x 一樣。
+
+## 實測修正（3.5.0 F 組）
+
+規格 11 第 6 節。全部放在既有路徑的新欄位裡，**沒有新的管理 API 路徑**：OpenWrt 的 `rpcd.sh` 白名單、padavan 韌體的 `kuroshio.sh api` 白名單都不用改。新設定都有安全的預設值；行為改變的幾包都有開關，關掉＝這一包之前的行為。
+
+### 新設定
+
+| JSON | UCI | 預設 | 說明 |
+|---|---|---|---|
+| `upstream.roundAwareFailures` | `config upstream` 的 `option round_aware_failures` | `true` | 上游成敗照整輪判斷（F4）。`false`＝這一包之前的記法 |
+| `benchmark.probeSample` | `config benchmark` 的 `option probe_sample` | `true` | 惡意網站探測的網域從已下載的惡意類清單抽樣（F10，見上面「惡意網站探測」） |
+| `filter.lists[].probe` | `config filter_list` 的 `option probe` | 沒寫 | 這份清單能不能抽探測網域；沒寫＝依分類與網址（F10） |
+| `cdn.verifyPacing` | `config cdn` 的 `option verify_pacing` | `true` | 新網域很多時 CDN 驗證自動減量（F12） |
+| `cdn.verifyPerMin` | `config cdn` 的 `option verify_per_min` | `auto` | CDN 驗證每分鐘上限（F12；6～1,200） |
+
+`/api/config` 的 `auto`（依 CPU 換算、沒填＝自動的欄位）多 `cdn.verifyPerMin`。
+
+### `/api/status`、`/api/upstreams` 的上游（F4）
+
+`upstreams[]` 每台多三個計數（啟動後累計，32 位元；串接上游不算「來不及」）：
+
+- `servfail`：這台正常回應了 SERVFAIL 的次數。同一筆查詢多台都 SERVFAIL＝網域壞掉，不算任何一台失敗；單一上游 SERVFAIL 而別台正常回答才算那台失敗（這一點跟以前一樣，只是分開計）。
+- `late`：已經送出、但別的上游先答完，這台還沒回來就被取消的次數。沒有延遲紀錄的上游用等了多久當下限（不再永遠排第一個問）；連續 8 次都來不及、而且這段期間沒成功過才算 1 次失敗（成功一次歸零）。第一次這樣時一行 INFO「`<id>` 每次都來不及回答（別的上游先答完），先排到後面；一直這樣的話可能是位址或協定不通」。
+- `unanswered`：整輪沒有任何上游正常回答（Ok、NODATA、NXDOMAIN 都算正常）、所以沒有算它失敗的次數。等了逾時 90% 以上的失敗與 SERVFAIL 先收著，這一輪有別台正常回答才記失敗；很快就回來的錯誤（連線被拒、TLS 失敗、HTTP 4xx）照舊立刻記。整台斷網時不記失敗、不暫停。
+
+成功率照舊用 `ok ÷ (ok + fail)`；ui-core.js 的 `upstreamExtra(u)` 把 `servfail`、`late` 寫成「SERVFAIL 3、來不及 5」（都是 0 不顯示）。
+
+### CDN 驗證節流（F12）
+
+`/api/status` 的 `cdn` 多：
+
+```json
+"pace": { "enabled": true, "perMin": 30, "maxPerMin": 60, "paced": true, "usedLastMin": 30, "cpuPct": 41,
+          "waited": 1234, "capped": 56, "since": 1795486200000 },
+"bg": { "verify": { "started": 1200, "done": 1190 }, "ecs": { "started": 80, "done": 80 },
+        "cross": { "started": 12, "done": 12 }, "latency": { "started": 300, "done": 300 } }
+```
+
+- `perMin`：目前的速率（在 `max(6, maxPerMin ÷ 8)` 與 `maxPerMin` 之間）；主程式每 10 秒量一次黑潮自己這 10 秒用掉的 CPU 佔整台的比例（`cpuPct`，量不到是 `null`、速率維持 `maxPerMin`）：55% 以上減半、30% 以下加 `maxPerMin ÷ 10`；記憶體壓力不是 Normal 時是下限。
+- `paced`：減量中（名額用完、或速率低於上限時進入；連續 5 分鐘名額都沒用完而且速率回到上限才離開），進入、離開各一行 INFO。減量中只問過 1 次的網域不排驗證、ECS、延遲量測、跨 CDN 探索（照常回原本的答案）；`since` 是進入的時間。
+- `usedLastMin`：最近一分鐘用掉的名額（手動 `POST /api/cdn/verify` 不受限制但算進去）；`waited`：只問過一次所以沒排的次數；`capped`：名額用完沒排的次數（都是啟動後累計）。`cdn.lite` 照舊有 `stats.liteWaited`／`liteCapped`，`pace.waited`／`capped` 是所有機器的。
+- `bg`：驗證、ECS、跨 CDN、延遲量測各自「開始幾個、完成幾個」的累計，給壓測分辨成本在哪一種工作。
+- `findings` 多 `cdn-verify-paced`（info）「新網域很多，CDN 驗證減量中（每分鐘 N 個）」。
+- 舊版核心沒有 `pace`；`pace` 是空物件時介面不顯示（ui-core.js 的 `paceView`）。
+
+### 其他欄位與日誌
+
+- `/api/status` 的 `system.rssKB` 在 Windows 也有值（F6；以前只讀 `/proc`，Windows 上是 `null`）。介面讀不到時退回 `memory.rssKB`。
+- `memory.waiting` 多一種文字「可用記憶體已經回到保留量以上，等狀態穩定，不再讓出」（F1）；「於事無補」的離開要條件連續成立 60 秒（包括回到寬裕），離開的日誌在那時才出現。
+- 只改 `pool.*` 或只影響 CDN 背景與觀測的鍵（`cdn.dbDiskBudgetKB`、`maxEntries`、`popAudit`、`verifyConcurrency`、`verifyPacing`、`verifyPerMin`、`cross.concurrency`、`cross.requestScore`、`cross.recheckHours`、`healthIntervalMin`、`qualityIntervalMin`）時，重新載入不清 DNS 快取；日誌文字改成「上游、解析或 CDN 的設定有變，DNS 快取重新開始」（F5）。
+- 重新載入設定時排隊中的工作與執行中被中斷的工作排回新的一輪（60 秒內有效；手動的照樣優先），日誌「重新載入：保留排隊中的工作 N 個（…）」「…重新載入時中斷，重新執行」；同一個工作連續因為重新載入中斷 2 次就不再自動排回（WARN）；保留不了的寫「重新載入：取消排隊中的 `<名稱>`（工作已停用）」。程式結束時不交接（F14）。
+- 查詢紀錄開、關各一行 INFO（F6）。節點池測速的日誌：被限流時 WARN「[cloudflare] 測速被對方限流（HTTP 429）：這一輪不再對它測速，沿用上一輪的速度與參考值；排序照延遲」，其他失敗印「沒量到（HTTP 403）」「沒量到（連線失敗）」，不再印「0 MB/s」；快測那一行印實際量到的速度（F6、F15）。
 
 ## 重新載入不斷線（3.4.0 起）
 
@@ -859,10 +924,12 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
 | `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`（UCI 是 `config cdn` 的 `option lite '1'`／`'0'`）。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped`（都是次數：還沒驗證完的網域每查一次就再算一次，不是網域數） |
 | `pool.relativeSpeed` | 3.5.0：節點測速用相對評分（預設 `true`；UCI 是 `config pool` 的 `option relative_speed '0'`／`'1'`）。關掉＝3.4.x：低於 1 MB/s 算慢、差 5% 以內才算瓶頸、直接比速度 |
-| `cdn.cross.requestScore` | 3.5.0：跨 CDN 加實測分數（預設 `true`；UCI 是 `config cdn` 的 `option cross_request_score '0'`／`'1'`）。關掉＝3.4.x：只看 TCP 延遲 |
+| `cdn.cross.requestScore` | 3.5.0：跨 CDN 加實測分數（預設 `true`；UCI 是 `config cdn` 的 `option cross_request_score '0'`／`'1'`）。分數是連線＋TLS 握手的毫秒數（F13）。關掉＝3.4.x：只看 TCP 延遲 |
+| `cdn.verifyPacing` | 3.5.0 F12：新網域很多時 CDN 驗證自動減量（預設 `true`；UCI 是 `config cdn` 的 `option verify_pacing '0'`／`'1'`）。關掉＝只有 `cdn.lite` 有每分鐘 30 個的上限 |
+| `cdn.verifyPerMin` | 3.5.0 F12：CDN 驗證每分鐘上限。`auto`（預設：`cdn.lite` 30；沒有 AES 的核心數 × 30；有 AES 的核心數 × 60、最多 480）／數字（6～1,200）。UCI 是 `config cdn` 的 `option verify_per_min`。`kuroshio sysinfo` 印出換算的值 |
 | `cdn.multiCdn` | 3.5.0：尊重多來源 CDN、第一層 CNAME 變了就失效（預設 `true`；UCI 是 `config cdn` 的 `option multi_cdn '0'`／`'1'`）。關掉＝3.4.x：每個網域只記一家、業者欄位直接改寫 |
 | `cdn.appLayer` | 3.5.0：App 自己選節點的服務（目前 Google、Apple）只辨識、不改寫（預設 `true`；UCI 是 `option app_layer`） |
-| `cdn.dbDiskBudgetKB` | 3.5.0：CDN 網域資料在磁碟上的預算。`auto`（預設：狀態目錄所在的檔案系統小於 64 MB 時用總容量的 30%，64 MB 以上或讀不到大小時不限）／數字（KB，下限 512）／`0`（不限）。UCI 是 `config cdn` 的 `option db_disk_budget_kb`。超過時在背景分批淘汰最久沒用的網域（一天內查過的、手動設定策略的不動），不會一次重寫全部分片。狀態：`cdn.dbBudgetKB`、`dbBudgetEntries`、`dbEntries`、`dbDiskKB`（實際）、`dbDiskEstKB`、`prunedForBudget` |
+| `cdn.dbDiskBudgetKB` | 3.5.0：CDN 網域資料在磁碟上的預算。`auto`（預設：狀態目錄所在的檔案系統小於 64 MB 時用總容量的 30%，64 MB 以上或讀不到大小時不限）／數字（KB，下限 512）／`0`（不限）。UCI 是 `config cdn` 的 `option db_disk_budget_kb`。超過時在背景分批淘汰最久沒用的網域（一天內查過的、手動設定策略的不動），不會一次重寫全部分片。狀態：`cdn.dbBudgetKB`、`dbBudgetEntries`、`dbEntries`、`dbDiskKB`（實際）、`dbDiskEstKB`、`prunedForBudget`。3.5.0 F8：`dbDiskKB` 量的是網域分片**實際佔用的磁碟區塊**（Unix 是 `blocks × 512`；`blocks` 是 0 的檔案系統與 Windows 用檔案長度），預算比的就是它；`dbFileKB` 是檔案長度合計（F8 之前 `dbDiskKB` 的量法，小檔多時少算約兩成）；`cdnDirKB` 是整個 `cdn/` 目錄（含節點池、網段掃描等）實際佔用，只顯示、不算進預算 |
 | `system.oomScoreAdj` | 預設 -500；設 0 就跟一般程式一樣讓核心挑 |
 | `filter.lists` | 少開幾份訂閱清單（每份的大小在 `filter.sources`） |
 
@@ -925,10 +992,12 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   - `provs`：最近看到的業者，最多 3 個：`[{ "provider": "cloudfront", "lastSeen": 毫秒, "verified": true }]`。`verified: true` 是有自己一格驗證結果的（最多兩家），`false` 是沒有格子、照原始答案回的。
   - `/api/cdn/domain` 的 `src`：原始的來源紀錄（`alt` 是另一家的那一格：`provider`、`v4`、`v6`、`base`、`last`；`seen`、`pend` 是第一層 CNAME 的防抖動狀態；`multiAt`、`invalAt`、`slotAt` 是毫秒時間）。這些欄位 3.4.x 讀到會原樣保留。
   - `/api/status` 的 `cdn.stats`：`srcInvalidated`（來源變了而清掉跨 CDN／ECS 的次數）、`multiHeld`（多來源沒有格子、照原始答案回的次數）、`appLayer`（App 層不改寫的次數）。
-- **跨 CDN 的實測分數**（3.5.0）：`/api/cdn/domain` 的 `cross4` 多 `score`（換過去那一家）與 `origScore`（原站）：一個請求的連線＋TLS 握手＋收到回應標頭的毫秒數，各取兩次探測裡比較小的；`cross4.tried[]` 每一家多 `score`（第一次探測的）。`verdict` 是 `fail` 而且兩個分數都有＝「連線比較近，但整個請求沒有比較快」。`/api/cdn/explain` 的 `cross` 步驟一樣多這兩個欄位；`GET /api/cdn/cross` 多 `scoreRejected`（因為這個原因沒有採用的網域數）。探測量不到分段時間時沒有這些欄位，照 3.4.x 的規則判斷。
+- **跨 CDN 的實測分數**（3.5.0）：`/api/cdn/domain` 的 `cross4` 多 `score`（換過去那一家）與 `origScore`（原站）：連線＋TLS 握手的毫秒數（F13 起不含收到回應標頭的時間，那是原站產生內容的時間、只會蓋掉差距），各取兩次探測裡比較小的；`cross4.tried[]` 每一家多 `score`（第一次探測的）。`verdict` 是 `fail` 而且兩個分數都有＝「連線比較近，但握手沒有比較快」。舊資料（連線＋握手＋TTFB）在下一次每日複驗時被新的值蓋掉。`/api/cdn/explain` 的 `cross` 步驟一樣多這兩個欄位；`GET /api/cdn/cross` 多 `scoreRejected`（因為這個原因沒有採用的網域數）。探測量不到分段時間時沒有這些欄位，照 3.4.x 的規則判斷。
 - **節點池的測速欄位**（3.5.0）：`GET /api/cdn/pools` 每家多 `speedRef`（這一次節點池工作量到速度的節點的中位數，MB/s；量到的不到 3 個時是 `null`），每個節點多：
   - `slow`：`true`／`false`＝相對評分的結果（連加上誤差範圍都不到 `speedRef` 的一半、或低於 0.1 MB/s）；沒有這個欄位＝沒量過速度，或舊資料（那時照舊規則：`speed` 低於 1 MB/s 算慢）。
   - `sample`：`{ "bytes": 8388608, "secs": 0.144, "connectMs": 4.1, "ttfbMs": 9.3, "quick": true }`——那一次下載收到的位元組數、收內容的秒數、連線（含 TLS 握手）與送出請求到收完標頭的毫秒數；`quick` 是量到瓶頸之後只收 1 MiB 的快測（這時節點的 `speed` 記的是瓶頸的速度）。這些是 3.6 工作負載分數的量測基礎，3.5.0 只收集、不參與排序。
+  - 3.5.0 F15、F16：每家多 `quickRef`（完整測的節點「前 1 MiB」速度的中位數，MB/s：快測的門檻跟它比；沒有時是 `null`、照舊公式）與 `speedRefWhy`（`speedRef` 沒算出來的原因，例如「量到速度的節點只有 2 個（要 3 個）」「被限流」）；`sample` 多 `headSecs`（收到第 1 MiB 的秒數）與 `status`（HTTP 狀態碼，0＝沒連上或沒收到標頭）。遇到 HTTP 429／503 時這一輪對那一家停止測速，沒量到的節點 `speed` 是 `null`（不再記成 0），上一輪有速度的沿用並記 `speedAge`（沿用了幾輪，最多 3）。
   - 3.4.x 讀到這些欄位會原樣保留。
 - **通訊類網域**（3.5.0）：推播服務的網域（內建 Apple 推播、Firebase 雲端訊息；`resolver.keepNames` 自己加，最多 64 個後綴）不被訂閱清單誤擋（`filter.protectComm`，預設開；自訂規則照樣優先，`/api/filter/check` 的 `rule` 是 `builtin-comm`）、快到期就預取（同時最多 16 個）、記憶體控制縮快取時優先留下、不換到別家 CDN。`/api/status` 的 `comm` 有內建與自己加的數量、預取中的數量；`filter.commSpared` 是清單本來要擋、照樣放行的次數（每天第一次會記一行 INFO，寫明是哪份清單，方便回報給清單維護者）。
+  - 3.5.0 F11：內建表多五類——時間同步（`ntp`）、連線偵測（`netcheck`）、憑證撤銷（`revocation`）、系統與安全更新（`update`）、地震速報（`quake`）。五類都不被訂閱清單擋（`/api/filter/check` 的 `rule` 是 `builtin-<類別>`，推播照舊 `builtin-comm`）；`ntp`、`netcheck`、`revocation`、`quake` 也不改寫 CDN 答案（不排驗證、不做 ECS 與跨 CDN，`cdn.stats.essentialKept` 加 1，`/api/cdn/explain` 的決定代碼是 `essential`）；`update` 照常換台灣節點。快到期就預取的只有推播、地震速報、自己加的；記憶體吃緊時先留的是推播、`ntp`、`netcheck`、`quake`、自己加的。`/api/status` 的 `comm` 多 `kinds`（每一類內建表的筆數，例如 `{ "apns": 1, "fcm": 3, "ntp": 17, … }`），`filter` 多 `commSparedByKind`（每一類放行的次數；`commSpared` 照舊是合計）。`filter.protectComm` 關掉＝新的五類一律不比對、推播回到 B6 原本的規則。`resolver.keepNames`（自己加的）只有不擋＋快取優先，不影響 CDN 改寫。內建表是編譯進執行檔的資料（`crates/kuroshio-net/src/comm.rs`）。
 
