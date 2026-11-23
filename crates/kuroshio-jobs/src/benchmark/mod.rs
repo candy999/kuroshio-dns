@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tags::{Tag, Tier};
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 工作名稱
 pub const JOB_NAME: &str = "dns-benchmark";
@@ -363,9 +363,50 @@ struct BenchCfg {
     tiers: Option<tiers::Mode>,
     /// `benchmark.malwareProbe`：惡意網站探測（預設開；`probe.txt` 空的就不跑）
     malware_probe: bool,
-    /// `benchmark.probeSample`：探測的網域從已下載的惡意類清單抽樣（3.5.0 F10，預設開；關掉＝只用 `probe.txt`）
-    #[allow(dead_code)] // 規格 11 第 6.2 節骨架，丙批接上
+    /// `benchmark.probeSample`：探測的網域從已下載的惡意類清單抽樣（3.5.0 F10，預設開；關掉＝只用 `probe.txt`，
+    /// 判斷規則也是 A5 原本的）
     probe_sample: bool,
+    /// 主程式抽到的網域（內部鍵 `benchmark._probeSample`，見 [`ProbeSample`]）
+    sample: ProbeSample,
+}
+
+/// 傳給評測的內部設定鍵（`benchmark` 底下）：主程式抽樣的結果（3.5.0 F10）。
+/// 底線開頭＝內部用：只放在傳給評測的那一份設定，不存檔、`/api/config` 看不到
+pub const PROBE_SAMPLE_KEY: &str = "_probeSample";
+
+/// 主程式抽樣的結果（`benchmark._probeSample`：`{ "names": [...], "lists": 份數, "skipped": "沒抽的原因" }`）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProbeSample {
+    pub names: Vec<String>,
+    /// 實際抽了幾份清單
+    pub lists: usize,
+    /// 主程式這次沒抽（或抽不到）的原因：寫進 judge.log
+    pub skipped: Option<String>,
+}
+
+impl ProbeSample {
+    pub fn from_cfg(cfg: &Value) -> ProbeSample {
+        let Some(v) = get(cfg, &format!("benchmark.{PROBE_SAMPLE_KEY}")) else {
+            return ProbeSample::default();
+        };
+        ProbeSample {
+            names: v["names"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .take(malware::SAMPLE_MAX * 2)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            lists: v["lists"].as_u64().unwrap_or(0) as usize,
+            skipped: v["skipped"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+        }
+    }
+    pub fn to_json(&self) -> Value {
+        json!({ "names": self.names, "lists": self.lists, "skipped": self.skipped })
+    }
 }
 
 fn pos_f64(cfg: &Value, k: &str) -> Option<f64> {
@@ -387,6 +428,7 @@ impl BenchCfg {
             tiers: get(cfg, "benchmark.tiers").and_then(Value::as_str).and_then(tiers::Mode::parse),
             malware_probe: kuroshio_config::chain::flex_bool(get(cfg, "benchmark.malwareProbe"), true).0,
             probe_sample: kuroshio_config::chain::flex_bool(get(cfg, "benchmark.probeSample"), true).0,
+            sample: ProbeSample::from_cfg(cfg),
         }
     }
 }
@@ -835,11 +877,23 @@ fn probe_ans(r: Option<&QueryResult>) -> malware::Ans {
 /// 惡意網站探測這一次的狀態（`upstreams.json` 的 `probe.malware`）
 #[derive(Debug, Default)]
 struct ProbeRun {
-    /// off＝設定關掉、empty＝`probe.txt` 沒有探測網域、no-reference＝參照不足、invalid＝探測都失效、
-    /// fuse＝保險絲燒斷、ok＝有判斷
+    /// off＝設定關掉、empty＝`probe.txt` 沒有探測網域（抽樣關掉）、no-source＝`probe.txt` 沒有、也抽不到（3.5.0 F10）、
+    /// no-reference＝參照不足、invalid＝探測都失效、fuse＝保險絲燒斷、ok＝有判斷
     state: &'static str,
-    /// `probe.txt` 裡的探測網域數
+    /// 參加自我檢查的探測網域數（`probe.txt` 的＋抽樣後確認解析得到的）
     domains: usize,
+    /// 一般候選怎麼算「有擋」（3.5.0 F10）
+    rule: Option<malware::Rule>,
+    /// `probe.txt` 的探測網域數（3.5.0 F10 `source.manual`）
+    manual: usize,
+    /// 主程式抽到、傳進來的（`source.sampled`）
+    sampled: usize,
+    /// 抽到的裡面確認還解析得到的（`source.alive`）
+    alive: usize,
+    /// 抽了幾份清單（`source.lists`）
+    lists: usize,
+    /// `used` 的每一個是不是 `probe.txt` 的（抽樣的不寫出網域，judge.log 會被回報、貼出來）
+    used_manual: Vec<bool>,
     /// 自我檢查通過、這次拿去問全部候選的探測網域
     used: Vec<String>,
     /// 事後再驗還有效的個數
@@ -853,14 +907,25 @@ struct ProbeRun {
 }
 
 impl ProbeRun {
-    /// 有設定探測、但今天判不出來
+    /// 有設定探測、但今天判不出來。`no-source`（3.5.0 F10：抽樣開著、但 `probe.txt` 沒有也抽不到）也算：
+    /// 抽樣通常每天都有，某一天抽不到（記憶體吃緊、清單停用）不能讓有擋惡意網站的對照組被報成回歸
     fn unusable(&self) -> bool {
-        matches!(self.state, "no-reference" | "invalid" | "fuse")
+        matches!(self.state, "no-source" | "no-reference" | "invalid" | "fuse")
+    }
+    /// 第 k 個用到的探測網域在 judge.log 裡怎麼寫：`probe.txt` 的寫網域，抽樣的只寫「抽樣第 N 個」
+    fn label(&self, k: usize) -> String {
+        match (self.used.get(k), self.used_manual.get(k)) {
+            (Some(d), Some(true)) => d.clone(),
+            (Some(_), _) => format!("抽樣第 {} 個", k + 1 - self.used_manual[..k].iter().filter(|m| **m).count()),
+            _ => "?".to_string(),
+        }
     }
     fn to_json(&self) -> Value {
         json!({ "malware": {
             "state": self.state, "domains": self.domains, "used": self.used.len(), "valid": self.valid,
             "blockedBy": self.filtering.len(), "probed": self.probed, "queries": self.queries,
+            "rule": self.rule.map(|r| if r == malware::Rule::Ratio { "ratio" } else { "count" }),
+            "source": { "manual": self.manual, "sampled": self.sampled, "alive": self.alive, "lists": self.lists },
             "filtering": self.filtering.iter().take(MAX_PROBE_REPORT).collect::<Vec<_>>(),
         } })
     }
@@ -2207,8 +2272,9 @@ impl Benchmark {
         Ok(state)
     }
 
-    /// 惡意網站探測的自我檢查（3.5.0 A5）：讀 `probe.txt`，挑少數幾台參照（有擋惡意網站的對照組、不過濾的候選，
-    /// 都取不同經營者的），每台用一條連線把探測網域問一輪；兩邊結果不同的探測網域才算有效，回傳前 4 個。
+    /// 惡意網站探測的自我檢查（3.5.0 A5；探測網域的來源 F10）：`probe.txt`（排前面）加上主程式抽樣、先確認還解析得到的，
+    /// 挑少數幾台參照（有擋惡意網站的對照組、不過濾的候選，都取不同經營者的），每台用一條連線把探測網域問一輪；
+    /// 兩邊結果不同的探測網域才算有效，回傳前幾個（[`malware::Rule::use_n`]）。
     /// 沒設定、沒有探測網域、參照不足、都失效時 `used` 是空的：後面整段不跑
     #[allow(clippy::too_many_arguments)]
     async fn probe_precheck(
@@ -2229,12 +2295,41 @@ impl Benchmark {
         if !cfg.malware_probe {
             return run;
         }
+        let rule = malware::Rule::of(cfg.probe_sample);
+        run.rule = Some(rule);
         let mut exclude: HashSet<String> = web.iter().map(|d| d.trim().to_ascii_lowercase()).collect();
         exclude.insert(pf_domain.to_ascii_lowercase());
-        let probes = malware::parse_probes(&self.paths.read_lists("probe.txt"), &exclude);
-        run.domains = probes.len();
-        if probes.is_empty() {
-            run.state = "empty";
+        let manual = malware::parse_probes(&self.paths.read_lists("probe.txt"), &exclude);
+        let sampled = if cfg.probe_sample {
+            malware::clean_sampled(&cfg.sample.names, &exclude, &manual)
+        } else {
+            Vec::new()
+        };
+        run.manual = manual.len();
+        run.sampled = sampled.len();
+        run.domains = manual.len() + sampled.len();
+        run.lists = if sampled.is_empty() { 0 } else { cfg.sample.lists };
+        if cfg.probe_sample {
+            jinfo!(
+                journal,
+                "[惡意網站探測] 來源：probe.txt {} 個；從 {} 份惡意類清單抽樣 {} 個{}",
+                manual.len(),
+                run.lists,
+                sampled.len(),
+                match (&cfg.sample.skipped, sampled.is_empty()) {
+                    (Some(why), true) => format!("（這次沒抽：{why}）"),
+                    _ => String::new(),
+                }
+            );
+        }
+        if manual.is_empty() && sampled.is_empty() {
+            run.state = if cfg.probe_sample { "no-source" } else { "empty" };
+            if cfg.probe_sample {
+                jinfo!(
+                    journal,
+                    "[惡意網站探測] 沒有探測網域（probe.txt 沒有、也抽不到）：今天不判斷，明天重新抽"
+                );
+            }
             return run;
         }
         // 參照：對照組裡預期會擋惡意網站、資格賽有回答的（不同經營者）；不過濾的用通過資格賽的一般候選（A 級優先、不同經營者）
@@ -2271,6 +2366,63 @@ impl Benchmark {
             );
             return run;
         }
+        // 抽樣的網域先確認還解析得到（3.5.0 F10）：問一台不過濾的參照（A 級、沒有 filter 標記的第一台；
+        // 連不上就換下一台，最多換一次），每秒最多 5 筆。威脅情資清單裡很多網域早就下線了
+        let mut alive_names: Vec<String> = Vec::new();
+        if !sampled.is_empty() {
+            let refs_alive: Vec<usize> = open.iter().copied().filter(|&i| all[i].tag.filter.is_none()).take(2).collect();
+            let names = Arc::new(sampled.clone());
+            for (n, &r) in refs_alive.iter().enumerate() {
+                let job = CollectJob {
+                    prober: self.prober.clone(),
+                    up: all[r].up.fresh(),
+                    domains: names.clone(),
+                    ctx: ctx.clone(),
+                    timeout: cfg.timeout,
+                    pace: cfg.pace.max(Duration::from_millis(malware::ALIVE_PACE_MS)),
+                    stop_after: Some(cfg.max_timeouts),
+                    pause: Arc::new(PauseState::default()),
+                };
+                let got = job.run().await;
+                run.queries += got.len();
+                let ans: Vec<malware::Ans> = got.iter().map(|r| probe_ans(r.as_ref())).collect();
+                let (keep, answered) = malware::alive(&ans);
+                if !answered {
+                    jinfo!(
+                        journal,
+                        "[惡意網站探測] 確認解析得到：參照 {} 沒有回答{}",
+                        all[r].id,
+                        if n == 0 && refs_alive.len() > 1 { "，換下一台" } else { "" }
+                    );
+                    continue;
+                }
+                alive_names = keep.into_iter().map(|k| sampled[k].clone()).collect();
+                jinfo!(
+                    journal,
+                    "[惡意網站探測] 確認解析得到（參照 {}）：抽樣的 {} 個裡 {} 個還解析得到，留 {} 個",
+                    all[r].id,
+                    sampled.len(),
+                    ans.iter().filter(|a| **a == malware::Ans::Ok).count(),
+                    alive_names.len()
+                );
+                for d in &alive_names {
+                    debug!("[惡意網站探測] 抽樣的探測網域：{d}");
+                }
+                break;
+            }
+        }
+        run.alive = alive_names.len();
+        let probes: Vec<String> = manual.iter().chain(&alive_names).cloned().collect();
+        let manual_n = manual.len();
+        run.domains = probes.len();
+        if probes.is_empty() {
+            run.state = "no-source";
+            jinfo!(
+                journal,
+                "[惡意網站探測] 抽樣的網域都解析不到、probe.txt 也沒有：今天不判斷，明天重新抽"
+            );
+            return run;
+        }
         let refs: Vec<usize> = controls.iter().chain(&open).copied().collect();
         let ctl_ops: Vec<String> = controls.iter().map(|&i| all[i].op_key()).collect();
         let domains = Arc::new(probes.clone());
@@ -2291,25 +2443,63 @@ impl Benchmark {
         let got = map_limit(jobs, self.effective_conc(cfg).0, |j| j.run()).await;
         run.queries = got.iter().flatten().map(Vec::len).sum();
         let ans = |r: usize, k: usize| probe_ans(got[r].as_ref().and_then(|v| v.get(k)).and_then(Option::as_ref));
+        let (mut passed, mut extra) = (0usize, 0usize);
         for (k, d) in probes.iter().enumerate() {
             let check = malware::self_check(
                 ctl_ops.iter().enumerate().map(|(r, o)| (o.as_str(), ans(r, k))),
                 (0..open.len()).map(|r| ans(controls.len() + r, k)),
             );
+            // `probe.txt` 的寫出網域；抽樣的只寫序號（網域只在 DEBUG）
+            let is_manual = k < manual_n;
+            let label = if is_manual {
+                d.clone()
+            } else {
+                format!("抽樣第 {} 個", k + 1 - manual_n)
+            };
             match check {
-                Ok(what) if run.used.len() < malware::PROBE_USE => {
-                    jinfo!(journal, "[惡意網站探測] 自我檢查通過 {d}：{what}");
+                Ok(what) if run.used.len() < rule.use_n() => {
+                    passed += 1;
+                    if is_manual {
+                        jinfo!(journal, "[惡意網站探測] 自我檢查通過 {label}：{what}");
+                    } else {
+                        debug!("[惡意網站探測] 自我檢查通過 {d}：{what}");
+                    }
                     run.used.push(d.clone());
+                    run.used_manual.push(is_manual);
                 }
-                Ok(_) => jinfo!(journal, "[惡意網站探測] {d} 有效，但已經有 {} 個，這次不用", malware::PROBE_USE),
-                Err(why) => jinfo!(journal, "[惡意網站探測] 自我檢查沒過 {d}：{why}。這個網域今天不拿來判斷"),
+                Ok(_) => {
+                    passed += 1;
+                    extra += 1;
+                    debug!("[惡意網站探測] {d} 有效，但已經有 {} 個，這次不用", rule.use_n());
+                }
+                Err(why) => {
+                    if is_manual {
+                        jinfo!(journal, "[惡意網站探測] 自我檢查沒過 {label}：{why}。這個網域今天不拿來判斷");
+                    } else {
+                        debug!("[惡意網站探測] 自我檢查沒過 {d}：{why}");
+                    }
+                }
             }
         }
+        jinfo!(
+            journal,
+            "[惡意網站探測] 自我檢查：{} 個（probe.txt {manual_n}、抽樣 {}）裡 {passed} 個通過{}，這次用 {} 個（最多 {}）",
+            probes.len(),
+            probes.len() - manual_n,
+            if extra > 0 {
+                format!("（超過上限沒用的 {extra} 個）")
+            } else {
+                String::new()
+            },
+            run.used.len(),
+            rule.use_n()
+        );
         if run.used.is_empty() {
             run.state = "invalid";
             let line = format!(
-                "[惡意網站探測] {} 個探測網域都沒過自我檢查：今天不判斷任何候選（探測網域可能失效了，請檢查 probe.txt）",
-                probes.len()
+                "[惡意網站探測] {} 個探測網域都沒過自我檢查：今天不判斷任何候選（探測網域可能失效了{}）",
+                probes.len(),
+                if manual_n > 0 { "，請檢查 probe.txt" } else { "" }
             );
             warn!("{line}");
             journal.push(line);
@@ -2334,14 +2524,11 @@ impl Benchmark {
         let cand_idx: Vec<usize> = verified.iter().copied().filter(|&i| all[i].selectable()).collect();
         let cands: Vec<Vec<malware::Ans>> = cand_idx.iter().map(|&i| answers[i].clone()).collect();
         run.queries += answers.iter().map(Vec::len).sum::<usize>();
-        let v = malware::judge(&controls, &cands);
+        let rule = run.rule.unwrap_or(malware::Rule::Count);
+        let v = malware::judge(&controls, &cands, rule);
         for (k, r) in v.valid.iter().enumerate() {
             if let Err(why) = r {
-                jinfo!(
-                    journal,
-                    "[惡意網站探測] {} 全部問完之後失效：{why}。不拿來判斷",
-                    run.used.get(k).map(String::as_str).unwrap_or("?")
-                );
+                jinfo!(journal, "[惡意網站探測] {} 全部問完之後失效：{why}。不拿來判斷", run.label(k));
             }
         }
         run.probed = v.probed;
@@ -2372,17 +2559,17 @@ impl Benchmark {
             run.filtering.push(s.id.clone());
             jinfo!(
                 journal,
-                "   [有擋惡意網站] {}：{} 個以上的探測網域回封鎖。比照對照組：今天不選、不記可疑、不進黑名單；建議移到 protected.txt（filter=malware）",
+                "   [有擋惡意網站] {}：{}。比照對照組：今天不選、不記可疑、不進黑名單；建議移到 protected.txt（filter=malware）",
                 s.id,
-                malware::MIN_VALID_TO_JUDGE
+                rule.text()
             );
         }
         jinfo!(
             journal,
             "[惡意網站探測] 有效的探測網域 {} 個{}；有回答的一般候選 {} 個，判出有擋惡意網站 {} 個；對照組擋 {}／沒擋 {}",
             run.valid,
-            if run.valid < malware::MIN_VALID_TO_JUDGE {
-                format!("（不到 {} 個，只看對照組、不判斷一般候選）", malware::MIN_VALID_TO_JUDGE)
+            if run.valid < rule.min_valid() {
+                format!("（不到 {} 個，只看對照組、不判斷一般候選）", rule.min_valid())
             } else {
                 String::new()
             },

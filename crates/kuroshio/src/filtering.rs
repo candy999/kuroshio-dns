@@ -105,6 +105,19 @@ pub struct ListSource {
     pub probe: bool,
 }
 
+/// 這一輪正在用的過濾服務（3.5.0 F10）：每日評測在排程器裡跑、拿不到 `App`，啟動評測前從這裡讀
+/// [`FilterService::probe_sources`]。[`FilterService::spawn`] 時登記；只留弱參照，這一輪結束就讀不到
+static CURRENT: Mutex<std::sync::Weak<FilterService>> = Mutex::new(std::sync::Weak::new());
+
+fn set_current(f: &Arc<FilterService>) {
+    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(f);
+}
+
+/// 這一輪正在用的過濾服務（沒有開過濾、或這一輪已經結束時是 None）
+pub fn current() -> Option<Arc<FilterService>> {
+    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).upgrade()
+}
+
 /// 惡意網站探測可以抽樣的一份清單（3.5.0 F10，[`FilterService::probe_sources`]）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeSource {
@@ -763,9 +776,34 @@ impl FilterService {
     }
 
     /// 惡意網站探測可以抽樣的清單（3.5.0 F10）：名稱、副本路徑、是不是停用中。唯讀，不下載、不重建。
-    /// 規格 11 第 6.2 節骨架：先回空的（＝抽不到，評測照現在只用 `probe.txt`），乙批補上實作
+    ///
+    /// - 只列 `probe` 的清單（[`ListSource::probe`]：惡意類、啟用中、不是 TW165／TWNIC-RPZ／新註冊網域／繞過防護，
+    ///   或設定明寫 `probe: true`）。
+    /// - `copy`：副本**已經寫在磁碟上**才有（索引有、檔案在）；沒有副本、或還在等寫出時是 None——抽樣不為了它多下載，
+    ///   也不讀還在記憶體裡等寫出的內容。
+    /// - `unloaded`：被記憶體控制停用中，或全部清單暫停中
     pub fn probe_sources(&self) -> Vec<ProbeSource> {
-        Vec::new()
+        let ex = self.excluded();
+        let all = self.all_suspended();
+        let copies = self.copies.get();
+        self.sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.probe)
+            .map(|(i, s)| ProbeSource {
+                url: s.url.clone(),
+                name: s.name.clone(),
+                copy: copies.and_then(|c| {
+                    let m = c.meta(&s.url)?;
+                    let p = c.persister.lock().unwrap();
+                    if p.is_pending(&m.file) {
+                        return None;
+                    }
+                    Some(p.file_path(&m.file)).filter(|f| f.is_file())
+                }),
+                unloaded: all || ex.get(i).copied().unwrap_or(false),
+            })
+            .collect()
     }
 
     /// 開始一次手動更新（重新讀自訂規則、強制檢查每份清單），在背景執行。
@@ -1831,6 +1869,7 @@ impl FilterService {
 
     /// 背景工作：清單定時更新、自訂規則每 3 秒檢查
     pub fn spawn(self: &Arc<Self>) {
+        set_current(self);
         self.reload_custom(true);
         let me = self.clone();
         tokio::spawn(async move {

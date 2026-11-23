@@ -11,6 +11,8 @@
 //! - 結果：評測本來就寫檔（`upstreams.json`、報表、ASN 快取），主程式照舊定時重新讀。
 //! - 排程逾時強制結束：主程式送 SIGTERM，子程序收到後照樣存 ASN 快取與可疑紀錄再結束；10 秒還沒結束就 SIGKILL。
 //! - `benchmark.subprocess: false`、或目前的執行檔不是 kuroshio 本身（例如測試程式）時在同一個程式裡跑（以前的做法）。
+//! - 惡意網站探測的抽樣（3.5.0 F10，[`crate::probesample`]）：啟動評測前由主程式從已下載的惡意類清單抽，
+//!   放進傳給評測的那一份設定的 `benchmark._probeSample`（子程序、同一個程式裡跑都一樣；不存檔）。
 
 use crate::app::{runtime_dir, share_dir, storage_class};
 use crate::sysinfo::StorageClass;
@@ -138,10 +140,13 @@ impl Job for BenchJob {
                 crate::upstreams::restore_never_ok(never_ok);
             }
         }
+        let paths = self.inner.paths.clone();
         match self.child.clone() {
             Some((exe, state, base)) => {
                 let (progress, last) = (self.progress.clone(), self.last.clone());
                 Box::pin(async move {
+                    // 惡意網站探測的網域：主程式抽樣，跟著設定從標準輸入傳給子程序（3.5.0 F10）
+                    let ctx = crate::probesample::prepare(ctx, &paths).await;
                     let t0 = std::time::Instant::now();
                     let (r, peak) = run_child_peak(&exe, &state, &base, &ctx, progress).await;
                     *last.lock().unwrap() = Some(json!({
@@ -158,9 +163,11 @@ impl Job for BenchJob {
                 })
             }
             None => {
-                let f = Job::run(&self.inner, ctx);
+                let inner = self.inner.clone();
                 Box::pin(async move {
-                    let r = f.await;
+                    // 不用子程序：抽樣結果放進同一份設定直接給（3.5.0 F10）
+                    let ctx = crate::probesample::prepare(ctx, &paths).await;
+                    let r = Job::run(&inner, ctx).await;
                     if r.is_ok() {
                         crate::chain::note_own_run("dns-benchmark");
                     }

@@ -34,6 +34,7 @@ pub mod observe;
 pub mod pathcheck;
 pub mod persist;
 pub mod presence;
+pub mod probesample;
 pub mod querylog;
 pub mod resolver;
 pub mod server;

@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(
             get(&d, "benchmark.malwareProbe"),
             Some(&json!(true)),
-            "惡意網站探測預設開，但附帶的 probe.txt 是空的＝不跑（3.5.0 A5）"
+            "惡意網站探測預設開（3.5.0 A5；F10 起探測網域從已下載的惡意類清單抽樣，probe.txt 可以留空）"
         );
         assert_eq!(get(&d, "cdn.multiCdn"), Some(&json!(true)), "尊重多來源 CDN（3.5.0 B3）");
         assert_eq!(
