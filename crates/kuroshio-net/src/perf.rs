@@ -82,13 +82,17 @@ pub static DOH: Tls = Tls::new();
 /// QUIC（DoQ、DoH3）上游：建立的連線數、失敗數（QUIC 的握手在 quinn 裡，這裡只數連線）
 pub static QUIC_NEW: AtomicU32 = AtomicU32::new(0);
 pub static QUIC_FAIL: AtomicU32 = AtomicU32::new(0);
+/// 目前開著的 QUIC 上游連線數（3.5.0 F4）：`connect()` 成功 +1、連線結束（被關閉、閒置逾時、不再使用）−1。
+/// `new` 是新建的連線數；連線每 10 秒送 keep-alive、會重複使用很久，所以壓測前後 `new` 的差可能是 0
+pub static QUIC_OPEN: AtomicU32 = AtomicU32::new(0);
 
 /// `/api/status` 的 `perf.tls`
 pub fn json() -> Value {
     json!({
         "dot": DOT.json(),
         "doh": DOH.json(),
-        "quic": { "new": QUIC_NEW.load(Ordering::Relaxed), "fail": QUIC_FAIL.load(Ordering::Relaxed) },
+        "quic": { "new": QUIC_NEW.load(Ordering::Relaxed), "fail": QUIC_FAIL.load(Ordering::Relaxed),
+                  "open": QUIC_OPEN.load(Ordering::Relaxed) },
     })
 }
 

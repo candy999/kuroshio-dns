@@ -528,11 +528,15 @@ pub struct FindInputs {
     pub upstreams: Vec<(bool, bool)>,
     /// 最近 15 分鐘的（過期快取, 查詢）
     pub stale_15m: (u64, u64),
+    /// 最近 15 分鐘背景更新失敗的次數（3.5.0 F3；跟 `stale_15m` 同一個時間窗）
+    pub stale_fail_15m: u64,
     pub counters: kuroshio_cdn::ObserveCounters,
     /// `Cdn::observe_json()`（CDN 關著是 `null`）
     pub cdn_observe: Value,
     /// `cdn.prunedForBudget`
     pub cdn_pruned: Option<u32>,
+    /// `Cdn::pace_json()`（3.5.0 F12：CDN 驗證節流；CDN 關著是 `null`）
+    pub cdn_pace: Value,
     /// `/api/chain`（含 `audit`）
     pub chain: Value,
     /// 載入中、但沒有本機副本的清單數
@@ -590,13 +594,16 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
     ));
 
     // 過期快取
+    // 3.5.0 F3（D23）：查詢少、重複多的家裡，過期的紀錄「先回舊答案、背景再更新」比例本來就高，不代表上游有狀況。
+    // 四個都要成立：查詢 100 筆以上、過期佔 5% 以上、背景更新失敗 5 次以上、過期回答裡至少四分之一是更新失敗
     let (s15, q15) = i.stale_15m;
+    let err15 = i.stale_fail_15m;
     let pct = if q15 > 0 { s15 as f64 * 100.0 / q15 as f64 } else { 0.0 };
     out.push(state(
         "serve-stale-high",
         Sev::Warn,
-        q15 >= 50 && s15 * 20 >= q15,
-        format!("最近 15 分鐘有 {pct:.0}% 的查詢靠過期快取回答（{s15}／{q15}）：上游可能有狀況"),
+        q15 >= 100 && s15 * 20 >= q15 && err15 >= 5 && err15 * 4 >= s15,
+        format!("最近 15 分鐘有 {pct:.0}% 的查詢靠過期快取回答，其中 {err15} 次背景更新失敗：上游可能有狀況"),
     ));
 
     // 台灣節點驗證失敗率（最近一小時）
@@ -663,7 +670,7 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
             Sev::Info,
             n,
             0,
-            format!("磁碟預算不夠，淘汰了 CDN 網域資料（累計 {n} 筆）"),
+            format!("CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 {n} 筆）"),
         ));
     }
 
@@ -786,6 +793,16 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
             kuroshio_jobs::time::fmt_date_time(fuse)
         ),
     ));
+
+    // 3.5.0 F12：新網域很多（或 CPU 很忙），CDN 驗證減量中（狀態類；欄位不齊時不報）
+    let paced = i.cdn_pace["paced"] == true;
+    let per_min = i.cdn_pace["perMin"].as_u64().unwrap_or(0);
+    out.push(state(
+        "cdn-verify-paced",
+        Sev::Info,
+        paced && per_min > 0,
+        format!("新網域很多，CDN 驗證減量中（每分鐘 {per_min} 個）"),
+    ));
     (out, sample)
 }
 
@@ -814,8 +831,10 @@ fn find_inputs(st: &AppState, now: u64) -> FindInputs {
         now,
         upstreams,
         stale_15m: r.stats.stale_15m(),
+        stale_fail_15m: r.stats.stale_refresh_fail_15m(),
         counters: cdn.as_ref().map(|c| c.observe_counters()).unwrap_or_default(),
         cdn_observe: cdn.as_ref().map(|c| c.observe_json()).unwrap_or(Value::Null),
+        cdn_pace: cdn.as_ref().map(|c| c.pace_json()).unwrap_or(Value::Null),
         pool_nodes: cdn.as_ref().map_or(0, |c| {
             let st = c.state();
             st.pools

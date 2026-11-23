@@ -1124,6 +1124,8 @@ fn answer_ok_ip(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {
 /// 串接上游沒有回應（逾時；等兩倍的 timeoutMs 再加 1 秒）：這一筆照舊改問自己的上游，連續 3 次才暫停串接
 #[tokio::test]
 async fn chain_timeout_still_falls_back() {
+    // 其他串接測試會改路徑檢查的狀態（一般 DNS 被接走時備援會被拿掉）：一起排隊，不然偶爾會失敗
+    let _path = PATH_STATE.lock().await;
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap(); // 收了不回
     let chain = dead.local_addr().unwrap();
     let (own, n_own) = upstream(0, answer_ok_ip).await;
@@ -1338,4 +1340,229 @@ async fn comm_prefetched_without_recent_hit() {
         assert_eq!(n.load(Ordering::SeqCst) - before, want, "{name}");
     }
     assert_eq!(r.comm_prefetching(), 0, "預取完成後歸零");
+}
+
+// ================= 3.5.0 F4：上游成敗的記法 =================
+
+/// 假上游：名稱是 `dead` 開頭的不回（等到逾時），其他回 198.51.100.77；計算收到幾次查詢
+async fn dead_for_dead_names() -> (SocketAddr, Arc<AtomicUsize>) {
+    let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = s.local_addr().unwrap();
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let Ok((len, peer)) = s.recv_from(&mut buf).await else { break };
+            n2.fetch_add(1, Ordering::SeqCst);
+            let q = Message::parse(&buf[..len]).unwrap();
+            if q.questions[0].name.starts_with("dead") {
+                continue;
+            }
+            let mut r = Message::response_to(&q, 0);
+            r.opt = None;
+            r.answers = vec![a(&q.questions[0].name, 300, [198, 51, 100, 77])];
+            let _ = s.send_to(&r.encode(), peer).await;
+        }
+    });
+    (addr, n)
+}
+
+fn up_json(r: &kuroshio::resolver::Resolver, addr: SocketAddr) -> Value {
+    let id = format!("udp://{addr}");
+    r.upstreams
+        .list_json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("{id}"))
+}
+
+/// D9／H11：收得到查詢、永遠不回的上游，別台先答完就被取消。以前成功、失敗都不記，沒有延遲紀錄時還排在最前面、
+/// 每一筆都佔掉先問的名額；現在記成「來不及回答」、平均延遲設成等了多久，排到後面
+#[tokio::test]
+async fn upstream_that_never_answers_in_time_is_noted_and_sorted_last() {
+    let hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent = hole.local_addr().unwrap();
+    let (f1, n1) = upstream(0, answer).await;
+    let (f2, n2) = upstream(0, answer).await;
+    // 先問 2 台：設定順序裡沒回應的排第一
+    let c = cfg(
+        &[silent, f1, f2],
+        json!({ "resolver": { "fastPath": false, "parallel": 2, "timeoutMs": 1500, "collectWindowMs": 50, "hedgeMs": 1000 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.handle(&q(1, "first.example.com", 1), &CTX).await.unwrap();
+    let s = up_json(&r, silent);
+    assert_eq!(s["late"], 1, "{s}");
+    assert_eq!((s["ok"].clone(), s["fail"].clone()), (json!(0), json!(0)), "一次來不及還不算失敗");
+    assert!(s["avgMs"].as_f64().is_some_and(|ms| ms >= 40.0), "平均延遲設成等了多久：{s}");
+    // 之後先問的是兩台會回答的
+    for i in 0..10u16 {
+        r.handle(&q(10 + i, &format!("n{i}.example.com"), 1), &CTX).await.unwrap();
+    }
+    assert_eq!(up_json(&r, silent)["late"], 1, "排到後面，不再佔先問的名額");
+    assert_eq!(n1.load(Ordering::SeqCst) + n2.load(Ordering::SeqCst), 1 + 20);
+    drop(hole);
+}
+
+/// H7：大家都答不出來的網域（4 個死網域，每一台都等到逾時）不算任何一台失敗，記在 unanswered
+#[tokio::test]
+async fn round_where_nobody_answers_counts_no_failures() {
+    let (a1, _) = dead_for_dead_names().await;
+    let (a2, _) = dead_for_dead_names().await;
+    let (a3, _) = dead_for_dead_names().await;
+    let c = cfg(
+        &[a1, a2, a3],
+        json!({ "resolver": { "fastPath": false, "parallel": 0, "timeoutMs": 200 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    for i in 0..4u16 {
+        let m = Message::parse(&r.handle(&q(i, &format!("dead{i}.example.com"), 1), &CTX).await.unwrap()).unwrap();
+        assert_eq!(m.rcode, 2);
+    }
+    for up in [a1, a2, a3] {
+        let j = up_json(&r, up);
+        assert_eq!(j["fail"], 0, "{j}");
+        assert_eq!(j["unanswered"], 4, "{j}");
+    }
+    // 只有一台答不出來、別台正常回答：那一台照算失敗
+    let hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent = hole.local_addr().unwrap();
+    let c = cfg(
+        &[a1, silent],
+        json!({ "resolver": { "fastPath": false, "parallel": 0, "timeoutMs": 200, "collectWindowMs": 400 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.handle(&q(9, "alive.example.com", 1), &CTX).await.unwrap();
+    let j = up_json(&r, silent);
+    assert_eq!((j["fail"].clone(), j["unanswered"].clone()), (json!(1), json!(0)), "{j}");
+    drop(hole);
+}
+
+/// 很快就回來的錯誤（連線被拒）是這台自己的問題：不等這一輪結束，照舊立刻記失敗，就算整輪沒有人答
+#[tokio::test]
+async fn fast_errors_still_count_at_once() {
+    // 綁了又關掉的 TCP 埠：連線被拒
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let (dead, _) = dead_for_dead_names().await;
+    let mut c = cfg(
+        &[dead],
+        json!({ "resolver": { "fastPath": false, "parallel": 0, "timeoutMs": 300 } }),
+    );
+    kuroshio_config::merge(
+        &mut c,
+        &json!({ "upstream": { "pinned": [format!("udp://{dead}"), format!("tcp://{closed}")] } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let tcp_fail = |r: &kuroshio::resolver::Resolver| {
+        let id = format!("tcp://{closed}");
+        r.upstreams.list_json().as_array().unwrap().iter().find(|u| u["id"] == id).unwrap()["fail"].clone()
+    };
+    r.handle(&q(1, "dead1.example.com", 1), &CTX).await.unwrap();
+    assert_eq!(tcp_fail(&r), 1, "整輪沒有人答：連線被拒的照算");
+    assert_eq!(up_json(&r, dead)["fail"], 0, "逾時的不算");
+    r.handle(&q(2, "alive.example.com", 1), &CTX).await.unwrap();
+    assert_eq!(tcp_fail(&r), 2);
+}
+
+/// SERVFAIL：單一上游 SERVFAIL 而別台正常回答才算那台失敗（3.4.2，不改）；分開記在 servfail
+#[tokio::test]
+async fn servfail_alone_counts_but_all_servfail_does_not() {
+    let (a, _) = upstream(0, servfail).await;
+    let (b, _) = upstream(0, servfail).await;
+    let c = cfg(&[a, b], json!({ "resolver": { "fastPath": false, "parallel": 0 } }));
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    for i in 0..3u16 {
+        r.handle(&q(i, &format!("broken{i}.example.com"), 1), &CTX).await.unwrap();
+    }
+    for up in [a, b] {
+        let j = up_json(&r, up);
+        assert_eq!((j["fail"].clone(), j["servfail"].clone()), (json!(0), json!(3)), "{j}");
+    }
+    let (ok, _) = upstream(0, answer_ok_ip).await;
+    let c = cfg(
+        &[ok, a],
+        json!({ "resolver": { "fastPath": false, "parallel": 0, "collectWindowMs": 300 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.handle(&q(9, "mixed.example.com", 1), &CTX).await.unwrap();
+    let j = up_json(&r, a);
+    assert_eq!((j["fail"].clone(), j["servfail"].clone()), (json!(1), json!(1)), "{j}");
+    assert_eq!(up_json(&r, ok)["servfail"], 0);
+}
+
+/// `upstream.roundAwareFailures` 關掉＝3.4.x 的記法：大家都逾時的那一輪每台都記一次失敗、被取消的上游不記
+#[tokio::test]
+async fn round_aware_off_matches_previous_behaviour() {
+    let (a1, _) = dead_for_dead_names().await;
+    let (a2, _) = dead_for_dead_names().await;
+    let off = json!({ "resolver": { "fastPath": false, "parallel": 0, "timeoutMs": 200 }, "upstream": { "roundAwareFailures": false } });
+    let r = kuroshio::app::build_resolver(&cfg(&[a1, a2], off)).unwrap();
+    for i in 0..3u16 {
+        r.handle(&q(i, &format!("dead{i}.example.com"), 1), &CTX).await.unwrap();
+    }
+    for up in [a1, a2] {
+        let j = up_json(&r, up);
+        assert_eq!((j["fail"].clone(), j["unanswered"].clone()), (json!(3), json!(0)), "{j}");
+    }
+    // 被取消的上游：成功、失敗、來不及都不記，也沒有延遲紀錄
+    let hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent = hole.local_addr().unwrap();
+    let (f1, _) = upstream(0, answer).await;
+    let c = cfg(
+        &[silent, f1],
+        json!({ "resolver": { "fastPath": false, "parallel": 0, "timeoutMs": 1500, "collectWindowMs": 50 },
+                "upstream": { "roundAwareFailures": false } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.handle(&q(1, "x.example.com", 1), &CTX).await.unwrap();
+    let j = up_json(&r, silent);
+    assert_eq!(
+        (j["ok"].clone(), j["fail"].clone(), j["late"].clone(), j["avgMs"].clone()),
+        (json!(0), json!(0), json!(0), Value::Null),
+        "{j}"
+    );
+    drop(hole);
+}
+
+/// 3.5.0 F11：快到期就預取的名額（同時最多 16 個）只給推播、地震速報、使用者自己加的；時間同步、憑證撤銷、系統更新照一般規則。
+/// （使用者自己加的那一組在 `comm.rs` 的單元測試：`keepNames` 是整個行程共用的，這裡其他測試建解析器時會清掉）
+#[tokio::test]
+async fn only_push_quake_and_user_names_use_prefetch_slots() {
+    use kuroshio_net::comm::TEST_ENTRIES;
+    kuroshio_net::comm::set_test_entries(TEST_ENTRIES);
+    let (up, n) = upstream(0, short_ttl).await;
+    let c = cfg(
+        &[up],
+        json!({ "resolver": { "prefetchRecentSec": 1, "fastPath": false, "rankIps": false } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let cases: Vec<(String, usize)> = vec![
+        (format!("gw.{}", kuroshio_net::comm::COMM_SUFFIXES[0].0), 2),
+        ("gw.quake.essential.example.com".into(), 2),
+        ("gw.ntp.essential.example.com".into(), 1),
+        ("gw.ocsp.essential.example.com".into(), 1),
+        ("gw.update.essential.example.com".into(), 1),
+    ];
+    // 同時跑：每個名稱各自的時間軸一樣（查一次、1.2 秒後再查一次）
+    let mut set = tokio::task::JoinSet::new();
+    let before = n.load(Ordering::SeqCst);
+    for (name, _) in cases.clone() {
+        let r = r.clone();
+        set.spawn(async move {
+            r.handle(&q(1, &name, 1), &CTX).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            r.handle(&q(2, &name, 1), &CTX).await.unwrap();
+        });
+    }
+    while set.join_next().await.is_some() {}
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let want: usize = cases.iter().map(|c| c.1).sum();
+    assert_eq!(n.load(Ordering::SeqCst) - before, want, "只有推播、地震速報有預取");
 }

@@ -480,7 +480,8 @@ pub fn pressure_of(r: &Reading, res: &Reserve) -> Pressure {
 // （不拒絕新的加密連線，只限 32 條）。路由器上保留量只有十幾到二十幾 MB，缺口最多就是保留量，
 // 黑潮自己通常好幾十 MB，所以小機器上不會成立。讀不到自己的用量或可用記憶體時規則不成立（照舊）。
 
-/// 離開「於事無補」要離開的條件連續成立多久（秒）；回到寬裕（可用 ≥ 保留量 + 遲滯）時立刻離開
+/// 離開「於事無補」要離開的條件連續成立多久（秒）。回到寬裕（可用 ≥ 保留量 + 遲滯）也一樣要連續這麼久
+/// （3.5.0 F1：可用記憶體被別的程式拉上拉下時，回到寬裕立刻離開會 5 分鐘進出好幾次）；只有讀不到量測時立刻離開
 pub const FUTILE_EXIT_SECS: u64 = 60;
 
 /// 缺口（保留量 − 可用，沒有缺是 0）與自己的用量（bytes）；有一個量不到（或用量是 0）就是 None
@@ -509,8 +510,8 @@ pub struct FutileGate {
 }
 
 impl FutileGate {
-    /// 依量測更新，回傳有沒有改變。進入：立刻（只會少做事）；離開：讀不到量測或回到寬裕時立刻，
-    /// 否則「用量 × 2 ≥ 缺口 × 1.2」要連續 `dwell` 秒（不會每幾秒切換一次）
+    /// 依量測更新，回傳有沒有改變。進入：立刻（只會少做事）；離開：讀不到量測時立刻（沒有依據繼續判），
+    /// 否則「用量 × 2 ≥ 缺口 × 1.2」（包括回到寬裕：沒有缺口）要連續 `dwell` 秒（不會每幾秒切換一次）
     pub fn step(&mut self, r: &Reading, res: &Reserve, dwell: u64, now: u64) -> bool {
         if !self.on {
             if futile_enter(r, res) {
@@ -520,12 +521,12 @@ impl FutileGate {
             }
             return false;
         }
-        let comfortable = r.avail.is_some_and(|a| a >= res.bytes.saturating_add(res.margin()));
-        if deficit_and_own(r, res).is_none() || comfortable {
+        if deficit_and_own(r, res).is_none() {
             self.on = false;
             self.exit_since = None;
             return true;
         }
+        // 回到寬裕時缺口是 0，`futile_hold` 不成立，跟「讓得出來」一起算連續時間
         if futile_hold(r, res) {
             self.exit_since = None;
             return false;
@@ -540,21 +541,19 @@ impl FutileGate {
     }
 }
 
+/// bytes → MB，四捨五入（3.5.0 F6／H12：日誌以前用 `>> 20` 捨去，狀態頁四捨五入，保留量一邊 3,264 一邊 3,265）
+pub fn mb_round(bytes: u64) -> u64 {
+    bytes.saturating_add(1 << 19) >> 20
+}
+
 /// 進入 / 離開「於事無補」的那一行日誌（進入 WARN、離開 info；只在改變時寫）
 pub fn futile_message(on: bool, r: &Reading, res: &Reserve) -> String {
     let (d, own) = deficit_and_own(r, res).unwrap_or((0, 0));
+    let (d, own) = (mb_round(d), mb_round(own));
     if on {
-        format!(
-            "可用記憶體不足是其他程式造成（缺口 {} MB，黑潮全部讓出也只有 {} MB）：只停止長大、寫出快照，不縮快取、不停用清單",
-            d >> 20,
-            own >> 20
-        )
+        format!("可用記憶體不足是其他程式造成（缺口 {d} MB，黑潮全部讓出也只有 {own} MB）：只停止長大、寫出快照，不縮快取、不停用清單")
     } else {
-        format!(
-            "記憶體缺口回到黑潮讓得出來的範圍（缺口 {} MB，黑潮 {} MB）：照一般的方式讓出與恢復",
-            d >> 20,
-            own >> 20
-        )
+        format!("記憶體缺口回到黑潮讓得出來的範圍（缺口 {d} MB，黑潮 {own} MB）：照一般的方式讓出與恢復")
     }
 }
 
@@ -668,6 +667,21 @@ pub fn restore_room(r: &Reading, res: &Reserve) -> u64 {
 /// 讓出的記憶體值不值得寫一行 WARN（1 KB 以上）
 fn worth_warning(bytes: u64) -> bool {
     bytes >= 1024
+}
+
+/// CDN 冷資料移出的結果。沒有冷資料是「做了 0」而不是錯誤（3.5.0 F6／H8：以前記憶體吃緊時每分鐘一行
+/// WARN「…沒有做：沒有可以移出的冷資料」）；0 bytes 的結果走 DEBUG，這一步照樣等久一點再試
+fn cdn_evict_outcome(entries: usize, bytes: u64) -> Outcome {
+    if entries == 0 {
+        return Outcome {
+            bytes: 0,
+            detail: "沒有可以移出的冷資料".into(),
+        };
+    }
+    Outcome {
+        bytes,
+        detail: format!("{entries} 筆（磁碟上保留，查到時讀回）"),
+    }
 }
 
 pub fn list_allowance(r: &Reading, res: &Reserve, lists_bytes: u64) -> Option<u64> {
@@ -960,9 +974,20 @@ impl Governor {
                 let (d, own) = deficit_and_own(&r, &self.reserve).unwrap_or((0, 0));
                 i.waiting = Some(format!(
                     "於事無補：缺口 {} MB 是其他程式造成（黑潮全部讓出也只有 {} MB），只停止長大、不讓出",
-                    d >> 20,
-                    own >> 20
+                    mb_round(d),
+                    mb_round(own)
                 ));
+                None
+            } else if state > State::Comfortable
+                && r.avail
+                    .is_some_and(|a| a >= self.reserve.bytes.saturating_add(self.reserve.margin()))
+                && r.psi.map_or(true, |p| p.calm())
+            {
+                // 狀態還在等穩定（`dwell`），但這一次的讀數已經回到保留量 + 遲滯以上、PSI 也平靜：沒有缺口，不讓出。
+                // 常見的是別的程式（Windows 上的大模型）一下子放掉記憶體：狀態要穩定 180 秒才降，這段時間照狀態去讓出
+                // 就會在可用記憶體很多的時候移出 CDN 冷資料、縮診斷緩衝（3.5.0 F1，Windows 實測 H1）。
+                // 下一次讀數掉回去就照舊讓出（路由器上本來就沒有缺口的那一刻讓出也沒有用）
+                i.waiting = Some("可用記憶體已經回到保留量以上，等狀態穩定，不再讓出".to_string());
                 None
             } else if state > State::Comfortable {
                 let any = (0..self.steps.len()).any(|k| self.eligible(i, k, state, &r, now));
@@ -1033,6 +1058,11 @@ impl Governor {
                                 warn!("記憶體控制：{}（約 {} KB）{}", s.label(), o.bytes / 1024, o.detail);
                             } else {
                                 debug!("記憶體控制：{}（約 {} KB）{}", s.label(), o.bytes / 1024, o.detail);
+                            }
+                            if o.bytes == 0 {
+                                // 這一步沒有東西可以讓（例如 CDN 沒有冷資料，3.5.0 F6／H8）：不是錯誤、不寫 WARN，
+                                // 但跟失敗一樣等久一點再試，不要每一輪都做一次
+                                i.skip_until[k] = now + (self.gap * 10).max(60);
                             }
                             i.freed_total += o.bytes;
                             freed += o.bytes;
@@ -1481,13 +1511,7 @@ impl Step for CdnStep {
         Box::pin(async move {
             let r = evict_cdn(&self.cdn, &self.persister, &self.sources, self.cold_ms).await?;
             *self.bytes.lock().unwrap() = r.bytes as u64;
-            if r.entries == 0 {
-                anyhow::bail!("沒有可以移出的冷資料");
-            }
-            Ok(Outcome {
-                bytes: r.bytes as u64,
-                detail: format!("{} 筆（磁碟上保留，查到時讀回）", r.entries),
-            })
+            Ok(cdn_evict_outcome(r.entries, r.bytes as u64))
         })
     }
     fn restore(&self) -> BoxFut<'_, anyhow::Result<Outcome>> {
@@ -1903,7 +1927,7 @@ mod tests {
         assert!(!futile_enter(&r(3000), &res));
     }
 
-    /// 遲滯：離開要「用量 × 2 ≥ 缺口 × 1.2」連續 60 秒；回到寬裕或讀不到用量時立刻離開
+    /// 遲滯：離開要「用量 × 2 ≥ 缺口 × 1.2」（包括回到寬裕）連續 60 秒；讀不到用量時立刻離開
     #[test]
     fn futile_gate_hysteresis() {
         let res = res100();
@@ -1933,8 +1957,15 @@ mod tests {
             }
         }
         assert_eq!(changes, 1, "只進入一次");
-        // 回到寬裕（可用 ≥ 保留量 + 遲滯）：立刻離開
-        assert!(g.step(&rdo(160, Some(20)), &res, d, 2000));
+        // 回到寬裕（可用 ≥ 保留量 + 遲滯）：3.5.0 F1 起也要連續 60 秒才離開（以前立刻離開，5 分鐘進出 4 次）
+        assert!(
+            !g.step(&rdo(30, Some(20)), &res, d, 1998),
+            "上面最後一次是讓得出來的讀數：先回到維持"
+        );
+        assert!(!g.step(&rdo(160, Some(20)), &res, d, 2000));
+        assert!(!g.step(&rdo(160, Some(20)), &res, d, 2000 + d - 1));
+        assert!(g.on);
+        assert!(g.step(&rdo(160, Some(20)), &res, d, 2000 + d), "回到寬裕連續 60 秒才離開");
         assert!(!g.on);
         // 讀不到自己的用量：規則不成立，立刻離開（照舊讓出）
         assert!(g.step(&rdo(30, Some(20)), &res, d, 3000));
@@ -2570,7 +2601,14 @@ mod tests {
         }
         assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
         assert_eq!(g.status_json()["floor"], true, "已經只轉送的維持");
-        // 回到寬裕：立刻離開於事無補，照一般規則依相反順序恢復
+        // 回到寬裕：連續 60 秒後離開於事無補（3.5.0 F1；以前立刻離開），照一般規則依相反順序恢復
+        let back = now;
+        for _ in 0..(FUTILE_EXIT_SECS / 5) {
+            now += 5;
+            assert!(g.observe_futile(&rdo(600, Some(30)), now), "回到寬裕還不到 60 秒：維持");
+            assert!(g.tick(rdo(600, Some(30)), now).await.is_none(), "於事無補期間不讓也不恢復");
+        }
+        assert!(now - back <= FUTILE_EXIT_SECS);
         for _ in 0..400 {
             now += 5;
             g.observe_futile(&rdo(600, Some(30)), now);
@@ -2580,6 +2618,180 @@ mod tests {
         let l = log.lock().unwrap().clone();
         assert_eq!(l.first().map(String::as_str), Some("restore:floor"), "{l:?}");
         assert!(l.contains(&"restore:diagnostics".to_string()), "{l:?}");
+    }
+
+    /// 3.5.0 F1（Windows 實測 H1，收 Windows 本地 AI 的 patch）：於事無補中，別的程式一下子放掉記憶體
+    /// （可用從 30 MB 跳到 600 MB）。於事無補要連續 60 秒才離開；離開之後狀態還在等穩定（`dwell`），
+    /// 這段時間讀數沒有缺口，不應該照狀態去讓出（以前會在可用 10 GB 的時候移出 CDN 冷資料）
+    #[tokio::test]
+    async fn no_shed_after_futile_exit_when_reading_is_back_above_reserve() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let g = Governor::new(res100(), ladder(&log, 2 * MB), 0);
+        g.tick(rdo(600, Some(20)), 100).await;
+        let mut now = 1000;
+        // 可用 30 MB、缺口 70 MB，黑潮 20 MB：於事無補，什麼都不讓
+        let low = rdo(30, Some(20));
+        for _ in 0..5 {
+            assert!(g.observe_futile(&low, now));
+            assert!(g.tick(low, now).await.is_none());
+            now += 2;
+        }
+        assert_eq!(g.state(), State::Critical);
+        // 別的程式放掉記憶體：回到寬裕的讀數（≥ 保留量 + 遲滯）。於事無補 60 秒後才離開；狀態還在等穩定
+        let high = rdo(600, Some(20));
+        for _ in 0..40 {
+            g.observe_futile(&high, now);
+            assert!(g.tick(high, now).await.is_none(), "沒有缺口：不讓出");
+            now += 2;
+        }
+        assert!(!g.is_futile());
+        assert!(g.state() > State::Comfortable, "狀態照舊要穩定一段時間才降");
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        assert!(g.status_json()["waiting"].as_str().unwrap().contains("回到保留量以上"));
+        // 讀數再掉回保留量以下（而且讓得出來）：照一般規則讓出
+        let r = rdo(90, Some(40));
+        g.observe_futile(&r, now);
+        assert!(g.tick(r, now).await.is_some());
+    }
+
+    /// 3.5.0 F1：W5 情境 3 的時間序列（19:41:06 進、:26 出、:36 進、19:43:21 出、:24 進、:32 出、:42 進）。
+    /// 回到寬裕也要連續 60 秒才離開：整段只進入一次、不離開，期間什麼都不讓；之後真的寬裕 60 秒才離開一次
+    #[tokio::test]
+    async fn futile_exit_needs_60s_even_when_comfortable() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let g = Governor::new(res100(), ladder(&log, 2 * MB), 0);
+        g.tick(rdo(600, Some(20)), 100).await;
+        let t0 = 1000u64;
+        // 相對 19:41:06 的秒數：寬裕的區間（其他時間是缺口很大、黑潮讓了也沒用）
+        let high_spans = [(20u64, 30u64), (135, 138), (146, 156)];
+        let mut flips = Vec::new();
+        let mut was = false;
+        for t in (0..=300u64).step_by(2) {
+            let high = high_spans.iter().any(|&(a, b)| t >= a && t < b);
+            let r = if high { rdo(600, Some(20)) } else { rdo(30, Some(20)) };
+            let on = g.observe_futile(&r, t0 + t);
+            if on != was {
+                flips.push((t, on));
+                was = on;
+            }
+            assert!(g.tick(r, t0 + t).await.is_none(), "t = {t}：什麼都不讓");
+        }
+        assert_eq!(flips, vec![(0, true)], "只進入一次、沒有來回");
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+        // 真的寬裕連續 60 秒：離開一次
+        let mut t = 302;
+        while t <= 302 + FUTILE_EXIT_SECS {
+            let on = g.observe_futile(&rdo(600, Some(20)), t0 + t);
+            if on != was {
+                flips.push((t, on));
+                was = on;
+            }
+            t += 2;
+        }
+        assert_eq!(flips, vec![(0, true), (302 + FUTILE_EXIT_SECS, false)]);
+        let ev = g.status_json()["events"].as_array().unwrap().clone();
+        assert_eq!(
+            ev.iter().filter(|e| e["msg"].as_str().unwrap().contains("讓得出來的範圍")).count(),
+            1,
+            "離開的日誌只有一行：{ev:?}"
+        );
+    }
+
+    /// 3.5.0 F6／H8：沒有冷資料可以移出是「做了 0」，不是錯誤：不寫 WARN（`worth_warning` 不成立，走 DEBUG）、
+    /// 不記「沒有做」，但這一步照樣等久一點（60 秒）再試，不會每一輪都做
+    #[tokio::test]
+    async fn evict_with_nothing_cold_is_debug_not_warn() {
+        let o = cdn_evict_outcome(0, 0);
+        assert_eq!(o.bytes, 0);
+        assert!(!worth_warning(o.bytes), "0 KB：DEBUG");
+        assert!(o.detail.contains("沒有可以移出的冷資料"));
+        let o = cdn_evict_outcome(7679, 4226 * 1024);
+        assert!(worth_warning(o.bytes) && o.detail.contains("7679 筆"));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut cdn = Fake::new("cdn", State::Tight, 99, 0, &log);
+        cdn.bytes = 0;
+        let g = Governor::new(res100(), vec![cdn], 0);
+        g.tick(rd(600), 100).await;
+        let mut now = 1000;
+        while now < 1000 + 59 {
+            g.tick(rd(80), now).await;
+            now += 5;
+        }
+        assert_eq!(*log.lock().unwrap(), ["shed:cdn"], "60 秒內只試一次");
+        let ev = g.status_json()["events"].as_array().unwrap().clone();
+        assert!(ev.iter().all(|e| !e["msg"].as_str().unwrap().contains("沒有做")), "{ev:?}");
+        g.tick(rd(80), 1000 + 60).await;
+        assert_eq!(log.lock().unwrap().len(), 2, "60 秒後再試");
+    }
+
+    /// 3.5.0 F6／H12：日誌的 MB 跟狀態頁一樣四捨五入（保留量 3,264.6 MB：兩邊都是 3,265）
+    #[test]
+    fn log_reserve_rounds_like_ui() {
+        assert_eq!(mb_round(3264 * MB + MB / 2), 3265);
+        assert_eq!(mb_round(3264 * MB + MB / 2 - 1), 3264);
+        assert_eq!(mb_round(0), 0);
+        assert_eq!(mb_round(u64::MAX), u64::MAX >> 20, "不溢位");
+        let res = Reserve::fixed(3264 * MB + MB * 6 / 10);
+        let r = Reading {
+            rss: Some(180 * MB + MB * 7 / 10),
+            total: Some(65536 * MB),
+            avail: Some(1000 * MB),
+            psi: None,
+        };
+        let m = futile_message(true, &r, &res);
+        assert!(m.contains("缺口 2265 MB") && m.contains("只有 181 MB"), "{m}");
+    }
+
+    /// 3.5.0 F1：讀不到量測（可用或自己的用量）時沒有依據繼續判，立刻離開（照舊讓出）
+    #[test]
+    fn futile_exits_at_once_when_unreadable() {
+        let res = res100();
+        let d = FUTILE_EXIT_SECS;
+        for unreadable in [
+            rdo(30, None),
+            Reading {
+                avail: None,
+                ..rdo(30, Some(20))
+            },
+        ] {
+            let mut g = FutileGate::default();
+            assert!(g.step(&rdo(30, Some(20)), &res, d, 0));
+            assert!(g.step(&unreadable, &res, d, 2), "立刻離開，不等 60 秒");
+            assert!(!g.on);
+        }
+    }
+
+    /// 3.5.0 F1：路由器（保留 16 MB、黑潮 20 MB）不會於事無補；吃緊中某一次讀數彈回保留量 + 遲滯以上時那一輪不讓出，
+    /// 下一次讀數掉回去就照舊讓出
+    #[tokio::test]
+    async fn tight_router_still_sheds_when_reading_drops_again() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let res = Reserve::fixed(16 * MB);
+        let g = Governor::new(res, ladder(&log, 2 * MB), 0);
+        let r = |avail_mb: u64| Reading {
+            rss: Some(20 * MB),
+            total: Some(128 * MB),
+            avail: Some(avail_mb * MB),
+            psi: None,
+        };
+        g.tick(r(100), 100).await;
+        let mut now = 1000;
+        // 可用 12 MB（保留 16 MB 以下）：吃緊，讓出一步
+        assert!(!g.observe_futile(&r(12), now));
+        assert!(g.tick(r(12), now).await.is_some());
+        let n = log.lock().unwrap().len();
+        // 讀數彈回 30 MB（≥ 16 + 8）：狀態還是吃緊，但這一輪不讓出
+        now += 10;
+        assert!(!g.observe_futile(&r(30), now));
+        assert!(g.tick(r(30), now).await.is_none());
+        assert_eq!(log.lock().unwrap().len(), n);
+        assert!(g.state() > State::Comfortable);
+        assert!(g.status_json()["waiting"].as_str().unwrap().contains("回到保留量以上"));
+        // 掉回 12 MB：照舊讓出
+        now += 10;
+        assert!(!g.observe_futile(&r(12), now));
+        assert!(g.tick(r(12), now).await.is_some());
+        assert!(log.lock().unwrap().len() > n);
     }
 
     #[tokio::test]

@@ -267,6 +267,123 @@ async fn persist_flush_and_reset_custom_rules() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 3.5.0 F2（D32）：`/api/status?lite=1` 不帶每個快照檔一筆的 `system.persist.files`，改帶 `filesSummary`；
+/// 不帶 `lite` 的完整回應兩個都有，而且加總跟逐檔的一致
+async fn status_with(st: &std::sync::Arc<kuroshio::app::AppState>, lite: bool) -> Value {
+    let q = if lite {
+        [("lite".to_string(), "1".to_string())].into_iter().collect()
+    } else {
+        Default::default()
+    };
+    let r = kuroshio::admin::route(st, "/api/status", &q).await;
+    assert_eq!(r.code, 200, "{}", r.body);
+    r.body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_lite_omits_persist_files_but_has_summary() {
+    let dir = tmp("lite");
+    let cfg = kuroshio_config::with_overrides(&user_cfg(&dir, 0, 0, false));
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let st = &started.state;
+    // 先寫一次，讓快照檔有大小與寫入時間
+    let r = kuroshio::admin::route(st, "/api/persist/flush", &Default::default()).await;
+    assert_eq!(r.code, 200, "{}", r.body);
+    let v = status_with(st, true).await;
+    let p = &v["system"]["persist"];
+    assert!(p.get("files").is_none(), "lite=1 不帶 files：{p}");
+    let sum = &p["filesSummary"];
+    for k in ["count", "bytes", "compressed", "pending"] {
+        assert!(sum[k].is_u64(), "{k}：{sum}");
+    }
+    assert!(sum.get("oldestWriteAt").is_some(), "{sum}");
+    // 其他加總欄位照帶（介面讀的就是這些）
+    for k in ["bytesToday", "oldestUnsavedSec", "maxAgeHours", "space"] {
+        assert!(p.get(k).is_some(), "{k}：{p}");
+    }
+    assert!(v.get("perf").is_none(), "perf 照舊不帶");
+    // 3.5.0 F6／H12：system.rssKB 每個平台都有（跟 memory.rssKB 同一個來源）
+    assert!(v["system"]["rssKB"].as_u64().is_some_and(|k| k > 0), "{}", v["system"]["rssKB"]);
+    started.shutdown();
+    drop(started);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_full_keeps_files() {
+    let dir = tmp("full");
+    let cfg = kuroshio_config::with_overrides(&user_cfg(&dir, 0, 0, false));
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let st = &started.state;
+    let r = kuroshio::admin::route(st, "/api/persist/flush", &Default::default()).await;
+    assert_eq!(r.code, 200, "{}", r.body);
+    let v = status_with(st, false).await;
+    let p = &v["system"]["persist"];
+    let files = p["files"].as_object().unwrap_or_else(|| panic!("完整回應有 files：{p}"));
+    let sum = &p["filesSummary"];
+    assert_eq!(sum["count"], json!(files.len()), "{sum}");
+    let bytes: u64 = files.values().map(|f| f["size"].as_u64().unwrap_or(0)).sum();
+    assert_eq!(sum["bytes"], json!(bytes));
+    let compressed = files.values().filter(|f| f["compressed"] == true).count();
+    assert_eq!(sum["compressed"], json!(compressed));
+    let oldest = files.values().filter_map(|f| f["lastWrite"].as_u64()).min();
+    assert_eq!(sum["oldestWriteAt"], json!(oldest));
+    assert!(v.get("perf").is_some());
+    started.shutdown();
+    drop(started);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 3.5.0 F14：重新載入（`shutdown()`）把排隊中與執行中的工作交給下一輪；程式結束（`shutdown_for()`）不交接
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_does_not_hand_off() {
+    let dir = tmp("handoff");
+    let cfg = kuroshio_config::with_overrides(&user_cfg(&dir, 0, 0, false));
+    // 一個一直跑的工作與一個排隊中的（本機的假工作，不連外）
+    let busy = |started: &kuroshio::app::Started| {
+        let s = started.state.scheduler.clone().unwrap();
+        s.register("test-wait", |_ctx: kuroshio_jobs::JobCtx| async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        s.register("test-next", |_ctx: kuroshio_jobs::JobCtx| async { Ok(()) });
+        assert_eq!(s.request("test-wait", "測試"), json!({ "ok": true }));
+        assert_eq!(s.request("test-next", "測試"), json!({ "ok": true }));
+        s
+    };
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let s = busy(&started);
+    let t0 = std::time::Instant::now();
+    while s.running().is_none() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    started.shutdown_for(kuroshio::app::StopReason::Quit);
+    assert!(!kuroshio::app::job_handoff_pending(), "程式結束：不交接");
+    drop(started);
+    // 重新載入：交接
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let s = busy(&started);
+    let t0 = std::time::Instant::now();
+    while s.running().is_none() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    started.shutdown();
+    assert!(kuroshio::app::job_handoff_pending(), "重新載入：交給下一輪");
+    drop(started);
+    // 下一輪（同一個快照目錄）接手：假工作在新的一輪沒有註冊，取消並寫日誌，交接清空
+    let started = kuroshio::app::start(&cfg).await.unwrap();
+    let t0 = std::time::Instant::now();
+    while kuroshio::app::job_handoff_pending() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "下一輪沒有接手");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    started.shutdown_for(kuroshio::app::StopReason::Quit);
+    drop(started);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `kuroshio run`：KUROSHIO_INIT_CONFIG 建立設定檔；SIGUSR1 寫出快照、SIGHUP 重新載入（都不結束）；SIGTERM 結束
 #[cfg(unix)]
 #[test]

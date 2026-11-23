@@ -557,8 +557,9 @@ impl Resolver {
                 let threshold = p.prefetch_threshold.max(e.ttl as f64 * 0.1);
                 if stale || (remain <= threshold && (recent || popular)) {
                     self.refresh(key.clone(), query.clone());
-                } else if remain <= threshold && kuroshio_net::comm::is_comm(&qname) {
-                    // 通訊類網域（推播，3.5.0）：快到期就預取，不要求最近問過或很熱門（同時最多 COMM_PREFETCH_MAX 個）
+                } else if remain <= threshold && kuroshio_net::comm::flags_of(&qname).prefetch {
+                    // 通訊類網域（推播，3.5.0）：快到期就預取，不要求最近問過或很熱門（同時最多 COMM_PREFETCH_MAX 個）。
+                    // 3.5.0 F11：只有推播、地震速報、使用者自己加的用這些名額（`prefetch` 旗標）
                     self.refresh_comm(key.clone(), query.clone());
                 }
                 if stale {
@@ -587,6 +588,8 @@ impl Resolver {
         let stale = e.remaining(Instant::now()) <= 0.0 && e.class != Class::ServFail;
         if stale {
             self.stats.count(StatKind::Stale);
+            // 3.5.0 F3：上游全部失敗、直接回舊資料（本來就失敗的慢路徑）
+            self.stats.note_stale_refresh_fail();
         }
         if let Some(cat) = self.entry_blocked(&e, Some(ctx.client)) {
             self.stats.blocked(cat);
@@ -712,7 +715,12 @@ impl Resolver {
         self.stats.count(StatKind::Prefetch);
         let me = self.clone();
         tokio::spawn(async move {
-            me.fetch(key, query).await;
+            let e = me.fetch(key, query).await;
+            // 3.5.0 F3：背景更新做完還是過期的（上游全部失敗時 store() 保留舊資料）或 SERVFAIL：記一次更新失敗
+            // （背景工作裡；命中快取的路徑不動）
+            if e.class == Class::ServFail || e.remaining(Instant::now()) <= 0.0 {
+                me.stats.note_stale_refresh_fail();
+            }
         });
     }
 
@@ -964,9 +972,13 @@ impl Resolver {
     /// 10 分鐘 1 個、24 小時 24 個、每個節點一次，`cdn.lite` 30 分鐘 1 個、8 個；`cdn.popAudit` 關、記憶體壓力時回 None），
     /// 用健檢同一個探測（那家 CDN 的 `probe` 路徑）拿到機房、交給 `Cdn::note_local_pop()` 比對。
     /// 不動答案抽查的可疑計數、不解除串接（機房不同是線路拓樸，不是不可信）
+    ///
+    /// 3.5.0 F7：拿到名額、但答案的 IP 不是待確認的節點時，`pop_audit_wanted()` 改回（CDN, 待確認的前幾名節點），
+    /// 量回傳的那個節點（[`AuditTarget`]：舊的回傳只有 CDN 名稱時照舊量答案的 IP）
     async fn pop_audit(&self, ip: IpAddr) {
         let Some(cdn) = self.cdn() else { return };
-        let Some(provider) = cdn.pop_audit_wanted(ip) else { return };
+        let Some(t) = cdn.pop_audit_wanted(ip) else { return };
+        let (provider, ip) = t.target(ip);
         let Some((prov, (host, path))) = kuroshio_cdn::providers::get(provider).and_then(|p| Some((p, p.probe?))) else {
             return;
         };
@@ -1092,42 +1104,54 @@ impl Resolver {
         let mut set = JoinSet::new();
         // 這台自己沒開 CDN 置換：問上游黑潮時請它照原樣回答（3.4.3）
         let no_cdn = self.steer_cdn().is_none().then(|| with_no_cdn(q)).flatten();
-        let spawn = |set: &mut JoinSet<_>, up: Arc<Up>| {
+        // 3.5.0 F4：哪幾台已經送出、什麼時候送的、回來了沒（list 裡的位置；固定大小、在堆疊上，不配置）。
+        // 這一輪結束時還沒回來的就是「來不及回答」
+        let round_aware = p.round_aware_failures;
+        let t_round = Instant::now();
+        let mut sent_at = [t_round; LATE_TRACK];
+        let mut back: u32 = 0;
+        let spawn = |set: &mut JoinSet<_>, sent_at: &mut [Instant; LATE_TRACK], i: usize, up: Arc<Up>| {
             let q = match &no_cdn {
                 Some(nq) if up.role == Role::Chain => nq.clone(),
                 _ => q.to_vec(),
             };
             let t = timeout_for(p, &up);
+            if i < LATE_TRACK {
+                sent_at[i] = Instant::now();
+            }
             set.spawn(async move {
                 let t0 = Instant::now();
                 let r = up.up.exchange(&q, t).await;
-                (up, r, t0.elapsed().as_secs_f64() * 1000.0)
+                (i, up, r, t0.elapsed().as_secs_f64() * 1000.0)
             });
         };
-        for u in list.iter().take(first) {
-            spawn(&mut set, u.clone());
+        for (i, u) in list.iter().enumerate().take(first) {
+            spawn(&mut set, &mut sent_at, i, u.clone());
         }
-        let mut rest = list.iter().skip(first).cloned();
+        let mut rest = list.iter().cloned().enumerate().skip(first);
         let longest = list.iter().map(|u| timeout_for(p, u)).max().unwrap_or(p.timeout);
         let hard = tokio::time::sleep(longest + Duration::from_millis(100));
         tokio::pin!(hard);
         let mut window: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let mut hedge = Box::pin(tokio::time::sleep(p.hedge));
         let mut got_ok = false;
-        // 回 SERVFAIL 的上游：等這一輪結束才決定算不算失敗（3.4.2）
-        let mut servfails: Vec<(Arc<Up>, f64)> = Vec::new();
+        // 回 SERVFAIL 的上游：等這一輪結束才決定算不算失敗（3.4.2）。第三個值：逾時（3.5.0 F4，等了 90% 以上才失敗）
+        let mut servfails: Vec<(Arc<Up>, f64, bool)> = Vec::new();
         loop {
             tokio::select! {
                 r = set.join_next() => {
-                    let (up, r, ms) = match r {
+                    let (i, up, r, ms) = match r {
                         Some(Ok(x)) => x,
                         // 某個上游的工作 panic：當成那個上游失敗，其他的照常等
                         Some(Err(_)) => {
-                            if let Some(u) = rest.next() { spawn(&mut set, u); }
+                            if let Some((i, u)) = rest.next() { spawn(&mut set, &mut sent_at, i, u); }
                             continue;
                         }
                         None => break,
                     };
+                    if i < LATE_TRACK {
+                        back |= 1 << i;
+                    }
                     match r.ok().and_then(|b| Message::parse(&b).ok()) {
                         Some(msg) => {
                             let mut class = logic::classify(&msg, qtype);
@@ -1136,8 +1160,11 @@ impl Resolver {
                             if up.role == Role::Chain && class == Class::NoData && blocked_by_ede(&msg) {
                                 class = Class::Blocked;
                             }
+                            if class == Class::ServFail {
+                                up.note_servfail();
+                            }
                             if class == Class::ServFail && up.role != Role::Chain {
-                                servfails.push((up.clone(), ms));
+                                servfails.push((up.clone(), ms, false));
                             } else {
                                 up.record(answered_ok(&up, class), ms);
                             }
@@ -1156,7 +1183,7 @@ impl Resolver {
                                 window = Some(Box::pin(tokio::time::sleep(p.window)));
                             }
                             if a.class != Class::Ok {
-                                if let Some(u) = rest.next() { spawn(&mut set, u); }
+                                if let Some((i, u)) = rest.next() { spawn(&mut set, &mut sent_at, i, u); }
                             }
                             out.push(a);
                             // 已經有兩台回否定答案、還沒有正常回應：多數決已經定了，不再等其他上游
@@ -1169,37 +1196,59 @@ impl Resolver {
                             }
                         }
                         None => {
-                            if defer_silent && up.role != Role::Chain {
-                                servfails.push((up.clone(), ms));
+                            // 3.5.0 F4：等到逾時（`timeout_for()` 的 90% 以上）才失敗的，跟 SERVFAIL 一樣先收著，
+                            // 這一輪有別的上游正常回答才算它失敗（大家都答不出來的網域不算個別上游的失敗）；
+                            // 很快就回來的錯誤（連線被拒、TLS 失敗、HTTP 4xx）照舊立刻記——那是這台自己的問題
+                            let timed_out = round_aware
+                                && up.role != Role::Chain
+                                && ms >= timeout_for(p, &up).as_secs_f64() * 1000.0 * 0.9;
+                            if (defer_silent && up.role != Role::Chain) || timed_out {
+                                servfails.push((up.clone(), ms, timed_out));
                             } else {
                                 up.record(false, ms);
                             }
-                            if let Some(u) = rest.next() { spawn(&mut set, u); }
+                            if let Some((i, u)) = rest.next() { spawn(&mut set, &mut sent_at, i, u); }
                         }
                     }
                 }
                 _ = async { window.as_mut().unwrap().await }, if window.is_some() => break,
                 _ = &mut hedge, if !got_ok && rest.len() > 0 => {
-                    if let Some(u) = rest.next() { spawn(&mut set, u); }
+                    if let Some((i, u)) = rest.next() { spawn(&mut set, &mut sent_at, i, u); }
                     hedge = Box::pin(tokio::time::sleep(p.hedge));
                 }
                 _ = &mut hard => break,
             }
         }
+        // 3.5.0 F4：這一輪有沒有上游正常回答（Ok、NODATA、NXDOMAIN、上游自己的過濾擋掉都算「答得出來」）
+        let answered = out
+            .iter()
+            .any(|a| matches!(a.class, Class::Ok | Class::NoData | Class::NxDomain | Class::Blocked));
+        if round_aware && answered {
+            // 來不及回答：已經送出、還沒回來就要被取消的（串接上游除外：它是唯一的主要上游，沒有「別台先答完」）
+            let sent = list.len() - rest.len();
+            for (i, up) in list.iter().enumerate().take(sent.min(LATE_TRACK)) {
+                if back & (1 << i) == 0 && up.role != Role::Chain {
+                    up.note_late(sent_at[i].elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+        }
         set.abort_all();
         // SERVFAIL 只在「同一筆有別的上游正常回答」時才算那台失敗：大家都解析不到（剛註冊、權威伺服器壞掉的網域）
         // 是網域的問題，不是上游的。以前照算，壓測新網域時自己的 DoH／DoT 一直被暫停 1→2→4 分鐘
-        // （padavan-tw 的 3.4.2 單獨運作測試，每段 35～38 次）
-        if out.iter().any(|a| a.class == Class::Ok) {
-            for (up, ms) in servfails {
+        // （padavan-tw 的 3.4.2 單獨運作測試，每段 35～38 次）。逾時的（3.5.0 F4）也一樣，條件是有別台答得出來
+        let any_ok = out.iter().any(|a| a.class == Class::Ok);
+        for (up, ms, timed_out) in servfails {
+            if (timed_out && answered) || (!timed_out && any_ok) {
                 up.record(false, ms);
+            } else if timed_out {
+                up.note_unanswered();
             }
         }
         // 效能計數器（3.5.0）：這次實際送出幾個上游查詢（list 裡還沒拿出來的就是沒送）
         perf::note_ask(list.len() - rest.len(), all);
         Asked {
             answers: out,
-            unasked: rest.collect(),
+            unasked: rest.map(|(_, u)| u).collect(),
         }
     }
 
@@ -1461,6 +1510,29 @@ fn answered_ok(up: &Up, class: Class) -> bool {
     }
 }
 
+/// `Cdn::pop_audit_wanted()` 的回傳（3.5.0 F7）：只有 CDN 名稱（E4：量答案的那個 IP），
+/// 或（CDN, 要量的節點 IP）（F7：答案的 IP 不是待確認的節點時，改量待確認的前幾名節點）。兩種都接，CDN 那一層改了這邊不用跟著改
+pub trait AuditTarget {
+    /// （CDN 名稱, 要量的 IP）；`answer_ip` 是答案抽查通過的那個 IP
+    fn target(self, answer_ip: IpAddr) -> (&'static str, IpAddr);
+}
+
+impl AuditTarget for &'static str {
+    fn target(self, answer_ip: IpAddr) -> (&'static str, IpAddr) {
+        (self, answer_ip)
+    }
+}
+
+impl AuditTarget for (&'static str, IpAddr) {
+    fn target(self, _answer_ip: IpAddr) -> (&'static str, IpAddr) {
+        self
+    }
+}
+
+/// 一輪詢問最多追蹤幾台上游有沒有回來（3.5.0 F4；`ask()` 裡的位元遮罩是 32 位元）。
+/// 一輪的上游超過這個數時，後面的不記「來不及回答」（照 3.4.x 的記法）
+const LATE_TRACK: usize = 32;
+
 /// 通訊類網域（推播）同時最多預取幾個（3.5.0）
 pub const COMM_PREFETCH_MAX: u32 = 16;
 
@@ -1614,6 +1686,15 @@ fn decide(results: &[Arc<Answer>], accept_blocked: bool, cdn: Option<&kuroshio_c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.5.0 F7：機房抽查量的 IP：CDN 那一層只回名稱時量答案的 IP；回（CDN, 節點 IP）時量那個節點
+    #[test]
+    fn pop_audit_target_uses_returned_node() {
+        let answer: IpAddr = "192.0.2.10".parse().unwrap();
+        let node: IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!("cloudflare".target(answer), ("cloudflare", answer));
+        assert_eq!(("cloudflare", node).target(answer), ("cloudflare", node));
+    }
 
     /// 3.4.3：下游黑潮自己關掉 CDN 置換時，問上游黑潮的查詢帶著私有選項；上游看到就照原樣回答
     #[test]

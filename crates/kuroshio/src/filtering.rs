@@ -596,9 +596,11 @@ pub struct FilterService {
     hits_dirty: AtomicBool,
     /// 通訊類網域（推播）不被清單誤擋（`filter.protectComm`，預設開；自訂規則照樣優先，3.5.0）
     protect_comm: bool,
-    /// 清單本來要擋、因為是通訊類而放行的次數；上一次記 INFO 的日數（每天第一次記一行）
+    /// 清單本來要擋、因為是通訊類或內建服務而放行的次數（合計與每一類，`CommKind::index()` 的順序）；
+    /// 每一類上一次記 INFO 的日數（每一類每天第一次記一行，3.5.0 F11）
     comm_spared: AtomicU32,
-    comm_logged_day: AtomicU32,
+    comm_spared_by: [AtomicU32; 8],
+    comm_logged_day: [AtomicU32; 8],
     /// 各清單上次載入時量到的大小（bytes；沒載入過是 0）與規則數
     sizes: Mutex<Vec<(u64, u64)>>,
     /// 暫時停用的清單（依停用順序）
@@ -754,7 +756,8 @@ impl FilterService {
             hits_dirty: AtomicBool::new(false),
             protect_comm: g("protectComm").and_then(Value::as_bool) != Some(false),
             comm_spared: AtomicU32::new(0),
-            comm_logged_day: AtomicU32::new(0),
+            comm_spared_by: Default::default(),
+            comm_logged_day: Default::default(),
             sizes: Mutex::new(vec![(0, 0); n]),
             unloaded: Mutex::new(Vec::new()),
             rebuild_lock: tokio::sync::Mutex::new(()),
@@ -1972,21 +1975,28 @@ impl FilterCheck for FilterService {
         }
         let lists = self.lists.read().unwrap().clone();
         let v = lists.check(name, qtype)?;
-        // 通訊類網域（推播）：清單要擋也放行（漏接通知比多一個連線嚴重）；自訂規則在上面，照樣優先（3.5.0）
-        if v.is_block() && self.protect_comm && kuroshio_net::comm::is_comm(name) {
-            self.comm_spared.fetch_add(1, Ordering::Relaxed);
-            let day = (crate::backup::now_ms() / 86_400_000) as u32;
-            if self.comm_logged_day.swap(day, Ordering::Relaxed) != day {
-                let list = v.list.and_then(|i| self.sources.get(i)).map(|s| s.name.as_str()).unwrap_or("?");
-                info!("過濾：清單「{list}」擋到通訊類網域 {name}，照樣放行（filter.protectComm；可以回報給清單維護者）");
+        // 通訊類網域（推播）與內建一定通過的服務（3.5.0 F11：時間同步、連線偵測、憑證撤銷、系統更新、地震速報）：
+        // 清單要擋也放行；自訂規則在上面，照樣優先（使用者明確要擋 NTP 也照擋）。只在清單判定要擋之後才比對
+        if v.is_block() && self.protect_comm {
+            if let Some(k) = kuroshio_net::comm::kind_of(name).filter(|k| k.flags().spare) {
+                self.comm_spared.fetch_add(1, Ordering::Relaxed);
+                self.comm_spared_by[k.index()].fetch_add(1, Ordering::Relaxed);
+                let day = (crate::backup::now_ms() / 86_400_000) as u32;
+                if self.comm_logged_day[k.index()].swap(day, Ordering::Relaxed) != day {
+                    let list = v.list.and_then(|i| self.sources.get(i)).map(|s| s.name.as_str()).unwrap_or("?");
+                    info!(
+                        "過濾：清單「{list}」擋到{}網域 {name}，照樣放行（filter.protectComm；可以回報給清單維護者）",
+                        k.label()
+                    );
+                }
+                return Some(Verdict {
+                    block: false,
+                    allow: true,
+                    category: v.category.as_str(),
+                    rule: k.rule(),
+                    bypass: false,
+                });
             }
-            return Some(Verdict {
-                block: false,
-                allow: true,
-                category: v.category.as_str(),
-                rule: "builtin-comm".into(),
-                bypass: false,
-            });
         }
         // 清單層的來源編號就是 sources 的位置（停用中的清單也佔一個位置）
         if let Some(h) = v.list.and_then(|i| self.hits.get(i)) {
@@ -2054,6 +2064,13 @@ impl FilterCheck for FilterService {
             "heldCopies": { "count": self.held_stats().0, "bytes": self.held_stats().1 },
             // 通訊類網域（3.5.0）：清單本來要擋、照樣放行的次數
             "commSpared": self.comm_spared.load(Ordering::Relaxed),
+            // 3.5.0 F11：每一類放行的次數（沒有放行過的類別不列）
+            "commSparedByKind": kuroshio_net::comm::CommKind::ALL
+                .iter()
+                .map(|k| (k.as_str(), self.comm_spared_by[k.index()].load(Ordering::Relaxed)))
+                .filter(|(_, n)| *n > 0)
+                .map(|(k, n)| (k.to_string(), json!(n)))
+                .collect::<serde_json::Map<String, Value>>(),
             "protectComm": self.protect_comm,
             "memoryBytes": c.memory_bytes() + l.memory_bytes(),
             "maxDomains": self.opts.max_domains,

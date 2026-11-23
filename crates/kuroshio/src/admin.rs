@@ -699,10 +699,21 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             if let Some(i) = path.get_mut("interceptor").filter(|i| i.is_object()) {
                 i["chain"] = crate::chain::client::interceptor_api_json();
             }
-            // `lite=1`（LuCI 的 rpcd、padavan 韌體每幾秒讀一次）：不回大的欄位（`perf`、`history`；規格 11 C12、E9）
+            // `lite=1`（LuCI 的 rpcd、padavan 韌體每幾秒讀一次）：不回大的欄位（`perf`、`history`、`system.persist.files`；
+            // 規格 11 C12、E9、F2）
             let lite = flag(q, "lite");
             // 線路感知（3.5.0 E3～E7）：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil` 由 `status_lite()` 帶出
-            let cdn = r.cdn().map(|c| c.status_lite()).unwrap_or_else(|| json!({ "enabled": false }));
+            let cdn = r
+                .cdn()
+                .map(|c| {
+                    let mut v = c.status_lite();
+                    // 3.5.0 F12：CDN 驗證節流的狀態（`status_lite()` 已經帶就不重複放）
+                    if let Some(o) = v.as_object_mut() {
+                        o.entry("pace").or_insert_with(|| c.pace_json());
+                    }
+                    v
+                })
+                .unwrap_or_else(|| json!({ "enabled": false }));
             let mut out = json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 // 管理 API 的版本（docs/integration.md）：行為有不相容的改變才加 1
@@ -751,6 +762,12 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
                 "comm": {
                     "builtin": kuroshio_net::comm::COMM_SUFFIXES.len(), "user": kuroshio_net::comm::user_count(),
                     "prefetching": r.comm_prefetching(),
+                    // 3.5.0 F11：內建表每一類幾個後綴；新加的五類有沒有在比對（filter.protectComm）
+                    "kinds": kuroshio_net::comm::builtin_kinds()
+                        .into_iter()
+                        .map(|(k, n)| (k.to_string(), json!(n)))
+                        .collect::<serde_json::Map<String, Value>>(),
+                    "essential": kuroshio_net::comm::enabled(),
                 },
                 // 3.5.0 E1：每一種會過期的資料的上次成功、失敗中、下次預定
                 "freshness": crate::observe::freshness(st),
@@ -762,6 +779,10 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             if lite {
                 if let Some(o) = out.as_object_mut() {
                     o.remove("perf");
+                }
+                // 3.5.0 F2（D32）：每個快照檔一筆的 `system.persist.files` 不帶（D3 上 37 KB），`filesSummary` 照帶
+                if let Some(p) = out.pointer_mut("/system/persist").and_then(Value::as_object_mut) {
+                    p.remove("files");
                 }
             } else if flag(q, "history") {
                 // 3.5.0 E9：24 小時歷史（約 6 KB，要明確要求才給）
@@ -1065,7 +1086,12 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
             let Some(n) = name else { return bad("需要 name", 400) };
             let fam = if q.get("family").map(String::as_str) == Some("6") { 6 } else { 4 };
             match c.verify_now(&n, fam).await {
-                Some((err, v)) => ok(json!({ "result": v, "error": err, "entry": c.domain(&n) })),
+                // 3.5.0 F9：這一次驗證的握手分數（`score`、`origScore`、`weighted`、`slower`、`state`、`confirmAfter`）
+                // 只放在回應裡、不存檔；CDN 那一層把它放在回傳值的 `speed`，這裡搬到最上層（沒有是 null）
+                Some((err, v)) => {
+                    let speed = v.get("speed").cloned().unwrap_or(Value::Null);
+                    ok(json!({ "result": v, "error": err, "entry": c.domain(&n), "speed": speed }))
+                }
                 None => bad("資料庫裡沒有這個網域（先查詢一次）", 404),
             }
         }

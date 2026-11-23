@@ -985,3 +985,158 @@ fn old_state_without_streak_is_inferred() {
     assert_eq!((b.failing, b.fails, b.last_ok), (false, 0, Some(now - HOUR_MS)), "舊版只有 lastEnd");
     assert_eq!(b.period, Some(7 * DAY_MS));
 }
+
+// ================= 3.5.0 F14：重新載入設定時保留排隊中的工作 =================
+
+fn queue_of(s: &Scheduler) -> Vec<(String, String, bool)> {
+    s.status()["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| {
+            (
+                q["name"].as_str().unwrap().to_string(),
+                q["reason"].as_str().unwrap().to_string(),
+                q["priority"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// 排隊中的手動工作重新載入後還在、還是優先；執行中被中斷的排回最前面重跑
+#[tokio::test(start_paused = true)]
+async fn reload_keeps_queued_manual_job_with_priority() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let (s1, _g1, _o1, _w1) = priority_fixture(&clock);
+    let h1 = s1.start();
+    s1.request("long", "補跑");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    s1.request("a", "補跑");
+    s1.request("b", "排程");
+    s1.request_priority("c", "手動 (管理介面)");
+    let hand = s1.handoff();
+    h1.abort();
+    assert_eq!(hand.running, Some(("long".to_string(), 1)));
+    assert_eq!(hand.queued.len(), 3);
+    // 新的一輪
+    let (s2, gate, order, _seen) = priority_fixture(&clock);
+    let lines = s2.adopt(hand, Duration::from_secs(5));
+    assert!(lines.iter().any(|l| l == "重新載入：保留排隊中的工作 3 個（c、a、b）"), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("long 執行到一半被中斷")), "{lines:?}");
+    assert_eq!(
+        queue_of(&s2),
+        vec![
+            ("long".into(), "重新載入時中斷，重新執行".into(), false),
+            ("c".into(), "手動 (管理介面)".into(), true),
+            ("a".into(), "補跑".into(), false),
+            ("b".into(), "排程".into(), false),
+        ]
+    );
+    let h2 = s2.start();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    gate.notify_one();
+    idle(&s2).await;
+    h2.abort();
+    assert_eq!(*order.lock().unwrap(), vec!["long", "c(手動 (管理介面))", "a(補跑)", "b(排程)"]);
+}
+
+/// 同一個工作連續因為重新載入被中斷 2 次就不再自動排回（WARN）；中間跑完一次就重新算
+#[tokio::test(start_paused = true)]
+async fn reload_requeues_interrupted_job_at_most_twice() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let (s1, _g1, _o1, _w1) = priority_fixture(&clock);
+    let h1 = s1.start();
+    s1.request("long", "補跑");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let hand = s1.handoff();
+    h1.abort();
+    // 第 1 次中斷：排回去
+    let (s2, _g2, _o2, _w2) = priority_fixture(&clock);
+    s2.adopt(hand, Duration::ZERO);
+    let h2 = s2.start();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(s2.running().as_deref(), Some("long"));
+    let hand = s2.handoff();
+    h2.abort();
+    assert_eq!(hand.running, Some(("long".to_string(), 2)));
+    // 第 2 次中斷：不再排回
+    let (s3, _g3, _o3, _w3) = priority_fixture(&clock);
+    let lines = s3.adopt(hand, Duration::ZERO);
+    assert_eq!(
+        lines,
+        vec!["long 已經因為重新載入中斷 2 次，不再自動重排；要跑請手動執行".to_string()]
+    );
+    assert!(queue_of(&s3).is_empty());
+    // 跑完一次就重新算：排回去的那一輪跑完之後再被中斷，算第 1 次
+    let (s4, g4, _o4, _w4) = priority_fixture(&clock);
+    s4.adopt(
+        kuroshio_jobs::scheduler::JobHandoff {
+            queued: vec![],
+            running: Some(("long".into(), 1)),
+        },
+        Duration::ZERO,
+    );
+    let h4 = s4.start();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    g4.notify_one();
+    idle(&s4).await;
+    s4.request("long", "排程");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(s4.handoff().running, Some(("long".to_string(), 1)));
+    h4.abort();
+}
+
+/// 保留不了的（停用、不存在）每一個寫一行，不會無聲消失
+#[tokio::test(start_paused = true)]
+async fn reload_logs_cancelled_jobs_when_disabled() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let cfg = json!({ "jobs": { "a": { "at": "04:10" }, "b": { "at": "04:10", "enabled": false } } });
+    let s = sched(cfg, None, &clock);
+    s.register("a", noop);
+    s.register("b", noop);
+    let lines = s.adopt(
+        kuroshio_jobs::scheduler::JobHandoff {
+            queued: vec![
+                ("a".into(), "手動".into(), true),
+                ("b".into(), "排程".into(), false),
+                ("gone".into(), "排程".into(), false),
+            ],
+            running: Some(("b".into(), 1)),
+        },
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "重新載入：取消排隊中的 b（工作已停用）".to_string(),
+            "重新載入：取消排隊中的 gone（工作不存在）".to_string(),
+            "重新載入：保留排隊中的工作 1 個（a）".to_string(),
+            "重新載入：取消重跑被中斷的 b（工作已停用）".to_string(),
+        ]
+    );
+    assert_eq!(queue_of(&s), vec![("a".into(), "手動".into(), true)]);
+}
+
+/// 交接超過 60 秒：全部取消，每一個寫一行
+#[tokio::test(start_paused = true)]
+async fn handoff_expires_after_60s() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let (s, _g, _o, _w) = priority_fixture(&clock);
+    let h = kuroshio_jobs::scheduler::JobHandoff {
+        queued: vec![("a".into(), "手動".into(), true)],
+        running: Some(("long".into(), 1)),
+    };
+    let lines = s.adopt(h.clone(), kuroshio_jobs::scheduler::HANDOFF_TTL + Duration::from_secs(1));
+    assert_eq!(
+        lines,
+        vec![
+            "重新載入：取消排隊中的 a（交接超過 60 秒）".to_string(),
+            "重新載入：取消重跑被中斷的 long（交接超過 60 秒）".to_string(),
+        ]
+    );
+    assert!(queue_of(&s).is_empty());
+    // 60 秒整還算
+    let (s, _g, _o, _w) = priority_fixture(&clock);
+    s.adopt(h, kuroshio_jobs::scheduler::HANDOFF_TTL);
+    assert_eq!(queue_of(&s).len(), 2);
+}

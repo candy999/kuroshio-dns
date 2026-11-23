@@ -69,6 +69,8 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
     });
     // 通訊類網域（3.5.0）：使用者自己加的後綴（最多 64 個）
     kuroshio_net::comm::set_user(&strings(get(cfg, "resolver.keepNames")));
+    // 3.5.0 F11：內建一定通過的服務（新加的五類）跟著 filter.protectComm；關掉時照清單擋、CDN 照常改寫
+    kuroshio_net::comm::set_enabled(get(cfg, "filter.protectComm").and_then(Value::as_bool) != Some(false));
     let r = Resolver::new(Params::from_cfg(cfg), ups, cache_max, iprank, local);
     adopt_cache(cfg, &r);
     // 查詢紀錄（3.5.0）：筆數上限依設定與實體記憶體；`log.queryLog` 是常開，否則預設關閉、從管理介面暫時開啟
@@ -83,8 +85,25 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
 type CacheHandoff = (String, String, Instant, crate::cache::Cache);
 static CACHE_HANDOFF: Mutex<Option<CacheHandoff>> = Mutex::new(None);
 
+/// `cdn` 裡只影響背景工作或觀測、不改變「這一筆查詢回什麼」的鍵（3.5.0 F5）：改了不清 DNS 快取
+const CDN_BACKGROUND_KEYS: [&str; 8] = [
+    "dbDiskBudgetKB",
+    "maxEntries",
+    "popAudit",
+    "verifyConcurrency",
+    "verifyPacing",
+    "verifyPerMin",
+    "healthIntervalMin",
+    "qualityIntervalMin",
+];
+/// `cdn.cross` 裡只影響背景探索的鍵（3.5.0 F5）
+const CDN_CROSS_BACKGROUND_KEYS: [&str; 3] = ["concurrency", "requestScore", "recheckHours"];
+
 /// 會改變快取裡答案的設定（上游、解析、CDN、本機網域、快照位置）：都沒變才沿用上一輪的快取。
-/// `upstream` 整段都算進去，所以串接的開關 `upstream.chain`（3.4.0，規格第 10 節）改了也不沿用
+/// `upstream` 整段都算進去，所以串接的開關 `upstream.chain`（3.4.0，規格第 10 節）改了也不沿用。
+/// 3.5.0 F5（H6）：`pool` 整段不算（只決定節點池工作怎麼量，量完之前快取裡的答案不會變）；`cdn` 裡只影響背景或觀測的
+/// 鍵（[`CDN_BACKGROUND_KEYS`]、`cross` 的 [`CDN_CROSS_BACKGROUND_KEYS`]）拿掉再算。`enabled`、`lite`、`slowerFallback`、
+/// `popSwitch`、`spreadPrefixes`、`v6Policy` 這些會改變回給裝置的答案，照舊算
 fn answer_fingerprint(cfg: &Value) -> String {
     let mut res = get(cfg, "resolver").cloned().unwrap_or_default();
     if let Some(m) = res.as_object_mut() {
@@ -93,16 +112,30 @@ fn answer_fingerprint(cfg: &Value) -> String {
             m.remove(k);
         }
     }
+    let mut cdn = get(cfg, "cdn").cloned().unwrap_or_default();
+    if let Some(m) = cdn.as_object_mut() {
+        for k in CDN_BACKGROUND_KEYS {
+            m.remove(k);
+        }
+        if let Some(x) = m.get_mut("cross").and_then(Value::as_object_mut) {
+            for k in CDN_CROSS_BACKGROUND_KEYS {
+                x.remove(k);
+            }
+        }
+    }
     let pick = |k: &str| get(cfg, k).cloned().unwrap_or_default();
-    json!([
-        pick("upstream"),
-        res,
-        pick("cdn"),
-        pick("pool"),
-        pick("domain"),
-        pick("system.persistDir")
-    ])
-    .to_string()
+    json!([pick("upstream"), res, cdn, pick("domain"), pick("system.persistDir")]).to_string()
+}
+
+/// 重新載入設定時交給下一輪的背景工作（3.5.0 F14）：（快照目錄, 交出的時間, 排隊中與執行中的工作）。
+/// 快照目錄不同（另一個實例）不接手；60 秒內沒人接手就過期（下一輪接手時每一個都寫一行「取消」）
+type JobHandoffSlot = (PathBuf, Instant, kuroshio_jobs::scheduler::JobHandoff);
+static JOB_HANDOFF: Mutex<Option<JobHandoffSlot>> = Mutex::new(None);
+
+/// 有沒有等下一輪接手的背景工作（3.5.0 F14；測試用）
+#[doc(hidden)]
+pub fn job_handoff_pending() -> bool {
+    JOB_HANDOFF.lock().unwrap().is_some()
 }
 
 /// 過濾相關的設定：`filter` 整段（含清單的 `bypass` 標記），加上決定「繞過防護清單放不放行下游」的
@@ -134,7 +167,7 @@ fn adopt_cache(cfg: &Value, r: &Resolver) {
         return;
     }
     if fp != answer_fingerprint(cfg) {
-        info!("重新載入：上游或解析設定有變，DNS 快取重新開始");
+        info!("重新載入：上游、解析或 CDN 的設定有變，DNS 快取重新開始");
         return;
     }
     let n = r.cache.lock().unwrap().adopt(c, ffp != filter_fingerprint(cfg), Instant::now());
@@ -827,6 +860,17 @@ fn start_scheduler(
     tokio::spawn(async move {
         crate::clock::wait_synced().await;
         s2.start();
+        // 3.5.0 F14：接手上一輪（重新載入前）排隊中與執行到一半的工作
+        let handed = {
+            let mut g = JOB_HANDOFF.lock().unwrap();
+            match g.as_ref() {
+                Some((dir, ..)) if *dir == state_dir => g.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, at, h)) = handed {
+            s2.adopt(h, at.elapsed());
+        }
     });
     sched
 }
@@ -1462,7 +1506,8 @@ impl AppState {
         json!({
             "memTotalMB": total.or(self.info.mem_total_mb),
             "memAvailableMB": avail,
-            "rssKB": sysinfo::rss_kb(),
+            // 3.5.0 F6／H12：用有 Windows 實作的 rss_bytes()（跟 memory.rssKB 同一個來源；以前 Windows 上是 null）
+            "rssKB": sysinfo::rss_bytes().map(|b| b / 1024),
             "pressure": format!("{:?}", pressure()).to_lowercase(),
             "memory": self.memory_json(),
             "cores": self.info.cores,
@@ -1557,15 +1602,30 @@ impl StopReason {
                 self.flush_budget().as_secs()
             )
         } else {
-            format!("收到 {}，正常停止", self.label())
+            // 英文開頭的（SIGTERM、Ctrl+C）前面空一格，中文的不空（3.5.0 F6／H12：以前是「收到 服務停止」）
+            let l = self.label();
+            let sp = if l.starts_with(|c: char| c.is_ascii()) { " " } else { "" };
+            format!("收到{sp}{l}，正常停止")
         }
     }
 }
 
 impl Started {
-    /// 關機：把有變動的快照全部寫出（規格 05 第 5.3 節），最多 10 秒
+    /// 重新載入設定時結束這一輪：把有變動的快照全部寫出（規格 05 第 5.3 節），最多 10 秒；
+    /// 排隊中與執行中的背景工作交給下一輪（3.5.0 F14）。程式結束走 [`Started::shutdown_for`]，不交接工作
     pub fn shutdown(&self) {
+        self.hand_over_jobs();
         self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
+    }
+
+    /// 3.5.0 F14：排隊中與執行中的工作交給下一輪（沒有就不放）
+    fn hand_over_jobs(&self) {
+        let Some(s) = &self.state.scheduler else { return };
+        let h = s.handoff();
+        if h.queued.is_empty() && h.running.is_none() {
+            return;
+        }
+        *JOB_HANDOFF.lock().unwrap() = Some((persist_dir(&self.state.cfg), Instant::now(), h));
     }
 
     /// 關機，時間上限依停止的原因（[`StopReason::flush_budget`]）
@@ -1734,7 +1794,7 @@ pub fn new_persister(cfg: &Value) -> Persister {
 
 /// 記憶體監看（規格 09）：依系統保留量更新整個程式的壓力訊號，記憶體控制開著時順便跑一輪控制。
 /// 離保留量近（兩倍以內）或 PSI 看得到等待時每 2–3 秒量一次，遠的時候 30 秒
-fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov::Governor>>) {
+fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov::Governor>>, cdn: Option<Arc<kuroshio_cdn::Cdn>>) {
     use crate::memgov::{poll_interval, pressure_of, Reading};
     // 記憶體控制另外一個工作：它可能要等清單重建（幾十秒），壓力訊號不能跟著停住。
     // 量測只留最新一筆，控制跑完一輪再拿最新的
@@ -1753,6 +1813,8 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
         let mut last = Pressure::Normal;
         // 記憶體控制關掉時自己判斷「於事無補」（開著時由記憶體控制判斷，狀態頁看得到同一份）
         let mut gate = crate::memgov::FutileGate::default();
+        // 3.5.0 F12：每 10 秒量一次黑潮自己用掉的 CPU（佔整台機器），交給 CDN 驗證的節流依 CPU 調整速率
+        let mut cpu = sysinfo::CpuMeter::new(kuroshio_config::Host::detect().cores);
         loop {
             let r = match &gov {
                 Some(g) => g.read(),
@@ -1772,8 +1834,16 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             // 好友資料（社群共享）：解壓後不超過保留量以上可用空間的 1/4（至少 1 MB）
             let cap = crate::memgov::headroom(&r, &reserve).map_or(0, |h| ((h >> 20) / 4).clamp(1, u32::MAX as u64) as u32);
             kuroshio_community::config::set_memory_cap_mb(cap);
+            if let Some(c) = &cdn {
+                if let Some(pct) = cpu.tick(Instant::now(), sysinfo::cpu_ms) {
+                    c.set_load(pct);
+                }
+            }
             if p != last {
-                let (a, res) = (r.avail.unwrap_or(0) >> 20, reserve.bytes >> 20);
+                let (a, res) = (
+                    crate::memgov::mb_round(r.avail.unwrap_or(0)),
+                    crate::memgov::mb_round(reserve.bytes),
+                );
                 match p {
                     // 這是「當下」的量測；記憶體控制的狀態（`memory.state`）要穩定一段時間才放鬆（遲滯，預設 3 分鐘），
                     // 兩者會差幾分鐘（3.4.3：日誌寫「恢復正常」、狀態頁卻還是吃緊，看起來像錯誤）
@@ -1793,7 +1863,12 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             if gov.is_some() {
                 tx.send_replace(Some(r));
             }
-            tokio::time::sleep(Duration::from_secs(poll_interval(&r, &reserve))).await;
+            // 離保留量遠時記憶體 30 秒量一次；有 CDN 時最多 10 秒（CPU 每 10 秒量一次，3.5.0 F12）
+            let mut wait = poll_interval(&r, &reserve);
+            if cdn.is_some() {
+                wait = wait.min(sysinfo::CPU_SAMPLE_SECS);
+            }
+            tokio::time::sleep(Duration::from_secs(wait)).await;
         }
     });
 }
@@ -1928,7 +2003,7 @@ fn start_governor(
     }
     info!(
         "記憶體控制：系統保留 {} MB（{}），可用記憶體低於保留量時依序讓出記憶體",
-        reserve.bytes >> 20,
+        crate::memgov::mb_round(reserve.bytes),
         reserve.how
     );
     g
@@ -2136,7 +2211,7 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         warn!("system.testHooks 關掉了：取消進行中的記憶體模擬");
     }
     if governor_on || get(cfg, "system.memoryWatchdog").and_then(Value::as_bool).unwrap_or(true) {
-        spawn_monitor(reserve.clone(), memgov.clone());
+        spawn_monitor(reserve.clone(), memgov.clone(), cdn.clone());
     }
     let encrypted = start_encrypted(cfg, &resolver, &base_dir).await;
     let scheduler = Some(start_scheduler(cfg, &persister, &base_dir, cdn.as_ref(), Some(&access)));
@@ -2240,6 +2315,19 @@ mod tests {
         }
     }
 
+    /// 3.5.0 F6／H12：「收到 服務停止」多一個空格；英文開頭的照舊空一格
+    #[test]
+    fn stop_line_has_no_double_space() {
+        use super::StopReason::*;
+        assert_eq!(Service.log_line(), "收到服務停止，正常停止");
+        assert_eq!(Quit.log_line(), "收到 quit 指令，正常停止");
+        assert_eq!(Terminate.log_line(), "收到 SIGTERM，正常停止");
+        for r in [Terminate, CtrlC, CtrlBreak, ConsoleClose, Logoff, SystemShutdown, Service, Quit] {
+            let l = r.log_line();
+            assert!(!l.contains("  ") && !l.contains("收到 服") && !l.contains("收到 主"), "{l}");
+        }
+    }
+
     /// 串接的設定（3.4.0）：`upstream.chain` 改了不沿用快取；清單的 `bypass`、`upstream.allowDownstream` 改了算過濾設定變了
     #[test]
     fn fingerprints_change_with_chain_settings() {
@@ -2266,6 +2354,54 @@ mod tests {
         let unmarked = with(json!({ "filter": { "lists": lists } }));
         assert_ne!(filter_fingerprint(&unmarked), f0, "清單的 bypass 改了：過濾設定變了");
         assert_eq!(answer_fingerprint(&unmarked), a0, "只改過濾：答案的指紋不變");
+    }
+
+    /// 3.5.0 F5（H6）：只改 `pool.*` 不清 DNS 快取（W3：只改 `pool.relativeSpeed`，快取被清空）
+    #[test]
+    fn pool_only_change_keeps_cache() {
+        let base = kuroshio_config::build(&json!({}));
+        let a0 = answer_fingerprint(&base);
+        for user in [
+            json!({ "pool": { "relativeSpeed": false } }),
+            json!({ "pool": { "relativeSpeed": false, "someFutureKey": 3 } }),
+        ] {
+            assert_eq!(answer_fingerprint(&kuroshio_config::build(&user)), a0, "{user}");
+        }
+    }
+
+    /// 3.5.0 F5：只影響背景或觀測的 `cdn.*` 不清 DNS 快取
+    #[test]
+    fn background_only_cdn_keys_keep_cache() {
+        let base = kuroshio_config::build(&json!({}));
+        let a0 = answer_fingerprint(&base);
+        for user in [
+            json!({ "cdn": { "dbDiskBudgetKB": 1234 } }),
+            json!({ "cdn": { "maxEntries": 999 } }),
+            json!({ "cdn": { "popAudit": false } }),
+            json!({ "cdn": { "verifyConcurrency": 1 } }),
+            json!({ "cdn": { "verifyPacing": false } }),
+            json!({ "cdn": { "verifyPerMin": 12 } }),
+            json!({ "cdn": { "healthIntervalMin": 99 } }),
+            json!({ "cdn": { "qualityIntervalMin": 99 } }),
+            json!({ "cdn": { "cross": { "concurrency": 1, "requestScore": false, "recheckHours": 48 } } }),
+        ] {
+            assert_eq!(answer_fingerprint(&kuroshio_config::build(&user)), a0, "{user}");
+        }
+    }
+
+    /// 3.5.0 F5：會改變回給裝置的答案的 `cdn.*` 照舊重來
+    #[test]
+    fn cdn_enabled_change_still_resets_cache() {
+        let base = kuroshio_config::build(&json!({}));
+        let a0 = answer_fingerprint(&base);
+        for user in [
+            json!({ "cdn": { "enabled": false } }),
+            json!({ "cdn": { "lite": true } }),
+            json!({ "cdn": { "slowerFallback": false } }),
+            json!({ "cdn": { "cross": { "enabled": false } } }),
+        ] {
+            assert_ne!(answer_fingerprint(&kuroshio_config::build(&user)), a0, "{user}");
+        }
     }
 
     #[test]
