@@ -751,10 +751,22 @@ impl Manager {
         if c.as_ref().is_some_and(|x| x.up.id == u.id) {
             return;
         }
-        *c = Some(match self.pinned.iter().find(|p| p.up.id == u.id) {
+        // 同一台上游換位址（3.5.0 C2：經攔截 → 直連閘道，中間沒有解除）：暫停的次數與時間帶過去，
+        // 不然換一次位址就把 `CHAIN_RELEASE_TRIPS` 的計數歸零
+        let carry = c.as_ref().filter(|x| x.role == Role::Chain).map(|x| {
+            let s = x.stats.lock().unwrap();
+            (s.trips, s.open_until)
+        });
+        let new = match self.pinned.iter().find(|p| p.up.id == u.id) {
             Some(p) => p.clone(),
             None => Up::new_chain(u, self.chain_trouble.clone()),
-        });
+        };
+        if let (Some((trips, open_until)), Role::Chain) = (carry, new.role) {
+            let mut s = new.stats.lock().unwrap();
+            s.trips = trips;
+            s.open_until = open_until;
+        }
+        *c = Some(new);
     }
 
     /// 目前的串接上游
@@ -1140,6 +1152,35 @@ mod tests {
         assert!(pauses[1] >= 59 && pauses[2] >= 119, "{pauses:?}");
         assert!(pauses.iter().all(|&p| p <= 600), "最多 10 分鐘：{pauses:?}");
         assert!(pauses[6] >= 599, "{pauses:?}");
+    }
+
+    /// 3.5.0 C2：同一台上游換位址（經攔截 → 直連閘道）不把暫停次數歸零；解除之後重新綁定才重新算
+    #[test]
+    fn rebinding_chain_keeps_trip_count() {
+        let m = Manager::new(&cfg(), PathBuf::from("/nonexistent/upstreams.json"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        m.on_chain_trouble(Arc::new(move |t| s2.lock().unwrap().push(t)));
+        m.set_chain(Some(Upstream::parse("udp://192.0.2.1:53").unwrap()));
+        let trip = |m: &Manager| {
+            let c = m.chain().unwrap();
+            c.stats.lock().unwrap().open_until = Some(Instant::now() - Duration::from_secs(1));
+            for _ in 0..CHAIN_FAIL_LIMIT {
+                c.record(false, 0.0);
+            }
+        };
+        trip(&m);
+        trip(&m);
+        // 換位址：次數帶過去，下一次是第 3 次
+        m.set_chain(Some(Upstream::parse("udp://192.168.1.1:53").unwrap()));
+        assert_eq!(m.chain().unwrap().up.id, "udp://192.168.1.1:53");
+        assert_eq!(m.chain().unwrap().stats.lock().unwrap().trips, 2);
+        trip(&m);
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3]);
+        // 解除再綁定：重新算
+        m.set_chain(None);
+        m.set_chain(Some(Upstream::parse("udp://192.168.1.1:53").unwrap()));
+        assert_eq!(m.chain().unwrap().stats.lock().unwrap().trips, 0);
     }
 
     #[test]

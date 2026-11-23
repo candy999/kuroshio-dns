@@ -230,6 +230,7 @@ fn timing() -> Timing {
         retry_min: Duration::from_millis(200),
         retry_max: Duration::from_millis(800),
         fail_limit: 3,
+        ..Timing::default()
     }
 }
 
@@ -608,6 +609,170 @@ async fn gateway_direct_preferred_when_same_key() {
         assert_eq!(d.mgr.chain().unwrap().up.id, format!("udp://{a}"));
         assert!(d.client.status_json()["text"].as_str().unwrap().starts_with("串接中：上游黑潮"));
     }
+}
+
+/// 閘道上是同一台上游（同一把金鑰）的另一個監聽
+async fn same_node_at_gateway(u: &Arc<Upstream>) -> (Arc<Upstream>, SocketAddr) {
+    let g = Arc::new(Upstream {
+        key: Mutex::new(KeyPair::from_pem(&u.key.lock().unwrap().to_pem()).unwrap()),
+        ..Arc::into_inner(Upstream::new()).unwrap()
+    });
+    let ga = fake_upstream(g.clone()).await;
+    (g, ga)
+}
+
+/// 3.5.0 C2：開機時還不知道閘道、先綁成經攔截；之後的路徑檢查拿到閘道、閘道就是同一台上游 → 改成直連。
+/// 串接沒有中斷（`since` 不變、Manager 裡一直有串接上游），之後的心跳、登記都對閘道發
+#[tokio::test]
+async fn intercept_upgrades_to_gateway_when_gateway_appears() {
+    let u = Upstream::new();
+    let a = fake_upstream(u.clone()).await;
+    let (g, ga) = same_node_at_gateway(&u).await;
+    let d = down(true);
+    d.client.set_gateway_override(Some(None));
+    d.client.on_path_report(&kuroshio(a)).await;
+    assert!(d.client.is_chained());
+    let s = d.client.status_json();
+    assert_eq!(s["upstream"]["via"], "intercept");
+    assert!(s["upstream"]["direct"].is_null(), "還沒試過：{s}");
+    let since = s["upstream"]["since"].clone();
+    assert_eq!(d.mgr.chain().unwrap().up.id, format!("udp://{a}"));
+    assert_eq!(g.chain_queries(), 0, "不知道閘道時不對它發任何查詢");
+    assert_eq!(u.regs.lock().unwrap().len(), 1);
+    // 狀態改變的回呼：換位址不算離開串接
+    let left = Arc::new(AtomicUsize::new(0));
+    {
+        let left = left.clone();
+        d.client.on_state_change(Arc::new(move |from, _| {
+            if from == State::Chained {
+                left.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
+    // 串接上游正在暫停（查詢連續失敗 3 次）：這時候不換
+    let c = d.mgr.chain().unwrap();
+    for _ in 0..3 {
+        c.record(false, 0.0);
+    }
+    assert!(d.mgr.chain_suspended());
+    d.client.set_gateway_override(Some(Some(ga)));
+    d.client.on_path_report(&kuroshio(a)).await;
+    let s = d.client.status_json();
+    assert_eq!(s["upstream"]["via"], "intercept");
+    assert_eq!(s["upstream"]["direct"]["lastResult"], "suspended");
+    assert_eq!(g.chain_queries(), 0);
+    // 下一輪（新的 Manager，沒有暫停；綁定跨重新載入接回）：路徑檢查拿到閘道 → 直連
+    let mgr2 = manager(&d.dir);
+    d.client.attach(settings(true), &mgr2, None);
+    d.client.spawn();
+    assert_eq!(mgr2.chain().unwrap().up.id, format!("udp://{a}"));
+    // 接回之後在背景做一次心跳，心跳成功時試著升級（不必等下一次路徑檢查）
+    let c2 = d.client.clone();
+    wait_for("改成直連閘道", Duration::from_secs(10), || {
+        c2.status_json()["upstream"]["via"] == "gateway"
+    })
+    .await;
+    let s = d.client.status_json();
+    assert_eq!(s["state"], "chained");
+    assert_eq!(s["upstream"]["address"], ga.ip().to_string());
+    assert_eq!(s["upstream"]["since"], since, "串接開始的時間不變");
+    assert_eq!(s["upstream"]["direct"]["lastResult"], "upgraded");
+    assert_eq!(s["upstream"]["fingerprint"], fingerprint(&u.public()));
+    assert!(
+        s["text"].as_str().unwrap().starts_with(&format!("串接中：上游 {}（", ga.ip())),
+        "{s}"
+    );
+    assert_eq!(mgr2.chain().unwrap().up.id, format!("udp://{ga}"));
+    assert_eq!(mgr2.active()[0].role, Role::Chain);
+    assert_eq!(d.client.bound_addr(), Some((ga, true)), "直連一定可以用 TCP（共用結果的同步）");
+    assert_eq!(d.client.bound_key(), Some(u.public()));
+    assert_eq!(left.load(Ordering::SeqCst), 0, "沒有離開過串接");
+    assert!(d.client.key_change_warning(kuroshio_community::util::now_ms()).is_none());
+    // 換了之後登記對閘道發（上游依來源位址記下游，目的位址換了不影響）
+    wait_for("向閘道登記", Duration::from_secs(10), || !g.regs.lock().unwrap().is_empty()).await;
+    assert_eq!(g.regs.lock().unwrap()[0].names, vec!["dns.example.net".to_string()]);
+    assert_eq!(s["upstream"]["registered"]["ok"], true);
+    // 心跳也對閘道發，一直是直連（不來回）
+    let (ua, gq) = (u.chain_queries(), g.chain_queries());
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(g.chain_queries() > gq, "心跳對閘道");
+    assert_eq!(u.chain_queries(), ua, "不再經攔截");
+    assert_eq!(d.client.status_json()["upstream"]["via"], "gateway");
+}
+
+/// 3.5.0 C2：改成直連之後直連不通（心跳沒回應）→ 照既有流程解除、重試；重新串接時退回經攔截，
+/// 而且接下來一小時不再試直連（不會「經攔截 ↔ 直連」來回）
+#[tokio::test]
+async fn direct_failure_falls_back_to_intercept_without_flapping() {
+    let u = Upstream::new();
+    let a = fake_upstream(u.clone()).await;
+    let (g, ga) = same_node_at_gateway(&u).await;
+    let d = down(true);
+    d.client.set_gateway_override(Some(None));
+    d.client.on_path_report(&kuroshio(a)).await;
+    d.client.set_gateway_override(Some(Some(ga)));
+    d.client.on_path_report(&kuroshio(a)).await;
+    assert_eq!(d.client.status_json()["upstream"]["via"], "gateway");
+    // 直連的那條路不通了（經攔截的還通）
+    g.silent.store(true, Ordering::SeqCst);
+    let c = d.client.clone();
+    wait_for("直連沒回應而解除", Duration::from_secs(10), || {
+        c.state() == (State::Released, Some(Reason::NoResponse))
+    })
+    .await;
+    assert_eq!(ids(&d.mgr), own_ids(), "這段時間用自己的上游");
+    wait_for("退回經攔截", Duration::from_secs(10), || {
+        c.is_chained() && c.status_json()["upstream"]["via"] == "intercept"
+    })
+    .await;
+    let s = d.client.status_json();
+    assert_eq!(d.mgr.chain().unwrap().up.id, format!("udp://{a}"));
+    assert_eq!(s["upstream"]["direct"]["failures"], 1, "{s}");
+    assert_eq!(s["upstream"]["direct"]["lastResult"], "direct-failed");
+    assert!(s["upstream"]["direct"]["blockedUntil"].as_u64().unwrap() > kuroshio_community::util::now_ms() + 3_000_000);
+    // 直連的路恢復了：被擋的期間路徑檢查、心跳都不再試直連，一直是經攔截
+    g.silent.store(false, Ordering::SeqCst);
+    let gq = g.chain_queries();
+    d.client.on_path_report(&kuroshio(a)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(g.chain_queries(), gq, "一筆都不對閘道發");
+    assert!(d.client.is_chained());
+    assert_eq!(d.client.status_json()["upstream"]["via"], "intercept");
+    // WAN 變動：紀錄清掉，重新偵測時可以再直連
+    d.client.on_wan_changed();
+    d.client.on_path_report(&kuroshio(a)).await;
+    assert_eq!(d.client.status_json()["upstream"]["via"], "gateway");
+}
+
+/// 3.5.0 C2：閘道上是別台黑潮（不同金鑰）或沒有人回答 → 維持經攔截，串接不受影響
+#[tokio::test]
+async fn no_upgrade_when_gateway_is_another_node() {
+    let u = Upstream::new();
+    let a = fake_upstream(u.clone()).await;
+    let other = Upstream::new();
+    let oa = fake_upstream(other.clone()).await;
+    for gw in [oa, closed()] {
+        let d = down(true);
+        d.client.set_gateway_override(Some(None));
+        d.client.on_path_report(&kuroshio(a)).await;
+        d.client.set_gateway_override(Some(Some(gw)));
+        d.client.on_path_report(&kuroshio(a)).await;
+        let s = d.client.status_json();
+        assert_eq!(s["state"], "chained");
+        assert_eq!(s["upstream"]["via"], "intercept");
+        assert_eq!(s["upstream"]["fingerprint"], fingerprint(&u.public()), "顯示的還是綁定的那台");
+        assert_eq!(
+            s["upstream"]["direct"]["lastResult"],
+            if gw == oa { "other-key" } else { "no-response" }
+        );
+        assert_eq!(d.mgr.chain().unwrap().up.id, format!("udp://{a}"));
+        assert_eq!(d.client.bound_key(), Some(u.public()));
+        // 剛試過：再來一次路徑檢查也不會馬上再探測
+        let q = other.chain_queries();
+        d.client.on_path_report(&kuroshio(a)).await;
+        assert_eq!(other.chain_queries(), q);
+    }
+    assert!(other.regs.lock().unwrap().is_empty(), "不向別台登記");
 }
 
 #[tokio::test]

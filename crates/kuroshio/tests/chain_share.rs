@@ -325,6 +325,7 @@ fn timing() -> Timing {
         retry_min: Duration::from_secs(30),
         retry_max: Duration::from_secs(60),
         fail_limit: 3,
+        ..Timing::default()
     }
 }
 

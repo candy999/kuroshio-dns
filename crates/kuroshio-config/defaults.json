@@ -334,6 +334,7 @@
     "v6Policy": "drop",
     "dbFile": "./state/cdn-domains.json",
     "maxEntries": 200000,
+    "dbDiskBudgetKB": "auto",
     "providers": {
       "cloudflare": {
         "enabled": true,

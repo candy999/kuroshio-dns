@@ -14,7 +14,8 @@
 //!   可重建、可省略的資料（統計、候選 IP、過濾清單的本機副本……）大方留在磁碟上，重開機更快、少重新下載；
 //!   空間掉到「保留 + 遲滯」以下就依序刪日誌 → 可省略 → 可重建（舊的、大的先刪）；還是不夠就只寫核心資料，
 //!   其他的留在記憶體等下次。核心累積的資料絕不自動刪除。
-//! - 關機時 `flush_all()` 不管間隔與上限，把有變動的都寫出去。
+//! - 關機時不管間隔與每日寫入量，在時限內把有變動的寫出去：重要變動先寫（小檔先），只有計數變動的排在後面、
+//!   只用時限的一半（3.5.0 C5）；管理介面的「立即儲存」（`flush_all()`）全部寫。
 //! - 很大的檔（CDN 網域分片）用串流：登記的只是「怎麼產生內容」，
 //!   要寫的那一刻才邊序列化邊寫進暫存檔，整份內容不會放在記憶體裡（等寫入間隔的期間也不會）。
 
@@ -326,6 +327,17 @@ pub struct Persister {
     staged_tmp: Vec<PathBuf>,
     /// 關機寫快照開始後過了多久（測試注入；正常是真的時鐘）
     elapsed_probe: Option<ElapsedProbe>,
+    /// 最近一次關機寫入的統計（測試、日誌用）
+    last_shutdown: Option<ShutdownFlush>,
+}
+
+/// 一次關機寫入：重要變動與只有計數變動的各有幾份待寫、幾份來不及寫
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShutdownFlush {
+    pub important: usize,
+    pub important_late: usize,
+    pub lazy: usize,
+    pub lazy_late: usize,
 }
 
 /// 關機寫快照開始後過了多久（呼叫一次量一次）
@@ -394,6 +406,7 @@ impl Persister {
             compress: Box::new(|_| false),
             free_probe: Box::new(space::free_bytes),
             elapsed_probe: None,
+            last_shutdown: None,
             fs_total: None,
             extra_files: Vec::new(),
             deleted: Vec::new(),
@@ -767,33 +780,51 @@ impl Persister {
         self.roll_day(now);
         let interval = effective_interval(&self.policy, self.mem);
         let critical = self.mem.pressure() == Pressure::Critical;
-        let mut names: Vec<(bool, u64, String)> = self
+        // （有沒有先後順序，關機時是不是只有計數變動，關機時的大小，名稱）
+        let mut names: Vec<(bool, bool, u64, String)> = self
             .entries
             .iter()
             .filter_map(|(k, e)| {
                 let size = if shutdown.is_some() { self.size_estimate(k, e) } else { 0 };
-                e.pending.as_ref().map(|p| (!p.opts.after.is_empty(), size, k.clone()))
+                e.pending
+                    .as_ref()
+                    .map(|p| (!p.opts.after.is_empty(), shutdown.is_some() && p.opts.lazy, size, k.clone()))
             })
             .collect();
-        // 有先後順序的（分片清單）放最後。關機時其他的小檔先寫：排程紀錄這類小檔不會排在幾百份 CDN 分片後面
-        // （平常照名稱，每日寫入額度的分配不變）
+        // 有先後順序的（分片清單）放最後。關機時重要變動先寫、其中小檔先寫：排程紀錄這類小檔不會排在幾百份 CDN 分片後面；
+        // 只有計數變動的（`lazy`）排在所有重要變動之後（3.5.0 C5）。平常照名稱，每日寫入額度的分配不變
         names.sort();
         // 批次模式（關機）：先寫暫存檔，最後一起落地、改名
         let mut staged: Vec<Staged> = Vec::new();
         let t0 = std::time::Instant::now();
-        let mut skipped_for_time = 0usize;
+        // 關機時來不及寫的：（重要變動，只有計數變動）；以及這兩種各有幾份待寫
+        let (mut late_important, mut late_lazy) = (0usize, 0usize);
+        let (mut all_important, mut all_lazy) = (0usize, 0usize);
         let (mut n, mut bytes) = (0, 0u64);
         // 一份寫失敗：放回待寫、繼續寫下一份（不讓後面的檔整輪都寫不到），最後回報第一個錯誤
         let mut first_err: Option<std::io::Error> = None;
-        for (_, _, name) in names {
+        for (_, lazy_late, _, name) in names {
+            if shutdown.is_some() {
+                if lazy_late {
+                    all_lazy += 1;
+                } else {
+                    all_important += 1;
+                }
+            }
             // 關機有時間限制（整合方通常等 15～30 秒就強制結束）：寫到 SHUTDOWN_BUDGET 就停，剩下的（排在後面的大檔，
-            // 通常是 CDN 分片）下次啟動用上一次存的。小檔先寫，排程紀錄這類小檔一定寫得到（3.4.2）
+            // 通常是 CDN 分片）下次啟動用上一次存的。小檔先寫，排程紀錄這類小檔一定寫得到（3.4.2）。
+            // 只有計數變動的檔（CDN 分片的查詢次數、最後出現時間）只用時限的一半（3.5.0 C5）：它們平常就要等到
+            // 「最久未存」上限才寫，關機少寫的只是這段期間的計數；不該讓關機每次都拖到時限、在 Flash 上多寫幾百 KB
             let elapsed = match &self.elapsed_probe {
                 Some(f) if shutdown.is_some() => f(),
                 _ => t0.elapsed(),
             };
-            if shutdown.is_some_and(|b| elapsed >= b) {
-                skipped_for_time += 1;
+            if shutdown.is_some_and(|b| elapsed >= if lazy_late { b / 2 } else { b }) {
+                if lazy_late {
+                    late_lazy += 1;
+                } else {
+                    late_important += 1;
+                }
                 continue;
             }
             let (why, size, age) = {
@@ -906,11 +937,26 @@ impl Persister {
             bytes += disk;
         }
         self.staged_tmp.clear();
-        if skipped_for_time > 0 {
-            warn!(
-                "關機時間有限（{:.1} 秒）：還有 {skipped_for_time} 份快照沒寫，下次啟動用上一次存的",
-                shutdown.unwrap_or(SHUTDOWN_BUDGET).as_secs_f32()
+        if late_important + late_lazy > 0 {
+            let secs = shutdown.unwrap_or(SHUTDOWN_BUDGET).as_secs_f32();
+            let msg = format!(
+                "關機時間有限（{secs:.1} 秒）：重要變動 {all_important} 份寫了 {} 份、只有計數變動的 {all_lazy} 份有 {late_lazy} 份沒寫\
+                 （計數只用時限的一半；少的只是這段期間的查詢次數與最後出現時間），沒寫的下次啟動用上一次存的",
+                all_important - late_important
             );
+            if late_important > 0 {
+                warn!("{msg}");
+            } else {
+                info!("{msg}");
+            }
+        }
+        if shutdown.is_some() {
+            self.last_shutdown = Some(ShutdownFlush {
+                important: all_important,
+                important_late: late_important,
+                lazy: all_lazy,
+                lazy_late: late_lazy,
+            });
         }
         if !staged.is_empty() {
             // 內容先落地，再依寫的順序改名（分片清單在分片之後），每個資料夾 fsync 一次
@@ -959,6 +1005,24 @@ impl Persister {
             .max()
             .filter(|&x| x > 0)
             .unwrap_or(256 * 1024)
+    }
+
+    /// 最近一次關機寫入的統計（還沒關過機是 None）
+    pub fn last_shutdown(&self) -> Option<ShutdownFlush> {
+        self.last_shutdown
+    }
+
+    /// 待寫的份數：（重要變動，只有計數變動）
+    pub fn pending_kinds(&self) -> (usize, usize) {
+        let mut out = (0, 0);
+        for p in self.entries.values().filter_map(|e| e.pending.as_ref()) {
+            if p.opts.lazy {
+                out.1 += 1;
+            } else {
+                out.0 += 1;
+            }
+        }
+        out
     }
 
     /// 最久的未存變動（秒）
@@ -1012,6 +1076,8 @@ impl Persister {
             "estimatedDailyBytes": self.estimated_daily(now),
             "deferred": st.deferred,
             "pending": st.pending,
+            "pendingImportant": self.pending_kinds().0,
+            "pendingCountersOnly": self.pending_kinds().1,
             "oldestUnsavedSec": self.oldest_unsaved(now),
             "forcedByAge": st.forced_by_age,
             "freeBytes": st.free_bytes,
@@ -1465,6 +1531,98 @@ mod tests {
             assert_eq!(dir.join("a.json").exists(), want == 5, "大檔排最後");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// 3.5.0 C5：關機時重要變動先寫（小檔先），只有計數變動的（CDN 分片的查詢次數）排在所有重要變動之後、
+    /// 只用時限的一半；來不及寫的留著。注入的時鐘：每量一次過 1 秒
+    #[test]
+    fn shutdown_skips_lazy_and_writes_small_files_first() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        let dir = tmpdir("lazyshut");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 1));
+        let ticks = std::sync::Arc::new(AtomicU32::new(0));
+        let t2 = ticks.clone();
+        p.set_elapsed_probe(move || Duration::from_secs(t2.fetch_add(1, Ordering::Relaxed) as u64));
+        let t = 6_000 * 86400;
+        let lazy = Opts {
+            lazy: true,
+            ..Opts::default()
+        };
+        // 只有計數變動的分片比重要的檔小：照樣排在重要變動後面
+        for (i, n) in ["s1", "s2", "s3", "s4"].iter().enumerate() {
+            p.stage_with(n, Snapshot::Bytes(vec![b'c'; 10 * (i + 1)]), lazy.clone(), t);
+        }
+        for (n, size) in [("big", 3000), ("jobs", 100), ("pools", 2000)] {
+            p.stage_with(n, Snapshot::Bytes(vec![b'i'; size]), Opts::default(), t);
+        }
+        assert_eq!(p.pending_kinds(), (3, 4));
+        let st = p.status_json(t);
+        assert_eq!(
+            (st["pendingImportant"].as_u64(), st["pendingCountersOnly"].as_u64()),
+            (Some(3), Some(4))
+        );
+        // 時限 10 秒：第 0、1、2 秒寫 3 份重要的；只有計數的只用到第 5 秒 → 第 3、4 秒寫 2 份（小的先），另外 2 份不寫
+        let (n, _) = p.flush_for_shutdown_within(t, Duration::from_secs(10)).unwrap();
+        assert_eq!(n, 5);
+        for f in ["big", "jobs", "pools", "s1", "s2"] {
+            assert!(dir.join(f).exists(), "{f}");
+        }
+        assert!(!dir.join("s3").exists() && !dir.join("s4").exists(), "只有計數變動的來不及就不寫");
+        assert_eq!(p.pending_kinds(), (0, 2), "沒寫的留著");
+        assert_eq!(
+            p.last_shutdown(),
+            Some(ShutdownFlush {
+                important: 3,
+                important_late: 0,
+                lazy: 4,
+                lazy_late: 2
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 3.5.0 C5：時限很短（主控台關閉的 3 秒）時，只有計數變動的不佔重要變動的時間；統計分開算
+    /// （日誌的「重要變動 N 份寫了 M 份、只有計數變動的 K 份沒寫」用的就是這組數字）
+    #[test]
+    fn shutdown_log_reports_skipped_lazy() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        let dir = tmpdir("lazyshut2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096));
+        let ticks = std::sync::Arc::new(AtomicU32::new(0));
+        let t2 = ticks.clone();
+        p.set_elapsed_probe(move || Duration::from_secs(t2.fetch_add(1, Ordering::Relaxed) as u64));
+        let t = 6_000 * 86400;
+        for i in 0..4usize {
+            p.stage_with(&format!("i{i}"), Snapshot::Bytes(vec![b'i'; 100 * (i + 1)]), Opts::default(), t);
+        }
+        for i in 0..3usize {
+            let lazy = Opts {
+                lazy: true,
+                ..Opts::default()
+            };
+            p.stage_with(&format!("c{i}"), Snapshot::Bytes(vec![b'c'; 10]), lazy, t);
+        }
+        let (n, _) = p.flush_for_shutdown_within(t, Duration::from_secs(3)).unwrap();
+        assert_eq!(n, 3, "3 秒寫 3 份重要的（小的先）");
+        assert!(dir.join("i0").exists() && dir.join("i2").exists() && !dir.join("i3").exists());
+        assert!(!dir.join("c0").exists(), "只有計數變動的一份都沒佔到時間");
+        assert_eq!(
+            p.last_shutdown(),
+            Some(ShutdownFlush {
+                important: 4,
+                important_late: 1,
+                lazy: 3,
+                lazy_late: 3
+            })
+        );
+        // 管理介面的「立即儲存」沒有時限：全部寫
+        assert_eq!(p.flush_all(t).unwrap(), 4);
+        assert_eq!(p.pending_kinds(), (0, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 3.4.2：關機批次寫入時空間吃緊，「先刪可刪的檔」不能刪到前面已寫好、還沒改名的暫存檔

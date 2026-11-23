@@ -93,6 +93,7 @@ return view.extend({
 			t('cross', 'cross_concurrency', _('同時測試數'), 'cdn.cross.concurrency');
 
 			t('misc', 'max_entries', _('CDN 網域資料庫上限（筆）'), 'cdn.maxEntries', _('記憶體較小的機器可以調低。'));
+			t('misc', 'db_disk_budget_kb', _('CDN 網域資料的磁碟預算（KB）'), 'cdn.dbDiskBudgetKB', _('留空 = 自動：狀態目錄所在的儲存空間小於 64 MB（路由器的 Flash）時用總容量的 30%，超過時淘汰最久沒用的網域，把空間留給過濾清單的本機副本；64 MB 以上不限。0 = 不限。下限 512 KB。'));
 		}
 
 		// ---------------- 各家 CDN ----------------

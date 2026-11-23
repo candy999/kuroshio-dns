@@ -364,7 +364,7 @@ fn bench_persist() {
         );
     }
     let only: Option<usize> = std::env::var("BENCH_N").ok().and_then(|s| s.parse().ok());
-    for n in [5_000usize, 20_000, 50_000, 120_000, 200_000] {
+    for n in [5_000usize, 10_000, 20_000, 40_000, 50_000, 120_000, 200_000] {
         if only.is_some_and(|o| o != n) {
             continue;
         }
@@ -372,7 +372,10 @@ fn bench_persist() {
         let mut db = crate::db::Db::new(n * 2);
         db.load_domains(&bytes, false).unwrap();
         let rss = "";
-        let shards = crate::db::shards_for(n);
+        let shards = std::env::var("BENCH_SHARDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(crate::db::shards_for(n));
         db.set_shards(shards);
         // 每片寫出、壓縮
         let mut raw_total = 0;

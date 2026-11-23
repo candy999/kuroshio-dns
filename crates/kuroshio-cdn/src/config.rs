@@ -83,6 +83,10 @@ pub struct CdnConfig {
     pub quality_samples: u32,
     pub v6_policy: String,
     pub max_entries: usize,
+    /// 網域資料在磁碟上的預算（bytes；3.5.0 C5，規格 05 第 5.7 節）。`None` = 不限（只受 `max_entries`）。
+    /// `cdn.dbDiskBudgetKB` 是數字時直接用（0 = 關，下限 512 KB）；`"auto"` 由主程式依狀態目錄所在的檔案系統大小
+    /// 換算成數字再傳進來（這裡看到 `"auto"` 當成不限）
+    pub db_disk_budget: Option<u64>,
     /// ip-zone.json（每個節點能不能服務網站的紀錄）上限
     pub zone_max: usize,
     /// 永久 IPv6 節點每家上限
@@ -169,6 +173,9 @@ impl CdnConfig {
                 .unwrap_or("drop")
                 .to_string(),
             max_entries: or(c, "maxEntries", 200000.0) as usize,
+            db_disk_budget: kuroshio_config::num_or_auto(c.get("dbDiskBudgetKB"))
+                .filter(|kb| *kb > 0)
+                .map(|kb| kb.saturating_mul(1024).max(crate::db::BUDGET_MIN_BYTES)),
             zone_max: or(c, "zoneMax", 8000.0) as usize,
             v6_max: or(c, "v6NodesMax", 2000.0) as usize,
             peak_start: nn(c, "peak.startHour", 20.0) as u32,
