@@ -841,3 +841,14 @@ fn cdn_db_disk_budget_from_uci() {
     let c = load("config cdn 'cdn'\n", &env());
     assert_eq!(g(&c, "cdn.dbDiskBudgetKB"), &json!("auto"));
 }
+
+/// 3.5.0 B3：`cdn.multiCdn`、`cdn.appLayer` 預設開；UCI 的 `option multi_cdn '0'`／`option app_layer '0'` 可以關
+#[test]
+fn cdn_multi_cdn_and_app_layer_from_uci() {
+    let c = load("config cdn 'cdn'\n", &env());
+    assert_eq!(g(&c, "cdn.multiCdn"), &json!(true));
+    assert_eq!(g(&c, "cdn.appLayer"), &json!(true));
+    let c = load("config cdn 'cdn'\n\toption multi_cdn '0'\n\toption app_layer '0'\n", &env());
+    assert_eq!(g(&c, "cdn.multiCdn"), &json!(false));
+    assert_eq!(g(&c, "cdn.appLayer"), &json!(false));
+}

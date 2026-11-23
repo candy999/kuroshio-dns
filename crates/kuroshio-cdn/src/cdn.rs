@@ -103,6 +103,12 @@ pub struct Stats {
     pub v6dropped: u32,
     pub ecs_rewrites: u32,
     pub cross_rewrites: u32,
+    /// 來源變了而清掉跨 CDN／ECS／最佳策略的次數（3.5.0 B3）
+    pub src_invalidated: u32,
+    /// 多來源：這一家沒有格子、照原始答案回的次數（3.5.0 B3）
+    pub multi_held: u32,
+    /// App 自己選節點的服務：只辨識、不改寫的次數（3.5.0 B3）
+    pub app_layer: u32,
 }
 
 /// 背景工作
@@ -376,6 +382,7 @@ impl Cdn {
 
         // 網域資料庫：分片（舊版的單一檔案也讀，之後搬進分片）
         let mut db = Db::new(c.max_entries);
+        db.multi_cdn = c.multi_cdn;
         let shard_dir = paths.state_dir.join(db::SHARD_DIR);
         let list = || -> Vec<String> {
             std::fs::read_dir(&shard_dir)
@@ -1221,7 +1228,21 @@ impl Cdn {
     pub fn domain(&self, name: &str) -> Option<Value> {
         self.ensure_loaded(&normalize(name));
         let st = self.state();
-        st.db.get(&normalize(name)).map(|d| serde_json::to_value(d).unwrap_or_default())
+        st.db.get(&normalize(name)).map(Self::domain_json)
+    }
+
+    /// 網域紀錄加上算出來的來源資訊（3.5.0 B3）：`multi`（多來源）、`provs`（最近看到的業者，最多 3 個）
+    fn domain_json(d: &db::Domain) -> Value {
+        let mut v = serde_json::to_value(d).unwrap_or_default();
+        if d.src.is_some() {
+            v["multi"] = json!(d.multi(now_ms()));
+            v["provs"] = d
+                .provs()
+                .into_iter()
+                .map(|(p, t, slot)| json!({ "provider": p, "lastSeen": t, "verified": slot }))
+                .collect();
+        }
+        v
     }
 
     /// `/api/cdn/policy`：auto / always / never

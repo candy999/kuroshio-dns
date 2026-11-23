@@ -326,6 +326,8 @@
               { "value": "drop", "label": "丟棄該 CDN 的 IPv6 位址（避免 IPv6 繞回國外，推薦）" },
               { "value": "keep", "label": "保留" }
             ] },
+            { "key": "cdn.multiCdn", "type": "bool", "label": "尊重多來源 CDN", "help": "網站自己在多家 CDN 之間分流時，每一家各自驗證、各自換成那一家的台灣節點，不把網站硬綁在其中一家，也不替它換到別家；網站換了 CDN 或第一層 CNAME 時，舊的跨 CDN 與 ECS 結果失效、重新驗證。關掉＝3.4.x 的行為。" },
+            { "key": "cdn.appLayer", "type": "bool", "label": "App 自己選節點的服務不改寫", "help": "影音、系統更新這類由 App 或服務自己決定連哪個節點的 CDN（目前：Google、Apple）只辨識與統計，不換節點。個別網域可以在 CDN 網域表手動設成「一定換」。" },
             { "key": "cdn.ecs.twSubnets", "type": "list", "label": "ECS 台灣網段", "help": "DNS 分流型 CDN 用。放你用戶實際所在的 ISP 網段效果最好；本機對外 IP 的 /24 會自動放在最前面。" }
           ]
         },

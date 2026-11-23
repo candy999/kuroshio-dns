@@ -95,6 +95,10 @@ pub struct CdnConfig {
     pub peak_start: u32,
     pub peak_end: u32,
     pub peak_weight: f64,
+    /// 尊重多來源 CDN、第一層 CNAME 變了就失效（3.5.0 B3，`cdn.multiCdn`，預設開）。關掉＝3.4.x 的行為
+    pub multi_cdn: bool,
+    /// App 自己選節點的服務只辨識、不改寫（3.5.0 B3，`cdn.appLayer`，預設開）
+    pub app_layer: bool,
     pub providers: Vec<ProviderCfg>,
     pub ecs: EcsCfg,
     pub cross: CrossCfg,
@@ -181,6 +185,8 @@ impl CdnConfig {
             peak_start: nn(c, "peak.startHour", 20.0) as u32,
             peak_end: nn(c, "peak.endHour", 23.0) as u32,
             peak_weight: nn(c, "peak.weight", 2.0),
+            multi_cdn: lite_value(c.get("multiCdn")) != Some(false),
+            app_layer: lite_value(c.get("appLayer")) != Some(false),
             providers,
             ecs: EcsCfg {
                 resolvers: if resolvers.is_empty() {

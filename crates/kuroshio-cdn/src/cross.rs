@@ -239,6 +239,10 @@ impl Cdn {
             ..Default::default()
         };
         let now = now_ms();
+        // 多來源、或剛換業者還沒定下來（3.5.0 B3）：排進來之後才變成多來源的也不探索
+        if self.state().db.get(name).is_some_and(|e| e.no_cross(now)) {
+            return "none";
+        }
         self.with_state(|st| st.cross_explored += 1);
         let base = self.net.https_probe(orig, name, "/", opts.clone()).await;
         if !base.ok {

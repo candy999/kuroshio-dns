@@ -599,6 +599,12 @@ mod tests {
             Some(&json!("auto")),
             "CDN 網域資料的磁碟預算：只在小 Flash 自動啟用（3.5.0 C5）"
         );
+        assert_eq!(get(&d, "cdn.multiCdn"), Some(&json!(true)), "尊重多來源 CDN（3.5.0 B3）");
+        assert_eq!(
+            get(&d, "cdn.appLayer"),
+            Some(&json!(true)),
+            "App 自己選節點的服務不改寫（3.5.0 B3）"
+        );
     }
 
     #[test]

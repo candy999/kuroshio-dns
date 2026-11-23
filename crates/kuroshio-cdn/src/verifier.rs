@@ -142,6 +142,25 @@ struct Done {
 
 /// 驗證時內容最多讀多少：判斷只看狀態碼與標頭（內容只用來找 Cloudflare 的 `colo=`，那在 /cdn-cgi/trace，
 /// 不在首頁），跟純 HTTP 探測一樣讀 4 KB 就關（3.4.2 以前讀 16 KB）
+/// 這家業者在這個網域的哪一格（多來源，3.5.0 B3）
+enum Slot<'a> {
+    Main,
+    Alt(&'a crate::db::Alt),
+    None,
+}
+
+fn slot_of<'a>(e: &'a crate::db::Domain, provider: &str, multi_cdn: bool) -> Slot<'a> {
+    match e.provider() {
+        _ if !multi_cdn => Slot::Main,
+        None => Slot::Main,
+        Some(p) if p == provider => Slot::Main,
+        Some(_) => match e.src.as_ref().and_then(|s| s.alt.as_deref()) {
+            Some(a) if a.provider.val().map(|p| &**p) == Some(provider) => Slot::Alt(a),
+            _ => Slot::None,
+        },
+    }
+}
+
 const VERIFY_MAX_BODY: usize = 4096;
 
 impl Cdn {
@@ -219,7 +238,15 @@ impl Cdn {
         let label = providers::label(provider);
         let prev_fails = {
             let st = self.state();
-            st.db.get(name).and_then(|e| e.verdict(family)).and_then(|v| v.fails).unwrap_or(0)
+            // 多來源（3.5.0 B3）：這一家已經沒有格子（被別家擠掉、過期）→ 不驗證，結果沒有地方放
+            match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
+                Some((e, Slot::Main)) => e.verdict(family).and_then(|v| v.fails).unwrap_or(0),
+                Some((_, Slot::Alt(a))) => if family == 6 { a.v6.as_deref() } else { a.v4.as_deref() }
+                    .and_then(|v| v.fails)
+                    .unwrap_or(0),
+                Some((_, Slot::None)) => return None,
+                None => 0,
+            }
         };
         let t = Duration::from_millis(self.cfg.verify_timeout_ms);
 
@@ -258,18 +285,20 @@ impl Cdn {
                 None => det_pop,
             };
             self.with_state(|st| {
-                st.db.set_base(
-                    name,
-                    Base {
-                        ip: Some(o),
-                        ok: Some(b.ok),
-                        status: if b.status > 0 { Num::V(b.status as f64) } else { Num::Null },
-                        pop: Some(intern(&pop)),
-                        ms: if b.ok { Num::V(util::round(b.ms, 1)) } else { Num::Null },
-                        error: b.error.clone(),
-                        ..Default::default()
-                    },
-                )
+                st.db.with_slot(name, provider, |db| {
+                    db.set_base(
+                        name,
+                        Base {
+                            ip: Some(o),
+                            ok: Some(b.ok),
+                            status: if b.status > 0 { Num::V(b.status as f64) } else { Num::Null },
+                            pop: Some(intern(&pop)),
+                            ms: if b.ok { Num::V(util::round(b.ms, 1)) } else { Num::Null },
+                            error: b.error.clone(),
+                            ..Default::default()
+                        },
+                    )
+                })
             });
             base = Some(b);
         }
@@ -281,8 +310,14 @@ impl Cdn {
         let mut candidates: Vec<IpAddr> = {
             let st = self.state();
             if octet {
-                let mut observed: Vec<IpAddr> = st.db.get(name).map(|e| e.ips4.to_vec()).unwrap_or_default();
-                if let Some(b) = st.db.get(name).and_then(|e| e.base.as_ref()).and_then(|b| b.ip) {
+                // 這一家那一格看到的 IP（多來源時不能拿別家的 IP 來猜最後一段）
+                let (mut observed, base_ip): (Vec<IpAddr>, Option<IpAddr>) =
+                    match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
+                        Some((e, Slot::Main)) => (e.ips4.to_vec(), e.base.as_ref().and_then(|b| b.ip)),
+                        Some((_, Slot::Alt(a))) => (a.ips4.to_vec(), a.base.as_ref().and_then(|b| b.ip)),
+                        _ => (Vec::new(), None),
+                    };
+                if let Some(b) = base_ip {
                     observed.push(b);
                 }
                 st.pools.verify_candidates(provider, orig, &observed)
@@ -381,6 +416,7 @@ impl Cdn {
                         }
                         return Some(self.done(
                             name,
+                            provider,
                             family,
                             true,
                             0,
@@ -411,6 +447,7 @@ impl Cdn {
                 }
                 return Some(self.done(
                     name,
+                    provider,
                     family,
                     false,
                     prev_fails,
@@ -432,6 +469,7 @@ impl Cdn {
                 if b.status < 400 && r.status >= 400 && r.status != b.status && r.status != 404 {
                     return Some(self.done(
                         name,
+                        provider,
                         family,
                         false,
                         prev_fails,
@@ -498,6 +536,7 @@ impl Cdn {
             }
             return Some(self.done(
                 name,
+                provider,
                 family,
                 true,
                 0,
@@ -521,6 +560,7 @@ impl Cdn {
             let retry = octet.then(|| now_ms() + HOUR_MS);
             return Some(self.done(
                 name,
+                provider,
                 family,
                 false,
                 prev_fails,
@@ -540,10 +580,12 @@ impl Cdn {
         }
         // 全部因網路或漂移失敗 → 暫不判定，10 分鐘後再試
         self.with_state(|st| {
-            st.db.set_verdict(name, family, |v| {
-                v.verdict = Some(intern("unknown"));
-                v.reason = Some(last_reason.clone());
-                v.until = Some(now_ms() + 600_000);
+            st.db.with_slot(name, provider, |db| {
+                db.set_verdict(name, family, |v| {
+                    v.verdict = Some(intern("unknown"));
+                    v.reason = Some(last_reason.clone());
+                    v.until = Some(now_ms() + 600_000);
+                })
             })
         });
         warn!("{name} IPv{family} 暫無法判定：{last_reason}");
@@ -601,34 +643,37 @@ impl Cdn {
     }
 
     /// 寫入判定（合併到舊紀錄，同 2.x）；`full` = 驗證成功的完整結果（ips / tried / http 一併更新）
-    fn done(&self, name: &str, family: u8, ok: bool, prev_fails: u32, d: Done, full: bool) -> &'static str {
+    #[allow(clippy::too_many_arguments)]
+    fn done(&self, name: &str, provider: &str, family: u8, ok: bool, prev_fails: u32, d: Done, full: bool) -> &'static str {
         let fails = if ok { 0 } else { prev_fails + 1 };
         let until = d.retry_at.unwrap_or_else(|| self.until(ok, fails));
         let reason = d.reason.clone();
         self.with_state(|st| {
-            st.db.set_verdict(name, family, |v| {
-                v.verdict = Some(intern(if ok { "ok" } else { "fail" }));
-                v.fails = Some(fails);
-                v.until = Some(until);
-                v.algo = Some(2);
-                if let Some(p) = &d.pop {
-                    v.pop = Some(intern(p));
-                }
-                if let Some(m) = d.ms {
-                    v.ms = Num::V(util::round(m, 1));
-                }
-                if let Some(s) = d.status {
-                    v.status = Num::V(s as f64);
-                }
-                v.ip = Some(d.ip);
-                if full {
-                    v.ips = d.ips.clone();
-                    v.tried = d.tried;
-                    v.http = d.http;
-                }
-                if let Some(r) = &d.reason {
-                    v.reason = Some(r.clone());
-                }
+            st.db.with_slot(name, provider, |db| {
+                db.set_verdict(name, family, |v| {
+                    v.verdict = Some(intern(if ok { "ok" } else { "fail" }));
+                    v.fails = Some(fails);
+                    v.until = Some(until);
+                    v.algo = Some(2);
+                    if let Some(p) = &d.pop {
+                        v.pop = Some(intern(p));
+                    }
+                    if let Some(m) = d.ms {
+                        v.ms = Num::V(util::round(m, 1));
+                    }
+                    if let Some(s) = d.status {
+                        v.status = Num::V(s as f64);
+                    }
+                    v.ip = Some(d.ip);
+                    if full {
+                        v.ips = d.ips.clone();
+                        v.tried = d.tried;
+                        v.http = d.http;
+                    }
+                    if let Some(r) = &d.reason {
+                        v.reason = Some(r.clone());
+                    }
+                })
             })
         });
         if ok {

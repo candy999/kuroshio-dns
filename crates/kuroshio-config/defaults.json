@@ -332,6 +332,8 @@
       "concurrency": 2
     },
     "v6Policy": "drop",
+    "multiCdn": true,
+    "appLayer": true,
     "dbFile": "./state/cdn-domains.json",
     "maxEntries": 200000,
     "dbDiskBudgetKB": "auto",

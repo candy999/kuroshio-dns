@@ -81,6 +81,171 @@ pub struct BudgetPlan {
     /// 這一輪剛開始主動重寫（寫日誌用）
     pub sweep_started: bool,
 }
+
+// ------------------------------------------------------------ 多來源 CDN 與第一層 CNAME（3.5.0 B3）
+
+/// 第一層 CNAME 的鍵最長幾個位元組（超過就退到比較短的一層，再超過就不記）
+pub const C1_MAX: usize = 64;
+/// 除了目前的鍵以外，還記幾個「最近看過的鍵」（網站自己在幾個第一層之間輪流時，不算變了）
+pub const C1_SEEN_MAX: usize = 3;
+/// 新的鍵要連續看到幾次、而且從第一次看到算起至少隔多久，才算「變了」
+/// （`apply()` 連快取命中都會走，同一份快取的答案會重複出現，所以一定要看時間）
+pub const C1_CONFIRM_HITS: u8 = 3;
+pub const C1_CONFIRM_MS: u64 = 10 * 60 * 1000;
+/// 「最近」：業者或第一層的鍵在這段時間內看過
+pub const SRC_WINDOW_MS: u64 = 24 * 3600 * 1000;
+/// 同一個網域兩次「失效」（清掉跨 CDN、ECS、最佳策略）或「替新的業者開一格」至少隔多久。
+/// 這是防風暴的上限：不管網站怎麼輪流，每個網域每 6 小時最多多一次重新驗證
+pub const SRC_GAP_MS: u64 = 6 * 3600 * 1000;
+/// 多來源的標記在多久沒有再看到兩家輪流之後取消
+pub const MULTI_KEEP_MS: u64 = 7 * 24 * 3600 * 1000;
+
+/// 第一層 CNAME 的鍵：取目標名稱的最後三段（可註冊網域再往前一層，跟 `providers.rs` 的 `last2()` 同一套切法）。
+/// 前面每次查詢都可能不同的標籤（節點、地區、雜湊）不算進去。不配置記憶體；比對時不分大小寫
+pub fn c1_key(target: &str) -> &str {
+    let t = target.trim_end_matches('.');
+    let mut cut = [0usize; 3]; // 最後三個「.」之後的位置
+    let mut n = 0;
+    for (i, b) in t.bytes().enumerate().rev() {
+        if b == b'.' {
+            cut[n] = i + 1;
+            n += 1;
+            if n == 3 {
+                break;
+            }
+        }
+    }
+    // n = 看到幾個點：不到 3 個點就是整個名稱（最多三段）
+    let last3 = if n == 3 { &t[cut[2]..] } else { t };
+    if last3.len() <= C1_MAX {
+        return last3;
+    }
+    let last2 = if n >= 2 { &t[cut[1]..] } else { t };
+    if last2.len() <= C1_MAX {
+        last2
+    } else {
+        ""
+    }
+}
+
+/// 另一家業者的那一格（多來源網域）：跟 `Domain` 上「跟業者有關」的欄位一一對應，回答換成這一家時整格對調
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alt {
+    #[serde(default, skip_serializing_if = "Field::is_absent", with = "field_arc")]
+    pub provider: Field<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Field::is_absent", with = "field_arc")]
+    pub via: Field<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Field::is_absent")]
+    pub cname: Field<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_arc",
+        deserialize_with = "de_opt_arc"
+    )]
+    pub c1: Option<Arc<str>>,
+    #[serde(default, deserialize_with = "de_ips_box")]
+    pub ips4: Box<[IpAddr]>,
+    #[serde(default, deserialize_with = "de_ips_box")]
+    pub ips6: Box<[IpAddr]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v4: Option<Box<Verdict>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6: Option<Box<Verdict>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<Box<Base>>,
+    /// 這一家最後一次回答的時間
+    #[serde(default, deserialize_with = "de_u64")]
+    pub last: u64,
+}
+
+/// 來源的變動紀錄（只有「看過第二家業者」或「第一層 CNAME 換過」的網域才有；其他網域只佔一個指標）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Src {
+    /// 最近看過的其他第一層鍵（鍵，最後看到的時間），最多 [`C1_SEEN_MAX`] 個
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<(String, u64)>,
+    /// 還沒確認的新鍵：連續看到幾次、第一次看到的時間
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pend: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub pend_n: u8,
+    #[serde(default, skip_serializing_if = "is_zero", deserialize_with = "de_u64")]
+    pub pend_at: u64,
+    /// 最後一次看到「兩家輪流」的時間（0 = 不是多來源）
+    #[serde(default, skip_serializing_if = "is_zero", deserialize_with = "de_u64")]
+    pub multi_at: u64,
+    /// 最後一次失效（清掉跨 CDN、ECS、最佳策略）的時間
+    #[serde(default, skip_serializing_if = "is_zero", deserialize_with = "de_u64")]
+    pub inval_at: u64,
+    /// 最後一次替新的業者開一格的時間
+    #[serde(default, skip_serializing_if = "is_zero", deserialize_with = "de_u64")]
+    pub slot_at: u64,
+    /// 沒有格子可以放的業者（第三家，或 6 小時內的第二次換家）：業者、最後看到的時間
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<(String, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt: Option<Box<Alt>>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+impl Src {
+    fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+            && self.pend.is_none()
+            && self.multi_at == 0
+            && self.inval_at == 0
+            && self.slot_at == 0
+            && self.other.is_none()
+            && self.alt.is_none()
+            && self.extra.is_empty()
+    }
+
+    /// 多來源：7 天內看過兩家輪流回答
+    pub fn multi(&self, now: u64) -> bool {
+        self.multi_at != 0 && now.abs_diff(self.multi_at) < MULTI_KEEP_MS
+    }
+
+    fn approx_bytes(&self) -> usize {
+        use std::mem::size_of;
+        size_of::<Src>()
+            + self.seen.iter().map(|s| s.0.len() + size_of::<(String, u64)>()).sum::<usize>()
+            + self.pend.as_ref().map_or(0, |p| p.len())
+            + self.other.as_ref().map_or(0, |o| o.0.len())
+            + self.alt.as_ref().map_or(0, |a| {
+                size_of::<Alt>()
+                    + a.cname.val().map_or(0, |c| c.len())
+                    + (a.ips4.len() + a.ips6.len()) * size_of::<IpAddr>()
+                    + if a.v4.is_some() { size_of::<Verdict>() } else { 0 }
+                    + if a.v6.is_some() { size_of::<Verdict>() } else { 0 }
+                    + if a.base.is_some() { size_of::<Base>() } else { 0 }
+            })
+    }
+}
+
+/// `touch_at()` 看完這次回答的來源之後的結論
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Touch {
+    /// 這次回答的業者沒有格子可以放（多來源的第三家，或太快又換一家）：照原始答案回，不驗證、不改寫
+    pub held: bool,
+    /// 多來源、或剛換業者還沒定下來：不做跨 CDN（網站自己在多家之間選）
+    pub no_cross: bool,
+    /// 這次清掉了跨 CDN、ECS、最佳策略（給測試與統計看）
+    pub invalidated: bool,
+    /// 這次替新的業者開了一格
+    pub new_slot: bool,
+}
+
 pub const HARVEST_FILE: &str = "cdn/harvest.json";
 /// 每家 CDN 每個家族最多收集幾個候選 IP（同 2.x）
 pub const HARVEST_MAX: usize = 3000;
@@ -392,6 +557,17 @@ pub struct Domain {
     /// 最後成功的改寫方式（3.0 新增；2.x 讀到會原封保留）
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_strategy")]
     pub best: Option<Strategy>,
+    /// 第一層 CNAME 的鍵（3.5.0 B3；`c1_key()`）。沒有 CNAME、或舊資料還沒補上時沒有
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_arc",
+        deserialize_with = "de_opt_arc"
+    )]
+    pub c1: Option<Arc<str>>,
+    /// 來源的變動紀錄與另一家業者的那一格（3.5.0 B3）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<Box<Src>>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -459,6 +635,61 @@ impl Domain {
             + boxed(self.base.is_some(), size_of::<Base>())
             + boxed(self.ecs.is_some(), size_of::<Ecs>())
             + boxed(self.cross4.is_some(), size_of::<Cross>())
+            + self.src.as_ref().map_or(0, |s| s.approx_bytes())
+    }
+
+    /// 多來源（7 天內看過兩家輪流回答）
+    pub fn multi(&self, now: u64) -> bool {
+        self.src.as_ref().is_some_and(|s| s.multi(now))
+    }
+
+    /// 不做跨 CDN：多來源，或剛看到第二家、還沒定下來是「換家」還是「輪流」
+    pub fn no_cross(&self, now: u64) -> bool {
+        self.src.as_ref().is_some_and(|s| s.alt.is_some() || s.multi(now))
+    }
+
+    /// 最近看到的業者（業者，最後看到的時間，有沒有自己的一格），最多 3 個：目前這一家、另一格、沒有格子的
+    pub fn provs(&self) -> Vec<(String, u64, bool)> {
+        let mut out = Vec::new();
+        if let Some(p) = self.provider() {
+            out.push((p.to_string(), self.last_seen, true));
+        }
+        if let Some(s) = &self.src {
+            if let Some(a) = &s.alt {
+                if let Some(p) = a.provider.val() {
+                    out.push((p.to_string(), a.last, true));
+                }
+            }
+            if let Some((p, t)) = &s.other {
+                out.push((p.clone(), *t, false));
+            }
+        }
+        out
+    }
+
+    /// 對調目前這一格與另一格（只換「跟業者有關」的欄位；`last` 由呼叫端處理）
+    fn swap_slot(&mut self) {
+        let Some(a) = self.src.as_mut().and_then(|s| s.alt.as_deref_mut()) else {
+            return;
+        };
+        std::mem::swap(&mut self.provider, &mut a.provider);
+        std::mem::swap(&mut self.via, &mut a.via);
+        std::mem::swap(&mut self.cname, &mut a.cname);
+        std::mem::swap(&mut self.c1, &mut a.c1);
+        std::mem::swap(&mut self.ips4, &mut a.ips4);
+        std::mem::swap(&mut self.ips6, &mut a.ips6);
+        std::mem::swap(&mut self.v4, &mut a.v4);
+        std::mem::swap(&mut self.v6, &mut a.v6);
+        std::mem::swap(&mut self.base, &mut a.base);
+    }
+
+    /// 清掉不分業者的結果（跨 CDN、ECS、最佳策略）。回傳有沒有東西被清掉
+    fn invalidate_shared(&mut self) -> bool {
+        let had = self.cross4.is_some() || self.ecs.is_some() || self.best.is_some();
+        self.cross4 = None;
+        self.ecs = None;
+        self.best = None;
+        had
     }
 }
 
@@ -741,6 +972,15 @@ pub struct Db {
     evicted: Vec<u32>,
     /// 磁碟預算：正在一輪一輪主動重寫超過額度的分片（超過 110% 開始，回到預算以內結束）
     budget_sweep: bool,
+    /// 尊重多來源 CDN、第一層 CNAME 變了就失效（3.5.0 B3，`cdn.multiCdn`）。關掉時同 3.4.x：業者欄位直接改寫
+    pub multi_cdn: bool,
+}
+
+/// `switch_provider()` 的結果
+enum Switch {
+    Swapped,
+    NewSlot { invalidated: bool },
+    Held,
 }
 
 /// 冷資料移出記憶體的結果
@@ -766,6 +1006,7 @@ impl Db {
             manifest_pending: None,
             evicted: Vec::new(),
             budget_sweep: false,
+            multi_cdn: true,
         }
     }
 
@@ -1023,6 +1264,8 @@ impl Db {
         for mut d in f.domains {
             if seed {
                 d.last_seen = now;
+                // 另一家業者的那一格也是別台機器驗證的：不帶
+                d.src = None;
                 // 種子裡「通過」的結果是別台機器在別的網路驗證的：有效期限一律設成現在，
                 // 這台機器自己驗證過才換節點（每小時的複驗會處理，第一次查詢也會觸發）。
                 // 以前種子匯出後 24 小時內（跨 CDN 是 3 天）安裝，會直接照種子的結果改寫
@@ -1365,9 +1608,37 @@ impl Db {
         self.domains.get_mut(name)
     }
 
-    /// 每次解析到 CDN 網域時呼叫：登記 / 更新統計
+    /// 每次解析到 CDN 網域時呼叫：登記 / 更新統計（不帶第一層 CNAME 的鍵；測試與舊的呼叫端用）
     pub fn touch(&mut self, name: &str, provider: &str, via: &str, ips4: &[IpAddr], ips6: &[IpAddr], cname: Option<&str>) -> &mut Domain {
-        let now = now_ms();
+        self.touch_at(name, provider, via, ips4, ips6, cname, "", now_ms());
+        self.domains.get_mut(name).unwrap()
+    }
+
+    /// 每次解析到 CDN 網域時呼叫：登記 / 更新統計，並看這次回答的來源（業者、第一層 CNAME 的鍵 `c1`）有沒有變。
+    ///
+    /// 多來源（3.5.0 B3，`multi_cdn`）：
+    /// - 每個網域最多兩格（目前這一家＋另一家），驗證結果各存各的。回答換成另一家時整格對調，
+    ///   所以「兩家輪流回答」不會清掉任何驗證結果，也不算重要變動（不觸發寫入）。
+    /// - 第一次看到第二家：替它開一格（從試用期開始驗證），清掉不分業者的結果（跨 CDN、ECS、最佳策略）。
+    ///   開新的一格每個網域每 [`SRC_GAP_MS`] 最多一次；不能開的那次回 `held`（照原始答案回）。
+    /// - 回到另一格、而且剛剛那一家 24 小時內才回答過 → 兩家在輪流：標成多來源，[`MULTI_KEEP_MS`] 沒再發生就取消。
+    /// - 同一家裡第一層 CNAME 的鍵變了：新的鍵要連續看到 [`C1_CONFIRM_HITS`] 次、相隔 [`C1_CONFIRM_MS`] 以上、
+    ///   中間沒有再看到舊的鍵才算；24 小時內看過的鍵不算新的。確認之後清掉跨 CDN 與 ECS（驗證結果留著），
+    ///   一樣每 [`SRC_GAP_MS`] 最多一次。
+    /// - 舊資料沒有鍵：第一次看到時補上，**不算變了**（不然升級後第一輪會把所有網域的結果清掉）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn touch_at(
+        &mut self,
+        name: &str,
+        provider: &str,
+        via: &str,
+        ips4: &[IpAddr],
+        ips6: &[IpAddr],
+        cname: Option<&str>,
+        c1: &str,
+        now: u64,
+    ) -> Touch {
+        let mut out = Touch::default();
         if !self.domains.contains_key(name) {
             if self.domains.len() >= self.max_entries {
                 self.prune();
@@ -1389,15 +1660,47 @@ impl Db {
             );
         }
         let shard = shard_of(name, self.shards);
+        let multi_cdn = self.multi_cdn;
         let e = self.domains.get_mut(name).unwrap();
         // 剛新增的（hits 還是 0）算重要變動；其他只有計數變了的，不單獨觸發寫入
         let mut important = e.hits == 0;
+        if !provider.is_empty() && e.provider() != Some(provider) {
+            if !multi_cdn || e.provider().is_none() {
+                e.provider = Field::Val(util::intern(provider));
+                e.via = Field::Val(util::intern(via));
+                important = true;
+            } else {
+                match Self::switch_provider(e, provider, via, now) {
+                    Switch::Swapped => {}
+                    Switch::NewSlot { invalidated } => {
+                        out.new_slot = true;
+                        out.invalidated = invalidated;
+                        important = true;
+                    }
+                    Switch::Held => {
+                        // 沒有格子：只記計數，其他都不動（這一家的 IP、CNAME 不能蓋掉目前這一格的）
+                        e.last_seen = now;
+                        e.hits = e.hits.saturating_add(1);
+                        out.held = true;
+                        out.no_cross = true;
+                        let m = &mut self.marks[shard];
+                        if *m == Mark::Clean {
+                            *m = Mark::Counters;
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
         e.last_seen = now;
         e.hits = e.hits.saturating_add(1);
-        if !provider.is_empty() && e.provider() != Some(provider) {
-            e.provider = Field::Val(util::intern(provider));
-            e.via = Field::Val(util::intern(via));
-            important = true;
+        if multi_cdn {
+            if !c1.is_empty() && Self::observe_c1(e, c1, now) {
+                out.invalidated = true;
+                important = true;
+            }
+            Self::expire_src(e, now);
+            out.no_cross = e.no_cross(now);
         }
         if let Some(c) = cname {
             if e.cname.val().map(|x| x.as_str()) != Some(c) {
@@ -1419,7 +1722,185 @@ impl Db {
         } else if *m == Mark::Clean {
             *m = Mark::Counters;
         }
-        e
+        out
+    }
+
+    /// 這次回答的業者跟目前這一格不同：對調、開新的一格，或沒有格子
+    fn switch_provider(e: &mut Domain, provider: &str, via: &str, now: u64) -> Switch {
+        let prev_last = e.last_seen;
+        let src = e.src.get_or_insert_with(Default::default);
+        let in_alt = src.alt.as_ref().is_some_and(|a| a.provider.val().map(|p| &**p) == Some(provider));
+        if in_alt {
+            // 另一格就是這一家：整格對調。剛剛那一家 24 小時內才回答過 → 兩家在輪流
+            if now.abs_diff(prev_last) < SRC_WINDOW_MS {
+                src.multi_at = now;
+            }
+            src.pend = None;
+            src.pend_n = 0;
+            src.pend_at = 0;
+            e.swap_slot();
+            if let Some(a) = e.src.as_mut().and_then(|s| s.alt.as_deref_mut()) {
+                a.last = prev_last;
+            }
+            return Switch::Swapped;
+        }
+        if src.slot_at != 0 && now.abs_diff(src.slot_at) < SRC_GAP_MS {
+            src.other = Some((provider.to_string(), now));
+            return Switch::Held;
+        }
+        // 開新的一格：目前這一格移到另一格（原本在另一格的那一家被擠掉）
+        src.slot_at = now;
+        src.inval_at = now;
+        src.pend = None;
+        src.pend_n = 0;
+        src.pend_at = 0;
+        if src.other.as_ref().is_some_and(|o| o.0 == provider) {
+            src.other = None;
+        }
+        src.alt = Some(Box::new(Alt {
+            provider: Field::Val(util::intern(provider)),
+            via: Field::Val(util::intern(via)),
+            cname: Field::Null,
+            ..Default::default()
+        }));
+        e.swap_slot();
+        if let Some(a) = e.src.as_mut().and_then(|s| s.alt.as_deref_mut()) {
+            a.last = prev_last;
+        }
+        Switch::NewSlot {
+            invalidated: e.invalidate_shared(),
+        }
+    }
+
+    /// 同一家裡第一層 CNAME 的鍵。回傳 true = 確認變了、而且這次清掉了跨 CDN／ECS／最佳策略
+    fn observe_c1(e: &mut Domain, c1: &str, now: u64) -> bool {
+        let Some(cur) = e.c1.as_deref() else {
+            // 舊資料或新的一格：補上，不算變了
+            e.c1 = Some(util::intern(&c1.to_ascii_lowercase()));
+            return false;
+        };
+        if cur.eq_ignore_ascii_case(c1) {
+            // 又看到目前的鍵：等確認中的那個其實是「輪流出現的另一個」，記進最近看過的，以後不算新的
+            if let Some(s) = e.src.as_mut() {
+                if let Some(p) = s.pend.take() {
+                    s.pend_n = 0;
+                    s.pend_at = 0;
+                    Self::remember_c1(s, p, now);
+                }
+            }
+            return false;
+        }
+        let s = e.src.get_or_insert_with(Default::default);
+        if let Some(x) = s
+            .seen
+            .iter_mut()
+            .find(|x| x.0.eq_ignore_ascii_case(c1) && now.abs_diff(x.1) < SRC_WINDOW_MS)
+        {
+            x.1 = now;
+            return false;
+        }
+        if s.pend.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(c1)) {
+            s.pend_n = s.pend_n.saturating_add(1);
+        } else {
+            s.pend = Some(c1.to_ascii_lowercase());
+            s.pend_n = 1;
+            s.pend_at = now;
+        }
+        if s.pend_n < C1_CONFIRM_HITS || now.saturating_sub(s.pend_at) < C1_CONFIRM_MS {
+            return false;
+        }
+        // 確認變了：舊的鍵記進最近看過的（之後換回來不算新的）
+        let new = s.pend.take().unwrap_or_default();
+        s.pend_n = 0;
+        s.pend_at = 0;
+        Self::remember_c1(s, cur.to_string(), now);
+        let can = s.inval_at == 0 || now.abs_diff(s.inval_at) >= SRC_GAP_MS;
+        if can {
+            s.inval_at = now;
+        }
+        e.c1 = Some(util::intern(&new));
+        can && e.invalidate_shared()
+    }
+
+    fn remember_c1(s: &mut Src, key: String, now: u64) {
+        if let Some(x) = s.seen.iter_mut().find(|x| x.0 == key) {
+            x.1 = now;
+            return;
+        }
+        if s.seen.len() >= C1_SEEN_MAX {
+            if let Some(i) = (0..s.seen.len()).min_by_key(|&i| s.seen[i].1) {
+                s.seen.remove(i);
+            }
+        }
+        s.seen.push((key, now));
+    }
+
+    /// 過期的來源紀錄順手清掉（只在這個網域被查到時做；都是幾個時間比較）
+    fn expire_src(e: &mut Domain, now: u64) {
+        let same = e.provider.val().cloned();
+        let Some(s) = e.src.as_mut() else { return };
+        if s.multi_at != 0 && !s.multi(now) {
+            s.multi_at = 0;
+        }
+        let keep = if s.multi_at != 0 { MULTI_KEEP_MS } else { SRC_WINDOW_MS };
+        // 另一格太久沒回答（換家已經定下來、或多來源取消了）：丟掉。跟目前這一格同一家的（舊版寫回來、匯入合併造成的）也丟
+        if s.alt
+            .as_ref()
+            .is_some_and(|a| now.abs_diff(a.last) >= keep || a.provider.val() == same.as_ref())
+        {
+            s.alt = None;
+        }
+        s.seen.retain(|x| now.abs_diff(x.1) < SRC_WINDOW_MS);
+        if s.other.as_ref().is_some_and(|o| now.abs_diff(o.1) >= SRC_WINDOW_MS) {
+            s.other = None;
+        }
+        if s.pend.is_some() && now.abs_diff(s.pend_at) >= SRC_WINDOW_MS {
+            s.pend = None;
+            s.pend_n = 0;
+            s.pend_at = 0;
+        }
+        if s.slot_at != 0 && now.abs_diff(s.slot_at) >= MULTI_KEEP_MS {
+            s.slot_at = 0;
+        }
+        if s.inval_at != 0 && now.abs_diff(s.inval_at) >= MULTI_KEEP_MS {
+            s.inval_at = 0;
+        }
+        if s.is_empty() {
+            e.src = None;
+        }
+    }
+
+    /// 背景工作（驗證）寫結果用：把 `provider` 的那一格暫時換到前面、做完換回來。
+    /// 這一家已經沒有格子（被擠掉、過期）回 None：結果不寫（不能寫到別家的格子裡）。
+    /// `multi_cdn` 關掉、或這個網域還沒有業者時不分格子，直接做
+    pub fn with_slot<R>(&mut self, name: &str, provider: &str, f: impl FnOnce(&mut Db) -> R) -> Option<R> {
+        let swapped = {
+            let e = self.domains.get_mut(name)?;
+            match e.provider() {
+                _ if !self.multi_cdn => false,
+                None => false,
+                Some(p) if p == provider => false,
+                Some(_) => {
+                    let in_alt = e
+                        .src
+                        .as_ref()
+                        .and_then(|s| s.alt.as_ref())
+                        .is_some_and(|a| a.provider.val().map(|p| &**p) == Some(provider));
+                    if !in_alt {
+                        return None;
+                    }
+                    e.swap_slot();
+                    true
+                }
+            }
+        };
+        let r = f(self);
+        if swapped {
+            if let Some(e) = self.domains.get_mut(name) {
+                e.swap_slot();
+            }
+        }
+        Some(r)
     }
 
     /// 合併更新驗證結果（同 2.x：舊欄位保留、新欄位覆蓋，加上 `at`）
@@ -1724,7 +2205,9 @@ mod tests {
     #[test]
     fn record_size() {
         // 每筆網域的固定大小（64 位元）：選填的子物件都在 Box 裡、名稱跟鍵共用、IP 用定長切片
-        assert!(std::mem::size_of::<Domain>() <= 192, "{}", std::mem::size_of::<Domain>());
+        // 3.5.0 B3 多了第一層 CNAME 的鍵（共用字串，兩個指標寬）與來源紀錄（一個指標）：64 位元 +24、32 位元 +12
+        assert!(std::mem::size_of::<Domain>() <= 216, "{}", std::mem::size_of::<Domain>());
+        assert!(std::mem::size_of::<Option<Box<Src>>>() == std::mem::size_of::<usize>());
         assert_eq!(std::mem::size_of::<Extra>(), std::mem::size_of::<usize>());
         let mut db = Db::new(100);
         db.touch("a.test", "cloudflare", "ip", &[], &[], None);

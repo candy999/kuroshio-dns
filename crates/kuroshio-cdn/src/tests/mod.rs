@@ -5,6 +5,7 @@ mod bench;
 mod explain;
 mod jobs;
 mod lite;
+mod multi;
 mod parity;
 mod queue;
 mod selftest;

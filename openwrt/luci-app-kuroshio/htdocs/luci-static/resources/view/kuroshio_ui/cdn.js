@@ -92,6 +92,14 @@ return view.extend({
 			t('cross', 'cross_akamai_max_ms', _('Akamai 台灣節點延遲上限（毫秒）'), 'cdn.cross.akamaiMaxMs');
 			t('cross', 'cross_concurrency', _('同時測試數'), 'cdn.cross.concurrency');
 
+			o = s.taboption('misc', form.Flag, 'multi_cdn', _('尊重多來源 CDN'),
+				_('網站自己在多家 CDN 之間分流時，每一家各自驗證、各自換成那一家的台灣節點，不硬綁其中一家，也不替它換到別家；網站換了 CDN 或第一層 CNAME 時，舊的跨 CDN 與 ECS 結果失效、重新驗證。關掉＝3.4.x 的行為。'));
+			o.default = common.def('cdn.multiCdn') === false ? '0' : '1';
+			o.rmempty = false;
+			o = s.taboption('misc', form.Flag, 'app_layer', _('App 自己選節點的服務不改寫'),
+				_('影音、系統更新這類由 App 或服務自己決定連哪個節點的 CDN（目前：Google、Apple）只辨識與統計，不換節點。'));
+			o.default = common.def('cdn.appLayer') === false ? '0' : '1';
+			o.rmempty = false;
 			t('misc', 'max_entries', _('CDN 網域資料庫上限（筆）'), 'cdn.maxEntries', _('記憶體較小的機器可以調低。'));
 			t('misc', 'db_disk_budget_kb', _('CDN 網域資料的磁碟預算（KB）'), 'cdn.dbDiskBudgetKB', _('留空 = 自動：狀態目錄所在的儲存空間小於 64 MB（路由器的 Flash）時用總容量的 30%，超過時淘汰最久沒用的網域，把空間留給過濾清單的本機副本；64 MB 以上不限。0 = 不限。下限 512 KB。'));
 		}

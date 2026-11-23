@@ -36,6 +36,10 @@ pub struct Provider {
     /// 不在官方清單、但由這家服務的客戶自有網段
     pub extra_v4: &'static [&'static str],
     pub extra_v6: &'static [&'static str],
+    /// App 自己選節點的服務（3.5.0 B3）：用戶端的 App 或服務自己的排程決定連哪個節點（影音、系統更新這類），
+    /// DNS 的答案只是它的起點。只辨識與統計，不改寫、不 ECS、不跨 CDN（`cdn.appLayer` 可以關，
+    /// 個別網域可以用 `/api/cdn/policy` 設成「一定換」）
+    pub app_layer: bool,
 }
 
 const fn base(name: &'static str, label: &'static str, cname: &'static [&'static str]) -> Provider {
@@ -54,7 +58,13 @@ const fn base(name: &'static str, label: &'static str, cname: &'static [&'static
         seed_hosts: &[],
         extra_v4: &[],
         extra_v6: &[],
+        app_layer: false,
     }
+}
+
+const fn app_layer(mut p: Provider) -> Provider {
+    p.app_layer = true;
+    p
 }
 
 const fn capable(mut p: Provider) -> Provider {
@@ -182,12 +192,17 @@ pub static PROVIDERS: &[Provider] = &[
         "BytePlus / Volcengine",
         &["bytecdn.cn", "bytedns.net", "volcgslb.com", "bytegslb.com", "tiktokcdn.com", "byteeffecttos.com", "bytednsdoc.com"],
     )),
-    base(
+    // Google（影音、更新下載）與 Apple（系統更新、App Store）：節點由服務自己排程，標成 App 層（3.5.0 B3）
+    app_layer(base(
         "google",
         "Google",
         &["googlehosted.com", "ghs.google.com", "googleusercontent.com", "gvt1.com", "l.google.com", "googlevideo.com"],
-    ),
-    capable(base("apple", "Apple CDN", &["aaplimg.com", "apple-dns.net", "cdn-apple.com", "apple.com.edgekey.net"])),
+    )),
+    app_layer(capable(base(
+        "apple",
+        "Apple CDN",
+        &["aaplimg.com", "apple-dns.net", "cdn-apple.com", "apple.com.edgekey.net"],
+    ))),
     base("microsoft", "Microsoft", &["msedge.net", "trafficmanager.net", "msecnd.net", "vo.msecnd.net", "footprintdns.com"]),
     base("stackpath", "StackPath / Highwinds", &["stackpathdns.com", "hwcdn.net", "netdna-cdn.com", "netdna-ssl.com"]),
     base("imperva", "Imperva", &["incapdns.net", "impervadns.net"]),
