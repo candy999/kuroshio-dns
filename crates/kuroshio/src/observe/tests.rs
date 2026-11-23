@@ -357,6 +357,7 @@ fn noisy_inputs() -> FindInputs {
         now: NOW,
         upstreams: vec![(true, false), (false, false), (true, true)],
         stale_15m: (40, 100),
+        stale_fail_15m: 12,
         counters: kuroshio_cdn::ObserveCounters {
             verify_ok: 5,
             verify_fail: 30,
@@ -456,7 +457,7 @@ fn rules_quiet_when_everything_is_fine() {
     let mut e = Engine::new();
     e.apply(&obs, NOW);
     assert_eq!(e.json(), json!([]), "到得了兩個機房、上游正常、沒有串接問題");
-    // 過期快取：查詢不到 50 筆不判斷
+    // 過期快取：查詢不到 100 筆不判斷
     let inp = FindInputs {
         now: NOW,
         stale_15m: (20, 40),
@@ -638,4 +639,99 @@ fn invalid_isp_string_dropped() {
     assert!(!valid_isp("abcdefghijklmnopq"), "太長");
     assert!(!valid_isp("a.example"));
     assert!(!valid_isp("台灣"));
+}
+
+fn stale_high(inp: &FindInputs) -> Option<String> {
+    let (obs, _) = rules(inp, &[]);
+    obs.into_iter().find_map(|o| match o {
+        Obs::State {
+            key: "serve-stale-high",
+            on: true,
+            text,
+            ..
+        } => Some(text),
+        _ => None,
+    })
+}
+
+/// 3.5.0 F3（D23）：查詢少、重複多的家裡（37／101，37%），上游都正常、背景更新沒有失敗：不報
+#[test]
+fn stale_high_needs_refresh_failures() {
+    let mut inp = FindInputs {
+        now: NOW,
+        stale_15m: (37, 101),
+        stale_fail_15m: 0,
+        ..FindInputs::default()
+    };
+    assert_eq!(stale_high(&inp), None, "背景更新沒有失敗");
+    inp.stale_fail_15m = 4;
+    assert_eq!(stale_high(&inp), None, "失敗不到 5 次");
+    inp.stale_fail_15m = 9;
+    assert_eq!(stale_high(&inp), None, "失敗不到過期回答的四分之一（9 × 4 < 37）");
+    inp.stale_fail_15m = 10;
+    assert!(stale_high(&inp).is_some(), "10 × 4 ≥ 37");
+}
+
+/// 3.5.0 F3：上游掛掉時（過期回答大多是更新失敗）會報，上游恢復、15 分鐘內失敗歸零後變成「已過去」
+#[test]
+fn stale_high_fires_when_upstreams_down_and_clears() {
+    let mut e = Engine::new();
+    let down = FindInputs {
+        now: NOW,
+        stale_15m: (60, 200),
+        stale_fail_15m: 55,
+        ..FindInputs::default()
+    };
+    let t = stale_high(&down).expect("上游掛掉：報");
+    assert_eq!(t, "最近 15 分鐘有 30% 的查詢靠過期快取回答，其中 55 次背景更新失敗：上游可能有狀況");
+    let (obs, _) = rules(&down, &[]);
+    e.apply(&obs, NOW);
+    assert_eq!(find(&e.json(), "serve-stale-high").unwrap()["active"], true);
+    // 上游恢復：背景更新不再失敗（15 分鐘的時間窗滾過去）
+    let up = FindInputs {
+        now: NOW + 15 * 60_000,
+        stale_15m: (30, 200),
+        stale_fail_15m: 0,
+        ..FindInputs::default()
+    };
+    let (obs, _) = rules(&up, &[]);
+    e.apply(&obs, up.now);
+    assert_eq!(find(&e.json(), "serve-stale-high").unwrap()["active"], false, "已過去");
+}
+
+/// 3.5.0 F3：查詢 100 筆以上才判斷（以前 50 筆）
+#[test]
+fn stale_high_needs_100_queries() {
+    let mut inp = FindInputs {
+        now: NOW,
+        stale_15m: (60, 99),
+        stale_fail_15m: 60,
+        ..FindInputs::default()
+    };
+    assert_eq!(stale_high(&inp), None);
+    inp.stale_15m = (60, 100);
+    assert!(stale_high(&inp).is_some());
+    // 過期佔不到 5%：不報
+    inp.stale_15m = (4, 100);
+    inp.stale_fail_15m = 4;
+    assert_eq!(stale_high(&inp), None);
+}
+
+/// 3.5.0 F3（D12）：淘汰 CDN 網域資料是因為筆數超過校正後的上限，不是磁碟不夠
+#[test]
+fn cdn_db_pruning_text() {
+    let inp = FindInputs {
+        now: NOW,
+        cdn_pruned: Some(3645),
+        ..FindInputs::default()
+    };
+    let (obs, _) = rules(&inp, &[]);
+    let mut e = Engine::new();
+    e.apply(&obs, NOW);
+    let f = find(&e.json(), "cdn-db-pruning").unwrap().clone();
+    assert_eq!(
+        f["text"],
+        "CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 3645 筆）"
+    );
+    assert!(!f["text"].as_str().unwrap().contains("磁碟預算不夠"));
 }

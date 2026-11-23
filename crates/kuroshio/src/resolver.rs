@@ -587,6 +587,8 @@ impl Resolver {
         let stale = e.remaining(Instant::now()) <= 0.0 && e.class != Class::ServFail;
         if stale {
             self.stats.count(StatKind::Stale);
+            // 3.5.0 F3：上游全部失敗、直接回舊資料（本來就失敗的慢路徑）
+            self.stats.note_stale_refresh_fail();
         }
         if let Some(cat) = self.entry_blocked(&e, Some(ctx.client)) {
             self.stats.blocked(cat);
@@ -712,7 +714,12 @@ impl Resolver {
         self.stats.count(StatKind::Prefetch);
         let me = self.clone();
         tokio::spawn(async move {
-            me.fetch(key, query).await;
+            let e = me.fetch(key, query).await;
+            // 3.5.0 F3：背景更新做完還是過期的（上游全部失敗時 store() 保留舊資料）或 SERVFAIL：記一次更新失敗
+            // （背景工作裡；命中快取的路徑不動）
+            if e.class == Class::ServFail || e.remaining(Instant::now()) <= 0.0 {
+                me.stats.note_stale_refresh_fail();
+            }
         });
     }
 

@@ -18,6 +18,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -173,12 +174,15 @@ struct HistBase {
     abroad: u64,
     tw: u64,
     lat: [u64; 12],
+    /// [`Stats::stale_refresh_fail`] 的值（32 位元、會繞回，差值用 `wrapping_sub`）
+    refresh_fail: u32,
 }
 
 impl HistBase {
-    fn of(d: &Day) -> HistBase {
+    fn of(d: &Day, refresh_fail: u32) -> HistBase {
         let (abroad, tw) = d.route.values().fold((0, 0), |(a, t), r| (a + r.abroad, t + r.acc));
         HistBase {
+            refresh_fail,
             q: d.query,
             blocked: d.blocked,
             servfail: d.servfail,
@@ -202,7 +206,12 @@ struct Hist {
     /// 進行中的那一格的槽號（Unix 秒 ÷ 300）；`u64::MAX` = 還沒開始
     cur: u64,
     base: HistBase,
+    /// 3.5.0 F3：最近 4 個格子邊界上 [`Stats::stale_refresh_fail`] 的值（舊的在前）：最新減最舊＝最近 3 格的增加量。
+    /// 不放進每一格（`Slot` 維持 32 位元組），只多 16 位元組
+    rf_marks: [u32; RF_MARKS],
 }
+
+const RF_MARKS: usize = 4;
 
 impl Default for Hist {
     fn default() -> Self {
@@ -212,6 +221,7 @@ impl Default for Hist {
             n: 0,
             cur: u64::MAX,
             base: HistBase::default(),
+            rf_marks: [0; RF_MARKS],
         }
     }
 }
@@ -245,14 +255,15 @@ impl Hist {
 
     /// 槽號變了：關掉進行中的那一格（現在的累計值 − 上一格結束時的累計值），中間沒有查詢的格子補 0。
     /// 第一次、時鐘倒退、或跳了超過 288 格：清空、基準重設（不補一整圈的 0）
-    fn advance(&mut self, slot: u64, day: &Day) {
-        let now = HistBase::of(day);
+    fn advance(&mut self, slot: u64, day: &Day, refresh_fail: u32) {
+        let now = HistBase::of(day, refresh_fail);
         if self.cur == u64::MAX || slot < self.cur || slot - self.cur > HIST_SLOTS as u64 {
             if self.cur != u64::MAX {
                 self.clear();
             }
             self.cur = slot;
             self.base = now;
+            self.rf_marks = [now.refresh_fail; RF_MARKS];
             return;
         }
         let b = &self.base;
@@ -275,6 +286,11 @@ impl Hist {
         for _ in 1..(slot - self.cur) {
             self.push(Slot::default());
         }
+        // 背景更新失敗的計數：這一格結束時的值，中間沒有查詢的格子同一個值（增加量全部算在第一格，跟上面一樣）
+        for _ in 0..(slot - self.cur).min(RF_MARKS as u64) {
+            self.rf_marks.rotate_left(1);
+            self.rf_marks[RF_MARKS - 1] = now.refresh_fail;
+        }
         self.cur = slot;
         self.base = now;
     }
@@ -290,6 +306,11 @@ impl Hist {
         self.iter()
             .skip(self.n.saturating_sub(k))
             .fold((0, 0), |(s, q), x| (s + x.stale as u64, q + x.q as u64))
+    }
+
+    /// 最近 3 格（完整的 5 分鐘）的背景更新失敗次數（3.5.0 F3；跟 `stale_window(3)` 同一個時間窗）
+    fn refresh_fail_15m(&self) -> u64 {
+        self.rf_marks[RF_MARKS - 1].wrapping_sub(self.rf_marks[0]) as u64
     }
 
     fn json(&self) -> Value {
@@ -390,6 +411,9 @@ impl Default for Inner {
 pub struct Stats {
     started: Instant,
     inner: Mutex<Inner>,
+    /// 過期快取的背景更新失敗（3.5.0 F3）：`refresh()` 做完拿回來的還是過期的或 SERVFAIL、或上游全部失敗直接回舊資料。
+    /// 啟動後累計；只在背景工作或本來就失敗的慢路徑上累加（不拿 `inner` 的鎖），E9 的歷史換格時讀一次
+    stale_refresh_fail: AtomicU32,
 }
 
 /// 由 1970-01-01 起算的日數轉成年月日（Howard Hinnant 的演算法）
@@ -550,6 +574,7 @@ impl Default for Stats {
         Stats {
             started: Instant::now(),
             inner: Mutex::new(Inner::default()),
+            stale_refresh_fail: AtomicU32::new(0),
         }
     }
 }
@@ -896,12 +921,12 @@ impl Stats {
         // 3.5.0 E9：每筆查詢只多這一次整數比較；先關格、再換日（台北午夜也是 5 分鐘的邊界，
         // 換日前先用舊的 `Day` 算完差值，換日後基準歸零）
         if i.hist.cur != slot {
-            i.hist.advance(slot, &i.day);
+            i.hist.advance(slot, &i.day, self.stale_refresh_fail.load(Ordering::Relaxed));
         }
         if i.day_no != day_no {
             i.roll(&taipei_date(now));
             i.day_no = day_no;
-            i.hist.base = HistBase::of(&i.day);
+            i.hist.base = HistBase::of(&i.day, self.stale_refresh_fail.load(Ordering::Relaxed));
         }
         f(i)
     }
@@ -1113,7 +1138,15 @@ impl Stats {
     }
 
     fn stale_rates_at(&self, now: u64) -> Value {
-        let (today, query, w15, w60) = self.with_at(now, |i| (i.day.stale, i.day.query, i.hist.stale_window(3), i.hist.stale_window(12)));
+        let (today, query, w15, w60, f15) = self.with_at(now, |i| {
+            (
+                i.day.stale,
+                i.day.query,
+                i.hist.stale_window(3),
+                i.hist.stale_window(12),
+                i.hist.refresh_fail_15m(),
+            )
+        });
         let rate = |s: u64, q: u64| {
             if q == 0 {
                 0.0
@@ -1121,7 +1154,19 @@ impl Stats {
                 (s as f64 / q as f64 * 10_000.0).round() / 10_000.0
             }
         };
-        json!({ "today": today, "rateToday": rate(today, query), "rate15m": rate(w15.0, w15.1), "rate1h": rate(w60.0, w60.1) })
+        json!({ "today": today, "rateToday": rate(today, query), "rate15m": rate(w15.0, w15.1), "rate1h": rate(w60.0, w60.1),
+                // 3.5.0 F3：最近 15 分鐘背景更新失敗的次數（跟 rate15m 同一個時間窗）
+                "refreshFail15m": f15 })
+    }
+
+    /// 過期快取的背景更新失敗了一次（3.5.0 F3；只在背景工作或上游全部失敗的慢路徑上呼叫）
+    pub fn note_stale_refresh_fail(&self) {
+        self.stale_refresh_fail.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 最近 15 分鐘（3 格）的背景更新失敗次數（E2 的 `serve-stale-high` 用）
+    pub fn stale_refresh_fail_15m(&self) -> u64 {
+        self.with(|i| i.hist.refresh_fail_15m())
     }
 
     /// 最近 15 分鐘（3 格）的（過期快取, 查詢）總和（E2 的 `serve-stale-high` 用）
@@ -1269,7 +1314,7 @@ impl Stats {
         }
         g.trim_history();
         // 3.5.0 E9：還原回來的累計值不算進下一格（不會出現一格「今天到目前為止的總和」）
-        let base = HistBase::of(&g.day);
+        let base = HistBase::of(&g.day, self.stale_refresh_fail.load(Ordering::Relaxed));
         g.hist.base = base;
         true
     }
@@ -1605,7 +1650,30 @@ mod tests {
         assert_eq!(r["rate1h"], 0.025);
         assert_eq!(r["rateToday"], 0.025);
         let empty = Stats::default().stale_rates_at(T0);
-        assert_eq!(empty, json!({ "today": 0, "rateToday": 0.0, "rate15m": 0.0, "rate1h": 0.0 }));
+        assert_eq!(
+            empty,
+            json!({ "today": 0, "rateToday": 0.0, "rate15m": 0.0, "rate1h": 0.0, "refreshFail15m": 0 })
+        );
+    }
+
+    /// 3.5.0 F3：背景更新失敗的次數跟 `rate15m` 同一個時間窗（最近 3 個完整的 5 分鐘），舊的滾出去
+    #[test]
+    fn refresh_fail_15m_follows_history_window() {
+        let s = Stats::default();
+        bump_at(&s, T0, 10, 0, &[]);
+        for k in 1..=6u64 {
+            // 第 1～3 格每格失敗 2 次，第 4～6 格每格 1 次
+            for _ in 0..(if k <= 3 { 2 } else { 1 }) {
+                s.note_stale_refresh_fail();
+            }
+            bump_at(&s, T0 + k * 300 - 1, 10, 1, &[]);
+            bump_at(&s, T0 + k * 300, 10, 0, &[]);
+        }
+        assert_eq!(s.stale_rates_at(T0 + 6 * 300)["refreshFail15m"], 3, "第 4～6 格");
+        assert_eq!(s.with_at(T0 + 6 * 300, |i| i.hist.refresh_fail_15m()), 3);
+        // 之後 15 分鐘沒有失敗：歸零（中間沒有查詢的格子也算進去）
+        bump_at(&s, T0 + 10 * 300, 10, 0, &[]);
+        assert_eq!(s.stale_rates_at(T0 + 10 * 300)["refreshFail15m"], 0);
     }
 
     #[test]
