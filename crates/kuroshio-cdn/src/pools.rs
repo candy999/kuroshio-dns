@@ -144,11 +144,37 @@ impl PoolNode {
         self.pop.as_deref().unwrap_or("")
     }
 
+    /// 上游宣稱的機房（3.5.0 E4，`extra.upPop`）：串接匯入的節點在本機量到之前才有。
+    /// 放在 `extra`（不認得的欄位原樣保留），舊版讀到 `pools.json` 也不受影響
+    pub fn up_pop(&self) -> Option<&str> {
+        self.extra.get(UP_POP).and_then(Value::as_str)
+    }
+
+    pub fn set_up_pop(&mut self, pop: &str) {
+        self.extra
+            .0
+            .get_or_insert_with(Default::default)
+            .insert(UP_POP.into(), Value::String(pop.to_string()));
+    }
+
+    /// 拿掉 `upPop`（本機量到了、或分享給下游之前），回傳原本的值
+    pub fn take_up_pop(&mut self) -> Option<String> {
+        let m = self.extra.0.as_mut()?;
+        let v = m.remove(UP_POP)?;
+        if m.is_empty() {
+            self.extra.0 = None;
+        }
+        v.as_str().map(String::from)
+    }
+
     /// 有效的尖峰量測（3 天內）
     pub fn peak_fresh(&self, now: u64) -> bool {
         self.peak_at.map(|t| now.saturating_sub(t) < PEAK_FRESH_MS).unwrap_or(false) && self.peak_ms.get().is_some()
     }
 }
+
+/// `PoolNode.extra` 裡上游宣稱的機房（3.5.0 E4）
+pub const UP_POP: &str = "upPop";
 
 /// 2.x 的 `String(pop).substring(0, 3).toUpperCase()`
 pub fn pop3(pop: &str) -> String {
@@ -505,6 +531,8 @@ pub struct Pools {
     pub zone_dirty: bool,
     /// 節點不足、需要重建節點池的 CDN（由外層取出後通知排程）
     pub low_pool: Vec<&'static str>,
+    /// 節點池內容換過（`replace()`、`merge_shared()`）：放開狀態鎖時重算 E3 的 `reach`（3.5.0）
+    pub reach_dirty: bool,
 }
 
 impl Pools {
@@ -520,6 +548,7 @@ impl Pools {
             dirty: false,
             zone_dirty: false,
             low_pool: Vec::new(),
+            reach_dirty: true,
         }
     }
 
@@ -743,6 +772,7 @@ impl Pools {
         d.bad.clear();
         d.bad24.clear();
         self.dirty = true;
+        self.reach_dirty = true;
     }
 
     // ------------------------------------------------------------ 站台相容性
@@ -1236,6 +1266,59 @@ impl Pools {
     }
 }
 
+/// 網段分散用的網段鍵（3.5.0 E6）：IPv4 是 /24、IPv6 是 /48（兩個家族不會混在同一個節點池）
+pub fn net_key(ip: IpAddr) -> Option<u128> {
+    match ip {
+        IpAddr::V4(_) => util::prefix24(ip).map(u128::from),
+        IpAddr::V6(_) => util::v6_48(ip),
+    }
+}
+
+/// 網段分散（3.5.0 E6）的延遲條件：換上來的節點延遲不超過這個位置原本節點的 1.5 倍＋5 毫秒
+pub const SPREAD_RATIO: f64 = 1.5;
+pub const SPREAD_ABS_MS: f64 = 5.0;
+
+/// 同機房內的網段分散（3.5.0 E6）：健檢排序之後呼叫，讓回給裝置的前 `n` 個可用節點盡量來自不同的 /24（IPv6 /48）。
+///
+/// - 只看可用的節點（`skip` 回 false 的：不在 `bad`、沒被 E5 暫緩），只調整前 `n` 個可用位置
+/// - 由前往後：第 i 個位置跟前面已經放的同網段，就從後面找第一個「不同網段、不是 B1 判慢的、
+///   延遲不超過這個位置原本節點的 [`SPREAD_RATIO`] 倍＋[`SPREAD_ABS_MS`] 毫秒」的節點換上來；找不到就不換
+/// - 其餘節點的相對順序不變；不新增、不移除節點，不發任何探測
+///
+/// 回傳換了幾次
+pub fn spread_head(pool: &mut [PoolNode], skip: &dyn Fn(&PoolNode) -> bool, n: usize, key: &dyn Fn(&PoolNode) -> f64) -> usize {
+    // 可用節點在節點池裡的位置（健檢排序後是排在前面的一段，但這裡不假設）
+    let idx: Vec<usize> = (0..pool.len()).filter(|&i| !skip(&pool[i])).collect();
+    let mut seen: Vec<u128> = Vec::with_capacity(n);
+    let mut moved = 0;
+    for i in 0..n.min(idx.len()) {
+        let here = net_key(pool[idx[i]].ip);
+        if !here.is_some_and(|k| seen.contains(&k)) {
+            seen.extend(here);
+            continue;
+        }
+        let limit = key(&pool[idx[i]]) * SPREAD_RATIO + SPREAD_ABS_MS;
+        let found = (i + 1..idx.len()).find(|&j| {
+            let x = &pool[idx[j]];
+            net_key(x.ip).is_some_and(|k| !seen.contains(&k)) && x.is_slow() != Some(true) && key(x) <= limit
+        });
+        match found {
+            Some(j) => {
+                // 把第 j 個可用節點移到第 i 個可用位置，中間的往後挪一格（只在可用的位置之間挪）
+                let x = pool[idx[j]].clone();
+                for k in (i..j).rev() {
+                    pool[idx[k + 1]] = pool[idx[k]].clone();
+                }
+                pool[idx[i]] = x;
+                seen.extend(net_key(pool[idx[i]].ip));
+                moved += 1;
+            }
+            None => seen.extend(here),
+        }
+    }
+    moved
+}
+
 fn seed_nodes(list: &[String]) -> Vec<PoolNode> {
     list.iter()
         .filter_map(|s| util::parse_ip(s))
@@ -1267,4 +1350,93 @@ pub fn cidr(list: &[&str]) -> Arc<CidrSet> {
     let mut s = CidrSet::new();
     s.add_many(list.iter().copied());
     Arc::new(s.done())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(ip: &str, ms: f64) -> PoolNode {
+        let mut x = PoolNode::new(ip.parse().unwrap());
+        x.ms = Num::V(ms);
+        x.pop = Some(util::intern("TPE"));
+        x
+    }
+
+    fn ips(p: &[PoolNode]) -> Vec<String> {
+        p.iter().map(|x| x.ip.to_string()).collect()
+    }
+
+    fn ms(x: &PoolNode) -> f64 {
+        x.ms.or(999.0)
+    }
+
+    #[test]
+    fn spread_head_picks_distinct_48_among_permanent_v6() {
+        // 永久 IPv6 節點：前 4 名原本都在同一個 /48
+        let mut p = vec![
+            n("2001:db8:1::1", 2.0),
+            n("2001:db8:1::2", 2.1),
+            n("2001:db8:1::3", 2.2),
+            n("2001:db8:1::4", 2.3),
+            n("2001:db8:2::1", 2.5),
+            n("2001:db8:3::1", 2.6),
+            n("2001:db8:4::1", 2.7),
+        ];
+        assert_eq!(spread_head(&mut p, &|_| false, 4, &ms), 3);
+        assert_eq!(ips(&p[..4]), ["2001:db8:1::1", "2001:db8:2::1", "2001:db8:3::1", "2001:db8:4::1"]);
+        // 其餘的相對順序不變、不增不減
+        assert_eq!(ips(&p[4..]), ["2001:db8:1::2", "2001:db8:1::3", "2001:db8:1::4"]);
+    }
+
+    #[test]
+    fn spread_head_keeps_order_when_alternative_too_slow() {
+        // 第 2 名同網段（4 ms）；不同網段的要 ≤ 4 × 1.5 + 5 = 11 ms
+        let mut p = vec![n("192.0.2.1", 3.0), n("192.0.2.2", 4.0), n("198.51.100.1", 11.5)];
+        let before = p.clone();
+        assert_eq!(spread_head(&mut p, &|_| false, 4, &ms), 0);
+        assert_eq!(p, before);
+        let mut p = vec![n("192.0.2.1", 3.0), n("192.0.2.2", 4.0), n("198.51.100.1", 11.0)];
+        assert_eq!(spread_head(&mut p, &|_| false, 4, &ms), 1);
+        assert_eq!(ips(&p), ["192.0.2.1", "198.51.100.1", "192.0.2.2"]);
+        // B1 判慢的不換上來
+        let mut slow = n("198.51.100.1", 5.0);
+        slow.slow = Some(true);
+        let mut p = vec![n("192.0.2.1", 3.0), n("192.0.2.2", 4.0), slow];
+        assert_eq!(spread_head(&mut p, &|_| false, 4, &ms), 0);
+    }
+
+    #[test]
+    fn spread_head_noop_when_already_distinct() {
+        let mut p = vec![n("192.0.2.1", 3.0), n("198.51.100.1", 4.0), n("192.0.2.2", 5.0)];
+        let before = p.clone();
+        assert_eq!(spread_head(&mut p, &|_| false, 2, &ms), 0);
+        assert_eq!(p, before);
+        // 只動前 n 個位置：第 3 個同網段，但 n = 2
+        let mut p = vec![
+            n("192.0.2.1", 3.0),
+            n("198.51.100.1", 4.0),
+            n("192.0.2.2", 5.0),
+            n("198.51.100.2", 5.0),
+        ];
+        let before = p.clone();
+        spread_head(&mut p, &|_| false, 2, &ms);
+        assert_eq!(p, before);
+        assert_eq!(spread_head(&mut [], &|_| false, 4, &ms), 0);
+    }
+
+    #[test]
+    fn spread_head_skips_bad_and_held() {
+        // 壞的、暫緩的不當候選，也不佔位置
+        let skip: HashMap<IpAddr, ()> = [("198.51.100.1".parse().unwrap(), ())].into_iter().collect();
+        let mut p = vec![
+            n("192.0.2.1", 3.0),
+            n("192.0.2.2", 4.0),
+            n("198.51.100.1", 4.5),
+            n("198.51.100.2", 5.0),
+        ];
+        assert_eq!(spread_head(&mut p, &|x| skip.contains_key(&x.ip), 4, &ms), 1);
+        assert_eq!(ips(&p), ["192.0.2.1", "198.51.100.2", "198.51.100.1", "192.0.2.2"]);
+        assert_eq!(p[2].ip.to_string(), "198.51.100.1", "跳過的節點留在原本的位置");
+    }
 }

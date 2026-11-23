@@ -153,9 +153,14 @@ impl Cdn {
                     return VState::Ok;
                 }
                 if v.is("fail") {
-                    // 舊版只試一個 IP 就判失敗；若當時那個 IP 後來確認是「特定產品專用」，重新驗證一次
+                    // 舊版只試一個 IP 就判失敗；若當時那個 IP 後來確認是「特定產品專用」，重新驗證一次。
+                    // 「比原本慢」（3.5.0 E7）不是這種失敗：照到期時間重測，不因此每次查詢都重新驗證
                     let restricted = match (v.ip, e.provider()) {
-                        (Some(ip), Some(p)) => !v.reason.as_deref().unwrap_or("").contains("試了") && pools.is_restricted(p, ip),
+                        (Some(ip), Some(p)) => {
+                            !v.reason.as_deref().unwrap_or("").contains("試了")
+                                && v.extra.get(crate::verifier::SLOWER).is_none()
+                                && pools.is_restricted(p, ip)
+                        }
                         _ => false,
                     };
                     return if restricted { VState::Trial } else { VState::Fail };

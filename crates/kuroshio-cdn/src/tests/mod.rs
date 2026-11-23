@@ -5,6 +5,7 @@ mod bench;
 mod crossscore;
 mod explain;
 mod jobs;
+mod line;
 mod lite;
 mod multi;
 mod parity;

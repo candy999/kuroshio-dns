@@ -16,6 +16,8 @@ pub mod decision {
     pub const TRIAL: &str = "trial";
     pub const LITE_WAITING: &str = "lite-waiting";
     pub const VERIFY_FAILED: &str = "verify-failed";
+    /// 台灣節點能用，但實測比原本的答案慢：暫時用原本的答案（3.5.0 E7）
+    pub const SLOWER: &str = "slower";
     pub const NO_TW_NODE: &str = "no-tw-node";
     pub const NO_POOL: &str = "no-pool";
     pub const CROSS: &str = "cross";
@@ -56,6 +58,7 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::TRIAL => format!("這個網域用 {label}，台灣節點還在驗證中（試用期先回原本的答案，TTL 10 秒）{detail}。"),
         d::LITE_WAITING => format!("這個網域用 {label}；這台是小記憶體減量模式，問過 2 次以上才驗證台灣節點，現在先回原本的答案。"),
         d::VERIFY_FAILED => format!("這個網域用 {label}，台灣節點驗證沒通過，暫時用原本的答案{detail}；到期後會重新驗證。"),
+        d::SLOWER => format!("這個網域用 {label}，台灣節點能用，但實測比原本的答案慢{detail}，暫時用原本的答案；到期後重測。"),
         d::NO_TW_NODE => format!("這個網域用 {label}，找不到可用的台灣節點，跨 CDN 也沒有可用的替代{detail}。"),
         d::NO_POOL => format!("這個網域用 {label}，但這台還沒有 {label} 的台灣節點池（節點池工作還沒跑完），先用原本的答案。"),
         d::CROSS => format!("這個網域用 {label}，同一個網站也放在別家 CDN 上，已經換成那家的台灣節點{detail}。"),
@@ -76,13 +79,26 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
 fn verdict_step(what: &str, v: Option<&Verdict>, now: u64) -> Value {
     match v {
         None => json!({ "what": what, "result": "none" }),
-        Some(v) => json!({
-            "what": what,
-            "result": if !v.valid(now) { "expired" } else { v.verdict.as_deref().unwrap_or("none") },
-            "verdict": v.verdict.as_deref(),
-            "pop": v.pop.as_deref(), "ms": v.ms.get(), "reason": v.reason, "at": v.at, "until": v.until,
-        }),
+        Some(v) => {
+            let mut j = json!({
+                "what": what,
+                "result": if !v.valid(now) { "expired" } else { v.verdict.as_deref().unwrap_or("none") },
+                "verdict": v.verdict.as_deref(),
+                "pop": v.pop.as_deref(), "ms": v.ms.get(), "reason": v.reason, "at": v.at, "until": v.until,
+            });
+            // 比原本慢（3.5.0 E7）：兩邊的請求時間（毫秒）
+            if is_slower(v) {
+                j["slower"] = json!(true);
+                j["score"] = v.extra.get("score").cloned().unwrap_or(Value::Null);
+                j["origScore"] = v.extra.get("origScore").cloned().unwrap_or(Value::Null);
+            }
+            j
+        }
     }
+}
+
+fn is_slower(v: &Verdict) -> bool {
+    v.extra.get(crate::verifier::SLOWER).and_then(Value::as_bool) == Some(true)
 }
 
 impl Cdn {
@@ -207,6 +223,16 @@ impl Cdn {
                         _ => String::new(),
                     };
                     return (d::REWRITTEN, detail);
+                }
+                if v.is("fail") && is_slower(v) {
+                    let n = |k: &str| {
+                        v.extra
+                            .get(k)
+                            .and_then(Value::as_f64)
+                            .map(|x| format!("{x:.0}"))
+                            .unwrap_or_else(|| "?".into())
+                    };
+                    return (d::SLOWER, format!("{} 對 {} 毫秒", n("score"), n("origScore")));
                 }
                 if v.is("fail") {
                     return (d::VERIFY_FAILED, v.reason.clone().unwrap_or_default());
