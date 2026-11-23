@@ -63,8 +63,8 @@ const SHARE_LEGACY: [&str; 2] = [UPSTREAMS, BLACKLIST];
 /// 完整備份的固定檔案（另外還有 community/*、community-keys/*）
 const FULL_FILES: [&str; 10] = [DOMAINS, POOLS, V6, HARVEST, ZONE, UPSTREAMS, BLACKLIST, STATS, HOT, CUSTOM];
 
-/// 分享時從每個網域拿掉的欄位（使用習慣、手動設定）
-const PRIVATE_DOMAIN_FIELDS: [&str; 4] = ["hits", "firstSeen", "lastSeen", "policy"];
+/// 分享時從每個網域拿掉的欄位（使用習慣、手動設定；`src` 是多來源的來源紀錄，裡面有各家最後回答的時間，3.5.0 B3）
+const PRIVATE_DOMAIN_FIELDS: [&str; 5] = ["hits", "firstSeen", "lastSeen", "policy", "src"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -1358,7 +1358,8 @@ mod tests {
 
     fn domain(name: &str, at: u64, hits: u64) -> Value {
         json!({ "name": name, "provider": "cloudflare", "firstSeen": 1000, "lastSeen": 2000, "hits": hits,
-                "policy": "always", "v4": { "verdict": "ok", "at": at }, "xFuture": 1 })
+                "policy": "always", "v4": { "verdict": "ok", "at": at }, "xFuture": 1,
+                "src": { "multiAt": 5, "alt": { "provider": "cloudfront", "last": 7 } } })
     }
 
     fn fill(dir: &Path) -> Locations {

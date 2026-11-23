@@ -329,9 +329,12 @@
       "recheckHours": 24,
       "failDays": 3,
       "akamaiMaxMs": 15,
-      "concurrency": 2
+      "concurrency": 2,
+      "requestScore": true
     },
     "v6Policy": "drop",
+    "multiCdn": true,
+    "appLayer": true,
     "dbFile": "./state/cdn-domains.json",
     "maxEntries": 200000,
     "dbDiskBudgetKB": "auto",
@@ -531,6 +534,7 @@
     "poolSize": 12,
     "speedTop": 16,
     "speedSeconds": 5,
+    "relativeSpeed": true,
     "latencyConcurrency": "auto",
     "probeConcurrency": "auto",
     "nearestProbeTop": 1500,

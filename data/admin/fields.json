@@ -326,6 +326,8 @@
               { "value": "drop", "label": "丟棄該 CDN 的 IPv6 位址（避免 IPv6 繞回國外，推薦）" },
               { "value": "keep", "label": "保留" }
             ] },
+            { "key": "cdn.multiCdn", "type": "bool", "label": "尊重多來源 CDN", "help": "網站自己在多家 CDN 之間分流時，每一家各自驗證、各自換成那一家的台灣節點，不把網站硬綁在其中一家，也不替它換到別家；網站換了 CDN 或第一層 CNAME 時，舊的跨 CDN 與 ECS 結果失效、重新驗證。關掉＝3.4.x 的行為。" },
+            { "key": "cdn.appLayer", "type": "bool", "label": "App 自己選節點的服務不改寫", "help": "影音、系統更新這類由 App 或服務自己決定連哪個節點的 CDN（目前：Google、Apple）只辨識與統計，不換節點。個別網域可以在 CDN 網域表手動設成「一定換」。" },
             { "key": "cdn.ecs.twSubnets", "type": "list", "label": "ECS 台灣網段", "help": "DNS 分流型 CDN 用。放你用戶實際所在的 ISP 網段效果最好；本機對外 IP 的 /24 會自動放在最前面。" }
           ]
         },
@@ -359,6 +361,7 @@
           "pro": true,
           "fields": [
             { "key": "cdn.cross.enabled", "type": "bool", "label": "啟用跨 CDN 備援", "help": "原本的 CDN 在台灣沒有節點（例如 Fastly）時，測試同一個網站是不是也放在 Cloudflare、CloudFront、Azure、Akamai 的台灣節點上；憑證與網頁內容都一致才採用。" },
+            { "key": "cdn.cross.requestScore", "type": "bool", "label": "整個請求也要比較快才換", "help": "原本的條件（憑證相符、確實是那一家、不是錯誤頁、同一個網站、TCP 連線比較近）都通過之後，再比一個請求從連線、握手到收到回應標頭的時間：比原站快 5% 以上才採用；已經在用的，差 10% 以內都留著。關掉＝3.4.x：只看 TCP 連線的延遲。" },
             { "key": "cdn.cross.minOrigMs", "type": "int", "label": "原本延遲超過幾毫秒才嘗試", "min": 0 },
             { "key": "cdn.cross.recheckHours", "type": "int", "label": "複驗間隔（小時）", "min": 1 },
             { "key": "cdn.cross.failDays", "type": "int", "label": "失敗後幾天再試", "min": 0 },
@@ -617,7 +620,8 @@
             { "key": "pool.candidatesPerProvider", "type": "int", "label": "每家 CDN 候選 IP 數", "min": 1 },
             { "key": "pool.poolSize", "type": "int", "label": "節點池大小", "min": 1 },
             { "key": "pool.speedTop", "type": "int", "label": "取前幾名測下載速度", "min": 0 },
-            { "key": "pool.speedSeconds", "type": "int", "label": "每次下載測速秒數", "min": 1 }
+            { "key": "pool.speedSeconds", "type": "int", "label": "每次下載測速秒數", "min": 1 },
+            { "key": "pool.relativeSpeed", "type": "bool", "label": "測速用相對評分", "help": "節點慢不慢跟同一家其他節點比（低於中位數的一半才算慢），「幾乎一樣」的範圍依實際傳輸時間決定，速度分不出來的節點由延遲決定名次。關掉＝3.4.x：低於 1 MB/s 算慢、5% 以內才算一樣、直接比速度。" }
           ]
         }
       ]

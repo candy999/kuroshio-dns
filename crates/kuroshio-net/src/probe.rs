@@ -29,6 +29,61 @@ pub struct ProbeResult {
     pub error: Option<String>,
     /// 失敗是 TLS 造成的（憑證不符、握手被拒…）：通常代表「這個節點不服務這個網站」
     pub tls_error: bool,
+    /// 分段時間（3.5.0：量測基礎，同一條連線順便記，不多連線）
+    pub timing: Timing,
+}
+
+/// 一次 HTTP(S) 探測的分段時間（毫秒）。0 = 沒量到（失敗、假的網路、舊資料）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Timing {
+    /// TCP 連線（三向交握）
+    pub connect_ms: f64,
+    /// TLS 握手（純 HTTP 是 0）
+    pub tls_ms: f64,
+    /// 送出請求到收完回應標頭（第一個位元組的時間，TTFB）
+    pub ttfb_ms: f64,
+}
+
+impl Timing {
+    /// 有量到（連線與 TTFB 都有數字）
+    pub fn measured(&self) -> bool {
+        self.connect_ms > 0.0 && self.ttfb_ms > 0.0
+    }
+
+    /// 一個請求從開始連線到收到標頭的時間：連線＋握手＋TTFB（沒量到回 None）
+    pub fn request_ms(&self) -> Option<f64> {
+        self.measured().then_some(self.connect_ms + self.tls_ms + self.ttfb_ms)
+    }
+}
+
+/// 一次下載測速的量測樣本（3.5.0）：相對評分、誤差範圍、之後的工作負載分數都用它。
+/// 全部來自同一條連線，有上限（`max_bytes`、`max_ms`）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpeedSample {
+    /// MB/s（兩位小數）；0 = 量不到（連不上、轉址或錯誤、檔案太小）
+    pub mbps: f64,
+    /// 收到的內容位元組數
+    pub bytes: u64,
+    /// 收內容花的秒數（收到標頭後開始算）
+    pub secs: f64,
+    /// 連線＋握手（毫秒；0 = 沒量到）
+    pub connect_ms: f64,
+    /// 送出請求到收完標頭（毫秒；0 = 沒量到）
+    pub ttfb_ms: f64,
+}
+
+impl SpeedSample {
+    /// 只知道速度時（假的網路、舊的呼叫端）：當成收滿 `max_bytes`，時間用速度回推
+    pub fn from_mbps(mbps: f64, max_bytes: u64) -> SpeedSample {
+        let ok = mbps.is_finite() && mbps > 0.0;
+        SpeedSample {
+            mbps: if ok { mbps } else { 0.0 },
+            bytes: if ok { max_bytes } else { 0 },
+            secs: if ok { max_bytes as f64 / 1_048_576.0 / mbps } else { 0.0 },
+            connect_ms: 0.0,
+            ttfb_ms: 0.0,
+        }
+    }
 }
 
 impl ProbeResult {
@@ -212,7 +267,8 @@ fn dechunk(raw: &[u8], max: usize) -> (Vec<u8>, bool) {
 }
 
 /// 送出請求、讀回標頭與內容前段（`max_body` 為上限）
-async fn exchange(s: &mut dyn Io, req: &[u8], max_body: usize, head_only: bool) -> Result<(Head, Vec<u8>)> {
+async fn exchange(s: &mut dyn Io, req: &[u8], max_body: usize, head_only: bool, ttfb_ms: &mut f64) -> Result<(Head, Vec<u8>)> {
+    let t_req = Instant::now();
     s.write_all(req).await?;
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = vec![0u8; 8192];
@@ -229,6 +285,7 @@ async fn exchange(s: &mut dyn Io, req: &[u8], max_body: usize, head_only: bool) 
         }
         buf.extend_from_slice(&tmp[..n]);
     };
+    *ttfb_ms = t_req.elapsed().as_secs_f64() * 1000.0;
     let head = parse_head(&buf[..end]);
     let no_body = head_only || head.status == 204 || head.status == 304 || (100..200).contains(&head.status);
     if no_body {
@@ -287,12 +344,23 @@ fn host_header(host: &str, port: u16, default: u16) -> String {
 
 async fn run(addr: SocketAddr, tls: Option<(&str, bool)>, req: String, timeout: Duration, max_body: usize, head_only: bool) -> ProbeResult {
     let t0 = Instant::now();
+    // 分段時間放在外面：逾時或中途失敗時，已經量到的那幾段不會用到（只有成功的回應才帶）
+    let mut timing = Timing::default();
     let r = tokio::time::timeout(timeout, async {
         let mut s: Box<dyn Io> = match tls {
-            Some((sni, verify)) => Box::new(crate::tls::connect_ip_with(addr.ip(), addr.port(), sni, verify, timeout, true).await?),
-            None => Box::new(crate::tls::probe_tcp(addr).await?),
+            Some((sni, verify)) => {
+                let (s, tcp_ms) = crate::tls::connect_ip_timed(addr.ip(), addr.port(), sni, verify, timeout, true).await?;
+                timing.connect_ms = tcp_ms;
+                timing.tls_ms = (t0.elapsed().as_secs_f64() * 1000.0 - tcp_ms).max(0.0);
+                Box::new(s)
+            }
+            None => {
+                let s = crate::tls::probe_tcp(addr).await?;
+                timing.connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                Box::new(s)
+            }
         };
-        exchange(&mut *s, req.as_bytes(), max_body, head_only).await
+        exchange(&mut *s, req.as_bytes(), max_body, head_only, &mut timing.ttfb_ms).await
     })
     .await;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -316,6 +384,7 @@ async fn run(addr: SocketAddr, tls: Option<(&str, bool)>, req: String, timeout: 
             ms,
             error: None,
             tls_error: false,
+            timing,
         },
     }
 }
@@ -355,16 +424,25 @@ pub const SPEED_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// 跟 2.x 一樣：收到標頭後開始計時，`max_ms + 3` 秒或收到 `max_bytes` 就停；狀態碼 ≥ 300 回 0。
 /// 沒收滿 `max_bytes` 又不到 0.2 秒（檔案太小、連線被關）回 0；收滿了就照實際時間算（網路很快時不到 0.2 秒）
 pub async fn download_speed(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u64, max_bytes: u64) -> f64 {
-    let Ok(u) = crate::fetch::parse_url(url) else { return 0.0 };
+    download_sample(ip, port, url, max_ms, max_bytes).await.mbps
+}
+
+/// 同 [`download_speed`]，回整個量測樣本（3.5.0）：速度之外還有位元組數、傳輸時間、連線與 TTFB。
+/// 同一條連線、同樣的上限，流量跟 `download_speed` 完全一樣
+pub async fn download_sample(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u64, max_bytes: u64) -> SpeedSample {
+    let Ok(u) = crate::fetch::parse_url(url) else {
+        return SpeedSample::default();
+    };
     let addr = SocketAddr::new(ip, port.unwrap_or(u.port));
-    let deadline = Instant::now() + Duration::from_millis(max_ms + 3000);
+    let t0 = Instant::now();
+    let deadline = t0 + Duration::from_millis(max_ms + 3000);
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {UA}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
         u.path,
         host_header(&u.host, u.port, if u.tls { 443 } else { 80 })
     );
     let left = || deadline.saturating_duration_since(Instant::now());
-    let r: Result<(u64, f64)> = async {
+    let r: Result<SpeedSample> = async {
         let mut s: Box<dyn Io> = if u.tls {
             Box::new(crate::tls::connect_ip(addr.ip(), addr.port(), &u.host, true, left()).await?)
         } else {
@@ -374,6 +452,8 @@ pub async fn download_speed(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u6
                     .map_err(|_| anyhow!("逾時"))??,
             )
         };
+        let connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t_req = Instant::now();
         tokio::time::timeout(left(), s.write_all(req.as_bytes()))
             .await
             .map_err(|_| anyhow!("逾時"))??;
@@ -394,8 +474,14 @@ pub async fn download_speed(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u6
             }
             buf.extend_from_slice(&tmp[..n]);
         };
+        let ttfb_ms = t_req.elapsed().as_secs_f64() * 1000.0;
         if parse_head(&buf[..end]).status >= 300 {
-            return Ok((0, 0.0)); // 轉址或錯誤都不算測速
+            // 轉址或錯誤都不算測速（連線與 TTFB 還是量到了）
+            return Ok(SpeedSample {
+                connect_ms,
+                ttfb_ms,
+                ..Default::default()
+            });
         }
         let start = Instant::now();
         let mut bytes = (buf.len() - end) as u64;
@@ -405,13 +491,22 @@ pub async fn download_speed(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u6
                 _ => break,
             }
         }
-        Ok((bytes, start.elapsed().as_secs_f64()))
+        let secs = start.elapsed().as_secs_f64();
+        let mbps = if secs > 0.2 || (bytes >= max_bytes && secs > 0.0) {
+            speed_mbs(bytes, secs)
+        } else {
+            0.0
+        };
+        Ok(SpeedSample {
+            mbps,
+            bytes,
+            secs,
+            connect_ms,
+            ttfb_ms,
+        })
     }
     .await;
-    match r {
-        Ok((bytes, sec)) if sec > 0.2 || (bytes >= max_bytes && sec > 0.0) => speed_mbs(bytes, sec),
-        _ => 0.0,
-    }
+    r.unwrap_or_default()
 }
 
 fn speed_mbs(bytes: u64, sec: f64) -> f64 {

@@ -86,12 +86,24 @@ return view.extend({
 				_('原本的 CDN 在台灣沒有節點（例如 Fastly）時，測試同一個網站是不是也放在 Cloudflare、CloudFront、Azure、Akamai 的台灣節點上；憑證與網頁內容都一致才採用。'));
 			o.default = common.def('cdn.cross.enabled') === false ? '0' : '1';
 			o.rmempty = false;
+			o = s.taboption('cross', form.Flag, 'cross_request_score', _('整個請求也要比較快才換'),
+				_('原本的條件都通過之後，再比一個請求從連線、握手到收到回應標頭的時間：比原站快 5% 以上才採用；已經在用的，差 10% 以內都留著。關掉＝3.4.x：只看 TCP 連線的延遲。'));
+			o.default = common.def('cdn.cross.requestScore') === false ? '0' : '1';
+			o.rmempty = false;
 			t('cross', 'cross_min_orig_ms', _('原本延遲超過幾毫秒才嘗試'), 'cdn.cross.minOrigMs');
 			t('cross', 'cross_recheck_hours', _('複驗間隔（小時）'), 'cdn.cross.recheckHours');
 			t('cross', 'cross_fail_days', _('失敗後幾天再試'), 'cdn.cross.failDays');
 			t('cross', 'cross_akamai_max_ms', _('Akamai 台灣節點延遲上限（毫秒）'), 'cdn.cross.akamaiMaxMs');
 			t('cross', 'cross_concurrency', _('同時測試數'), 'cdn.cross.concurrency');
 
+			o = s.taboption('misc', form.Flag, 'multi_cdn', _('尊重多來源 CDN'),
+				_('網站自己在多家 CDN 之間分流時，每一家各自驗證、各自換成那一家的台灣節點，不硬綁其中一家，也不替它換到別家；網站換了 CDN 或第一層 CNAME 時，舊的跨 CDN 與 ECS 結果失效、重新驗證。關掉＝3.4.x 的行為。'));
+			o.default = common.def('cdn.multiCdn') === false ? '0' : '1';
+			o.rmempty = false;
+			o = s.taboption('misc', form.Flag, 'app_layer', _('App 自己選節點的服務不改寫'),
+				_('影音、系統更新這類由 App 或服務自己決定連哪個節點的 CDN（目前：Google、Apple）只辨識與統計，不換節點。'));
+			o.default = common.def('cdn.appLayer') === false ? '0' : '1';
+			o.rmempty = false;
 			t('misc', 'max_entries', _('CDN 網域資料庫上限（筆）'), 'cdn.maxEntries', _('記憶體較小的機器可以調低。'));
 			t('misc', 'db_disk_budget_kb', _('CDN 網域資料的磁碟預算（KB）'), 'cdn.dbDiskBudgetKB', _('留空 = 自動：狀態目錄所在的儲存空間小於 64 MB（路由器的 Flash）時用總容量的 30%，超過時淘汰最久沒用的網域，把空間留給過濾清單的本機副本；64 MB 以上不限。0 = 不限。下限 512 KB。'));
 		}

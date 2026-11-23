@@ -444,6 +444,18 @@ pub async fn connect_ip_with(
     timeout: Duration,
     probe: bool,
 ) -> Result<TlsStream<TcpStream>> {
+    Ok(connect_ip_timed(ip, port, sni, verify, timeout, probe).await?.0)
+}
+
+/// 同 [`connect_ip_with`]，另外回 TCP 連線花的毫秒數（3.5.0：探測的分段時間；握手時間＝總時間減掉它）
+pub async fn connect_ip_timed(
+    ip: IpAddr,
+    port: u16,
+    sni: &str,
+    verify: bool,
+    timeout: Duration,
+    probe: bool,
+) -> Result<(TlsStream<TcpStream>, f64)> {
     let name = match sni.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
         Err(_) => ServerName::try_from(sni.to_string()).context("主機名稱格式錯誤")?,
@@ -451,6 +463,7 @@ pub async fn connect_ip_with(
     let connector = tokio_rustls::TlsConnector::from(cached_config_probe(verify));
     tokio::time::timeout(timeout, async {
         let addr = SocketAddr::new(ip, port);
+        let t0 = std::time::Instant::now();
         let tcp = if probe {
             probe_tcp(addr).await?
         } else {
@@ -458,7 +471,8 @@ pub async fn connect_ip_with(
             tcp.set_nodelay(true)?;
             tcp
         };
-        Ok::<_, anyhow::Error>(connector.connect(name, tcp).await?)
+        let tcp_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        Ok::<_, anyhow::Error>((connector.connect(name, tcp).await?, tcp_ms))
     })
     .await
     .map_err(|_| anyhow!("連線逾時 {ip}:{port}"))?

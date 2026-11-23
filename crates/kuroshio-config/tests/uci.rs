@@ -847,3 +847,32 @@ fn cdn_db_disk_budget_from_uci() {
     let c = load("config cdn 'cdn'\n", &env());
     assert_eq!(g(&c, "cdn.dbDiskBudgetKB"), &json!("auto"));
 }
+
+/// 3.5.0 B3：`cdn.multiCdn`、`cdn.appLayer` 預設開；UCI 的 `option multi_cdn '0'`／`option app_layer '0'` 可以關
+#[test]
+fn cdn_multi_cdn_and_app_layer_from_uci() {
+    let c = load("config cdn 'cdn'\n", &env());
+    assert_eq!(g(&c, "cdn.multiCdn"), &json!(true));
+    assert_eq!(g(&c, "cdn.appLayer"), &json!(true));
+    let c = load("config cdn 'cdn'\n\toption multi_cdn '0'\n\toption app_layer '0'\n", &env());
+    assert_eq!(g(&c, "cdn.multiCdn"), &json!(false));
+    assert_eq!(g(&c, "cdn.appLayer"), &json!(false));
+}
+
+/// 3.5.0 B1：`pool.relativeSpeed` 預設開；UCI 的 `config pool` `option relative_speed '0'` 回到 3.4.x 的測速規則
+#[test]
+fn pool_relative_speed_from_uci() {
+    let c = load("config pool 'pool'\n", &env());
+    assert_eq!(g(&c, "pool.relativeSpeed"), &json!(true));
+    let c = load("config pool 'pool'\n\toption relative_speed '0'\n", &env());
+    assert_eq!(g(&c, "pool.relativeSpeed"), &json!(false));
+}
+
+/// 3.5.0 B4：`cdn.cross.requestScore` 預設開；UCI 的 `config cdn` `option cross_request_score '0'` 回到只看 TCP 延遲
+#[test]
+fn cdn_cross_request_score_from_uci() {
+    let c = load("config cdn 'cdn'\n", &env());
+    assert_eq!(g(&c, "cdn.cross.requestScore"), &json!(true));
+    let c = load("config cdn 'cdn'\n\toption cross_request_score '0'\n", &env());
+    assert_eq!(g(&c, "cdn.cross.requestScore"), &json!(false));
+}

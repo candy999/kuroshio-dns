@@ -34,6 +34,9 @@ pub struct CrossCfg {
     pub fail_days: f64,
     pub akamai_max_ms: f64,
     pub concurrency: usize,
+    /// 跨 CDN 加實測分數（3.5.0 B4，`cdn.cross.requestScore`，預設開）：原本的條件都過了之後，
+    /// 還要「整個請求（連線＋握手＋TTFB）不比原站慢」才採用。關掉＝3.4.x（只看 TCP 延遲）
+    pub request_score: bool,
 }
 
 /// `cdn.lite` 的值：true／false，或 UCI 的 "1"／"0"（"true"／"false"、"on"／"off"）；其他（"auto"、沒寫）是 None
@@ -95,6 +98,10 @@ pub struct CdnConfig {
     pub peak_start: u32,
     pub peak_end: u32,
     pub peak_weight: f64,
+    /// 尊重多來源 CDN、第一層 CNAME 變了就失效（3.5.0 B3，`cdn.multiCdn`，預設開）。關掉＝3.4.x 的行為
+    pub multi_cdn: bool,
+    /// App 自己選節點的服務只辨識、不改寫（3.5.0 B3，`cdn.appLayer`，預設開）
+    pub app_layer: bool,
     pub providers: Vec<ProviderCfg>,
     pub ecs: EcsCfg,
     pub cross: CrossCfg,
@@ -181,6 +188,8 @@ impl CdnConfig {
             peak_start: nn(c, "peak.startHour", 20.0) as u32,
             peak_end: nn(c, "peak.endHour", 23.0) as u32,
             peak_weight: nn(c, "peak.weight", 2.0),
+            multi_cdn: lite_value(c.get("multiCdn")) != Some(false),
+            app_layer: lite_value(c.get("appLayer")) != Some(false),
             providers,
             ecs: EcsCfg {
                 resolvers: if resolvers.is_empty() {
@@ -201,6 +210,7 @@ impl CdnConfig {
                 fail_days: or(c, "cross.failDays", 3.0),
                 akamai_max_ms: or(c, "cross.akamaiMaxMs", 15.0),
                 concurrency: or(c, "cross.concurrency", 2.0) as usize,
+                request_score: lite_value(kuroshio_config::get(c, "cross.requestScore")) != Some(false),
             },
         }
     }
@@ -268,6 +278,9 @@ pub struct JobsConfig {
     pub pool_size: usize,
     pub speed_top: usize,
     pub speed_seconds: u64,
+    /// 測速的相對評分（3.5.0 B1，`pool.relativeSpeed`，預設開）：慢不慢跟同一家其他節點比、誤差範圍依傳輸時間、
+    /// 排序先分級。關掉＝3.4.x（絕對的 1 MB/s、5% 門檻、直接比速度）
+    pub relative_speed: bool,
     pub nearest_probe_top: usize,
     pub nearest_pops: usize,
     pub nearest_keep_pops: usize,
@@ -289,6 +302,7 @@ impl JobsConfig {
             pool_size: or(cfg, "pool.poolSize", 12.0) as usize,
             speed_top: or(cfg, "pool.speedTop", 16.0) as usize,
             speed_seconds: or(cfg, "pool.speedSeconds", 5.0) as u64,
+            relative_speed: lite_value(kuroshio_config::get(cfg, "pool.relativeSpeed")) != Some(false),
             nearest_probe_top: or(cfg, "pool.nearestProbeTop", 1500.0) as usize,
             nearest_pops: or(cfg, "pool.nearestPops", 6.0) as usize,
             nearest_keep_pops: or(cfg, "pool.nearestKeepPops", 5.0) as usize,

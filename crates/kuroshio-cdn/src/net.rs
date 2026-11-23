@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use kuroshio_net::iprank::{IpRank, Latency, Quality};
-use kuroshio_net::probe::{self, HttpsOpts, ProbeResult};
+use kuroshio_net::probe::{self, HttpsOpts, ProbeResult, SpeedSample};
 use kuroshio_net::upstream::Upstream;
 use kuroshio_proto::message::{opt_code, Message, Opt, Question, FLAG_RD};
 use std::collections::HashMap;
@@ -32,6 +32,12 @@ pub trait Net: Send + Sync {
     /// 下載測速（MB/s）
     /// 下載測速（MB/s）：`max_ms` 時間上限、`max_bytes` 收多少就停
     fn download_speed<'a>(&'a self, ip: IpAddr, url: &'a str, max_ms: u64, max_bytes: u64) -> BoxFut<'a, f64>;
+    /// 下載測速的量測樣本（3.5.0）：速度、位元組數、傳輸時間、連線與 TTFB。每個節點一次，流量同 `download_speed`。
+    /// 預設用 `download_speed` 的速度回推（當成收滿 `max_bytes`），假的網路不用另外實作
+    fn download_sample<'a>(&'a self, ip: IpAddr, url: &'a str, max_ms: u64, max_bytes: u64) -> BoxFut<'a, SpeedSample> {
+        let f = self.download_speed(ip, url, max_ms, max_bytes);
+        Box::pin(async move { SpeedSample::from_mbps(f.await, max_bytes) })
+    }
     /// TCP 443 連線延遲（取 `samples` 次最好的，不經過快取）
     fn tcp_ping(&self, ip: IpAddr, timeout: Duration, samples: u32) -> BoxFut<'_, Latency>;
     /// 連線品質（中位數延遲、抖動、掉包）
@@ -137,6 +143,17 @@ impl Net for RealNet {
                 self.https_port
             };
             probe::download_speed(ip, Some(port), url, max_ms, max_bytes).await
+        })
+    }
+
+    fn download_sample<'a>(&'a self, ip: IpAddr, url: &'a str, max_ms: u64, max_bytes: u64) -> BoxFut<'a, SpeedSample> {
+        Box::pin(async move {
+            let port = if url.starts_with("http://") {
+                self.http_port
+            } else {
+                self.https_port
+            };
+            probe::download_sample(ip, Some(port), url, max_ms, max_bytes).await
         })
     }
 

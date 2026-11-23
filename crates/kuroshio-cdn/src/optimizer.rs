@@ -68,6 +68,16 @@ fn ip_of(r: &Record) -> Option<IpAddr> {
     }
 }
 
+/// 查詢名稱的第一個 CNAME 目標的鍵（`db::c1_key`）；沒有 CNAME 回空字串。不配置記憶體
+fn first_cname_key<'a>(msg: &'a Message, name: &str) -> &'a str {
+    msg.answers
+        .iter()
+        .find(|a| a.rtype == rtype::CNAME && a.name.trim_end_matches('.').eq_ignore_ascii_case(name))
+        .and_then(|a| a.target())
+        .map(crate::db::c1_key)
+        .unwrap_or("")
+}
+
 fn is_svcb(r: &Record) -> bool {
     r.rtype == rtype::HTTPS || r.rtype == rtype::SVCB
 }
@@ -241,11 +251,20 @@ impl Cdn {
         // 記憶體控制移出的冷資料：查到時從磁碟讀回來（沒有移出任何網域時不做任何事）
         self.ensure_loaded(&name);
         let cname = terminal_name(msg, &name);
+        // 第一層 CNAME 的鍵（3.5.0 B3）：只對已經判斷是 CDN 的回應做，切片比對、不配置
+        // （鍵最長 C1_MAX 位元組，抄到堆疊上：下面要改 `msg`，不能一直借著它）
+        let mut c1_buf = [0u8; crate::db::C1_MAX];
+        let c1_len = {
+            let k = first_cname_key(msg, &name);
+            c1_buf[..k.len()].copy_from_slice(k.as_bytes());
+            k.len()
+        };
+        let c1 = std::str::from_utf8(&c1_buf[..c1_len]).unwrap_or("");
         let mut tasks: Vec<Task> = Vec::new();
         {
             let mut st = self.state();
             let st = &mut *st;
-            self.apply_locked(st, msg, &name, qtype, provider, via, &cname, &mut res, &mut tasks);
+            self.apply_locked(st, msg, &name, qtype, provider, via, &cname, c1, &mut res, &mut tasks);
             // 小機器減量（3.4.2）：只問過一次的網域先不驗證（剛註冊、只出現一次的網域不值得驗）。
             // 答案照樣是原始結果、試用期 TTL 10 秒，真的有人在用的話很快會再問，那時才排驗證
             if self.cfg.lite && st.db.get(&name).map_or(0, |e| e.hits) < 2 {
@@ -278,14 +297,17 @@ impl Cdn {
         provider: &'static str,
         via: &str,
         cname: &str,
+        c1: &str,
         res: &mut ApplyResult,
         tasks: &mut Vec<Task>,
     ) {
         res.provider = Some(provider);
         let ips4: Vec<IpAddr> = msg.answers.iter().filter(|a| a.rtype == rtype::A).filter_map(ip_of).collect();
         let ips6: Vec<IpAddr> = msg.answers.iter().filter(|a| a.rtype == rtype::AAAA).filter_map(ip_of).collect();
-        let entry = st.db.touch(name, provider, via, &ips4, &ips6, Some(cname));
-        if entry.policy() == Policy::Never {
+        let touch = st.db.touch_at(name, provider, via, &ips4, &ips6, Some(cname), c1, now_ms());
+        let Some(entry) = st.db.get(name) else { return };
+        let policy = entry.policy();
+        if policy == Policy::Never {
             res.tags.push("CDN-略過".into());
             return;
         }
@@ -293,9 +315,27 @@ impl Cdn {
         let prov = providers::get(provider);
         let label = label_of(provider);
         let fam_q = qtype == rtype::A || qtype == rtype::AAAA;
+        if touch.invalidated {
+            st.stats.src_invalidated += 1;
+        }
+        // App 自己選節點的服務（3.5.0 B3）：只辨識與統計，不改寫、不 ECS、不跨 CDN。手動設成「一定換」的照使用者的
+        if self.cfg.app_layer && prov.is_some_and(|p| p.app_layer) && policy != Policy::Always {
+            res.tags.push(format!("{label}:App 自選節點→原始"));
+            st.stats.app_layer += 1;
+            return;
+        }
+        // 多來源（3.5.0 B3）：這一家沒有格子可以放（第三家，或太快又換一家）→ 照原始答案回，不驗證
+        if touch.held {
+            res.tags.push(format!("{label}:多來源→原始"));
+            st.stats.multi_held += 1;
+            return;
+        }
+        // 多來源、或剛換業者還沒定下來：網站自己在多家之間選，不替它換到別家
+        let no_cross = touch.no_cross;
 
         // 這個網站上次是跨 CDN 成功的：先用跨 CDN（規格 06 第 3.5 節）
         if best == Some(Strategy::Cross)
+            && !no_cross
             && fam_q
             && !st.pools.is_nearest(provider)
             && self.cross_rewrite(st, msg, name, provider, qtype, &label, res, tasks, &|_| true)
@@ -330,7 +370,7 @@ impl Cdn {
                 }
             }
             // 沒有台灣節點的 CDN（Fastly）：先看這個網站是不是也放在別家有台灣節點的 CDN 上
-            if st.pools.is_nearest(provider) {
+            if st.pools.is_nearest(provider) && !no_cross {
                 let pools = &st.pools;
                 let is_t = |ip: IpAddr| pools.classify(ip).map(|c| c.provider == provider).unwrap_or(false);
                 let t_ips: HashSet<IpAddr> = msg.answers.iter().filter_map(ip_of).filter(|ip| is_t(*ip)).collect();
@@ -358,7 +398,7 @@ impl Cdn {
             match ecs {
                 Some(e) if e.until.unwrap_or(0) > now => {
                     // ECS 找不到台灣節點：試試跨 CDN
-                    if !e.is("ok") && self.cross_rewrite(st, msg, name, provider, qtype, &label, res, tasks, &|_| true) {
+                    if !e.is("ok") && !no_cross && self.cross_rewrite(st, msg, name, provider, qtype, &label, res, tasks, &|_| true) {
                         return;
                     }
                     if e.is("ok") {
@@ -386,7 +426,7 @@ impl Cdn {
         }
 
         // ---------- 只能用 CNAME 認出來的 CDN（Edgio、BunnyCDN、CDN77…）：原本就慢才試跨 CDN ----------
-        if fam_q {
+        if fam_q && !no_cross {
             self.cross_rewrite(st, msg, name, provider, qtype, &label, res, tasks, &|_| true);
         }
     }

@@ -177,6 +177,44 @@ pub(crate) fn merge_cross_hint(own: Vec<IpAddr>, hint: &[HintIp], check: impl Fn
     (out, uses)
 }
 
+/// 實測分數（3.5.0 B4）：新採用的，分數要不超過原站的這個比例（至少快 5%）。
+/// 這幾個比例是暫定的（規格 11 的 Q6：等 W11 的實測資料再定）
+pub const SCORE_RATIO: f64 = 0.95;
+/// 已經在用的跨 CDN 結果複驗時的遲滯：分數比原站差超過這個比例才撤掉（避免每天在邊界來回）
+pub const SCORE_KEEP_RATIO: f64 = 1.10;
+/// 幾家的分數差在這個比例以內算「接近」，改由 TCP 延遲決定
+pub const SCORE_NEAR: f64 = 0.10;
+/// 為了實測分數最多多做幾次探測（第一名與原站各再一次，取比較小的）
+pub const SCORE_EXTRA_PROBES: usize = 2;
+
+/// 通過原本條件的一家
+#[derive(Debug, Clone)]
+struct Cand {
+    to: String,
+    ips: Vec<IpAddr>,
+    /// TCP 延遲（毫秒）
+    ms: f64,
+    /// 實測分數與量到它的那個節點
+    score: Option<(f64, IpAddr)>,
+}
+
+/// 依實測分數挑一家：分數最低的；跟它差在 [`SCORE_NEAR`] 以內的幾家裡挑 TCP 延遲最低的。
+/// 輸入是（TCP 延遲，實測分數），回傳索引；空的回 None
+pub(crate) fn pick_by_score(c: &[(f64, f64)]) -> Option<usize> {
+    let best = c.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
+    if !best.is_finite() {
+        return None;
+    }
+    (0..c.len())
+        .filter(|&i| c[i].1 <= best * (1.0 + SCORE_NEAR))
+        .min_by(|&a, &b| c[a].0.total_cmp(&c[b].0).then(c[a].1.total_cmp(&c[b].1)))
+}
+
+/// 實測分數夠不夠快。`in_use` = 這一家就是現在正在用的跨 CDN 結果（複驗：用遲滯的比例）
+pub(crate) fn score_ok(new: f64, orig: f64, in_use: bool) -> bool {
+    new <= orig * if in_use { SCORE_KEEP_RATIO } else { SCORE_RATIO }
+}
+
 impl Cdn {
     /// 某家 CDN 的候選台灣節點：（先試的, 好友提示可以採用的範圍）。
     /// 好友提示的範圍：Akamai 是這台自己帶台灣網段解析、量過延遲的全部節點；其他家不用（看節點池）
@@ -239,6 +277,19 @@ impl Cdn {
             ..Default::default()
         };
         let now = now_ms();
+        // 多來源、或剛換業者還沒定下來（3.5.0 B3）：排進來之後才變成多來源的也不探索
+        if self.state().db.get(name).is_some_and(|e| e.no_cross(now)) {
+            return "none";
+        }
+        // 現在正在用的跨 CDN 結果換到哪一家（複驗時給它遲滯）
+        let in_use: Option<String> = {
+            let st = self.state();
+            st.db
+                .get(name)
+                .and_then(|e| e.cross4.as_deref())
+                .filter(|x| x.is("ok") && x.until.unwrap_or(0) > now)
+                .and_then(|x| x.to.as_deref().map(str::to_string))
+        };
         self.with_state(|st| st.cross_explored += 1);
         let base = self.net.https_probe(orig, name, "/", opts.clone()).await;
         if !base.ok {
@@ -261,7 +312,7 @@ impl Cdn {
             .quality(orig, 3, Duration::from_millis(1500), Duration::from_millis(50))
             .await;
         let mut tried: Vec<Tried> = Vec::new();
-        let mut ok_list: Vec<(String, Vec<IpAddr>, f64)> = Vec::new();
+        let mut ok_list: Vec<Cand> = Vec::new();
         // 社群好友試過這個網站可以換到哪一家：那一家先試，並帶上好友驗證過的 IP
         let hint = self.hints().and_then(|h| h.cross_hint(name));
         let mut order: Vec<&str> = TARGETS.to_vec();
@@ -320,6 +371,8 @@ impl Cdn {
                 continue;
             }
             let mut pass = Vec::new();
+            // 實測分數（3.5.0 B4）：條件 ①～④ 的探測本來就要做，把它的分段時間留下來，不多連線
+            let mut score: Option<(f64, IpAddr)> = None;
             let mut why: Option<String> = None;
             for ip in ips {
                 let r = self.net.https_probe(ip, name, "/", opts.clone()).await;
@@ -347,6 +400,11 @@ impl Cdn {
                     why = Some(d);
                     continue;
                 }
+                if let Some(ms) = r.timing.request_ms() {
+                    if score.map_or(true, |s| ms < s.0) {
+                        score = Some((ms, ip));
+                    }
+                }
                 pass.push(ip);
             }
             if pass.is_empty() {
@@ -369,14 +427,20 @@ impl Cdn {
                 } else {
                     Num::Null
                 },
+                score: score.map_or(Num::Absent, |s| Num::V(util::round(s.0, 1))),
                 ..Default::default()
             });
-            ok_list.push((to.to_string(), pass, q.ms));
+            ok_list.push(Cand {
+                to: to.to_string(),
+                ips: pass,
+                ms: q.ms,
+                score,
+            });
         }
-        ok_list.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        ok_list.sort_by(|a, b| a.ms.partial_cmp(&b.ms).unwrap_or(std::cmp::Ordering::Equal));
         // 好友提示的命中率：試過的照結果算，一定錯的（家族不符、範圍外）算沒命中，本機沒辦法確認的不算
         if let (Some(h), Some(hs)) = (hint.as_ref(), self.hints()) {
-            let passed: Vec<IpAddr> = ok_list.iter().find(|o| o.0 == h.to).map(|o| o.1.clone()).unwrap_or_default();
+            let passed: Vec<IpAddr> = ok_list.iter().find(|o| o.to == h.to).map(|o| o.ips.clone()).unwrap_or_default();
             for (x, u) in h.ips.iter().zip(&hint_uses) {
                 match u {
                     HintUse::Try => hs.hint_result(&x.from, HintKind::Cross, passed.contains(&x.ip)),
@@ -387,9 +451,42 @@ impl Cdn {
         }
         let min_gain = self.cfg.nearest_min_gain_ms;
         let orig_ms = orig_q.ms.is_finite().then(|| util::round(orig_q.ms, 1));
-        if let Some(best) = ok_list.first().filter(|b| orig_ms.map(|o| b.2 + min_gain <= o).unwrap_or(true)) {
-            let also: Vec<String> = ok_list[1..].iter().map(|o| o.0.clone()).collect();
-            let (to, ips, ms) = best.clone();
+        // 條件 ⑤（不變）：TCP 延遲比原站快 `nearestMinGainMs` 以上。通過的幾家才往下比
+        let eligible: Vec<usize> = (0..ok_list.len())
+            .filter(|&i| orig_ms.map(|o| ok_list[i].ms + min_gain <= o).unwrap_or(true))
+            .collect();
+        // 實測分數（3.5.0 B4）：原站與通過的每一家都量到了才用；量不到（舊的探測、假的網路）照原本的規則
+        let base_score = base.timing.request_ms();
+        let use_score = self.cfg.cross.request_score
+            && base_score.is_some()
+            && !eligible.is_empty()
+            && eligible.iter().all(|&i| ok_list[i].score.is_some());
+        // 挑哪一家：有分數時分數最低的（接近時看 TCP 延遲），沒有分數時 TCP 延遲最低的（同 3.4.x）
+        let pick: Option<usize> = if use_score {
+            let c: Vec<(f64, f64)> = eligible.iter().map(|&i| (ok_list[i].ms, ok_list[i].score.unwrap().0)).collect();
+            pick_by_score(&c).map(|k| eligible[k])
+        } else {
+            eligible.first().copied()
+        };
+        // 只有一次樣本雜訊大：第一名與原站各再探測一次，取比較小的（最多多 SCORE_EXTRA_PROBES 條連線）
+        let mut scores: Option<(f64, f64)> = None;
+        if let (true, Some(i), Some(mut orig_score)) = (use_score, pick, base_score) {
+            let (mut new_score, ip) = ok_list[i].score.unwrap();
+            for (target, slot) in [(ip, &mut new_score), (orig, &mut orig_score)].into_iter().take(SCORE_EXTRA_PROBES) {
+                let r = self.net.https_probe(target, name, "/", opts.clone()).await;
+                if let Some(ms) = r.timing.request_ms().filter(|_| r.ok) {
+                    *slot = slot.min(ms);
+                }
+            }
+            scores = Some((util::round(new_score, 1), util::round(orig_score, 1)));
+        }
+        let fast_enough = match (scores, pick) {
+            (Some((n, o)), Some(i)) => score_ok(n, o, in_use.as_deref() == Some(ok_list[i].to.as_str())),
+            _ => true,
+        };
+        if let Some(best) = pick.filter(|_| fast_enough).map(|i| ok_list[i].clone()) {
+            let also: Vec<String> = ok_list.iter().filter(|o| o.to != best.to).map(|o| o.to.clone()).collect();
+            let Cand { to, ips, ms, .. } = best;
             self.with_state(|st| {
                 st.cross_ok += 1;
                 st.db.set_cross(
@@ -401,6 +498,8 @@ impl Cdn {
                         ips: Some(ips),
                         ms: Num::of(util::round(ms, 1)),
                         orig_ms: Num::opt(orig_ms),
+                        score: scores.map_or(Num::Absent, |s| Num::V(s.0)),
+                        orig_score: scores.map_or(Num::Absent, |s| Num::V(s.1)),
                         orig_ip: Some(orig),
                         also: Some(also),
                         tried: Some(tried),
@@ -411,18 +510,26 @@ impl Cdn {
                 )
             });
             info!(
-                "⇄ {name}：{} → {} 台灣節點可用（{:.0}ms，原本 {}ms）",
+                "⇄ {name}：{} → {} 台灣節點可用（{:.0}ms，原本 {}ms{}）",
                 providers::label(from),
                 providers::label(&to),
                 ms,
-                orig_ms.map(|m| m.to_string()).unwrap_or_else(|| "?".into())
+                orig_ms.map(|m| m.to_string()).unwrap_or_else(|| "?".into()),
+                scores
+                    .map(|(n, o)| format!("；整個請求 {n:.0}ms，原本 {o:.0}ms"))
+                    .unwrap_or_default()
             );
             return "ok";
         }
         let om = orig_ms.map(|m| m.to_string()).unwrap_or_else(|| "null".into());
-        let reason = match ok_list.first() {
-            Some(b) => format!("{} 可用但沒有比較快（{:.0}ms／原本 {om}ms）", providers::label(&b.0), b.2),
-            None => "其他 CDN 都沒有這個網站".into(),
+        let reason = match (pick, scores, ok_list.first()) {
+            // 原本的條件都過了，但整個請求沒有比較快（3.5.0 B4）
+            (Some(i), Some((n, o)), _) => format!(
+                "{} 連線比較近，但整個請求沒有比較快（{n:.0}ms／原本 {o:.0}ms）",
+                providers::label(&ok_list[i].to)
+            ),
+            (_, _, Some(b)) => format!("{} 可用但沒有比較快（{:.0}ms／原本 {om}ms）", providers::label(&b.to), b.ms),
+            _ => "其他 CDN 都沒有這個網站".into(),
         };
         // 大網站簽哪幾家 CDN 很少變動：失敗幾天後再試
         self.with_state(|st| {
@@ -433,6 +540,8 @@ impl Cdn {
                     from: Some(intern(from)),
                     reason: Some(reason),
                     orig_ms: Num::opt(orig_ms),
+                    score: scores.map_or(Num::Absent, |s| Num::V(s.0)),
+                    orig_score: scores.map_or(Num::Absent, |s| Num::V(s.1)),
                     tried: Some(tried),
                     until: Some(now + (self.cfg.cross.fail_days * DAY_MS as f64) as u64),
                     ..Default::default()

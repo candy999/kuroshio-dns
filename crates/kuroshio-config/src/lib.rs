@@ -605,6 +605,12 @@ mod tests {
             Some(&json!(true)),
             "惡意網站探測預設開，但附帶的 probe.txt 是空的＝不跑（3.5.0 A5）"
         );
+        assert_eq!(get(&d, "cdn.multiCdn"), Some(&json!(true)), "尊重多來源 CDN（3.5.0 B3）");
+        assert_eq!(
+            get(&d, "cdn.appLayer"),
+            Some(&json!(true)),
+            "App 自己選節點的服務不改寫（3.5.0 B3）"
+        );
     }
 
     #[test]

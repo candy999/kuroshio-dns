@@ -22,6 +22,10 @@ pub mod decision {
     pub const ECS: &str = "ecs";
     pub const POLICY_NEVER: &str = "policy-never";
     pub const POLICY_ALWAYS: &str = "policy-always";
+    /// 網站自己在多家 CDN 之間分流：不替它換到別家（3.5.0 B3）
+    pub const MULTI_CDN: &str = "multi-cdn";
+    /// App 自己選節點的服務：只辨識、不改寫（3.5.0 B3）
+    pub const APP_LAYER: &str = "app-layer";
     pub const CHAINED: &str = "chained";
     pub const CDN_DISABLED: &str = "cdn-disabled";
     pub const MEMORY_FLOOR: &str = "memory-floor";
@@ -58,6 +62,8 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::ECS => format!("這個網域用 {label}（依查詢來源分流），已經帶台灣網段問到台灣節點{detail}。"),
         d::POLICY_NEVER => "這個網域被手動設成「不換」，照原本的答案。".into(),
         d::POLICY_ALWAYS => format!("這個網域被手動設成「一定換」，有 {label} 的台灣節點就換。"),
+        d::MULTI_CDN => format!("這個網站自己在多家 CDN 之間分流（這次是 {label}）{detail}。黑潮不替它換到別家；回答來自驗證過的那一家時照常換成那一家的台灣節點。"),
+        d::APP_LAYER => format!("這個網域用 {label}，節點由 App 或服務自己選（影音、系統更新這類），黑潮只辨識、不改寫。要換可以把這個網域手動設成「一定換」。"),
         d::CHAINED => "串接中：答案由上游黑潮換好台灣節點，這台不再做 CDN 處理。".into(),
         d::CDN_DISABLED => "這台沒有開 CDN 台灣節點。".into(),
         d::MEMORY_FLOOR => "記憶體控制的最低限度：暫停 CDN 調整，照原本的答案。".into(),
@@ -119,6 +125,13 @@ impl Cdn {
         v["policy"] = json!(e.policy().as_str());
         v["hits"] = json!(e.hits);
         v["best"] = json!(e.best.map(|s| s.as_str()));
+        v["c1"] = json!(e.c1.as_deref());
+        v["multi"] = json!(e.multi(now));
+        v["provs"] = e
+            .provs()
+            .into_iter()
+            .map(|(p, t, slot)| json!({ "provider": p, "lastSeen": t, "verified": slot }))
+            .collect();
         let mut steps = vec![verdict_step("v4", e.v4.as_deref(), now), verdict_step("v6", e.v6.as_deref(), now)];
         if let Some(x) = e.ecs.as_deref() {
             steps.push(
@@ -129,7 +142,8 @@ impl Cdn {
         if let Some(x) = e.cross4.as_deref() {
             steps.push(
                 json!({ "what": "cross", "result": Cdn::cross_state(Some(e), now), "to": x.to.as_deref(),
-                               "ms": x.ms.get(), "origMs": x.orig_ms.get(), "reason": x.reason, "at": x.at, "until": x.until }),
+                               "ms": x.ms.get(), "origMs": x.orig_ms.get(), "score": x.score.get(), "origScore": x.orig_score.get(),
+                               "reason": x.reason, "at": x.at, "until": x.until }),
             );
         }
         v["steps"] = Value::Array(steps);
@@ -144,7 +158,25 @@ impl Cdn {
             Policy::Always => return (d::POLICY_ALWAYS, String::new()),
             Policy::Auto => {}
         }
-        let cross = Cdn::cross_state(Some(e), now);
+        if self.cfg.app_layer && providers::get(provider).is_some_and(|p| p.app_layer) {
+            return (d::APP_LAYER, String::new());
+        }
+        // 多來源：不做跨 CDN。原本要靠跨 CDN 才換得到台灣的情況，說明成「多來源」
+        let no_cross = e.no_cross(now);
+        let multi_detail = || {
+            let others: Vec<String> = e
+                .provs()
+                .into_iter()
+                .filter(|x| x.0 != provider)
+                .map(|x| providers::label(&x.0).to_string())
+                .collect();
+            if others.is_empty() {
+                String::new()
+            } else {
+                format!("另外看過 {}", others.join("、"))
+            }
+        };
+        let cross = if no_cross { "none" } else { Cdn::cross_state(Some(e), now) };
         let cross_detail = || {
             e.cross4
                 .as_deref()
@@ -161,7 +193,11 @@ impl Cdn {
                 return (d::NO_POOL, String::new());
             }
             if Cdn::is_nearest(provider) {
-                return (d::NO_TW_NODE, String::new());
+                return if no_cross {
+                    (d::MULTI_CDN, multi_detail())
+                } else {
+                    (d::NO_TW_NODE, String::new())
+                };
             }
             if let Some(v) = e.v4.as_deref().filter(|v| v.valid(now)) {
                 if v.is("ok") {
@@ -198,11 +234,17 @@ impl Cdn {
                 if matches!(cross, "ok" | "ok-recheck") {
                     return (d::CROSS, cross_detail());
                 }
+                if no_cross {
+                    return (d::MULTI_CDN, multi_detail());
+                }
                 return (d::NO_TW_NODE, x.reason.clone().unwrap_or_default());
             }
             return (d::TRIAL, String::new());
         }
         // 只能用 CNAME 認出來的 CDN：原本就慢才試跨 CDN
+        if no_cross {
+            return (d::MULTI_CDN, multi_detail());
+        }
         match cross {
             "ok" | "ok-recheck" => (d::CROSS, cross_detail()),
             "none" => (d::TRIAL, String::new()),
