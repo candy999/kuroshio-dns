@@ -29,6 +29,14 @@ function fmtAge(s) {
 	if (s < 3600) return _('%d 分鐘').format(Math.max(1, Math.round(s / 60)));
 	return _('%s 小時').format((s / 3600).toFixed(1));
 }
+// 時間長度（小時，可以是小數）→ 10 分鐘 / 24 小時 / 1.5 小時（「最久未存」的上限：記憶體或磁碟上是 10 分鐘）
+function fmtHours(h) {
+	if (h == null) return '-';
+	var s = Math.round(h * 3600);
+	if (s < 3600) return _('%d 分鐘').format(Math.max(1, Math.round(s / 60)));
+	var x = s / 3600;
+	return _('%s 小時').format(x % 1 === 0 ? String(x) : x.toFixed(1));
+}
 function fmtUptime(s) {
 	if (s == null) return '-';
 	var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
@@ -157,7 +165,7 @@ return view.extend({
 				tile(_('回應時間 p50 / p95'), ms(lat.hit), _('問上游 ') + ms(lat.miss)),
 				tile(_('Flash 寫入（今天）'), per.bytesToday != null ? (per.bytesToday / 1024).toFixed(0) + ' KB' : '-', (per.storage || '') + _(' · 間隔 ') + (per.effectiveIntervalMin != null ? per.effectiveIntervalMin : (per.intervalMin || '-')) + _(' 分') +
 					(per.estimatedDailyBytes != null ? _(' · 預估每天 ') + (per.estimatedDailyBytes / 1024).toFixed(0) + ' KB' : '')),
-				tile(_('最久未存'), fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? _('上限 %s 小時').format(per.maxAgeHours) : '') +
+				tile(_('最久未存'), fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? _('上限 %s').format(fmtHours(per.maxAgeHours)) : '') +
 					(per.forcedByAge ? _(' · 到期強制寫入 %s 次').format(fmtNum(per.forcedByAge)) : '') + (per.lowSpace ? _(' · 儲存空間不足（只寫核心資料）') : '')),
 				per.space && per.space.reserveBytes != null ? tile(_('儲存空間'), per.space.freeBytes != null ? _('可用 %s KB').format(fmtNum(Math.round(per.space.freeBytes / 1024))) : '-',
 					_('保留 %s KB（%s）').format(fmtNum(Math.round(per.space.reserveBytes / 1024)), per.space.reserveAuto ? _('自動') : _('設定')) +

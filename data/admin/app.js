@@ -120,6 +120,14 @@
 		if (sec < 3600) return Math.max(1, Math.round(sec / 60)) + ' 分鐘';
 		return (sec / 3600).toFixed(1) + ' 小時';
 	}
+	/** 時間長度（小時，可以是小數）→ 10 分鐘 / 24 小時 / 1.5 小時（「最久未存」的上限：記憶體或磁碟上是 10 分鐘） */
+	function fmtHours(h) {
+		if (h == null) return '-';
+		var s = Math.round(h * 3600);
+		if (s < 3600) return Math.max(1, Math.round(s / 60)) + ' 分鐘';
+		var x = s / 3600;
+		return (x % 1 === 0 ? String(x) : x.toFixed(1)) + ' 小時';
+	}
 	/** 位元組 → 1023 B / 12 KB / 1.5 MB（ui-core.js 的 fmtBytes） */
 	function fmtBytes(b) { return core.fmtBytes(b); }
 	/** 位址數量：一萬以上用「萬」（1,401 萬），跟一般人講 IP 數量的方式一樣 */
@@ -644,7 +652,7 @@
 			st.access ? tile('連線來源', ACCESS_MODE[st.access.mode] || st.access.mode || '-',
 				st.access.failClosed ? '資料讀不到，公網來源暫時一律擋下' : '已拒絕 ' + fmtNum((st.access.denied || {}).total) + ' 次' + (st.access.generatedAt ? ' · 資料 ' + st.access.generatedAt : '')) : null,
 			tile('磁碟寫入（今天）', per.bytesToday != null ? fmtBytes(per.bytesToday) : '-', (per.storage || '') + (per.effectiveIntervalMin != null ? ' · 間隔 ' + per.effectiveIntervalMin + ' 分' : '') + (per.estimatedDailyBytes != null ? ' · 預估每天 ' + fmtBytes(per.estimatedDailyBytes) : '')),
-			tile('最久未存', fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? '上限 ' + per.maxAgeHours + ' 小時' : '') + (per.forcedByAge ? ' · 到期強制寫入 ' + fmtNum(per.forcedByAge) + ' 次' : '') +
+			tile('最久未存', fmtAge(per.oldestUnsavedSec), (per.maxAgeHours != null ? '上限 ' + fmtHours(per.maxAgeHours) : '') + (per.forcedByAge ? ' · 到期強制寫入 ' + fmtNum(per.forcedByAge) + ' 次' : '') +
 				(per.lowSpace ? ' · 儲存空間不足（只寫核心資料）' : '')),
 			per.space && per.space.reserveBytes != null ? tile('儲存空間', per.space.freeBytes != null ? '可用 ' + fmtBytes(per.space.freeBytes) : '-',
 				'保留 ' + fmtBytes(per.space.reserveBytes) + '（' + (per.space.reserveAuto ? '自動' : '設定') + '）' +
