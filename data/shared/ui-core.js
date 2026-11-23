@@ -9,6 +9,7 @@
  *   restorePlan(cur, defs, removeOwn)  「恢復預設清單」的比對結果
  *   restoreSummary(changes, tr)     「恢復預設清單」的變更清單（文字，畫面由各介面自己組）
  *   chainView(chain, tr, now)       /api/status 的 chain（串接模式）→ 狀態頁顯示用的資料（下游與上游兩種角色）
+ *   benchScope(b, tr)               /api/benchmark 的 tiers、probe（評測範圍、惡意網站探測）→ 一行摘要
  *   controlSummary(list, tr)        /api/benchmark 的 protected[]（對照組）→ 一行摘要
  *   regionLabel(u, tr)              上游的地區（region、regionSource、near）→「台灣」「鄰近（註冊地 GB）」「註冊地 GB」「鄰近」
  *   format(template, args)          %s / %d 代換
@@ -293,6 +294,26 @@
 	}
 
 	/**
+	 * 每日評測測了哪些（/api/benchmark 的 tiers、probe，3.5.0）→ 一行摘要；舊版沒有 tiers 回 null。
+	 *   tiers.mode = 'a'：小機器的減量，只測 A 級加少數 B 級；'ab'：全部都測
+	 *   probe.malware.state：ok（有判斷）、invalid／fuse／no-reference（今天失效，沒拿來判斷）、off／empty（沒有跑，不顯示）
+	 */
+	function benchScope(b, tr) {
+		var t = typeof tr === 'function' ? tr : function (s) { return s; };
+		var ti = b && b.tiers;
+		if (!ti || !ti.mode) return null;
+		var n = function (v) { return typeof v === 'number' ? v : 0; };
+		var out = ti.mode === 'a'
+			? format(t('評測範圍：只測 A 級（A 級 %d、依歷史拉上來的 B 級 %d、沿用 %d、補位 %d、探索 %d；其餘 B 級 %d 個今天不測）'),
+				[n(ti.a), n(ti.promoted) + n(ti.trial), n(ti.incumbent), n(ti.fill), n(ti.explore), n(ti.skippedB)])
+			: t('評測範圍：全部都測');
+		var m = b.probe && b.probe.malware;
+		if (m && m.state === 'ok') out += format(t('；惡意網站探測：%d 台有擋（不選）'), [n(m.blockedBy)]);
+		else if (m && (m.state === 'invalid' || m.state === 'fuse' || m.state === 'no-reference')) out += t('；惡意網站探測今天失效，沒有拿來判斷');
+		return out;
+	}
+
+	/**
 	 * 上游的地區（/api/upstreams、/api/status 的 upstreams[]，或 upstreams.json 的 selected[]；3.5.0）→ 顯示文字。
 	 * 評測用 ip-api 查到的國別是 IP 的「註冊地」，任播的公共 DNS 在東京的節點也會標成 GB、AU，所以不寫成實際位置：
 	 *   regionSource = 'tw-net'（位址在台灣網段）：「台灣」
@@ -318,6 +339,7 @@
 		restoreSummary: restoreSummary,
 		chainView: chainView,
 		controlSummary: controlSummary,
+		benchScope: benchScope,
 		regionLabel: regionLabel
 	};
 

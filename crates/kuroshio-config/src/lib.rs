@@ -599,6 +599,12 @@ mod tests {
             Some(&json!("auto")),
             "CDN 網域資料的磁碟預算：只在小 Flash 自動啟用（3.5.0 C5）"
         );
+        assert_eq!(get(&d, "benchmark.tiers"), Some(&json!("auto")), "分級評測預設依記憶體（3.5.0 A3）");
+        assert_eq!(
+            get(&d, "benchmark.malwareProbe"),
+            Some(&json!(true)),
+            "惡意網站探測預設開，但附帶的 probe.txt 是空的＝不跑（3.5.0 A5）"
+        );
     }
 
     #[test]

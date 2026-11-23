@@ -4,13 +4,17 @@
 //! ```json
 //! { "v": 1, "day": 20781,
 //!   "control": { "<id>": "ddddpd-u…" }, "controlDay": 20781,
+//!   "hist":    { "<id>": [t, s, q, ms, dv, e, last] },
 //!   "h3skip":  { "<h3:// 的 id>": { "f": 3, "n": 1, "until": 20790, "last": 20783 } },
 //!   "neverOk": { "<id>": { "since": 20780, "n": 2 } } }
 //! ```
 //!
 //! - 丟了只是重新學，不影響正確性（`space.rs` 歸 `Rebuildable`）；不進備份的分享檔、不傳給下游與好友。
 //! - 讀不到、格式不對、`v` 不認識、太大：當成空的，不失敗。
-//! - 用到的區段：`neverOk`（A7）、`h3skip`（A6）、`control`／`controlDay`（A2）；不認得的區段（之後的 `hist`）原樣保留，不會被這裡蓋掉。
+//! - 用到的區段：`neverOk`（A7）、`h3skip`（A6）、`control`／`controlDay`（A2）、`hist`（A4）；不認得的區段原樣保留，不會被這裡蓋掉。
+//! - `hist`（A4）：每個測過的一般候選一筆，寫成陣列省空間（2,000 筆要放得進上限）：
+//!   `t`／`s`／`q` 是近 30 天的位元遮罩（最低位是 `last` 那天）：哪幾天測到、哪幾天倖存到最後、哪幾天有汙染／可疑；
+//!   `ms`／`dv` 是倖存那幾天平均延遲的 EWMA 與它的平均偏差；`e` 是升降狀態（見 [`HistState`]）；`last` 是最後記錄的日數。
 //! - `day` 是台北的日數（Unix 毫秒換算，`u32`）；系統時間倒退（還沒對時）時不寫。
 
 use crate::time::{DAY_MS, TPE_OFFSET_MS};
@@ -24,8 +28,158 @@ use std::path::{Path, PathBuf};
 pub const LEARN_FILE: &str = "benchmark-learn.json";
 /// 格式版本
 pub const VERSION: u64 = 1;
-/// 解壓後最多讀這麼多（原始大小上限約 160 KB；超過當成壞掉的）
-pub const MAX_RAW: u64 = 256 * 1024;
+/// 解壓後最多讀這麼多（原始大小約 180 KB 以內：`hist` 2,000 筆約 130 KB；超過當成壞掉的）
+pub const MAX_RAW: u64 = 384 * 1024;
+/// `hist` 最多幾筆（預設名單約 1,800 個候選）
+pub const MAX_HIST: usize = 2000;
+/// `hist` 記最近幾天
+pub const HIST_DAYS: u32 = 30;
+const HIST_MASK: u32 = (1 << HIST_DAYS) - 1;
+
+/// 依評測歷史的升降狀態（A4）。只影響「今天測不測」，不影響選不選
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistState {
+    /// 照人工分級
+    #[default]
+    Normal,
+    /// B 級拉上來每天測（歷史夠長、夠好）
+    Promoted,
+    /// A 級降下去（歷史很差）：只在探索時輪到
+    Demoted,
+    /// B 級試用：探索時表現好，先每天測，累積到夠長的歷史再決定
+    Trial,
+}
+
+impl HistState {
+    fn code(self) -> u64 {
+        match self {
+            HistState::Normal => 0,
+            HistState::Promoted => 1,
+            HistState::Demoted => 2,
+            HistState::Trial => 3,
+        }
+    }
+    fn from_code(c: u64) -> HistState {
+        match c {
+            1 => HistState::Promoted,
+            2 => HistState::Demoted,
+            3 => HistState::Trial,
+            _ => HistState::Normal,
+        }
+    }
+}
+
+/// 一個候選近 30 天的評測歷史（A4）
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Hist {
+    /// 哪幾天測到（而且那天評測成功）；最低位是 `last` 那天
+    pub t: u32,
+    /// 哪幾天倖存到最後
+    pub s: u32,
+    /// 哪幾天被判汙染／可疑
+    pub q: u32,
+    /// 倖存那幾天平均延遲的 EWMA（毫秒）
+    pub ms: f32,
+    /// 延遲的平均偏差（EWMA）
+    pub dv: f32,
+    pub e: HistState,
+    pub last: u32,
+}
+
+impl Hist {
+    /// 換算到今天：依日數差位移，超過 30 天的掉出去。日數差 32 以上直接歸零（位移不能溢位）；
+    /// 今天比 `last` 舊（系統時間倒退）時原樣回傳
+    pub fn aged(mut self, today: u32) -> Hist {
+        if today <= self.last {
+            return self;
+        }
+        let gap = today - self.last;
+        let shift = |m: u32| if gap >= 32 { 0 } else { (m << gap) & HIST_MASK };
+        self.t = shift(self.t);
+        self.s = shift(self.s);
+        self.q = shift(self.q);
+        self.last = today;
+        self
+    }
+    /// 測到幾天
+    pub fn tested(&self) -> u32 {
+        (self.t & HIST_MASK).count_ones()
+    }
+    /// 倖存幾天
+    pub fn survived(&self) -> u32 {
+        (self.s & self.t & HIST_MASK).count_ones()
+    }
+    /// 幾天有汙染／可疑紀錄
+    pub fn suspect(&self) -> u32 {
+        (self.q & HIST_MASK).count_ones()
+    }
+    /// 倖存率（沒測過是 0）
+    pub fn rate(&self) -> f32 {
+        match self.tested() {
+            0 => 0.0,
+            n => self.survived() as f32 / n as f32,
+        }
+    }
+    /// 延遲穩不穩：平均偏差不超過平均的一半（延遲很低時放寬到 10 ms，區網抖動幾毫秒不算不穩）
+    pub fn stable(&self) -> bool {
+        self.dv <= (self.ms * 0.5).max(10.0)
+    }
+    /// 歷史分數（只用來排序）：倖存率 × 穩定度 − 可疑懲罰。沒測過是 None
+    pub fn score(&self) -> Option<f32> {
+        if self.tested() == 0 {
+            return None;
+        }
+        let cv = if self.ms > 0.0 { (self.dv / self.ms).min(1.0) } else { 0.0 };
+        Some(self.rate() * (1.0 - cv * 0.5) - 0.25 * self.suspect() as f32)
+    }
+    /// 記下今天的結果。回 false＝沒記（系統時間倒退）。同一天再跑一次：換掉今天那一格，延遲不重複算
+    pub fn record(&mut self, today: u32, survived: bool, suspect: bool, ms: Option<f32>) -> bool {
+        if today < self.last {
+            return false;
+        }
+        let again = self.last == today && self.t & 1 == 1;
+        *self = self.aged(today);
+        self.last = today;
+        self.t |= 1;
+        self.s = (self.s & !1) | survived as u32;
+        self.q = (self.q & !1) | suspect as u32;
+        if let (false, true, Some(x)) = (again, survived, ms.filter(|x| x.is_finite() && *x >= 0.0)) {
+            if self.ms <= 0.0 {
+                self.ms = x;
+                self.dv = 0.0;
+            } else {
+                self.dv += ((x - self.ms).abs() - self.dv) / 4.0;
+                self.ms += (x - self.ms) / 4.0;
+            }
+        }
+        true
+    }
+
+    fn to_json(self) -> Value {
+        let r = |x: f32| (x as f64 * 10.0).round() / 10.0;
+        json!([self.t, self.s, self.q, r(self.ms), r(self.dv), self.e.code(), self.last])
+    }
+
+    fn from_json(v: &Value) -> Option<Hist> {
+        let a = v.as_array()?;
+        let u = |i: usize| a.get(i).and_then(Value::as_u64).map(|x| x.min(u32::MAX as u64) as u32);
+        let f = |i: usize| {
+            a.get(i)
+                .and_then(Value::as_f64)
+                .filter(|x| x.is_finite() && *x >= 0.0)
+                .map(|x| x as f32)
+        };
+        Some(Hist {
+            t: u(0)? & HIST_MASK,
+            s: u(1)? & HIST_MASK,
+            q: u(2)? & HIST_MASK,
+            ms: f(3)?,
+            dv: f(4)?,
+            e: HistState::from_code(a.get(5)?.as_u64()?),
+            last: u(6)?,
+        })
+    }
+}
 /// `neverOk` 最多幾筆（執行時上線以來從未成功的自動上游）
 pub const MAX_NEVER_OK: usize = 32;
 /// 連續幾次評測都排除後忘掉重來（它可能修好了）
@@ -172,6 +326,8 @@ pub struct Learn {
     pub control: BTreeMap<String, String>,
     /// `control` 最後記錄的日數（跟檔案的 `day` 分開：主程式登記 `neverOk` 時也會更新 `day`）
     pub control_day: u32,
+    /// 每個候選近 30 天的評測歷史（A4）
+    pub hist: BTreeMap<String, Hist>,
     /// 這一版不認得的區段：原樣保留
     rest: Map<String, Value>,
 }
@@ -251,8 +407,17 @@ impl Learn {
             }
         }
         let control_day = o.remove("controlDay").and_then(|d| d.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
+        let mut hist = BTreeMap::new();
+        if let Some(Value::Object(m)) = o.remove("hist") {
+            for (id, e) in m {
+                if let Some(h) = Hist::from_json(&e) {
+                    hist.insert(id, h);
+                }
+            }
+        }
         let mut l = Learn {
             day,
+            hist,
             never_ok,
             h3skip,
             control,
@@ -272,6 +437,7 @@ impl Learn {
             self.never_ok.remove(&oldest);
         }
         self.cap_h3();
+        self.hist_cap(|_| true);
         // control：超過上限時丟「最後一次有結果」最久以前的
         while self.control.len() > MAX_CONTROL {
             let Some(k) = self
@@ -318,6 +484,8 @@ impl Learn {
         let c: Map<String, Value> = self.control.iter().map(|(k, h)| (k.clone(), json!(h))).collect();
         o.insert("control".into(), Value::Object(c));
         o.insert("controlDay".into(), json!(self.control_day));
+        let h: Map<String, Value> = self.hist.iter().map(|(k, e)| (k.clone(), e.to_json())).collect();
+        o.insert("hist".into(), Value::Object(h));
         Value::Object(o)
     }
 
@@ -461,6 +629,20 @@ impl Learn {
         true
     }
 
+    /// `hist` 超過 [`MAX_HIST`] 筆時：先丟名單裡已經沒有的，再丟 `last` 最舊的。回傳丟了幾筆
+    pub fn hist_cap(&mut self, listed: impl Fn(&str) -> bool) -> usize {
+        let over = self.hist.len().saturating_sub(MAX_HIST);
+        if over == 0 {
+            return 0;
+        }
+        let mut order: Vec<(bool, u32, String)> = self.hist.iter().map(|(k, e)| (listed(k), e.last, k.clone())).collect();
+        order.sort();
+        for (_, _, k) in order.into_iter().take(over) {
+            self.hist.remove(&k);
+        }
+        over
+    }
+
     /// 今天在跳過期間的筆數
     pub fn h3_skipping_count(&self, today: u32) -> usize {
         self.h3skip.keys().filter(|k| self.h3_skipping(k, today)).count()
@@ -515,15 +697,153 @@ mod tests {
     #[test]
     fn save_is_compressed_and_keeps_other_sections() {
         let p = tmp("save");
-        std::fs::write(&p, br#"{"v":1,"day":10,"hist":{"x":{"t":1}},"neverOk":{}}"#).unwrap();
+        std::fs::write(&p, br#"{"v":1,"day":10,"later":{"x":{"t":1}},"neverOk":{}}"#).unwrap();
         let mut l = Learn::load(&p);
         assert!(l.add_never_ok(&["udp://192.0.2.1:53".into()], 10));
         l.save(&p).unwrap();
         assert!(!p.exists(), "舊的一般 JSON 刪掉");
         assert!(zst_path(&p).exists());
         let l = Learn::load(&p);
-        assert_eq!(l.to_json()["hist"]["x"]["t"], 1, "不認得的區段原樣保留");
+        assert_eq!(l.to_json()["later"]["x"]["t"], 1, "不認得的區段原樣保留");
         assert_eq!(l.never_ok["udp://192.0.2.1:53"], NeverOk { since: 10, n: 0 });
+    }
+
+    #[test]
+    fn hist_shift_across_days_and_gaps() {
+        let mut h = Hist::default();
+        assert!(h.record(100, true, false, Some(20.0)));
+        assert_eq!((h.t, h.s, h.q, h.last), (1, 1, 0, 100));
+        assert_eq!((h.ms, h.dv), (20.0, 0.0));
+        // 隔天沒倖存、有可疑紀錄
+        assert!(h.record(101, false, true, None));
+        assert_eq!((h.t, h.s, h.q), (0b11, 0b10, 0b01));
+        assert_eq!((h.tested(), h.survived(), h.suspect()), (2, 1, 1));
+        // 同一天再跑一次：換掉今天那一格，延遲不重複算
+        assert!(h.record(101, true, false, Some(60.0)));
+        assert_eq!((h.t, h.s, h.q), (0b11, 0b11, 0));
+        assert_eq!(h.ms, 20.0, "同一天的第二次不算進延遲");
+        // 跳過 3 天沒測
+        assert!(h.record(105, true, false, Some(28.0)));
+        assert_eq!((h.t, h.s), (0b110001, 0b110001));
+        assert_eq!((h.ms, h.dv), (22.0, 2.0));
+        // 系統時間倒退：不記、不位移
+        let before = h;
+        assert!(!h.record(104, false, true, Some(1.0)));
+        assert_eq!(h, before);
+        assert_eq!(h.aged(90), before);
+        // 30 天後最舊的掉出去；日數差 32 以上直接歸零（不會位移溢位）
+        assert_eq!(h.aged(105 + 25).tested(), 2, "第 100、101 天還在 30 天內");
+        assert_eq!(h.aged(105 + 29).tested(), 1);
+        assert_eq!(h.aged(105 + 30).tested(), 0);
+        for gap in [31, 32, 33, 64, 4_000_000] {
+            let a = h.aged(105 + gap);
+            assert_eq!((a.t, a.s, a.q), (0, 0, 0), "{gap}");
+        }
+        assert!(h.record(105 + 40, true, false, Some(22.0)));
+        assert_eq!(h.t, 1);
+        // 分數：倖存率 × 穩定度 − 可疑懲罰
+        assert_eq!(Hist::default().score(), None);
+        let good = Hist {
+            t: 0b1111,
+            s: 0b1111,
+            ms: 20.0,
+            dv: 2.0,
+            ..Default::default()
+        };
+        let flaky = Hist {
+            t: 0b1111,
+            s: 0b0101,
+            ms: 20.0,
+            dv: 2.0,
+            ..Default::default()
+        };
+        let jumpy = Hist {
+            t: 0b1111,
+            s: 0b1111,
+            ms: 20.0,
+            dv: 30.0,
+            ..Default::default()
+        };
+        let suspect = Hist {
+            t: 0b1111,
+            s: 0b1111,
+            q: 1,
+            ms: 20.0,
+            dv: 2.0,
+            ..Default::default()
+        };
+        assert!(good.score() > jumpy.score() && jumpy.score() > flaky.score());
+        assert!(good.score() > suspect.score());
+        assert!(good.stable() && !jumpy.stable());
+        assert!(Hist { ms: 4.0, dv: 8.0, ..good }.stable(), "延遲很低時抖動幾毫秒不算不穩");
+    }
+
+    #[test]
+    fn hist_roundtrip_and_capped_at_2000_drops_unlisted_first() {
+        let p = tmp("hist");
+        let mut l = Learn::default();
+        for i in 0..MAX_HIST + 50 {
+            let mut h = Hist {
+                e: HistState::Trial,
+                ..Default::default()
+            };
+            h.record(20_000 + (i % 7) as u32, i % 3 != 0, false, Some(12.3 + i as f32 / 100.0));
+            l.hist.insert(format!("https://dns{i}.example.net/dns-query"), h);
+        }
+        // 名單裡已經沒有的 50 筆先丟（即使它們比較新），再丟最舊的
+        let unlisted = |k: &str| k.contains("dns20") && k.len() == "https://dns2000.example.net/dns-query".len();
+        let n_unlisted = l.hist.keys().filter(|k| unlisted(k)).count();
+        assert_eq!(n_unlisted, 50);
+        assert_eq!(l.hist_cap(|k| !unlisted(k)), 50);
+        assert_eq!(l.hist.len(), MAX_HIST);
+        assert!(!l.hist.keys().any(|k| unlisted(k)));
+        // 再塞 10 筆最舊的：丟的是它們
+        for i in 0..10 {
+            l.hist.insert(
+                format!("old{i}"),
+                Hist {
+                    t: 1,
+                    last: 5,
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(l.hist_cap(|_| true), 10);
+        assert!(!l.hist.keys().any(|k| k.starts_with("old")));
+        l.day = 20_010;
+        l.save(&p).unwrap();
+        let back = Learn::load(&p);
+        assert_eq!(back.hist.len(), MAX_HIST);
+        let (k, h) = l.hist.iter().next().unwrap();
+        let b = back.hist[k];
+        assert_eq!((b.t, b.s, b.q, b.e, b.last), (h.t, h.s, h.q, HistState::Trial, h.last));
+        assert!((b.ms - h.ms).abs() < 0.06);
+        // 大小：原始放得進上限，壓縮後在 64 KB 以內（小 Flash、每日寫入額度）
+        let raw = serde_json::to_vec(&l.to_json()).unwrap().len() as u64;
+        assert!(raw < MAX_RAW * 3 / 4, "原始 {raw} bytes");
+        let z = std::fs::metadata(zst_path(&p)).unwrap().len();
+        assert!(z < 64 * 1024, "壓縮後 {z} bytes");
+        // 格式不對的那一筆丟掉，其他照讀
+        std::fs::write(
+            &p,
+            br#"{"v":1,"day":5,"hist":{"a":[3,1,0,12.5,1,2,5],"bad":{"t":1},"short":[1,1]}}"#,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(zst_path(&p));
+        let l = Learn::load(&p);
+        assert_eq!(l.hist.len(), 1);
+        assert_eq!(
+            l.hist["a"],
+            Hist {
+                t: 3,
+                s: 1,
+                q: 0,
+                ms: 12.5,
+                dv: 1.0,
+                e: HistState::Demoted,
+                last: 5
+            }
+        );
     }
 
     #[test]

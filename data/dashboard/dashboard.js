@@ -901,6 +901,14 @@
           { h: '台灣率', v: r => (r.twRate == null ? '—' : pct1(r.twRate)) + (r.ecs ? ' · ECS' : ''), num: 1 },
           { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
         ]);
+        // 評測範圍、惡意網站探測（3.5.0）：小機器只測 A 級時寫明測了哪幾類
+        if (b.tiers && b.tiers.mode === 'a') {
+          const ti = b.tiers;
+          box.appendChild(el('div', 'muted', `評測範圍：只測 A 級（A 級 ${ti.a || 0}、依歷史拉上來的 B 級 ${(ti.promoted || 0) + (ti.trial || 0)}、沿用 ${ti.incumbent || 0}、補位 ${ti.fill || 0}、探索 ${ti.explore || 0}；其餘 B 級 ${ti.skippedB || 0} 個今天不測）`));
+        }
+        const mp = b.probe && b.probe.malware;
+        if (mp && mp.state === 'ok') box.appendChild(el('div', 'muted', `惡意網站探測：${mp.blockedBy} 台有擋惡意網站（比照對照組，不選）${(mp.filtering || []).length ? '：' + mp.filtering.slice(0, 5).join('、') : ''}`));
+        else if (mp && ['invalid', 'fuse', 'no-reference'].includes(mp.state)) box.appendChild(el('div', 'muted', '惡意網站探測今天失效（自我檢查沒過），沒有拿來判斷'));
         if (b.blocked && b.blocked.length) box.appendChild(el('div', 'muted', `封殺紀錄 ${b.blocked.length} 筆（例：${b.blocked.slice(0, 3).map(x => x.dns + ' → ' + x.domain).join('、')}）`));
         // 對照組（3.5.0）：有過濾的大型 DNS，用來確認評測判得出過濾；永遠不選。摺疊起來，點開才看每一台
         const ctl = b.protected || [];
@@ -915,7 +923,7 @@
           table(t2, ctl, [
             { h: '上游', v: r => r.id, cls: 'mono' },
             { h: '預期會擋', v: r => String(r.expect || '').split(',').map(x => CAT[x] || x).join('、') },
-            { h: '今天', v: r => { const x = RES[r.result] || [r.result, '']; return tag(x[0] + (r.result === 'detected' && r.stage === 'preflight' ? '（資格賽）' : ''), x[1]); } },
+            { h: '今天', v: r => { const x = RES[r.result] || [r.result, '']; return tag(x[0] + (r.result === 'detected' && r.stage === 'preflight' ? '（資格賽）' : r.result === 'detected' && r.stage === 'probe' ? '（惡意探測）' : ''), x[1]); } },
             { h: '近 7 天', v: r => r.recent || '—', cls: 'mono' },
             { h: '預期', v: r => r.expectMet === true ? '符合' : r.expectMet === false ? tag('不符', 'warn') : '—' },
             { h: '回歸', v: r => r.regress ? tag('回歸', 'bad') : '—' },

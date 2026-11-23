@@ -30,10 +30,12 @@
 //! 量到的最低延遲），`benchmark.coverageRegion = near`（預設）時「覆蓋」階段先挑鄰近的（台灣、日本、香港、新加坡）。
 
 pub mod learn;
+pub mod malware;
 pub mod probe;
 pub mod rules;
 pub mod select;
 pub mod tags;
+pub mod tiers;
 
 use crate::scheduler::{resolve_path, BoxFuture, Job, JobCtx};
 use crate::time::{fmt_time, iso_string, local_date_str, parse_date_utc, DAY_MS};
@@ -186,6 +188,8 @@ pub struct Benchmark {
     pub keep_last: Option<PathBuf>,
     /// 台灣網段（`geo/tw-ip.json`）：判斷上游在不在台灣（規格 10 的 6.1）。None = 讀不到，只靠國別與延遲
     pub tw: Option<Arc<crate::geo::TwIp>>,
+    /// `benchmark.tiers = auto` 時用哪一種（主程式依實體記憶體換算，3.5.0 A3）。預設全部測
+    pub tier_auto: tiers::Mode,
 }
 
 /// 讀台灣網段（`tw-ip.json`，約 41 KB）給評測用；讀不到或格式錯誤是 None（不影響評測，只少一個訊號）。
@@ -235,7 +239,14 @@ impl Benchmark {
             path: PathSource::Off,
             keep_last: None,
             tw: None,
+            tier_auto: tiers::Mode::Ab,
         }
+    }
+
+    /// `benchmark.tiers = auto` 時用哪一種（見 [`tiers::auto_mode`]）
+    pub fn with_tier_auto(mut self, m: tiers::Mode) -> Benchmark {
+        self.tier_auto = m;
+        self
     }
 
     /// 指定台灣網段（`read_tw_ip` 讀出來的）
@@ -348,6 +359,10 @@ struct BenchCfg {
     select: SelectOpts,
     /// `benchmark.nearMaxMs`：最低延遲在這以內就算鄰近
     near_max_ms: f64,
+    /// `benchmark.tiers`：`a`／`ab`；None = `auto`（用 [`Benchmark::tier_auto`]）
+    tiers: Option<tiers::Mode>,
+    /// `benchmark.malwareProbe`：惡意網站探測（預設開；`probe.txt` 空的就不跑）
+    malware_probe: bool,
 }
 
 fn pos_f64(cfg: &Value, k: &str) -> Option<f64> {
@@ -366,6 +381,8 @@ impl BenchCfg {
             pinned: strings(cfg, "upstream.pinned").unwrap_or_default(),
             select: select_opts(cfg),
             near_max_ms: kuroshio_config::chain::coverage_region_of(cfg).1,
+            tiers: get(cfg, "benchmark.tiers").and_then(Value::as_str).and_then(tiers::Mode::parse),
+            malware_probe: kuroshio_config::chain::flex_bool(get(cfg, "benchmark.malwareProbe"), true).0,
         }
     }
 }
@@ -572,6 +589,10 @@ struct Srv {
     never_ok: bool,
     /// 對照組的資格賽網域被擋（3.5.0 A2）：記為判出過濾（`stage = preflight`），照樣測網域
     preflight: Option<String>,
+    /// 惡意網站探測（3.5.0 A5）判出這個一般候選有擋惡意網站：比照對照組（照常評測、今天不選、不記可疑、不進黑名單）
+    malware_filter: bool,
+    /// 惡意網站探測的結果（對照組用）：Some(true)＝有擋、Some(false)＝沒擋、None＝今天判不出來
+    probe: Option<bool>,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -594,6 +615,8 @@ impl Srv {
             tag,
             never_ok: false,
             preflight: None,
+            malware_filter: false,
+            probe: None,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -606,9 +629,33 @@ impl Srv {
         }
     }
 
+    /// 經營者（多樣性用）：名單的 `op=`，沒有就用主機的可註冊網域或 /16
+    fn op_key(&self) -> String {
+        if self.tag.op.is_empty() {
+            operator_of(&self.up.host)
+        } else {
+            self.tag.op.to_ascii_lowercase()
+        }
+    }
+
     /// 會不會被選來用（固定上游另外處理，對照組永遠不選）
     fn selectable(&self) -> bool {
-        !self.pinned && self.protected.is_none()
+        !self.pinned && !self.control_like()
+    }
+
+    /// 比照對照組處理：對照組本身，或惡意網站探測判出有擋惡意網站的一般候選（3.5.0 A5）。
+    /// 照常測、照常判，但不選、不算覆蓋、不參加多數決、不記可疑、不進永久黑名單
+    fn control_like(&self) -> bool {
+        self.protected.is_some() || self.malware_filter
+    }
+
+    /// 判斷過程摘要裡的稱呼
+    fn control_label(&self) -> &'static str {
+        if self.protected.is_some() {
+            "對照組"
+        } else {
+            "有擋惡意網站"
+        }
     }
 
     /// 評測結果會不會記下來（可疑天數、永久黑名單）：固定上游與對照組都不記
@@ -713,12 +760,14 @@ fn protected_ids(paths: &BenchPaths) -> Vec<(String, String, Tag)> {
 /// - `detected`：網域判斷判出過濾（封殺、汙染、可疑，`stage = domain`）；或網域都沒判出、但資格賽網域被擋（`stage = preflight`，3.5.0）
 /// - `passed`：網域都沒判出（`stage = domain`）
 /// - `untested`：連不上、逾時（資格賽就連不上是 `preflight`，測網域時才連不上是 `domain`）
-///
-/// A5（惡意網站探測）之後會多 `stage = probe`
+/// - 網域沒判出、惡意網站探測判出有擋（3.5.0 A5）：`detected`、`stage = probe`
 fn protected_outcome(s: &Srv) -> (&'static str, &'static str, String) {
     let judged = ["封殺", "汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p));
     if !s.alive && judged {
         return ("detected", "domain", s.fail_reason.clone());
+    }
+    if s.probe == Some(true) {
+        return ("detected", "probe", "封殺 惡意網站探測".to_string());
     }
     if let Some(pf) = &s.preflight {
         return ("detected", "preflight", pf.clone());
@@ -734,26 +783,134 @@ fn protected_outcome(s: &Srv) -> (&'static str, &'static str, String) {
     ("untested", stage, s.fail_reason.clone())
 }
 
-/// 這個過濾類型今天有沒有對應的判斷（給 `expectMet`）：Some(true)＝有而且正常、Some(false)＝有但今天失效、None＝沒有。
-/// 評測網域（`web.txt`）有廣告追蹤與成人網站；惡意網站要等 A5 的探測（自我檢查通過才算），在那之前是 None
-fn category_checked(cat: &str) -> Option<bool> {
-    match cat {
-        "ads" | "adult" | "tracking" | "telemetry" => Some(true),
-        _ => None,
-    }
-}
-
-/// 對照組的預期值（`expectMet`）：`filter=` 裡至少有一種類型今天有判斷 → 判出了沒有（資格賽網域被擋不算，那不是這些類型）；
-/// 都沒有判斷（例如只擋惡意網站、A5 之前）或今天沒測到 → None
-fn expect_met(expect: &str, result: &str, stage: &str) -> Option<bool> {
+/// 對照組的預期值（`expectMet`）：`filter=` 裡至少有一種類型今天有對應的判斷 → 那些類型裡有沒有判出。
+/// - 廣告、追蹤、成人：評測網域（`web.txt`）有，看網域判斷（資格賽網域被擋不算，那不是這些類型）；
+/// - 惡意網站：看惡意網站探測（3.5.0 A5）；探測今天沒跑、失效、或這一台沒回答探測時不算有判斷；
+/// - 都沒有判斷（例如只擋惡意網站而探測今天失效）或今天沒測到 → None
+fn expect_met(expect: &str, result: &str, stage: &str, probe: Option<bool>) -> Option<bool> {
     if result == "untested" {
         return None;
     }
-    let types: Vec<Option<bool>> = expect.split(',').map(|t| category_checked(t.trim())).collect();
-    if !types.contains(&Some(true)) {
-        return None;
+    let (mut checked, mut met) = (false, false);
+    for t in expect.split(',') {
+        match t.trim() {
+            "ads" | "adult" | "tracking" | "telemetry" => {
+                checked = true;
+                met |= result == "detected" && stage == "domain";
+            }
+            "malware" => {
+                if let Some(hit) = probe {
+                    checked = true;
+                    met |= hit;
+                }
+            }
+            _ => {}
+        }
     }
-    Some(result == "detected" && stage != "preflight")
+    checked.then_some(met)
+}
+
+/// 對照組一天的結果字元（學習檔的 `control`）。惡意網站探測今天有設定卻判不出來（失效、保險絲、參照不足）時，
+/// 預期會擋惡意網站、其他都沒判出的對照組記成「沒測到」：不然探測失效一天就會被報成回歸
+fn control_day_char(result: &str, expect: &str, probe_unusable: bool) -> char {
+    if result == "passed" && probe_unusable && malware::expects_malware(expect) {
+        return 'u';
+    }
+    day_char(result)
+}
+
+/// 一筆探測查詢的分類：只認明確的阻擋（NXDOMAIN、沒有 A 記錄、封鎖位址）；回另一個位址（業者自己的警告頁）不判
+fn probe_ans(r: Option<&QueryResult>) -> malware::Ans {
+    match r.map(|r| &r.outcome) {
+        Some(Outcome::Ok(_)) => malware::Ans::Ok,
+        Some(Outcome::Blocked(_)) => malware::Ans::Blocked,
+        _ => malware::Ans::None,
+    }
+}
+
+/// 惡意網站探測這一次的狀態（`upstreams.json` 的 `probe.malware`）
+#[derive(Debug, Default)]
+struct ProbeRun {
+    /// off＝設定關掉、empty＝`probe.txt` 沒有探測網域、no-reference＝參照不足、invalid＝探測都失效、
+    /// fuse＝保險絲燒斷、ok＝有判斷
+    state: &'static str,
+    /// `probe.txt` 裡的探測網域數
+    domains: usize,
+    /// 自我檢查通過、這次拿去問全部候選的探測網域
+    used: Vec<String>,
+    /// 事後再驗還有效的個數
+    valid: usize,
+    /// 判出有擋惡意網站的一般候選
+    filtering: Vec<String>,
+    /// 有回答探測的一般候選數
+    probed: usize,
+    /// 今天多送了幾筆查詢（估計：自我檢查＋每個候選的探測）
+    queries: usize,
+}
+
+impl ProbeRun {
+    /// 有設定探測、但今天判不出來
+    fn unusable(&self) -> bool {
+        matches!(self.state, "no-reference" | "invalid" | "fuse")
+    }
+    fn to_json(&self) -> Value {
+        json!({ "malware": {
+            "state": self.state, "domains": self.domains, "used": self.used.len(), "valid": self.valid,
+            "blockedBy": self.filtering.len(), "probed": self.probed, "queries": self.queries,
+            "filtering": self.filtering.iter().take(MAX_PROBE_REPORT).collect::<Vec<_>>(),
+        } })
+    }
+}
+
+/// 結果裡最多列幾台「有擋惡意網站」的候選
+const MAX_PROBE_REPORT: usize = 100;
+
+/// 昨天選上或列為候補的上游（`upstreams.json` 的 `selected[]`、`spares[]`）：分級評測只測 A 級時沿用，
+/// 不然探索到的 B 級今天選上、明天又不測。讀不到就是空的
+fn incumbent_ids(file: &Path) -> HashSet<String> {
+    let Some(v) = read_json(file) else {
+        return HashSet::new();
+    };
+    ["selected", "spares"]
+        .iter()
+        .flat_map(|k| v[*k].as_array().into_iter().flatten())
+        .filter_map(|x| x["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// 分級評測的統計（`upstreams.json` 的 `tiers`）
+#[derive(Debug, Clone, Copy)]
+struct TierCounts {
+    mode: tiers::Mode,
+    /// 設定是 `auto`（依記憶體換算出來的）
+    auto: bool,
+    /// 今天測的 A 級
+    a: usize,
+    incumbent: usize,
+    fill: usize,
+    explore: usize,
+    skipped_b: usize,
+    /// 依歷史拉上來每天測的 B 級（A4）：升級的、試用中的
+    promoted: usize,
+    trial: usize,
+    /// 依歷史降級的 A 級（`a` 模式今天不測）
+    demoted: usize,
+    /// 降級太多、今天不採用降級
+    demote_fuse: bool,
+    /// 今天評測之後的升降（A4）
+    promoted_today: usize,
+    demoted_today: usize,
+}
+
+impl TierCounts {
+    fn to_json(self) -> Value {
+        json!({
+            "mode": self.mode.name(), "auto": self.auto, "a": self.a, "incumbent": self.incumbent,
+            "fill": self.fill, "explore": self.explore, "skippedB": self.skipped_b,
+            "promoted": self.promoted, "trial": self.trial, "demoted": self.demoted, "demoteFuse": self.demote_fuse,
+            "promotedToday": self.promoted_today, "demotedToday": self.demoted_today,
+        })
+    }
 }
 
 /// 社群好友提供的上游候選最多收幾個（社群模組已經先合併、排序、限制成 100 個；這裡再擋一次，
@@ -1098,6 +1255,106 @@ impl Benchmark {
             s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
             all.push(s);
         }
+        // 分級評測（3.5.0 A3）：`a` 模式只測 A 級、使用者的、沿用、補位、探索；其餘 B 級今天不測
+        // （不算淘汰、不記任何紀錄）。在路徑檢查、黑名單略過之後才算：多樣性要看今天實際能測的
+        let tier_mode = cfg.tiers.unwrap_or(self.tier_auto);
+        // 依評測歷史的升降（3.5.0 A4）：人工分級是起點，學習檔的 hist 決定實際分級；讀不到學習檔就照人工分級。
+        // 固定上游、對照組、使用者自己加的不參與
+        let hist_of = |s: &Srv| -> Option<&learn::Hist> {
+            if s.pinned || s.protected.is_some() {
+                return None;
+            }
+            learned.as_ref().filter(|l| today_n >= l.day).and_then(|l| l.hist.get(&s.id))
+        };
+        let eff: Vec<Tier> = all.iter().map(|s| tiers::effective_tier(s.tag.tier, hist_of(s), today_n)).collect();
+        let manual_a = all.iter().filter(|s| s.selectable() && s.tag.tier == Tier::A).count();
+        let demoted_now = (0..all.len()).filter(|&i| all[i].tag.tier == Tier::A && eff[i] != Tier::A).count();
+        // 保險絲：被降級的超過 A 級的三分之一，多半是線路的問題，今天不採用降級
+        let demote_fuse = demoted_now > 0 && tiers::demotion_fuse(manual_a, demoted_now);
+        if demote_fuse {
+            let line = format!(
+                "[分級] 依歷史要降級的 A 級有 {demoted_now} 個，超過 A 級 {manual_a} 個的三分之一：多半是這條線路的問題，今天不採用降級（照人工分級測）"
+            );
+            warn!("{line}");
+            journal.push(line);
+        }
+        let eff: Vec<Tier> = (0..all.len())
+            .map(|i| {
+                if demote_fuse && all[i].tag.tier == Tier::A {
+                    Tier::A
+                } else {
+                    eff[i]
+                }
+            })
+            .collect();
+        let pulled = |i: usize, st: learn::HistState| {
+            matches!(all[i].tag.tier, Tier::B | Tier::Unknown) && eff[i] == Tier::A && hist_of(&all[i]).is_some_and(|h| h.e == st)
+        };
+        let tier_plan = {
+            let incumbents = incumbent_ids(&self.paths.upstreams_file);
+            let items: Vec<tiers::Item> = all
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let aged = hist_of(s).map(|h| h.aged(today_n));
+                    tiers::Item {
+                        id: &s.id,
+                        kind: s.kind,
+                        tier: eff[i],
+                        op: s.op_key(),
+                        ms: s.tag.ms,
+                        always: s.pinned || s.protected.is_some() || s.never_ok,
+                        incumbent: incumbents.contains(s.id.as_str()),
+                        score: aged.as_ref().and_then(learn::Hist::score),
+                        bad: aged.as_ref().is_some_and(tiers::history_bad),
+                        manual_b: matches!(s.tag.tier, Tier::B | Tier::Unknown),
+                    }
+                })
+                .collect();
+            tiers::plan(&items, tier_mode, today_n, &cfg.select.auto_types)
+        };
+        let mut tier_counts = TierCounts {
+            promoted: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Promoted)).count(),
+            trial: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Trial)).count(),
+            demoted: if demote_fuse { 0 } else { demoted_now },
+            demote_fuse,
+            mode: tier_mode,
+            auto: cfg.tiers.is_none(),
+            a: (0..all.len())
+                .filter(|&i| tier_plan.why[i] == tiers::Why::Base && all[i].selectable() && all[i].tag.tier == Tier::A)
+                .count(),
+            incumbent: tier_plan.count(tiers::Why::Incumbent),
+            fill: tier_plan.count(tiers::Why::Fill),
+            explore: tier_plan.count(tiers::Why::Explore),
+            skipped_b: tier_plan.count(tiers::Why::Skip),
+            promoted_today: 0,
+            demoted_today: 0,
+        };
+        if tier_mode == tiers::Mode::A {
+            let mut k = 0usize;
+            all.retain(|_| {
+                k += 1;
+                tier_plan.tested(k - 1)
+            });
+            jinfo!(
+                journal,
+                "[分級] 今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）、依歷史拉上來的 B 級 {} 個（試用 {}）、沿用昨天選上或候補的 B 級 {} 個、補位 {} 個{}、探索 {} 個；B 級其餘 {} 個今天不測（不算淘汰、不記紀錄）",
+                tier_counts.a,
+                tier_counts.demoted,
+                tier_counts.promoted + tier_counts.trial,
+                tier_counts.trial,
+                tier_counts.incumbent,
+                tier_counts.fill,
+                if tier_plan.fill_reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("（原因：{}）", tier_plan.fill_reason)
+                },
+                tier_counts.explore,
+                tier_counts.skipped_b
+            );
+        }
+        drop(tier_plan);
         if !path_skipped.is_empty() {
             let parts: Vec<String> = path_skipped.iter().map(|(k, n)| format!("{} {n}", path_skip_label(k))).collect();
             jinfo!(
@@ -1194,7 +1451,25 @@ impl Benchmark {
 
         // Phase 1：逐一測網域。先收集（每個候選用自己的連線測完全部網域），再照原本的順序逐網域判斷
         let domains = self.paths.read_lists("web.txt");
-        let mut raw = self.collect(ctx, &all, &verified, &domains, &cfg).await;
+        // 惡意網站探測（3.5.0 A5）：先用少數幾台參照做自我檢查，通過的探測網域（最多 4 個）接在評測網域後面，
+        // 每個候選用同一條連線順便問（不另外連線）；判斷時評測網域照舊，探測的答案另外看
+        let mut probe = self
+            .probe_precheck(ctx, &all, &verified, &pf, &domains, &pf_domain, &cfg, &mut journal)
+            .await;
+        let mut ask = domains.clone();
+        ask.extend(probe.used.iter().cloned());
+        let mut raw = self.collect(ctx, &all, &verified, &ask, &cfg).await;
+        drop(ask);
+        if !probe.used.is_empty() {
+            // 探測的答案拿出來（只留分類），原始答案只留評測網域的
+            let mut answers: Vec<Vec<malware::Ans>> = vec![Vec::new(); all.len()];
+            for &i in &verified {
+                if raw[i].len() > domains.len() {
+                    answers[i] = raw[i].drain(domains.len()..).map(|r| probe_ans(r.as_ref())).collect();
+                }
+            }
+            self.probe_judge(&mut all, &verified, answers, &mut probe, &mut journal);
+        }
         // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
         let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
         let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
@@ -1243,8 +1518,8 @@ impl Benchmark {
                 }
             }
             // 對照組不參加多數決（它們本來就會擋）
-            let ok_n = ok.iter().filter(|(i, _, _)| all[*i].protected.is_none()).count();
-            let blocked_n = blocked.iter().filter(|(i, _)| all[*i].protected.is_none()).count();
+            let ok_n = ok.iter().filter(|(i, _, _)| !all[*i].control_like()).count();
+            let blocked_n = blocked.iter().filter(|(i, _)| !all[*i].control_like()).count();
             let answered = ok_n + blocked_n;
             // 多數 DNS 都解析不到 → 網域本身有問題（下線 / 只在特定地區），本題不計分
             if answered == 0 || (ok_n as f64 / answered as f64) < 0.3 {
@@ -1261,8 +1536,8 @@ impl Benchmark {
                         json!({ "dns": s.id, "domain": domain, "reason": reason, "pinned": s.pinned, "protected": s.protected.is_some() }),
                     );
                 }
-                if s.protected.is_some() {
-                    jinfo!(journal, "   [對照組] {} -> 判出過濾：封殺 ({reason})", s.id);
+                if s.control_like() {
+                    jinfo!(journal, "   [{}] {} -> 判出過濾：封殺 ({reason})", s.control_label(), s.id);
                 } else if !s.pinned {
                     jinfo!(journal, "   [淘汰] {} -> 封殺 ({reason})", s.id);
                 }
@@ -1271,7 +1546,7 @@ impl Benchmark {
             // 污染判斷（v16.1 邏輯）
             let all_ips: Vec<IpAddr> = ok.iter().flat_map(|(_, ips, _)| ips.iter().map(|i| IpAddr::V4(*i))).collect();
             let ip_info = cache.lookup(&*self.asn, &all_ips, false).await;
-            for (_, ips, _) in ok.iter().filter(|(i, _, _)| all[*i].protected.is_none()) {
+            for (_, ips, _) in ok.iter().filter(|(i, _, _)| !all[*i].control_like()) {
                 universe.extend(ips.iter().map(|ip| select::item(dix, u32::from(*ip))));
             }
             let infos: Vec<AsnInfo> = ok
@@ -1290,7 +1565,7 @@ impl Benchmark {
             // 其實都是同一個攔截者給的，不能讓它們變成「多數」（padavan-tw 11-19：306 台一般 DNS 全是上游黑潮在回答）
             let mut plain_seen: HashSet<Vec<Ipv4Addr>> = HashSet::new();
             for ((i, ips, _), info) in ok.iter().zip(&infos).filter(|(_, i)| !i.is_unknown()) {
-                if all[*i].protected.is_some() {
+                if all[*i].control_like() {
                     continue;
                 }
                 let mut w = rules::calculate_weight(Some(info), domain);
@@ -1370,7 +1645,7 @@ impl Benchmark {
                     .iter()
                     .filter(|(_, (c, _))| *c == SiteCheck::Unverified)
                     .map(|(k, _)| *k)
-                    .filter(|k| !is_plain(all[ok[*k].0].kind) && all[ok[*k].0].protected.is_none())
+                    .filter(|k| !is_plain(all[ok[*k].0].kind) && !all[ok[*k].0].control_like())
                     .collect();
                 let mut out = HashSet::new();
                 for &k in &unverified {
@@ -1416,8 +1691,14 @@ impl Benchmark {
                     }
                     Some((SiteCheck::Invalid, why)) => {
                         s.kill(format!("汙染 {domain} (判定為 {}，憑證不符 {why})", info.label()));
-                        if s.protected.is_some() {
-                            jinfo!(journal, "   [對照組] {} -> 判出過濾：汙染 {}（憑證不符 {why}）", s.id, info.label());
+                        if s.control_like() {
+                            jinfo!(
+                                journal,
+                                "   [{}] {} -> 判出過濾：汙染 {}（憑證不符 {why}）",
+                                s.control_label(),
+                                s.id,
+                                info.label()
+                            );
                             continue;
                         }
                         polluted += 1;
@@ -1460,10 +1741,11 @@ impl Benchmark {
                     }
                     Some((SiteCheck::Unverified, why)) => {
                         s.kill(format!("可疑 {domain} (判定為 {}，網站無法驗證 {why})", info.label()));
-                        if s.protected.is_some() {
+                        if s.control_like() {
                             jinfo!(
                                 journal,
-                                "   [對照組] {} -> 判出過濾：可疑 {}（網站無法驗證 {why}）",
+                                "   [{}] {} -> 判出過濾：可疑 {}（網站無法驗證 {why}）",
+                                s.control_label(),
                                 s.id,
                                 info.label()
                             );
@@ -1509,7 +1791,7 @@ impl Benchmark {
         let finals: Vec<usize> = verified
             .iter()
             .copied()
-            .filter(|i| all[*i].alive && all[*i].protected.is_none())
+            .filter(|i| all[*i].alive && !all[*i].control_like())
             .collect();
         if !finals.iter().any(|i| !all[*i].pinned) {
             bail!("沒有倖存的 DNS，保留昨天的結果");
@@ -1554,7 +1836,15 @@ impl Benchmark {
             .collect();
         // 跨天回歸（3.5.0 A2）：學習檔的 control 記每台最近 30 天；名單裡有、今天沒測（路徑檢查略過、不支援）的記 u
         if let Some(l) = learned.as_mut() {
-            let tested: HashMap<&str, char> = outcomes.iter().map(|(s, (r, _, _))| (s.id.as_str(), day_char(r))).collect();
+            let tested: HashMap<&str, char> = outcomes
+                .iter()
+                .map(|(s, (r, _, _))| {
+                    (
+                        s.id.as_str(),
+                        control_day_char(r, s.protected.as_deref().unwrap_or(""), probe.unusable()),
+                    )
+                })
+                .collect();
             let results: Vec<(String, char)> = protected
                 .iter()
                 .map(|(spec, _, _)| (spec.clone(), tested.get(spec.as_str()).copied().unwrap_or('u')))
@@ -1566,26 +1856,26 @@ impl Benchmark {
                 });
             learn_dirty |= l.control_record(today_n, &results);
         }
-        let hist_of = |id: &str, r: &str| -> String {
+        let hist_of = |id: &str, c: char| -> String {
             match learned
                 .as_ref()
                 .filter(|l| l.control_day == today_n)
                 .and_then(|l| l.control.get(id))
             {
                 Some(h) => h.clone(),
-                None => day_char(r).to_string(),
+                None => c.to_string(),
             }
         };
         let control: Vec<Value> = outcomes
             .iter()
             .map(|(s, (result, stage, reason))| {
                 let expect = s.protected.as_deref().unwrap_or("?");
-                let hist = hist_of(&s.id, result);
+                let hist = hist_of(&s.id, control_day_char(result, expect, probe.unusable()));
                 let recent: String = hist.chars().take(learn::CONTROL_RECENT).collect();
                 json!({
                     "id": s.id, "type": s.kind, "expect": expect, "result": result, "reason": reason,
                     "stage": stage, "preflight": s.preflight, "recent": recent,
-                    "regress": learn::control_regress(&hist), "expectMet": expect_met(expect, result, stage),
+                    "regress": learn::control_regress(&hist), "expectMet": expect_met(expect, result, stage, s.probe),
                 })
             })
             .collect();
@@ -1638,6 +1928,76 @@ impl Benchmark {
                 );
             }
         }
+        // 評測歷史（3.5.0 A4）：今天真的測到的一般候選各記一筆，再依歷史升降。走到這裡表示評測成功
+        // （沒有任何 DNS 通過資格賽、沒有倖存時前面就結束了，不會記到候選頭上）；路徑檢查略過、今天沒輪到的不在 all 裡
+        if let Some(l) = learned.as_mut().filter(|l| today_n >= l.day) {
+            // 某一種類型今天整批過不了資格賽（3 個以上、一個都沒過）：多半是這條線路擋了那種協定而路徑檢查沒抓到，不記
+            let mut kinds: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+            let general = |s: &Srv| !s.pinned && s.protected.is_none();
+            for (i, s) in all.iter().enumerate().filter(|(_, s)| general(s)) {
+                let e = kinds.entry(s.kind).or_default();
+                e.0 += 1;
+                e.1 += (pf[i] == Some(Preflight::Pass)) as usize;
+            }
+            let dead: Vec<&'static str> = kinds.iter().filter(|(_, (n, ok))| *n >= 3 && *ok == 0).map(|(k, _)| *k).collect();
+            if !dead.is_empty() {
+                jinfo!(
+                    journal,
+                    "[分級] {} 今天整批過不了資格賽：多半是線路的問題，不記進評測歷史",
+                    dead.join("、")
+                );
+            }
+            let tested: Vec<tiers::Tested> = all
+                .iter()
+                .filter(|s| general(s) && s.tag.tier != Tier::User && !dead.contains(&s.kind))
+                .map(|s| tiers::Tested {
+                    id: s.id.clone(),
+                    manual: s.tag.tier,
+                    // 惡意網站探測判出有擋的：今天不選，算沒倖存
+                    survived: s.alive && !s.malware_filter,
+                    suspect: !s.alive && ["汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p)),
+                    ms: (s.alive && !s.malware_filter && s.lat_count > 0).then(|| s.avg() as f32),
+                    trial_ok: !s.never_ok && cfg.select.auto_types.iter().any(|t| t == s.kind),
+                })
+                .collect();
+            let listed: HashSet<&str> = ids.iter().map(|c| c.id.as_str()).collect();
+            let ch = tiers::update_history(&mut l.hist, &tested, today_n, |k| listed.contains(k));
+            l.hist_cap(|k| listed.contains(k));
+            learn_dirty = true;
+            tier_counts.promoted_today = ch.promoted.len();
+            tier_counts.demoted_today = ch.demoted.len();
+            if ch.any() {
+                jinfo!(
+                    journal,
+                    "[分級] 依近 30 天的評測歷史：升級 {}、降回 {}、降級 {}、恢復 {}、開始試用 {}、結束試用 {}（只影響測不測，不影響選不選）",
+                    ch.promoted.len(),
+                    ch.unpromoted.len(),
+                    ch.demoted.len(),
+                    ch.restored.len(),
+                    ch.trial_in.len(),
+                    ch.trial_out.len()
+                );
+                for (what, list) in [
+                    ("升級", &ch.promoted),
+                    ("降級", &ch.demoted),
+                    ("恢復", &ch.restored),
+                    ("降回", &ch.unpromoted),
+                ] {
+                    for id in list.iter().take(20) {
+                        let h = l.hist.get(id).copied().unwrap_or_default();
+                        jinfo!(
+                            journal,
+                            "   [{what}] {id}：近 30 天測到 {} 天、倖存 {} 天、可疑 {} 天、延遲 {} ±{} ms",
+                            h.tested(),
+                            h.survived(),
+                            h.suspect(),
+                            to_fixed(h.ms as f64, 1),
+                            to_fixed(h.dv as f64, 1)
+                        );
+                    }
+                }
+            }
+        }
         let eliminated: Vec<(String, &'static str, String)> = all
             .iter()
             .filter(|s| !s.alive && s.protected.is_none())
@@ -1649,7 +2009,7 @@ impl Benchmark {
         for s in all.iter().filter(|s| s.selectable()) {
             *by_tier.entry(s.tag.tier.name()).or_default() += 1;
         }
-        let counts = json!({ "total": all.len(), "verified": verified.len(), "survivors": finals.len(), "eliminated": eliminated.len(), "protected": control.len(), "byTier": by_tier });
+        let counts = json!({ "total": all.len(), "verified": verified.len(), "survivors": finals.len(), "eliminated": eliminated.len(), "protected": control.len(), "byTier": by_tier, "malwareFilter": probe.filtering.len() });
         drop(all);
         ctx.checkpoint().await;
 
@@ -1705,6 +2065,8 @@ impl Benchmark {
             "counts": counts,
             "blocked": blocked_report,
             "protected": control,
+            "tiers": tier_counts.to_json(),
+            "probe": probe.to_json(),
             "skippedTypes": skipped.iter().filter(|(k, _)| **k != "blacklist").map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "pathSkipped": path_skipped.iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "path": path.as_ref().map(|r| { let mut j = r.to_json(); j["policy"] = json!(policy); j }),
@@ -1839,6 +2201,192 @@ impl Benchmark {
             keep_last_report(d, keep, &journal);
         }
         Ok(state)
+    }
+
+    /// 惡意網站探測的自我檢查（3.5.0 A5）：讀 `probe.txt`，挑少數幾台參照（有擋惡意網站的對照組、不過濾的候選，
+    /// 都取不同經營者的），每台用一條連線把探測網域問一輪；兩邊結果不同的探測網域才算有效，回傳前 4 個。
+    /// 沒設定、沒有探測網域、參照不足、都失效時 `used` 是空的：後面整段不跑
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_precheck(
+        &self,
+        ctx: &JobCtx,
+        all: &[Srv],
+        verified: &[usize],
+        pf: &[Option<Preflight>],
+        web: &[String],
+        pf_domain: &str,
+        cfg: &BenchCfg,
+        journal: &mut Journal,
+    ) -> ProbeRun {
+        let mut run = ProbeRun {
+            state: "off",
+            ..Default::default()
+        };
+        if !cfg.malware_probe {
+            return run;
+        }
+        let mut exclude: HashSet<String> = web.iter().map(|d| d.trim().to_ascii_lowercase()).collect();
+        exclude.insert(pf_domain.to_ascii_lowercase());
+        let probes = malware::parse_probes(&self.paths.read_lists("probe.txt"), &exclude);
+        run.domains = probes.len();
+        if probes.is_empty() {
+            run.state = "empty";
+            return run;
+        }
+        // 參照：對照組裡預期會擋惡意網站、資格賽有回答的（不同經營者）；不過濾的用通過資格賽的一般候選（A 級優先、不同經營者）
+        let mut ops: HashSet<String> = HashSet::new();
+        let controls: Vec<usize> = (0..all.len())
+            .filter(|&i| {
+                all[i].protected.as_deref().is_some_and(malware::expects_malware)
+                    && matches!(pf[i], Some(Preflight::Pass | Preflight::Answered))
+            })
+            .filter(|&i| ops.insert(all[i].op_key()))
+            .take(malware::REF_CONTROLS)
+            .collect();
+        let mut ops: HashSet<String> = HashSet::new();
+        let mut open: Vec<usize> = verified
+            .iter()
+            .copied()
+            .filter(|&i| all[i].selectable() && !all[i].never_ok)
+            .collect();
+        open.sort_by_key(|&i| all[i].tag.tier != Tier::A);
+        let open: Vec<usize> = open
+            .into_iter()
+            .filter(|&i| ops.insert(all[i].op_key()))
+            .take(malware::REF_OPEN)
+            .collect();
+        if controls.len() < malware::MIN_CONTROL_OPS || open.len() < malware::MIN_OPEN {
+            run.state = "no-reference";
+            jinfo!(
+                journal,
+                "[惡意網站探測] 參照不足（有擋惡意網站的對照組 {} 家、不過濾的候選 {} 家；至少要 {} 與 {}）：今天整段不跑、不判斷",
+                controls.len(),
+                open.len(),
+                malware::MIN_CONTROL_OPS,
+                malware::MIN_OPEN
+            );
+            return run;
+        }
+        let refs: Vec<usize> = controls.iter().chain(&open).copied().collect();
+        let ctl_ops: Vec<String> = controls.iter().map(|&i| all[i].op_key()).collect();
+        let domains = Arc::new(probes.clone());
+        let pause = Arc::new(PauseState::default());
+        let jobs: Vec<CollectJob> = refs
+            .iter()
+            .map(|&i| CollectJob {
+                prober: self.prober.clone(),
+                up: all[i].up.fresh(),
+                domains: domains.clone(),
+                ctx: ctx.clone(),
+                timeout: cfg.timeout,
+                pace: cfg.pace,
+                stop_after: Some(cfg.max_timeouts),
+                pause: pause.clone(),
+            })
+            .collect();
+        let got = map_limit(jobs, self.effective_conc(cfg).0, |j| j.run()).await;
+        run.queries = got.iter().flatten().map(Vec::len).sum();
+        let ans = |r: usize, k: usize| probe_ans(got[r].as_ref().and_then(|v| v.get(k)).and_then(Option::as_ref));
+        for (k, d) in probes.iter().enumerate() {
+            let check = malware::self_check(
+                ctl_ops.iter().enumerate().map(|(r, o)| (o.as_str(), ans(r, k))),
+                (0..open.len()).map(|r| ans(controls.len() + r, k)),
+            );
+            match check {
+                Ok(what) if run.used.len() < malware::PROBE_USE => {
+                    jinfo!(journal, "[惡意網站探測] 自我檢查通過 {d}：{what}");
+                    run.used.push(d.clone());
+                }
+                Ok(_) => jinfo!(journal, "[惡意網站探測] {d} 有效，但已經有 {} 個，這次不用", malware::PROBE_USE),
+                Err(why) => jinfo!(journal, "[惡意網站探測] 自我檢查沒過 {d}：{why}。這個網域今天不拿來判斷"),
+            }
+        }
+        if run.used.is_empty() {
+            run.state = "invalid";
+            let line = format!(
+                "[惡意網站探測] {} 個探測網域都沒過自我檢查：今天不判斷任何候選（探測網域可能失效了，請檢查 probe.txt）",
+                probes.len()
+            );
+            warn!("{line}");
+            journal.push(line);
+        } else {
+            run.state = "ok";
+        }
+        run
+    }
+
+    /// 惡意網站探測的判斷（3.5.0 A5）：全部候選都問完之後，同樣的條件用全部的資料再驗一次，加上保險絲。
+    /// 判出的一般候選比照對照組（今天不選、不記可疑、不進黑名單）；對照組記下有沒有擋（`expectMet` 用）
+    fn probe_judge(&self, all: &mut [Srv], verified: &[usize], answers: Vec<Vec<malware::Ans>>, run: &mut ProbeRun, journal: &mut Journal) {
+        let ctl_idx: Vec<usize> = (0..all.len()).filter(|&i| all[i].protected.is_some()).collect();
+        let controls: Vec<malware::Control> = ctl_idx
+            .iter()
+            .map(|&i| malware::Control {
+                op: all[i].op_key(),
+                malware: all[i].protected.as_deref().is_some_and(malware::expects_malware),
+                ans: answers[i].clone(),
+            })
+            .collect();
+        let cand_idx: Vec<usize> = verified.iter().copied().filter(|&i| all[i].selectable()).collect();
+        let cands: Vec<Vec<malware::Ans>> = cand_idx.iter().map(|&i| answers[i].clone()).collect();
+        run.queries += answers.iter().map(Vec::len).sum::<usize>();
+        let v = malware::judge(&controls, &cands);
+        for (k, r) in v.valid.iter().enumerate() {
+            if let Err(why) = r {
+                jinfo!(
+                    journal,
+                    "[惡意網站探測] {} 全部問完之後失效：{why}。不拿來判斷",
+                    run.used.get(k).map(String::as_str).unwrap_or("?")
+                );
+            }
+        }
+        run.probed = v.probed;
+        run.valid = v.valid_count();
+        if v.fuse {
+            run.state = "fuse";
+            let line = format!(
+                "[惡意網站探測] 保險絲：有回答的 {} 個候選裡有 {} 個會被判成「有擋惡意網站」，超過一半——多半是探測網域失效，今天整段作廢、不判斷任何候選",
+                v.probed, v.would_flag
+            );
+            warn!("{line}");
+            journal.push(line);
+            return;
+        }
+        if run.valid == 0 {
+            run.state = "invalid";
+            let line = "[惡意網站探測] 全部問完之後沒有有效的探測網域：今天不判斷任何候選".to_string();
+            warn!("{line}");
+            journal.push(line);
+            return;
+        }
+        for (c, hit) in ctl_idx.iter().zip(&v.controls) {
+            all[*c].probe = *hit;
+        }
+        for &k in &v.flagged {
+            let s = &mut all[cand_idx[k]];
+            s.malware_filter = true;
+            run.filtering.push(s.id.clone());
+            jinfo!(
+                journal,
+                "   [有擋惡意網站] {}：{} 個以上的探測網域回封鎖。比照對照組：今天不選、不記可疑、不進黑名單；建議移到 protected.txt（filter=malware）",
+                s.id,
+                malware::MIN_VALID_TO_JUDGE
+            );
+        }
+        jinfo!(
+            journal,
+            "[惡意網站探測] 有效的探測網域 {} 個{}；有回答的一般候選 {} 個，判出有擋惡意網站 {} 個；對照組擋 {}／沒擋 {}",
+            run.valid,
+            if run.valid < malware::MIN_VALID_TO_JUDGE {
+                format!("（不到 {} 個，只看對照組、不判斷一般候選）", malware::MIN_VALID_TO_JUDGE)
+            } else {
+                String::new()
+            },
+            v.probed,
+            v.flagged.len(),
+            v.controls.iter().filter(|c| **c == Some(true)).count(),
+            v.controls.iter().filter(|c| **c == Some(false)).count()
+        );
     }
 
     /// Phase 1 的收集：`verified` 裡的每個候選用自己的連線依序測完 `domains`，測完就關閉連線；

@@ -261,7 +261,7 @@ async fn end_to_end_with_mock_servers() {
     assert_eq!(up["coverage"], json!(0.8571));
     assert_eq!(
         up["counts"],
-        json!({ "total": 9, "verified": 7, "survivors": 4, "eliminated": 5, "protected": 0, "byTier": { "A": 1, "B": 7 } })
+        json!({ "total": 9, "verified": 7, "survivors": 4, "eliminated": 5, "protected": 0, "byTier": { "A": 1, "B": 7 }, "malwareFilter": 0 })
     );
     // 標記跟著候選走到結果：只是輸出，選擇照舊
     assert_eq!(up["selected"][0]["tier"], "A");
@@ -675,5 +675,34 @@ fn repository_lists_have_tiers() {
         let n = |t: Tier| l.iter().filter(|(_, x)| x.tier == t).count();
         assert_eq!((n(Tier::A), n(Tier::B), n(Tier::Unknown)), (a, b, 0), "{name}");
         assert!(l.iter().filter(|(_, x)| x.tier == Tier::A).all(|(_, x)| !x.op.is_empty()), "{name}");
+    }
+}
+
+/// 附帶的惡意網站探測名單（3.5.0 A5）：每一筆都要寫出處與確認日期（探測網域一定要人工確認過）；
+/// 不跟評測網域重複、不超過上限。名單可以是空的（＝整段不跑）
+#[test]
+fn repository_probe_list_entries_are_confirmed() {
+    use kuroshio_jobs::benchmark::malware::{parse_probes, MAX_PROBES};
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/benchmark");
+    let text = std::fs::read_to_string(dir.join("probe.txt")).unwrap();
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    assert!(lines.len() <= MAX_PROBES);
+    let web: std::collections::HashSet<String> = std::fs::read_to_string(dir.join("web.txt"))
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .collect();
+    assert_eq!(
+        parse_probes(&lines, &web).len(),
+        lines.len(),
+        "每一行都要是 probe=malware 的有效網域、不跟 web.txt 重複"
+    );
+    for l in &lines {
+        assert!(l.contains(" src=") && l.contains(" checked="), "探測網域要寫出處與確認日期：{l}");
     }
 }

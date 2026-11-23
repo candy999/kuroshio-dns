@@ -516,7 +516,9 @@
     "subprocess": true,
     "keepLastReport": true,
     "coverageRegion": "near",
-    "nearMaxMs": 60
+    "nearMaxMs": 60,
+    "tiers": "auto",
+    "malwareProbe": true
   },
   "scan": {
     "samplesPerSubnet": 6,

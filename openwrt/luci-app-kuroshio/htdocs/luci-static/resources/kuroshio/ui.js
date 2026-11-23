@@ -265,6 +265,12 @@ return baseclass.extend({
 		return x && typeof x.controlSummary === 'function' ? x.controlSummary(list, function(s) { return _(s); }) : null;
 	},
 
+	/** 每日評測測了哪些（/api/benchmark 的 tiers、probe）→ 一行摘要（ui-core.js 的 benchScope）；舊版回 null */
+	benchScope: function(b) {
+		var x = core();
+		return x && typeof x.benchScope === 'function' ? x.benchScope(b, function(s) { return _(s); }) : null;
+	},
+
 	/** 上游的地區 → 「台灣」「鄰近（註冊地 GB）」「註冊地 GB」（ui-core.js 的 regionLabel）；ui-core.js 是舊的時照舊顯示國別 */
 	regionLabel: function(u) {
 		var x = core();
