@@ -2129,7 +2129,10 @@ pub async fn start(cfg: &Value) -> Result<Started> {
     crate::ipfilter::spawn_tasks(access.clone());
     // 統計歷史（公開頁 7 / 30 天）：重開機後接續
     if let Some(b) = persister.lock().unwrap().load(STATS_FILE) {
-        resolver.stats.restore(&b);
+        if !resolver.stats.restore(&b) {
+            // 檔案壞了（斷電、磁碟錯誤）：以前不寫任何紀錄，統計歷史就默默從頭開始
+            warn!("{STATS_FILE} 讀不懂（{} bytes）：統計歷史從頭開始，下次存檔會蓋掉這份", b.len());
+        }
     }
     if let Some(p) = crate::presence::Presence::from_cfg(cfg) {
         let _ = resolver.presence.set(p);

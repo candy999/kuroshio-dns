@@ -540,13 +540,20 @@ pub struct Scheduler {
 impl Scheduler {
     /// `cfg` 是完整設定（讀 `jobs.*`，並原樣交給工作）；`saved` 是上次的 `jobs.json` 內容
     pub fn new(cfg: Value, saved: Option<&[u8]>, opts: Options) -> Scheduler {
-        let state = saved
+        let parsed = saved
             .and_then(|b| serde_json::from_slice::<Value>(b.strip_prefix("\u{feff}".as_bytes()).unwrap_or(b)).ok())
             .and_then(|v| match v {
                 Value::Object(m) => Some(m),
                 _ => None,
-            })
-            .unwrap_or_default();
+            });
+        if let (Some(b), None) = (saved, &parsed) {
+            // 檔案壞了（斷電、磁碟錯誤）：以前不寫任何紀錄，每個工作都默默當成沒跑過
+            warn!(
+                "{JOBS_STATE_FILE} 讀不懂（{} bytes）：排程紀錄從頭開始，每個工作照第一次執行的規則排",
+                b.len()
+            );
+        }
+        let state = parsed.unwrap_or_default();
         Scheduler {
             inner: Arc::new(Inner {
                 opts,
