@@ -617,7 +617,7 @@
               { "value": "ab", "label": "全部都測" }
             ] },
             { "key": "benchmark.malwareProbe", "type": "bool", "label": "惡意網站探測", "help": "評測時用探測網域判出「有擋惡意網站的 DNS」，這類不選來用（不記可疑、不進黑名單）。探測網域是 probe.txt（手動指定，可以留空）加上從這台已下載的惡意類清單抽樣的。評測只做 DNS 查詢、不連線；但抽到的是還在活動的惡意網域，線路上的資安設備可能把這台記成「有裝置中毒」（每天十幾個查詢）。企業或學校網路建議關掉。" },
-            { "key": "benchmark.probeSample", "type": "bool", "label": "探測網域從已下載的清單抽樣", "help": "每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 40 個網域，先確認還解析得到（留最多 20 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）。抽到的網域不寫進 judge.log。關掉＝只用 probe.txt（A5 原本的規則）。", "dependsOn": { "key": "benchmark.malwareProbe", "values": [true] } },
+            { "key": "benchmark.probeSample", "type": "bool", "label": "探測網域從已下載的清單抽樣", "help": "每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 60 個網域，先確認還解析得到（留最多 30 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）。抽到的網域不寫進 judge.log。關掉＝只用 probe.txt（A5 原本的規則）。", "dependsOn": { "key": "benchmark.malwareProbe", "values": [true] } },
             { "key": "benchmark.minAuto", "type": "int", "label": "至少選幾台", "min": 0 },
             { "key": "benchmark.maxAvgLatencyMs", "type": "int", "label": "平均延遲上限（毫秒）", "min": 1 },
             { "key": "benchmark.keepDays", "type": "int", "label": "報表保留天數", "min": 0 }

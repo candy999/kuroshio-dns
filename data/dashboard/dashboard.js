@@ -1030,7 +1030,7 @@
           const n = r => ctl.filter(x => x.result === r).length;
           const reg = ctl.filter(x => x.regress === true).length;
           const RES = { detected: ['判出', 'ok'], passed: ['沒判出', 'warn'], untested: ['沒測到', ''] };
-          const CAT = { ads: '廣告', adult: '成人', malware: '惡意', tracking: '追蹤', telemetry: '追蹤' };
+          const CAT = { ads: '廣告', adult: '成人', malware: '惡意', tracking: '追蹤', telemetry: '追蹤', '?': '觀察中（不設期望）' };
           const d = el('details', 'table kd-mt8');
           d.appendChild(el('summary', '', `對照組 ${ctl.length} 台：判出 ${n('detected')}、沒判出 ${n('passed')}、沒測到 ${n('untested')}；回歸 ${reg}`));
           const t2 = el('table'); const w2 = el('div', 'tbl'); w2.appendChild(t2); d.appendChild(w2); box.appendChild(d);

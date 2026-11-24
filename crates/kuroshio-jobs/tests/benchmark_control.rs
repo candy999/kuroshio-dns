@@ -318,3 +318,47 @@ async fn control_regression_reported_not_enforced() {
     assert!(Learn::load(&p.learn_file.clone().unwrap()).control.is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 3.5.0 D3 第 3 輪之後：沒寫 `filter=` 的對照組是「觀察中（不設期望）」——照常測、照常記結果，
+/// 但 `expectMet` 是 null、不判回歸（同樣「以前判出、今天沒判出」的情況，有期望的會被報成回歸）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_without_expectation_is_observed_not_regressed() {
+    let root = tmp("observe");
+    let p = paths(&root);
+    normal(&root).await;
+    let blocking = Arc::new(AtomicBool::new(true));
+    let b2 = blocking.clone();
+    let watch = mock(move |d| {
+        if d == "adult.example.net" && b2.load(Ordering::Relaxed) {
+            Reply::Nx
+        } else {
+            honest(d, 60)
+        }
+    })
+    .await;
+    std::fs::write(
+        p.list_dir.join("protected.txt"),
+        format!("{watch}  # 觀察中（不設期望）：實測沒判出，待更多實測再定\n"),
+    )
+    .unwrap();
+    let clock = Arc::new(ManualClock::new(day0()));
+    for _ in 0..3 {
+        let up = run(&p, &clock).await;
+        let c = control(&up, &watch);
+        assert_eq!((c["result"].as_str(), c["expect"].as_str()), (Some("detected"), Some("?")), "{c}");
+        assert_eq!(c["expectMet"], Value::Null);
+        clock.advance(DAY_MS);
+    }
+    blocking.store(false, Ordering::Relaxed);
+    let up = run(&p, &clock).await;
+    let c = control(&up, &watch);
+    assert_eq!(c["result"], "passed");
+    assert_eq!(c["recent"], "pddd", "結果照常記");
+    assert_eq!(c["regress"], false, "不設期望的不判回歸：{c}");
+    assert_eq!(c["expectMet"], Value::Null);
+    let log = report(&p, &up, "judge.log");
+    assert!(!log.contains("以前判得出過濾，今天沒判出"), "{log}");
+    assert!(log.contains("回歸 0"), "{log}");
+    assert!(log.contains(&format!("沒判出：{watch}（觀察中，不設期望）")), "{log}");
+    let _ = std::fs::remove_dir_all(&root);
+}

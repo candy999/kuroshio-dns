@@ -954,10 +954,11 @@ impl Cdn {
     }
 
     /// WAN 變動（`/api/notify/wan-changed`）：`wanEpoch` 加 1、`reach` 標成過期、清掉 E5 的連續計數與暫緩。
-    /// 不因此補跑健檢或掃描，等下一輪定時健檢自然更新（E3）
+    /// 不因此補跑健檢或掃描，也不把定時健檢提前（它是主程式裡固定間隔的計時器，跟 WAN 無關），
+    /// 等下一輪定時健檢自然更新（E3；D3 第 3 輪 D24 撥號後 3.5 分鐘那一輪就是原本排好的）
     pub fn on_wan_changed(&self) {
         self.with_state(|st| st.line.wan_changed());
-        info!("WAN 變動：這條線到得了哪些台灣機房等下一輪健檢重新量（不另外探測）；機房切換的連續計數與暫緩清掉");
+        info!("WAN 變動：這條線到得了哪些台灣機房等下一輪定時健檢重新量（照原本的排程，不提前、不另外探測）；機房切換的連續計數與暫緩清掉");
     }
 
     /// `/api/status` 的 `cdn` 多帶的觀測欄位：`reach`、`popHealth`、`popSwitch`、`popAudit`、`slowerFuseUntil`

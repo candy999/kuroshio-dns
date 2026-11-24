@@ -316,7 +316,8 @@
 
 	/**
 	 * 每日評測測了哪些（/api/benchmark 的 tiers、probe，3.5.0）→ 一行摘要；舊版沒有 tiers 回 null。
-	 *   tiers.mode = 'a'：只測 A 級為主——tiers.onlyA 是 true＝設定 a（只用 A 級，B 級不測、不選）；
+	 *   tiers.mode = 'a'：只測 A 級為主——tiers.onlyA 是 true＝設定 a（只用 A 級，B 級不測、不選；
+	 *     tiers.promotedSkipped 是其中依歷史升上來的、今天不測的，promoted／trial 是 0。舊版這時把同一批寫在 trial，不拿來顯示）；
 	 *     不是（或舊版沒有）＝小機器的 auto（減量，A 級加少數 B 級）；'ab'：全部都測
 	 *   probe.malware.state：ok（有判斷）、invalid／fuse／no-reference（今天失效，沒拿來判斷）、
 	 *     no-source（3.5.0 F10：probe.txt 沒有、也抽不到）、off／empty（沒有跑，不顯示）
@@ -328,7 +329,9 @@
 		if (!ti || !ti.mode) return null;
 		var n = function (v) { return typeof v === 'number' ? v : 0; };
 		var out = ti.mode === 'a' && ti.onlyA
-			? format(t('評測範圍：只用 A 級（A 級 %d；B 級 %d 個不測、不選）'), [n(ti.a), n(ti.skippedB)])
+			? (n(ti.promotedSkipped)
+				? format(t('評測範圍：只用 A 級（A 級 %d；B 級 %d 個不測、不選，含依歷史升上來的 %d 個）'), [n(ti.a), n(ti.skippedB), n(ti.promotedSkipped)])
+				: format(t('評測範圍：只用 A 級（A 級 %d；B 級 %d 個不測、不選）'), [n(ti.a), n(ti.skippedB)]))
 			: ti.mode === 'a'
 			? format(t('評測範圍：只測 A 級（A 級 %d、依歷史拉上來的 B 級 %d、沿用 %d、補位 %d、探索 %d；其餘 B 級 %d 個今天不測）'),
 				[n(ti.a), n(ti.promoted) + n(ti.trial), n(ti.incumbent), n(ti.fill), n(ti.explore), n(ti.skippedB)])

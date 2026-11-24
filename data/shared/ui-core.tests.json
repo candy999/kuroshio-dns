@@ -133,6 +133,7 @@
     {"name":"全部都測、沒有探測網域","args":[{"tiers":{"mode":"ab","fill":0,"explore":0,"skippedB":0},"probe":{"malware":{"state":"empty","blockedBy":0}}}],"expect":"評測範圍：全部都測"},
     {"name":"只測 A 級","args":[{"tiers":{"mode":"a","auto":true,"a":467,"incumbent":2,"fill":3,"explore":40,"skippedB":1250,"promoted":5,"trial":8},"probe":{"malware":{"state":"off"}}}],"expect":"評測範圍：只測 A 級（A 級 467、依歷史拉上來的 B 級 13、沿用 2、補位 3、探索 40；其餘 B 級 1250 個今天不測）"},
     {"name":"只用 A 級（設定 a）","args":[{"tiers":{"mode":"a","auto":false,"onlyA":true,"a":467,"incumbent":2,"fill":3,"explore":40,"skippedB":1250,"promoted":5,"trial":8},"probe":{"malware":{"state":"off"}}}],"expect":"評測範圍：只用 A 級（A 級 467；B 級 1250 個不測、不選）"},
+    {"name":"只用 A 級：依歷史升上來的今天不測（promotedSkipped，D3 第 3 輪之後）","args":[{"tiers":{"mode":"a","auto":false,"onlyA":true,"a":465,"incumbent":0,"fill":0,"explore":0,"skippedB":1291,"promoted":0,"trial":0,"promotedSkipped":24},"probe":{"malware":{"state":"off"}}}],"expect":"評測範圍：只用 A 級（A 級 465；B 級 1291 個不測、不選，含依歷史升上來的 24 個）"},
     {"name":"惡意網站探測有判斷","args":[{"tiers":{"mode":"ab"},"probe":{"malware":{"state":"ok","blockedBy":2}}}],"expect":"評測範圍：全部都測；惡意網站探測：2 台有擋（不選）"},
     {"name":"惡意網站探測失效","args":[{"tiers":{"mode":"ab"},"probe":{"malware":{"state":"fuse","blockedBy":0}}}],"expect":"評測範圍：全部都測；惡意網站探測今天失效，沒有拿來判斷"},
     {"name":"翻譯函式","args":[{"tiers":{"mode":"ab"}},"bracket"],"expect":"[評測範圍：全部都測]"},

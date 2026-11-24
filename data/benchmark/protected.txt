@@ -8,6 +8,8 @@
 #   兩邊都沒有（no-source）、或探測當天沒過自我檢查時判不出來（expectMet 是 null，近 7 天記成沒測到）。
 #   filter=malware 的這幾台同時是探測的參照：至少 2 家不同經營者回封鎖，那個探測網域才算有效
 # 格式：一行一個上游（一般 DNS 的位址或 https://、tls://、quic://），後面 filter= 是預期會擋的類型；最多 64 台
+#   沒寫 filter= 的是「觀察中（不設期望）」：照常測、照常記結果（近 7 天），但 expectMet 是 null、
+#   不當惡意網站探測的參照、不判回歸（3.5.0 D3 第 3 輪之後：實測沒判出、又不確定它到底擋不擋的先放這一類）
 # 2026-11-22 整理：老毛子 D3 直連實測有過濾、或官方文件寫明有過濾的；官方沒寫的 Quad9 名稱保守列入
 
 https://dns.adguard-dns.com/dns-query  # filter=ads 依據：老毛子 D3 實測擋廣告 checked=2026-11-22
@@ -19,10 +21,10 @@ https://doh.safesurfer.io/dns-query  # filter=adult,malware 依據：老毛子 D
 tls://dns.quad9.net  # filter=malware 依據：Quad9 官方：9.9.9.9 擋惡意網站 checked=2026-11-22
 tls://dns9.quad9.net  # filter=malware 依據：9.9.9.9 的反解名稱 checked=2026-11-22
 tls://dns11.quad9.net  # filter=malware 依據：Quad9 官方：9.9.9.11 擋惡意網站、帶 ECS checked=2026-11-22
-tls://dns13.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+tls://dns13.quad9.net  # 觀察中（不設期望）：3.5.0 D3 實測 9 個有效探測未擋，待更多實測再定；Quad9 官方沒寫 checked=2026-11-24
 tls://alpha-dns.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
-tls://doh-mullvad.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
-tls://protective.joindns4.eu  # filter=malware 依據：DNS4EU 官方：Protective checked=2026-11-22
+tls://doh-mullvad.quad9.net  # 觀察中（不設期望）：3.5.0 D3 實測 9 個有效探測未擋，待更多實測再定；Quad9 官方沒寫 checked=2026-11-24
+tls://protective.joindns4.eu  # 觀察中（不設期望）：3.5.0 D3 實測 9 個有效探測未擋，待更多實測再定；DNS4EU 官方：Protective checked=2026-11-24
 tls://child.joindns4.eu  # filter=adult,malware 依據：DNS4EU 官方：Child checked=2026-11-22
 tls://noads.joindns4.eu  # filter=ads,malware 依據：DNS4EU 官方：No ads；老毛子 D3 實測 checked=2026-11-22
 tls://child-noads.joindns4.eu  # filter=ads,adult,malware 依據：DNS4EU 官方；老毛子 D3 實測 checked=2026-11-22
@@ -31,9 +33,9 @@ quic://family.adguard-dns.com  # filter=ads,adult 依據：老毛子 D3 實測 c
 quic://dns.quad9.net  # filter=malware 依據：Quad9 官方 checked=2026-11-22
 quic://dns9.quad9.net  # filter=malware 依據：9.9.9.9 的反解名稱 checked=2026-11-22
 quic://dns11.quad9.net  # filter=malware 依據：Quad9 官方 checked=2026-11-22
-quic://dns13.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+quic://dns13.quad9.net  # 觀察中（不設期望）：3.5.0 D3 實測 9 個有效探測未擋，待更多實測再定；Quad9 官方沒寫 checked=2026-11-24
 quic://alpha-dns.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
-quic://doh-mullvad.quad9.net  # filter=malware 依據：Quad9 官方沒寫，保守列入 checked=2026-11-22
+quic://doh-mullvad.quad9.net  # 觀察中（不設期望）：3.5.0 D3 實測 9 個有效探測未擋，待更多實測再定；Quad9 官方沒寫 checked=2026-11-24
 94.140.14.14  # filter=ads 依據：AdGuard 預設；老毛子 D3 實測 checked=2026-11-22
 2a10:50c0::ad1:ff  # filter=ads 依據：AdGuard 預設；老毛子 D3 實測 checked=2026-11-22
 1.1.1.2  # filter=malware 依據：Cloudflare security；老毛子 D3 實測 checked=2026-11-22

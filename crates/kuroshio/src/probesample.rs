@@ -14,7 +14,7 @@
 //!   （`kuroshio_jobs::benchmark::malware`）。
 //! - 抽到的網域不寫進一般日誌（只在 DEBUG）：`judge.log` 與日誌會被回報、貼出來。
 //!
-//! 在主程式啟動評測前做一次（解壓一份幾百 KB 的副本），記憶體只有水塘的 40 個字串。
+//! 在主程式啟動評測前做一次（解壓一份幾百 KB 的副本），記憶體只有水塘的 [`SAMPLE_MAX`] 個（60 個）字串。
 
 use crate::filtering::ProbeSource;
 use kuroshio_config::get;
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_capped_at_40() {
+    fn sample_capped_at_60() {
         let d = tmp("cap");
         let body: String = (0..1000).map(|i| format!("||m{i}.example.com^\n")).collect();
         let s = sample(&[src("tif", Some(copy(&d, "tif", &body)), false)], true, &none, 7);
@@ -346,12 +346,12 @@ mod tests {
         assert!(s.skipped.is_none());
         let uniq: HashSet<&String> = s.names.iter().collect();
         assert_eq!(uniq.len(), SAMPLE_MAX, "不重複");
-        // 水塘抽樣：不是只拿前 40 行
+        // 水塘抽樣：不是只拿前 60 行
         assert!(s
             .names
             .iter()
-            .any(|n| n.trim_start_matches('m').split('.').next().unwrap().parse::<u32>().unwrap() >= 40));
-        // 兩份清單合起來還是 40 個；同一個網域只出現一次
+            .any(|n| n.trim_start_matches('m').split('.').next().unwrap().parse::<u32>().unwrap() >= SAMPLE_MAX as u32));
+        // 兩份清單合起來還是 60 個；同一個網域只出現一次
         let s2 = sample(
             &[
                 src("a", Some(copy(&d, "a", &body)), false),
@@ -362,7 +362,7 @@ mod tests {
             9,
         );
         assert_eq!((s2.names.len(), s2.lists), (SAMPLE_MAX, 2));
-        // 少於 40 個：全部收
+        // 少於 60 個：全部收
         let s3 = sample(
             &[src(
                 "few",

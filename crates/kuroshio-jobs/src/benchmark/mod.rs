@@ -856,6 +856,12 @@ fn expect_met(expect: &str, result: &str, stage: &str, probe: Option<bool>) -> O
     checked.then_some(met)
 }
 
+/// 對照組有沒有設期望（`filter=`）。沒寫的（`expect` 是 `?`）是「觀察中」：照常測、照常記結果，
+/// 但 `expectMet` 是 null、不當惡意網站探測的參照、不判回歸（個別與整體都不算；3.5.0 D3 第 3 輪之後）
+fn has_expect(expect: &str) -> bool {
+    !expect.is_empty() && expect != "?"
+}
+
 /// 對照組一天的結果字元（學習檔的 `control`）。惡意網站探測今天有設定卻判不出來（失效、保險絲、參照不足）時，
 /// 預期會擋惡意網站、其他都沒判出的對照組記成「沒測到」：不然探測失效一天就會被報成回歸
 fn control_day_char(result: &str, expect: &str, probe_unusable: bool) -> char {
@@ -961,9 +967,12 @@ struct TierCounts {
     fill: usize,
     explore: usize,
     skipped_b: usize,
-    /// 依歷史拉上來每天測的 B 級（A4）：升級的、試用中的
+    /// 依歷史拉上來每天測的 B 級（A4）：升級的、試用中的。只用 A 級（設定 `a`）時它們今天不測，這兩個是 0，
+    /// 改記在 `promoted_skipped`（D3 第 3 輪之後：以前照樣寫 `trial 24`，看起來像「今天試了 24 個」）
     promoted: usize,
     trial: usize,
+    /// 只用 A 級時今天不測的「依歷史升上來的 B 級」（升級的、試用中的）；其他模式是 0
+    promoted_skipped: usize,
     /// 依歷史降級的 A 級（`a` 模式今天不測）
     demoted: usize,
     /// 降級太多、今天不採用降級
@@ -978,7 +987,8 @@ impl TierCounts {
         json!({
             "mode": self.mode.name(), "auto": self.auto, "onlyA": self.only_a, "a": self.a, "incumbent": self.incumbent,
             "fill": self.fill, "explore": self.explore, "skippedB": self.skipped_b,
-            "promoted": self.promoted, "trial": self.trial, "demoted": self.demoted, "demoteFuse": self.demote_fuse,
+            "promoted": self.promoted, "trial": self.trial, "promotedSkipped": self.promoted_skipped,
+            "demoted": self.demoted, "demoteFuse": self.demote_fuse,
             "promotedToday": self.promoted_today, "demotedToday": self.demoted_today,
         })
     }
@@ -1398,9 +1408,18 @@ impl Benchmark {
         } else {
             (0, 0)
         };
+        // 只用 A 級：依歷史拉上來的 B 級今天一個都不測，`promoted`／`trial` 寫 0、另外記 `promotedSkipped`
+        let tested_pulled = |st: learn::HistState| {
+            if tier_mode.only_a() {
+                0
+            } else {
+                (0..all.len()).filter(|&i| pulled(i, st)).count()
+            }
+        };
         let mut tier_counts = TierCounts {
-            promoted: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Promoted)).count(),
-            trial: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Trial)).count(),
+            promoted: tested_pulled(learn::HistState::Promoted),
+            trial: tested_pulled(learn::HistState::Trial),
+            promoted_skipped: dropped_pulled,
             demoted: if demote_fuse { 0 } else { demoted_now },
             demote_fuse,
             mode: tier_mode,
@@ -1980,7 +1999,8 @@ impl Benchmark {
                 json!({
                     "id": s.id, "type": s.kind, "expect": expect, "result": result, "reason": reason,
                     "stage": stage, "preflight": s.preflight, "recent": recent,
-                    "regress": learn::control_regress(&hist), "expectMet": expect_met(expect, result, stage, s.probe),
+                    "regress": has_expect(expect) && learn::control_regress(&hist),
+                    "expectMet": expect_met(expect, result, stage, s.probe),
                 })
             })
             .collect();
@@ -2011,11 +2031,15 @@ impl Benchmark {
                 warn!("{line}");
                 journal.push(line);
             }
-            if let Some((t, m)) = learned
-                .as_ref()
-                .filter(|l| l.control_day == today_n)
-                .and_then(|l| learn::control_overall_drop(l.control.values().map(String::as_str)))
-            {
+            if let Some((t, m)) = learned.as_ref().filter(|l| l.control_day == today_n).and_then(|l| {
+                // 不設期望（觀察中）的不算：它們本來就可能今天判出、明天沒判出
+                learn::control_overall_drop(
+                    l.control
+                        .iter()
+                        .filter(|(id, _)| protected.iter().any(|(spec, e, _)| spec == *id && has_expect(e)))
+                        .map(|(_, h)| h.as_str()),
+                )
+            }) {
                 let line = format!(
                     "[對照組] 今天判出過濾的比例 {}% 比過去 7 天的中位數 {}% 少一半以上：評測網域檔或判斷規則可能改壞了",
                     to_fixed(t * 100.0, 0),
@@ -2025,11 +2049,16 @@ impl Benchmark {
                 journal.push(line);
             }
             for c in control.iter().filter(|c| c["result"] == "passed") {
+                let expect = c["expect"].as_str().unwrap_or("");
                 jinfo!(
                     journal,
-                    "   沒判出：{}（預期會擋 {}）",
+                    "   沒判出：{}（{}）",
                     c["id"].as_str().unwrap_or(""),
-                    c["expect"].as_str().unwrap_or("")
+                    if has_expect(expect) {
+                        format!("預期會擋 {expect}")
+                    } else {
+                        "觀察中，不設期望".to_string()
+                    }
                 );
             }
         }
@@ -2480,8 +2509,10 @@ impl Benchmark {
         run.queries = got.iter().flatten().map(Vec::len).sum();
         let ans = |r: usize, k: usize| probe_ans(got[r].as_ref().and_then(|v| v.get(k)).and_then(Option::as_ref));
         let (mut passed, mut extra) = (0usize, 0usize);
+        // 沒過的原因各幾個（對照組沒擋、不過濾的回答太少、不過濾的也解析不到）：只寫數量，不寫抽到的網域
+        let mut fails = [0usize; 3];
         for (k, d) in probes.iter().enumerate() {
-            let check = malware::self_check(
+            let check = malware::self_check_kind(
                 ctl_ops.iter().enumerate().map(|(r, o)| (o.as_str(), ans(r, k))),
                 (0..open.len()).map(|r| ans(controls.len() + r, k)),
             );
@@ -2508,7 +2539,12 @@ impl Benchmark {
                     extra += 1;
                     debug!("[惡意網站探測] {d} 有效，但已經有 {} 個，這次不用", rule.use_n());
                 }
-                Err(why) => {
+                Err((kind, why)) => {
+                    fails[match kind {
+                        malware::Fail::Controls => 0,
+                        malware::Fail::FewOpen => 1,
+                        malware::Fail::OpenDead => 2,
+                    }] += 1;
                     if is_manual {
                         jinfo!(journal, "[惡意網站探測] 自我檢查沒過 {label}：{why}。這個網域今天不拿來判斷");
                     } else {
@@ -2517,9 +2553,18 @@ impl Benchmark {
                 }
             }
         }
+        let failed: Vec<String> = [
+            (format!("有擋惡意網站的對照組不到 {} 家擋", malware::MIN_CONTROL_OPS), fails[0]),
+            ("不過濾的有回答的太少".to_string(), fails[1]),
+            ("不過濾的也解析不到".to_string(), fails[2]),
+        ]
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(t, n)| format!("{t} {n}"))
+        .collect();
         jinfo!(
             journal,
-            "[惡意網站探測] 自我檢查：{} 個（probe.txt {manual_n}、抽樣 {}）裡 {passed} 個通過{}，這次用 {} 個（最多 {}）",
+            "[惡意網站探測] 自我檢查：{} 個（probe.txt {manual_n}、抽樣 {}）裡 {passed} 個通過{}，這次用 {} 個（最多 {}）{}",
             probes.len(),
             probes.len() - manual_n,
             if extra > 0 {
@@ -2528,7 +2573,12 @@ impl Benchmark {
                 String::new()
             },
             run.used.len(),
-            rule.use_n()
+            rule.use_n(),
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!("；沒過的：{}", failed.join("、"))
+            }
         );
         if run.used.is_empty() {
             run.state = "invalid";

@@ -1883,6 +1883,8 @@ impl FilterService {
         });
         let me = self.clone();
         tokio::spawn(async move {
+            // 「立即更新」（管理介面、API）結束的通知：先訂閱，開機補缺期間結束的那一次也看得到
+            let mut done = me.update_done.subscribe();
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut tries = me.boot(&BootHooks::real()).await;
             // 有清單下載失敗（或還有沒載入的）時短間隔重試：1、2、5 分鐘，之後每 30 分鐘；全部成功就回到正常間隔
@@ -1899,8 +1901,7 @@ impl FilterService {
                     Duration::ZERO
                 } else {
                     let r = me.update_lists(false).await;
-                    let partial = me.status.lock().unwrap()["errors"].as_array().is_some_and(|a| !a.is_empty())
-                        || !me.missing.lock().unwrap().is_empty();
+                    let partial = me.failing();
                     match r {
                         Ok(_) if !partial => {
                             tries = 0;
@@ -1917,9 +1918,82 @@ impl FilterService {
                         }
                     }
                 };
-                tokio::time::sleep(wait).await;
+                // 等下一次的時候，「立即更新」結束了：失敗就接著照退避重試（3.5.0 D3 第 3 輪 D22：以前手動的那一次
+                // 失敗不影響這裡，網路恢復後要等到下一次定時更新——每天一次的話是隔天——失敗才會消失）
+                let failing = || me.failing() || me.update_status().error.is_some();
+                tries = wait_next(&mut done, wait, tries, me.interval, failing, &RETRY_STEPS).await;
             }
         });
+    }
+
+    /// 有清單更新失敗、或還有沒載入的（定時更新的重試與資料新鮮度的「失敗中」看同一份狀態）
+    fn failing(&self) -> bool {
+        self.status.lock().unwrap()["errors"].as_array().is_some_and(|a| !a.is_empty()) || !self.missing.lock().unwrap().is_empty()
+    }
+}
+
+/// 定時更新在等下一次的時候，別的更新（管理介面、API 的「立即更新」）結束了（3.5.0 D3 第 3 輪 D22）：
+/// 回傳（從現在起還要等多久, 重試次數）。`remaining` 是原本還要等多久。
+///
+/// - 那一次有清單失敗：照同一份退避（[`RETRY_BACKOFF`]：1、2、5 分鐘，之後每 30 分鐘）排重試，比原本排的早才提前；
+///   重試次數接著算——手動一直按、一直失敗也不會越排越密，最密就是退避本身。
+/// - 那一次全部成功、迴圈原本在退避中：回到正常間隔（剛剛已經全部檢查過，不再重複問一次）。
+/// - 其他（全部成功、原本就是正常間隔）：不變。
+fn after_other_update(failing: bool, tries: usize, remaining: Duration, interval: Duration, steps: &[Duration]) -> (Duration, usize) {
+    if failing {
+        let w = steps.get(tries.min(steps.len().saturating_sub(1))).copied().unwrap_or(remaining);
+        return if w < remaining { (w, tries + 1) } else { (remaining, tries) };
+    }
+    if tries > 0 {
+        return (interval, 0);
+    }
+    (remaining, tries)
+}
+
+/// [`RETRY_BACKOFF`] 換成 `Duration`
+const RETRY_STEPS: [Duration; 4] = [
+    Duration::from_secs(RETRY_BACKOFF[0]),
+    Duration::from_secs(RETRY_BACKOFF[1]),
+    Duration::from_secs(RETRY_BACKOFF[2]),
+    Duration::from_secs(RETRY_BACKOFF[3]),
+];
+
+/// 定時更新等 `wait` 之後再跑下一次；等的時候「立即更新」結束了就照 [`after_other_update`] 調整（3.5.0 D22）。
+/// 回傳之後的重試次數。`failing` 是那一次結束之後有沒有清單失敗；`steps` 是退避（正式執行是 [`RETRY_STEPS`]）。
+/// 通知的那一端不在了（服務結束）就照原本的時間等完
+async fn wait_next(
+    done: &mut tokio::sync::watch::Receiver<u64>,
+    wait: Duration,
+    mut tries: usize,
+    interval: Duration,
+    failing: impl Fn() -> bool,
+    steps: &[Duration],
+) -> usize {
+    let mut deadline = tokio::time::Instant::now() + wait;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return tries,
+            r = done.changed() => {
+                if r.is_err() {
+                    tokio::time::sleep_until(deadline).await;
+                    return tries;
+                }
+                let now = tokio::time::Instant::now();
+                let remaining = deadline.saturating_duration_since(now);
+                let failed = failing();
+                let (w, t) = after_other_update(failed, tries, remaining, interval, steps);
+                if failed && w < remaining {
+                    info!(
+                        "過濾清單：立即更新有清單失敗，{} 秒後自動重試（之後照 1、2、5、30 分鐘的間隔，成功就回到正常間隔）",
+                        w.as_secs()
+                    );
+                } else if !failed && tries > 0 {
+                    info!("過濾清單：立即更新全部成功，不再重試，回到正常的更新間隔");
+                }
+                tries = t;
+                deadline = now + w;
+            }
+        }
     }
 }
 
@@ -2182,6 +2256,47 @@ mod copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_failure_joins_retry_backoff() {
+        let (min, day) = (Duration::from_secs(60), Duration::from_secs(86_400));
+        // 原本要等到明天，立即更新失敗：1 分鐘後重試，重試次數接著算
+        assert_eq!(after_other_update(true, 0, day, day, &RETRY_STEPS), (min, 1));
+        // 已經在退避中（下一次 30 秒後）：不提前、不加次數——手動一直失敗也不會越排越密
+        assert_eq!(after_other_update(true, 1, min / 2, day, &RETRY_STEPS), (min / 2, 1));
+        // 退避到底是每 30 分鐘
+        assert_eq!(after_other_update(true, 9, day, day, &RETRY_STEPS), (Duration::from_secs(1800), 10));
+        // 立即更新全部成功：退避中就回到正常間隔；本來就正常的不變（不因為手動更新多跑或少跑）
+        assert_eq!(after_other_update(false, 3, min, day, &RETRY_STEPS), (day, 0));
+        assert_eq!(after_other_update(false, 0, min, day, &RETRY_STEPS), (min, 0));
+    }
+
+    #[tokio::test]
+    async fn wait_next_retries_soon_after_manual_failure() {
+        let steps = [Duration::from_millis(30), Duration::from_millis(60)];
+        let (tx, mut rx) = tokio::sync::watch::channel(0u64);
+        // 原本要等 60 秒；20 毫秒後一次立即更新失敗 → 照退避 30 毫秒後就回來（重試次數 1）
+        let t0 = std::time::Instant::now();
+        let h = tokio::spawn(async move {
+            let n = wait_next(&mut rx, Duration::from_secs(60), 0, Duration::from_secs(60), || true, &steps).await;
+            (n, rx)
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send_replace(1);
+        let (n, mut rx) = tokio::time::timeout(Duration::from_secs(5), h).await.unwrap().unwrap();
+        assert_eq!(n, 1);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        // 退避中（tries 2），立即更新成功：回到正常間隔（這裡 40 毫秒），次數歸零
+        let h =
+            tokio::spawn(async move { wait_next(&mut rx, Duration::from_secs(60), 2, Duration::from_millis(40), || false, &steps).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send_replace(2);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), h).await.unwrap().unwrap(), 0);
+        // 沒有立即更新：照原本的時間等完，次數不變
+        let (_tx2, mut rx2) = tokio::sync::watch::channel(0u64);
+        let n = wait_next(&mut rx2, Duration::from_millis(10), 3, Duration::from_secs(60), || true, &steps).await;
+        assert_eq!(n, 3);
+    }
 
     fn src(name: &str, cat: Category, protect: bool) -> ListSource {
         ListSource {

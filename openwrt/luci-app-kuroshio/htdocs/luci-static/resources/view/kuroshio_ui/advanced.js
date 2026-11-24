@@ -302,7 +302,7 @@ return view.extend({
 		o.rmempty = false;
 		// 探測網域從已下載的清單抽樣（3.5.0 F10）
 		o = common.flag(s, null, 'probe_sample', _('探測網域從已下載的清單抽樣'), 'benchmark.probeSample',
-			_('每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 40 個網域，先確認還解析得到（留最多 20 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。TW165、TWNIC-RPZ、新註冊網域不抽。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）。關掉＝只用 probe.txt。'));
+			_('每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 60 個網域，先確認還解析得到（留最多 30 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。TW165、TWNIC-RPZ、新註冊網域不抽。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）。關掉＝只用 probe.txt。'));
 		o.depends('malware_probe', '1');
 		num('near_max_ms', _('鄰近的延遲上限（毫秒）'), 'benchmark.nearMaxMs', _('最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。'));
 		num('min_auto', _('至少選幾台'), 'benchmark.minAuto');

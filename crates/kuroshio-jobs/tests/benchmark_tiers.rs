@@ -307,7 +307,11 @@ async fn tier_a_uses_only_a_even_when_b_was_selected_yesterday() {
         "{t}"
     );
     assert_eq!(t["skippedB"], 50, "{t}");
-    assert!(l.b.iter().all(|m| m.hits.load(Ordering::Relaxed) == 0), "B 級不測");
+    // 依歷史拉上來的（試用中的）今天不測：promoted／trial 是 0，另外記在 promotedSkipped（D3 第 3 輪之後：
+    // 以前寫 trial，看起來像「今天試了幾個」）
+    assert_eq!((t["promoted"].as_u64(), t["trial"].as_u64()), (Some(0), Some(0)), "{t}");
+    let pulled = t["promotedSkipped"].as_u64().unwrap();
+    assert!(pulled >= 1, "{t}");
     assert!(l.a.iter().chain([&l.user]).all(|m| m.hits.load(Ordering::Relaxed) >= 3));
     assert_eq!(up["counts"]["total"], 4, "{up:#}");
     assert_eq!(up["counts"]["byTier"], json!({ "A": 3, "user": 1 }), "{up:#}");
@@ -321,6 +325,10 @@ async fn tier_a_uses_only_a_even_when_b_was_selected_yesterday() {
     let log = report(&p, &up, "judge.log");
     assert!(log.contains("[分級] 只用 A 級（benchmark.tiers = a）：今天測 A 級 3 個"), "{log}");
     assert!(log.contains("B 級 50 個不測、不選（含昨天選上或候補的 1 個"), "{log}");
+    assert!(
+        log.contains(&format!("依歷史升上來的 {pulled} 個）")),
+        "跟 promotedSkipped 同一批：{log}"
+    );
     assert!(log.contains("只用 A 級時不從 B 級補"), "多樣性不夠照樣寫明：{log}");
     // 同一天再跑也一樣（不會因為多跑幾次就輪到 B 級）
     l.reset();
