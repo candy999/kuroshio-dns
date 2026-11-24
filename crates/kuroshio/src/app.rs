@@ -1844,6 +1844,8 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
         let mut gate = crate::memgov::FutileGate::default();
         // 「缺口是其他程式造成」那一行同一段於事無補只寫一次（3.5.0 J3）
         let mut note = crate::memgov::FutileNote::default();
+        // 於事無補期間讀數跳回保留量以上（還沒離開）：「回到保留量以上」同一段也只寫一次（Windows 實測：5 次跳動寫 5 行）
+        let mut note_up = crate::memgov::FutileNote::default();
         // 3.5.0 F12：每 10 秒量一次黑潮自己用掉的 CPU（佔整台機器），交給 CDN 驗證的節流依 CPU 調整速率
         let mut cpu = sysinfo::CpuMeter::new(kuroshio_config::Host::detect().cores);
         loop {
@@ -1861,6 +1863,7 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
             };
             crate::memgov::set_futile(futile);
             note.observe(futile);
+            note_up.observe(futile);
             let p = crate::memgov::signal_pressure(pressure_of(&r, &reserve), futile);
             PRESSURE.store(p as u8, Ordering::Relaxed);
             // 好友資料（社群共享）：解壓後不超過保留量以上可用空間的 1/4（至少 1 MB）
@@ -1879,6 +1882,11 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                 match p {
                     // 這是「當下」的量測；記憶體控制的狀態（`memory.state`）要穩定一段時間才放鬆（遲滯，預設 3 分鐘），
                     // 兩者會差幾分鐘（3.4.3：日誌寫「恢復正常」、狀態頁卻還是吃緊，看起來像錯誤）
+                    Pressure::Normal if futile => {
+                        if note_up.take() {
+                            info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆（缺口是其他程式造成的這一段，讀數再跳動不另外記）")
+                        }
+                    }
                     Pressure::Normal => info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆"),
                     Pressure::Low if futile => {
                         if note.take() {
