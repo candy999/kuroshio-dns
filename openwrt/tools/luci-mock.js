@@ -87,10 +87,10 @@ const DDNS = () => (uci.kuroshio.ddns.enabled === '1' ? { enabled: true, lastRun
 const STATUS = {
     version: '3.5.0', stats: { uptimeSec: 3700, today: { date: '2026-11-11', query: 1234, hit: 900, hitRate: 72.9, blocked: 50, blockedAds: 40, blockedTelemetry: 8, blockedMalware: 2, route: {}, latency: { hit: { p50: 1, p95: 2 }, miss: { p50: 20, p95: 80 } } } },
     cacheEntries: 800, cacheBytes: 300000, errors: { count: 0, recent: [] }, ownIp: null,
-    upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ok: 100, fail: 1, avgMs: 12, servfail: 2, late: 5, unanswered: 1 },
+    upstreams: [{ id: 'udp://192.0.2.53', role: 'pinned', ok: 100, fail: 1, avgMs: 12, servfail: 2, late: 5, unanswered: 1 },
       { id: 'https://doh.example/dns-query', role: 'auto', reason: '最快', ok: 50, fail: 0, avgMs: 20 },
       { id: 'quic://doq.example:853', role: 'auto', reason: '覆蓋', region: 'JP', ok: 0, fail: 0, avgMs: null, pathBlocked: true },
-      { id: 'udp://8.8.4.4:53', role: 'fallback', ok: 0, fail: 0, avgMs: null, via: 'interceptor' }], autoUpstreams: null,
+      { id: 'udp://192.0.2.54:53', role: 'fallback', ok: 0, fail: 0, avgMs: null, via: 'interceptor' }], autoUpstreams: null,
     network: { path: { enabled: true, policy: 'skip-plain', checkedAt: 1795000000000, summary: 'IPv6 不可用，一般 DNS 被路由器 192.0.2.1 上的黑潮（3.3.6）接走',
       warnings: ['一般 DNS 被路由器 192.0.2.1 上的黑潮（3.3.6）接走：評測不測一般 DNS，一般 DNS 只當最後備援'] } },
     filter: { lists: 100000, custom: 3, domains: 90000, memoryBytes: 4000000, notice: '記憶體不足，暫時停用：大廣告 清單（3000 條規則）', unloaded: [{ name: '大廣告', rules: 3000, bytes: 27000, reason: 'memory', at: 1793000000000 }] }, cdn: { stats: {}, domains: 10 },
@@ -123,7 +123,7 @@ const ACCESS = query => {
         enabled: mode !== 'open' && (mode === 'taiwan' || sel.includes('*') || sel.includes(g.id)), checked: sel.includes('*') || sel.includes(g.id) }));
     return { mode, applyTo, active: true, dataOk: true, failOpen: false, failClosed: false, warning: null, generatedAt: TWIP.generatedAt, ranges: 1003, memoryBytes: 16048, dataBytes: 21312,
         denied: { total: 57, byListener: { dot: 40, doh: 17, doq: 0, doh3: 0, site: 0, community: 0, plain: 0 } },
-        topDenied: [{ net: '45.135.232.0/24', count: 31 }, { net: '2a06:4880:1000::/48', count: 26 }],
+        topDenied: [{ net: '192.0.2.128/25', count: 31 }, { net: '2001:db8:8800::/48', count: 26 }],
         groups, selected: sel, allow: list(a.allow), deny: list(a.deny), log: a.log !== '0', localUpdate: a.local_update !== '0', dataSource: '/usr/share/kuroshio/geo/tw-ip.json', total: TWIP.total };
 };
 // 3.5.0 E 組：資料新鮮度、發現、過期快取比率、這條線到得了哪些台灣機房（甲批的欄位照規格 11 的格式）
@@ -288,11 +288,11 @@ function HISTORY(now) {
 const POOLS = {
     // 3.5.0 F15、F16：speedRefWhy（算得出來時是 null）、quickRef（快測的參考）、節點的 speedAge（沿用前幾輪）與 sample.headSecs
     cloudflare: { ranges: { v4: 14, v6: 7 }, scan: { tw: 78, global: 56, dead: 89 }, speedRef: 55.3, speedRefWhy: null, quickRef: 35.2,
-        v4: [{ ip: '104.18.22.203', pop: 'TPE', ms: 2.68, speed: 55.3, sample: { bytes: 8388608, secs: 0.152, headSecs: 0.028, connectMs: 4, ttfbMs: 9 } }, { ip: '104.18.143.105', pop: 'TPE', ms: 2.95, speed: 56.8, speedAge: 1 }, { ip: '172.67.70.39', pop: 'KHH', ms: 3.29, speed: null, bad: '速度太慢' }],
-        v6: [{ ip: '2606:4700:4408::9bd1', pop: 'TPE', ms: 3.36, permanent: true }] },
-    fastly: { ranges: { v4: 17, v6: 3 }, scan: { tw: 0, global: 87, dead: 0 }, speedRefWhy: '被限流（HTTP 429）', v4: [{ ip: '151.101.203.124', pop: 'IAD', ms: 0.08, speed: null }], v6: [] }
+        v4: [{ ip: '198.51.100.203', pop: 'TPE', ms: 2.68, speed: 55.3, sample: { bytes: 8388608, secs: 0.152, headSecs: 0.028, connectMs: 4, ttfbMs: 9 } }, { ip: '198.51.100.105', pop: 'TPE', ms: 2.95, speed: 56.8, speedAge: 1 }, { ip: '198.51.100.39', pop: 'KHH', ms: 3.29, speed: null, bad: '速度太慢' }],
+        v6: [{ ip: '2001:db8:4408::9bd1', pop: 'TPE', ms: 3.36, permanent: true }] },
+    fastly: { ranges: { v4: 17, v6: 3 }, scan: { tw: 0, global: 87, dead: 0 }, speedRefWhy: '被限流（HTTP 429）', v4: [{ ip: '203.0.113.124', pop: 'IAD', ms: 0.08, speed: null }], v6: [] }
 };
-const V6NODES = { providers: { cloudflare: { '2606:4700:4408::9bd1': { ms: 3.36, pop: 'TPE', fails: 0 } } } };
+const V6NODES = { providers: { cloudflare: { '2001:db8:4408::9bd1': { ms: 3.36, pop: 'TPE', fails: 0 } } } };
 const DOMAINS = Array.from({ length: 12 }, (_, i) => ({ name: `www${i}.example.com`, provider: i % 3 ? 'cloudflare' : 'fastly', via: i % 2 ? 'cname' : 'ip', hits: 5000 - i * 300,
     firstSeen: Date.now() - 86400e3 * 9, lastSeen: Date.now() - 60e3 * (i + 1),
     base: { pop: i % 3 ? 'HKG' : 'NRT', ms: 38 + i }, v4: i % 4 === 3 ? { verdict: 'fail', reason: '憑證不符' } : { verdict: 'ok', pop: 'TPE', ms: 3.1 + i / 10 },
@@ -303,7 +303,7 @@ const DOMAINS_API = query => {
 };
 const BENCH = { generatedAt: Date.now() - 3 * 3600e3, counts: { total: 120, survivors: 40, eliminated: 80 }, coverage: 0.93,
     selected: [{ id: 'https://dns.example.org/dns-query', avgMs: 14.2, newItems: 12, reason: '涵蓋率最高', owner: 'Example_Org' }],
-    pinned: [{ id: 'udp://1.1.1.1', avgMs: 12.4, coverageItems: 3, issues: [] }], blocked: [],
+    pinned: [{ id: 'udp://192.0.2.53', avgMs: 12.4, coverageItems: 3, issues: [] }], blocked: [],
     // 3.5.0 A3、A5、F10：評測範圍與惡意網站探測（探測網域的來源）
     tiers: { mode: 'ab' }, probe: { malware: { state: 'ok', domains: 17, used: 12, valid: 12, blockedBy: 2, probed: 40, queries: 900, rule: 'ratio',
         source: { manual: 0, sampled: 40, alive: 17, lists: 1 }, filtering: [] } } };
@@ -364,7 +364,7 @@ const SCENES = {
         upstreams: [{ id: 'udp://192.168.1.1:53', type: 'udp', role: 'chain', ok: 18342, fail: 3, avgMs: 2.1, reason: null, region: null, pathBlocked: false, via: null },
             { id: 'https://dns.example.net/dns-query', role: 'auto', reason: '最快', region: 'TW', ok: 0, fail: 0, avgMs: null },
             { id: 'tls://dot.example.org', role: 'auto', reason: '覆蓋', region: 'JP', ok: 0, fail: 0, avgMs: null },
-            { id: 'https://1.1.1.1/dns-query', role: 'fallback', ok: 0, fail: 0, avgMs: null }],
+            { id: 'https://192.0.2.53/dns-query', role: 'fallback', ok: 0, fail: 0, avgMs: null }],
         jobs: { config: { 'dns-benchmark': { at: ['04:10'] }, 'cdn-pool': { at: ['05:20'] }, 'filter-update': { at: ['03:30'], weekdays: [1, 4] } },
             state: { 'dns-benchmark': { lastCode: 0, lastEnd: Date.now() - 9 * 3600e3 }, 'cdn-pool': { lastCode: 0, lastEnd: Date.now() - 8 * 3600e3 }, 'filter-update': { lastCode: 0, lastEnd: Date.now() - 2 * 86400e3 } },
             detail: { 'dns-benchmark': { text: '由上游黑潮提供，略過' }, 'cdn-pool': { text: '由上游黑潮提供，略過' } }, running: null } }),
@@ -373,7 +373,7 @@ const SCENES = {
         upstreams: [{ id: 'https://dns.example.net/dns-query', role: 'auto', reason: '最快', region: 'TW', ok: 9120, fail: 4, avgMs: 11.8 },
             { id: 'h3://doh3.example.org/dns-query', role: 'auto', reason: '覆蓋', region: 'JP', ok: 3310, fail: 2, avgMs: 38.5 },
             { id: 'tls://dot.example.com', role: 'auto', reason: '覆蓋', region: 'HK', ok: 0, fail: 0, avgMs: null, pathBlocked: true },
-            { id: 'udp://8.8.8.8:53', role: 'fallback', ok: 0, fail: 0, avgMs: null, via: 'interceptor' }],
+            { id: 'udp://192.0.2.55:53', role: 'fallback', ok: 0, fail: 0, avgMs: null, via: 'interceptor' }],
         jobs: { config: { 'dns-benchmark': { at: ['04:10'] }, 'filter-update': { at: ['03:30'], weekdays: [1, 4] } },
             state: { 'dns-benchmark': { lastCode: 0, lastEnd: Date.now() - 9 * 3600e3 }, 'filter-update': { lastCode: 0, lastEnd: Date.now() - 2 * 86400e3 } }, running: null } })
 };
@@ -397,7 +397,7 @@ if (process.env.MOCK_SCENE) setScene(process.env.MOCK_SCENE);
 const API = { '/api/access': ACCESS, '/api/community/status': COMMUNITY_STATUS, '/api/community/peers': () => community.peers, '/api/community/events': COMMUNITY_EVENTS, '/api/community/invite': INVITE, '/api/status': () => STATUS, '/api/interfaces': () => IFACES, '/api/paths': () => PATHS, '/api/ddns': DDNS,
     '/api/dashboard': DASH, '/api/benchmark': () => BENCH, '/api/cdn/pools': () => POOLS, '/api/cdn/v6nodes': () => V6NODES, '/api/cdn/domains': DOMAINS_API,
     '/api/filter/check': query => (/ads\./.test(new URLSearchParams(query || '').get('name') || '') ? { action: 'block', rule: '||ads.example.com^', cat: 'ads', tier: 'list' } : { action: 'none' }),
-    '/api/trace': () => ({ filter: { action: 'none' }, upstreams: [{ id: 'udp://1.1.1.1', role: 'pinned', ms: 12, cls: 'ok', answers: ['www.example.com 300 IN A 192.0.2.80'] }], ranking: [{ ip: '192.0.2.80', ok: true, ms: 3.2 }], cdn: [] }) };
+    '/api/trace': () => ({ filter: { action: 'none' }, upstreams: [{ id: 'udp://192.0.2.53', role: 'pinned', ms: 12, cls: 'ok', answers: ['www.example.com 300 IN A 192.0.2.80'] }], ranking: [{ ip: '192.0.2.80', ok: true, ms: 3.2 }], cdn: [] }) };
 let defaults = null;
 try { defaults = JSON.parse(execFileSync(BIN, ['defaults', '--json'], { encoding: 'utf-8' })); } catch (e) { console.log('（沒有 kuroshio 執行檔：預設值提示不顯示）'); }
 

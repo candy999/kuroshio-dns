@@ -215,7 +215,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
         if (NAME === 'kuroshio' && p === 'access') {
             /只開放台灣（建議）/.test(text) && /全開放/.test(text) && /允許名單/.test(text) && /封鎖名單/.test(text) && /一律允許/.test(text) && /VPN/.test(text) && /優先於一切/.test(text)
                 ? ok('連線來源頁：模式、名單與說明') : bad(`連線來源頁內容不對\n     ${text.slice(0, 300)}`);
-            if (MOCK) /\d{4}-\d{2}-\d{2} 的資料/.test(text) && /57 次/.test(text) && /45\.135\.232\.0\/24/.test(text) ? ok('連線來源頁：資料日期、拒絕次數、被拒絕最多的網段') : bad('連線來源頁沒有目前狀態');
+            if (MOCK) /\d{4}-\d{2}-\d{2} 的資料/.test(text) && /57 次/.test(text) && /192\.0\.2\.128\/25/.test(text) ? ok('連線來源頁：資料日期、拒絕次數、被拒絕最多的網段') : bad('連線來源頁沒有目前狀態');
         }
         // 操作區只有服務在執行時才顯示（實機測試的容器裡服務沒有啟動），所以只在模擬環境檢查
         if (NAME === 'kuroshio' && p === 'status' && MOCK) {
@@ -337,7 +337,7 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
             /總覽/.test(text) && /DNS 查詢/.test(text) && /上游 DNS/.test(text) && /台灣節點池/.test(text) && /CDN 網域資料庫/.test(text) && /過濾規則/.test(text) && /排程工作/.test(text)
                 ? ok(`${tag}：各區塊都有`) : bad(`${tag}：缺少區塊\n     ${text.slice(0, 300)}`);
             if (MOCK) {
-                /youtube\.com/.test(text) && /doubleclick\.net/.test(text) && /Cloudflare/.test(text) && /udp:\/\/1\.1\.1\.1/.test(text) && /www0\.example\.com/.test(text) && /104\.18\.22\.203/.test(text) && /dns-benchmark/.test(text)
+                /youtube\.com/.test(text) && /doubleclick\.net/.test(text) && /Cloudflare/.test(text) && /udp:\/\/192\.0\.2\.53/.test(text) && /www0\.example\.com/.test(text) && /198\.51\.100\.203/.test(text) && /dns-benchmark/.test(text)
                     ? ok(`${tag}：資料來自 rpcd（統計、排行、上游、網域、節點、工作）`) : bad(`${tag}：資料不完整\n     ${text.slice(0, 400)}`);
                 (await page.locator('#kuroshio-dashboard .chart svg').count()) >= 2 && (await page.locator('#kuroshio-dashboard .gauge').count()) >= 3
                     ? ok(`${tag}：圖表`) : bad(`${tag}：圖表沒有畫出來`);
@@ -549,9 +549,9 @@ const bad = m => { fail++; console.log(`  ✘ ${m}`); };
                 // 被拒絕最多的網段：一鍵加入封鎖名單
                 await page.goto(`${BASE}/cgi-bin/luci/admin/services/${NAME}/access`);
                 await page.waitForLoadState('networkidle');
-                await page.locator('#kuroshio-access-status button[data-opt=deny][data-net="45.135.232.0/24"]').click();
+                await page.locator('#kuroshio-access-status button[data-opt=deny][data-net="192.0.2.128/25"]').click();
                 const dl = await page.locator(`[id="cbid.${NAME}.access.deny"]`).innerText();
-                /45\.135\.232\.0\/24/.test(dl) ? ok('一鍵加入封鎖名單') : bad(`一鍵加入封鎖名單沒有作用\n     ${dl}`);
+                /192\.0\.2\.128\/25/.test(dl) ? ok('一鍵加入封鎖名單') : bad(`一鍵加入封鎖名單沒有作用\n     ${dl}`);
             }
         } catch (e) { bad(`連線來源頁操作中斷：${e.message.split('\n')[0]}`); }
         await page.screenshot({ path: `${SHOTS}/access-saved.png`, fullPage: true });

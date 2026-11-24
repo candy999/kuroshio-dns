@@ -2,7 +2,7 @@
 // CI：LuCI 頁面語法檢查（LuCI 的 view 最外層有 return，所以包成函式再解析）＋ JSON 檔格式
 const fs = require('fs');
 const path = require('path');
-const root = path.join(__dirname, '..', process.argv[2] || 'luci-app-candydns');
+const root = path.join(__dirname, '..', process.argv[2] || 'luci-app-kuroshio');
 let fail = 0;
 const walk = d => fs.readdirSync(d, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
 for (const f of walk(root)) {
