@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn tiers_auto_follows_memory() {
         use kuroshio_jobs::benchmark::tiers::Mode;
-        assert_eq!(tiers_auto(Some(128)), Mode::A, "128 MB 的小機器只測 A 級");
+        assert_eq!(tiers_auto(Some(128)), Mode::Small, "128 MB 的小機器減量（A 級為主，不是只用 A 級）");
         assert_eq!(tiers_auto(Some(512)), Mode::Ab, "512 MB 的 D3 先照記憶體，全部測");
         assert_eq!(tiers_auto(None), Mode::Ab);
     }

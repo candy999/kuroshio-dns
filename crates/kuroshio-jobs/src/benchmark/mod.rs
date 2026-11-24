@@ -934,8 +934,8 @@ impl ProbeRun {
 /// 結果裡最多列幾台「有擋惡意網站」的候選
 const MAX_PROBE_REPORT: usize = 100;
 
-/// 昨天選上或列為候補的上游（`upstreams.json` 的 `selected[]`、`spares[]`）：分級評測只測 A 級時沿用，
-/// 不然探索到的 B 級今天選上、明天又不測。讀不到就是空的
+/// 昨天選上或列為候補的上游（`upstreams.json` 的 `selected[]`、`spares[]`）：小機器的 `auto`（減量）沿用，
+/// 不然探索到的 B 級今天選上、明天又不測（只用 A 級的 `a` 不沿用 B 級）。讀不到就是空的
 fn incumbent_ids(file: &Path) -> HashSet<String> {
     let Some(v) = read_json(file) else {
         return HashSet::new();
@@ -953,6 +953,8 @@ struct TierCounts {
     mode: tiers::Mode,
     /// 設定是 `auto`（依記憶體換算出來的）
     auto: bool,
+    /// 只用 A 級（設定 `a`）：B 級不測、不選
+    only_a: bool,
     /// 今天測的 A 級
     a: usize,
     incumbent: usize,
@@ -974,7 +976,7 @@ struct TierCounts {
 impl TierCounts {
     fn to_json(self) -> Value {
         json!({
-            "mode": self.mode.name(), "auto": self.auto, "a": self.a, "incumbent": self.incumbent,
+            "mode": self.mode.name(), "auto": self.auto, "onlyA": self.only_a, "a": self.a, "incumbent": self.incumbent,
             "fill": self.fill, "explore": self.explore, "skippedB": self.skipped_b,
             "promoted": self.promoted, "trial": self.trial, "demoted": self.demoted, "demoteFuse": self.demote_fuse,
             "promotedToday": self.promoted_today, "demotedToday": self.demoted_today,
@@ -1324,8 +1326,8 @@ impl Benchmark {
             s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
             all.push(s);
         }
-        // 分級評測（3.5.0 A3）：`a` 模式只測 A 級、使用者的、沿用、補位、探索；其餘 B 級今天不測
-        // （不算淘汰、不記任何紀錄）。在路徑檢查、黑名單略過之後才算：多樣性要看今天實際能測的
+        // 分級評測（3.5.0 A3）：`a` 只用 A 級（B 級一個都不測、不選）；小機器的 `auto` 測 A 級、使用者的、
+        // 沿用、補位、探索；其餘 B 級今天不測（不算淘汰、不記任何紀錄）。在路徑檢查、黑名單略過之後才算：多樣性要看今天實際能測的
         let tier_mode = cfg.tiers.unwrap_or(self.tier_auto);
         // 依評測歷史的升降（3.5.0 A4）：人工分級是起點，學習檔的 hist 決定實際分級；讀不到學習檔就照人工分級。
         // 固定上游、對照組、使用者自己加的不參與
@@ -1373,6 +1375,7 @@ impl Benchmark {
                         op: s.op_key(),
                         ms: s.tag.ms,
                         always: s.pinned || s.protected.is_some() || s.never_ok,
+                        fixed: s.pinned || s.protected.is_some(),
                         incumbent: incumbents.contains(s.id.as_str()),
                         score: aged.as_ref().and_then(learn::Hist::score),
                         bad: aged.as_ref().is_some_and(tiers::history_bad),
@@ -1382,6 +1385,19 @@ impl Benchmark {
                 .collect();
             tiers::plan(&items, tier_mode, today_n, &cfg.select.auto_types)
         };
+        // 只用 A 級時今天不測的 B 級裡，昨天選上或候補的、依歷史拉上來的（寫進 judge.log：連它們也不用）
+        let (dropped_incumbent, dropped_pulled) = if tier_mode.only_a() {
+            let incumbents = incumbent_ids(&self.paths.upstreams_file);
+            let skipped = |i: usize| tier_plan.why[i] == tiers::Why::Skip && matches!(all[i].tag.tier, Tier::B | Tier::Unknown);
+            (
+                (0..all.len())
+                    .filter(|&i| skipped(i) && incumbents.contains(all[i].id.as_str()))
+                    .count(),
+                (0..all.len()).filter(|&i| skipped(i) && eff[i] == Tier::A).count(),
+            )
+        } else {
+            (0, 0)
+        };
         let mut tier_counts = TierCounts {
             promoted: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Promoted)).count(),
             trial: (0..all.len()).filter(|&i| pulled(i, learn::HistState::Trial)).count(),
@@ -1389,6 +1405,7 @@ impl Benchmark {
             demote_fuse,
             mode: tier_mode,
             auto: cfg.tiers.is_none(),
+            only_a: tier_mode.only_a(),
             a: (0..all.len())
                 .filter(|&i| tier_plan.why[i] == tiers::Why::Base && all[i].selectable() && all[i].tag.tier == Tier::A)
                 .count(),
@@ -1399,12 +1416,31 @@ impl Benchmark {
             promoted_today: 0,
             demoted_today: 0,
         };
-        if tier_mode == tiers::Mode::A {
+        if tier_mode != tiers::Mode::Ab {
             let mut k = 0usize;
             all.retain(|_| {
                 k += 1;
                 tier_plan.tested(k - 1)
             });
+        }
+        if tier_mode.only_a() {
+            jinfo!(
+                journal,
+                "[分級] 只用 A 級（benchmark.tiers = a）：今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）；B 級 {} 個不測、不選（含昨天選上或候補的 {} 個、依歷史升上來的 {} 個）",
+                tier_counts.a,
+                tier_counts.demoted,
+                tier_counts.skipped_b,
+                dropped_incumbent,
+                dropped_pulled
+            );
+            if !tier_plan.fill_reason.is_empty() {
+                jinfo!(
+                    journal,
+                    "[分級] A 級的多樣性不夠（{}）：只用 A 級時不從 B 級補；要補請改成 auto 或 ab",
+                    tier_plan.fill_reason
+                );
+            }
+        } else if tier_mode == tiers::Mode::Small {
             jinfo!(
                 journal,
                 "[分級] 今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）、依歷史拉上來的 B 級 {} 個（試用 {}）、沿用昨天選上或候補的 B 級 {} 個、補位 {} 個{}、探索 {} 個；B 級其餘 {} 個今天不測（不算淘汰、不記紀錄）",

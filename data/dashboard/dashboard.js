@@ -1008,8 +1008,11 @@
           { h: '台灣率', v: r => (r.twRate == null ? '—' : pct1(r.twRate)) + (r.ecs ? ' · ECS' : ''), num: 1 },
           { h: '說明', v: r => r.reason || '' }, { h: '業者', v: r => (r.owner || '').replace(/_/g, ' ') }
         ]);
-        // 評測範圍、惡意網站探測（3.5.0）：小機器只測 A 級時寫明測了哪幾類
-        if (b.tiers && b.tiers.mode === 'a') {
+        // 評測範圍、惡意網站探測（3.5.0）：只用 A 級、小機器減量時寫明測了哪幾類
+        if (b.tiers && b.tiers.mode === 'a' && b.tiers.onlyA) {
+          // 設定 a：只用 A 級（B 級不測、不選）
+          box.appendChild(el('div', 'muted', `評測範圍：只用 A 級（A 級 ${b.tiers.a || 0}；B 級 ${b.tiers.skippedB || 0} 個不測、不選）`));
+        } else if (b.tiers && b.tiers.mode === 'a') {
           const ti = b.tiers;
           box.appendChild(el('div', 'muted', `評測範圍：只測 A 級（A 級 ${ti.a || 0}、依歷史拉上來的 B 級 ${(ti.promoted || 0) + (ti.trial || 0)}、沿用 ${ti.incumbent || 0}、補位 ${ti.fill || 0}、探索 ${ti.explore || 0}；其餘 B 級 ${ti.skippedB || 0} 個今天不測）`));
         }

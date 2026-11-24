@@ -1,5 +1,6 @@
 //! 3.5.0 A3／A4：分級評測（`benchmark.tiers`）與依評測歷史的升降
-//! - `a`：A 級、使用者的、沿用、補位、探索；其餘 B 級今天不測（一筆查詢都不送、不算淘汰）
+//! - `a`：只用 A 級：A 級、使用者的（固定上游、對照組照測）；B 級一個都不測、不選，連昨天選上的也不用
+//! - `auto` 在小機器（[`Mode::Small`]）：A 級、使用者的、沿用、補位、探索；其餘 B 級今天不測（一筆查詢都不送、不算淘汰）
 //! - `ab`：跟以前一樣全部測
 //!
 //! 本機假 DNS 伺服器（每台數自己收到幾筆查詢）、注入的時鐘
@@ -138,6 +139,12 @@ async fn run(p: &BenchPaths, tiers: &str, clock: &Arc<ManualClock>) -> Value {
     run_with(Benchmark::with(p.clone(), Arc::new(LocalOnly), asn()), tiers, clock).await
 }
 
+/// 小機器的 `auto`（記憶體小於 256 MB 換算出來的減量）
+async fn run_small(p: &BenchPaths, clock: &Arc<ManualClock>) -> Value {
+    let b = Benchmark::with(p.clone(), Arc::new(LocalOnly), asn()).with_tier_auto(Mode::Small);
+    run_with(b, "auto", clock).await
+}
+
 fn report(p: &BenchPaths, up: &Value, name: &str) -> String {
     std::fs::read_to_string(p.out_root.clone().unwrap().join(up["date"].as_str().unwrap()).join(name)).unwrap()
 }
@@ -182,15 +189,15 @@ async fn lists(root: &Path) -> Lists {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tier_a_tests_only_a_user_fill_and_explore() {
-    let root = tmp("a");
+async fn small_auto_tests_only_a_user_fill_and_explore() {
+    let root = tmp("small");
     let p = paths(&root);
     let l = lists(&root).await;
     let clock = Arc::new(ManualClock::new(day0()));
-    let up = run(&p, "a", &clock).await;
+    let up = run_small(&p, &clock).await;
     let t = &up["tiers"];
     assert_eq!(t["mode"], "a", "{t}");
-    assert_eq!(t["auto"], false);
+    assert_eq!((t["auto"].as_bool(), t["onlyA"].as_bool()), (Some(true), Some(false)), "{t}");
     assert_eq!(t["a"], 3);
     // 今天要測的只有 4 家經營者（A 級 3、使用者的 1）、udp 只有 4 個：補 8 家新的（每家 1 個，udp 也就有 8 個以上）
     assert_eq!(t["fill"], 8, "{t}");
@@ -224,7 +231,7 @@ async fn tier_a_tests_only_a_user_fill_and_explore() {
     // 同一天再跑一次：探索的是同一組（手動多跑幾次不會把 B 級測完）；多出來的只有沿用、試用與補位（各有上限）
     let before = l.b.iter().filter(|m| m.hits.load(Ordering::Relaxed) > 0).count();
     l.reset();
-    let again = run(&p, "a", &clock).await;
+    let again = run_small(&p, &clock).await;
     let after = l.b.iter().filter(|m| m.hits.load(Ordering::Relaxed) > 0).count();
     assert!(after <= before + 8, "第二次多測了 {} 個 B 級", after as i64 - before as i64);
     // 上一次選上的 B 級照測（沿用，或已經因為表現好開始試用）
@@ -263,7 +270,7 @@ async fn tier_ab_matches_previous_behaviour() {
         assert!(!report(&p, &up, "judge.log").contains("[分級] 今天測"));
     }
     // auto 換算成 a（小機器）：只測一部分；設定寫明 ab 時不看換算
-    let small = || Benchmark::with(p.clone(), Arc::new(LocalOnly), asn()).with_tier_auto(Mode::A);
+    let small = || Benchmark::with(p.clone(), Arc::new(LocalOnly), asn()).with_tier_auto(Mode::Small);
     let up = run_with(small(), "auto", &clock).await;
     assert_eq!(
         (up["tiers"]["mode"].as_str(), up["tiers"]["auto"].as_bool()),
@@ -272,6 +279,54 @@ async fn tier_ab_matches_previous_behaviour() {
     assert!(up["counts"]["total"].as_u64().unwrap() < 54);
     let up = run_with(small(), "ab", &clock).await;
     assert_eq!(up["counts"]["total"], 54);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier_a_uses_only_a_even_when_b_was_selected_yesterday() {
+    let root = tmp("only-a");
+    let p = paths(&root);
+    let l = lists(&root).await;
+    let clock = Arc::new(ManualClock::new(day0()));
+    // 第 1 天小機器的 auto：B 級最快的那一台（補位進來的）選上了，也開始試用
+    let up = run_small(&p, &clock).await;
+    assert_eq!(up["selected"][0]["id"], l.b[0].id.as_str(), "{up:#}");
+    // 第 2 天改成 a：B 級一筆查詢都不送，連昨天選上的、試用中的也不用
+    clock.advance(DAY_MS);
+    l.reset();
+    let up = run(&p, "a", &clock).await;
+    let t = &up["tiers"];
+    assert_eq!(
+        (t["mode"].as_str(), t["auto"].as_bool(), t["onlyA"].as_bool()),
+        (Some("a"), Some(false), Some(true)),
+        "{t}"
+    );
+    assert_eq!(
+        (t["incumbent"].as_u64(), t["fill"].as_u64(), t["explore"].as_u64()),
+        (Some(0), Some(0), Some(0)),
+        "{t}"
+    );
+    assert_eq!(t["skippedB"], 50, "{t}");
+    assert!(l.b.iter().all(|m| m.hits.load(Ordering::Relaxed) == 0), "B 級不測");
+    assert!(l.a.iter().chain([&l.user]).all(|m| m.hits.load(Ordering::Relaxed) >= 3));
+    assert_eq!(up["counts"]["total"], 4, "{up:#}");
+    assert_eq!(up["counts"]["byTier"], json!({ "A": 3, "user": 1 }), "{up:#}");
+    // selected／候補都沒有 B 級
+    for k in ["selected", "spares"] {
+        for x in up[k].as_array().into_iter().flatten() {
+            assert_ne!(x["tier"], "B", "{k}：{x}");
+        }
+    }
+    assert!(!up["selected"].as_array().unwrap().is_empty());
+    let log = report(&p, &up, "judge.log");
+    assert!(log.contains("[分級] 只用 A 級（benchmark.tiers = a）：今天測 A 級 3 個"), "{log}");
+    assert!(log.contains("B 級 50 個不測、不選（含昨天選上或候補的 1 個"), "{log}");
+    assert!(log.contains("只用 A 級時不從 B 級補"), "多樣性不夠照樣寫明：{log}");
+    // 同一天再跑也一樣（不會因為多跑幾次就輪到 B 級）
+    l.reset();
+    let again = run(&p, "a", &clock).await;
+    assert_eq!(again["counts"]["total"], 4);
+    assert!(l.b.iter().all(|m| m.hits.load(Ordering::Relaxed) == 0));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -328,7 +383,7 @@ async fn history_demotes_a_and_pulls_up_b() {
     let clock = Arc::new(ManualClock::new(day0()));
     // A 級第 1 台一直連不上
     l.a[0].up.store(false, Ordering::Relaxed);
-    let mut up = run(&p, "a", &clock).await;
+    let mut up = run_small(&p, &clock).await;
     // 第 1 天：今天測到、倖存、沒失敗過的 B 級裡，延遲低的 8 個開始試用
     let trial: Vec<String> = learn(&p)
         .hist
@@ -341,7 +396,7 @@ async fn history_demotes_a_and_pulls_up_b() {
     for day in 2..=7 {
         clock.advance(DAY_MS);
         l.reset();
-        up = run(&p, "a", &clock).await;
+        up = run_small(&p, &clock).await;
         // 試用中的每天都測（不靠補位或探索）
         assert!(
             up["tiers"]["trial"].as_u64().unwrap() >= TRIAL_NEW_PER_DAY as u64,
@@ -365,7 +420,7 @@ async fn history_demotes_a_and_pulls_up_b() {
     // 第 8 天：降級的 A 級不在 A 級裡了（只在探索時輪到）；跑到第 10 天，試用滿 10 天的升級
     for day in 8..=11 {
         clock.advance(DAY_MS);
-        up = run(&p, "a", &clock).await;
+        up = run_small(&p, &clock).await;
         assert_eq!(
             (up["tiers"]["a"].as_u64(), up["tiers"]["demoted"].as_u64()),
             (Some(2), Some(1)),

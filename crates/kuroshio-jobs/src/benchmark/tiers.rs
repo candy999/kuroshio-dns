@@ -2,15 +2,18 @@
 //!
 //! `benchmark.tiers`：
 //! - `ab`：全部都測（3.4.4 以前的行為）。
-//! - `a`：小機器的減量。A 級＋使用者自己加的每天測；B 級只測少數幾種：
+//! - `a`：**只用 A 級**（使用者自己選的）。只測、只選 A 級與使用者自己加的（另外固定上游、對照組照測）；
+//!   人工分級是 B 級的一個都不測，連昨天選上的、依歷史升上來的也不用，所以也不會進 `selected`／候補。
+//!   介意 B 級（經營者看不出來）的人用這個。A 級的多樣性不夠時只在 `judge.log` 寫明，不從 B 級補。
+//! - `auto`：由主程式依實體記憶體換算（`benchjob.rs`）：大機器全部測；小機器是 [`Mode::Small`]——
+//!   減量，不是只用 A 級。A 級＋使用者自己加的每天測；B 級只測少數幾種：
 //!   - **沿用**：昨天選上或列為候補的（不然探索到的 B 級今天選上、明天又不測，執行中的上游每天換）；
 //!   - **補位**（多樣性保護）：今天要測的 A 級經營者不到 [`OPS_MIN`] 家、或某一種類型不到 [`TYPE_MIN`] 個時，
 //!     從 B 級補，最多 [`B_FILL_MAX`] 個、同一個經營者最多 [`FILL_PER_OP`] 個；
 //!   - **探索**：每天輪 [`B_EXPLORE_MAX`] 個，B 級才有機會累積歷史。
-//! - `auto`：由主程式依實體記憶體換算（`benchjob.rs`）。
 //!
 //! 這裡只決定測不測：不測的 B 級不算淘汰、不記任何紀錄（跟路徑檢查略過一樣）；
-//! 要測的一樣走完所有檢查（A 級不是信任等級）。選上游仍然只看今天的評測結果。
+//! 要測的一樣走完所有檢查（A 級不是信任等級）。選上游仍然只看今天的評測結果（今天沒測的選不上）。
 //!
 //! 都是純函式：輸入是「路徑檢查、黑名單略過之後」今天實際可以測的候選（一般 DNS 被接走時，
 //! A 級的 UDP 候選整批不在裡面，多樣性要用剩下的算）。
@@ -34,18 +37,27 @@ pub const INCUMBENT_MAX: usize = 16;
 /// 評測範圍
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// A 級＋使用者的＋沿用＋補位＋探索
+    /// 設定 `a`：只用 A 級（A 級＋使用者的；人工分級 B 級的一個都不測、不選）
     A,
+    /// `auto` 在小機器的換算：A 級＋使用者的＋沿用＋補位＋探索（減量）
+    Small,
     /// 全部
     Ab,
 }
 
 impl Mode {
+    /// `upstreams.json` 的 `tiers.mode`：`a`（只測 A 級為主：設定 `a` 與小機器的 `auto`；
+    /// 分得出來的是 `tiers.onlyA`）／`ab`
     pub fn name(self) -> &'static str {
         match self {
-            Mode::A => "a",
+            Mode::A | Mode::Small => "a",
             Mode::Ab => "ab",
         }
+    }
+
+    /// 只用 A 級（設定 `a`）：B 級不測、不選
+    pub fn only_a(self) -> bool {
+        self == Mode::A
     }
 
     /// 設定值：`a`／`ab`；`auto`、沒寫、看不懂都是 None（由呼叫者用換算好的值）
@@ -58,13 +70,13 @@ impl Mode {
     }
 }
 
-/// `benchmark.tiers = auto` 的換算：實體記憶體小於這個值（MB）就只測 A 級。
+/// `benchmark.tiers = auto` 的換算：實體記憶體小於這個值（MB）就減量（[`Mode::Small`]）。
 /// 讀不到記憶體大小時照舊全部測
 pub const AUTO_A_BELOW_MB: u64 = 256;
 
 pub fn auto_mode(mem_total_mb: Option<u64>) -> Mode {
     match mem_total_mb {
-        Some(mb) if mb < AUTO_A_BELOW_MB => Mode::A,
+        Some(mb) if mb < AUTO_A_BELOW_MB => Mode::Small,
         _ => Mode::Ab,
     }
 }
@@ -82,7 +94,10 @@ pub struct Item<'a> {
     /// 整理名單時量到的延遲：沒有歷史時的排序依據
     pub ms: Option<f32>,
     /// 一定要測、但不算進多樣性的：固定上游、對照組、執行時從未成功的
+    /// （只用 A 級時，人工分級 B 級的從未成功也不測：見 [`Item::fixed`]）
     pub always: bool,
+    /// 固定上游、對照組：不論哪一種模式都測（只用 A 級時也一樣；它們本來就不會被選成自動上游）
+    pub fixed: bool,
     /// 昨天選上或列為候補
     pub incumbent: bool,
     /// 歷史分數（A4）：補位時高的先；沒有歷史是 None
@@ -158,35 +173,26 @@ pub fn explore_slice<'a>(b_ids: &[&'a str], day: u32) -> Vec<&'a str> {
         .collect()
 }
 
-/// 決定今天測誰。`auto_types`：會被選用的類型（多樣性只看這些類型）
-pub fn plan(items: &[Item], mode: Mode, day: u32, auto_types: &[String]) -> Plan {
-    if mode == Mode::Ab {
-        return Plan {
-            why: vec![Why::Base; items.len()],
-            fill_reason: String::new(),
-        };
-    }
-    let usable = |it: &Item| auto_types.iter().any(|t| t == it.kind);
-    let mut why: Vec<Why> = items
-        .iter()
-        .map(|it| if it.always || !is_b(it.tier) { Why::Base } else { Why::Skip })
-        .collect();
-    // 沿用：昨天選上或候補的 B 級
-    let mut n = 0usize;
-    for (i, it) in items.iter().enumerate() {
-        if why[i] == Why::Skip && it.incumbent && n < INCUMBENT_MAX {
-            why[i] = Why::Incumbent;
-            n += 1;
-        }
-    }
+/// 今天要測的一般候選（只算會被選用的類型）的多樣性
+struct Diversity<'a> {
+    /// 今天要測的有哪幾家經營者
+    ops: HashSet<&'a str>,
+    /// 經營者至少要幾家（今天能測的不到 [`OPS_MIN`] 家時有幾家算幾家）
+    ops_target: usize,
+    /// 每一種類型還差幾個
+    need: BTreeMap<&'a str, usize>,
+    /// 不夠的原因（寫進 judge.log）；夠了是空的
+    reasons: Vec<String>,
+}
 
-    // 多樣性：今天要測的一般候選（只算會被選用的類型）有幾家經營者、每種類型幾個
+fn diversity<'a>(items: &'a [Item], why: &[Why], auto_types: &[String]) -> Diversity<'a> {
+    let usable = |it: &Item| auto_types.iter().any(|t| t == it.kind);
     let mut ops: HashSet<&str> = HashSet::new();
     let mut have: BTreeMap<&str, usize> = BTreeMap::new();
     let mut avail: BTreeMap<&str, usize> = BTreeMap::new();
     let mut all_ops: HashSet<&str> = HashSet::new();
     for (i, it) in items.iter().enumerate() {
-        if it.always || !usable(it) {
+        if it.always || it.fixed || !usable(it) {
             continue;
         }
         *avail.entry(it.kind).or_default() += 1;
@@ -210,6 +216,64 @@ pub fn plan(items: &[Item], mode: Mode, day: u32, auto_types: &[String]) -> Plan
             reasons.push(format!("{k} 只有 {h} 個（至少 {target}）"));
         }
     }
+    Diversity {
+        ops,
+        ops_target,
+        need,
+        reasons,
+    }
+}
+
+/// 決定今天測誰。`auto_types`：會被選用的類型（多樣性只看這些類型）
+pub fn plan(items: &[Item], mode: Mode, day: u32, auto_types: &[String]) -> Plan {
+    match mode {
+        Mode::Ab => {
+            return Plan {
+                why: vec![Why::Base; items.len()],
+                fill_reason: String::new(),
+            }
+        }
+        Mode::A => {
+            // 只用 A 級：人工分級 B 級的（含依歷史升上來的、昨天選上的、從未成功的）一個都不測；
+            // 依歷史降級的 A 級照小機器的規則今天不測。多樣性不夠只寫原因，不從 B 級補
+            let why: Vec<Why> = items
+                .iter()
+                .map(|it| {
+                    if it.fixed || (!it.manual_b && (it.always || !is_b(it.tier))) {
+                        Why::Base
+                    } else {
+                        Why::Skip
+                    }
+                })
+                .collect();
+            let d = diversity(items, &why, auto_types);
+            return Plan {
+                why,
+                fill_reason: d.reasons.join("、"),
+            };
+        }
+        Mode::Small => {}
+    }
+    let usable = |it: &Item| auto_types.iter().any(|t| t == it.kind);
+    let mut why: Vec<Why> = items
+        .iter()
+        .map(|it| if it.always || !is_b(it.tier) { Why::Base } else { Why::Skip })
+        .collect();
+    // 沿用：昨天選上或候補的 B 級
+    let mut n = 0usize;
+    for (i, it) in items.iter().enumerate() {
+        if why[i] == Why::Skip && it.incumbent && n < INCUMBENT_MAX {
+            why[i] = Why::Incumbent;
+            n += 1;
+        }
+    }
+
+    let Diversity {
+        mut ops,
+        ops_target,
+        mut need,
+        reasons,
+    } = diversity(items, &why, auto_types);
     if !reasons.is_empty() {
         // 補位的順序：有歷史的依分數（高的先），沒有歷史的依整理名單時的延遲（小的先），再依 id（固定）
         let mut pool: Vec<usize> = (0..items.len())
@@ -483,6 +547,7 @@ mod tests {
             op: op.to_string(),
             ms: None,
             always: false,
+            fixed: false,
             incumbent: false,
             score: None,
             bad: false,
@@ -496,12 +561,14 @@ mod tests {
 
     #[test]
     fn auto_follows_memory_and_parse() {
-        assert_eq!(auto_mode(Some(128)), Mode::A);
-        assert_eq!(auto_mode(Some(255)), Mode::A);
+        assert_eq!(auto_mode(Some(128)), Mode::Small, "小機器是減量，不是只用 A 級");
+        assert_eq!(auto_mode(Some(255)), Mode::Small);
         assert_eq!(auto_mode(Some(256)), Mode::Ab);
         assert_eq!(auto_mode(Some(512)), Mode::Ab, "512 MB 的 D3 先照記憶體（待決 Q1）");
         assert_eq!(auto_mode(None), Mode::Ab, "讀不到就照舊全部測");
-        assert_eq!(Mode::parse("a"), Some(Mode::A));
+        assert_eq!(Mode::parse("a"), Some(Mode::A), "設定 a＝只用 A 級");
+        assert!(Mode::A.only_a() && !Mode::Small.only_a() && !Mode::Ab.only_a());
+        assert_eq!((Mode::A.name(), Mode::Small.name()), ("a", "a"));
         assert_eq!(Mode::parse(" AB "), Some(Mode::Ab));
         assert_eq!(Mode::parse("auto"), None);
         assert_eq!(Mode::parse("x"), None);
@@ -541,7 +608,46 @@ mod tests {
     }
 
     #[test]
-    fn tier_a_tests_only_a_user_fill_and_explore() {
+    fn tier_a_uses_only_a_no_incumbent_fill_or_explore() {
+        // 設定 a＝只用 A 級：A 級只有 3 家經營者（多樣性不夠）、B 級有昨天選上的、依歷史升上來的、從未成功的
+        let a: Vec<String> = (0..9).map(|i| format!("https://a{i}.example.com/dns-query")).collect();
+        let b: Vec<String> = (0..100).map(|i| format!("https://b{i}.example.net/dns-query")).collect();
+        let mut items: Vec<Item> = a
+            .iter()
+            .enumerate()
+            .map(|(i, id)| item(id, "doh", Tier::A, ["x", "y", "z"][i % 3]))
+            .collect();
+        items.push(item("https://mine.example.com/dns-query", "doh", Tier::User, "mine"));
+        let mut pinned = item("https://pinned.example.net/dns-query", "doh", Tier::B, "p");
+        (pinned.always, pinned.fixed) = (true, true);
+        items.push(pinned);
+        let mut control = item("https://control.example.net/dns-query", "doh", Tier::Unknown, "c");
+        (control.always, control.fixed) = (true, true);
+        items.push(control);
+        items.extend(b.iter().map(|id| item(id, "doh", Tier::B, "bop")));
+        let nb = items.len() - 100;
+        items[nb].incumbent = true; // 昨天選上的 B 級
+        items[nb + 1].tier = Tier::A; // 依歷史升上來的 B 級（實際分級 A、人工分級 B）
+        items[nb + 2].always = true; // 執行時從未成功的 B 級
+        let mut demoted = item("https://demoted.example.com/dns-query", "doh", Tier::B, "d");
+        demoted.manual_b = false; // 依歷史降級的 A 級
+        items.push(demoted);
+        for day in [20_000, 20_001, 20_002] {
+            let p = plan(&items, Mode::A, day, &types(&["doh"]));
+            assert_eq!(p.count(Why::Base), 12, "A 級 9、使用者的 1、固定上游 1、對照組 1");
+            assert_eq!((p.count(Why::Incumbent), p.count(Why::Fill), p.count(Why::Explore)), (0, 0, 0));
+            assert!((nb..items.len()).all(|i| p.why[i] == Why::Skip), "B 級一個都不測");
+            assert!(p.fill_reason.contains("經營者只有 4 家"), "多樣性不夠照樣寫原因：{}", p.fill_reason);
+        }
+        // 同一份候選在小機器的 auto：沿用、補位、探索照舊
+        let p = plan(&items, Mode::Small, 20_000, &types(&["doh"]));
+        assert_eq!(p.why[nb], Why::Incumbent);
+        assert_eq!(p.why[nb + 1], Why::Base);
+        assert!(p.count(Why::Fill) > 0 && p.count(Why::Explore) > 0);
+    }
+
+    #[test]
+    fn small_tests_only_a_user_fill_and_explore() {
         // A 級 20 家經營者、每種類型都夠：不補位
         let a: Vec<String> = (0..20).map(|i| format!("https://a{i}.example.com/dns-query")).collect();
         let b: Vec<String> = (0..100).map(|i| format!("https://b{i}.example.net/dns-query")).collect();
@@ -550,13 +656,14 @@ mod tests {
         items.push(item("https://mine.example.com/dns-query", "doh", Tier::User, "mine"));
         let mut pinned = item("https://pinned.example.net/dns-query", "doh", Tier::B, "p");
         pinned.always = true;
+        pinned.fixed = true;
         items.push(pinned);
         items.extend(b.iter().map(|id| item(id, "doh", Tier::B, "bop")));
         let mut unk = item("sdns://x", "dnscrypt", Tier::Unknown, "u");
         unk.incumbent = false;
         items.push(unk);
         // 101 個 B 級分 3 組，20_001 是第 0 組（滿 40 個）
-        let p = plan(&items, Mode::A, 20_001, &types(&["doh"]));
+        let p = plan(&items, Mode::Small, 20_001, &types(&["doh"]));
         assert!(p.fill_reason.is_empty(), "{}", p.fill_reason);
         assert_eq!(p.count(Why::Base), 22, "A 級 20、使用者的 1、固定上游 1");
         assert_eq!(p.count(Why::Fill), 0);
@@ -566,7 +673,7 @@ mod tests {
         for it in items.iter_mut().filter(|it| it.tier == Tier::B && !it.always).take(20) {
             it.incumbent = true;
         }
-        let p = plan(&items, Mode::A, 20_000, &types(&["doh"]));
+        let p = plan(&items, Mode::Small, 20_000, &types(&["doh"]));
         assert_eq!(p.count(Why::Incumbent), INCUMBENT_MAX);
     }
 
@@ -586,7 +693,7 @@ mod tests {
             it.ms = Some(300.0 - i as f32);
             it
         }));
-        let p = plan(&items, Mode::A, 20_000, &types(&["doh", "dot"]));
+        let p = plan(&items, Mode::Small, 20_000, &types(&["doh", "dot"]));
         assert!(p.fill_reason.contains("經營者只有 3 家"), "{}", p.fill_reason);
         let filled: Vec<&Item> = (0..items.len()).filter(|&i| p.why[i] == Why::Fill).map(|i| &items[i]).collect();
         // 3 家 → 12 家：補 9 家新的就夠（每家 1 個就達標），不超過上限
@@ -601,7 +708,7 @@ mod tests {
         // 有歷史分數的排在前面；歷史很差的不補
         items[9 + 3].score = Some(0.9);
         items[9 + 199].bad = true;
-        let p = plan(&items, Mode::A, 20_000, &types(&["doh"]));
+        let p = plan(&items, Mode::Small, 20_000, &types(&["doh"]));
         assert_eq!(p.why[9 + 3], Why::Fill);
         assert_ne!(p.why[9 + 199], Why::Fill);
     }
@@ -618,7 +725,7 @@ mod tests {
             .enumerate()
             .map(|(i, (id, op))| item(id, kinds[i % 5], Tier::B, op))
             .collect();
-        let p = plan(&items, Mode::A, 1, &types(&kinds));
+        let p = plan(&items, Mode::Small, 1, &types(&kinds));
         assert_eq!(p.count(Why::Fill), B_FILL_MAX);
         let mut per: BTreeMap<&str, usize> = BTreeMap::new();
         for i in (0..items.len()).filter(|&i| p.why[i] == Why::Fill) {
@@ -628,11 +735,11 @@ mod tests {
         assert!(p.count(Why::Explore) <= B_EXPLORE_MAX);
         // 名單裡某一種類型本來就只有 3 個：有幾個算幾個，不一直喊不夠
         let few: Vec<Item> = (0..3).map(|i| item(b[i].as_str(), "doq", Tier::A, ops[i * 10].as_str())).collect();
-        let p = plan(&few, Mode::A, 1, &types(&["doq"]));
+        let p = plan(&few, Mode::Small, 1, &types(&["doq"]));
         assert!(p.fill_reason.is_empty(), "{}", p.fill_reason);
         // 不會被選用的類型不補位
         let off: Vec<Item> = (0..20).map(|i| item(b[i].as_str(), "dnscrypt", Tier::B, "s")).collect();
-        let p = plan(&off, Mode::A, 1, &types(&["doh"]));
+        let p = plan(&off, Mode::Small, 1, &types(&["doh"]));
         assert_eq!(p.count(Why::Fill), 0);
     }
 
