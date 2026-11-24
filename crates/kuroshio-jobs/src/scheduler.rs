@@ -500,8 +500,24 @@ struct St {
 pub struct JobHandoff {
     /// 排隊中的：（名稱、原因、是不是手動優先），照佇列的順序
     pub queued: Vec<(String, String, bool)>,
-    /// 執行中、這一輪結束時被中斷的：（名稱、已經因為重新載入連續中斷幾次（含這一次））
-    pub running: Option<(String, u32)>,
+    /// 執行中、這一輪結束時被中斷的：（名稱、已經因為重新載入連續中斷幾次（含這一次）、原本的原因）。
+    /// 原本的原因交給重跑的那一次（工作自己用它判斷「手動」，例如 tw-ip 手動時不看清單幾天）
+    pub running: Option<(String, u32, String)>,
+}
+
+/// 被重新載入中斷、排回去重跑的那一次的原因：保留原本的原因在前面（「手動 (管理介面)；重新載入時中斷，重新執行」），
+/// 工作用原因開頭判斷手動的照樣成立；原本沒有原因的只寫「重新載入時中斷，重新執行」
+pub fn interrupted_reason(orig: &str) -> String {
+    const TAIL: &str = "重新載入時中斷，重新執行";
+    let orig = orig.trim();
+    if orig.is_empty() {
+        TAIL.to_string()
+    } else if orig.ends_with(TAIL) {
+        // 已經是重跑的那一次（照理連續中斷 2 次就不再排回，到不了這裡）：不重複加
+        orig.to_string()
+    } else {
+        format!("{orig}；{TAIL}")
+    }
 }
 
 /// 交接多久之內有效（跟 DNS 快取一樣 60 秒）
@@ -884,16 +900,20 @@ impl Scheduler {
                 .iter()
                 .map(|(n, r)| (n.clone(), r.clone(), st.priority.contains(n)))
                 .collect(),
-            running: st
-                .running
-                .as_ref()
-                .map(|r| (r.name.clone(), st.reload_interrupts.get(&r.name).copied().unwrap_or(0) + 1)),
+            running: st.running.as_ref().map(|r| {
+                (
+                    r.name.clone(),
+                    st.reload_interrupts.get(&r.name).copied().unwrap_or(0) + 1,
+                    r.reason.clone(),
+                )
+            }),
         }
     }
 
     /// 新的一輪接手上一輪交出的工作（3.5.0 F14）。`age` 是交出到現在多久。
     /// - 排隊中的：工作還在、沒有停用 → 照原本的順序排回去（排在這一輪自己排的前面；手動的維持優先）。
-    /// - 執行中被中斷的：排回佇列最前面，原因「重新載入時中斷，重新執行」；連續中斷 [`RELOAD_INTERRUPT_MAX`] 次就不再排回（WARN）。
+    /// - 執行中被中斷的：排回佇列最前面，原因「<原本的原因>；重新載入時中斷，重新執行」（原本是手動的，工作照樣看得出是手動；
+    ///   不標手動優先）；連續中斷 [`RELOAD_INTERRUPT_MAX`] 次就不再排回（WARN）。
     /// - 保留不了的（工作停用、不存在、交接超過 60 秒）：每一個寫一行 INFO。沒有任何一個工作會無聲消失。
     ///
     /// 回傳寫了哪些日誌（測試用）
@@ -937,7 +957,7 @@ impl Scheduler {
                     format!("重新載入：保留排隊中的工作 {} 個（{}）", kept.len(), names.join("、")),
                 ));
             }
-            if let Some((name, n)) = h.running {
+            if let Some((name, n, orig)) = h.running {
                 match why_not(&name) {
                     Some(w) => lines.push((false, format!("重新載入：取消重跑被中斷的 {name}（{w}）"))),
                     None if n >= RELOAD_INTERRUPT_MAX => {
@@ -945,7 +965,9 @@ impl Scheduler {
                     }
                     None if busy(&st, &name) => {}
                     None => {
-                        st.queue.push_front((name.clone(), "重新載入時中斷，重新執行".to_string()));
+                        // 原因保留原本的（「手動 (管理介面)；重新載入時中斷，重新執行」）：工作自己判斷手動用得到。
+                        // 但不標手動優先：重排不多給讓出的優先權（A9 的排序照舊，它本來就排在最前面）
+                        st.queue.push_front((name.clone(), interrupted_reason(&orig)));
                         st.reload_interrupts.insert(name.clone(), n);
                         lines.push((false, format!("重新載入：{name} 執行到一半被中斷，排回佇列最前面重新執行")));
                     }

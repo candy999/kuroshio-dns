@@ -1016,7 +1016,7 @@ async fn reload_keeps_queued_manual_job_with_priority() {
     s1.request_priority("c", "手動 (管理介面)");
     let hand = s1.handoff();
     h1.abort();
-    assert_eq!(hand.running, Some(("long".to_string(), 1)));
+    assert_eq!(hand.running, Some(("long".to_string(), 1, "補跑".to_string())));
     assert_eq!(hand.queued.len(), 3);
     // 新的一輪
     let (s2, gate, order, _seen) = priority_fixture(&clock);
@@ -1026,7 +1026,7 @@ async fn reload_keeps_queued_manual_job_with_priority() {
     assert_eq!(
         queue_of(&s2),
         vec![
-            ("long".into(), "重新載入時中斷，重新執行".into(), false),
+            ("long".into(), "補跑；重新載入時中斷，重新執行".into(), false),
             ("c".into(), "手動 (管理介面)".into(), true),
             ("a".into(), "補跑".into(), false),
             ("b".into(), "排程".into(), false),
@@ -1038,6 +1038,43 @@ async fn reload_keeps_queued_manual_job_with_priority() {
     idle(&s2).await;
     h2.abort();
     assert_eq!(*order.lock().unwrap(), vec!["long", "c(手動 (管理介面))", "a(補跑)", "b(排程)"]);
+}
+
+/// 手動執行的工作被重新載入中斷：重跑那一次的原因保留「手動」（工作自己判斷用，例如 tw-ip 手動時不看清單幾天），
+/// 但不標手動優先（不多給讓出的優先權）
+#[tokio::test(start_paused = true)]
+async fn reload_keeps_manual_reason_of_interrupted_job() {
+    let clock = Arc::new(ManualClock::new(tpe(2026, 11, 10, 12, 0)));
+    let (s1, _g1, _o1, _w1) = priority_fixture(&clock);
+    let h1 = s1.start();
+    s1.request_priority("long", "手動 (管理介面)");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(s1.running().as_deref(), Some("long"));
+    let hand = s1.handoff();
+    h1.abort();
+    assert_eq!(hand.running, Some(("long".to_string(), 1, "手動 (管理介面)".to_string())));
+    let (s2, gate, order, _w2) = priority_fixture(&clock);
+    s2.adopt(hand, Duration::from_secs(1));
+    assert_eq!(
+        queue_of(&s2),
+        vec![("long".into(), "手動 (管理介面)；重新載入時中斷，重新執行".into(), false)]
+    );
+    let h2 = s2.start();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let reason = s2.status()["running"]["reason"].as_str().unwrap_or_default().to_string();
+    assert!(reason.starts_with("手動"), "{reason}");
+    gate.notify_one();
+    idle(&s2).await;
+    h2.abort();
+    assert_eq!(*order.lock().unwrap(), vec!["long"]);
+    // 原因的寫法
+    use kuroshio_jobs::scheduler::interrupted_reason;
+    assert_eq!(interrupted_reason("排程"), "排程；重新載入時中斷，重新執行");
+    assert_eq!(interrupted_reason(""), "重新載入時中斷，重新執行");
+    assert_eq!(
+        interrupted_reason("手動 (管理介面)；重新載入時中斷，重新執行"),
+        "手動 (管理介面)；重新載入時中斷，重新執行"
+    );
 }
 
 /// 同一個工作連續因為重新載入被中斷 2 次就不再自動排回（WARN）；中間跑完一次就重新算
@@ -1058,7 +1095,10 @@ async fn reload_requeues_interrupted_job_at_most_twice() {
     assert_eq!(s2.running().as_deref(), Some("long"));
     let hand = s2.handoff();
     h2.abort();
-    assert_eq!(hand.running, Some(("long".to_string(), 2)));
+    assert_eq!(
+        hand.running,
+        Some(("long".to_string(), 2, "補跑；重新載入時中斷，重新執行".to_string()))
+    );
     // 第 2 次中斷：不再排回
     let (s3, _g3, _o3, _w3) = priority_fixture(&clock);
     let lines = s3.adopt(hand, Duration::ZERO);
@@ -1072,7 +1112,7 @@ async fn reload_requeues_interrupted_job_at_most_twice() {
     s4.adopt(
         kuroshio_jobs::scheduler::JobHandoff {
             queued: vec![],
-            running: Some(("long".into(), 1)),
+            running: Some(("long".into(), 1, "補跑".into())),
         },
         Duration::ZERO,
     );
@@ -1082,7 +1122,7 @@ async fn reload_requeues_interrupted_job_at_most_twice() {
     idle(&s4).await;
     s4.request("long", "排程");
     tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(s4.handoff().running, Some(("long".to_string(), 1)));
+    assert_eq!(s4.handoff().running, Some(("long".to_string(), 1, "排程".to_string())));
     h4.abort();
 }
 
@@ -1101,7 +1141,7 @@ async fn reload_logs_cancelled_jobs_when_disabled() {
                 ("b".into(), "排程".into(), false),
                 ("gone".into(), "排程".into(), false),
             ],
-            running: Some(("b".into(), 1)),
+            running: Some(("b".into(), 1, "排程".into())),
         },
         Duration::from_secs(1),
     );
@@ -1124,7 +1164,7 @@ async fn handoff_expires_after_60s() {
     let (s, _g, _o, _w) = priority_fixture(&clock);
     let h = kuroshio_jobs::scheduler::JobHandoff {
         queued: vec![("a".into(), "手動".into(), true)],
-        running: Some(("long".into(), 1)),
+        running: Some(("long".into(), 1, "排程".into())),
     };
     let lines = s.adopt(h.clone(), kuroshio_jobs::scheduler::HANDOFF_TTL + Duration::from_secs(1));
     assert_eq!(

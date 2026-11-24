@@ -501,6 +501,28 @@ pub fn futile_hold(r: &Reading, res: &Reserve) -> bool {
     deficit_and_own(r, res).is_some_and(|(d, own)| (own as u128) * 20 < d as u128 * 12)
 }
 
+/// 「記憶體不足，但缺口是其他程式造成」那一行 INFO：同一段於事無補（從進入到離開）只寫一次
+/// （3.5.0 第一階段 Windows W19／J3：可用記憶體被別的程式拉上拉下時，每次掉回保留量以下都再寫一行，5 分鐘 6 次）。
+/// 進入時的 WARN 已經說明了；離開之後再進入才重新寫
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FutileNote {
+    noted: bool,
+}
+
+impl FutileNote {
+    /// 每一輪量測後呼叫：不在於事無補（離開了）就重新算
+    pub fn observe(&mut self, futile: bool) {
+        if !futile {
+            self.noted = false;
+        }
+    }
+
+    /// 這一次要不要寫那一行（寫了就記住，這一段不再寫）
+    pub fn take(&mut self) -> bool {
+        !std::mem::replace(&mut self.noted, true)
+    }
+}
+
 /// 「於事無補」的判定與遲滯（純狀態，測試直接造）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FutileGate {
@@ -1775,6 +1797,26 @@ impl Step for ProtectedStep {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// 3.5.0 J3：同一段於事無補裡讀數掉回保留量以下好幾次，「缺口是其他程式造成」只寫一次；離開後再進入才重新寫
+    #[test]
+    fn futile_note_once_per_episode() {
+        let mut n = FutileNote::default();
+        let mut lines = 0;
+        // W19：進入、讀數回升五次又掉回去（都沒有離開）
+        for _ in 0..6 {
+            n.observe(true);
+            if n.take() {
+                lines += 1;
+            }
+        }
+        assert_eq!(lines, 1);
+        // 離開、再進入：寫一次
+        n.observe(false);
+        n.observe(true);
+        assert!(n.take());
+        assert!(!n.take());
+    }
 
     /// 3.5.0：讓出不到 1 KB 的步驟不寫 WARN
     #[test]

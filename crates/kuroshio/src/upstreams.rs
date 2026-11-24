@@ -75,13 +75,19 @@ struct Stats {
     late: u64,
     /// 連續幾次來不及回答（成功一次歸零；到 [`LATE_STREAK_FAIL`] 算 1 次失敗、歸零）
     late_streak: u8,
-    /// 「每次都來不及回答」的 INFO 寫過了（每台上游每次啟動一行）
+    /// 「到現在一次都沒答成功」的 INFO 寫過了（每台上游每次啟動一行；[`never_answered_line`]）
     late_logged: bool,
 }
 
 /// 連續幾次來不及回答（而且這段期間沒有成功過）算 1 次失敗（3.5.0 F4）：自動上游要 5 次失敗才暫停，
 /// 也就是連續 40 筆都來不及才會暫停
 pub const LATE_STREAK_FAIL: u8 = 8;
+
+/// 一直來不及回答、上線以來一次都沒成功的上游那一行 INFO（3.5.0 F4；D3 第 3 輪 D35 之後改成直接講「一次都沒答成功」：
+/// 這一行只在 `ok` 是 0 時寫，不是「慢」，是根本沒答成功過）
+fn never_answered_line(id: &str) -> String {
+    format!("{id} 到現在一次都沒答成功（每次都是別的上游先答完），先排到後面；可能是位址或協定不通")
+}
 
 /// 從未成功的自動上游第幾次暫停時先不用（前兩次是 1、2 分鐘，合計已經失敗 15 筆）
 pub const BENCH_TRIPS: u32 = 3;
@@ -157,6 +163,36 @@ pub fn take_never_ok() -> Vec<String> {
 pub fn restore_never_ok(ids: Vec<String>) {
     for id in ids {
         note_never_ok(&id);
+    }
+}
+
+/// 重新載入設定時交給下一輪的自動上游狀態（3.5.0 第一階段 Windows W21／J2）：只交「上線以來從未成功」的
+/// 自動上游（`ok` 是 0、已經暫停過或先不用）。不然每存一次設定，壞掉的上游就從「來不及 → 暫停 1 分 → 2 分 → 先不用」
+/// 重來一次（多 3 分鐘、15 筆失敗）。同一個行程裡「上線以來」本來就沒有中斷，所以接得上；
+/// 有成功過的（時好時壞）照舊重新算。程式重新啟動不交接
+#[derive(Debug, Clone, Default)]
+pub struct UpHandoff {
+    entries: Vec<Carried>,
+}
+
+#[derive(Debug, Clone)]
+struct Carried {
+    id: String,
+    trips: u32,
+    open_until: Option<Instant>,
+    benched: bool,
+    late_logged: bool,
+}
+
+/// 交接最多帶幾台（自動上游＋候補本來就只有 `autoMax`＋[`MAX_SPARES`] 台；保險起見另外設上限）
+pub const UP_HANDOFF_MAX: usize = 32;
+
+impl UpHandoff {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -365,7 +401,7 @@ impl Up {
     /// 拿的是這台自己的 `stats` 鎖一次（它如果回來，本來就會在 `record()` 拿同一把鎖一次）。
     /// - 沒有延遲紀錄時把平均延遲設成 `ms`（下限）、有紀錄而且比它小時往上修：不再永遠排第一。
     /// - 連續 [`LATE_STREAK_FAIL`] 次（中間沒有成功）算 1 次失敗（走一般的失敗規則：自動上游會暫停、從未成功的會先不用）。
-    /// - 第一次「連續 8 次來不及、上線以來沒有成功過」時寫一行 INFO（每台上游每次啟動一行）
+    /// - 第一次「連續 8 次來不及、上線以來沒有成功過」時寫一行 INFO「到現在一次都沒答成功」（每台上游每次啟動一行）
     pub fn note_late(&self, ms: f64) {
         self.note_late_at(ms, Instant::now());
     }
@@ -394,10 +430,7 @@ impl Up {
             self.record_locked(&mut s, false, ms, now, &mut notify, &mut benched);
         }
         if log {
-            info!(
-                "{} 每次都來不及回答（別的上游先答完），先排到後面；一直這樣的話可能是位址或協定不通",
-                self.up.id
-            );
+            info!("{}", never_answered_line(&self.up.id));
         }
         self.after_record(false, now, notify, benched);
     }
@@ -642,6 +675,71 @@ impl Manager {
         };
         m.reload_auto();
         m
+    }
+
+    /// 重新載入設定、這一輪結束時（3.5.0 J2）：上線以來從未成功的自動上游（含候補）的暫停／先不用狀態
+    pub fn handoff(&self) -> UpHandoff {
+        let a = self.auto.read().unwrap();
+        let entries = a
+            .list
+            .iter()
+            .chain(&a.spares)
+            .filter(|u| u.role == Role::Auto)
+            .filter_map(|u| {
+                let st = u.stats.lock().unwrap();
+                (st.ok == 0 && (st.benched || st.trips > 0)).then(|| Carried {
+                    id: u.up.id.clone(),
+                    trips: st.trips,
+                    open_until: st.open_until,
+                    benched: st.benched,
+                    late_logged: st.late_logged,
+                })
+            })
+            .take(UP_HANDOFF_MAX)
+            .collect();
+        UpHandoff { entries }
+    }
+
+    /// 新的一輪接手上一輪交出的狀態（3.5.0 J2）。只接同一個 id、這一輪也是自動上游（或候補）、這一輪還沒有任何紀錄的；
+    /// 新的設定或評測結果裡沒有的就丟掉。先不用的照原本的時間（A7：每 6 小時放 1 筆試探），所以會自己過期、恢復。
+    /// `age` 是交出到現在多久，超過 60 秒（跟 DNS 快取一樣）就不接。回傳接了幾台
+    pub fn adopt(&self, h: UpHandoff, age: Duration) -> usize {
+        if age > Duration::from_secs(60) || h.entries.is_empty() {
+            return 0;
+        }
+        let a = self.auto.read().unwrap();
+        let mut benched: Vec<&str> = Vec::new();
+        let mut paused: Vec<&str> = Vec::new();
+        for c in &h.entries {
+            let Some(u) = a.list.iter().chain(&a.spares).find(|u| u.role == Role::Auto && u.up.id == c.id) else {
+                continue;
+            };
+            let mut st = u.stats.lock().unwrap();
+            if st.ok > 0 || st.fail > 0 || st.trips > 0 || st.benched {
+                continue;
+            }
+            st.trips = c.trips;
+            st.open_until = c.open_until;
+            st.benched = c.benched;
+            st.late_logged = c.late_logged;
+            if c.benched {
+                benched.push(&c.id);
+            } else {
+                paused.push(&c.id);
+            }
+        }
+        let n = benched.len() + paused.len();
+        if n > 0 {
+            let mut parts = Vec::new();
+            if !benched.is_empty() {
+                parts.push(format!("先不用 {}（每 6 小時試一次）", benched.join("、")));
+            }
+            if !paused.is_empty() {
+                parts.push(format!("暫停的次數照算 {}", paused.join("、")));
+            }
+            info!("重新載入：上線以來從未成功的上游 {n} 台沿用原本的狀態：{}", parts.join("；"));
+        }
+        n
     }
 
     /// 這台有沒有用自動上游（`autoTypes` 有設、`autoMax` 不是 0）。沒有用時評測結果只是記下來，不必檢查夠不夠用
@@ -1432,6 +1530,16 @@ mod tests {
         assert!(bad.paused(t0), "連續 40 筆來不及：暫停 1 分鐘");
         assert!(pause_left_at(&bad, t0) <= Duration::from_secs(60));
         assert!(bad.stats.lock().unwrap().late_logged, "寫過一次 INFO");
+        // D35（D3 第 3 輪）：這一行只在上線以來沒成功過時寫，直接講「一次都沒答成功」
+        assert_eq!(
+            never_answered_line(&bad.up.id),
+            "tls://never.example.com:853 到現在一次都沒答成功（每次都是別的上游先答完），先排到後面；可能是位址或協定不通"
+        );
+        // 成功過的上游一直來不及：不寫這一行（只照常記失敗、排到後面）
+        let v = Up::new(Upstream::parse("tls://ok.example.net").unwrap(), Role::Pinned);
+        v.record_at(true, 5.0, t0);
+        (0..8).for_each(|_| v.note_late_at(150.0, t0));
+        assert!(!v.stats.lock().unwrap().late_logged);
         let t1 = t0 + Duration::from_secs(61);
         good.record_at(true, 5.0, t1);
         late40(t1);
@@ -1499,6 +1607,68 @@ mod tests {
         assert!(!bad.benched());
         assert_eq!(bad.avail(p2), Avail::Ok);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const THREE: &str = r#"{"generatedAt":"2026-11-10T04:00:00Z","selected":[
+        {"id":"tls://never.example.com","type":"dot"},{"id":"tls://good.example.net","type":"dot"},
+        {"id":"tls://half.example.org","type":"dot"}]}"#;
+
+    /// 3.5.0 J2：重新載入時，上線以來從未成功的自動上游的「先不用」與暫停次數交給新的一輪（同一個 id 才接），
+    /// 不會每存一次設定就從「暫停 1 分 → 2 分 → 先不用」重來；成功過的照舊重新算；先不用照 6 小時的規則自己恢復
+    #[test]
+    fn reload_hands_over_benched_never_ok_upstreams() {
+        let (dir, m) = manager_with("handoff", THREE, json!({}));
+        let (bad, good, half) = (
+            auto_by(&m, "tls://never.example.com:853"),
+            auto_by(&m, "tls://good.example.net:853"),
+            auto_by(&m, "tls://half.example.org:853"),
+        );
+        let t = three_trips(&bad, &good, true, Instant::now());
+        assert!(bad.benched());
+        fail5_at(&half, t);
+        assert!(!half.benched() && pause_left_at(&half, t) > Duration::ZERO);
+        fail5_at(&good, t + Duration::from_secs(1));
+        let h = m.handoff();
+        assert_eq!(h.len(), 2, "成功過的（good）不交：{h:?}");
+
+        // 新的一輪（同一份評測結果）：先不用的照舊先不用、時間照原本的；暫停過一次的照算次數
+        let (_, m2) = manager_with("handoff", THREE, json!({}));
+        assert_eq!(m2.adopt(h.clone(), Duration::from_secs(1)), 2);
+        let (bad2, good2, half2) = (
+            auto_by(&m2, "tls://never.example.com:853"),
+            auto_by(&m2, "tls://good.example.net:853"),
+            auto_by(&m2, "tls://half.example.org:853"),
+        );
+        assert!(bad2.benched());
+        assert_eq!(bad2.avail(t + Duration::from_secs(3600)), Avail::Off, "還在 6 小時內");
+        assert!(pause_left_at(&bad2, t) > BENCH_PAUSE - Duration::from_secs(5));
+        assert!(!good2.benched() && pause_left_at(&good2, t) == Duration::ZERO, "成功過的重新算");
+        // 暫停過一次的：下一次連續失敗是第 2 次（2 分鐘），不是從 1 分鐘重來
+        let t2 = t + Duration::from_secs(61);
+        good2.record_at(true, 5.0, t2);
+        fail5_at(&half2, t2);
+        assert!(pause_left_at(&half2, t2) > Duration::from_secs(61), "第 2 次暫停是 2 分鐘");
+        // 先不用照 A7 的規則：6 小時到了放 1 筆試探，成功就恢復
+        let p = t + BENCH_PAUSE + Duration::from_secs(1);
+        assert_eq!(bad2.avail(p), Avail::Probe);
+        bad2.record_at(true, 8.0, p);
+        assert!(!bad2.benched());
+
+        // 交接超過 60 秒：不接
+        let (_, m3) = manager_with("handoff", THREE, json!({}));
+        assert_eq!(m3.adopt(h.clone(), Duration::from_secs(61)), 0);
+        assert!(!auto_by(&m3, "tls://never.example.com:853").benched());
+        // 新的評測結果（或設定）裡沒有那一台：丟掉
+        let (dir4, m4) = manager_with("handoff-gone", TWO.replace("never", "other").as_str(), json!({}));
+        assert_eq!(m4.adopt(h.clone(), Duration::from_secs(1)), 0, "交出的兩台都不在新的結果裡");
+        assert!(!auto_by(&m4, "tls://other.example.com:853").benched());
+        // 已經有紀錄的不蓋掉
+        let (_, m5) = manager_with("handoff", THREE, json!({}));
+        auto_by(&m5, "tls://never.example.com:853").record_at(true, 5.0, t);
+        assert_eq!(m5.adopt(h, Duration::from_secs(1)), 1);
+        assert!(!auto_by(&m5, "tls://never.example.com:853").benched());
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir4).unwrap();
     }
 
     #[test]

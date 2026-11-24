@@ -47,6 +47,7 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
     crate::tls::set_bootstrap(&strings(get(cfg, "upstream.bootstrap")));
     crate::pathcheck::configure(cfg);
     let ups = Arc::new(Manager::new(cfg, state_path(cfg, state)));
+    adopt_upstreams(cfg, &ups);
     if ups.active().is_empty() && ups.backup().is_empty() {
         bail!("沒有可用的上游（upstream.pinned / upstream.fallback / resolver.lastResort）");
     }
@@ -131,6 +132,25 @@ fn answer_fingerprint(cfg: &Value) -> String {
 /// 快照目錄不同（另一個實例）不接手；60 秒內沒人接手就過期（下一輪接手時每一個都寫一行「取消」）
 type JobHandoffSlot = (PathBuf, Instant, kuroshio_jobs::scheduler::JobHandoff);
 static JOB_HANDOFF: Mutex<Option<JobHandoffSlot>> = Mutex::new(None);
+
+/// 重新載入設定時交給下一輪的自動上游狀態（3.5.0 J2：上線以來從未成功的暫停、先不用）：（快照目錄, 交出的時間, 狀態）。
+/// 跟背景工作一樣：只在重新載入時交（程式結束不交）、快照目錄不同不接、60 秒內沒人接手就過期
+type UpHandoffSlot = (PathBuf, Instant, crate::upstreams::UpHandoff);
+static UP_HANDOFF: Mutex<Option<UpHandoffSlot>> = Mutex::new(None);
+
+/// 新的一輪：接手上一輪交出的自動上游狀態（同一個 id 才接；設定裡沒有的丟掉）
+fn adopt_upstreams(cfg: &Value, ups: &Manager) {
+    let slot = {
+        let mut g = UP_HANDOFF.lock().unwrap();
+        match g.as_ref() {
+            Some((dir, _, _)) if *dir == persist_dir(cfg) => g.take(),
+            _ => None,
+        }
+    };
+    if let Some((_, at, h)) = slot {
+        ups.adopt(h, at.elapsed());
+    }
+}
 
 /// 有沒有等下一輪接手的背景工作（3.5.0 F14；測試用）
 #[doc(hidden)]
@@ -1615,6 +1635,7 @@ impl Started {
     /// 排隊中與執行中的背景工作交給下一輪（3.5.0 F14）。程式結束走 [`Started::shutdown_for`]，不交接工作
     pub fn shutdown(&self) {
         self.hand_over_jobs();
+        self.hand_over_upstreams();
         self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
     }
 
@@ -1626,6 +1647,14 @@ impl Started {
             return;
         }
         *JOB_HANDOFF.lock().unwrap() = Some((persist_dir(&self.state.cfg), Instant::now(), h));
+    }
+
+    /// 3.5.0 J2：上線以來從未成功的自動上游的暫停、先不用狀態交給下一輪（沒有就不放）
+    fn hand_over_upstreams(&self) {
+        let h = self.state.resolver.upstreams.handoff();
+        if !h.is_empty() {
+            *UP_HANDOFF.lock().unwrap() = Some((persist_dir(&self.state.cfg), Instant::now(), h));
+        }
     }
 
     /// 關機，時間上限依停止的原因（[`StopReason::flush_budget`]）
@@ -1813,6 +1842,8 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
         let mut last = Pressure::Normal;
         // 記憶體控制關掉時自己判斷「於事無補」（開著時由記憶體控制判斷，狀態頁看得到同一份）
         let mut gate = crate::memgov::FutileGate::default();
+        // 「缺口是其他程式造成」那一行同一段於事無補只寫一次（3.5.0 J3）
+        let mut note = crate::memgov::FutileNote::default();
         // 3.5.0 F12：每 10 秒量一次黑潮自己用掉的 CPU（佔整台機器），交給 CDN 驗證的節流依 CPU 調整速率
         let mut cpu = sysinfo::CpuMeter::new(kuroshio_config::Host::detect().cores);
         loop {
@@ -1829,6 +1860,7 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                 None => crate::memgov::observe_futile_standalone(&mut gate, &r, &reserve, now),
             };
             crate::memgov::set_futile(futile);
+            note.observe(futile);
             let p = crate::memgov::signal_pressure(pressure_of(&r, &reserve), futile);
             PRESSURE.store(p as u8, Ordering::Relaxed);
             // 好友資料（社群共享）：解壓後不超過保留量以上可用空間的 1/4（至少 1 MB）
@@ -1848,9 +1880,13 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                     // 這是「當下」的量測；記憶體控制的狀態（`memory.state`）要穩定一段時間才放鬆（遲滯，預設 3 分鐘），
                     // 兩者會差幾分鐘（3.4.3：日誌寫「恢復正常」、狀態頁卻還是吃緊，看起來像錯誤）
                     Pressure::Normal => info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆"),
-                    Pressure::Low if futile => info!(
-                        "記憶體不足，但缺口是其他程式造成（可用 {a} MB，保留 {res} MB）：照「偏低」處理——背景工作延後、記憶體結構不再長大，照樣接受加密連線"
-                    ),
+                    Pressure::Low if futile => {
+                        if note.take() {
+                            info!(
+                                "記憶體不足，但缺口是其他程式造成（可用 {a} MB，保留 {res} MB）：照「偏低」處理——背景工作延後、記憶體結構不再長大，照樣接受加密連線"
+                            )
+                        }
+                    }
                     Pressure::Low => info!("記憶體接近保留量（可用 {a} MB，保留 {res} MB）：背景工作延後、記憶體結構不再長大"),
                     Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }
