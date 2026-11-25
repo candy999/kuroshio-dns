@@ -205,6 +205,8 @@ pub struct Resolver {
     inflight: Mutex<HashMap<String, Waiters>>,
     /// 最近一次「所有上游都失敗」的時間（0.1 秒，相對 `base`）；0 = 沒發生過
     last_outage: AtomicU32,
+    /// 上一次寫「查詢工作超過期限」日誌的時間（`now_ds`；3.5.1 H1）
+    job_timeout_logged: AtomicU32,
     /// 查詢計數，用來每 20 次探索一個平常排在後面的上游
     picks: AtomicU32,
     /// 背景補問的抽樣計數（非 CDN 的 A／AAAA 查詢；跟 `picks` 分開）
@@ -263,6 +265,7 @@ impl Resolver {
         local: Option<LocalForward>,
     ) -> Arc<Resolver> {
         let backfills = Arc::new(tokio::sync::Semaphore::new(params.backfill_max));
+        perf::set_rank(&iprank);
         Arc::new(Resolver {
             params,
             upstreams,
@@ -284,6 +287,7 @@ impl Resolver {
             comm_prefetching: AtomicU32::new(0),
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
+            job_timeout_logged: AtomicU32::new(0),
             picks: AtomicU32::new(0),
             sample_tick: AtomicU32::new(0),
             backfills,
@@ -743,11 +747,36 @@ impl Resolver {
         if first {
             let me = self.clone();
             let k = key.clone();
-            tokio::spawn(async move { me.job(k, query).await });
+            tokio::spawn(async move {
+                // 總期限（3.5.1 H1）：任何一步沒有在期限內結束，就放棄這個工作——`InflightGuard` 把鍵拿掉，
+                // 等待的人收到「通道關閉」回 SERVFAIL，之後同一個鍵的查詢重新問。
+                // 以前沒有總期限，卡住的那一筆讓同名同類型的查詢全部跟著等，直到重新啟動
+                if tokio::time::timeout(JOB_DEADLINE, me.clone().job(k.clone(), query)).await.is_err() {
+                    me.note_job_timeout(&k);
+                }
+            });
         }
         match rx.await {
             Ok(e) => e,
             Err(_) => Arc::new(Entry::new(2, vec![], vec![], Class::ServFail, "內部錯誤".into(), 3, false, None)),
+        }
+    }
+
+    /// 查詢工作超過 [`JOB_DEADLINE`]：計數；日誌每分鐘最多一行
+    fn note_job_timeout(&self, key: &str) {
+        perf::note_job_timeout();
+        let now = self.now_ds();
+        let last = self.job_timeout_logged.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 600
+            && self
+                .job_timeout_logged
+                .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            warn!(
+                "查詢工作超過 {} 秒沒有結束，先回 SERVFAIL、下一筆重新問（{key}；之後一分鐘內的不再寫日誌，次數看 /api/status 的 perf.jobTimeouts）",
+                JOB_DEADLINE.as_secs()
+            );
         }
     }
 
@@ -1251,7 +1280,8 @@ impl Resolver {
         if all.len() <= 1 && oks.len() <= 1 {
             return None;
         }
-        let ranked = self.iprank.rank(&all).await;
+        // 查詢路徑不排隊等測速名額（3.5.1 H1）：名額用完時照上游的順序回答
+        let ranked = self.iprank.rank_now(&all).await;
         let best = ranked.iter().find(|r| r.1.ok)?.0;
         let base = oks.iter().find(|a| logic::ips_of(&a.msg, qtype).contains(&best))?;
         let term = logic::terminal_name(&base.msg, qname);
@@ -1442,6 +1472,10 @@ fn backfill_mismatch(first: &[Arc<Answer>], more: &[Arc<Answer>]) -> bool {
 /// padavan-tw 的串接壓測裡，自己的 DoH／DoT 一直被問到「連續失敗」）。所以等兩倍的逾時再加 1 秒
 const CHAIN_EXTRA_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// 一個往上游查的工作（合併後的那一筆）最多多久（3.5.1 H1）：主要上游一輪、備援一輪、IP 測速排序，正常都在幾秒內；
+/// 超過就放棄，等待的人回 SERVFAIL，下一筆重新問。不放棄的話同名同類型的查詢會一直跟著等
+pub const JOB_DEADLINE: Duration = Duration::from_secs(12);
+
 fn timeout_for(p: &Params, up: &Up) -> Duration {
     if up.role == Role::Chain {
         p.timeout * 2 + CHAIN_EXTRA_TIMEOUT
@@ -1532,6 +1566,18 @@ pub mod perf {
     static FANOUT: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
     /// 背景補問送出的上游查詢數
     static BACKFILL: AtomicU32 = AtomicU32::new(0);
+    /// 超過總期限被放棄的查詢工作（3.5.1 H1）
+    static JOB_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+    /// 查詢路徑因為測速名額用完而沒有排序 IP 的次數（3.5.1 H1；由 `Resolver` 設定來源）
+    static RANK: std::sync::Mutex<Option<std::sync::Weak<kuroshio_net::iprank::IpRank>>> = std::sync::Mutex::new(None);
+
+    pub fn note_job_timeout() {
+        JOB_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_rank(r: &std::sync::Arc<kuroshio_net::iprank::IpRank>) {
+        *RANK.lock().unwrap() = Some(std::sync::Arc::downgrade(r));
+    }
 
     pub fn note_ask(sent: usize, backfill: bool) {
         if backfill {
@@ -1549,6 +1595,8 @@ pub mod perf {
             // 每次詢問送出 1、2、3、4 個以上上游查詢的次數（一筆查詢可能詢問兩次：先問主要的，再問備援）
             "fanout": { "1": f[0], "2": f[1], "3": f[2], "4+": f[3] },
             "backfillQueries": BACKFILL.load(Ordering::Relaxed),
+            "jobTimeouts": JOB_TIMEOUTS.load(Ordering::Relaxed),
+            "rankSkipped": RANK.lock().unwrap().as_ref().and_then(|w| w.upgrade()).map_or(0, |r| r.busy_skips()),
         })
     }
 }
@@ -1844,5 +1892,31 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(1), rx).await.expect("不能卡住");
         assert!(got.is_err());
         assert!(inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn singleflight_waiters_released_when_the_job_exceeds_its_deadline() {
+        // 3.5.1 H1：job() 有一步一直不回來（以前是查詢路徑排隊等 IP 測速名額）：總期限一到就放棄，
+        // 鍵拿掉、等待的人回 SERVFAIL，同名同類型的下一筆重新問——不會一直卡到重新啟動
+        let inflight: Arc<Mutex<HashMap<String, Waiters>>> = Arc::default();
+        let (tx, rx) = oneshot::channel();
+        inflight.lock().unwrap().insert("1|www.example.com".into(), vec![tx]);
+        let map = inflight.clone();
+        let job = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(50), async {
+                let _guard = InflightGuard(&map, "1|www.example.com");
+                std::future::pending::<()>().await;
+            })
+            .await
+            .is_err()
+        });
+        assert!(job.await.unwrap(), "超過期限");
+        let got = tokio::time::timeout(Duration::from_secs(1), rx).await.expect("不能卡住");
+        assert!(got.is_err());
+        assert!(inflight.lock().unwrap().is_empty());
+        assert!(
+            JOB_DEADLINE >= Duration::from_secs(8),
+            "主要上游一輪 + 備援一輪 + 測速，正常的查詢不能被它砍掉"
+        );
     }
 }

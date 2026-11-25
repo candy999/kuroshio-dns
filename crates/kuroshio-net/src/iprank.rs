@@ -3,6 +3,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -25,6 +26,8 @@ pub struct IpRank {
     cache: Mutex<HashMap<IpAddr, (Latency, Instant)>>,
     /// 本機有沒有 IPv6 連線能力（第一次 v6 測試後決定；同 2.x 的 `v6Usable`）
     v6: Mutex<Option<bool>>,
+    /// [`IpRank::rank_now`] 因為名額用完而不排序的次數
+    busy_skips: AtomicU32,
 }
 
 /// 連線品質（`quality`）：中位數延遲、抖動（相鄰樣本差的平均）、掉包率
@@ -82,6 +85,7 @@ impl IpRank {
             sem: Arc::new(Semaphore::new(n("iprank.concurrency", 64).max(1) as usize)),
             cache: Mutex::new(HashMap::new()),
             v6: Mutex::new(None),
+            busy_skips: AtomicU32::new(0),
         }
     }
 
@@ -210,6 +214,74 @@ impl IpRank {
         c.insert(ip, (l, Instant::now()));
     }
 
+    /// 查詢路徑用的排序（3.5.1 H1）：**不排隊**。快取裡沒有的 IP 要一次拿到全部的測速名額才測，
+    /// 名額不夠（同時在測的已經滿了）就整筆不排序、回空的（呼叫端照上游原本的順序回答），也不記快取。
+    /// 整體最多等 `timeout` + 200 ms。
+    ///
+    /// 以前查詢路徑跟背景工作一樣排隊等名額、沒有期限：每秒幾百個新網域時排隊越排越長，排在後面的查詢工作等上好幾分鐘，
+    /// 同名同類型的查詢（合併成一筆往上游問）全部跟著等——「`www.google.com` A 卡住、AAAA 正常」（3.5.0 D3、Windows 壓測）
+    pub async fn rank_now(self: &Arc<Self>, ips: &[IpAddr]) -> Vec<(IpAddr, Latency)> {
+        let mut uniq: Vec<IpAddr> = Vec::new();
+        for ip in ips {
+            if !uniq.contains(ip) {
+                uniq.push(*ip);
+            }
+        }
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let mut need = Vec::new();
+        {
+            let c = self.cache.lock().unwrap();
+            for ip in uniq {
+                match c.get(&ip) {
+                    Some((l, at)) if now.duration_since(*at) < if l.ok { self.ok_ttl } else { self.fail_ttl } => out.push((ip, *l)),
+                    _ => need.push(ip),
+                }
+            }
+        }
+        if !need.is_empty() {
+            let Ok(permits) = self.sem.clone().try_acquire_many_owned(need.len().min(u32::MAX as usize) as u32) else {
+                self.busy_skips.fetch_add(1, Ordering::Relaxed);
+                return Vec::new();
+            };
+            let mut set = tokio::task::JoinSet::new();
+            for ip in need {
+                let me = self.clone();
+                set.spawn(async move {
+                    let (l, unreach) = connect_once(ip, me.port, me.timeout).await;
+                    me.note_v6(ip, &l, unreach);
+                    me.store(ip, l);
+                    (ip, l)
+                });
+            }
+            let deadline = tokio::time::sleep(self.timeout + Duration::from_millis(200));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    r = set.join_next() => match r {
+                        Some(Ok(x)) => out.push(x),
+                        Some(Err(_)) => {}
+                        None => break,
+                    },
+                    _ = &mut deadline => {
+                        // 還沒回來的不算（不排序那些 IP 會被當成失敗拿掉）：整筆不排序
+                        set.abort_all();
+                        drop(permits);
+                        return Vec::new();
+                    }
+                }
+            }
+            drop(permits);
+        }
+        out.sort_by(|a, b| a.1.ms.partial_cmp(&b.1.ms).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
+    /// 查詢路徑因為測速名額用完而不排序的次數（[`IpRank::rank_now`]；`/api/status.perf.rankSkipped`）
+    pub fn busy_skips(&self) -> u32 {
+        self.busy_skips.load(Ordering::Relaxed)
+    }
+
     /// 依延遲排序（同時測，數量受 concurrency 限制）
     pub async fn rank(self: &Arc<Self>, ips: &[IpAddr]) -> Vec<(IpAddr, Latency)> {
         let mut uniq: Vec<IpAddr> = Vec::new();
@@ -236,6 +308,36 @@ impl IpRank {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn rank_now_never_queues_for_permits() {
+        // 3.5.1 H1：查詢路徑不排隊等測速名額。名額用完時整筆不排序（回空的）、記一次；名額空出來就照常測
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let _ = l.accept().await;
+            }
+        });
+        let cfg = kuroshio_config::with_overrides(&json!({ "iprank": { "port": port, "timeoutMs": 300, "concurrency": 8 } }));
+        let r = Arc::new(IpRank::new(&cfg, 1000));
+        let ips: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap()];
+        let held = r.sem.clone().try_acquire_many_owned(8).unwrap();
+        let t0 = Instant::now();
+        assert!(r.rank_now(&ips).await.is_empty(), "名額用完：不排序");
+        assert!(t0.elapsed() < Duration::from_millis(50), "不等");
+        assert_eq!(r.busy_skips(), 1);
+        assert!(r.cached(ips[0]).is_none(), "沒測的不記快取");
+        drop(held);
+        let out = r.rank_now(&ips).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.ok);
+        // 快取裡有的不用名額
+        let held = r.sem.clone().try_acquire_many_owned(8).unwrap();
+        assert_eq!(r.rank_now(&ips).await.len(), 1);
+        drop(held);
+        assert_eq!(r.busy_skips(), 1);
+    }
 
     #[tokio::test]
     async fn ranks_reachable_first() {
