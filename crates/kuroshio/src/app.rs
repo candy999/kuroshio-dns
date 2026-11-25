@@ -2075,22 +2075,92 @@ fn spawn_persist_loop(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(300)).await;
-            // CDN 網域資料的磁碟預算（3.5.0 C5）：登記之前先淘汰，這一輪要重寫的分片跟著這次登記。
-            // 只在這裡做（關機、手動儲存都不淘汰）；跟記憶體控制移出冷資料用同一把鎖，不會交錯
-            if let Some(c) = &cdn {
-                let _g = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                c.budget_round();
-            }
-            stage_sources(&p, &sources);
-            let mut p = p.lock().unwrap();
-            // 記憶體越多、留在記憶體越久；記憶體吃緊時提早寫出、放掉待寫內容
-            p.set_mem(mem_now(&reserve));
-            p.check_space();
-            if let Err(e) = p.flush(crate::persist::now_secs()) {
-                warn!("寫入快照失敗：{e}");
+            let (p, sources, reserve, cdn) = (p.clone(), sources.clone(), reserve.clone(), cdn.clone());
+            // 3.5.1 K10：整段（預算整理、登記、序列化、zstd 壓縮、寫 Flash、fsync）在 blocking 執行緒上做，而且這段期間
+            // 降低這條執行緒的優先權。以前直接在 tokio 的工作執行緒上跑：MT7621 只有兩個核心，等於一個查詢工作執行緒
+            // 被佔住好幾秒，D3 每 7～8 分鐘查快取的 95% 跳到 120～400 ms（3.5.0 D3 壓測）
+            let r = tokio::task::spawn_blocking(move || {
+                let _low = LowPriority::enter();
+                // CDN 網域資料的磁碟預算（3.5.0 C5）：登記之前先淘汰，這一輪要重寫的分片跟著這次登記。
+                // 只在這裡做（關機、手動儲存都不淘汰）；跟記憶體控制移出冷資料用同一把鎖，不會交錯
+                if let Some(c) = &cdn {
+                    let _g = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    c.budget_round();
+                }
+                stage_sources(&p, &sources);
+                let mut p = p.lock().unwrap();
+                // 記憶體越多、留在記憶體越久；記憶體吃緊時提早寫出、放掉待寫內容
+                p.set_mem(mem_now(&reserve));
+                p.check_space();
+                if let Err(e) = p.flush(crate::persist::now_secs()) {
+                    warn!("寫入快照失敗：{e}");
+                }
+            })
+            .await;
+            if let Err(e) = r {
+                warn!("寫入快照的工作中途結束：{e}");
             }
         }
     });
+}
+
+/// 這條執行緒暫時降低優先權（Linux：nice + [`LowPriority::NICE`]），離開時恢復原本的值（3.5.1 K10）。
+/// blocking 執行緒是重複使用的，所以一定要恢復；其他平台什麼都不做
+pub struct LowPriority {
+    #[cfg(target_os = "linux")]
+    old: Option<libc::c_int>,
+}
+
+impl LowPriority {
+    /// 調低多少（nice 值越大越讓別人先跑）。只調 5：這段期間會短暫拿 CDN 狀態鎖序列化分片（每批幾百筆），
+    /// 調太低時持鎖中被搶走 CPU，查詢反而要等它（優先權反轉）；主要的改善是離開 tokio 的工作執行緒
+    pub const NICE: libc_compat::Nice = 5;
+
+    pub fn enter() -> LowPriority {
+        #[cfg(target_os = "linux")]
+        {
+            // Linux 的 setpriority(PRIO_PROCESS, 0, …) 只改呼叫的這條執行緒；讀到 -1 時要看 errno 分辨是不是錯誤
+            // SAFETY: 只讀寫這條執行緒自己的排程優先權
+            unsafe {
+                *libc::__errno_location() = 0;
+                let old = libc::getpriority(libc::PRIO_PROCESS, 0);
+                if old == -1 && *libc::__errno_location() != 0 {
+                    return LowPriority { old: None };
+                }
+                let target = (old + Self::NICE).min(19);
+                if libc::setpriority(libc::PRIO_PROCESS, 0, target) != 0 {
+                    return LowPriority { old: None };
+                }
+                LowPriority { old: Some(old) }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            LowPriority {}
+        }
+    }
+}
+
+impl Drop for LowPriority {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(old) = self.old {
+            // 調回原本的值：一般使用者調低之後調不回來（沒有 CAP_SYS_NICE）時，這條執行緒之後就一直是低優先權——
+            // 只影響 blocking 工作（寫檔、讀分片），不影響查詢的工作執行緒
+            // SAFETY: 同上
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, old);
+            }
+        }
+    }
+}
+
+mod libc_compat {
+    /// nice 值的型別（Linux 是 c_int；其他平台用不到，給個一樣大小的）
+    #[cfg(target_os = "linux")]
+    pub type Nice = libc::c_int;
+    #[cfg(not(target_os = "linux"))]
+    pub type Nice = i32;
 }
 
 pub async fn start(cfg: &Value) -> Result<Started> {
@@ -2508,6 +2578,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn low_priority_is_restored_on_drop() {
+        // 3.5.1 K10：寫快照期間降低優先權，結束後恢復（blocking 執行緒會重複使用）
+        std::thread::spawn(|| {
+            // SAFETY: 只讀這條執行緒自己的優先權
+            let get = || unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            let before = get();
+            {
+                let _low = LowPriority::enter();
+                assert_eq!(get(), (before + LowPriority::NICE).min(19));
+            }
+            // 沒有權限調回來（一般使用者）時維持低優先權：只檢查有權限的情況
+            let after = get();
+            assert!(after == before || after == (before + LowPriority::NICE).min(19));
+        })
+        .join()
+        .unwrap();
+    }
     use std::path::Path;
 
     fn cfg(over: Value) -> Value {
