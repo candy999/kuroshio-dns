@@ -365,7 +365,8 @@ c = CPU 核心數（`available_parallelism`）：
 | `pool.latencyConcurrency` | clamp(32c, 32, 200) | 32 | 64 | 128 | 200 |
 | `pool.probeConcurrency` | clamp(8c, 8, 32) | 8 | 16 | 32 | 32 |
 | `system.maxTlsConnections`（每條約 30–60 KB，記憶體另由 09 收緊） | clamp(128c, 128, 2048) | 128 | 256 | 512 | 1,024（16 核 2,048） |
-| `system.maxTlsConnectionsPerIp`（3.3.2 起；IPv6 以 /64 算一個來源，本機不算；0 = 不限；DoQ / DoH3 握手完成才計入，未驗證的握手超過 QUIC 總上限的 1/4 時先 Retry） | 總上限 ÷ 8，限制在 8–64 | 16 | 32 | 64 | 64 |
+| `system.maxTlsConnectionsPerIp`（3.3.2 起；IPv6 以 /64 算一個來源，本機不算；0 = 不限；DoT 與 DoH 的 TCP 連線共用一份；DoQ / DoH3 握手完成才計入，未驗證的握手超過 QUIC 總上限的 1/4 時先 Retry；3.5.1 起 ÷ 4、16–256，以前 ÷ 8、8–64：四核心以上剛好 64 條，CGNAT、公司、學校共用 IP 時太容易撞到，見 01 第 1.1.2 節） | 總上限 ÷ 4，限制在 16–256 | 32 | 64 | 128 | 256 |
+| `system.maxDohInflight`（3.5.1；DoH 同時處理中的請求，HTTP/1.1、HTTP/2、HTTP/3、HTTP.sys 共用；滿了立刻回 503 busy，不排隊） | `maxTlsConnections` ÷ 2，限制在 64–1024 | 64 | 128 | 256 | 512（16 核 1,024） |
 | `system.maxQuicConnections`（0 = 不開 QUIC） | clamp(32c, 32, 512) | 32 | 64 | 128 | 256 |
 | `filter.maxUnindexed`（每次查詢都要跑的規則；每 2,000 條約 +0.5 ms/查詢，慢的 CPU 更多） | clamp(250c, 200, 2000) | 250 | 500 | 1,000 | 2,000 |
 

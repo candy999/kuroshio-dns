@@ -74,7 +74,17 @@ Windows 版跟 OpenWrt 版是同一個核心程式（`kuroshio.exe`），差別�
 - HTTP Server API 2.0：`HttpInitialize` → `HttpCreateServerSession` → `HttpCreateUrlGroup` → `HttpCreateRequestQueue` →
   `HttpSetUrlGroupProperty(HttpServerBindingProperty)` → `HttpAddUrlToUrlGroup`；兩條專用執行緒同步呼叫
   `HttpReceiveHttpRequest`（`COPY_BODY`），處理交給 tokio、跟 TCP 的 DoH 用同一個 `doh_core`（公開頁、社群、DoH 查詢）；
-  POST 剩下的內容（`HttpReceiveRequestEntityBody`）與回應（`HttpSendHttpResponse`）在 blocking 執行緒。內容上限、連線數上限跟 TCP 的 DoH 一樣
+  內容上限跟 TCP 的 DoH 一樣
+- 過載保護（3.5.1 K7、K8；上限與日誌見 [01 第 1.1.2 節](01-protocols.md#112-過載保護連線與請求的上限351)）：
+  - 同時處理中的請求跟 TCP 的 DoH 共用 `system.maxDohInflight`，**在接收的執行緒就判斷**：滿了（或記憶體不足）當場回 `503 busy`，
+    不排隊、不經過 tokio。不再佔 TLS 連線的名額（3.5.0 以前每個請求佔一個：處理不完的 DoH 請求讓 DoT 的新連線也被拒絕，DoQ 不受影響）
+  - 回應（`HttpSendHttpResponse`）加 `HTTP_SEND_RESPONSE_FLAG_BUFFER_DATA`（複製到 HTTP.sys 的緩衝區就返回，不等用戶端收到），
+    交給 2 條送回應的專用執行緒；名額送完才還，所以送回應的佇列不會無限長。POST 剩下的內容（`HttpReceiveRequestEntityBody`）交給 4 條讀內容的專用執行緒
+    （最多排 32 個，滿了回 `503 busy`）。3.5.0 以前兩者都在 tokio 的 blocking 執行緒（工作執行緒數的兩倍，跟清單重建、快照寫入共用、排隊沒有上限）：
+    高負載時回應越排越久，用戶端放棄了還在排，新的請求也等不到回應，壓力解除後要好幾分鐘才消化完
+  - 黑潮自己的網址群組設 `HttpServerTimeoutsProperty`：請求內容 10 秒內要送完（`EntityBody`）、在 HTTP.sys 佇列裡最多等 15 秒（`RequestQueue`）；
+    HTTP.sys 預設都是 2 分鐘。只設在自己的網址群組，不影響 IIS；設定失敗只記警告
+  - 每筆查詢最多 10 秒，逾時回 SERVFAIL。HTTP.sys 不通知用戶端放棄，所以放棄的請求最多佔 10 秒名額
 - 網址一律以 `/` 結尾（HTTP.sys 的規定，請求 `/dns-query` 也對得到 `/dns-query/`），埠號是 `listen.doh.port`（要跟 IIS 共用請設 443）
 - 公開頁：先登記 `https://<網域>:<埠>/`；已經被 IIS 站台登記（`ERROR_ALREADY_EXISTS`）時改登記公開頁實際用到的路徑
   （`/index.html`、`/robots.txt`、`/favicon.*`、`/qr.svg`、`/api/public/`、`/apple/`、詳細頁），首頁 `/` 照常由 IIS 處理

@@ -4,7 +4,10 @@
 //! - 登記：`https://<網域>:<埠>/dns-query/`、`https://<網域>:<埠>/.well-known/kuroshio/`，公開頁開啟時加上
 //!   `https://<網域>:<埠>/`；首頁已經被 IIS 站台登記時，改登記公開頁的實際路徑（`/api/public/`、`/apple/`…）
 //! - 請求交給跟 TCP DoH 一樣的 [`crate::encrypted::doh_core`] 處理；用戶端 IP 取自 HTTP.sys（不看 X-Forwarded-For）
-//! - 接收：兩條專用執行緒做同步的 `HttpReceiveHttpRequest`，處理交給 tokio；回應與讀剩下的內容走 `spawn_blocking`
+//! - 接收：兩條專用執行緒做同步的 `HttpReceiveHttpRequest`，處理交給 tokio；回應與讀剩下的內容各有專用執行緒
+//!   （[`Lane`]，有上限的佇列；3.5.1 K7 以前走 tokio 的 `spawn_blocking`，高負載時越排越長，連新的請求都等不到回應）
+//! - 同時處理中的請求有上限（[`crate::encrypted::DohGate`]，跟 TCP 的 DoH 共用）：在接收的執行緒就判斷，
+//!   滿了立刻回 503 busy；不再佔 TLS 連線的名額（3.5.1 K8：以前處理不完的 DoH 請求讓 DoT 的新連線也被拒絕）
 //! - 停止（重新載入、結束）：移除網址、`HttpShutdownRequestQueue`，最後一個參照放掉時關閉所有 handle
 //!
 //! 模式判斷、網址清單、Alt-Svc、urlacl 指令、標頭對照等純邏輯跨平台（在任何系統上都能測試）；呼叫 HTTP.sys 只在 Windows。
@@ -397,6 +400,45 @@ impl Drop for Server {
     }
 }
 
+/// 一個交給專用執行緒的工作
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// 固定幾條專用執行緒、佇列有上限（HTTP.sys 的同步呼叫用；3.5.1 K7）。
+///
+/// 不用 tokio 的 `spawn_blocking`：那裡的執行緒只有工作執行緒數的兩倍，跟清單重建、快照寫入共用，排隊沒有上限；
+/// 3.5.1 以前每個 DoH 回應都排在那裡，高負載時回應越排越久，用戶端放棄了還在排，壓力解除後還要好幾分鐘才消化完。
+/// 工作 panic 不會讓執行緒結束；`Lane` 丟掉時執行緒做完手上的就結束
+pub struct Lane {
+    tx: std::sync::mpsc::SyncSender<Job>,
+}
+
+impl Lane {
+    pub fn new(name: &str, threads: usize, cap: usize) -> std::io::Result<Lane> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(cap.max(1));
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for i in 0..threads.max(1) {
+            let rx = rx.clone();
+            std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || loop {
+                let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                match job {
+                    Ok(job) => {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                    Err(_) => break,
+                }
+            })?;
+        }
+        Ok(Lane { tx })
+    }
+
+    /// 交給專用執行緒（不等）；佇列滿了把工作還回來
+    pub fn try_run(&self, job: Job) -> Result<(), Job> {
+        self.tx.try_send(job).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(j) | std::sync::mpsc::TrySendError::Disconnected(j) => j,
+        })
+    }
+}
+
 /// auto 模式：TCP 埠是不是已經被 HTTP.sys / IIS 占用（試著綁定 + 看 HTTP.sys 已登記的網址）
 #[cfg(windows)]
 pub fn probe_port(hosts: &[IpAddr], port: u16) -> PortProbe {
@@ -440,19 +482,14 @@ pub fn registry_http3() -> (bool, bool) {
 pub use imp::start;
 
 #[cfg(not(windows))]
-pub fn start(
-    _p: &Prefixes,
-    _r: std::sync::Arc<crate::resolver::Resolver>,
-    _opts: crate::encrypted::DohOptions,
-    _limits: crate::encrypted::Limits,
-) -> anyhow::Result<Server> {
+pub fn start(_p: &Prefixes, _r: std::sync::Arc<crate::resolver::Resolver>, _opts: crate::encrypted::DohOptions) -> anyhow::Result<Server> {
     anyhow::bail!("HTTP.sys 只有 Windows 有")
 }
 
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use crate::encrypted::{doh_core, DohOptions, DohReq, Limits};
+    use crate::encrypted::{busy_reply, doh_core, note_body_busy, DohOptions, DohReq, DohSlot, Proto};
     use crate::resolver::Resolver;
     use anyhow::{bail, Result};
     use bytes::Bytes;
@@ -475,6 +512,15 @@ mod imp {
     /// 標頭最大 1 MB，超過直接回 431
     const MAX_HEADER_BUF: usize = 1 << 20;
     const RECEIVERS: usize = 2;
+    /// 送回應的專用執行緒（每次送出很快：回應先複製到 HTTP.sys 的緩衝區，不等用戶端收到）
+    const SENDERS: usize = 2;
+    /// 讀還沒送完的請求內容的專用執行緒、最多排幾個（滿了立刻回 503）；每個最多等 [`ENTITY_BODY_SECS`]
+    const READERS: usize = 4;
+    const READ_QUEUE: usize = 32;
+    /// HTTP.sys 的逾時（只設在黑潮自己的網址群組，不影響 IIS）：請求內容多久要送完、在佇列裡最多等多久。
+    /// HTTP.sys 的預設都是 2 分鐘（3.5.1 K7：負載降下來之後 DoH 還卡了約 2 分 10 秒）
+    const ENTITY_BODY_SECS: u16 = 10;
+    const REQUEST_QUEUE_SECS: u16 = 15;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -556,7 +602,10 @@ mod imp {
         rt: tokio::runtime::Handle,
         resolver: Arc<Resolver>,
         opts: DohOptions,
-        limits: Limits,
+        /// 送回應（佇列容量比處理中的上限大：處理中的名額送完才還，所以排不滿）
+        senders: Lane,
+        /// 讀還沒送完的請求內容
+        readers: Lane,
     }
 
     fn check(what: &str, rc: u32) -> Result<()> {
@@ -566,7 +615,7 @@ mod imp {
         Ok(())
     }
 
-    pub fn start(p: &Prefixes, resolver: Arc<Resolver>, opts: DohOptions, limits: Limits) -> Result<Server> {
+    pub fn start(p: &Prefixes, resolver: Arc<Resolver>, opts: DohOptions) -> Result<Server> {
         let rt = tokio::runtime::Handle::current();
         // SAFETY：以下都是 HTTP Server API 的標準呼叫順序，指標都指向這裡的區域變數
         let q = unsafe {
@@ -592,6 +641,25 @@ mod imp {
                     std::mem::size_of::<HTTP_BINDING_INFO>() as u32,
                 ),
             )?;
+            // 逾時只設在自己的網址群組；0 = 沿用 HTTP.sys 的預設。設定失敗只提醒（照預設的 2 分鐘）
+            let timeouts = HTTP_TIMEOUT_LIMIT_INFO {
+                Flags: HTTP_PROPERTY_FLAGS { _bitfield: 1 },
+                EntityBody: ENTITY_BODY_SECS,
+                DrainEntityBody: 0,
+                RequestQueue: REQUEST_QUEUE_SECS,
+                IdleConnection: 0,
+                HeaderWait: 0,
+                MinSendRate: 0,
+            };
+            let rc = HttpSetUrlGroupProperty(
+                q.group,
+                HttpServerTimeoutsProperty,
+                &timeouts as *const _ as *const _,
+                std::mem::size_of::<HTTP_TIMEOUT_LIMIT_INFO>() as u32,
+            );
+            if rc != NO_ERROR {
+                warn!("HTTP.sys：設定逾時失敗（錯誤碼 {rc}），請求內容與排隊照 HTTP.sys 預設最多等 2 分鐘");
+            }
             Arc::new(q)
         };
         let add = |url: &str| -> u32 {
@@ -631,11 +699,14 @@ mod imp {
             bail!("沒有任何網址登記成功：{}", why.join("；"));
         }
         let stopped = Arc::new(AtomicBool::new(false));
+        let senders = Lane::new("httpsys-send", SENDERS, opts.gate.max() + 64)?;
+        let readers = Lane::new("httpsys-body", READERS, READ_QUEUE)?;
         let shared = Arc::new(Shared {
             rt,
             resolver,
             opts,
-            limits,
+            senders,
+            readers,
         });
         let mut threads = Vec::new();
         for i in 0..RECEIVERS {
@@ -747,8 +818,7 @@ mod imp {
                     if buf.len() * 8 > SMALL {
                         buf = vec![0; SMALL / 8];
                     }
-                    let (q2, s2) = (q.clone(), s.clone());
-                    s.rt.spawn(serve(q2, s2, inc));
+                    dispatch(&q, &s, inc);
                 }
                 ERROR_MORE_DATA => {
                     // SAFETY：ERROR_MORE_DATA 時 RequestId 已經填好
@@ -799,43 +869,62 @@ mod imp {
         }
     }
 
-    async fn serve(q: Arc<Queue>, s: Arc<Shared>, inc: Incoming) {
+    /// 剛收到的請求（在接收的執行緒上）：內容還沒收完的交給讀內容的執行緒（都在忙就立刻回 503）；其他的直接 [`admit`]
+    fn dispatch(q: &Arc<Queue>, s: &Arc<Shared>, inc: Incoming) {
+        if !(inc.method == hyper::Method::POST && inc.more) {
+            admit(q, s, inc);
+            return;
+        }
+        let (id, peer, head) = (inc.id, inc.peer, inc.method == hyper::Method::HEAD);
+        let (q2, s2) = (q.clone(), s.clone());
+        let job: Job = Box::new(move || {
+            let mut inc = inc;
+            let first = std::mem::take(&mut inc.body);
+            match read_rest(&q2, inc.id, first).filter(|b| b.len() <= MAX_BODY) {
+                Some(b) => {
+                    inc.body = b;
+                    inc.more = false;
+                    admit(&q2, &s2, inc);
+                }
+                None => send(
+                    &q2,
+                    inc.id,
+                    413,
+                    &[("content-type", "text/plain; charset=utf-8".to_string())],
+                    Bytes::from_static(b"too large\n"),
+                    false,
+                ),
+            }
+        });
+        if s.readers.try_run(job).is_err() {
+            note_body_busy(peer);
+            send_busy(q, id, head);
+        }
+    }
+
+    /// 佔處理中的名額交給 tokio；滿了（或記憶體不足）就在這條執行緒上立刻回 503，不排隊、不經過 tokio
+    fn admit(q: &Arc<Queue>, s: &Arc<Shared>, inc: Incoming) {
+        match s.opts.gate.try_enter_mem() {
+            Some(slot) => {
+                s.rt.spawn(serve(q.clone(), s.clone(), inc, slot));
+            }
+            None => {
+                let proto = if inc.http3 { Proto::Doh3 } else { Proto::Doh };
+                s.opts.gate.note_busy(proto, inc.peer);
+                send_busy(q, inc.id, inc.method == hyper::Method::HEAD);
+            }
+        }
+    }
+
+    fn send_busy(q: &Queue, id: u64, head: bool) {
+        let (code, headers, body) = busy_reply();
+        send(q, id, code.as_u16(), &headers, body, head);
+    }
+
+    /// 處理一個請求（已經佔了處理中的名額 `slot`；查詢最多 10 秒，逾時回 SERVFAIL）
+    async fn serve(q: Arc<Queue>, s: Arc<Shared>, inc: Incoming, slot: DohSlot) {
         let head = inc.method == hyper::Method::HEAD;
         let id = inc.id;
-        let reply = |code: u16, body: &'static str| {
-            let q = q.clone();
-            tokio::task::spawn_blocking(move || {
-                send(
-                    &q,
-                    id,
-                    code,
-                    &[("content-type", "text/plain; charset=utf-8".to_string())],
-                    Bytes::from_static(body.as_bytes()),
-                    head,
-                )
-            })
-        };
-        let Some(_permit) = s.limits.admit() else {
-            let _ = reply(503, "busy\n").await;
-            return;
-        };
-        let body = if inc.method == hyper::Method::POST {
-            let (q2, first, more) = (q.clone(), inc.body, inc.more);
-            let b = if more {
-                tokio::task::spawn_blocking(move || read_rest(&q2, id, first)).await.ok().flatten()
-            } else {
-                Some(first)
-            };
-            match b.filter(|b| b.len() <= MAX_BODY) {
-                Some(b) => b,
-                None => {
-                    let _ = reply(413, "too large\n").await;
-                    return;
-                }
-            }
-        } else {
-            Vec::new()
-        };
         let (path, query) = split_raw_url(&inc.raw_url);
         let req = DohReq {
             method: inc.method,
@@ -845,14 +934,23 @@ mod imp {
             // HTTP.sys 直接給用戶端 IP，不採用 X-Forwarded-For
             forwarded_for: None,
             host: inc.host,
-            body,
+            body: inc.body,
         };
         let proto = if inc.http3 { "doh3" } else { "doh" };
-        let (code, headers, out) = doh_core(req, inc.peer, &s.resolver, &s.opts, proto).await;
-        let _ = tokio::task::spawn_blocking(move || send(&q, id, code.as_u16(), &headers, out, head)).await;
+        let (code, headers, out) = doh_core(req, inc.peer, &s.resolver, &s.opts, proto, true).await;
+        // 回應交給送回應的執行緒；名額送完才還（處理中的 = 還沒送出回應的，送回應的佇列不會無限長）
+        let job: Job = Box::new(move || {
+            send(&q, id, code.as_u16(), &headers, out, head);
+            drop(slot);
+        });
+        if let Err(job) = s.senders.try_run(job) {
+            // 不會發生（佇列比處理中的上限大）；萬一發生改用 tokio 的 blocking 執行緒
+            let _ = tokio::task::spawn_blocking(job).await;
+        }
     }
 
-    /// 送出整個回應（同步，回應很小）
+    /// 送出整個回應（同步，回應很小）。`BUFFER_DATA`：複製到 HTTP.sys 的緩衝區就返回，
+    /// 不等用戶端收到（3.5.1 K7：以前沒有這個旗標，同步送出可能要等網路，送回應的執行緒被延遲綁住）
     fn send(q: &Queue, id: u64, code: u16, headers: &[(&'static str, String)], body: Bytes, head: bool) {
         let mut resp: HTTP_RESPONSE_V2 = Default::default();
         let reason = http::StatusCode::from_u16(code)
@@ -900,7 +998,20 @@ mod imp {
         }
         let mut sent = 0u32;
         // SAFETY：所有指標（標頭、內容）在這個同步呼叫結束前都有效
-        let rc = unsafe { HttpSendHttpResponse(q.h, id, 0, &resp, null(), &mut sent, null(), 0, null_mut(), null()) };
+        let rc = unsafe {
+            HttpSendHttpResponse(
+                q.h,
+                id,
+                HTTP_SEND_RESPONSE_FLAG_BUFFER_DATA,
+                &resp,
+                null(),
+                &mut sent,
+                null(),
+                0,
+                null_mut(),
+                null(),
+            )
+        };
         if rc != NO_ERROR {
             debug!("HTTP.sys 回應失敗（錯誤碼 {rc}）");
         }
@@ -911,6 +1022,41 @@ mod imp {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 專用執行緒（3.5.1 K7）：佇列滿了立刻把工作還回來（不等、不排隊）；工作 panic 之後執行緒照常做下一個
+    #[test]
+    fn lane_is_bounded_and_survives_panics() {
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+        let lane = Lane::new("test-lane", 1, 1).unwrap();
+        let (hold_tx, hold_rx) = channel::<()>();
+        let (started_tx, started_rx) = channel::<()>();
+        // 第一個佔住唯一的執行緒
+        assert!(lane
+            .try_run(Box::new(move || {
+                started_tx.send(()).unwrap();
+                let _ = hold_rx.recv();
+            }))
+            .is_ok());
+        started_rx.recv().unwrap();
+        // 第二個排進佇列（容量 1）：它會 panic
+        assert!(lane.try_run(Box::new(|| panic!("測試用"))).is_ok());
+        // 第三個：滿了，立刻還回來
+        let t0 = Instant::now();
+        assert!(lane.try_run(Box::new(|| {})).is_err(), "滿了");
+        assert!(t0.elapsed() < Duration::from_millis(100), "不等");
+        hold_tx.send(()).unwrap();
+        // panic 之後同一條執行緒照常做下一個
+        let (done_tx, done_rx) = channel::<u32>();
+        let mut job: Job = Box::new(move || done_tx.send(4).unwrap());
+        let t0 = Instant::now();
+        while let Err(back) = lane.try_run(job) {
+            assert!(t0.elapsed() < Duration::from_secs(2), "佇列一直沒有空出來");
+            job = back;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(4));
+    }
 
     #[test]
     fn mode_decision() {

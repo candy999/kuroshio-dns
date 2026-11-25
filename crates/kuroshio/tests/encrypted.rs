@@ -357,3 +357,162 @@ fn cert_hot_reload() {
     assert!(store.reload());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// 上游：名稱以 `slow` 開頭的永遠不回（模擬卡住的查詢），其他的馬上回 A 9.8.7.6
+async fn upstream_with_stuck() -> SocketAddr {
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = s.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (len, peer) = s.recv_from(&mut buf).await.unwrap();
+            let Ok(q) = Message::parse(&buf[..len]) else { continue };
+            if q.questions.first().is_some_and(|x| x.name.starts_with("slow")) {
+                continue;
+            }
+            let mut r = Message::response_to(&q, 0);
+            r.opt = None;
+            r.answers.push(Record::a(&q.questions[0].name, 120, Ipv4Addr::new(9, 8, 7, 6)));
+            let _ = s.send_to(&r.encode(), peer).await;
+        }
+    });
+    addr
+}
+
+/// 卡住的查詢要等很久才會被解析器放棄（上游逾時 8 秒）：測試的動作都在這之前做完
+fn stuck_resolver(dir: &std::path::Path, up: SocketAddr) -> std::sync::Arc<kuroshio::resolver::Resolver> {
+    let cfg = kuroshio_config::with_overrides(&json!({
+        "system": { "persistDir": dir.join("state").to_string_lossy() },
+        "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
+        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false, "timeoutMs": 8000 }
+    }));
+    kuroshio::app::build_resolver(&cfg).unwrap()
+}
+
+async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let t0 = std::time::Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(3), "等不到：{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 3.5.1 K9：DoT 連線被重設時，卡住的查詢馬上取消、連線名額馬上還回來，新連線照常接受。
+/// 以前要等卡住的查詢自己結束（這裡 8 秒以上），這段期間新連線一律被拒絕
+#[tokio::test]
+async fn dot_reset_releases_connection_slot() {
+    let dir = std::env::temp_dir().join(format!("kuroshio-enc-dotreset-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let der = write_cert(&dir);
+    kuroshio::tls::add_root(der);
+    let r = stuck_resolver(&dir, upstream_with_stuck().await);
+    let certs = kuroshio::encrypted::CertStore::new(dir.join("cert.pem"), dir.join("key.pem"));
+    assert!(certs.reload());
+    // 總共只收 1 條（本機不算每個來源的上限，這裡用總數測同一套名額）
+    let limits = kuroshio::encrypted::Limits::new(1);
+    let dot = kuroshio::encrypted::listen_dot("127.0.0.1:0".parse().unwrap(), certs, r, limits.clone())
+        .await
+        .unwrap();
+    let refused0 = kuroshio::resolver::perf::json()["server"]["refused"]["dot"]["total"]
+        .as_u64()
+        .unwrap();
+    // A：送一筆會卡住的查詢
+    let mut a = kuroshio::tls::connect_addrs("127.0.0.1", &[dot], &[b"dot"], Duration::from_secs(3))
+        .await
+        .unwrap();
+    let mut f = (q(1, "slow.example.com").len() as u16).to_be_bytes().to_vec();
+    f.extend_from_slice(&q(1, "slow.example.com"));
+    a.write_all(&f).await.unwrap();
+    a.flush().await.unwrap();
+    wait_until("A 佔著唯一的名額", || limits.in_use() == 1).await;
+    // 名額滿了：新連線在 TLS 握手之前就被關閉，有計數
+    let b = kuroshio::tls::connect_addrs("127.0.0.1", &[dot], &[b"dot"], Duration::from_secs(2)).await;
+    assert!(b.is_err(), "滿了要拒絕");
+    let refused = kuroshio::resolver::perf::json()["server"]["refused"]["dot"]["total"]
+        .as_u64()
+        .unwrap();
+    assert!(refused > refused0, "拒絕有計數：{refused0} → {refused}");
+    // A 被重設（用戶端放棄：SO_LINGER 0 再關閉 = 送 RST）
+    let (tcp, _) = a.into_inner();
+    #[allow(deprecated)]
+    tcp.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(tcp);
+    wait_until("被重設的連線馬上還名額（不等卡住的查詢）", || {
+        limits.in_use() == 0
+    })
+    .await;
+    // 新連線照常查得到
+    let u = Upstream::parse(&format!("tls://{dot}")).unwrap();
+    let m = Message::parse(&u.exchange(&q(2, "fast.example.com"), Duration::from_secs(3)).await.unwrap()).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 3.5.1 K7：DoH 處理中的請求滿了**立刻**回 503 busy（不排隊）；用戶端放棄（HTTP/2 RST_STREAM）後名額馬上還回來
+#[tokio::test]
+async fn doh_busy_is_immediate_and_abandoned_requests_free_slots() {
+    let dir = std::env::temp_dir().join(format!("kuroshio-enc-dohbusy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let r = stuck_resolver(&dir, upstream_with_stuck().await);
+    let gate = kuroshio::encrypted::DohGate::new(1);
+    let opts = kuroshio::encrypted::DohOptions::new("/dns-query", gate.clone());
+    // 純 HTTP（h2c）：不用憑證
+    let doh = kuroshio::encrypted::listen_doh("127.0.0.1:0".parse().unwrap(), None, r, opts, kuroshio::encrypted::Limits::new(64))
+        .await
+        .unwrap();
+    let tcp = tokio::net::TcpStream::connect(doh).await.unwrap();
+    let (mut h2c, conn) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let post = |h2c: &mut h2::client::SendRequest<bytes::Bytes>, body: Vec<u8>| {
+        let req = http::Request::post(format!("http://{doh}/dns-query"))
+            .header("content-type", "application/dns-message")
+            .body(())
+            .unwrap();
+        let (resp, mut send) = h2c.send_request(req, false).unwrap();
+        send.send_data(bytes::Bytes::from(body), true).unwrap();
+        resp
+    };
+    // A：卡住的查詢佔著唯一的名額
+    h2c = h2c.ready().await.unwrap();
+    let stuck = post(&mut h2c, q(1, "slow.example.com"));
+    wait_until("A 佔著名額", || gate.in_use() == 1).await;
+    // B：滿了 → 立刻 503 busy
+    h2c = h2c.ready().await.unwrap();
+    let t0 = std::time::Instant::now();
+    let resp = tokio::time::timeout(Duration::from_secs(2), post(&mut h2c, q(2, "fast.example.com")))
+        .await
+        .expect("滿了要立刻回應，不排隊")
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.headers()["retry-after"], "1");
+    let mut body = resp.into_body();
+    let mut text = Vec::new();
+    while let Some(Ok(c)) = body.data().await {
+        text.extend_from_slice(&c);
+    }
+    assert_eq!(text, b"busy\n");
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    // A 的用戶端放棄（丟掉回應 = RST_STREAM CANCEL）：伺服器丟掉處理中的請求，名額馬上還回來
+    drop(stuck);
+    wait_until("放棄的請求還名額", || gate.in_use() == 0).await;
+    // C：照常回答
+    h2c = h2c.ready().await.unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(3), post(&mut h2c, q(3, "fast.example.com")))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+    let mut out = Vec::new();
+    while let Some(Ok(c)) = body.data().await {
+        out.extend_from_slice(&c);
+    }
+    let m = Message::parse(&out).unwrap();
+    assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)));
+    assert!(kuroshio::resolver::perf::json()["server"]["dohBusy"].as_u64().unwrap() >= 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
