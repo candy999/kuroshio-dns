@@ -575,6 +575,8 @@
             { "key": "system.workerThreads", "type": "int", "label": "工作執行緒數", "help": "0 = 依 CPU 核心數自動決定。重新啟動程式後生效。", "pro": true, "min": 0 },
             { "key": "system.maxTlsConnections", "type": "int", "label": "TLS 同時連線上限", "help": "預設依 CPU 核心數（每核 128，128–2048）；記憶體接近保留量時新連線最多 32 條。", "pro": true, "min": 1 },
             { "key": "system.maxQuicConnections", "type": "int", "label": "QUIC 同時連線上限", "help": "預設依 CPU 核心數（每核 32，32–512）；0 = 不開 QUIC。", "pro": true, "min": 0 },
+            { "key": "system.maxTlsConnectionsPerIp", "type": "int", "label": "每個來源的 TLS 連線上限", "help": "同一個來源 IP 最多幾條 DoT／DoH 連線。留空 = 自動：TLS 同時連線上限的 1/4（16–256）；CGNAT、公司、學校共用 IP 很多人時調大；0 = 不限。", "pro": true, "min": 0 },
+            { "key": "system.maxDohInflight", "type": "int", "label": "DoH 同時處理上限", "help": "同時在處理的 DoH 請求數，滿了立刻回 503 busy（用戶端會改用別台）。留空 = 自動：TLS 同時連線上限的一半（64–1024）。", "pro": true, "min": 1 },
             { "key": "system.memoryWatchdog", "type": "bool", "label": "記憶體監看（關掉記憶體控制時仍然依保留量暫停背景工作）", "pro": true },
             { "key": "system.memoryGovernor", "type": "bool", "label": "記憶體控制", "help": "系統可用記憶體低於保留量時依序讓出記憶體：診斷緩衝 → DNS 快取 → CDN 冷資料移到磁碟 → （真的不足時）優先順序最低的過濾清單 → 只轉送（暫停 CDN 調整、快取最小）→ 最後才暫停保護清單。區網的 DNS 轉送永遠不停。寬裕後依相反順序恢復。", "pro": true },
             { "key": "system.memoryReserveMB", "type": "int", "label": "記憶體保留量（MB）", "help": "系統可用記憶體至少留這麼多給其他程式；低於它就讓出記憶體，高於它 + 遲滯才恢復、才讓快取長大。0 = 自動（Linux：max(16 MB, 5%, min_free_kbytes × 3)；Windows：max(128 MB, 5%)）。缺口是其他程式造成、黑潮全部讓出也補不了時只停止長大、不讓出。跟百分比都填時取大的。", "pro": true, "min": 0, "placeholder": "0" },
