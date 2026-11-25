@@ -547,6 +547,8 @@ pub struct FindInputs {
     pub friends_failing3: usize,
     /// 節點池裡可用的節點數（不含壞的、最近節點型；`reach-none` 用）
     pub pool_nodes: usize,
+    /// 記憶體控制的摘要（3.5.1 H3；記憶體控制關著是 None）
+    pub memory: Option<crate::memgov::MemSummary>,
 }
 
 fn state(key: &'static str, sev: Sev, on: bool, text: String) -> Obs {
@@ -652,6 +654,46 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
         text: "抽查上游黑潮給的答案不通過（憑證不符），解除了串接，稍後重試".into(),
         min_count: 0,
     });
+
+    // 記憶體（3.5.1 H3）：以前吃緊、不足、連保護清單都暫停時只寫日誌，狀態頁、管理頁的發現清單看不到（D3 壓測）
+    if let Some(m) = &i.memory {
+        use crate::memgov::State;
+        let mb = |b: u64| (b + 512 * 1024) / (1024 * 1024);
+        let avail = m.avail.map_or_else(|| "量不到".to_string(), |a| format!("{} MB", mb(a)));
+        let shed = if m.shed.is_empty() {
+            "還沒有讓出任何東西".to_string()
+        } else {
+            format!("已經讓出：{}", m.shed.join("、"))
+        };
+        let tail = if m.protected {
+            "；連保護清單都暫停了，只剩自訂規則".to_string()
+        } else if m.floor {
+            "；只轉送（CDN 調整暫停、快取最小）".to_string()
+        } else {
+            String::new()
+        };
+        out.push(state(
+            "memory-tight",
+            Sev::Warn,
+            !m.futile && m.state == State::Tight,
+            format!("記憶體吃緊（系統可用 {avail}，保留 {} MB）：停止長大，{shed}{tail}", mb(m.reserve)),
+        ));
+        out.push(state(
+            "memory-critical",
+            Sev::Warn,
+            !m.futile && m.state == State::Critical,
+            format!("記憶體不足（系統可用 {avail}，保留 {} MB）：{shed}{tail}", mb(m.reserve)),
+        ));
+        out.push(state(
+            "memory-futile",
+            Sev::Info,
+            m.futile,
+            format!(
+                "系統可用記憶體 {avail}、低於保留量 {} MB，是其他程式造成的：黑潮只停止長大、照常回答",
+                mb(m.reserve)
+            ),
+        ));
+    }
 
     // 清單副本
     if let Some(n) = i.lists_without_copy {
@@ -853,6 +895,7 @@ fn find_inputs(st: &AppState, now: u64) -> FindInputs {
         lists_without_copy: st.filter.as_ref().and_then(|f| f.lists_without_copy()),
         fresh: fresh_items(&fresh_inputs(st)),
         friends_failing3: st.community.as_ref().and_then(|c| c.sync_summary()).map_or(0, |s| s.failing3),
+        memory: st.memgov.as_ref().map(|g| g.finding_summary()),
     }
 }
 

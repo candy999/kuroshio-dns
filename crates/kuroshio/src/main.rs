@@ -2034,10 +2034,7 @@ async fn memory_plan_cmd(config: &std::path::Path, uci: bool, ram: Vec<u64>, bit
         reserve_pct: n("system.memoryReservePercent"),
         rules,
         protected_rules: protected,
-        cache_max: match n("resolver.cacheMax") {
-            0 => 100_000,
-            c => c,
-        },
+        cache_max: kuroshio_config::cache_max(&cfg, Some(total)),
         bench_conc: conc,
     };
     let a = match bits {

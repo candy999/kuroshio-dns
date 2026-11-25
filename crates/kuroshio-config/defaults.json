@@ -165,7 +165,7 @@
     "serveStaleSec": 3600,
     "prefetchThresholdSec": 5,
     "prefetchRecentSec": 600,
-    "cacheMax": 100000,
+    "cacheMax": "auto",
     "sendEcs": true,
     "lastResort": [
       "udp://8.8.8.8",

@@ -925,7 +925,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | 設定 | 作用 |
 |---|---|
 | `system.memoryReserveMB` / `system.memoryReservePercent` | 加大保留量：黑潮 DNS 更早讓出（兩個都填取大的） |
-| `resolver.cacheMax` | DNS 快取筆數上限（預設 100,000；記憶體控制另外會依可用記憶體收緊） |
+| `resolver.cacheMax` | DNS 快取筆數上限（預設 `auto`：實體記憶體 × 8% ÷ 600 bytes，4,000～100 萬；3.5.1 以前固定 100,000。記憶體控制另外會依可用記憶體收緊） |
 | `benchmark.concurrency` | 每日評測同時測幾個候選 |
 | `cdn.verifyConcurrency` | CDN 節點驗證同時幾個（每個都是 TLS 握手） |
 | `cdn.lite` | 3.4.2：`auto`（預設，實體記憶體小於 160 MB 時減量）／`true`／`false`（UCI 是 `config cdn` 的 `option lite '1'`／`'0'`）。減量不是關掉：只驗證問過 2 次以上的網域、驗證每分鐘最多 30 個、節點池測速 4 個節點；狀態的 `cdn.lite` 與 `cdn.stats.liteWaited`、`liteCapped`（都是次數：還沒驗證完的網域每查一次就再算一次，不是網域數） |

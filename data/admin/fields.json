@@ -240,7 +240,7 @@
             { "key": "resolver.prefetchThresholdSec", "type": "int", "label": "剩餘 TTL 低於幾秒就預取", "min": 0 },
             { "key": "resolver.prefetchRecentSec", "type": "int", "label": "最近幾秒內有人查才預取", "min": 0 },
             { "key": "resolver.keepNames", "type": "list", "label": "通訊類網域（自己加）", "help": "推播、通訊服務的網域後綴（一行一個，最多 64 個），跟內建的 Apple 推播、Firebase 雲端訊息一樣：不被過濾清單誤擋、快到期就預取、記憶體吃緊時優先留在快取、不換到別家 CDN。" },
-            { "key": "resolver.cacheMax", "type": "int", "label": "快取筆數上限", "min": 0 },
+            { "key": "resolver.cacheMax", "type": "int", "label": "快取筆數上限", "help": "留空 = 自動：依實體記憶體換算（實體記憶體的 8%，每筆約 600 bytes；4,000～100 萬筆）。實際大小再由記憶體控制依可用記憶體決定。", "min": 0 },
             { "key": "resolver.sendEcs", "type": "bool", "label": "對上游附帶 ECS（本機對外 IP 的 /24）" },
             { "key": "resolver.stripEch", "type": "bool", "label": "移除 HTTPS 記錄的 ECH", "help": "某些網路環境下 ECH 會讓網站連不上時再打開。" },
             { "key": "resolver.dnssec", "type": "bool", "label": "本機 DNSSEC 驗證" },

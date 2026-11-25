@@ -818,6 +818,19 @@ struct ShedRec {
     at: u64,
 }
 
+/// [`Governor::finding_summary`] 的內容
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemSummary {
+    pub state: State,
+    pub avail: Option<u64>,
+    pub reserve: u64,
+    pub futile: bool,
+    pub floor: bool,
+    pub protected: bool,
+    /// 讓出了哪些（步驟名稱，依順序、不重複）
+    pub shed: Vec<&'static str>,
+}
+
 /// 同一步可以一輪一輪讓出的（CDN 冷資料，3.5.1 G1）：同一步最多留這麼多筆紀錄，再多就併進最舊的那一筆
 const SHED_RECS_PER_STEP: usize = 4;
 
@@ -945,6 +958,25 @@ impl Governor {
     /// 目前是不是「於事無補」
     pub fn is_futile(&self) -> bool {
         self.inner.lock().unwrap().futile.on
+    }
+
+    /// 發現清單用的摘要（3.5.1 H3）：狀態、可用與保留量、讓出了哪些（依步驟、不重複）、只轉送、保護清單暫停、於事無補
+    pub fn finding_summary(&self) -> MemSummary {
+        let (state, avail, futile, mut shed) = {
+            let i = self.inner.lock().unwrap();
+            let labels: Vec<&'static str> = i.shed.iter().map(|s| s.label).collect();
+            (i.hyst.state, i.last.avail, i.futile.on, labels)
+        };
+        shed.dedup();
+        MemSummary {
+            state,
+            avail,
+            reserve: self.reserve.bytes,
+            futile,
+            floor: self.at_floor(),
+            protected: self.steps.iter().any(|s| s.key() == "protected" && s.is_shed()),
+            shed,
+        }
     }
 
     /// 到了最低限度（只轉送）

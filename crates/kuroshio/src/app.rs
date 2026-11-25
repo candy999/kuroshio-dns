@@ -51,7 +51,8 @@ pub fn build_resolver(cfg: &Value) -> Result<Arc<Resolver>> {
     if ups.active().is_empty() && ups.backup().is_empty() {
         bail!("沒有可用的上游（upstream.pinned / upstream.fallback / resolver.lastResort）");
     }
-    let cache_max = get(cfg, "resolver.cacheMax").and_then(Value::as_u64).unwrap_or(100_000) as usize;
+    // 3.5.1 H2：沒填（"auto"）時依實體記憶體換算
+    let cache_max = kuroshio_config::cache_max(cfg, crate::sysinfo::mem_bytes().0) as usize;
     let iprank = Arc::new(IpRank::new(cfg, cache_max / 2));
     // 區網網域交給本機 dnsmasq（OpenWrt 的 UCI 轉換會在需要時設定 resolver.localForward）
     let local = get(cfg, "resolver.localForward").and_then(|lf| {

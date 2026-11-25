@@ -389,7 +389,80 @@ fn noisy_inputs() -> FindInputs {
         }],
         friends_failing3: 1,
         pool_nodes: 0,
+        memory: Some(crate::memgov::MemSummary {
+            state: crate::memgov::State::Critical,
+            avail: Some(13 << 20),
+            reserve: 36 << 20,
+            futile: false,
+            floor: true,
+            protected: false,
+            shed: vec!["縮小 DNS 快取", "暫時停用過濾清單"],
+        }),
     }
+}
+
+#[test]
+fn memory_findings_follow_governor_state() {
+    // 3.5.1 H3：記憶體吃緊、不足時發現清單有 WARN（以前只寫日誌），於事無補時只是說明（Info）
+    let on = |m: crate::memgov::MemSummary| -> Vec<(&'static str, String)> {
+        let i = FindInputs {
+            now: NOW,
+            memory: Some(m),
+            ..FindInputs::default()
+        };
+        rules(&i, &[])
+            .0
+            .into_iter()
+            .filter_map(|o| match o {
+                Obs::State {
+                    key, on: true, text, sev, ..
+                } if key.starts_with("memory-") => {
+                    assert_eq!(sev == Sev::Warn, key != "memory-futile", "{key}");
+                    Some((key, text))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let base = crate::memgov::MemSummary {
+        state: crate::memgov::State::Comfortable,
+        avail: Some(200 << 20),
+        reserve: 36 << 20,
+        futile: false,
+        floor: false,
+        protected: false,
+        shed: vec![],
+    };
+    assert!(on(base.clone()).is_empty(), "寬裕：沒有");
+    let tight = on(crate::memgov::MemSummary {
+        state: crate::memgov::State::Tight,
+        avail: Some(30 << 20),
+        shed: vec!["縮小 DNS 快取"],
+        ..base.clone()
+    });
+    assert_eq!(tight.len(), 1);
+    assert_eq!(tight[0].0, "memory-tight");
+    assert!(
+        tight[0].1.contains("系統可用 30 MB，保留 36 MB") && tight[0].1.contains("縮小 DNS 快取"),
+        "{}",
+        tight[0].1
+    );
+    let crit = on(crate::memgov::MemSummary {
+        state: crate::memgov::State::Critical,
+        avail: Some(8 << 20),
+        protected: true,
+        floor: true,
+        ..base.clone()
+    });
+    assert_eq!(crit[0].0, "memory-critical");
+    assert!(crit[0].1.contains("連保護清單都暫停了"), "{}", crit[0].1);
+    let futile = on(crate::memgov::MemSummary {
+        state: crate::memgov::State::Critical,
+        futile: true,
+        ..base
+    });
+    assert_eq!(futile.len(), 1);
+    assert_eq!(futile[0].0, "memory-futile");
 }
 
 #[test]
@@ -415,6 +488,7 @@ fn finding_text_has_no_domain_or_client_ip() {
         "cdn-db-pruning",
         "job-failing",
         "friends-sync-failing",
+        "memory-critical",
         "reach-single-pop",
         "pop-mismatch",
         "pop-switched",

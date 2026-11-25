@@ -79,6 +79,35 @@ pub fn auto_verify_per_min(host: &Host) -> u64 {
     }
 }
 
+/// `resolver.cacheMax` 的 `"auto"`（3.5.1 H2，規格 05 第 7 節）：DNS 快取的筆數上限依實體記憶體換算——
+/// 實體記憶體的 [`CACHE_SHARE_PERCENT`]% ÷ 每筆約 [`CACHE_ENTRY_BYTES`] bytes，夾在 [`CACHE_MIN`]～[`CACHE_MAX`]。
+/// 這是上限，實際大小照舊由記憶體控制決定（接近保留量停止長大、吃緊縮小）。量不到實體記憶體時用 10 萬（3.5.0 的固定值）。
+///
+/// 以前所有機器都是 10 萬：448 MB 的 D3 跟 64 GB 的電腦一樣。大機器用不到它的記憶體，小機器在大量新網域時一路長到保留量才開始讓，
+/// 而 musl 的配置器釋放的小塊記憶體不太還給系統，讓出來的效果打折（3.5.0 D3 壓測）
+pub fn auto_cache_max(mem_total: Option<u64>) -> u64 {
+    match mem_total {
+        Some(t) => (t / 100 * CACHE_SHARE_PERCENT / CACHE_ENTRY_BYTES).clamp(CACHE_MIN, CACHE_MAX),
+        None => 100_000,
+    }
+}
+
+/// [`auto_cache_max`]：拿實體記憶體的幾 % 給 DNS 快取
+pub const CACHE_SHARE_PERCENT: u64 = 8;
+/// [`auto_cache_max`]：每筆快取估計多少記憶體（鍵、答案、雜湊表的一格與配置器的額外開銷）
+pub const CACHE_ENTRY_BYTES: u64 = 600;
+/// [`auto_cache_max`] 的下限、上限
+pub const CACHE_MIN: u64 = 4_000;
+pub const CACHE_MAX: u64 = 1_000_000;
+
+/// `resolver.cacheMax`：使用者填的數字照填的；`"auto"`、沒寫 → [`auto_cache_max`]
+pub fn cache_max(cfg: &Value, mem_total: Option<u64>) -> u64 {
+    match num_or_auto(get(cfg, "resolver.cacheMax")) {
+        Some(n) => n,
+        None => auto_cache_max(mem_total),
+    }
+}
+
 /// 依 CPU 核心數換算的設定（`"auto"` 或沒寫時套用；規格 05 第 7 節）。
 /// 每一項：（路徑，每個核心多少，下限，上限）；`resolver.parallel`、`cdn.verifyPerMin` 也看 AES，另外處理
 pub const PER_CORE: [(&str, u64, u64, u64); 11] = [
@@ -486,6 +515,29 @@ mod tests {
             get(&one, "jobs.cdn-scan.enabled"),
             Some(&json!(true)),
             "背景工作不再依等級停用：記憶體夠時才跑"
+        );
+    }
+
+    #[test]
+    fn cache_max_follows_physical_memory() {
+        // 3.5.1 H2：依實體記憶體換算；使用者填的照填的
+        const MB: u64 = 1024 * 1024;
+        let a = |mb: u64| auto_cache_max(Some(mb * MB));
+        assert_eq!(a(16), CACHE_MIN, "很小的機器有下限");
+        assert_eq!(a(64), 8_947);
+        assert_eq!(a(128), 17_895);
+        assert_eq!(a(448), 62_634, "D3");
+        assert_eq!(a(512), 71_582);
+        assert_eq!(a(1024), 143_165);
+        assert_eq!(a(64 * 1024), CACHE_MAX, "大機器有上限");
+        assert_eq!(auto_cache_max(None), 100_000, "量不到：同 3.5.0");
+        assert_eq!(get(&defaults(), "resolver.cacheMax"), Some(&json!("auto")));
+        assert_eq!(cache_max(&defaults(), Some(448 * MB)), 62_634);
+        assert_eq!(cache_max(&json!({ "resolver": { "cacheMax": 9999 } }), Some(448 * MB)), 9999);
+        assert_eq!(
+            cache_max(&json!({ "resolver": { "cacheMax": "7777" } }), Some(448 * MB)),
+            7777,
+            "UCI 給字串"
         );
     }
 

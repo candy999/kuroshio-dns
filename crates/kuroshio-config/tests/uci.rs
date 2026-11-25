@@ -488,13 +488,13 @@ fn bad_numbers_warn() {
     for bad in ["5k", "-1x", "1e5", "inf", "0x10"] {
         let text = default_text().replace(
             "config resolver 'resolver'",
-            &format!("config resolver 'resolver'\n\toption cache_max '{bad}'"),
+            &format!("config resolver 'resolver'\n\toption warm_names '{bad}'"),
         );
         let (c, warns) = load_warn(&text);
-        assert_eq!(g(&c, "resolver.cacheMax"), g(&d, "resolver.cacheMax"), "{bad}");
+        assert_eq!(g(&c, "resolver.warmNames"), g(&d, "resolver.warmNames"), "{bad}");
         let want = format!(
-            "UCI 選項 resolver.cache_max = '{bad}' 不是有效的數字，改用預設值 {}",
-            g(&d, "resolver.cacheMax")
+            "UCI 選項 resolver.warm_names = '{bad}' 不是有效的數字，改用預設值 {}",
+            g(&d, "resolver.warmNames")
         );
         assert!(warns.contains(&want), "{bad}：{warns:?}");
     }
