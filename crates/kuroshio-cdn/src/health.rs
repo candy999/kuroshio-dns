@@ -208,7 +208,10 @@ impl Cdn {
                                 x.peak_ms = Num::V(util::round(r.ms, 2));
                                 x.peak_at = Some(now);
                             }
-                            if d.bad.remove(&r.ip).is_some() {
+                            // 驗證反覆標壞的節點（3.5.1 K2）：暫停時間還沒到，健檢通過也不恢復
+                            // （健檢連的是業者自己的網站，證明不了對那個網站可以用）
+                            let held = d.strikes.get(&r.ip).is_some_and(|s| s.held(now));
+                            if !held && d.bad.remove(&r.ip).is_some() {
                                 changed = true;
                             }
                         } else if let std::collections::hash_map::Entry::Vacant(e) = d.bad.entry(r.ip) {

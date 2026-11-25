@@ -72,6 +72,82 @@ async fn verifier_error_1034_then_fail_and_backoff() {
     assert!(c.state().pools.is_restricted("cloudflare", ip("104.16.161.36")));
 }
 
+/// 3.5.1（Azure「台北換台北」）：驗證時原本的答案已經落在台灣機房 → 當成已是台灣、不換，也不再試候選節點。
+/// 不算驗證失敗、不加失敗次數、不標壞節點；「一定換」與 `cdn.slowerFallback: false` 照舊換
+#[tokio::test]
+async fn verifier_original_already_in_taiwan_is_not_replaced() {
+    let name = "www.example.com";
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        st.db.touch(name, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|_, _| cf_ok("TPE"));
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("fail"));
+    assert_eq!(net.calls("https ").len(), 1, "只連了原本的 IP：{:?}", net.calls("https "));
+    {
+        let st = c.state();
+        let v = st.db.get(name).unwrap().v4.clone().unwrap();
+        assert!(v.is("fail"));
+        assert_eq!(v.fails, Some(0), "不加失敗次數");
+        assert_eq!(crate::verifier::orig_tw_pop(&v), Some("TPE"));
+        assert!(v.reason.as_deref().unwrap().contains("台灣機房"), "{:?}", v.reason);
+        let until = v.until.unwrap();
+        assert!(
+            until > now_ms() + 5 * 3_600_000 && until <= now_ms() + 6 * 3_600_000 + 1000,
+            "6 小時後再看"
+        );
+        assert!(st.pools.p["cloudflare"].bad.is_empty(), "不標壞節點");
+        assert!(st.pools.zone.is_empty(), "不記相容性");
+    }
+    let s = c.stats();
+    assert_eq!((s.orig_tw, s.verify_fail, s.verify_ok), (1, 0, 0));
+    // 查詢路徑：照原本的答案（走既有的「驗證失敗 → 原始」），不縮短 TTL、不重新驗證
+    let mut m = msg(name, 1, &["104.21.0.5"], vec![]);
+    let r = c.apply(&mut m, name, 1);
+    assert_eq!(answer_ips(&m, 1), ["104.21.0.5"]);
+    assert!(r.rewritten.is_none() && r.ttl_cap.is_none(), "{r:?}");
+    assert!(c.take_tasks().is_empty());
+    let v = c.explain(name, crate::explain::Context::default());
+    assert_eq!(v["decision"], "already-tw", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("TPE"), "{v}");
+
+    // 到期之後原本的答案改到國外：照常換台灣節點，`origTw` 清掉
+    c.with_state(|st| st.db.set_verdict(name, 4, |v| v.until = Some(1)));
+    net.on_https(|i, _| cf_ok(if i == ip("104.21.0.5") { "HKG" } else { "TPE" }));
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+    let v = c.state().db.get(name).unwrap().v4.clone().unwrap();
+    assert!(v.is("ok") && crate::verifier::orig_tw_pop(&v).is_none(), "{v:?}");
+
+    // 手動「一定換」：照使用者的
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        st.db.touch(name, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+        st.db.set_policy(name, crate::db::Policy::Always);
+    });
+    net.on_https(|_, _| cf_ok("TPE"));
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+    // `cdn.slowerFallback: false`：驗證通過就換，跟 3.5.0 一樣
+    let (c, net) = setup(json!({ "slowerFallback": false }));
+    c.with_state(|st| {
+        st.db.touch(name, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|_, _| cf_ok("TPE"));
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+    // 原本的回應不正常（5xx）：不當成已是台灣
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        st.db.touch(name, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|i, _| {
+        if i == ip("104.21.0.5") {
+            resp(502, &[("cf-ray", "x-TPE"), ("server", "cloudflare")], "")
+        } else {
+            cf_ok("TPE")
+        }
+    });
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+}
+
 #[tokio::test]
 async fn verifier_network_failure_is_unknown_and_marks_bad() {
     let (c, net) = setup(json!({}));
@@ -84,9 +160,17 @@ async fn verifier_network_failure_is_unknown_and_marks_bad() {
     let v = st.db.get("u.test").unwrap().v4.clone().unwrap();
     assert!(v.is("unknown"));
     assert_eq!(v.reason.as_deref(), Some("連線失敗 ECONNRESET"));
+    // 3.5.1 K2：只有一個網站連不上還不暫停（可能是那個網站的問題）；1 小時內第 2 個網站也連不上才暫停
+    assert!(st.pools.p["cloudflare"].bad.is_empty(), "一個網站還不暫停");
+    drop(st);
+    c.with_state(|st| {
+        st.db.touch("u2.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    assert_eq!(c.verify("u2.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("unknown"));
+    let st = c.state();
     assert!(
         st.pools.p["cloudflare"].bad.contains_key(&ip("104.16.161.36")),
-        "原站可以連、台灣節點連不上 → 暫停"
+        "原站可以連、台灣節點對兩個網站都連不上 → 暫停"
     );
 }
 
@@ -117,7 +201,8 @@ async fn verifier_http_only_site() {
         st.db.touch("ocsp.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
     });
     net.on_https(|_, _| fail("ECONNREFUSED"));
-    net.on_http(|_, _| resp(200, &[("cf-ray", "x-TPE")], "ok"));
+    // 原本的答案落在國外（落在台灣機房的話 3.5.1 起不換）
+    net.on_http(|i, _| resp(200, &[("cf-ray", if i == ip("104.21.0.5") { "x-HKG" } else { "x-TPE" })], "ok"));
     assert_eq!(c.verify("ocsp.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
     assert_eq!(c.state().db.get("ocsp.test").unwrap().v4.as_ref().unwrap().http, Some(true));
 }
@@ -152,7 +237,7 @@ async fn verifier_tries_community_hints_first() {
         st.db.touch("h.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
         // 好友給的 IP 不在我的節點池：驗證成功也不會拿來回給用戶端，但命中率照算
     });
-    net.on_https(|_, _| cf_ok("TPE"));
+    net.on_https(|i, _| cf_ok(if i == ip("104.21.0.5") { "NRT" } else { "TPE" }));
     c.verify("h.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await;
     assert!(net.calls("https 104.16.99.1").len() == 1);
     let https: Vec<String> = net.calls("https ");
@@ -196,7 +281,7 @@ async fn verifier_hint_outside_provider_range_is_never_probed() {
     c.with_state(|st| {
         st.db.touch("hr.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
     });
-    net.on_https(|_, _| cf_ok("TPE"));
+    net.on_https(|i, _| cf_ok(if i == ip("104.21.0.5") { "NRT" } else { "TPE" }));
     assert_eq!(c.verify("hr.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
     assert!(net.calls("https 203.0.113.9").is_empty(), "範圍外的不試");
     assert!(net.calls("https 2606:4700::1").is_empty(), "家族不符的不試");
@@ -251,7 +336,7 @@ async fn verifier_http_only_requires_consistent_https() {
             ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true)
         }
     });
-    net.on_http(|_, _| resp(200, &[("cf-ray", "x-TPE")], "ok"));
+    net.on_http(|i, _| resp(200, &[("cf-ray", if i == ip("104.21.0.5") { "x-HKG" } else { "x-TPE" })], "ok"));
     assert_eq!(c.verify("mix.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("unknown"));
     let v = c.state().db.get("mix.test").unwrap().v4.clone().unwrap();
     assert!(!v.is("ok"));
@@ -361,6 +446,200 @@ async fn health_check_marks_and_sorts() {
     assert_eq!(d.bad[&ip("104.18.20.216")].reason, "POP=HKG");
     drop(st);
     assert_eq!(low.lock().unwrap().as_slice(), ["cloudflare"], "可用節點不足：通知重建節點池");
+}
+
+/// 3.5.1 K2：同一個節點反覆被驗證標壞，暫停時間逐次加倍（30 → 60 → 120 分鐘…最多 8 小時），
+/// 暫停期間健檢通過也不恢復；24 小時沒再發生就從頭算；紀錄有上限
+#[tokio::test]
+async fn repeated_mark_bad_doubles_hold_and_health_respects_it() {
+    let (c, net) = setup(json!({}));
+    let (a, b) = (ip("192.0.2.1"), ip("192.0.2.2"));
+    c.with_state(|st| {
+        let mut x = PoolNode::new(a);
+        x.ms = Num::V(3.0);
+        let mut y = PoolNode::new(b);
+        y.ms = Num::V(4.0);
+        st.pools.p.get_mut("cloudflare").unwrap().pool4 = vec![x, y];
+    });
+    net.on_http(|_, _| cf_ok("TPE"));
+    net.on_ping(|_| lat(2.5));
+    let age = |c: &Cdn, min: u64| {
+        c.with_state(|st| {
+            let d = st.pools.p.get_mut("cloudflare").unwrap();
+            d.strikes.get_mut(&a).unwrap().at = now_ms() - min * 60_000;
+        })
+    };
+    let bad = |c: &Cdn| c.state().pools.p["cloudflare"].bad.contains_key(&a);
+    // 第 1 次：30 分鐘
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "驗證 www.example.com 時 TIMEOUT"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].hold_ms(), 30 * 60_000);
+    age(&c, 10);
+    c.health_check().await;
+    assert!(bad(&c), "暫停中：健檢通過也不恢復");
+    age(&c, 31);
+    c.health_check().await;
+    assert!(!bad(&c), "過了 30 分鐘：健檢通過就恢復");
+    // 第 2 次（24 小時內）：60 分鐘
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "驗證 www.example.com 時 TIMEOUT"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].n, 2);
+    age(&c, 31);
+    c.health_check().await;
+    assert!(bad(&c), "第 2 次要 60 分鐘");
+    age(&c, 61);
+    c.health_check().await;
+    assert!(!bad(&c));
+    // 第 3 次：120 分鐘；別的節點不受影響
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "x"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].hold_ms(), 120 * 60_000);
+    assert!(!c.state().pools.p["cloudflare"].bad.contains_key(&b));
+    // 上限 8 小時
+    let s = crate::pools::Strike { n: 30, at: 0 };
+    assert_eq!(s.hold_ms(), crate::pools::STRIKE_MAX_MS);
+    // 24 小時沒再發生：從 1 算
+    age(&c, 25 * 60);
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "x"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].n, 1);
+    // 紀錄有上限
+    c.with_state(|st| {
+        let d = st.pools.p.get_mut("cloudflare").unwrap();
+        for i in 0..400u32 {
+            d.strike(IpAddr::from(std::net::Ipv4Addr::from(0xC633_6400 + i)), now_ms());
+        }
+        assert!(d.strikes.len() <= crate::pools::STRIKE_CAP);
+    });
+}
+
+/// 3.5.1 K2：驗證時連不上，同一個節點 1 小時內第 2 個不同的網站也連不上才暫停；
+/// 保留最後一段的 CDN（Fastly）以 /24 算，到門檻時暫停網段裡節點池的節點
+#[tokio::test]
+async fn conn_fail_needs_two_sites_before_pausing() {
+    let (c, _net) = setup(json!({}));
+    let pf = |s: &str| crate::util::parse_prefix24(s).unwrap();
+    let (cf, node) = (ip("192.0.2.1"), ip("198.51.100.2"));
+    c.with_state(|st| {
+        st.pools.p.get_mut("cloudflare").unwrap().pool4 = vec![PoolNode::new(cf)];
+        let d = st.pools.p.get_mut("fastly").unwrap();
+        let mut n = PoolNode::new(node);
+        n.pop = Some(intern("HKG"));
+        n.ms = Num::V(26.0);
+        n.score = Num::V(28.0);
+        d.pool4 = vec![n];
+        d.prefixes = [("HKG".to_string(), vec![pf("198.51.100")])].into_iter().collect();
+    });
+    c.with_state(|st| {
+        let p = &mut st.pools;
+        assert!(!p.note_conn_fail("cloudflare", cf, "a.example.com", "x"));
+        assert!(!p.note_conn_fail("cloudflare", cf, "a.example.com", "x"), "同一個網站再一次不算");
+        assert!(p.p["cloudflare"].bad.is_empty());
+        assert!(p.note_conn_fail("cloudflare", cf, "b.example.com", "x"), "第 2 個網站：暫停");
+        assert!(p.p["cloudflare"].bad[&cf].reason.contains("2 個網站"));
+        // Fastly：同一個 /24、不同最後一段（不同網站的憑證組）
+        assert!(!p.note_conn_fail("fastly", ip("198.51.100.140"), "a.example.com", "x"));
+        assert!(p.p["fastly"].bad.is_empty() && p.p["fastly"].bad24.is_empty());
+        assert!(p.note_conn_fail("fastly", ip("198.51.100.77"), "b.example.com", "x"));
+        assert!(p.p["fastly"].bad.contains_key(&node), "暫停網段裡節點池的節點");
+        // 超過 1 小時的紀錄不算
+        assert!(!p.note_conn_fail("fastly", ip("203.0.113.1"), "a.example.com", "x"));
+        p.p.get_mut("fastly")
+            .unwrap()
+            .conn_fails
+            .values_mut()
+            .for_each(|x| x.at = now_ms() - 61 * 60_000);
+        assert!(!p.note_conn_fail("fastly", ip("203.0.113.1"), "b.example.com", "x"));
+        assert!(p.p["fastly"].bad24.is_empty());
+    });
+}
+
+/// 3.5.1 K2：一個網站對 3 個以上不同的台灣節點都連不上（例如只接受業者專用 IP）：記在網站上（`fail`、逐次拉長），
+/// 不暫停那些節點；節點對別的網站照常可以用
+#[tokio::test]
+async fn site_failing_on_many_nodes_is_recorded_on_site_not_nodes() {
+    let name = "www.example.com";
+    let (c, net) = setup(json!({}));
+    let nodes = ips(&["192.0.2.1", "192.0.2.2", "198.51.100.1", "198.51.100.2"]);
+    c.with_state(|st| {
+        st.pools.p.get_mut("cloudflare").unwrap().pool4 = nodes.iter().map(|i| PoolNode::new(*i)).collect();
+        st.db.touch(name, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|i, _| if i == ip("104.21.0.5") { cf_ok("NRT") } else { fail("ECONNRESET") });
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("fail"));
+    {
+        let st = c.state();
+        let d = &st.pools.p["cloudflare"];
+        assert!(d.bad.is_empty() && d.conn_fails.is_empty(), "節點沒有被暫停、也沒有記");
+        let v = st.db.get(name).unwrap().v4.clone().unwrap();
+        assert!(v.is("fail"));
+        assert_eq!(v.fails, Some(1));
+        assert!(v.reason.as_deref().unwrap().contains("試了 4 個台灣節點都連不上"), "{:?}", v.reason);
+        assert!(v.until.unwrap() > now_ms() + 5 * 3_600_000, "照一般失敗逐次拉長（6 小時起）");
+    }
+    // 第二次失敗：12 小時
+    c.with_state(|st| st.db.set_verdict(name, 4, |v| v.until = Some(1)));
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("fail"));
+    let v = c.state().db.get(name).unwrap().v4.clone().unwrap();
+    assert_eq!(v.fails, Some(2));
+    assert!(v.until.unwrap() > now_ms() + 11 * 3_600_000);
+    // 只連不上 1～2 個（其他通過）：網站驗證通過；那個節點只記一筆，還沒暫停
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        st.pools.p.get_mut("cloudflare").unwrap().pool4 = nodes.iter().map(|i| PoolNode::new(*i)).collect();
+        st.db.touch(name, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "104.21.0.5" => cf_ok("NRT"),
+        "192.0.2.1" => fail("ECONNRESET"),
+        _ => cf_ok("TPE"),
+    });
+    assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+    let st = c.state();
+    let d = &st.pools.p["cloudflare"];
+    assert!(d.bad.is_empty());
+    assert_eq!(d.conn_fails.len(), 1);
+}
+
+/// 3.5.1 K2：GitHub Pages（Fastly 的業者專用 IP）照原本的答案，不驗證；別的 Fastly IP 照舊
+#[test]
+fn github_pages_dedicated_ips_are_not_rewritten() {
+    use crate::providers::dedicated_ip;
+    for s in [
+        "185.199.108.153",
+        "185.199.109.153",
+        "185.199.110.153",
+        "185.199.111.153",
+        "2606:50c0:8000::153",
+        "2606:50c0:8003::153",
+    ] {
+        assert!(dedicated_ip("fastly", ip(s)), "{s}");
+    }
+    for s in [
+        "185.199.108.133",
+        "185.199.112.153",
+        "2606:50c0:8004::153",
+        "2606:50c0:8000::154",
+        "151.101.1.140",
+    ] {
+        assert!(!dedicated_ip("fastly", ip(s)), "{s}");
+    }
+    assert!(!dedicated_ip("cloudflare", ip("185.199.108.153")));
+    let (c, _net) = setup(json!({}));
+    let name = "www.example.com";
+    for _ in 0..3 {
+        let mut m = msg(
+            name,
+            1,
+            &["185.199.108.153", "185.199.109.153"],
+            vec![cname(name, "example.github.io", 300)],
+        );
+        let r = c.apply(&mut m, name, 1);
+        assert_eq!(r.provider, Some("fastly"));
+        assert!(r.rewritten.is_none() && r.ttl_cap.is_none(), "{r:?}");
+        assert!(r.tags.iter().any(|t| t.contains("業者專用 IP")), "{:?}", r.tags);
+        assert_eq!(answer_ips(&m, 1), ["185.199.108.153", "185.199.109.153"]);
+        assert!(c.take_tasks().is_empty(), "不驗證、不跨 CDN");
+    }
+    assert_eq!(c.stats().dedicated, 3);
+    let v = c.explain(name, crate::explain::Context::default());
+    assert_eq!(v["decision"], "dedicated-ip", "{v}");
 }
 
 #[tokio::test]
@@ -584,6 +863,8 @@ fn provider_by_cname_matches_plain_suffix_scan() {
         all.iter()
             .find(|(suf, _)| h == *suf || (h.len() > suf.len() && h.ends_with(suf) && h.as_bytes()[h.len() - suf.len() - 1] == b'.'))
             .map(|x| x.1)
+            // 有編號的後綴（3.5.1）：索引沒命中才比規則
+            .or_else(|| crate::providers::last2(&h).and_then(|k| crate::providers::provider_by_pattern(&h, k)))
     };
     let mut n = 0;
     for (suf, _) in &all {

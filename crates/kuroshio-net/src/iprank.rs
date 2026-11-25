@@ -219,7 +219,7 @@ impl IpRank {
     /// 整體最多等 `timeout` + 200 ms。
     ///
     /// 以前查詢路徑跟背景工作一樣排隊等名額、沒有期限：每秒幾百個新網域時排隊越排越長，排在後面的查詢工作等上好幾分鐘，
-    /// 同名同類型的查詢（合併成一筆往上游問）全部跟著等——「`www.google.com` A 卡住、AAAA 正常」（3.5.0 D3、Windows 壓測）
+    /// 同名同類型的查詢（合併成一筆往上游問）全部跟著等——「熱門網站的 A 記錄卡住、AAAA 正常」（3.5.0 D3、Windows 壓測）
     pub async fn rank_now(self: &Arc<Self>, ips: &[IpAddr]) -> Vec<(IpAddr, Latency)> {
         let mut uniq: Vec<IpAddr> = Vec::new();
         for ip in ips {

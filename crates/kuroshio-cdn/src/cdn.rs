@@ -119,6 +119,10 @@ pub struct Stats {
     pub slower_first: u32,
     /// 退回之後重驗不慢、回到台灣節點的次數（3.5.0 F9）
     pub slower_returned: u32,
+    /// 驗證時原本的答案已經在台灣機房、不換的次數（3.5.1；不算在 `verify_fail`）
+    pub orig_tw: u32,
+    /// 業者專用 IP（GitHub Pages 這類，只有那幾個位址服務它）照原本的答案回的次數（3.5.1 K2）
+    pub dedicated: u32,
     /// 內建服務（時間同步、連線偵測、憑證撤銷、地震速報）照原本的答案回、不改寫的次數（3.5.0 F11；
     /// 計數在 `Cdn` 的原子計數器，查詢路徑不拿狀態鎖，讀的時候才填進來）
     pub essential_kept: u32,

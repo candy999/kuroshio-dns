@@ -444,9 +444,11 @@ fn default_config_path() -> PathBuf {
     }
 }
 
-/// 預設的日誌過濾：設定的等級，加上 QUIC 函式庫只記錯誤
+/// 預設的日誌過濾：設定的等級，加上 QUIC 函式庫只記錯誤。
+/// `quinn_udp`（3.5.1 K3）：UDP 送不出去（例如 Windows 的 `sendmsg error: 10040` 封包太大）是 WARN、每分鐘最多一行，
+/// QUIC 本來就會重送、逾時，上游失敗由黑潮自己的上游成敗紀錄處理；`KUROSHIO_LOG=quinn_udp=warn` 可以打開
 fn default_log_directives(level: &str) -> String {
-    format!("{level},quinn_proto=error,quinn=warn")
+    format!("{level},quinn_proto=error,quinn=warn,quinn_udp=error")
 }
 
 /// 記錄到檔案（Windows 服務用）：超過 5 MB 時改名成 .old 再重新開始
@@ -2458,5 +2460,16 @@ async fn shutdown_signal() -> StopReason {
     {
         let _ = tokio::signal::ctrl_c().await;
         StopReason::CtrlC
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// QUIC 函式庫的日誌預設只記錯誤（3.5.1 K3 加上 `quinn_udp`：Windows 的 `sendmsg error` 不洗版）
+    #[test]
+    fn default_log_quiets_quic_libraries() {
+        let d = super::default_log_directives("info");
+        assert_eq!(d, "info,quinn_proto=error,quinn=warn,quinn_udp=error");
+        assert!(tracing_subscriber::EnvFilter::try_new(&d).is_ok());
     }
 }

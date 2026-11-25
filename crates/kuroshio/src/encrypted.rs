@@ -1207,7 +1207,8 @@ fn quic_server(certs: &Arc<CertStore>, alpn: &[&[u8]], max_conns: u32) -> Result
     let tls = certs.server_config(alpn);
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| anyhow!("QUIC TLS 設定：{e}"))?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let mut t = quinn::TransportConfig::default();
+    // 不做路徑 MTU 探測（3.5.1 K3，同用戶端）
+    let mut t = kuroshio_net::quic::dns_transport();
     t.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
     // 每條連線同時最多 128 筆查詢（雙向串流）
     t.max_concurrent_bidi_streams(128u32.into());

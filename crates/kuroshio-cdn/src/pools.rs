@@ -258,6 +258,52 @@ pub struct Bad {
     pub quality: bool,
 }
 
+/// 同一個位址反覆被驗證標成壞的（3.5.1 K2）：第 n 次暫停 [`STRIKE_BASE_MS`] × 2^(n−1)，最多 [`STRIKE_MAX_MS`]；
+/// 最後一次之後 [`STRIKE_FORGET_MS`] 沒再發生就從頭算。暫停期間健檢通過也不恢復（健檢只連業者自己的網站，
+/// 證明不了「對這個網站可以用」）
+pub const STRIKE_BASE_MS: u64 = BAD24_MS;
+pub const STRIKE_MAX_MS: u64 = 8 * util::HOUR_MS;
+pub const STRIKE_FORGET_MS: u64 = util::DAY_MS;
+/// 每家 CDN 最多記幾個位址（超過丟掉最舊的）
+pub const STRIKE_CAP: usize = 256;
+
+/// 一個位址被驗證標成壞的次數與最後一次的時間（3.5.1 K2）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strike {
+    pub n: u32,
+    pub at: u64,
+}
+
+impl Strike {
+    /// 這一次暫停多久
+    pub fn hold_ms(&self) -> u64 {
+        (STRIKE_BASE_MS << self.n.saturating_sub(1).min(8)).min(STRIKE_MAX_MS)
+    }
+    /// 還在暫停中
+    pub fn held(&self, now: u64) -> bool {
+        now < self.at.saturating_add(self.hold_ms())
+    }
+}
+
+/// 驗證時連不上（3.5.1 K2）：同一個節點在 [`CONN_FAIL_WINDOW_MS`] 內對 [`CONN_FAIL_SITES`] 個以上不同的網站都連不上，
+/// 才算節點的問題、暫停節點。只有一個網站連不上多半是那個網站的問題（例如只接受業者專用 IP），
+/// 由驗證結果記在網站上（`verifier.rs`）
+pub const CONN_FAIL_SITES: usize = 2;
+pub const CONN_FAIL_WINDOW_MS: u64 = util::HOUR_MS;
+
+/// 一個節點的連不上紀錄（3.5.1 K2）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnFail {
+    pub at: u64,
+    /// 網站名稱的雜湊（最多 [`CONN_FAIL_SITES`] 個）
+    pub sites: Vec<u32>,
+}
+
+/// 網站名稱的雜湊（FNV-1a，只用來分辨「是不是同一個網站」）
+fn site_hash(name: &str) -> u32 {
+    name.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193))
+}
+
 /// IP 的分類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cls {
@@ -356,6 +402,10 @@ pub struct ProviderPools {
     pub prefixes: IndexMap<String, Vec<u32>>,
     pub bad: HashMap<IpAddr, Bad>,
     pub bad24: HashMap<u32, Bad>,
+    /// 驗證反覆標成壞的位址（3.5.1 K2，暫停時間逐次加倍）。換節點池（`replace()`）時不清，下次再失敗照樣加倍
+    pub strikes: HashMap<IpAddr, Strike>,
+    /// 驗證時連不上的節點（3.5.1 K2）：節點（保留最後一段的 CDN 是 /24）→ 第一次的時間與連不上的網站（雜湊）
+    pub conn_fails: HashMap<IpAddr, ConnFail>,
     /// IPv6 即時發現：每個 /48 上次嘗試時間
     pub tried6: IndexMap<u128, u64>,
     /// pools.json 裡這家的其他欄位（updatedAt、tw48、prefixes…）
@@ -385,6 +435,23 @@ impl ProviderPools {
             return Some(if self.tw48.contains(ip) { Cls::Tw } else { Cls::Global });
         }
         None
+    }
+
+    /// 記一次（3.5.1 K2）：上一次超過 [`STRIKE_FORGET_MS`] 就從 1 算；有上限（丟掉最舊的）
+    pub fn strike(&mut self, ip: IpAddr, now: u64) -> Strike {
+        self.strikes.retain(|_, s| now.saturating_sub(s.at) <= STRIKE_FORGET_MS);
+        let n = self.strikes.get(&ip).map_or(0, |s| s.n);
+        if n == 0 && self.strikes.len() >= STRIKE_CAP {
+            if let Some(old) = self.strikes.iter().min_by_key(|(_, s)| s.at).map(|(k, _)| *k) {
+                self.strikes.remove(&old);
+            }
+        }
+        let s = Strike {
+            n: n.saturating_add(1),
+            at: now,
+        };
+        self.strikes.insert(ip, s);
+        s
     }
 
     /// 範圍與分類是不是同一份（比指標）
@@ -1210,7 +1277,7 @@ impl Pools {
         let mut ip = ip;
         if octet {
             if let Some(pf) = util::prefix24(ip) {
-                match d.pool4.iter().find(|x| util::prefix24(x.ip) == Some(pf)) {
+                match d.pool4.iter().find(|x| util::prefix24(x.ip) == Some(pf)).map(|x| x.ip) {
                     None => {
                         d.bad24.retain(|_, b| now.saturating_sub(b.at) <= BAD24_MS);
                         d.bad24.insert(
@@ -1224,10 +1291,11 @@ impl Pools {
                         warn!("{provider} 網段 {}.0/24 暫停使用：{reason}", util::prefix24_str(pf));
                         return;
                     }
-                    Some(e) => ip = e.ip,
+                    Some(node) => ip = node,
                 }
             }
         }
+        let s = d.strike(ip, now);
         d.bad.insert(
             ip,
             Bad {
@@ -1236,11 +1304,53 @@ impl Pools {
                 quality: false,
             },
         );
-        warn!("{provider} 節點 {ip} 暫停使用：{reason}");
+        if s.n > 1 {
+            warn!(
+                "{provider} 節點 {ip} 暫停使用（24 小時內第 {} 次，{} 分鐘內健檢通過也不恢復）：{reason}",
+                s.n,
+                s.hold_ms() / 60_000
+            );
+        } else {
+            warn!("{provider} 節點 {ip} 暫停使用：{reason}");
+        }
         let fam = if ip.is_ipv6() { 6 } else { 4 };
         if self.pool_size(provider, fam) < self.cfg.min_pool {
             self.request_rebuild(provider);
         }
+    }
+
+    /// 驗證某個網站時連不上這個節點（3.5.1 K2）：記下來，1 小時內第 2 個不同的網站也連不上才暫停（`mark_bad()`）。
+    /// 保留最後一段的 CDN（Fastly）以 /24 為單位算（不同網站用的最後一段不同）。回傳有沒有暫停
+    pub fn note_conn_fail(&mut self, provider: &str, ip: IpAddr, site: &str, reason: &str) -> bool {
+        let octet = self.octet_mode(provider);
+        let Some(d) = self.p.get_mut(provider) else { return false };
+        let key = match (octet, util::prefix24(ip)) {
+            (true, Some(pf)) => util::ip_of(pf, 0),
+            _ => ip,
+        };
+        let now = now_ms();
+        d.conn_fails.retain(|_, c| now.saturating_sub(c.at) <= CONN_FAIL_WINDOW_MS);
+        if !d.conn_fails.contains_key(&key) && d.conn_fails.len() >= STRIKE_CAP {
+            if let Some(old) = d.conn_fails.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| *k) {
+                d.conn_fails.remove(&old);
+            }
+        }
+        let h = site_hash(site);
+        let c = d.conn_fails.entry(key).or_insert_with(|| ConnFail {
+            at: now,
+            sites: Vec::new(),
+        });
+        if !c.sites.contains(&h) {
+            c.sites.push(h);
+        }
+        if c.sites.len() < CONN_FAIL_SITES {
+            return false;
+        }
+        let n = c.sites.len();
+        d.conn_fails.remove(&key);
+        // `mark_bad()` 照舊處理保留最後一段的 CDN：網段裡有節點池的節點就暫停那個節點，沒有就暫停整個 /24
+        self.mark_bad(provider, ip, &format!("{reason}（1 小時內 {n} 個網站都連不上）"));
+        true
     }
 
     pub fn request_rebuild(&mut self, provider: &str) {
@@ -1261,6 +1371,10 @@ impl Pools {
                         let mut v = serde_json::to_value(x).unwrap_or_default();
                         if let (Some(b), Some(m)) = (d.bad.get(&x.ip), v.as_object_mut()) {
                             m.insert("bad".into(), json!(b.reason));
+                            // 24 小時內被驗證標壞的次數（3.5.1 K2）
+                            if let Some(s) = d.strikes.get(&x.ip) {
+                                m.insert("strikes".into(), json!(s.n));
+                            }
                         }
                         v
                     })

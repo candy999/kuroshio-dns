@@ -5,6 +5,7 @@
 //! - 只有 CNAME 的廠商只做網域蒐集與分析（設定裡開 `ecs: true` 也會嘗試 ECS 突破）
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 
 /// 回應標頭（名稱小寫）
@@ -40,6 +41,9 @@ pub struct Provider {
     /// DNS 的答案只是它的起點。只辨識與統計，不改寫、不 ECS、不跨 CDN（`cdn.appLayer` 可以關，
     /// 個別網域可以用 `/api/cdn/policy` 設成「一定換」）
     pub app_layer: bool,
+    /// 台灣本地的 CDN（3.5.1）：節點本來就在台灣（中華電信 HiNet CDN）。只辨識、標成「已是台灣」，
+    /// 不換、不 ECS、不跨 CDN（個別網域可以用 `/api/cdn/policy` 設成「一定換」）
+    pub tw_native: bool,
 }
 
 const fn base(name: &'static str, label: &'static str, cname: &'static [&'static str]) -> Provider {
@@ -59,7 +63,13 @@ const fn base(name: &'static str, label: &'static str, cname: &'static [&'static
         extra_v4: &[],
         extra_v6: &[],
         app_layer: false,
+        tw_native: false,
     }
+}
+
+const fn tw_native(mut p: Provider) -> Provider {
+    p.tw_native = true;
+    p
 }
 
 const fn app_layer(mut p: Provider) -> Provider {
@@ -161,10 +171,16 @@ pub static PROVIDERS: &[Provider] = &[
             "tdnsv6.com",
             "cdntip.com",
             "qcloudcdn.com",
+            // EdgeOne 的 `eo.dnseN.com` 還有其他編號：由 [`CNAME_PATTERNS`] 比對，這兩個留著（索引直接命中）
             "eo.dnse0.com",
             "eo.dnse1.com",
             "edgeone.app",
             "dsa.dnsv1.com",
+            // 3.5.1（B11 比對）：跟 `tdnsv6.com` 一樣的 `*.sched.*` 命名；`.cn` 的兩個權威 DNS 是 DNSPod
+            "ovscdns.com",
+            "ovscdns.net",
+            // SOA 跟 `tdnsv6.com` 完全一樣
+            "apdcdn.com",
         ],
     )),
     capable(base(
@@ -180,17 +196,39 @@ pub static PROVIDERS: &[Provider] = &[
             "alicdngslb.com",
             "tbcache.com",
             "w.alikunlun.com",
+            // 3.5.1：官方文件寫的是「`*.*kunlun*.com`」，其他 `kunlunXX.com` 由 [`CNAME_PATTERNS`] 比對
+            "kunluncan.com",
+            "kunlunaq.com",
+            "kunlunpi.com",
+            // `queniuXX.com` 由 [`CNAME_PATTERNS`] 比對
         ],
     )),
     capable(base(
         "wangsu",
         "Wangsu / ChinaNetCenter",
-        &["wscdns.com", "wsglb0.com", "chinanetcenter.com", "lxdns.com", "wscloudcdn.com", "ourwebpic.com"],
+        &[
+            "wscdns.com",
+            "wsglb0.com",
+            "chinanetcenter.com",
+            "lxdns.com",
+            "wscloudcdn.com",
+            "ourwebpic.com",
+            // 3.5.1：權威 DNS 跟既有的網宿後綴同一組（`cdn30.org`）
+            "wswebpic.com",
+            "wswebcdn.com",
+            "cdn20.com",
+            "cdn30.com",
+            "wsdvs.com",
+            // 權威 DNS 是自己的，但主機名稱用網宿的 `wsall.` 慣例
+            "wcdnga.com",
+        ],
     )),
     capable(base(
         "bytedance",
         "BytePlus / Volcengine",
-        &["bytecdn.cn", "bytedns.net", "volcgslb.com", "bytegslb.com", "tiktokcdn.com", "byteeffecttos.com", "bytednsdoc.com"],
+        &["bytecdn.cn", "bytedns.net", "volcgslb.com", "bytegslb.com", "tiktokcdn.com", "byteeffecttos.com", "bytednsdoc.com",
+          // 3.5.1：權威 DNS 是火山引擎（`volc-dns`）
+          "cdnbuild.net", "bytefcdn.com", "byteoversea.net"],
     )),
     // Google（影音、更新下載）與 Apple（系統更新、App Store）：節點由服務自己排程，標成 App 層（3.5.0 B3）
     app_layer(base(
@@ -203,9 +241,26 @@ pub static PROVIDERS: &[Provider] = &[
         "Apple CDN",
         &["aaplimg.com", "apple-dns.net", "cdn-apple.com", "apple.com.edgekey.net"],
     ))),
-    base("microsoft", "Microsoft", &["msedge.net", "trafficmanager.net", "msecnd.net", "vo.msecnd.net", "footprintdns.com"]),
+    base(
+        "microsoft",
+        "Microsoft",
+        &[
+            "msedge.net",
+            "trafficmanager.net",
+            "msecnd.net",
+            "vo.msecnd.net",
+            "footprintdns.com",
+            // 3.5.1（B11 比對）：Microsoft 365 的前端（SharePoint、Office 線上版…）
+            "spo-msedge.net",
+            "spov-msedge.net",
+            "t-s1-msedge.net",
+            "bx-msedge.net",
+            "wac-msedge.net",
+        ],
+    ),
     base("stackpath", "StackPath / Highwinds", &["stackpathdns.com", "hwcdn.net", "netdna-cdn.com", "netdna-ssl.com"]),
     base("imperva", "Imperva", &["incapdns.net", "impervadns.net"]),
+    // `vercel-dns-0NN.com` 這類有編號的由 [`CNAME_PATTERNS`] 比對
     base("vercel", "Vercel", &["vercel-dns.com", "vercel.app"]),
     base("netlify", "Netlify", &["netlify.app", "netlifyglobalcdn.com"]),
     base("keycdn", "KeyCDN", &["kxcdn.com"]),
@@ -214,7 +269,133 @@ pub static PROVIDERS: &[Provider] = &[
     base("github", "GitHub Pages", &["github.io", "githubusercontent.com"]),
     base("shopify", "Shopify", &["myshopify.com", "shops.myshopify.com"]),
     base("line", "LINE CDN", &["line-scdn.net", "line-apps.com"]),
+    // ---- 3.5.1 新增：只認得（CNAME 辨識），沒有官方公布的台灣節點範圍，黑潮不換（收或不收的理由見規格 06 第 3.13 節）----
+    // 台灣本地的 CDN：節點本來就在台灣，標成「已是台灣」
+    tw_native(base("hinet", "中華電信 HiNet CDN", &["cdn.hinet.net"])),
+    base("baishan", "白山雲 Baishan", &["bsclink.cn", "trpcdn.net", "bsgslb.cn", "bsgslb.com", "baishan-cloud.net"]),
+    base("jiashule", "知道創宇 加速樂", &["jiashule.com"]),
+    base("baidu", "百度智能雲 CDN", &["shifen.com", "jomodns.com"]),
+    // `cdnhwcN.com`、`cdnhwcxxxNNN.com`（權威 DNS 是華為雲）由 [`CNAME_PATTERNS`] 比對
+    base("huawei", "華為雲 CDN", &[]),
+    base("ksyun", "金山雲 CDN", &["ksyuncdn.com"]),
+    base("radware", "Radware Cloud WAF", &["radwarecloud.net"]),
+    base("f5xc", "F5 Distributed Cloud", &["ves.io"]),
+    // `yundunwafN.com`、`aliyunwafN.com` 由 [`CNAME_PATTERNS`] 比對
+    base("aliwaf", "阿里雲 WAF", &[]),
+    base("huaweiwaf", "華為雲 WAF", &["huaweicloudwaf.com"]),
+    base("wpengine", "WP Engine", &["wpeproxy.com"]),
+    base("hostinger", "Hostinger CDN", &["cdn.hstgr.net"]),
+    base("jstream", "J-Stream", &["stream.ne.jp"]),
 ];
+
+/// 有編號的 CNAME 後綴（3.5.1）：倒數第二段是「固定前綴＋數字或英文字母」，編號會一直增加，不逐一列舉。
+/// 只在 [`provider_by_cname`] 的索引沒命中時比（幾個位元組的前綴比對，不配置）。
+/// 名單來自 2026-11-25 壓測的 CNAME 精簡表（B11）：同一家業者有好幾個編號時才用規則
+struct CnamePattern {
+    /// 倒數第二段的開頭（小寫）
+    prefix: &'static str,
+    /// 開頭之後接幾個字元（最少，最多）
+    len: (usize, usize),
+    /// 接的是什麼
+    tail: Tail,
+    /// 最後一段（小寫）
+    tld: &'static str,
+    /// 倒數第三段一定要是其中一個（`eo.dnse2.com` 的 `eo`）；空的 = 不限
+    before: &'static [&'static str],
+    provider: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum Tail {
+    /// 只有數字
+    Digits,
+    /// 只有英文字母
+    Letters,
+    /// 英文字母（可以沒有）接著至少一個數字（`cdnhwc2`、`cdnhwcbzj102`）
+    LettersDigits,
+}
+
+impl Tail {
+    fn ok(self, t: &[u8]) -> bool {
+        match self {
+            Tail::Digits => t.iter().all(u8::is_ascii_digit),
+            Tail::Letters => t.iter().all(u8::is_ascii_alphabetic),
+            Tail::LettersDigits => {
+                let n = t.iter().take_while(|c| c.is_ascii_alphabetic()).count();
+                n < t.len() && t[n..].iter().all(u8::is_ascii_digit)
+            }
+        }
+    }
+}
+
+const fn pat(prefix: &'static str, len: (usize, usize), tail: Tail, tld: &'static str, provider: &'static str) -> CnamePattern {
+    CnamePattern {
+        prefix,
+        len,
+        tail,
+        tld,
+        before: &[],
+        provider,
+    }
+}
+
+static CNAME_PATTERNS: &[CnamePattern] = &[
+    // 騰訊 EdgeOne：`<網域>.eo.dnse0.com`～`eo.dnse5.com`…，共享 CNAME 是 `….share.dnseN.com`
+    CnamePattern {
+        before: &["eo", "share"],
+        ..pat("dnse", (1, 2), Tail::Digits, "com", "tencent")
+    },
+    // 騰訊雲 CDN：`tdnsv5.com`、`tdnsv6.com`、`tdnsv8.com`…，`tdnsstic1.cn`、`tdnsvod1.cn`
+    pat("tdnsv", (1, 2), Tail::Digits, "com", "tencent"),
+    pat("tdnsstic", (1, 2), Tail::Digits, "cn", "tencent"),
+    pat("tdnsvod", (1, 2), Tail::Digits, "cn", "tencent"),
+    // Vercel：`vercel-dns-013.com`、`vercel-dns-016.com`、`vercel-dns-017.com`…
+    pat("vercel-dns-", (1, 3), Tail::Digits, "com", "vercel"),
+    // 阿里雲 CDN：`<網域>.w.kunluncan.com`、`kunlunaq.com`、`kunlunpi.com`…（官方文件寫「`*.*kunlun*.com`」）
+    pat("kunlun", (2, 4), Tail::Letters, "com", "alibaba"),
+    // 阿里系的 `queniuaa.com`、`queniuak.com`…（權威 DNS 是 `queniudns`，註冊商與 DNS 主機都在阿里雲；
+    // 阿里巴巴、字節跳動的網域都指過去）
+    pat("queniu", (2, 2), Tail::Letters, "com", "alibaba"),
+    // 阿里雲 WAF：`yundunwaf1.com`～`yundunwaf5.com`、`aliyunwaf1.com`～`aliyunwaf5.com`
+    pat("yundunwaf", (1, 2), Tail::Digits, "com", "aliwaf"),
+    pat("aliyunwaf", (1, 2), Tail::Digits, "com", "aliwaf"),
+    // 華為雲 CDN：`cdnhwc1.com`、`cdnhwc2.com`、`cdnhwcbzj102.com`、`cdnhwcaoc115.cn`…
+    pat("cdnhwc", (1, 8), Tail::LettersDigits, "com", "huawei"),
+    pat("cdnhwc", (1, 8), Tail::LettersDigits, "cn", "huawei"),
+    // 火山引擎：`volcfcdndvs1.com`～`volcfcdndvs3.com`
+    pat("volcfcdndvs", (1, 2), Tail::Digits, "com", "bytedance"),
+];
+
+/// 倒數第三段是不是 `b`（`host` 是 `…b.<k>`，`b` 前面是開頭或點）
+fn label_before(host: &[u8], k_len: usize, b: &str) -> bool {
+    let b = b.as_bytes();
+    let Some(end) = host.len().checked_sub(k_len + 1) else {
+        return false;
+    };
+    if host[end] != b'.' || end < b.len() {
+        return false;
+    }
+    let start = end - b.len();
+    host[start..end].eq_ignore_ascii_case(b) && (start == 0 || host[start - 1] == b'.')
+}
+
+/// 依 [`CNAME_PATTERNS`] 判斷。`host` 已經去掉結尾的點，`k` 是它的最後兩段
+pub(crate) fn provider_by_pattern(host: &str, k: &str) -> Option<&'static str> {
+    let (label, tld) = k.split_once('.')?;
+    let l = label.as_bytes();
+    CNAME_PATTERNS
+        .iter()
+        .find(|p| {
+            let n = l.len().saturating_sub(p.prefix.len());
+            l.len() > p.prefix.len()
+                && (p.len.0..=p.len.1).contains(&n)
+                && tld.eq_ignore_ascii_case(p.tld)
+                && l[..p.prefix.len()].eq_ignore_ascii_case(p.prefix.as_bytes())
+                && p.tail.ok(&l[p.prefix.len()..])
+                && (p.before.is_empty() || p.before.iter().any(|b| label_before(host.as_bytes(), k.len(), b)))
+        })
+        .map(|p| p.provider)
+}
 
 pub fn get(name: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().find(|p| p.name == name)
@@ -233,7 +414,7 @@ struct CnameIndex {
 }
 
 /// 最後兩段（不到兩段回 None）
-fn last2(s: &str) -> Option<&str> {
+pub(crate) fn last2(s: &str) -> Option<&str> {
     let i = s.rfind('.')?;
     Some(match s[..i].rfind('.') {
         Some(j) => &s[j + 1..],
@@ -289,8 +470,40 @@ pub fn provider_by_cname(host: &str) -> Option<&'static str> {
         if let Some(p) = group.and_then(|g| hit(g)) {
             return Some(p);
         }
+        if let Some(p) = provider_by_pattern(host, k) {
+            return Some(p);
+        }
     }
     hit(&idx.rest)
+}
+
+/// 業者專用 IP（3.5.1 K2）：在這家 CDN 的範圍裡，但只有這幾個位址服務那個產品，別的節點連過去會被重設或憑證不符。
+/// 黑潮換不了，照原本的答案（不驗證、不標壞節點）。
+///
+/// - Fastly：GitHub Pages 官方文件公布的四個 A（`185.199.108.153`～`185.199.111.153`）與四個 AAAA
+///   （`2606:50c0:8000::153`～`2606:50c0:8003::153`）。D3 壓測的記錄裡，Fastly 節點被暫停的 113 次有 109 次是在驗證
+///   GitHub Pages 的網站（`*.github.io` 與自訂網域）時被重設
+///
+/// 每個已經判斷是這家 CDN 的回應都會比：只有幾個整數比較，不配置
+pub fn dedicated_ip(provider: &str, ip: IpAddr) -> bool {
+    if provider != "fastly" {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            o[0] == 185 && o[1] == 199 && (108..=111).contains(&o[2]) && o[3] == 153
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            s[0] == 0x2606 && s[1] == 0x50c0 && (0x8000..=0x8003).contains(&s[2]) && s[3..7] == [0, 0, 0, 0] && s[7] == 0x153
+        }
+    }
+}
+
+/// 有業者專用 IP 規則的業者（不是這幾家就不必逐一比 IP）
+pub fn has_dedicated(provider: &str) -> bool {
+    provider == "fastly"
 }
 
 /// 台灣 POP：TPE 台北、KHH 高雄、TSA 松山、RMQ 台中、TXG 台中、TNN 台南（開頭比對，不分大小寫）
@@ -521,6 +734,142 @@ mod tests {
         assert_eq!(provider_by_cname("notcloudfront.net"), None);
         assert_eq!(provider_by_cname("CLOUDFRONT.NET"), Some("cloudfront"));
         assert_eq!(provider_by_cname("x.vo.msecnd.net"), Some("microsoft"));
+    }
+
+    /// 3.5.1：已收錄業者的新後綴、有編號的後綴用規則比對；舊的比對不受影響
+    #[test]
+    fn cname_new_suffixes_and_patterns() {
+        // 騰訊 EdgeOne：eo.dnse0～eo.dnse5 以後的編號
+        for n in 0..=9 {
+            assert_eq!(
+                provider_by_cname(&format!("www.example.com.eo.dnse{n}.com.")),
+                Some("tencent"),
+                "{n}"
+            );
+        }
+        assert_eq!(provider_by_cname("www.example.com.EO.DNSE12.COM"), Some("tencent"));
+        assert_eq!(provider_by_cname("eo.dnse2.com"), Some("tencent"));
+        // 一定要有 `eo` 那一段、編號是數字、最多兩位
+        for host in [
+            "www.example.com.dnse2.com",
+            "www.example.com.xeo.dnse2.com",
+            "www.example.com.eo.dnsex.com",
+            "www.example.com.eo.dnse.com",
+            "www.example.com.eo.dnse123.com",
+            "www.example.com.eo.dnse2.net",
+            "dnse2.com",
+        ] {
+            assert_eq!(provider_by_cname(host), None, "{host}");
+        }
+        // Vercel：vercel-dns-0NN
+        for host in [
+            "cname.vercel-dns-016.com",
+            "cname.vercel-dns-017.com.",
+            "x.vercel-dns-013.com",
+            "vercel-dns-1.com",
+        ] {
+            assert_eq!(provider_by_cname(host), Some("vercel"), "{host}");
+        }
+        assert_eq!(provider_by_cname("cname.vercel-dns.com"), Some("vercel"), "舊的照舊");
+        for host in [
+            "x.vercel-dns-.com",
+            "x.vercel-dns-0167.com",
+            "x.vercel-dns-01a.com",
+            "x.myvercel-dns-016.com",
+        ] {
+            assert_eq!(provider_by_cname(host), None, "{host}");
+        }
+        // 阿里雲：<網域>.w.kunlunXX.com
+        for host in [
+            "www.example.com.w.kunluncan.com",
+            "www.example.com.w.kunlunaq.com",
+            "www.example.com.w.kunlunpi.com",
+            "www.example.com.w.kunlunhuf.com",
+            "www.example.com.w.kunlunca.com",
+            "www.example.com.w.alikunlun.com",
+        ] {
+            assert_eq!(provider_by_cname(host), Some("alibaba"), "{host}");
+        }
+        for host in [
+            "x.kunlun.com",
+            "x.kunlun1.com",
+            "x.kunlunabcde.com",
+            "x.xkunlunca.com",
+            "x.kunlunca.net",
+        ] {
+            assert_eq!(provider_by_cname(host), None, "{host}");
+        }
+        // 網宿、火山引擎的新後綴
+        for host in [
+            "www.example.com.wswebpic.com",
+            "www.example.com.wswebcdn.com",
+            "www.example.com.cdn20.com",
+        ] {
+            assert_eq!(provider_by_cname(host), Some("wangsu"), "{host}");
+        }
+        assert_eq!(provider_by_cname("www.example.com.cdnbuild.net"), Some("bytedance"));
+        // 新的業者（只認得）
+        for (host, p) in [
+            ("www.example.com.cdn.hinet.net", "hinet"),
+            ("www.example.com.bsclink.cn", "baishan"),
+            ("www.example.com.trpcdn.net", "baishan"),
+            ("www.example.com.jiashule.com", "jiashule"),
+            ("www.example.com.n.shifen.com", "baidu"),
+            ("www.example.com.radwarecloud.net", "radware"),
+            ("www.example.com.ves.io", "f5xc"),
+            ("www.example.com.yundunwaf3.com", "aliwaf"),
+            ("www.example.com.c.yundunwaf1.com", "aliwaf"),
+            ("www.example.com.aliyunwaf5.com", "aliwaf"),
+            ("www.example.com.share.dnse0.com", "tencent"),
+            ("www.example.com.sched.tdnsv8.com", "tencent"),
+            ("www.example.com.sched.tdnsstic1.cn", "tencent"),
+            ("www.example.com.sched.tdnsvod1.cn", "tencent"),
+            ("www.example.com.sched.ovscdns.com", "tencent"),
+            ("www.example.com.queniuaa.com", "alibaba"),
+            ("www.example.com.queniuak.com", "alibaba"),
+            ("hcdnw.example.v6.c.cdnhwc2.com", "huawei"),
+            ("hcdnw.example.cdnhwcbzj102.com", "huawei"),
+            ("hcdnw.example.cdnhwcaoc115.cn", "huawei"),
+            ("www.example.com.gslb.ksyuncdn.com", "ksyun"),
+            ("www.example.com.volcfcdndvs1.com", "bytedance"),
+            ("www.example.com.cdn30.com", "wangsu"),
+            ("www.example.com.wsdvs.com", "wangsu"),
+            ("wsall.example.com.wcdnga.com", "wangsu"),
+            ("x.sched.apdcdn.com", "tencent"),
+            ("pull.s.bytefcdn.com", "bytedance"),
+            ("x.gtm.byteoversea.net", "bytedance"),
+            ("example.spo-msedge.net", "microsoft"),
+            ("www.example.com.v.bsgslb.cn", "baishan"),
+            ("www.example.com.v.baishan-cloud.net", "baishan"),
+            ("www.example.com.jomodns.com", "baidu"),
+            ("www.example.com.huaweicloudwaf.com", "huaweiwaf"),
+            ("www.example.com.wpeproxy.com", "wpengine"),
+            ("www.example.com.cdn.hstgr.net", "hostinger"),
+            ("www.example.com.stream.ne.jp", "jstream"),
+        ] {
+            assert_eq!(provider_by_cname(host), Some(p), "{host}");
+        }
+        // 規則的邊界：前綴後面接的不對、最後一段不對就不算
+        for host in [
+            "x.cdnhwc.com",
+            "x.cdnhwcabc.com",
+            "x.cdnhwc2x.com",
+            "x.queniuabc.com",
+            "x.queniua.com",
+            "x.yundunwaf.com",
+            "x.tdnsv5.cn",
+            "x.volcfcdndvs.com",
+            "x.www.dnse0.com",
+        ] {
+            assert_eq!(provider_by_cname(host), None, "{host}");
+        }
+        // 只有 `cdn.hinet.net` 底下才是 HiNet CDN（ISP 其他主機名稱不算）
+        assert_eq!(provider_by_cname("host.dynamic.hinet.net"), None);
+        assert!(get("hinet").unwrap().tw_native && !get("hinet").unwrap().alias);
+        assert!(PROVIDERS
+            .iter()
+            .filter(|p| p.tw_native)
+            .all(|p| !p.alias && !p.ecs && !p.ecs_capable));
     }
 
     #[test]
