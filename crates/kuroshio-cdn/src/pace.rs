@@ -7,6 +7,9 @@
 //!   跨 CDN 探索用到四分之三（最後四分之一留給第 2 類）；只問過一次的新網域用到一半（另一半留給第 2 類），
 //!   而且減量中根本不排（在 `apply()` 就拿掉）。
 //! - 「減量中」：這一分鐘有排不進的、或 `r < Rmax` → 進入；連續 5 分鐘都沒有排不進的、而且 `r` 回到 `Rmax` → 離開。
+//!   減量中先不排的「只問過一次的新網域」也算需求（3.5.1）：一分鐘裡先不排的超過離開後它們能用的名額（`r ÷ 2`），
+//!   這一分鐘就不算安靜。以前減量中根本不排它們，看起來沒有排不進的，5 分鐘後離開、新網域的驗證一下子湧進來、
+//!   幾秒內又進入減量——D3 壓測每 8 分鐘來回一次，每次 CPU 掉到三到六成閒置、查快取的 95% 跳到 120～400 ms
 //!
 //! 全部在 `Cdn` 既有的 `bg` 鎖裡（`schedule()` 本來就拿），沒有新的鎖；時間戳（64 位元）也在鎖裡。
 
@@ -62,6 +65,10 @@ pub struct Pace {
     pub cpu: Option<u8>,
     /// 名額用完沒排的累計
     pub capped: u32,
+    /// [`Pace::note_waited`]：上一次看到的累計、這一分鐘的量、是哪一分鐘
+    seen_waited: u32,
+    waited: u32,
+    waited_minute: u32,
 }
 
 pub fn rmin_of(rmax: u32) -> u32 {
@@ -88,6 +95,25 @@ impl Pace {
             last_adjust: 0,
             cpu: None,
             capped: 0,
+            seen_waited: 0,
+            waited: 0,
+            waited_minute: 0,
+        }
+    }
+
+    /// 減量中先不排的新網域（`Cdn` 的累計計數，查詢路徑只加原子計數；主程式每 10 秒交 CPU 時一起交進來）。
+    /// 這一分鐘先不排的超過離開後它們能用的名額（`r ÷ 2`）：這一分鐘不算安靜，不離開減量（3.5.1）
+    pub fn note_waited(&mut self, total: u32, now: u64) {
+        let d = total.wrapping_sub(self.seen_waited);
+        self.seen_waited = total;
+        let m = minute_of(now);
+        if m != self.waited_minute {
+            self.waited_minute = m;
+            self.waited = 0;
+        }
+        self.waited = self.waited.saturating_add(d);
+        if self.paced && self.waited > (self.rate / 2).max(1) {
+            self.last_busy = Some(m);
         }
     }
 
@@ -199,6 +225,36 @@ mod tests {
 
     const T0: u64 = 1_800_000_000_000;
     const MIN: u64 = 60_000;
+
+    #[test]
+    fn stays_paced_while_new_domains_keep_coming() {
+        // 3.5.1：減量中先不排的新網域還很多時不離開（以前看起來安靜，5 分鐘後離開、一下子湧進來、幾秒內又進入）
+        let mut p = Pace::new(60);
+        let mut t = T0;
+        for _ in 0..40 {
+            p.take(Cat::FirstSeen, t);
+        }
+        assert!(p.paced);
+        let mut total = 0u32;
+        for _ in 0..(10 * 6) {
+            t += 10_000;
+            total += 20; // 每 10 秒 20 個、每分鐘 120 個，超過離開後的名額 30
+            p.note_waited(total, t);
+            assert_eq!(p.load(Some(10), true, t), None, "還很多新網域：不離開");
+        }
+        assert!(p.paced);
+        // 新網域少了（每分鐘 12 個 < 30）：5 分鐘後照常離開
+        let mut left = false;
+        for _ in 0..(7 * 6) {
+            t += 10_000;
+            total += 2;
+            p.note_waited(total, t);
+            if p.load(Some(10), true, t) == Some(Transition::Leave) {
+                left = true;
+            }
+        }
+        assert!(left && !p.paced);
+    }
 
     #[test]
     fn rmin_is_eighth_but_at_least_6() {

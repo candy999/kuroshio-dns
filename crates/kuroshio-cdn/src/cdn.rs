@@ -1461,6 +1461,7 @@ impl Cdn {
         let tr = {
             let mut bg = self.bg.lock().unwrap();
             if self.cfg.verify_pacing {
+                bg.pace.note_waited(self.pace_waited.load(Ordering::Relaxed), now);
                 bg.pace.load(pct, memory_normal, now)
             } else {
                 bg.pace.cpu = pct;
