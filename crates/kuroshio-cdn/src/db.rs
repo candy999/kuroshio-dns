@@ -993,6 +993,36 @@ enum Switch {
     Held,
 }
 
+/// 冷資料的條件（記憶體控制，規格 09；3.5.1 G1）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ColdRule {
+    /// 最後出現早於這個時間（毫秒）的算冷資料
+    pub cutoff_ms: u64,
+    /// 只問過一次（`hits` ≤ 1）的：最後出現早於這個時間就算（0 = 不用這一條）。
+    /// 大量冷門網域湧入時（壓測、掃描、新註冊網域）它們全部都「最近才出現」，只看一小時的話第一個小時沒有冷資料可以移出，
+    /// 記憶體控制就會跳過這一步、去停用過濾清單（3.5.0 D3 壓測觀察）
+    pub once_cutoff_ms: u64,
+}
+
+impl ColdRule {
+    pub fn is_cold(&self, d: &Domain) -> bool {
+        d.last_seen < self.cutoff_ms || (d.hits <= 1 && d.last_seen < self.once_cutoff_ms)
+    }
+}
+
+/// 讀回冷資料時可以直接忘掉的（3.5.1 G1）：只問過一次、沒有任何驗證、ECS、跨 CDN 結果、自動策略。
+/// 忘掉不會損失任何東西（沒有結果可以重用；之後再出現就當新網域，照小機器減量的規則問第二次才驗證），
+/// 不讀回才不會在記憶體剛恢復時又被大量一次性網域塞滿、來回讓出又恢復
+pub fn forgettable(d: &Domain) -> bool {
+    d.hits <= 1
+        && d.policy() == Policy::Auto
+        && d.v4.is_none()
+        && d.v6.is_none()
+        && d.ecs.is_none()
+        && d.cross4.is_none()
+        && d.best.is_none()
+}
+
 /// 冷資料移出記憶體的結果
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Evicted {
@@ -1027,6 +1057,19 @@ impl Db {
     /// 自動策略的網域（手動設定的、最近用到的、剛改過的都不動）。
     /// 整個資料庫要重寫、分片清單還沒寫時一律不動（磁碟上的內容還不是最新的）
     pub fn evict_cold(&mut self, cutoff_ms: u64, persisted: &dyn Fn(usize) -> bool) -> Evicted {
+        self.evict_by(
+            ColdRule {
+                cutoff_ms,
+                once_cutoff_ms: 0,
+            },
+            &|_| false,
+            persisted,
+        )
+    }
+
+    /// 同 [`Db::evict_cold`]，條件照 [`ColdRule`]（3.5.1 G1：只問過一次的可以早一點算冷資料），
+    /// `busy(名稱)` = 這個網域正在排隊或正在做驗證、ECS、跨 CDN（不移出，不然結果回來時找不到它，白做一次）
+    pub fn evict_by(&mut self, rule: ColdRule, busy: &dyn Fn(&str) -> bool, persisted: &dyn Fn(usize) -> bool) -> Evicted {
         let mut out = Evicted::default();
         if self.dirty || self.manifest_pending.is_some() {
             return out;
@@ -1036,7 +1079,7 @@ impl Db {
         let cold: Vec<Arc<str>> = self
             .domains
             .values()
-            .filter(|d| d.policy() == Policy::Auto && d.last_seen < cutoff_ms && ok[shard_of(&d.name, n)])
+            .filter(|d| d.policy() == Policy::Auto && rule.is_cold(d) && ok[shard_of(&d.name, n)] && !busy(&d.name))
             .map(|d| d.name.clone())
             .collect();
         for name in cold {
@@ -1109,6 +1152,15 @@ impl Db {
     pub fn set_shards(&mut self, n: usize) {
         self.shards = n.clamp(1, MAX_SHARDS).next_power_of_two();
         self.marks = vec![Mark::Clean; self.shards];
+    }
+
+    /// 第 `i` 片只有計數等級的變動（沒有更高等級時才設；3.5.1 G1 讀回時忘掉一次性網域用）
+    pub fn mark_counters(&mut self, i: usize) {
+        if let Some(m) = self.marks.get_mut(i) {
+            if *m == Mark::Clean {
+                *m = Mark::Counters;
+            }
+        }
     }
 
     /// 這個網域有重要的變動：它的分片要寫
@@ -2216,6 +2268,64 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_rule_once_and_busy() {
+        // 3.5.1 G1：只問過一次的網域 10 分鐘沒再出現就算冷資料；正在驗證的不移出；手動策略、分片有待寫的照舊不動
+        let mut db = Db::new(1000);
+        db.set_shards(1);
+        let now = now_ms();
+        for (name, hits, age_min) in [
+            ("once-old.example.com", 1u32, 20u64),
+            ("once-new.example.com", 1, 5),
+            ("many.example.com", 5, 20),
+            ("hour.example.com", 5, 90),
+            ("busy.example.com", 1, 20),
+            ("manual.example.com", 1, 90),
+        ] {
+            let d = db.touch(name, "cloudflare", "ip", &[], &[], None);
+            d.hits = hits;
+            d.last_seen = now - age_min * 60_000;
+        }
+        db.set_policy("manual.example.com", Policy::Always);
+        db.marks = vec![Mark::Clean; 1];
+        db.dirty = false;
+        db.manifest_pending = None;
+        let rule = ColdRule {
+            cutoff_ms: now - 3_600_000,
+            once_cutoff_ms: now - 600_000,
+        };
+        let r = db.evict_by(rule, &|n| n == "busy.example.com", &|_| true);
+        assert_eq!(r.entries, 2);
+        for (n, gone) in [
+            ("once-old.example.com", true),
+            ("hour.example.com", true),
+            ("once-new.example.com", false),
+            ("many.example.com", false),
+            ("busy.example.com", false),
+            ("manual.example.com", false),
+        ] {
+            assert_eq!(db.get(n).is_none(), gone, "{n}");
+        }
+        // 只看一小時（3.5.0 的規則）：只問過一次、20 分鐘的不算
+        let mut d = Domain {
+            hits: 1,
+            last_seen: now - 20 * 60_000,
+            ..Default::default()
+        };
+        assert!(!ColdRule {
+            cutoff_ms: now - 3_600_000,
+            once_cutoff_ms: 0
+        }
+        .is_cold(&d));
+        // 忘掉：只有「只問過一次、沒有任何結果、自動策略」的
+        assert!(forgettable(&d));
+        d.v4 = Some(Box::default());
+        assert!(!forgettable(&d), "有驗證結果的要讀回");
+        d.v4 = None;
+        d.hits = 2;
+        assert!(!forgettable(&d), "問過兩次的要讀回");
+    }
 
     #[test]
     fn record_size() {

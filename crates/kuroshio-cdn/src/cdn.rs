@@ -331,6 +331,8 @@ pub struct ColdReport {
     pub entries: usize,
     /// 估計的記憶體（bytes）
     pub bytes: usize,
+    /// 讀回時直接忘掉的一次性網域（[`db::forgettable`]；3.5.1 G1）
+    pub forgotten: usize,
 }
 
 static NEXT_CLS_ID: AtomicU32 = AtomicU32::new(0);
@@ -863,7 +865,47 @@ impl Cdn {
         ColdReport {
             entries: r.entries,
             bytes: r.bytes,
+            forgotten: 0,
         }
+    }
+
+    /// 記憶體吃緊（3.5.1 G1）：照 [`db::ColdRule`] 移出冷資料——`cold_ms` 以前出現的，加上只問過一次、
+    /// `once_ms` 以前出現的（0 = 不用這一條）。正在排隊或正在做驗證、ECS、跨 CDN 的網域不移出
+    pub fn evict_cold_rule(&self, cold_ms: u64, once_ms: u64, persisted: &dyn Fn(&str) -> bool) -> ColdReport {
+        let busy: HashSet<String> = {
+            let bg = self.bg.lock().unwrap();
+            bg.verify
+                .iter()
+                .map(|k| k.rsplit_once('|').map_or(k.as_str(), |(n, _)| n).to_string())
+                .chain(bg.ecs.iter().cloned())
+                .chain(bg.cross.iter().cloned())
+                .collect()
+        };
+        let r = {
+            let mut st = self.state();
+            let n = st.db.shards;
+            let now = now_ms();
+            let rule = db::ColdRule {
+                cutoff_ms: now.saturating_sub(cold_ms),
+                once_cutoff_ms: if once_ms == 0 { 0 } else { now.saturating_sub(once_ms) },
+            };
+            st.db
+                .evict_by(rule, &|name| busy.contains(name), &|i| persisted(&db::shard_file(n, i)))
+        };
+        self.sync_evicted();
+        ColdReport {
+            entries: r.entries,
+            bytes: r.bytes,
+            forgotten: 0,
+        }
+    }
+
+    /// 移出記憶體的冷資料分佈在幾個分片（記憶體恢復時估計一次讀回一片要多少用）
+    pub fn evicted_shard_count(&self) -> usize {
+        if self.evicted_n.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        self.state().db.evicted_shards().len()
     }
 
     /// 查詢用到移出記憶體的網域：從磁碟的分片把那一筆讀回來（只解析、不保留整片）。回傳有沒有讀回來
@@ -902,6 +944,12 @@ impl Cdn {
 
     /// 記憶體恢復：把移出的冷資料全部讀回記憶體（一次一片）。回傳讀回幾筆、多少記憶體
     pub fn restore_cold(&self) -> ColdReport {
+        self.restore_cold_upto(usize::MAX)
+    }
+
+    /// 記憶體恢復（3.5.1 G1）：一次一片讀回移出的冷資料，讀回的估計用量到 `max_bytes` 就停（至少讀一片），
+    /// 剩下的下一輪再讀。只問過一次、沒有任何結果的網域不讀回（[`db::forgettable`]）
+    pub fn restore_cold_upto(&self, max_bytes: usize) -> ColdReport {
         let mut out = ColdReport::default();
         if self.evicted_n.load(Ordering::Relaxed) == 0 {
             return out;
@@ -914,6 +962,10 @@ impl Cdn {
             let r = self.restore_shard_cold(n, i);
             out.entries += r.entries;
             out.bytes += r.bytes;
+            out.forgotten += r.forgotten;
+            if out.bytes >= max_bytes {
+                break;
+            }
         }
         self.sync_evicted();
         out
@@ -936,6 +988,11 @@ impl Cdn {
         }
         let mut st = self.state();
         for d in found {
+            if db::forgettable(&d) {
+                // 一次性網域：不讀回、從移出名單拿掉；這片下次寫出時就不再帶它（之後再出現就當新網域）
+                out.forgotten += 1;
+                continue;
+            }
             let bytes = d.approx_bytes();
             if st.db.insert_reloaded(d) {
                 out.entries += 1;
@@ -943,6 +1000,10 @@ impl Cdn {
             }
         }
         st.db.unevict_shard(i);
+        if out.forgotten > 0 {
+            // 只是計數等級：不單獨觸發寫入，等這片因為別的原因要寫、或到了最久未存的上限
+            st.db.mark_counters(i);
+        }
         out
     }
 
@@ -1202,6 +1263,8 @@ impl Cdn {
                 rt.spawn(async move {
                     let g = BgSlot(me, Kind::Verify, key);
                     let _permit = g.0.verify_sem.clone().acquire_owned().await;
+                    // 排隊期間被記憶體控制移出的話先讀回來，不然結果寫不回去（3.5.1 G1）
+                    g.0.ensure_loaded(&name);
                     g.0.bg_count(Kind::Verify, false);
                     g.0.verify(&name, &provider, family, orig).await;
                     g.0.bg_count(Kind::Verify, true);
@@ -1218,6 +1281,7 @@ impl Cdn {
                 rt.spawn(async move {
                     let g = BgSlot(me, Kind::Ecs, name);
                     let _permit = g.0.ecs_sem.clone().acquire_owned().await;
+                    g.0.ensure_loaded(&g.2);
                     g.0.bg_count(Kind::Ecs, false);
                     g.0.ecs_probe(&g.2, &ips4, &ips6).await;
                     g.0.bg_count(Kind::Ecs, true);
@@ -1240,6 +1304,7 @@ impl Cdn {
                 rt.spawn(async move {
                     let g = BgSlot(me, Kind::Cross, name);
                     let _permit = g.0.cross_sem.clone().acquire_owned().await;
+                    g.0.ensure_loaded(&g.2);
                     g.0.bg_count(Kind::Cross, false);
                     g.0.cross_explore(&g.2, &from, orig).await;
                     g.0.bg_count(Kind::Cross, true);

@@ -776,6 +776,11 @@ pub trait Step: Send + Sync {
     fn wanted(&self, _r: &Reading, _res: &Reserve) -> bool {
         true
     }
+    /// 這一步剛讓出、而且還有東西可以讓，只是在等下一次（3.5.1 G1）：後面的步驟先不做。
+    /// 大量冷門網域湧入時 CDN 冷資料一輪一輪移出，等待的空檔不能讓過濾清單插隊
+    fn holds_later(&self) -> bool {
+        false
+    }
     /// 目前有釋出中的東西（要恢復）
     fn is_shed(&self) -> bool;
     /// 恢復下一個項目估計要多少記憶體
@@ -811,6 +816,24 @@ struct ShedRec {
     avail_before: Option<u64>,
     avail_delta: Option<i64>,
     at: u64,
+}
+
+/// 同一步可以一輪一輪讓出的（CDN 冷資料，3.5.1 G1）：同一步最多留這麼多筆紀錄，再多就併進最舊的那一筆
+const SHED_RECS_PER_STEP: usize = 4;
+
+/// 記一筆讓出；同一步的紀錄超過 [`SHED_RECS_PER_STEP`] 時把最舊的兩筆合成一筆（大量冷門網域時不會一直長）
+fn push_shed(v: &mut Vec<ShedRec>, rec: ShedRec) {
+    let key = rec.key;
+    v.push(rec);
+    let idx: Vec<usize> = v.iter().enumerate().filter(|(_, x)| x.key == key).map(|(k, _)| k).collect();
+    if idx.len() > SHED_RECS_PER_STEP {
+        let (a, b) = (idx[0], idx[1]);
+        let old = v.remove(a);
+        let x = &mut v[b - 1];
+        x.bytes += old.bytes;
+        x.avail_before = old.avail_before.or(x.avail_before);
+        x.at = old.at.min(x.at);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -942,6 +965,20 @@ impl Governor {
         now >= i.skip_until[k] && state >= s.min_state() && s.can_shed() && s.wanted(r, &self.reserve)
     }
 
+    /// 這一輪要做的步驟：照順序第一個可以做的；前面有步驟在等下一次（[`Step::holds_later`]）時後面的不做（3.5.1 G1）
+    fn pick(&self, i: &Inner, state: State, r: &Reading, now: u64) -> Option<usize> {
+        for k in 0..self.steps.len() {
+            if self.eligible(i, k, state, r, now) {
+                return Some(k);
+            }
+            let s = &self.steps[k];
+            if state >= s.min_state() && now >= i.skip_until[k] && s.holds_later() {
+                return None;
+            }
+        }
+        None
+    }
+
     /// 一輪：更新狀態，必要時釋出（離保留量遠時連做好幾步）或恢復一步。
     /// 回傳這輪做了什麼（`shed:鍵` / `restore:鍵`，好幾步用逗號分開）
     pub async fn tick(&self, r: Reading, now: u64) -> Option<String> {
@@ -1012,7 +1049,7 @@ impl Governor {
                 i.waiting = Some("可用記憶體已經回到保留量以上，等狀態穩定，不再讓出".to_string());
                 None
             } else if state > State::Comfortable {
-                let any = (0..self.steps.len()).any(|k| self.eligible(i, k, state, &r, now));
+                let any = self.pick(i, state, &r, now).is_some();
                 (now >= i.next_shed_at && any).then(|| {
                     let deficit = r.avail.map_or(0, |a| self.reserve.bytes.saturating_sub(a));
                     let far = state == State::Critical || r.avail.is_some_and(|a| a < self.reserve.bytes / 4 * 3);
@@ -1061,7 +1098,7 @@ impl Governor {
                     let k = {
                         let i = self.inner.lock().unwrap();
                         let state = i.hyst.state;
-                        (0..self.steps.len()).find(|&k| self.eligible(&i, k, state, &r, now))
+                        self.pick(&i, state, &r, now)
                     };
                     let Some(k) = k else { break };
                     let s = &self.steps[k];
@@ -1089,15 +1126,18 @@ impl Governor {
                             i.freed_total += o.bytes;
                             freed += o.bytes;
                             Self::event(i, now, format!("釋出：{} {}（約 {} KB）", s.label(), o.detail, o.bytes / 1024));
-                            i.shed.push(ShedRec {
-                                key: s.key(),
-                                label: s.label(),
-                                detail: o.detail,
-                                bytes: o.bytes,
-                                avail_before: r.avail,
-                                avail_delta: None,
-                                at: now,
-                            });
+                            push_shed(
+                                &mut i.shed,
+                                ShedRec {
+                                    key: s.key(),
+                                    label: s.label(),
+                                    detail: o.detail,
+                                    bytes: o.bytes,
+                                    avail_before: r.avail,
+                                    avail_delta: None,
+                                    at: now,
+                                },
+                            );
                         }
                         Err(e) => {
                             warn!("記憶體控制：{}沒有做：{e:#}", s.label());
@@ -1180,15 +1220,18 @@ impl Governor {
                         now,
                         format!("應要求釋出：{} {}（約 {} KB）", s.label(), o.detail, o.bytes / 1024),
                     );
-                    i.shed.push(ShedRec {
-                        key: s.key(),
-                        label: s.label(),
-                        detail: o.detail.clone(),
-                        bytes: o.bytes,
-                        avail_before: before.avail,
-                        avail_delta: None,
-                        at: now,
-                    });
+                    push_shed(
+                        &mut i.shed,
+                        ShedRec {
+                            key: s.key(),
+                            label: s.label(),
+                            detail: o.detail.clone(),
+                            bytes: o.bytes,
+                            avail_before: before.avail,
+                            avail_delta: None,
+                            at: now,
+                        },
+                    );
                     done.push(json!({ "step": s.key(), "label": s.label(), "freedBytes": o.bytes, "detail": o.detail }));
                 }
                 Err(e) => done.push(json!({ "step": s.key(), "label": s.label(), "skipped": format!("{e:#}") })),
@@ -1463,12 +1506,15 @@ impl Step for CacheStep {
     }
 }
 
-/// 先把變動寫進磁碟，再把冷資料移出記憶體（`cold_ms` = 0：全部移出）
+/// 先把變動寫進磁碟，再把冷資料移出記憶體：`cold_ms` 以前出現的、只問過一次而且 `once_ms` 以前出現的（0 = 不用這一條）；
+/// `floor` = 讓出的不到 `short` 時，再把 `floor` 毫秒以前出現的全部移出（離保留量遠時的最後一層；3.5.1 G1）
 async fn evict_cdn(
     cdn: &Arc<kuroshio_cdn::Cdn>,
     persister: &Arc<Mutex<crate::persist::Persister>>,
     sources: &[crate::app::SnapSource],
     cold_ms: u64,
+    once_ms: u64,
+    floor: Option<(u64, u64)>,
 ) -> anyhow::Result<kuroshio_cdn::cdn::ColdReport> {
     let (cdn, p, sources) = (cdn.clone(), persister.clone(), sources.to_vec());
     tokio::task::spawn_blocking(move || -> anyhow::Result<kuroshio_cdn::cdn::ColdReport> {
@@ -1477,19 +1523,43 @@ async fn evict_cdn(
         crate::app::stage_sources_locked(&p, &sources);
         let mut pg = p.lock().unwrap();
         pg.flush_all(crate::persist::now_secs())?;
-        Ok(cdn.evict_cold(cold_ms, &|rel| !pg.is_pending(rel)))
+        let mut r = cdn.evict_cold_rule(cold_ms, once_ms, &|rel| !pg.is_pending(rel));
+        if let Some((floor_ms, short)) = floor {
+            if (r.bytes as u64) < short {
+                let r2 = cdn.evict_cold_rule(floor_ms, 0, &|rel| !pg.is_pending(rel));
+                r.entries += r2.entries;
+                r.bytes += r2.bytes;
+            }
+        }
+        Ok(r)
     })
     .await?
 }
 
-/// 第 3 步：CDN 網域資料庫：先把變動寫進磁碟，再把一小時沒出現的網域移出記憶體（磁碟保留，查到時讀回）
+/// 只問過一次的網域多久沒再出現就算冷資料（3.5.1 G1）。大量冷門網域湧入時它們是最先該讓的
+pub const CDN_ONCE_COLD_MS: u64 = 10 * 60 * 1000;
+/// 離保留量遠、上面兩條讓得不夠時：所有自動策略的網域多久沒出現就移出（最後一層；最近 10 分鐘的一定留著）
+pub const CDN_FLOOR_COLD_MS: u64 = 10 * 60 * 1000;
+/// 讓出後多久才能再做一次（每次都會先把變動寫進 Flash，不能太頻繁）：吃緊時
+pub const CDN_RESHED_SECS: u64 = 120;
+/// 同上，離保留量遠時
+pub const CDN_RESHED_FAR_SECS: u64 = 30;
+/// 上一次讓出這麼多以上才算「還有東西可以讓」：等待下一次的期間後面的步驟（過濾清單）不做
+pub const CDN_HOLD_MIN_BYTES: u64 = 64 * 1024;
+
+/// 第 3 步：CDN 網域資料庫：先把變動寫進磁碟，再把冷資料移出記憶體（磁碟保留，查到時讀回）。
+/// 冷資料是一小時沒出現的，加上只問過一次、10 分鐘沒再出現的；可以一輪一輪做（3.5.1 G1：以前做過一次就要等恢復，
+/// 大量冷門網域湧入時新進來的沒辦法再讓，下一步就是停用過濾清單）
 pub struct CdnStep {
     pub cdn: Arc<kuroshio_cdn::Cdn>,
     pub persister: Arc<Mutex<crate::persist::Persister>>,
     pub sources: Vec<crate::app::SnapSource>,
     /// 多久沒出現算冷資料（毫秒）
     pub cold_ms: u64,
+    /// 移出中的估計用量（bytes；讀回時扣掉）
     bytes: Mutex<u64>,
+    /// 上一次讓出：（時間，讓出多少，多久後才能再做）
+    last: Mutex<Option<(std::time::Instant, u64, u64)>>,
 }
 
 impl CdnStep {
@@ -1504,7 +1574,14 @@ impl CdnStep {
             sources,
             cold_ms: 3600 * 1000,
             bytes: Mutex::new(0),
+            last: Mutex::new(None),
         }
+    }
+
+    /// 還在「讓出後的等待」裡：回上一次讓出多少
+    fn cooling(&self) -> Option<u64> {
+        let l = *self.last.lock().unwrap();
+        l.filter(|(t, _, wait)| t.elapsed().as_secs() < *wait).map(|(_, b, _)| b)
     }
 }
 
@@ -1516,34 +1593,63 @@ impl Step for CdnStep {
         "CDN 網域資料庫冷資料移出記憶體"
     }
     fn can_shed(&self) -> bool {
-        self.cdn.evicted_count() == 0
+        self.cooling().is_none() && self.cdn.domains_in_ram() > 0
+    }
+    fn holds_later(&self) -> bool {
+        self.cooling().is_some_and(|b| b >= CDN_HOLD_MIN_BYTES)
     }
     fn is_shed(&self) -> bool {
         self.cdn.evicted_count() > 0
     }
+    /// 一次讀回一片的估計（剩下的移出量 ÷ 有移出的分片數）
     fn restore_need(&self) -> u64 {
-        *self.bytes.lock().unwrap()
+        let b = *self.bytes.lock().unwrap();
+        b / self.cdn.evicted_shard_count().max(1) as u64
     }
     fn sizes(&self, out: &mut serde_json::Map<String, Value>) {
         out.insert("cdnInRam".into(), json!(self.cdn.domains_in_ram()));
         out.insert("cdnBytes".into(), json!(self.cdn.approx_ram_bytes()));
         out.insert("cdnOnDiskOnly".into(), json!(self.cdn.evicted_count()));
     }
-    fn shed<'a>(&'a self, _r: &'a Reading) -> BoxFut<'a, anyhow::Result<Outcome>> {
+    fn shed<'a>(&'a self, r: &'a Reading) -> BoxFut<'a, anyhow::Result<Outcome>> {
+        self.shed_for(r, 0)
+    }
+    fn shed_for<'a>(&'a self, _r: &'a Reading, short: u64) -> BoxFut<'a, anyhow::Result<Outcome>> {
         Box::pin(async move {
-            let r = evict_cdn(&self.cdn, &self.persister, &self.sources, self.cold_ms).await?;
-            *self.bytes.lock().unwrap() = r.bytes as u64;
+            let floor = (short > 0).then_some((CDN_FLOOR_COLD_MS, short));
+            let res = evict_cdn(&self.cdn, &self.persister, &self.sources, self.cold_ms, CDN_ONCE_COLD_MS, floor).await;
+            let freed = res.as_ref().map_or(0, |r| r.bytes as u64);
+            let wait = if short > 0 { CDN_RESHED_FAR_SECS } else { CDN_RESHED_SECS };
+            *self.last.lock().unwrap() = Some((std::time::Instant::now(), freed, wait));
+            let r = res?;
+            *self.bytes.lock().unwrap() += r.bytes as u64;
             Ok(cdn_evict_outcome(r.entries, r.bytes as u64))
         })
     }
     fn restore(&self) -> BoxFut<'_, anyhow::Result<Outcome>> {
+        self.restore_for(u64::MAX)
+    }
+    /// 依可用空間一次讀回幾片（至少一片），剩下的下一輪再讀；只問過一次、沒有任何結果的不讀回（3.5.1 G1）
+    fn restore_for(&self, room: u64) -> BoxFut<'_, anyhow::Result<Outcome>> {
         Box::pin(async move {
             let cdn = self.cdn.clone();
-            let r = tokio::task::spawn_blocking(move || cdn.restore_cold()).await?;
-            *self.bytes.lock().unwrap() = 0;
+            let max = (room as u128 * 10 / 13).min(usize::MAX as u128) as usize;
+            let r = tokio::task::spawn_blocking(move || cdn.restore_cold_upto(max)).await?;
+            let left = self.cdn.evicted_count();
+            {
+                let mut b = self.bytes.lock().unwrap();
+                *b = if left == 0 { 0 } else { b.saturating_sub(r.bytes as u64) };
+            }
+            let mut detail = format!("：讀回 {} 筆", r.entries);
+            if r.forgotten > 0 {
+                detail.push_str(&format!("，{} 筆只問過一次、沒有結果的不讀回", r.forgotten));
+            }
+            if left > 0 {
+                detail.push_str(&format!("，還有 {left} 筆之後再讀回"));
+            }
             Ok(Outcome {
                 bytes: r.bytes as u64,
-                detail: format!("：讀回 {} 筆", r.entries),
+                detail,
             })
         })
     }
@@ -1710,7 +1816,7 @@ impl Step for FloorStep {
             let mut detail = format!("快取 {before} → {after} 筆");
             if let Some((cdn, p, sources)) = &self.cdn {
                 // CDN 暫停：資料庫整個寫進磁碟、移出記憶體（寫不了也照樣暫停調整）
-                match evict_cdn(cdn, p, sources, 0).await {
+                match evict_cdn(cdn, p, sources, 0, 0, None).await {
                     Ok(r) => {
                         bytes += r.bytes;
                         detail.push_str(&format!("、CDN 調整暫停（{} 筆移到磁碟）", r.entries));
@@ -2193,6 +2299,8 @@ mod tests {
         /// 每次釋出時 `tick` 傳下來的「還缺多少」、每次恢復時的可用空間（3.5.0 C3）
         shorts: Arc<Mutex<Vec<u64>>>,
         rooms: Arc<Mutex<Vec<u64>>>,
+        /// 讓出後在等下一次（[`Step::holds_later`]；3.5.1 G1）
+        hold: Arc<AtomicBool>,
     }
 
     impl Fake {
@@ -2210,6 +2318,7 @@ mod tests {
                 grow: Default::default(),
                 shorts: Default::default(),
                 rooms: Default::default(),
+                hold: Arc::new(AtomicBool::new(false)),
             })
         }
     }
@@ -2226,6 +2335,9 @@ mod tests {
         }
         fn can_shed(&self) -> bool {
             self.shed_n.load(Ordering::Relaxed) < self.units
+        }
+        fn holds_later(&self) -> bool {
+            self.hold.load(Ordering::Relaxed)
         }
         /// 跟 FilterStep 一樣：「不足」才做的步驟只在系統真的不足時做
         fn wanted(&self, r: &Reading, res: &Reserve) -> bool {
@@ -2273,6 +2385,60 @@ mod tests {
                 Ok(Outcome::default())
             })
         }
+    }
+
+    #[tokio::test]
+    async fn filter_waits_while_cdn_still_has_cold_data() {
+        // 3.5.1 G1：CDN 冷資料讓出後在等下一次（還有東西可以讓）時，系統再不足也不跳去停用過濾清單
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut steps = ladder(&log, 2 * MB);
+        let cdn = Fake::new("cdn", State::Tight, 1, 5 * MB, &log);
+        cdn.hold.store(true, Ordering::Relaxed);
+        let hold = cdn.hold.clone();
+        steps[2] = cdn;
+        let g = Governor::new(res100(), steps, 0);
+        let mut now = 1000;
+        for _ in 0..80 {
+            g.tick(rd(30), now).await;
+            now += 5;
+        }
+        assert_eq!(g.state(), State::Critical);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["shed:diagnostics", "shed:cache", "shed:cdn"],
+            "過濾清單等 CDN"
+        );
+        // CDN 沒東西可以讓了：才輪到過濾清單
+        hold.store(false, Ordering::Relaxed);
+        for _ in 0..4 {
+            g.tick(rd(30), now).await;
+            now += 5;
+        }
+        assert!(log.lock().unwrap().iter().any(|x| x == "shed:filter"), "{:?}", log.lock().unwrap());
+    }
+
+    #[test]
+    fn repeated_sheds_keep_few_records() {
+        // 3.5.1 G1：CDN 一輪一輪讓出時紀錄不會一直長：同一步最多 4 筆，最舊的合在一起，總量不變
+        let mut v = Vec::new();
+        let rec = |key, bytes, at| ShedRec {
+            key,
+            label: "x",
+            detail: String::new(),
+            bytes,
+            avail_before: Some(at),
+            avail_delta: None,
+            at,
+        };
+        push_shed(&mut v, rec("cache", 7, 0));
+        for k in 1..=10u64 {
+            push_shed(&mut v, rec("cdn", 100, k));
+        }
+        assert_eq!(v.iter().filter(|x| x.key == "cdn").count(), SHED_RECS_PER_STEP);
+        assert_eq!(v.iter().filter(|x| x.key == "cdn").map(|x| x.bytes).sum::<u64>(), 1000);
+        assert_eq!(v[0].key, "cache");
+        assert_eq!(v[1].at, 1, "合併的那筆記最早的時間");
+        assert_eq!(v.last().unwrap().at, 10);
     }
 
     fn ladder(log: &Arc<Mutex<Vec<String>>>, filter_need: u64) -> Vec<Box<dyn Step>> {

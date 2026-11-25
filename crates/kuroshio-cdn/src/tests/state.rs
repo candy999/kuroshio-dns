@@ -534,10 +534,68 @@ fn cold_entries_evicted_after_persist_and_lazily_reloaded() {
     };
     assert_eq!(count(&raw), count(&before[s]) + 1, "新增一筆、冷資料都在");
     // 記憶體恢復：全部讀回來
+    // （3.5.1 G1：只問過一次、沒有任何結果的不讀回）
     let back = c.restore_cold();
-    assert_eq!(back.entries, r.entries - 1);
+    assert_eq!(back.entries + back.forgotten, r.entries - 1);
     assert_eq!(c.evicted_count(), 0);
-    assert_eq!(c.state().db.domains.len(), n + 1);
+    assert_eq!(c.state().db.domains.len(), n + 1 - back.forgotten);
+}
+
+#[test]
+fn flood_of_one_off_domains_is_evicted_and_not_read_back() {
+    // 3.5.1 G1：大量冷門網域湧入（壓測、掃描）時它們都「最近才出現」，只看一小時的話沒有冷資料可以移出。
+    // 只問過一次、10 分鐘沒再出現的也算冷資料；讀回時沒有任何結果的直接忘掉，有結果、問過兩次以上的照樣讀回
+    let paths = paths_no_seed("flood");
+    let dir = paths.state_dir.clone();
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = Cdn::load(&full_cfg(), paths, MockNet::new());
+    let now = now_ms();
+    c.with_state(|st| {
+        for i in 0..300 {
+            let d = st.db.touch(&format!("f{i}.example.com"), "cloudflare", "ip", &[], &[], None);
+            d.last_seen = now - 20 * 60_000;
+        }
+        for i in 0..40 {
+            let n = format!("v{i}.example.com");
+            st.db.touch(&n, "cloudflare", "ip", &[], &[], None).last_seen = now - 20 * 60_000;
+            st.db.set_verdict(&n, 4, |v| v.verdict = Some(crate::util::intern("ok")));
+        }
+        for i in 0..30 {
+            let n = format!("h{i}.example.com");
+            st.db.touch(&n, "cloudflare", "ip", &[], &[], None);
+            st.db.touch(&n, "cloudflare", "ip", &[], &[], None).last_seen = now - 20 * 60_000;
+        }
+        for i in 0..10 {
+            st.db.touch(&format!("new{i}.example.com"), "cloudflare", "ip", &[], &[], None);
+        }
+    });
+    let (_, ch) = c.snapshots_sharded(false);
+    write_changes(&c, &dir, &ch);
+    let shards = ch.shards;
+    assert_eq!(c.evict_cold(3_600_000, &|_| true).entries, 0, "全部都在一小時內：舊規則沒有冷資料");
+    let r = c.evict_cold_rule(3_600_000, 600_000, &|_| true);
+    assert_eq!(r.entries, 340, "只問過一次、20 分鐘前的（含有驗證結果的）");
+    assert_eq!(c.domains_in_ram(), 40, "問過兩次的、剛出現的留著");
+    assert!(c.evicted_shard_count() > 1);
+    // 一次讀回一點（至少一片），剩下的下一輪
+    let first = c.restore_cold_upto(1);
+    assert!(c.evicted_count() > 0 && c.evicted_count() < 340, "{}", c.evicted_count());
+    let rest = c.restore_cold();
+    assert_eq!(c.evicted_count(), 0);
+    assert_eq!(first.entries + rest.entries, 40, "有驗證結果的讀回來");
+    assert_eq!(first.forgotten + rest.forgotten, 300, "一次性、沒有結果的不讀回");
+    assert_eq!(c.domains_in_ram(), 80);
+    assert!(c.state().db.get("v0.example.com").unwrap().v4.is_some());
+    // 忘掉的網域下次寫分片時不再帶
+    let (_, ch) = c.snapshots_sharded(true);
+    write_changes(&c, &dir, &ch);
+    let mut on_disk = 0;
+    for i in 0..shards {
+        if let Some(b) = crate::statefile::read(&dir.join(crate::db::shard_file(shards, i))) {
+            crate::db::scan_shard(&b, &mut |_| on_disk += 1).unwrap();
+        }
+    }
+    assert_eq!(on_disk, 80);
 }
 
 // ---- 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）----
