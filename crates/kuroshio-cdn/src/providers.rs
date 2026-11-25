@@ -5,6 +5,7 @@
 //! - 只有 CNAME 的廠商只做網域蒐集與分析（設定裡開 `ecs: true` 也會嘗試 ECS 突破）
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 
 /// 回應標頭（名稱小寫）
@@ -417,6 +418,35 @@ pub fn provider_by_cname(host: &str) -> Option<&'static str> {
         }
     }
     hit(&idx.rest)
+}
+
+/// 業者專用 IP（3.5.1 K2）：在這家 CDN 的範圍裡，但只有這幾個位址服務那個產品，別的節點連過去會被重設或憑證不符。
+/// 黑潮換不了，照原本的答案（不驗證、不標壞節點）。
+///
+/// - Fastly：GitHub Pages 官方文件公布的四個 A（`185.199.108.153`～`185.199.111.153`）與四個 AAAA
+///   （`2606:50c0:8000::153`～`2606:50c0:8003::153`）。D3 壓測的記錄裡，Fastly 節點被暫停的 113 次有 109 次是在驗證
+///   GitHub Pages 的網站（`*.github.io` 與自訂網域）時被重設
+///
+/// 每個已經判斷是這家 CDN 的回應都會比：只有幾個整數比較，不配置
+pub fn dedicated_ip(provider: &str, ip: IpAddr) -> bool {
+    if provider != "fastly" {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            o[0] == 185 && o[1] == 199 && (108..=111).contains(&o[2]) && o[3] == 153
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            s[0] == 0x2606 && s[1] == 0x50c0 && (0x8000..=0x8003).contains(&s[2]) && s[3..7] == [0, 0, 0, 0] && s[7] == 0x153
+        }
+    }
+}
+
+/// 有業者專用 IP 規則的業者（不是這幾家就不必逐一比 IP）
+pub fn has_dedicated(provider: &str) -> bool {
+    provider == "fastly"
 }
 
 /// 台灣 POP：TPE 台北、KHH 高雄、TSA 松山、RMQ 台中、TXG 台中、TNN 台南（開頭比對，不分大小寫）

@@ -32,6 +32,8 @@ pub mod decision {
     pub const APP_LAYER: &str = "app-layer";
     /// 內建一定通過的服務（時間同步、連線偵測、憑證撤銷、地震速報）：不改寫、不擋（3.5.0 F11）
     pub const ESSENTIAL: &str = "essential";
+    /// 業者專用 IP（GitHub Pages 這類）：只有那幾個位址服務它，照原本的答案（3.5.1 K2）
+    pub const DEDICATED: &str = "dedicated-ip";
     pub const CHAINED: &str = "chained";
     pub const CDN_DISABLED: &str = "cdn-disabled";
     pub const MEMORY_FLOOR: &str = "memory-floor";
@@ -73,6 +75,7 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::MULTI_CDN => format!("這個網站自己在多家 CDN 之間分流（這次是 {label}）{detail}。黑潮不替它換到別家；回答來自驗證過的那一家時照常換成那一家的台灣節點。"),
         d::APP_LAYER => format!("這個網域用 {label}，節點由 App 或服務自己選（影音、系統更新這類），黑潮只辨識、不改寫。要換可以把這個網域手動設成「一定換」。"),
         d::ESSENTIAL => format!("這個網域是內建的{label}服務：不改寫、不擋。"),
+        d::DEDICATED => format!("這個網域用 {label} 的業者專用 IP（例如 GitHub Pages），別的節點不服務它，照原本的答案。"),
         d::CHAINED => "串接中：答案由上游黑潮換好台灣節點，這台不再做 CDN 處理。".into(),
         d::CDN_DISABLED => "這台沒有開 CDN 台灣節點。".into(),
         d::MEMORY_FLOOR => "記憶體控制的最低限度：暫停 CDN 調整，照原本的答案。".into(),
@@ -259,6 +262,13 @@ impl Cdn {
         // 台灣本地的 CDN（3.5.1）：跟 `apply_locked` 一樣直接當成已是台灣
         if providers::get(provider).is_some_and(|p| p.tw_native) {
             return (d::ALREADY_TW, "台灣本地的 CDN".into());
+        }
+        // 業者專用 IP（3.5.1 K2）：最近一次答案全部是那幾個位址
+        if providers::has_dedicated(provider)
+            && (!e.ips4.is_empty() || !e.ips6.is_empty())
+            && e.ips4.iter().chain(e.ips6.iter()).all(|ip| providers::dedicated_ip(provider, *ip))
+        {
+            return (d::DEDICATED, String::new());
         }
         // 多來源：不做跨 CDN。原本要靠跨 CDN 才換得到台灣的情況，說明成「多來源」
         let no_cross = e.no_cross(now);

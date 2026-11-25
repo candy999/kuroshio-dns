@@ -113,6 +113,21 @@ struct Hinted {
 /// 好友提示最多試幾個（每個都要連一次）
 const MAX_HINTS: usize = 4;
 
+/// 一次驗證裡連不上（或憑證不符）幾個不同的台灣節點、一個都沒通過，就算是這個網站的問題（3.5.1 K2）：
+/// 記在網站上（`fail`，失敗次數照加、逐次拉長），不暫停那些節點
+pub const SITE_FAIL_NODES: usize = 3;
+
+/// 這一次驗證裡連不上的節點（3.5.1 K2）：驗證結束後才決定要不要記到節點上
+#[derive(Default)]
+struct ConnOut {
+    /// （節點，錯誤）
+    list: Vec<(IpAddr, String)>,
+    /// 判定是網站的問題：不記到節點上
+    site_level: bool,
+    /// 原本的 IP 連得上（連不上的時候多半是本機的網路，不記）
+    base_ok: bool,
+}
+
 /// 原始節點 HTTPS 失敗的樣子（只用 HTTP 驗證時，候選節點要跟它一致）
 struct HttpsFail {
     tls_error: bool,
@@ -328,7 +343,18 @@ impl Cdn {
         }
         let mut hinted: Vec<Hinted> = Vec::new();
         let mut speed = None;
-        let r = self.verify_inner(name, provider, family, orig, &mut hinted, &mut speed).await;
+        let mut conn = ConnOut::default();
+        let r = self
+            .verify_inner(name, provider, family, orig, &mut hinted, &mut speed, &mut conn)
+            .await;
+        // 連不上的節點（3.5.1 K2）：網站的問題不記；其餘記下來，同一個節點 1 小時內第 2 個網站也連不上才暫停
+        if conn.base_ok && !conn.site_level && !conn.list.is_empty() {
+            self.with_state(|st| {
+                for (ip, err) in &conn.list {
+                    st.pools.note_conn_fail(provider, *ip, name, &format!("驗證 {name} 時 {err}"));
+                }
+            });
+        }
         // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗（沒輪到試的不算）
         if !hinted.is_empty() {
             if let Some(h) = self.hints() {
@@ -352,6 +378,7 @@ impl Cdn {
         r.tls_error == base.tls_error && (r.tls_error || r.error == base.error)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn verify_inner(
         self: &Arc<Self>,
         name: &str,
@@ -360,6 +387,7 @@ impl Cdn {
         orig: Option<IpAddr>,
         hinted_out: &mut Vec<Hinted>,
         speed_out: &mut Option<serde_json::Value>,
+        conn_out: &mut ConnOut,
     ) -> Option<&'static str> {
         let prov = providers::get(provider);
         let label = providers::label(provider);
@@ -437,6 +465,7 @@ impl Cdn {
             base = Some(b);
         }
         let base_ok = base.as_ref().filter(|b| b.ok);
+        conn_out.base_ok = base_ok.is_some();
         // 3.5.1（Azure「台北換台北」）：原本的答案這條線連過去已經落在台灣機房 → 當成已是台灣、不換。
         // 換成節點池裡另一個台灣節點不會更近，實測握手反而常常比較慢（同一個城市換另一個節點）；
         // 也不必再對候選節點一個一個連。範圍同 F9：IPv4、非最近節點型、不是「一定換」、`cdn.slowerFallback` 開著；
@@ -516,11 +545,16 @@ impl Cdn {
         };
         let mut last_reason = "無可用台灣節點".to_string();
         let mut zone_fail: Option<ZoneFail> = None;
+        // 這一次連不上或憑證不符的不同節點數（3.5.1 K2）
+        let mut failed_nodes: Vec<IpAddr> = Vec::new();
         for (idx, &ip) in candidates.iter().enumerate() {
             note(hinted_out, ip, false);
             let r = self.probe_site(ip, name, http_mode).await;
             if !r.ok {
                 let err = r.error.clone().unwrap_or_default();
+                if !failed_nodes.contains(&ip) {
+                    failed_nodes.push(ip);
+                }
                 if r.tls_error {
                     self.with_state(|st| st.pools.zone_note(provider, ip, false));
                     zone_fail.get_or_insert(ZoneFail {
@@ -532,9 +566,8 @@ impl Cdn {
                     continue;
                 }
                 last_reason = format!("連線失敗 {err}");
-                if base_ok.is_some() {
-                    self.with_state(|st| st.pools.mark_bad(provider, ip, &format!("驗證 {name} 時 {err}")));
-                }
+                // 3.5.1 K2：不馬上暫停節點，驗證結束後再看是網站還是節點的問題（`verify_with_speed()`）
+                conn_out.list.push((ip, err));
                 continue;
             }
             let pop = prov.filter(|p| p.has_pop()).map(|p| p.pop(&r.headers, &r.body)).unwrap_or_default();
@@ -739,10 +772,17 @@ impl Cdn {
                 true,
             ));
         }
+        // 一個都沒通過，而且連不上（或憑證不符）的不同節點有 3 個以上：這個網站的問題（例如只接受業者專用的 IP），
+        // 不是那些節點的問題（3.5.1 K2：D3 壓測裡 Fastly 節點被暫停的大多是這種）
+        conn_out.site_level = base_ok.is_some() && failed_nodes.len() >= SITE_FAIL_NODES;
         // 每個候選 IP 都明確表示「不服務這個網站」→ 判定失敗
         if let Some(z) = zone_fail {
-            // Fastly 這類：可能只是還沒掃到放了這組憑證的網段，1 小時後再找一次
-            let retry = octet.then(|| now_ms() + HOUR_MS);
+            // Fastly 這類：可能只是還沒掃到放了這組憑證的網段，1 小時後再找一次；
+            // 一直找不到就逐次拉長（1、2、4…小時，不超過一般失敗的到期時間；3.5.1 K2）
+            let retry = octet.then(|| {
+                let normal = self.until(false, prev_fails + 1);
+                (now_ms() + (HOUR_MS << prev_fails.min(5))).min(normal)
+            });
             return Some(self.done(
                 name,
                 provider,
@@ -759,6 +799,34 @@ impl Cdn {
                     http: None,
                     reason: Some(format!("{}（試了 {} 個網段）", z.reason, candidates.len())),
                     retry_at: retry,
+                    slow: SlowMark::Clear,
+                    returned: false,
+                },
+                false,
+            ));
+        }
+        // 連不上很多個不同的節點（3.5.1 K2）：記在網站上，失敗次數照加、到期時間逐次拉長（以前是「暫不判定、10 分鐘後再試」，
+        // 而且每個節點都暫停，結果對其他網站是好的節點一直被暫停又恢復）
+        if conn_out.site_level {
+            return Some(self.done(
+                name,
+                provider,
+                family,
+                false,
+                prev_fails,
+                Done {
+                    pop: None,
+                    ms: None,
+                    status: None,
+                    ip: failed_nodes[0],
+                    ips: None,
+                    tried: None,
+                    http: None,
+                    reason: Some(format!(
+                        "試了 {} 個台灣節點都連不上（{last_reason}）：這個網站可能只接受業者專用的 IP",
+                        failed_nodes.len()
+                    )),
+                    retry_at: None,
                     slow: SlowMark::Clear,
                     returned: false,
                 },

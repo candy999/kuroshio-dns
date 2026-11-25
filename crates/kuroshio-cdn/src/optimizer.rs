@@ -366,6 +366,16 @@ impl Cdn {
             res.tags.push(format!("{label}:已是台灣"));
             return;
         }
+        // 業者專用 IP（3.5.1 K2，GitHub Pages）：別的節點不服務它，照原本的答案，不驗證、不跨 CDN。
+        // 只有有這種規則的業者（Fastly）才逐一比答案裡的 IP（幾個整數比較）
+        if providers::has_dedicated(provider) && policy != Policy::Always {
+            let mut ips = ips4.iter().chain(&ips6);
+            if (!ips4.is_empty() || !ips6.is_empty()) && ips.all(|ip| providers::dedicated_ip(provider, *ip)) {
+                res.tags.push(format!("{label}:業者專用 IP→原始"));
+                st.stats.dedicated = st.stats.dedicated.saturating_add(1);
+                return;
+            }
+        }
         // 多來源（3.5.0 B3）：這一家沒有格子可以放（第三家，或太快又換一家）→ 照原始答案回，不驗證
         if touch.held {
             res.tags.push(format!("{label}:多來源→原始"));

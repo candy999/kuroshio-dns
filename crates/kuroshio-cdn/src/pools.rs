@@ -285,6 +285,25 @@ impl Strike {
     }
 }
 
+/// 驗證時連不上（3.5.1 K2）：同一個節點在 [`CONN_FAIL_WINDOW_MS`] 內對 [`CONN_FAIL_SITES`] 個以上不同的網站都連不上，
+/// 才算節點的問題、暫停節點。只有一個網站連不上多半是那個網站的問題（例如只接受業者專用 IP），
+/// 由驗證結果記在網站上（`verifier.rs`）
+pub const CONN_FAIL_SITES: usize = 2;
+pub const CONN_FAIL_WINDOW_MS: u64 = util::HOUR_MS;
+
+/// 一個節點的連不上紀錄（3.5.1 K2）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnFail {
+    pub at: u64,
+    /// 網站名稱的雜湊（最多 [`CONN_FAIL_SITES`] 個）
+    pub sites: Vec<u32>,
+}
+
+/// 網站名稱的雜湊（FNV-1a，只用來分辨「是不是同一個網站」）
+fn site_hash(name: &str) -> u32 {
+    name.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193))
+}
+
 /// IP 的分類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cls {
@@ -385,6 +404,8 @@ pub struct ProviderPools {
     pub bad24: HashMap<u32, Bad>,
     /// 驗證反覆標成壞的位址（3.5.1 K2，暫停時間逐次加倍）。換節點池（`replace()`）時不清，下次再失敗照樣加倍
     pub strikes: HashMap<IpAddr, Strike>,
+    /// 驗證時連不上的節點（3.5.1 K2）：節點（保留最後一段的 CDN 是 /24）→ 第一次的時間與連不上的網站（雜湊）
+    pub conn_fails: HashMap<IpAddr, ConnFail>,
     /// IPv6 即時發現：每個 /48 上次嘗試時間
     pub tried6: IndexMap<u128, u64>,
     /// pools.json 裡這家的其他欄位（updatedAt、tw48、prefixes…）
@@ -431,11 +452,6 @@ impl ProviderPools {
         };
         self.strikes.insert(ip, s);
         s
-    }
-
-    /// 這個位址還在 K2 的暫停中（沒有任何紀錄時不讀時間）
-    pub fn held(&self, ip: IpAddr) -> bool {
-        !self.strikes.is_empty() && self.strikes.get(&ip).is_some_and(|s| s.held(now_ms()))
     }
 
     /// 範圍與分類是不是同一份（比指標）
@@ -922,7 +938,7 @@ impl Pools {
         let Some(d) = self.p.get(provider) else { return false };
         if self.octet_mode(provider) {
             if let Some(pf) = util::prefix24(ip) {
-                if self.bad24(provider, pf) || self.is_restricted(provider, ip) || d.held(ip) {
+                if self.bad24(provider, pf) || self.is_restricted(provider, ip) {
                     return false;
                 }
                 return self.pop_view(provider).has_prefix(pf);
@@ -1083,14 +1099,13 @@ impl Pools {
             }
         }
         let n = self.cfg.serve_count_of(provider);
-        let held = |ip: IpAddr| self.p.get(provider).is_some_and(|d| d.held(ip));
         // 同一次回應只用同一個 POP：依品質順序，找第一個「這組憑證已驗證可用」的 POP
         for (_, prefs) in &self.pop_view(provider).pops {
             let mut out: Vec<IpAddr> = Vec::new();
             for &o in &octs {
                 for &pf in prefs {
                     let ip = util::ip_of(pf, o);
-                    if self.zone_hit(provider, ip) && !out.contains(&ip) && !held(ip) {
+                    if self.zone_hit(provider, ip) && !out.contains(&ip) {
                         out.push(ip);
                     }
                 }
@@ -1135,7 +1150,7 @@ impl Pools {
             let list: Vec<IpAddr> = order
                 .into_iter()
                 .map(|pf| util::ip_of(pf, o))
-                .filter(|ip| !self.is_restricted(provider, *ip) && !self.p.get(provider).is_some_and(|d| d.held(*ip)))
+                .filter(|ip| !self.is_restricted(provider, *ip))
                 .collect();
             let take = if i == 0 { self.cfg.octet_search } else { 3 };
             out.extend(list.into_iter().take(take));
@@ -1276,19 +1291,6 @@ impl Pools {
                         warn!("{provider} 網段 {}.0/24 暫停使用：{reason}", util::prefix24_str(pf));
                         return;
                     }
-                    // 3.5.1 K2：同一個 /24 的另一個位址（最後一段不同 = 另一組憑證）連不上，只暫停那個位址。
-                    // 以前把節點池裡同網段的節點整個標壞，30 分鐘後健檢（連 www.fastly.com）通過就恢復，
-                    // 下一次驗證同一個網站又失敗，同一個節點一直被暫停又恢復
-                    Some(node) if node != ip => {
-                        let s = d.strike(ip, now);
-                        let more = if s.n > 1 { format!("，第 {} 次", s.n) } else { String::new() };
-                        warn!(
-                            "{provider} 位址 {ip}（節點 {} 的網段、另一組憑證）暫停 {} 分鐘{more}：{reason}",
-                            node,
-                            s.hold_ms() / 60_000
-                        );
-                        return;
-                    }
                     Some(node) => ip = node,
                 }
             }
@@ -1315,6 +1317,40 @@ impl Pools {
         if self.pool_size(provider, fam) < self.cfg.min_pool {
             self.request_rebuild(provider);
         }
+    }
+
+    /// 驗證某個網站時連不上這個節點（3.5.1 K2）：記下來，1 小時內第 2 個不同的網站也連不上才暫停（`mark_bad()`）。
+    /// 保留最後一段的 CDN（Fastly）以 /24 為單位算（不同網站用的最後一段不同）。回傳有沒有暫停
+    pub fn note_conn_fail(&mut self, provider: &str, ip: IpAddr, site: &str, reason: &str) -> bool {
+        let octet = self.octet_mode(provider);
+        let Some(d) = self.p.get_mut(provider) else { return false };
+        let key = match (octet, util::prefix24(ip)) {
+            (true, Some(pf)) => util::ip_of(pf, 0),
+            _ => ip,
+        };
+        let now = now_ms();
+        d.conn_fails.retain(|_, c| now.saturating_sub(c.at) <= CONN_FAIL_WINDOW_MS);
+        if !d.conn_fails.contains_key(&key) && d.conn_fails.len() >= STRIKE_CAP {
+            if let Some(old) = d.conn_fails.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| *k) {
+                d.conn_fails.remove(&old);
+            }
+        }
+        let h = site_hash(site);
+        let c = d.conn_fails.entry(key).or_insert_with(|| ConnFail {
+            at: now,
+            sites: Vec::new(),
+        });
+        if !c.sites.contains(&h) {
+            c.sites.push(h);
+        }
+        if c.sites.len() < CONN_FAIL_SITES {
+            return false;
+        }
+        let n = c.sites.len();
+        d.conn_fails.remove(&key);
+        // `mark_bad()` 照舊處理保留最後一段的 CDN：網段裡有節點池的節點就暫停那個節點，沒有就暫停整個 /24
+        self.mark_bad(provider, ip, &format!("{reason}（1 小時內 {n} 個網站都連不上）"));
+        true
     }
 
     pub fn request_rebuild(&mut self, provider: &str) {
