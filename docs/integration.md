@@ -233,7 +233,7 @@ kuroshio notify simulate-memory --avail-mb MB [--minutes 分鐘] | --off [-c 設
 | `NO_COLOR` | 有設定（任何值）就不輸出 ANSI 色碼（日誌交給 syslog、檔案時用） |
 | `KUROSHIO_PATH_TARGETS`、`KUROSHIO_CHAIN_TIMING` | **只給整合測試用，不是穩定介面**，以後可能改名或拿掉。前者把路徑檢查的保留位址、閘道換成本機的假伺服器；後者縮短串接的心跳與重試時間（JSON，毫秒）。正式環境不要設定 |
 
-`KUROSHIO_LOG` 沒設定時，QUIC 函式庫（`quinn_proto`）只記錯誤：它的警告（例如某些伺服器造成的 `duplicate reset token`，每十幾秒一行）跟查詢結果無關，會洗掉路由器很小的 syslog。要看的話設定 `KUROSHIO_LOG=info,quinn_proto=warn`。
+`KUROSHIO_LOG` 沒設定時，QUIC 函式庫（`quinn_proto`）只記錯誤：它的警告（例如某些伺服器造成的 `duplicate reset token`，每十幾秒一行）跟查詢結果無關，會洗掉路由器很小的 syslog。要看的話設定 `KUROSHIO_LOG=info,quinn_proto=warn`。3.5.1 起 `quinn_udp`（UDP 送不出去，例如 Windows 的 `sendmsg error: ... 10040`）也只記錯誤：`KUROSHIO_LOG=info,quinn_udp=warn` 可以打開。DoQ／DoH3（用戶端與伺服器）3.5.1 起不做路徑 MTU 探測，封包固定在 1200 位元組以內：quinn 預設每 10 分鐘探測到 1452 位元組的 UDP 內容，IPv6 加標頭剛好 1500，PPPoE（MTU 1492）與 VPN 放不下，Windows 送出時回 WSAEMSGSIZE（10040）；DNS 的訊息幾乎都在 1200 位元組以內，探測沒有好處。
 
 ### 寫入設定後的外部指令（`KUROSHIO_ON_CONFIG_WRITE`）
 
@@ -823,9 +823,9 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 | `popSwitch` | 機房切換（`cdn.popSwitch`）。`reason`：`disabled`、`chained`、`chain-pop-unreliable`、`memory`、`single-pop`（沒有家族符合資格）、`ok`；`nearest-provider` 只出現在 `excluded[]`。`eligibleFamilies`：符合資格的家族；`holds[]`：`{ provider, family, pop, until（毫秒）, other }`；`switches24h`：24 小時內暫緩的次數 |
 | `popAudit` | 機房以這台量到的為準（`cdn.popAudit`）。`pending`：`upPop` 還在的節點；`confirmed`／`mismatch`：啟動後累計的比對次數；`probes24h`：24 小時內用掉的機房抽查名額（一天最多 24 個、`cdn.lite` 8 個）；`lastMismatchAt` 毫秒或 `null`；`chainPopUnreliable`：24 小時內比對過的一半以上不一樣（至少 4 個），期間不做機房切換。3.5.0 F7：抽到的答案 IP 不是待確認的節點時，改量一個待確認的前幾名節點（每家 CDN、每個位址族排在前 `serveCount` 名的，各家輪流；名額不變）——`pendingServed`：前幾名裡還沒確認的；`lastProbeAt`：上次量機房的時間（毫秒或 `null`）；`noTarget`：拿到名額、但已經沒有要量的次數 |
 | `slowerFuseUntil` | 跳了才有（毫秒）：一小時裡「台灣節點比原本慢」超過 30%（至少 10 次），之前照常換台灣節點 |
-| `stats.verifyOk`／`verifyFail`／`slowerFallback` | 台灣節點驗證通過／沒通過（不含比原本慢）／比原本慢暫時用原本答案的次數（啟動後累計，32 位元）。3.5.0 F9 多 `slowerFirst`（第一次量到慢，照樣換台灣節點）、`slowerReturned`（退回之後重驗不慢、回台灣節點） |
+| `stats.verifyOk`／`verifyFail`／`slowerFallback` | 台灣節點驗證通過／沒通過（不含比原本慢）／比原本慢暫時用原本答案的次數（啟動後累計，32 位元）。3.5.0 F9 多 `slowerFirst`（第一次量到慢，照樣換台灣節點）、`slowerReturned`（退回之後重驗不慢、回台灣節點）。3.5.1 多 `origTw`（驗證時原本的答案已經在台灣機房、不換；不算在 `verifyFail`）、`dedicated`（業者專用 IP 照原本的答案回的次數） |
 
-其他：`/api/cdn/pools` 還沒確認的節點多 `upPop`；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。
+其他：`/api/cdn/pools` 還沒確認的節點多 `upPop`；3.5.1：被驗證暫停的節點多 `strikes`（24 小時內第幾次，暫停 30 分鐘 × 2^(次數−1)、最多 8 小時，期間健檢通過也不恢復）；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。
 
 3.5.0 F9（比原本慢的第二版）：`score`／`origScore` 的意義改成**連線＋TLS 握手**的毫秒數（台灣節點／原本的 IP；不含收到回應標頭的時間）。判斷是「台灣 × 0.7 > 原本 ＋ 10 毫秒」，要連續 2 次驗證、相隔 10 分鐘以上都慢才退回；第一次慢時 `v4` 多 `slow1: { at, score, origScore }`、照常換台灣節點（`explain` 的 `text` 多一句「上一次驗證握手比原本慢，再確認一次才會退回」）。退回 15 分鐘（`cdn.lite` 1 小時），到期後有人查才重驗，重驗一次不慢就回台灣節點並清掉 `slower`／`score`／`origScore`／`reason`。分數只存在 `slow1`／`slower` 的那幾筆。手動 `POST /api/cdn/verify` 走同一套（不受 F12 的名額限制，但算進用量），回應是 `{ "result": 網域紀錄, "error": "ok"｜"fail"｜…, "entry": …, "speed": … }`，`speed` 是 `{ "score", "origScore", "weighted"（台灣 × 0.7）, "slower"（這一次慢不慢）, "state", "confirmAfter" }`：`state` 是 `ok`、`slow1`（第一次慢，或第一次慢之後不到 10 分鐘又驗：不算確認、`slow1` 的時間不重設）或 `slower`（確認退回）；`confirmAfter` 是 `slow1` 時還要等幾毫秒下一次驗證才算確認，其他是 0。沒有判的時候 `speed` 是 `null`：IPv6、Fastly 這類最近節點型、手動「一定換」、只能用 HTTP 驗證的網站、量不到握手、保險絲跳了、`cdn.slowerFallback` 關掉（這幾種都照驗證通過處理，並清掉 `slow1`）。第一次慢的日誌併在既有的 ✔ 那一行：「✔ example.com IPv4 台灣節點可用 (TPE 200 5ms)；握手比原本慢（250 對 100 毫秒），先照常換，10 分鐘後有人查再確認一次」；確認退回「↷ example.com IPv4 台灣節點能用，但握手連續兩次比原本慢（250 對 100 毫秒，相隔 12 分鐘）：暫時用原本的答案，15 分鐘後有人查再重驗」；退回後重驗還是慢「↷ … 重驗握手還是比原本慢（…）：繼續用原本的答案，15 分鐘後有人查再重驗」；回來「✔ … 台灣節點可用 (…)；重驗握手不比原本慢，回到台灣節點」。`kuroshio notify wan-changed`（`/api/notify/wan-changed`）多做一件事：把 `reach` 標成過期、清掉機房切換的連續計數與暫緩，不補跑健檢或掃描。
 
@@ -975,7 +975,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   | 代碼 | 意思 |
   |---|---|
   | `rewritten` | 已經換成驗證過的台灣節點 |
-  | `already-tw` | 原本的答案就是台灣節點 |
+  | `already-tw` | 原本的答案就是台灣節點。3.5.1：跟查詢路徑一樣用最近一次答案的 IP 在節點池裡的分類判斷；也包括台灣本地的 CDN（中華電信 HiNet CDN），以及驗證時原本的答案已經在台灣機房、不換的（`steps` 的 `v4` 多 `origTw`：那時量到的 POP） |
   | `trial` | 台灣節點還在驗證中（先回原本的答案，TTL 10 秒） |
   | `lite-waiting` | 小記憶體減量：問過 2 次以上才驗證 |
   | `paced-waiting` | 3.5.0 F12：新網域很多（或 CPU 很忙），CDN 驗證減量中，問過 2 次以上才驗證，先回原本的答案（小機器照舊是 `lite-waiting`） |
@@ -989,6 +989,7 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
   | `policy-never`／`policy-always` | 手動設成不換／一定換 |
   | `multi-cdn` | 3.5.0：網站自己在多家 CDN 之間分流，不替它換到別家（回答來自驗證過的那一家時照常換，那時是 `rewritten`） |
   | `app-layer` | 3.5.0：App 自己選節點的服務，只辨識、不改寫 |
+  | `dedicated-ip` | 3.5.1：業者專用 IP（GitHub Pages 這類，只有那幾個位址服務它），照原本的答案 |
   | `chained` | 串接中：上游黑潮換好，這台不處理 |
   | `memory-floor` | 記憶體控制的最低限度：暫停 CDN 調整 |
   | `cdn-disabled` | 這台沒開 CDN 台灣節點 |

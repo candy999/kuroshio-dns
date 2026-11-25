@@ -176,6 +176,68 @@
 - 跨 CDN 探索受 CDN 驗證的每分鐘名額管（3.5.0 F12）：每次算 1 個名額、排在重驗與問過 2 次以上的新網域之後；只問過 1 次的網域減量中不探索。
 - 多來源網域不做跨 CDN（3.9 節）；通訊類網域不做跨 CDN（3.5.0 B6）；內建服務裡「不改寫」的四類（時間同步、連線偵測、憑證撤銷、地震速報）連驗證都不排（3.5.0 F11）。
 
+### 3.13 業者表的補充與收錄原則（3.5.1）
+
+資料來源：2026-11-25 壓測時每筆查詢的最後一段 CNAME 與 A 記錄（精簡表 B11，127 萬個網域；名單有台灣前 10 萬、台灣前 50 萬級、Umbrella 前 100 萬、新註冊網域），跟 3.5.0 的 27 家、112 個後綴、`data/cdn/` 的 IP 範圍比對。業者歸屬另外用權威 DNS（NS／SOA）、主機名稱的命名慣例、官方文件查證；**只取後綴，不取資料裡的任何 IP 當節點或範圍**。
+
+**收錄原則**（原則 1：黑潮的本質是把答案換成驗證過的台灣節點）：
+
+1. 在台灣有節點、有官方公布的 IP 範圍、黑潮能驗證能換的：收成 IP 置換型（`alias`），要有範圍檔、測速網址、POP 判斷。3.5.1 沒有新增這一類。
+2. 認得出來就有用的（統計、`/api/cdn/explain` 說得出是誰、原本就慢時試跨 CDN；設定開 `ecs` 時可以試 ECS）：只加 CNAME 後綴，不加範圍、不加節點。
+3. 台灣本地的 CDN（節點本來就在台灣）：只加後綴並標成 `tw_native`，查詢時當成「已是台灣」，不換、不 ECS、不跨 CDN，`explain` 是 `already-tw`。手動「一定換」照使用者的。
+4. 不收：架站平台、雲端主機與負載平衡、流量排程（GTM）、單一主機（沒有多個機房可以選，黑潮換不了）；歸屬查不清楚的；只出現在新註冊網域、像博弈詐騙站共用的。
+
+**比對方式**：逐一列舉的後綴照舊用「最後兩段」的雜湊索引（每個有 CNAME 的回應一次查表）。同一家有好幾個編號、而且編號會一直增加的，用**規則**比（`providers.rs` 的 `CNAME_PATTERNS`：倒數第二段是「固定前綴＋數字／英文字母」、最後一段固定、必要時限定倒數第三段）。規則只在索引沒命中時比，幾個位元組的前綴比對、不配置；舊的逐一列舉照舊命中。
+
+| 業者 | 3.5.1 補上的 | 怎麼確認的 |
+|---|---|---|
+| 騰訊 EdgeOne／騰訊雲 CDN | 規則：`eo.dnseN.com`、`share.dnseN.com`（N 最多兩位數）、`tdnsvN.com`、`tdnssticN.cn`、`tdnsvodN.cn`；後綴：`ovscdns.com`、`ovscdns.net`、`apdcdn.com` | `eo.dnse0`／`dnse1` 已收錄；`tdnsv8`、`ovscdns`、`apdcdn` 的 SOA 跟已收錄的 `tdnsv6.com` 一字不差；`.cn` 兩個的權威 DNS 是 DNSPod |
+| Vercel | 規則：`vercel-dns-N.com`（最多三位數；B11 有 013、016、017） | 已收錄 `vercel-dns.com` |
+| 阿里雲 CDN | 規則：`kunlunXX.com`（2～4 個英文字母）、`queniuXX.com`（2 個英文字母）；後綴：`kunluncan.com`、`kunlunaq.com`、`kunlunpi.com` | 官方文件：CNAME 是「`*.*kunlun*.com`」。`queniu*` 的權威 DNS 是 `queniudns`，網域註冊商與 DNS 主機都在阿里雲，阿里巴巴、高德、字節跳動的網域都指過去（**沒有官方文件，只認得、不換**） |
+| 網宿 | `wswebpic.com`、`wswebcdn.com`、`cdn20.com`、`cdn30.com`、`wsdvs.com`、`wcdnga.com` | 權威 DNS 跟網宿既有後綴同一組（`cdn30.org`）；`wcdnga.com` 的主機名稱用網宿的 `wsall.` 慣例 |
+| 火山引擎／BytePlus | `cdnbuild.net`、`bytefcdn.com`、`byteoversea.net`；規則：`volcfcdndvsN.com` | 權威 DNS 是 `volc-dns`；`byteoversea.net` 是 TikTok 的海外排程 |
+| Microsoft | `spo-msedge.net`、`spov-msedge.net`、`t-s1-msedge.net`、`bx-msedge.net`、`wac-msedge.net` | Microsoft 365 的前端（SharePoint、Office 線上版），已收錄 `msedge.net` 的同一家 |
+| 中華電信 HiNet CDN（新，`tw_native`） | `cdn.hinet.net` | 政府、學校網站居多（B11 約 520 個），答案是中華電信的台灣位址。只有 `cdn.hinet.net` 底下才算，ISP 其他主機名稱不算 |
+| 白山雲（新） | `bsclink.cn`、`trpcdn.net`、`bsgslb.cn`、`bsgslb.com`、`baishan-cloud.net` | 權威 DNS 是白山的 `dolfindns`／`bainsx` |
+| 知道創宇 加速樂（新） | `jiashule.com` | 權威 DNS 是創宇盾（`cyudun`） |
+| 百度智能雲 CDN（新） | `shifen.com`、`jomodns.com` | 百度的 CDN 調度網域（`*.n.shifen.com`、`bcedy*.jomodns.com`） |
+| 華為雲 CDN（新） | 規則：`cdnhwc` 後面接「英文字母＋數字」的 `.com`／`.cn`（`cdnhwc1.com`、`cdnhwcbzj102.com`、`cdnhwcaoc115.cn`…） | 權威 DNS 是 `huaweicloud-dns` |
+| 金山雲 CDN（新） | `ksyuncdn.com` | 自己的權威 DNS，`*.gslb.ksyuncdn.com` |
+| 阿里雲 WAF（新） | 規則：`yundunwafN.com`、`aliyunwafN.com` | 權威 DNS 是 `alidns` |
+| 華為雲 WAF、Radware Cloud WAF、F5 Distributed Cloud、WP Engine、Hostinger CDN、J-Stream（新） | `huaweicloudwaf.com`、`radwarecloud.net`、`ves.io`、`wpeproxy.com`、`cdn.hstgr.net`、`stream.ne.jp` | 業者自己的網域；沒有官方公布的台灣節點範圍 |
+
+**不收**（理由）：
+
+- 架站平台、電商、客服、雲端主機與負載平衡：CYBERBIZ、1shop、SHOPLINE、QDM、so-buy、netiCRM、Webflow、Squarespace、Wix、Strikingly、Webnode、Zendesk、AWS ELB（`amazonaws.com`）、AWS Global Accelerator、Azure 雲端服務（`cloudapp.azure.com`）、阿里雲 ALB（`aliyuncs.com`、`aliyuncsslb*.com`）、阿里雲全球加速（`aliyungaNNNN.com`）、阿里雲 DDoS 防護（`aliyunddos*.com`）、騰訊雲負載平衡（`tencentclb.com`）、騰訊雲主機（`*.ias.tencent-cloud.net`，主機名稱是 `ins-` 開頭的主機編號）、Heroku、Firebase `web.app`、Salesforce、Yahoo、Wikimedia、Shopee、Netease、Naver：沒有多個機房可以選，黑潮換不了。
+- 流量排程（GTM）：`*.gds.alibabadns.com`（阿里巴巴的全域排程，背後可能是任何東西）、`volcgtm.com`：跟 AWS Global Accelerator 同一類。
+- `imycdn.com`：答案是一兩台雲端主機（每個網域都指到同一兩個位址），是架站主機，不是多機房的 CDN；業者查不到。
+- `greatwall.net`、`queniu` 以外的 `dnsoe*.com`、`kgns*.com`、`enacdn.net`、`bplslb.com`、`ctlcdn.cn`：歸屬查不清楚。
+- 只出現在新註冊網域、像博弈詐騙站共用的：`91dun.vip`、`91cdncdn.com`、`zazxb.com`、`keihuia.com`、`orbitnexuscore.com`、`11bcname.com`、`cdn-cluster.com` 等。
+- 只有 IP、不在範圍裡的網域（台灣前 10 萬裡最大的一塊）要靠 ASN 才分得出來，不在這一版。GitHub Pages（`185.199.108.153`～`111.153`）已經在 Fastly 的範圍裡（見 3.14 節）。
+
+**B11 重跑**（同一份資料、同樣的分類：IP 在範圍裡或 CNAME 認得＝已收錄）：「未收錄（有 CNAME）」從 159,550 個網域減到 134,818 個（−24,732，−15.5%）。依名單：台灣前 10 萬 200 → 170、台灣前 10 萬（第二次）53 → 44、台灣 50 萬級 2,856 → 2,505、50 萬級／Umbrella 55,209 → 45,465、Umbrella 99,288 → 84,723、新註冊網域 1,944 → 1,911。減少的裡面約 1 萬個是 Microsoft 365 的 `*-msedge.net`（Umbrella 為主）。
+
+### 3.14 驗證失敗記在網站還是節點、業者專用 IP、原本就在台灣（3.5.1）
+
+**K2：Fastly 節點反覆被暫停**。Windows 2 小時 44 分裡同樣幾個 Fastly 節點各被暫停 5～6 次；D3 壓測的系統記錄裡 Fastly「暫停使用」113 次，**109 次是在驗證 GitHub Pages 的網站**（`*.github.io` 與指到 `185.199.108.153`～`111.153` 的自訂網域），全部是 ECONNRESET；其他是 `linktr.ee`、`pinterest.ru` 這類少數網站。原因：
+
+- Fastly 的範圍包含 GitHub 的 `185.199.108.0/22`（為了 GitHub 的下載、頭像這些走一般 Fastly 節點也可以用的服務），GitHub Pages 因此被認成 Fastly；但 GitHub Pages 只接受 GitHub 那幾個位址，拿節點池的節點去驗證一定被重設。
+- 驗證時連不上一個節點就**馬上暫停那個節點**（保留最後一段的 Fastly 是暫停同網段的節點或整個 /24），30 分鐘後健檢（連業者自己的網站）通過就恢復，下一次驗證同一個網站又失敗——同一個節點一直被暫停又恢復，對其他網站是好的節點也被拉下來。
+
+現在：
+
+1. **業者專用 IP**（`providers.rs` 的 `dedicated_ip()`）：GitHub Pages 官方文件公布的四個 A（`185.199.108.153`～`185.199.111.153`）與四個 AAAA（`2606:50c0:8000::153`～`8003::153`）。答案全部是這些位址時照原本的答案，不驗證、不跨 CDN、不 ECS（`cdn.stats.dedicated`、`explain` 是 `dedicated-ip`；手動「一定換」照使用者的）。只有 Fastly 有這條規則，比的是幾個整數。
+2. **網站的問題記在網站上**：一次驗證裡連不上（或憑證不符）的不同節點有 **3 個以上**、一個都沒通過，而且原本的 IP 連得上 → 記成這個網站的 `fail`（原因「試了 N 個台灣節點都連不上…這個網站可能只接受業者專用的 IP」），失敗次數照加、到期時間照一般失敗逐次拉長（6 → 12 → 24 小時…），不暫停任何節點。以前是「暫不判定、10 分鐘後再試」。
+3. **節點的問題要看多個網站**：驗證時連不上不再馬上暫停節點，記下來；同一個節點 **1 小時內第 2 個不同的網站**也連不上才暫停（`pools.rs` 的 `note_conn_fail()`）。保留最後一段的 Fastly 以 /24 算（不同網站用的最後一段不同），到門檻時照舊暫停網段裡節點池的節點，沒有就暫停那個 /24。每家最多記 256 個節點，1 小時前的不算。原本的 IP 也連不上（多半是本機網路）時不記。
+4. **同一個節點反覆被暫停時逐次加倍**：24 小時內第 n 次被驗證暫停，暫停 30 分鐘 × 2^(n−1)，最多 8 小時；暫停期間健檢通過也不恢復（健檢只證明節點對業者自己的網站可以用）；24 小時沒再發生就從 1 算；每家最多記 256 個。`/api/cdn/pools` 的節點多 `strikes`（次數）。
+5. Fastly「每個網段都不服務這組憑證」的重找間隔從固定 1 小時改成 1、2、4…小時（不超過一般失敗的到期時間）。
+
+**上限與恢復**：暫停最多 8 小時、紀錄每家最多 256 筆、1 小時與 24 小時的視窗都會自己過期；判斷錯的最壞情況是「某個網站暫時用原本的答案」或「某個節點晚一點才暫停」（健檢每 30 分鐘、Fastly 品質檢查每 5 分鐘照樣會把真的壞掉的節點拉下來）。
+
+**原本的答案已經在台灣機房就不換**（Azure「台北換台北」）：7 個「比原本慢」的網域有 4 個是 Azure，原本的 POP 已經是 TPE，黑潮卻換成節點池裡另一個台北節點，握手反而慢（43.5 對 19.7、271 對 30.3 毫秒）。現在驗證時先探測原本的 IP（本來就有這一步），量到的 POP 已經是台灣機房、回應正常（狀態碼 500 以下、不像錯誤頁）就記成 `fail`＋`origTw`（POP），查詢路徑走既有的「驗證失敗 → 原始」；不加失敗次數、不算驗證失敗（`cdn.stats.origTw`）、不標壞節點、不再對候選節點一個一個連；`cdn.verifyFailHours`（預設 6 小時）後有人查再看一次（業者也可能把原本的答案改到國外）。範圍同 F9：IPv4、非最近節點型、不是手動「一定換」、`cdn.slowerFallback` 開著（關掉＝跟 3.5.0 一樣，驗證通過就換）。`explain` 是 `already-tw`（「驗證時原本的答案在 TPE」），`steps` 的 `v4` 多 `origTw`。
+
+**explain 的「已是台灣」**：退回（F9「比原本慢」）到期之後，上游的答案已經是台灣節點時，以前一直說 `trial`「台灣節點還在驗證中（試用期先回原本的答案，TTL 10 秒）」，其實沒有在驗證、也沒有縮短 TTL——`explain` 只看存著的基準 POP（那是退回時量的國外 POP）。現在跟查詢路徑（`alias_family()`）一樣，用最近一次答案的 IP 在節點池裡的分類判斷（`Tw`／`Dead` 不換、`Global`／`Unknown` 才換）；這家的 IP 一個都沒有（舊資料）時才看存著的基準 POP。
+
 ## 4. 實作順序
 
 1. ✅ 這一批：1.1、1.2、1.3、2.1、2.4（不改變外部行為，只讓命中率與速度變好，而且都能量測）

@@ -269,7 +269,7 @@ pub static PROVIDERS: &[Provider] = &[
     base("github", "GitHub Pages", &["github.io", "githubusercontent.com"]),
     base("shopify", "Shopify", &["myshopify.com", "shops.myshopify.com"]),
     base("line", "LINE CDN", &["line-scdn.net", "line-apps.com"]),
-    // ---- 3.5.1 新增：只認得（CNAME 辨識），沒有官方公布的台灣節點範圍，黑潮不換（收或不收的理由見規格 06 第 3.9 節）----
+    // ---- 3.5.1 新增：只認得（CNAME 辨識），沒有官方公布的台灣節點範圍，黑潮不換（收或不收的理由見規格 06 第 3.13 節）----
     // 台灣本地的 CDN：節點本來就在台灣，標成「已是台灣」
     tw_native(base("hinet", "中華電信 HiNet CDN", &["cdn.hinet.net"])),
     base("baishan", "白山雲 Baishan", &["bsclink.cn", "trpcdn.net", "bsgslb.cn", "bsgslb.com", "baishan-cloud.net"]),
