@@ -122,7 +122,15 @@ pub struct Stats {
     /// 內建服務（時間同步、連線偵測、憑證撤銷、地震速報）照原本的答案回、不改寫的次數（3.5.0 F11；
     /// 計數在 `Cdn` 的原子計數器，查詢路徑不拿狀態鎖，讀的時候才填進來）
     pub essential_kept: u32,
+    /// 不再收新網域的期間（記憶體不能長大、或筆數超過磁碟預算的 [`ADMIT_BUDGET_FACTOR`] 倍），新網域照上游答案回、
+    /// 不記進資料庫的次數（3.5.1 K4）
+    pub new_held: u32,
 }
+
+/// 網域資料（記憶體＋移出的）超過磁碟預算換算筆數的這麼多倍時，先不收新網域（3.5.1 K4）：淘汰是一輪一輪做的，
+/// 每秒上百個新網域時淘汰追不上（D3 壓測：預算 24,919 筆，漲到 84,131 筆）。記憶體多用一些保護 Flash 是設計，
+/// 但不能無限長；淘汰追上之後自己恢復
+pub const ADMIT_BUDGET_FACTOR: usize = 2;
 
 /// 背景工作
 #[derive(Debug, Clone, PartialEq)]
@@ -296,6 +304,10 @@ pub struct Cdn {
     pub(crate) line_env: RwLock<Option<LineEnvFn>>,
     /// 移出記憶體的冷資料筆數（`Db::evicted_count` 的副本）：0 時查詢路徑完全不必檢查
     evicted_n: AtomicU32,
+    /// 可不可以收新網域（記憶體控制的「長大」開關；3.5.1 K4）
+    admit_new: std::sync::atomic::AtomicBool,
+    /// 磁碟預算換算的筆數（每一輪預算整理時更新；0 = 沒有預算）
+    pub(crate) budget_cap: AtomicU32,
     /// 驗證節流的「減量中」（3.5.0 F12）：查詢路徑只讀這一個（`apply()` 判斷要不要先不排只問過一次的網域）
     paced: std::sync::atomic::AtomicBool,
     /// 減量中時，查詢路徑每分鐘最多一次順便檢查要不要離開（Unix 分鐘；沒有主程式的 CPU 讀數時也會自己恢復）
@@ -512,6 +524,8 @@ impl Cdn {
             on_low_pool: RwLock::new(None),
             line_env: RwLock::new(None),
             evicted_n: AtomicU32::new(0),
+            admit_new: std::sync::atomic::AtomicBool::new(true),
+            budget_cap: AtomicU32::new(0),
             budget_pruned: AtomicU32::new(0),
             disk_kb: AtomicU32::new(u32::MAX),
             file_kb: AtomicU32::new(u32::MAX),
@@ -897,6 +911,24 @@ impl Cdn {
         }
     }
 
+    /// 記憶體控制的「長大」開關（3.5.1 K4）：不能長大時新網域照上游的答案回、不記進資料庫（已經記著的照常）
+    pub fn set_admit_new(&self, on: bool) {
+        self.admit_new.store(on, Ordering::Relaxed);
+    }
+
+    /// 這個網域收不收（3.5.1 K4）：已經在資料庫（含移出記憶體的）一定收；新網域要記憶體能長大、
+    /// 而且總筆數沒超過磁碟預算的 [`ADMIT_BUDGET_FACTOR`] 倍
+    pub(crate) fn admits(&self, st: &State, name: &str) -> bool {
+        if st.db.get(name).is_some() || st.db.is_evicted(name) {
+            return true;
+        }
+        if !self.admit_new.load(Ordering::Relaxed) {
+            return false;
+        }
+        let cap = self.budget_cap.load(Ordering::Relaxed) as usize;
+        cap == 0 || st.db.total_entries() < cap.saturating_mul(ADMIT_BUDGET_FACTOR)
+    }
+
     /// 移出記憶體的冷資料分佈在幾個分片（記憶體恢復時估計一次讀回一片要多少用）
     pub fn evicted_shard_count(&self) -> usize {
         if self.evicted_n.load(Ordering::Relaxed) == 0 {
@@ -1049,8 +1081,10 @@ impl Cdn {
         let mut out = BudgetRound::default();
         let disk = self.measure_disk();
         let (Some(limit), Some(budget)) = (self.budget_limit(), self.cfg.db_disk_budget) else {
+            self.budget_cap.store(0, Ordering::Relaxed);
             return out;
         };
+        self.budget_cap.store(limit.min(u32::MAX as usize) as u32, Ordering::Relaxed);
         let (plan, n) = {
             let mut st = self.state();
             (st.db.budget_plan(limit, disk > budget), st.db.shards)

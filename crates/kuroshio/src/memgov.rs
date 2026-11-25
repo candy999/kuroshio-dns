@@ -1634,6 +1634,10 @@ impl Step for CdnStep {
     fn can_shed(&self) -> bool {
         self.cooling().is_none() && self.cdn.domains_in_ram() > 0
     }
+    /// 接近保留量：新網域先不記（3.5.1 K4；已經記著的照常）
+    fn set_growth(&self, allowed: bool) {
+        self.cdn.set_admit_new(allowed);
+    }
     fn holds_later(&self) -> bool {
         self.cooling().is_some_and(|b| b >= CDN_HOLD_MIN_BYTES)
     }

@@ -492,6 +492,51 @@ fn recheck_and_shrink() {
 }
 
 #[test]
+fn new_domains_held_when_growth_stops() {
+    // 3.5.1 K4：記憶體控制說不能長大時，新網域照上游的答案回、不記進資料庫；已經記著的照常；恢復後照常收
+    let (c, _net) = setup(json!({}));
+    c.with_state(|st| st.pools.p.get_mut("cloudflare").unwrap().range4 = crate::pools::cidr(&["198.51.100.0/24"]));
+    let mut m = msg("old.example.com", 1, &["198.51.100.7"], vec![]);
+    assert_eq!(c.apply(&mut m, "old.example.com", rtype::A).provider, Some("cloudflare"));
+    assert!(c.state().db.get("old.example.com").is_some());
+    c.set_admit_new(false);
+    let mut m = msg("new.example.com", 1, &["198.51.100.8"], vec![]);
+    let r = c.apply(&mut m, "new.example.com", rtype::A);
+    assert_eq!(r.provider, Some("cloudflare"), "照樣認得");
+    assert!(r.tags.iter().any(|t| t.starts_with("新網域先不記")), "{:?}", r.tags);
+    assert!(c.state().db.get("new.example.com").is_none(), "不記");
+    assert_eq!(c.state().stats.new_held, 1);
+    let hits = c.state().db.get("old.example.com").unwrap().hits;
+    let mut m = msg("old.example.com", 1, &["198.51.100.7"], vec![]);
+    c.apply(&mut m, "old.example.com", rtype::A);
+    assert_eq!(c.state().db.get("old.example.com").unwrap().hits, hits + 1, "已經記著的照常");
+    c.set_admit_new(true);
+    let mut m = msg("new.example.com", 1, &["198.51.100.8"], vec![]);
+    c.apply(&mut m, "new.example.com", rtype::A);
+    assert!(c.state().db.get("new.example.com").is_some(), "恢復後照常收");
+}
+
+#[test]
+fn new_domains_held_when_far_over_budget() {
+    // 3.5.1 K4：總筆數到了磁碟預算換算筆數的 2 倍：先不收新網域（淘汰追上之後自己恢復）
+    let (c, _net) = setup(json!({}));
+    c.with_state(|st| st.pools.p.get_mut("cloudflare").unwrap().range4 = crate::pools::cidr(&["198.51.100.0/24"]));
+    c.with_state(|st| {
+        for i in 0..(2 * 100) {
+            st.db.touch(&format!("d{i}.example.com"), "cloudflare", "ip", &[], &[], None);
+        }
+    });
+    c.budget_cap.store(100, std::sync::atomic::Ordering::Relaxed);
+    let mut m = msg("over.example.com", 1, &["198.51.100.9"], vec![]);
+    c.apply(&mut m, "over.example.com", rtype::A);
+    assert!(c.state().db.get("over.example.com").is_none(), "預算 100 筆、已經 200 筆");
+    c.budget_cap.store(1000, std::sync::atomic::Ordering::Relaxed);
+    let mut m = msg("over.example.com", 1, &["198.51.100.9"], vec![]);
+    c.apply(&mut m, "over.example.com", rtype::A);
+    assert!(c.state().db.get("over.example.com").is_some());
+}
+
+#[test]
 fn classifier_snapshot_follows_range_changes() {
     // `apply()` 用唯讀快照判斷是不是 CDN（不拿狀態鎖）；範圍 / 分類不管怎麼換，放開鎖之後快照都要跟上
     let (c, _net) = setup(json!({}));

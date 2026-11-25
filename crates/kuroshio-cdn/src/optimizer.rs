@@ -279,6 +279,14 @@ impl Cdn {
         {
             let mut st = self.state();
             let st = &mut *st;
+            // 3.5.1 K4：先不收新網域（記憶體不能長大、或筆數超過磁碟預算的 2 倍）：照上游的答案回、不記、不排驗證。
+            // 已經記著的網域照常；記憶體回來、淘汰追上之後自己恢復
+            if !self.admits(st, &name) {
+                st.stats.new_held = st.stats.new_held.saturating_add(1);
+                res.provider = Some(provider);
+                res.tags.push("新網域先不記:記憶體或磁碟預算".into());
+                return res;
+            }
             self.apply_locked(st, msg, &name, qtype, provider, via, &cname, c1, &mut res, &mut tasks);
             // 小機器減量（3.4.2）：只問過一次的網域先不驗證（剛註冊、只出現一次的網域不值得驗）。
             // 答案照樣是原始結果、試用期 TTL 10 秒，真的有人在用的話很快會再問，那時才排驗證。
