@@ -440,6 +440,105 @@ async fn health_check_marks_and_sorts() {
     assert_eq!(low.lock().unwrap().as_slice(), ["cloudflare"], "可用節點不足：通知重建節點池");
 }
 
+/// 3.5.1 K2：同一個節點反覆被驗證標壞，暫停時間逐次加倍（30 → 60 → 120 分鐘…最多 8 小時），
+/// 暫停期間健檢通過也不恢復；24 小時沒再發生就從頭算；紀錄有上限
+#[tokio::test]
+async fn repeated_mark_bad_doubles_hold_and_health_respects_it() {
+    let (c, net) = setup(json!({}));
+    let (a, b) = (ip("192.0.2.1"), ip("192.0.2.2"));
+    c.with_state(|st| {
+        let mut x = PoolNode::new(a);
+        x.ms = Num::V(3.0);
+        let mut y = PoolNode::new(b);
+        y.ms = Num::V(4.0);
+        st.pools.p.get_mut("cloudflare").unwrap().pool4 = vec![x, y];
+    });
+    net.on_http(|_, _| cf_ok("TPE"));
+    net.on_ping(|_| lat(2.5));
+    let age = |c: &Cdn, min: u64| {
+        c.with_state(|st| {
+            let d = st.pools.p.get_mut("cloudflare").unwrap();
+            d.strikes.get_mut(&a).unwrap().at = now_ms() - min * 60_000;
+        })
+    };
+    let bad = |c: &Cdn| c.state().pools.p["cloudflare"].bad.contains_key(&a);
+    // 第 1 次：30 分鐘
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "驗證 www.example.com 時 TIMEOUT"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].hold_ms(), 30 * 60_000);
+    age(&c, 10);
+    c.health_check().await;
+    assert!(bad(&c), "暫停中：健檢通過也不恢復");
+    age(&c, 31);
+    c.health_check().await;
+    assert!(!bad(&c), "過了 30 分鐘：健檢通過就恢復");
+    // 第 2 次（24 小時內）：60 分鐘
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "驗證 www.example.com 時 TIMEOUT"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].n, 2);
+    age(&c, 31);
+    c.health_check().await;
+    assert!(bad(&c), "第 2 次要 60 分鐘");
+    age(&c, 61);
+    c.health_check().await;
+    assert!(!bad(&c));
+    // 第 3 次：120 分鐘；別的節點不受影響
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "x"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].hold_ms(), 120 * 60_000);
+    assert!(!c.state().pools.p["cloudflare"].bad.contains_key(&b));
+    // 上限 8 小時
+    let s = crate::pools::Strike { n: 30, at: 0 };
+    assert_eq!(s.hold_ms(), crate::pools::STRIKE_MAX_MS);
+    // 24 小時沒再發生：從 1 算
+    age(&c, 25 * 60);
+    c.with_state(|st| st.pools.mark_bad("cloudflare", a, "x"));
+    assert_eq!(c.state().pools.p["cloudflare"].strikes[&a].n, 1);
+    // 紀錄有上限
+    c.with_state(|st| {
+        let d = st.pools.p.get_mut("cloudflare").unwrap();
+        for i in 0..400u32 {
+            d.strike(IpAddr::from(std::net::Ipv4Addr::from(0xC633_6400 + i)), now_ms());
+        }
+        assert!(d.strikes.len() <= crate::pools::STRIKE_CAP);
+    });
+}
+
+/// 3.5.1 K2（Fastly，保留最後一段）：同網段另一組憑證的位址連不上，只暫停那個位址，不暫停節點池的節點；
+/// 那個位址暫停期間不當驗證候選、不回給用戶端，時間到自己恢復
+#[tokio::test]
+async fn octet_other_address_failure_holds_only_that_address() {
+    let (c, _net) = setup(json!({}));
+    let pf = |s: &str| crate::util::parse_prefix24(s).unwrap();
+    let (node, other) = (ip("192.0.2.2"), ip("192.0.2.140"));
+    c.with_state(|st| {
+        let d = st.pools.p.get_mut("fastly").unwrap();
+        let mut n = PoolNode::new(node);
+        n.pop = Some(intern("HKG"));
+        n.ms = Num::V(26.0);
+        n.score = Num::V(28.0);
+        d.pool4 = vec![n];
+        d.prefixes = [("HKG".to_string(), vec![pf("192.0.2"), pf("198.51.100")])].into_iter().collect();
+        st.pools.mark_bad("fastly", other, "驗證 www.example.com 時 TIMEOUT");
+    });
+    let st = c.state();
+    let d = &st.pools.p["fastly"];
+    assert!(d.bad.is_empty(), "節點池的節點沒有被暫停");
+    assert!(d.held(other) && !d.held(node));
+    assert!(st.pools.usable("fastly", node));
+    assert!(!st.pools.usable("fastly", other));
+    let cand = st.pools.verify_candidates("fastly", Some(ip("203.0.113.140")), &[]);
+    assert!(!cand.contains(&other) && cand.contains(&ip("198.51.100.140")), "{cand:?}");
+    drop(st);
+    // 時間到自己恢復
+    c.with_state(|st| {
+        st.pools.p.get_mut("fastly").unwrap().strikes.get_mut(&other).unwrap().at = now_ms() - 31 * 60_000;
+    });
+    let st = c.state();
+    assert!(st.pools.usable("fastly", other));
+    assert!(st
+        .pools
+        .verify_candidates("fastly", Some(ip("203.0.113.140")), &[])
+        .contains(&other));
+}
+
 #[tokio::test]
 async fn small_healthy_pool_does_not_request_rebuild() {
     // 節點池本來就只有 2 個（少於 minPool 3）但都正常：重建也找不到更多，不要一直重排節點池工作

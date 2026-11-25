@@ -258,6 +258,33 @@ pub struct Bad {
     pub quality: bool,
 }
 
+/// 同一個位址反覆被驗證標成壞的（3.5.1 K2）：第 n 次暫停 [`STRIKE_BASE_MS`] × 2^(n−1)，最多 [`STRIKE_MAX_MS`]；
+/// 最後一次之後 [`STRIKE_FORGET_MS`] 沒再發生就從頭算。暫停期間健檢通過也不恢復（健檢只連業者自己的網站，
+/// 證明不了「對這個網站可以用」）
+pub const STRIKE_BASE_MS: u64 = BAD24_MS;
+pub const STRIKE_MAX_MS: u64 = 8 * util::HOUR_MS;
+pub const STRIKE_FORGET_MS: u64 = util::DAY_MS;
+/// 每家 CDN 最多記幾個位址（超過丟掉最舊的）
+pub const STRIKE_CAP: usize = 256;
+
+/// 一個位址被驗證標成壞的次數與最後一次的時間（3.5.1 K2）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strike {
+    pub n: u32,
+    pub at: u64,
+}
+
+impl Strike {
+    /// 這一次暫停多久
+    pub fn hold_ms(&self) -> u64 {
+        (STRIKE_BASE_MS << self.n.saturating_sub(1).min(8)).min(STRIKE_MAX_MS)
+    }
+    /// 還在暫停中
+    pub fn held(&self, now: u64) -> bool {
+        now < self.at.saturating_add(self.hold_ms())
+    }
+}
+
 /// IP 的分類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cls {
@@ -356,6 +383,8 @@ pub struct ProviderPools {
     pub prefixes: IndexMap<String, Vec<u32>>,
     pub bad: HashMap<IpAddr, Bad>,
     pub bad24: HashMap<u32, Bad>,
+    /// 驗證反覆標成壞的位址（3.5.1 K2，暫停時間逐次加倍）。換節點池（`replace()`）時不清，下次再失敗照樣加倍
+    pub strikes: HashMap<IpAddr, Strike>,
     /// IPv6 即時發現：每個 /48 上次嘗試時間
     pub tried6: IndexMap<u128, u64>,
     /// pools.json 裡這家的其他欄位（updatedAt、tw48、prefixes…）
@@ -385,6 +414,28 @@ impl ProviderPools {
             return Some(if self.tw48.contains(ip) { Cls::Tw } else { Cls::Global });
         }
         None
+    }
+
+    /// 記一次（3.5.1 K2）：上一次超過 [`STRIKE_FORGET_MS`] 就從 1 算；有上限（丟掉最舊的）
+    pub fn strike(&mut self, ip: IpAddr, now: u64) -> Strike {
+        self.strikes.retain(|_, s| now.saturating_sub(s.at) <= STRIKE_FORGET_MS);
+        let n = self.strikes.get(&ip).map_or(0, |s| s.n);
+        if n == 0 && self.strikes.len() >= STRIKE_CAP {
+            if let Some(old) = self.strikes.iter().min_by_key(|(_, s)| s.at).map(|(k, _)| *k) {
+                self.strikes.remove(&old);
+            }
+        }
+        let s = Strike {
+            n: n.saturating_add(1),
+            at: now,
+        };
+        self.strikes.insert(ip, s);
+        s
+    }
+
+    /// 這個位址還在 K2 的暫停中（沒有任何紀錄時不讀時間）
+    pub fn held(&self, ip: IpAddr) -> bool {
+        !self.strikes.is_empty() && self.strikes.get(&ip).is_some_and(|s| s.held(now_ms()))
     }
 
     /// 範圍與分類是不是同一份（比指標）
@@ -871,7 +922,7 @@ impl Pools {
         let Some(d) = self.p.get(provider) else { return false };
         if self.octet_mode(provider) {
             if let Some(pf) = util::prefix24(ip) {
-                if self.bad24(provider, pf) || self.is_restricted(provider, ip) {
+                if self.bad24(provider, pf) || self.is_restricted(provider, ip) || d.held(ip) {
                     return false;
                 }
                 return self.pop_view(provider).has_prefix(pf);
@@ -1032,13 +1083,14 @@ impl Pools {
             }
         }
         let n = self.cfg.serve_count_of(provider);
+        let held = |ip: IpAddr| self.p.get(provider).is_some_and(|d| d.held(ip));
         // 同一次回應只用同一個 POP：依品質順序，找第一個「這組憑證已驗證可用」的 POP
         for (_, prefs) in &self.pop_view(provider).pops {
             let mut out: Vec<IpAddr> = Vec::new();
             for &o in &octs {
                 for &pf in prefs {
                     let ip = util::ip_of(pf, o);
-                    if self.zone_hit(provider, ip) && !out.contains(&ip) {
+                    if self.zone_hit(provider, ip) && !out.contains(&ip) && !held(ip) {
                         out.push(ip);
                     }
                 }
@@ -1083,7 +1135,7 @@ impl Pools {
             let list: Vec<IpAddr> = order
                 .into_iter()
                 .map(|pf| util::ip_of(pf, o))
-                .filter(|ip| !self.is_restricted(provider, *ip))
+                .filter(|ip| !self.is_restricted(provider, *ip) && !self.p.get(provider).is_some_and(|d| d.held(*ip)))
                 .collect();
             let take = if i == 0 { self.cfg.octet_search } else { 3 };
             out.extend(list.into_iter().take(take));
@@ -1210,7 +1262,7 @@ impl Pools {
         let mut ip = ip;
         if octet {
             if let Some(pf) = util::prefix24(ip) {
-                match d.pool4.iter().find(|x| util::prefix24(x.ip) == Some(pf)) {
+                match d.pool4.iter().find(|x| util::prefix24(x.ip) == Some(pf)).map(|x| x.ip) {
                     None => {
                         d.bad24.retain(|_, b| now.saturating_sub(b.at) <= BAD24_MS);
                         d.bad24.insert(
@@ -1224,10 +1276,24 @@ impl Pools {
                         warn!("{provider} 網段 {}.0/24 暫停使用：{reason}", util::prefix24_str(pf));
                         return;
                     }
-                    Some(e) => ip = e.ip,
+                    // 3.5.1 K2：同一個 /24 的另一個位址（最後一段不同 = 另一組憑證）連不上，只暫停那個位址。
+                    // 以前把節點池裡同網段的節點整個標壞，30 分鐘後健檢（連 www.fastly.com）通過就恢復，
+                    // 下一次驗證同一個網站又失敗，同一個節點一直被暫停又恢復
+                    Some(node) if node != ip => {
+                        let s = d.strike(ip, now);
+                        let more = if s.n > 1 { format!("，第 {} 次", s.n) } else { String::new() };
+                        warn!(
+                            "{provider} 位址 {ip}（節點 {} 的網段、另一組憑證）暫停 {} 分鐘{more}：{reason}",
+                            node,
+                            s.hold_ms() / 60_000
+                        );
+                        return;
+                    }
+                    Some(node) => ip = node,
                 }
             }
         }
+        let s = d.strike(ip, now);
         d.bad.insert(
             ip,
             Bad {
@@ -1236,7 +1302,15 @@ impl Pools {
                 quality: false,
             },
         );
-        warn!("{provider} 節點 {ip} 暫停使用：{reason}");
+        if s.n > 1 {
+            warn!(
+                "{provider} 節點 {ip} 暫停使用（24 小時內第 {} 次，{} 分鐘內健檢通過也不恢復）：{reason}",
+                s.n,
+                s.hold_ms() / 60_000
+            );
+        } else {
+            warn!("{provider} 節點 {ip} 暫停使用：{reason}");
+        }
         let fam = if ip.is_ipv6() { 6 } else { 4 };
         if self.pool_size(provider, fam) < self.cfg.min_pool {
             self.request_rebuild(provider);
@@ -1261,6 +1335,10 @@ impl Pools {
                         let mut v = serde_json::to_value(x).unwrap_or_default();
                         if let (Some(b), Some(m)) = (d.bad.get(&x.ip), v.as_object_mut()) {
                             m.insert("bad".into(), json!(b.reason));
+                            // 24 小時內被驗證標壞的次數（3.5.1 K2）
+                            if let Some(s) = d.strikes.get(&x.ip) {
+                                m.insert("strikes".into(), json!(s.n));
+                            }
                         }
                         v
                     })
