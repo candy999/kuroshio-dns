@@ -193,7 +193,7 @@
 |---|---|---|
 | 騰訊 EdgeOne／騰訊雲 CDN | 規則：`eo.dnseN.com`、`share.dnseN.com`（N 最多兩位數）、`tdnsvN.com`、`tdnssticN.cn`、`tdnsvodN.cn`；後綴：`ovscdns.com`、`ovscdns.net`、`apdcdn.com` | `eo.dnse0`／`dnse1` 已收錄；`tdnsv8`、`ovscdns`、`apdcdn` 的 SOA 跟已收錄的 `tdnsv6.com` 一字不差；`.cn` 兩個的權威 DNS 是 DNSPod |
 | Vercel | 規則：`vercel-dns-N.com`（最多三位數；B11 有 013、016、017） | 已收錄 `vercel-dns.com` |
-| 阿里雲 CDN | 規則：`kunlunXX.com`（2～4 個英文字母）、`queniuXX.com`（2 個英文字母）；後綴：`kunluncan.com`、`kunlunaq.com`、`kunlunpi.com` | 官方文件：CNAME 是「`*.*kunlun*.com`」。`queniu*` 的權威 DNS 是 `queniudns`，網域註冊商與 DNS 主機都在阿里雲，阿里巴巴、高德、字節跳動的網域都指過去（**沒有官方文件，只認得、不換**） |
+| 阿里雲 CDN | 規則：`kunlunXX.com`（2～4 個英文字母）、`queniuXX.com`（2 個英文字母）；後綴：`kunluncan.com`、`kunlunaq.com`、`kunlunpi.com` | 官方文件：CNAME 是「`*.*kunlun*.com`」。`queniu*` 的權威 DNS 是 `queniudns`，網域註冊商與 DNS 主機都在阿里雲，阿里巴巴、高德、字節跳動的網域都指過去；阿里雲沒有公開文件寫這組網域，但第三方的網域情資（Netify）也把 `queniu*` 歸為阿里雲 CDN 的調度網域（使用者 2026-11-25 查證）。跟其他阿里雲 CDN 後綴一樣照常驗證、換台灣節點 |
 | 網宿 | `wswebpic.com`、`wswebcdn.com`、`cdn20.com`、`cdn30.com`、`wsdvs.com`、`wcdnga.com` | 權威 DNS 跟網宿既有後綴同一組（`cdn30.org`）；`wcdnga.com` 的主機名稱用網宿的 `wsall.` 慣例 |
 | 火山引擎／BytePlus | `cdnbuild.net`、`bytefcdn.com`、`byteoversea.net`；規則：`volcfcdndvsN.com` | 權威 DNS 是 `volc-dns`；`byteoversea.net` 是 TikTok 的海外排程 |
 | Microsoft | `spo-msedge.net`、`spov-msedge.net`、`t-s1-msedge.net`、`bx-msedge.net`、`wac-msedge.net` | Microsoft 365 的前端（SharePoint、Office 線上版），已收錄 `msedge.net` 的同一家 |

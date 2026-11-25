@@ -354,7 +354,7 @@ static CNAME_PATTERNS: &[CnamePattern] = &[
     // 阿里雲 CDN：`<網域>.w.kunluncan.com`、`kunlunaq.com`、`kunlunpi.com`…（官方文件寫「`*.*kunlun*.com`」）
     pat("kunlun", (2, 4), Tail::Letters, "com", "alibaba"),
     // 阿里系的 `queniuaa.com`、`queniuak.com`…（權威 DNS 是 `queniudns`，註冊商與 DNS 主機都在阿里雲；
-    // 阿里巴巴、字節跳動的網域都指過去）
+    // 阿里巴巴、字節跳動的網域都指過去；第三方網域情資也歸為阿里雲 CDN 的調度網域）
     pat("queniu", (2, 2), Tail::Letters, "com", "alibaba"),
     // 阿里雲 WAF：`yundunwaf1.com`～`yundunwaf5.com`、`aliyunwaf1.com`～`aliyunwaf5.com`
     pat("yundunwaf", (1, 2), Tail::Digits, "com", "aliwaf"),
