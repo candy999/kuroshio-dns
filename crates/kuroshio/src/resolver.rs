@@ -1597,6 +1597,8 @@ pub mod perf {
             "backfillQueries": BACKFILL.load(Ordering::Relaxed),
             "jobTimeouts": JOB_TIMEOUTS.load(Ordering::Relaxed),
             "rankSkipped": RANK.lock().unwrap().as_ref().and_then(|w| w.upgrade()).map_or(0, |r| r.busy_skips()),
+            // 加密 DNS 伺服器拒絕新連線、DoH 回 busy、查詢逾時的累計次數（3.5.1 K7–K9）
+            "server": crate::encrypted::server_json(),
         })
     }
 }

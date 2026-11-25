@@ -581,6 +581,13 @@ LuCI 與 Windows / Linux 設定頁的狀態頁有「串接」區塊：下游角�
 
 3.5.0：`/api/status` 的 `cdn` 在 CDN 關掉時是 `{"enabled": false}`（以前是 `null`，看不出是關掉還是讀不到）。`/api/status` 多 `perf`（效能計數器，找出沒有 AES 指令的機器把 CPU 花在哪裡）：`perf.tls.dot`／`perf.tls.doh` 各有 `full`（完整握手）、`resumed`（續用 session）、`aes`／`chacha`（協商到的密碼套件）、`fail`（連線或握手失敗）；`perf.tls.quic` 有 `new`（新建的連線數；QUIC 連線每 10 秒送 keep-alive、會一直重複使用，所以前後相減常常是 0）、`fail`、`open`（目前開著的連線數，3.5.0 F4）；`perf.fanout` 是每次詢問送出 1、2、3、4 個以上上游查詢的次數（一筆查詢可能詢問兩次：先問主要的，再問備援），`perf.backfillQueries` 是背景補問送出的上游查詢數。都是啟動以來的累計，32 位元，溢位就從 0 重來。`/api/status?lite=1` 不回 `perf`（3.5.0 起；見「觀測與線路感知」）。`/api/trace` 的 `upstreams[]` 多 `viaInterceptor`：一般 DNS 被路上的攔截者（路由器）接走時是 `true`，並附一句 `note`，表示回答的其實是攔截者、不是那個位址。
 
+3.5.1：`/api/status` 的 `perf` 多 `jobTimeouts`（往上游問的工作超過 12 秒被放棄的次數）、`rankSkipped`（查詢路徑因為測速名額用完而沒有排序 IP 的次數），
+以及 `perf.server`（加密 DNS 伺服器的過載保護，見[規格 01 第 1.1.2 節](spec/01-protocols.md#112-過載保護連線與請求的上限351)）：
+`refused` 底下 `dot`、`doh`、`doq`、`doh3` 各有 `total`（連線總數滿了）、`perSource`（這個來源的連線數滿了，`system.maxTlsConnectionsPerIp`）、`memory`（記憶體偏低或不足）——新連線被拒絕的次數；
+`dohBusy`（DoH 同時處理中的請求滿了、立刻回 `503 busy` 的次數，`system.maxDohInflight`）、`deadline`（一筆查詢 10 秒沒有結果、回 SERVFAIL 的次數）、
+`httpsysBodyBusy`（Windows HTTP.sys 模式讀請求內容的執行緒都在忙、回 `503 busy` 的次數）。同樣是啟動以來的累計、32 位元；`lite=1` 不回。
+DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-After: 1`：用戶端稍等就可以重送，不需要換伺服器。
+
 ## 上游多樣性（3.4.0 起）
 
 每日評測選「覆蓋」上游時，先在鄰近（台灣、日本、香港、新加坡，或延遲夠低）的候選裡選；名額還有、覆蓋率還不夠才選遠的。這樣 CDN 回的節點比較常在亞洲。

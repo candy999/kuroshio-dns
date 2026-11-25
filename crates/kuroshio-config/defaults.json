@@ -18,6 +18,7 @@
     "workerThreads": 0,
     "maxTlsConnections": "auto",
     "maxTlsConnectionsPerIp": "auto",
+    "maxDohInflight": "auto",
     "maxQuicConnections": "auto",
     "queryLogRing": 20000,
     "memoryWatchdog": true,

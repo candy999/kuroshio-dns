@@ -400,11 +400,19 @@ pub fn doh_uses_tls(cfg: &Value, base: &std::path::Path) -> bool {
 /// DoT / DoH 伺服器（規格 01 第 1.1 節）；開不起來只記警告，區網 DNS 照常。
 /// 一個協議可以監聽多個位址（`binds`）；其中一個綁定失敗只記警告，其他照常。
 async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path::Path) -> Encrypted {
-    use crate::encrypted::{listen_doh, listen_doh3, listen_doq, listen_dot, CertStore, DohOptions, Limits};
+    use crate::encrypted::{listen_doh, listen_doh3, listen_doq, listen_dot, CertStore, DohGate, DohOptions, Limits};
     let mut out = Encrypted::default();
-    // 每個來源的連線上限：auto（沒填）= 總上限的 1/8（8–64 條）；0 = 不限
+    // 每個來源的連線上限：auto（沒填）= 總上限的 1/4（16–256 條，3.5.1 K9）；0 = 不限
     let per_ip = kuroshio_config::num_or_auto(get(cfg, "system.maxTlsConnectionsPerIp")).map(|n| n as usize);
-    let limits = Limits::new(get(cfg, "system.maxTlsConnections").and_then(Value::as_u64).unwrap_or(2048) as usize).with_per_ip(per_ip);
+    let max_tls = get(cfg, "system.maxTlsConnections").and_then(Value::as_u64).unwrap_or(2048) as usize;
+    let limits = Limits::new(max_tls).with_per_ip(per_ip);
+    // DoH 同時處理中的請求上限（HTTP/1.1、HTTP/2、HTTP/3、HTTP.sys 共用）：auto = TLS 連線上限的一半（64–1024）。
+    // 滿了立刻回 503，不排隊（3.5.1 K7）
+    let doh_inflight = kuroshio_config::num_or_auto(get(cfg, "system.maxDohInflight"))
+        .filter(|n| *n > 0)
+        .map(|n| n as usize)
+        .unwrap_or_else(|| crate::encrypted::doh_inflight_default(max_tls));
+    let gate = DohGate::new(doh_inflight);
     let mut stores: std::collections::HashMap<(PathBuf, PathBuf), Arc<CertStore>> = std::collections::HashMap::new();
     let mut store_for = |key: (PathBuf, PathBuf)| -> Arc<CertStore> {
         stores
@@ -562,6 +570,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             path: path.clone(),
             trust_proxy,
             alt_svc: None,
+            gate: gate.clone(),
         };
         // DoH3（UDP，預設跟 DoH 同樣的位址與埠號；`listen.doh.http3Binds` 可以另外指定位址）：
         // 一定要憑證；開成功時 DoH 的回應加 Alt-Svc。HTTP.sys 開了 HTTP/3 的模式 B 由 HTTP.sys 提供，不綁 UDP
@@ -589,11 +598,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
                 Some(pair) => {
                     let certs = store_for(pair);
                     for (i, a) in targets(&mut out, "doh3", &h3_hosts, h3_port, true) {
-                        let o3 = DohOptions {
-                            path: path.clone(),
-                            trust_proxy: false,
-                            alt_svc: None,
-                        };
+                        let o3 = DohOptions::new(path.clone(), gate.clone());
                         let r = listen_doh3(a, certs.clone(), resolver.clone(), o3, Limits::new(quic_max).with_per_ip(per_ip)).await;
                         if let Some(b) = done(&mut out, i, r) {
                             out.doh3.get_or_insert(b);
@@ -615,7 +620,7 @@ async fn start_encrypted(cfg: &Value, resolver: &Arc<Resolver>, base: &std::path
             }
             let started = crate::httpsys::plan(cfg)
                 .map_err(anyhow::Error::msg)
-                .and_then(|(_, _, p)| crate::httpsys::start(&p, resolver.clone(), opts.clone(), limits.clone()));
+                .and_then(|(_, _, p)| crate::httpsys::start(&p, resolver.clone(), opts.clone()));
             let any = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), port);
             match started {
                 Ok(srv) => {
