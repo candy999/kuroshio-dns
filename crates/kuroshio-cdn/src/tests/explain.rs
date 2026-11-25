@@ -104,3 +104,68 @@ fn explain_does_not_touch_or_schedule() {
     assert_eq!(c.state().db.get("quiet.test").unwrap().hits, hits, "沒有增加 hits");
     assert!(c.take_tasks().is_empty(), "沒有排背景工作");
 }
+
+/// 3.5.1：退回（F9「比原本慢」）到期之後，上游的答案已經是台灣節點時，跟查詢路徑一樣說「已是台灣」，
+/// 不是「還在驗證中」；判斷用最近一次答案的 IP 在節點池裡的分類，不用存著的舊 POP
+#[test]
+fn explain_expired_slower_with_taiwan_answer_is_already_tw() {
+    let (c, _) = setup(json!({}));
+    let name = "www.example.com";
+    seen(&c, name);
+    c.with_state(|st| {
+        // 退回的那一筆：存著的基準是國外的 POP，結果已經到期
+        st.db.set_base(
+            name,
+            crate::db::Base {
+                ip: Some(ip("104.21.0.5")),
+                ok: Some(true),
+                pop: Some("HKG".into()),
+                ..Default::default()
+            },
+        );
+        st.db.set_verdict(name, 4, |v| {
+            v.verdict = Some("fail".into());
+            v.until = Some(1);
+            v.reason = Some("台灣節點握手連續兩次比原本慢（120 毫秒對 30 毫秒）".into());
+            let m = v.extra.0.get_or_insert_with(Default::default);
+            m.insert(crate::verifier::SLOWER.into(), json!(true));
+        });
+    });
+    // 最近一次答案還是國外的 IP：照舊是「驗證中」（查詢路徑也會試用、排驗證）
+    assert_eq!(decision(&c, name), "trial");
+    // 上游改回台灣節點（節點池的分類是 Tw）
+    let mut m = msg(name, 1, &["104.16.161.5"], vec![]);
+    let r = c.apply(&mut m, name, 1);
+    assert!(r.tags.iter().any(|t| t.contains("已是台灣")), "{:?}", r.tags);
+    assert!(r.ttl_cap.is_none(), "沒有縮短 TTL");
+    assert!(c.take_tasks().is_empty(), "沒有排驗證");
+    assert_eq!(decision(&c, name), "already-tw");
+    // 舊資料沒有這家的 IP：才用存著的基準 POP
+    c.with_state(|st| {
+        st.db.domains.get_mut(name).unwrap().ips4 = Box::new([]);
+    });
+    assert_eq!(decision(&c, name), "trial", "基準 POP 是 HKG");
+}
+
+/// 台灣本地的 CDN（3.5.1，中華電信 HiNet CDN）：認得、標成已是台灣，不換、不排任何背景工作
+#[test]
+fn tw_native_cdn_is_already_taiwan() {
+    let (c, _) = setup(json!({}));
+    for _ in 0..3 {
+        let mut m = msg(
+            "www.example.com",
+            1,
+            &["192.0.2.10"],
+            vec![cname("www.example.com", "www.example.com.cdn.hinet.net", 300)],
+        );
+        let r = c.apply(&mut m, "www.example.com", 1);
+        assert_eq!(r.provider, Some("hinet"));
+        assert!(r.rewritten.is_none() && r.ttl_cap.is_none(), "{r:?}");
+        assert!(r.tags.iter().any(|t| t.contains("已是台灣")), "{:?}", r.tags);
+        assert_eq!(answer_ips(&m, 1), ["192.0.2.10"]);
+        assert!(c.take_tasks().is_empty(), "不驗證、不跨 CDN、不量延遲");
+    }
+    let v = c.explain("www.example.com", Context::default());
+    assert_eq!(v["decision"], "already-tw", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("HiNet"), "{v}");
+}

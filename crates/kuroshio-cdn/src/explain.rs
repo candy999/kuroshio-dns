@@ -123,6 +123,10 @@ fn verdict_step(what: &str, v: Option<&Verdict>, now: u64) -> Value {
             if let Some(x) = v.extra.get(crate::verifier::SLOW1) {
                 j["slow1"] = x.clone();
             }
+            // 原本的答案已經在台灣機房、不換（3.5.1）：那時量到的 POP
+            if let Some(p) = crate::verifier::orig_tw_pop(v) {
+                j["origTw"] = json!(p);
+            }
             j
         }
     }
@@ -130,6 +134,24 @@ fn verdict_step(what: &str, v: Option<&Verdict>, now: u64) -> Value {
 
 fn is_slower(v: &Verdict) -> bool {
     v.extra.get(crate::verifier::SLOWER).and_then(Value::as_bool) == Some(true)
+}
+
+/// 最近一次答案（`ips4`）裡這家 CDN 的 IP 是不是都已經是台灣節點（或 Dead）：跟 `alias_family()` 同一個判斷
+/// （節點池的分類 `Tw`／`Dead` 不換，`Global`／`Unknown` 才換）。這家的 IP 一個都沒有（舊資料、別家的答案）回 None
+fn answer_tw(pools: &crate::pools::Pools, e: &Domain, provider: &str) -> Option<bool> {
+    let mut any = false;
+    for c in e
+        .ips4
+        .iter()
+        .filter_map(|ip| pools.classify(*ip))
+        .filter(|c| c.provider == provider)
+    {
+        if matches!(c.cls, crate::Cls::Global | crate::Cls::Unknown) {
+            return Some(false);
+        }
+        any = true;
+    }
+    any.then_some(true)
 }
 
 impl Cdn {
@@ -169,7 +191,7 @@ impl Cdn {
         } else if ctx.suspended {
             (d::MEMORY_FLOOR, String::new())
         } else {
-            self.decide(e, &provider, st.pools.has(&provider), now)
+            self.decide(e, &provider, st.pools.has(&provider), answer_tw(&st.pools, e, &provider), now)
         };
         let mut v = base(decision, &label, &detail);
         if decision == d::SLOWER && self.cfg.lite {
@@ -223,8 +245,9 @@ impl Cdn {
     }
 
     /// 依資料庫紀錄判斷（跟 `apply_locked` 的順序一致：手動策略 → 跨 CDN 最佳 → IP 置換型 → ECS 型 → 只能用 CNAME 認的）
-    /// `has_pool`：這家 CDN 有沒有台灣節點池（呼叫端拿著狀態鎖時算好，這裡不再拿鎖）
-    fn decide(&self, e: &Domain, provider: &str, has_pool: bool, now: u64) -> (&'static str, String) {
+    /// `has_pool`：這家 CDN 有沒有台灣節點池；`answer_tw`：最近一次答案是不是已經是台灣節點（見 [`answer_tw`]）。
+    /// 兩個都由呼叫端拿著狀態鎖時算好，這裡不再拿鎖
+    fn decide(&self, e: &Domain, provider: &str, has_pool: bool, answer_tw: Option<bool>, now: u64) -> (&'static str, String) {
         match e.policy() {
             Policy::Never => return (d::POLICY_NEVER, String::new()),
             Policy::Always => return (d::POLICY_ALWAYS, String::new()),
@@ -232,6 +255,10 @@ impl Cdn {
         }
         if self.cfg.app_layer && providers::get(provider).is_some_and(|p| p.app_layer) {
             return (d::APP_LAYER, String::new());
+        }
+        // 台灣本地的 CDN（3.5.1）：跟 `apply_locked` 一樣直接當成已是台灣
+        if providers::get(provider).is_some_and(|p| p.tw_native) {
+            return (d::ALREADY_TW, "台灣本地的 CDN".into());
         }
         // 多來源：不做跨 CDN。原本要靠跨 CDN 才換得到台灣的情況，說明成「多來源」
         let no_cross = e.no_cross(now);
@@ -271,6 +298,11 @@ impl Cdn {
                     (d::NO_TW_NODE, String::new())
                 };
             }
+            // 最近一次答案的 IP 在節點池裡已經是台灣節點（3.5.1）：查詢路徑（`alias_family()`）在看驗證結果之前
+            // 就照原本的答案回（「已是台灣」），不換、不試用、不排驗證，這裡也一樣先判斷
+            if answer_tw == Some(true) {
+                return (d::ALREADY_TW, String::new());
+            }
             if let Some(v) = e.v4.as_deref().filter(|v| v.valid(now)) {
                 if v.is("ok") {
                     let detail = match (v.pop.as_deref(), v.ms.get()) {
@@ -290,11 +322,16 @@ impl Cdn {
                     };
                     return (d::SLOWER, format!("{} 對 {} 毫秒", n("score"), n("origScore")));
                 }
+                // 驗證時原本的答案已經落在台灣機房（3.5.1，例如 Azure 原本就是 TPE）：不換
                 if v.is("fail") {
+                    if let Some(pop) = crate::verifier::orig_tw_pop(v) {
+                        return (d::ALREADY_TW, format!("驗證時原本的答案在 {pop}"));
+                    }
                     return (d::VERIFY_FAILED, v.reason.clone().unwrap_or_default());
                 }
             }
-            if e.base.as_deref().and_then(|b| b.pop.as_deref()).is_some_and(providers::is_tw_pop) {
+            // 舊資料沒有最近一次答案的 IP 時，才用存著的基準 POP（那可能是很久以前量的）
+            if answer_tw.is_none() && e.base.as_deref().and_then(|b| b.pop.as_deref()).is_some_and(providers::is_tw_pop) {
                 return (d::ALREADY_TW, String::new());
             }
             if self.cfg.lite && e.hits < 2 {

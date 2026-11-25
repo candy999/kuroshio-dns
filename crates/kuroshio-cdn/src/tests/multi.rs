@@ -420,7 +420,16 @@ async fn verify_result_goes_to_its_own_provider_slot() {
     c.apply(&mut m, name, 1);
     let mut m = msg(name, 1, &["192.0.2.10"], vec![cname(name, "d111.cloudfront.net", 60)]);
     c.apply(&mut m, name, 1);
-    net.on_https(|_, _| resp(200, &[("server", "cloudflare"), ("cf-ray", "1-TPE")], "ok"));
+    net.on_https(|i, _| {
+        resp(
+            200,
+            &[
+                ("server", "cloudflare"),
+                ("cf-ray", if i == ip("104.21.0.5") { "1-NRT" } else { "1-TPE" }),
+            ],
+            "ok",
+        )
+    });
     assert_eq!(c.verify(name, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
     {
         let st = c.state();

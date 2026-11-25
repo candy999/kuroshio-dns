@@ -159,6 +159,7 @@ impl Cdn {
                         (Some(ip), Some(p)) => {
                             !v.reason.as_deref().unwrap_or("").contains("試了")
                                 && v.extra.get(crate::verifier::SLOWER).is_none()
+                                && v.extra.get(crate::verifier::ORIG_TW).is_none()
                                 && pools.is_restricted(p, ip)
                         }
                         _ => false,
@@ -358,6 +359,11 @@ impl Cdn {
         if self.cfg.app_layer && prov.is_some_and(|p| p.app_layer) && policy != Policy::Always {
             res.tags.push(format!("{label}:App 自選節點→原始"));
             st.stats.app_layer += 1;
+            return;
+        }
+        // 台灣本地的 CDN（3.5.1，中華電信 HiNet CDN）：節點本來就在台灣，不換、不 ECS、不跨 CDN。手動設成「一定換」的照使用者的
+        if prov.is_some_and(|p| p.tw_native) && policy != Policy::Always {
+            res.tags.push(format!("{label}:已是台灣"));
             return;
         }
         // 多來源（3.5.0 B3）：這一家沒有格子可以放（第三家，或太快又換一家）→ 照原始答案回，不驗證

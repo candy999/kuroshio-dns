@@ -3,7 +3,7 @@
 
 use crate::cdn::Cdn;
 use crate::db::Base;
-use crate::providers::{self, detect_from_headers, hv};
+use crate::providers::{self, detect_from_headers, hv, is_tw_pop};
 use crate::util::{self, intern, now_ms, Num, HOUR_MS};
 use kuroshio_net::probe::{HttpsOpts, ProbeResult};
 use std::collections::HashSet;
@@ -228,6 +228,23 @@ pub(crate) fn slow1_at(v: &crate::db::Verdict) -> Option<u64> {
     v.extra.get(SLOW1).and_then(|x| x.get("at")).and_then(serde_json::Value::as_u64)
 }
 
+/// 驗證結果 `extra` 裡「原本的答案已經在台灣機房」的 POP（3.5.1）：有這個欄位的 `fail` 不是驗證失敗，是「不用換」
+pub const ORIG_TW: &str = "origTw";
+
+/// 「原本的答案已經在台灣機房」的 POP（沒有回 None）
+pub fn orig_tw_pop(v: &crate::db::Verdict) -> Option<&str> {
+    v.extra.get(ORIG_TW).and_then(serde_json::Value::as_str)
+}
+
+fn clear_orig_tw(extra: &mut util::Extra) {
+    if let Some(m) = extra.0.as_mut() {
+        m.remove(ORIG_TW);
+        if m.is_empty() {
+            extra.0 = None;
+        }
+    }
+}
+
 /// 依判斷結果寫入或拿掉 `slower`／`slow1`（只有這兩種狀態存分數；沒有的時候不配置）
 fn apply_slow(extra: &mut util::Extra, mark: SlowMark, now: u64) {
     if let Some(m) = extra.0.as_mut() {
@@ -367,6 +384,8 @@ impl Cdn {
         // 1. 基準：用原始 IP 連一次，記錄原本被分配到哪個 POP（給分析用）
         // 有些網站只開 HTTP（OCSP / CRL、軟體更新鏡像…），原始節點的 HTTPS 就失敗時改用 HTTP 驗證
         let mut base: Option<ProbeResult> = None;
+        // 原本的答案被分配到的 POP（3.5.1：已經是台灣機房就不換）
+        let mut base_pop = String::new();
         let mut http_mode = false;
         let mut base_https: Option<HttpsFail> = None;
         if let Some(o) = orig.filter(|o| family == 4 || o.is_ipv6()) {
@@ -414,9 +433,26 @@ impl Cdn {
                     )
                 })
             });
+            base_pop = pop;
             base = Some(b);
         }
         let base_ok = base.as_ref().filter(|b| b.ok);
+        // 3.5.1（Azure「台北換台北」）：原本的答案這條線連過去已經落在台灣機房 → 當成已是台灣、不換。
+        // 換成節點池裡另一個台灣節點不會更近，實測握手反而常常比較慢（同一個城市換另一個節點）；
+        // 也不必再對候選節點一個一個連。範圍同 F9：IPv4、非最近節點型、不是「一定換」、`cdn.slowerFallback` 開著；
+        // 原本的回應要正常（狀態碼 500 以下、不像壞掉的頁面）
+        if let (Some(b), Some(o)) = (base_ok, orig) {
+            if family == 4
+                && self.cfg.slower_fallback
+                && !always
+                && !Cdn::is_nearest(provider)
+                && is_tw_pop(&base_pop)
+                && b.status < 500
+                && looks_broken_r(provider, b).is_none()
+            {
+                return Some(self.done_orig_tw(name, provider, family, prev_fails, o, &base_pop, b));
+            }
+        }
 
         // 2. 依序用台灣池內 IP 測試
         // 保留最後一段的 CDN（Fastly）：候選 = 最佳幾個 POP 的網段 + 原始 IP 最後一段
@@ -743,6 +779,50 @@ impl Cdn {
         Some("unknown")
     }
 
+    /// 原本的答案已經在台灣機房（3.5.1）：記成 `fail`＋`origTw`（查詢路徑走既有的「驗證失敗 → 原始」），
+    /// 不加失敗次數、不標壞節點、不算驗證失敗；[`CdnConfig::verify_fail_hours`]（預設 6 小時）後有人查再看一次
+    /// （原本的答案也可能被業者改到國外）
+    #[allow(clippy::too_many_arguments)]
+    fn done_orig_tw(
+        &self,
+        name: &str,
+        provider: &str,
+        family: u8,
+        prev_fails: u32,
+        orig: IpAddr,
+        pop: &str,
+        b: &ProbeResult,
+    ) -> &'static str {
+        let now = now_ms();
+        let until = now + (self.cfg.verify_fail_hours * HOUR_MS as f64) as u64;
+        self.with_state(|st| {
+            st.stats.orig_tw = st.stats.orig_tw.saturating_add(1);
+            st.db.with_slot(name, provider, |db| {
+                db.set_verdict(name, family, |v| {
+                    v.verdict = Some(intern("fail"));
+                    v.fails = Some(prev_fails);
+                    v.until = Some(until);
+                    v.algo = Some(2);
+                    v.pop = Some(intern(pop));
+                    v.ms = if b.ms > 0.0 { Num::V(util::round(b.ms, 1)) } else { Num::Null };
+                    v.status = Num::V(b.status as f64);
+                    v.ip = Some(orig);
+                    v.reason = Some(format!("原本的答案已經在台灣機房（{pop}），不換"));
+                    apply_slow(&mut v.extra, SlowMark::Clear, now);
+                    v.extra
+                        .0
+                        .get_or_insert_with(Default::default)
+                        .insert(ORIG_TW.into(), serde_json::json!(pop));
+                })
+            })
+        });
+        info!(
+            "◎ {name} IPv{family} 原本的答案已經在台灣機房（{pop}），不換；{} 小時後有人查再看一次",
+            self.cfg.verify_fail_hours
+        );
+        "fail"
+    }
+
     /// 確認比原本慢之後退回多久（3.5.0 F9：15 分鐘；`cdn.lite` 1 小時）
     pub(crate) fn slower_retest_ms(&self) -> u64 {
         if self.cfg.lite {
@@ -936,6 +1016,7 @@ impl Cdn {
                         v.reason = Some(r.clone());
                     }
                     apply_slow(&mut v.extra, d.slow, now);
+                    clear_orig_tw(&mut v.extra);
                 })
             })
         });
