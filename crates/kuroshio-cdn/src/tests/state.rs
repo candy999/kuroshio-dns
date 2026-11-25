@@ -544,7 +544,7 @@ fn cold_entries_evicted_after_persist_and_lazily_reloaded() {
 #[test]
 fn flood_of_one_off_domains_is_evicted_and_not_read_back() {
     // 3.5.1 G1：大量冷門網域湧入（壓測、掃描）時它們都「最近才出現」，只看一小時的話沒有冷資料可以移出。
-    // 只問過一次、10 分鐘沒再出現的也算冷資料；讀回時沒有任何結果的直接忘掉，有結果、問過兩次以上的照樣讀回
+    // 從最冷的開始移、沒有學習資料的先；讀回時只問過一次、沒有結果的直接忘掉，有結果、問過兩次以上的照樣讀回
     let paths = paths_no_seed("flood");
     let dir = paths.state_dir.clone();
     std::fs::create_dir_all(&dir).unwrap();
@@ -573,16 +573,22 @@ fn flood_of_one_off_domains_is_evicted_and_not_read_back() {
     write_changes(&c, &dir, &ch);
     let shards = ch.shards;
     assert_eq!(c.evict_cold(3_600_000, &|_| true).entries, 0, "全部都在一小時內：舊規則沒有冷資料");
-    let r = c.evict_cold_rule(3_600_000, 600_000, &|_| true);
-    assert_eq!(r.entries, 340, "只問過一次、20 分鐘前的（含有驗證結果的）");
-    assert_eq!(c.domains_in_ram(), 40, "問過兩次的、剛出現的留著");
+    let one = c.evict_coldest(1, 120_000, &|_| true);
+    assert_eq!(one.entries, 1, "只移到目標量");
+    assert!(
+        c.state().db.domains.keys().filter(|k| k.starts_with('v')).count() == 40,
+        "有學習資料的最後才動"
+    );
+    let r = c.evict_coldest(usize::MAX, 120_000, &|_| true);
+    assert_eq!(one.entries + r.entries, 370, "2 分鐘以前出現的全部");
+    assert_eq!(c.domains_in_ram(), 10, "剛出現的留著");
     assert!(c.evicted_shard_count() > 1);
     // 一次讀回一點（至少一片），剩下的下一輪
     let first = c.restore_cold_upto(1);
-    assert!(c.evicted_count() > 0 && c.evicted_count() < 340, "{}", c.evicted_count());
+    assert!(c.evicted_count() > 0 && c.evicted_count() < 370, "{}", c.evicted_count());
     let rest = c.restore_cold();
     assert_eq!(c.evicted_count(), 0);
-    assert_eq!(first.entries + rest.entries, 40, "有驗證結果的讀回來");
+    assert_eq!(first.entries + rest.entries, 70, "有驗證結果的、問過兩次的讀回來");
     assert_eq!(first.forgotten + rest.forgotten, 300, "一次性、沒有結果的不讀回");
     assert_eq!(c.domains_in_ram(), 80);
     assert!(c.state().db.get("v0.example.com").unwrap().v4.is_some());

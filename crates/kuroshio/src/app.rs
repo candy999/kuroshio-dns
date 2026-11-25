@@ -2016,7 +2016,9 @@ fn start_governor(
     let cap = cache.cap.clone();
     let mut steps: Vec<Box<dyn Step>> = vec![Box::new(memgov::DiagStep::new(resolver.clone())), Box::new(cache)];
     if let Some(c) = cdn {
-        steps.push(Box::new(memgov::CdnStep::new(c.clone(), persister.clone(), sources.to_vec())));
+        let mut step = memgov::CdnStep::new(c.clone(), persister.clone(), sources.to_vec());
+        step.reserve = Some(reserve.clone());
+        steps.push(Box::new(step));
     }
     if let Some(f) = filter {
         steps.push(Box::new(memgov::FilterStep { filter: f.clone() }));

@@ -1506,15 +1506,14 @@ impl Step for CacheStep {
     }
 }
 
-/// 先把變動寫進磁碟，再把冷資料移出記憶體：`cold_ms` 以前出現的、只問過一次而且 `once_ms` 以前出現的（0 = 不用這一條）；
-/// `floor` = 讓出的不到 `short` 時，再把 `floor` 毫秒以前出現的全部移出（離保留量遠時的最後一層；3.5.1 G1）
+/// 先把變動寫進磁碟，再從最冷的開始把網域移出記憶體，估計釋出到 `target` bytes 就停（`usize::MAX` = 能移的全部）；
+/// 最後出現在 `protect_ms` 以內的不動（3.5.1 G1）
 async fn evict_cdn(
     cdn: &Arc<kuroshio_cdn::Cdn>,
     persister: &Arc<Mutex<crate::persist::Persister>>,
     sources: &[crate::app::SnapSource],
-    cold_ms: u64,
-    once_ms: u64,
-    floor: Option<(u64, u64)>,
+    target: usize,
+    protect_ms: u64,
 ) -> anyhow::Result<kuroshio_cdn::cdn::ColdReport> {
     let (cdn, p, sources) = (cdn.clone(), persister.clone(), sources.to_vec());
     tokio::task::spawn_blocking(move || -> anyhow::Result<kuroshio_cdn::cdn::ColdReport> {
@@ -1523,23 +1522,15 @@ async fn evict_cdn(
         crate::app::stage_sources_locked(&p, &sources);
         let mut pg = p.lock().unwrap();
         pg.flush_all(crate::persist::now_secs())?;
-        let mut r = cdn.evict_cold_rule(cold_ms, once_ms, &|rel| !pg.is_pending(rel));
-        if let Some((floor_ms, short)) = floor {
-            if (r.bytes as u64) < short {
-                let r2 = cdn.evict_cold_rule(floor_ms, 0, &|rel| !pg.is_pending(rel));
-                r.entries += r2.entries;
-                r.bytes += r2.bytes;
-            }
-        }
-        Ok(r)
+        Ok(cdn.evict_coldest(target, protect_ms, &|rel| !pg.is_pending(rel)))
     })
     .await?
 }
 
-/// 只問過一次的網域多久沒再出現就算冷資料（3.5.1 G1）。大量冷門網域湧入時它們是最先該讓的
-pub const CDN_ONCE_COLD_MS: u64 = 10 * 60 * 1000;
-/// 離保留量遠、上面兩條讓得不夠時：所有自動策略的網域多久沒出現就移出（最後一層；最近 10 分鐘的一定留著）
-pub const CDN_FLOOR_COLD_MS: u64 = 10 * 60 * 1000;
+/// 最近這麼久以內出現過的網域不移出（3.5.1 G1；剛查過、剛驗證完的很可能馬上又用到）
+pub const CDN_PROTECT_MS: u64 = kuroshio_cdn::db::COLD_AGE_EDGES_MS[0];
+/// 一次至少移出這麼多（估計），不然每次都要先寫 Flash、只換到一點點
+pub const CDN_MIN_UNIT: u64 = 512 * 1024;
 /// 讓出後多久才能再做一次（每次都會先把變動寫進 Flash，不能太頻繁）：吃緊時
 pub const CDN_RESHED_SECS: u64 = 120;
 /// 同上，離保留量遠時
@@ -1547,15 +1538,16 @@ pub const CDN_RESHED_FAR_SECS: u64 = 30;
 /// 上一次讓出這麼多以上才算「還有東西可以讓」：等待下一次的期間後面的步驟（過濾清單）不做
 pub const CDN_HOLD_MIN_BYTES: u64 = 64 * 1024;
 
-/// 第 3 步：CDN 網域資料庫：先把變動寫進磁碟，再把冷資料移出記憶體（磁碟保留，查到時讀回）。
-/// 冷資料是一小時沒出現的，加上只問過一次、10 分鐘沒再出現的；可以一輪一輪做（3.5.1 G1：以前做過一次就要等恢復，
-/// 大量冷門網域湧入時新進來的沒辦法再讓，下一步就是停用過濾清單）
+/// 第 3 步：CDN 網域資料庫：先把變動寫進磁碟，再從最冷的開始把網域移出記憶體（磁碟保留，查到時讀回）。
+/// 3.5.1 G1：以前固定移出「一小時沒出現」的、做過一次就要等恢復，大量冷門網域湧入時第一個小時沒有東西可以讓、
+/// 之後湧進來的也沒辦法再讓，下一步就是停用過濾清單。現在依缺口動態決定移多少：沒有學習資料的先、同一組裡最久沒出現的先，
+/// 夠了就停；可以一輪一輪做
 pub struct CdnStep {
     pub cdn: Arc<kuroshio_cdn::Cdn>,
     pub persister: Arc<Mutex<crate::persist::Persister>>,
     pub sources: Vec<crate::app::SnapSource>,
-    /// 多久沒出現算冷資料（毫秒）
-    pub cold_ms: u64,
+    /// 系統保留量（算缺口用；沒有時一次移 [`CDN_MIN_UNIT`]）
+    pub reserve: Option<Reserve>,
     /// 移出中的估計用量（bytes；讀回時扣掉）
     bytes: Mutex<u64>,
     /// 上一次讓出：（時間，讓出多少，多久後才能再做）
@@ -1572,10 +1564,25 @@ impl CdnStep {
             cdn,
             persister,
             sources,
-            cold_ms: 3600 * 1000,
+            reserve: None,
             bytes: Mutex::new(0),
             last: Mutex::new(None),
         }
+    }
+
+    /// 這一次要移出多少（估計 bytes）：`short` > 0（離保留量遠，[`Governor::tick`] 算的還缺多少）用它，
+    /// 不然用「回到保留量 + 遲滯」還差多少；都 × 1.3（估計值偏差、配置器不一定全部還給系統），至少 [`CDN_MIN_UNIT`]
+    fn target(&self, r: &Reading, short: u64) -> usize {
+        let gap = if short > 0 {
+            short
+        } else {
+            match (&self.reserve, r.avail) {
+                (Some(res), Some(a)) => (res.bytes + res.margin()).saturating_sub(a),
+                _ => 0,
+            }
+        };
+        let t = (gap as u128 * 13 / 10).max(CDN_MIN_UNIT as u128);
+        t.min(usize::MAX as u128) as usize
     }
 
     /// 還在「讓出後的等待」裡：回上一次讓出多少
@@ -1614,10 +1621,10 @@ impl Step for CdnStep {
     fn shed<'a>(&'a self, r: &'a Reading) -> BoxFut<'a, anyhow::Result<Outcome>> {
         self.shed_for(r, 0)
     }
-    fn shed_for<'a>(&'a self, _r: &'a Reading, short: u64) -> BoxFut<'a, anyhow::Result<Outcome>> {
+    fn shed_for<'a>(&'a self, r: &'a Reading, short: u64) -> BoxFut<'a, anyhow::Result<Outcome>> {
         Box::pin(async move {
-            let floor = (short > 0).then_some((CDN_FLOOR_COLD_MS, short));
-            let res = evict_cdn(&self.cdn, &self.persister, &self.sources, self.cold_ms, CDN_ONCE_COLD_MS, floor).await;
+            let target = self.target(r, short);
+            let res = evict_cdn(&self.cdn, &self.persister, &self.sources, target, CDN_PROTECT_MS).await;
             let freed = res.as_ref().map_or(0, |r| r.bytes as u64);
             let wait = if short > 0 { CDN_RESHED_FAR_SECS } else { CDN_RESHED_SECS };
             *self.last.lock().unwrap() = Some((std::time::Instant::now(), freed, wait));
@@ -1816,7 +1823,7 @@ impl Step for FloorStep {
             let mut detail = format!("快取 {before} → {after} 筆");
             if let Some((cdn, p, sources)) = &self.cdn {
                 // CDN 暫停：資料庫整個寫進磁碟、移出記憶體（寫不了也照樣暫停調整）
-                match evict_cdn(cdn, p, sources, 0, 0, None).await {
+                match evict_cdn(cdn, p, sources, usize::MAX, 0).await {
                     Ok(r) => {
                         bytes += r.bytes;
                         detail.push_str(&format!("、CDN 調整暫停（{} 筆移到磁碟）", r.entries));

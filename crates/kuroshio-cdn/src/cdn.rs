@@ -869,9 +869,9 @@ impl Cdn {
         }
     }
 
-    /// 記憶體吃緊（3.5.1 G1）：照 [`db::ColdRule`] 移出冷資料——`cold_ms` 以前出現的，加上只問過一次、
-    /// `once_ms` 以前出現的（0 = 不用這一條）。正在排隊或正在做驗證、ECS、跨 CDN 的網域不移出
-    pub fn evict_cold_rule(&self, cold_ms: u64, once_ms: u64, persisted: &dyn Fn(&str) -> bool) -> ColdReport {
+    /// 記憶體吃緊（3.5.1 G1）：從最冷的開始移出，估計釋出到 `target` bytes 就停（[`db::Db::evict_coldest`]；
+    /// `usize::MAX` = 能移的全部）。最後出現在 `protect_ms` 以內的、正在排隊或正在做驗證、ECS、跨 CDN 的網域不移出
+    pub fn evict_coldest(&self, target: usize, protect_ms: u64, persisted: &dyn Fn(&str) -> bool) -> ColdReport {
         let busy: HashSet<String> = {
             let bg = self.bg.lock().unwrap();
             bg.verify
@@ -884,13 +884,10 @@ impl Cdn {
         let r = {
             let mut st = self.state();
             let n = st.db.shards;
-            let now = now_ms();
-            let rule = db::ColdRule {
-                cutoff_ms: now.saturating_sub(cold_ms),
-                once_cutoff_ms: if once_ms == 0 { 0 } else { now.saturating_sub(once_ms) },
-            };
             st.db
-                .evict_by(rule, &|name| busy.contains(name), &|i| persisted(&db::shard_file(n, i)))
+                .evict_coldest(target, protect_ms, now_ms(), &|name| busy.contains(name), &|i| {
+                    persisted(&db::shard_file(n, i))
+                })
         };
         self.sync_evicted();
         ColdReport {

@@ -993,34 +993,42 @@ enum Switch {
     Held,
 }
 
-/// 冷資料的條件（記憶體控制，規格 09；3.5.1 G1）
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ColdRule {
-    /// 最後出現早於這個時間（毫秒）的算冷資料
-    pub cutoff_ms: u64,
-    /// 只問過一次（`hits` ≤ 1）的：最後出現早於這個時間就算（0 = 不用這一條）。
-    /// 大量冷門網域湧入時（壓測、掃描、新註冊網域）它們全部都「最近才出現」，只看一小時的話第一個小時沒有冷資料可以移出，
-    /// 記憶體控制就會跳過這一步、去停用過濾清單（3.5.0 D3 壓測觀察）
-    pub once_cutoff_ms: u64,
-}
+/// 冷熱分組的年齡邊界（毫秒，由新到舊；3.5.1 G1）：最後出現到現在的時間落在哪一格。
+/// 第 0 格（2 分鐘內）永遠不移出：剛查過、剛驗證完的網域很可能馬上又用到
+pub const COLD_AGE_EDGES_MS: [u64; 15] = [
+    2 * 60_000,
+    5 * 60_000,
+    10 * 60_000,
+    20 * 60_000,
+    30 * 60_000,
+    3_600_000,
+    2 * 3_600_000,
+    4 * 3_600_000,
+    8 * 3_600_000,
+    24 * 3_600_000,
+    2 * 24 * 3_600_000,
+    7 * 24 * 3_600_000,
+    14 * 24 * 3_600_000,
+    30 * 24 * 3_600_000,
+    90 * 24 * 3_600_000,
+];
 
-impl ColdRule {
-    pub fn is_cold(&self, d: &Domain) -> bool {
-        d.last_seen < self.cutoff_ms || (d.hits <= 1 && d.last_seen < self.once_cutoff_ms)
-    }
+/// 年齡落在 [`COLD_AGE_EDGES_MS`] 的第幾格（0 = 2 分鐘內，15 = 90 天以上）
+pub fn age_bucket(age_ms: u64) -> usize {
+    COLD_AGE_EDGES_MS.iter().take_while(|e| age_ms >= **e).count()
 }
 
 /// 讀回冷資料時可以直接忘掉的（3.5.1 G1）：只問過一次、沒有任何驗證、ECS、跨 CDN 結果、自動策略。
 /// 忘掉不會損失任何東西（沒有結果可以重用；之後再出現就當新網域，照小機器減量的規則問第二次才驗證），
 /// 不讀回才不會在記憶體剛恢復時又被大量一次性網域塞滿、來回讓出又恢復
 pub fn forgettable(d: &Domain) -> bool {
-    d.hits <= 1
-        && d.policy() == Policy::Auto
-        && d.v4.is_none()
-        && d.v6.is_none()
-        && d.ecs.is_none()
-        && d.cross4.is_none()
-        && d.best.is_none()
+    d.hits <= 1 && d.policy() == Policy::Auto && !has_learning(d)
+}
+
+/// 有學習資料：驗證（v4／v6）、ECS、跨 CDN 的結果，或最後成功的改寫方式（3.5.1 G1）。
+/// 記憶體吃緊時這種網域最後才移出記憶體；讀回時一定讀回、不忘掉
+pub fn has_learning(d: &Domain) -> bool {
+    d.v4.is_some() || d.v6.is_some() || d.ecs.is_some() || d.cross4.is_some() || d.best.is_some()
 }
 
 /// 冷資料移出記憶體的結果
@@ -1057,31 +1065,100 @@ impl Db {
     /// 自動策略的網域（手動設定的、最近用到的、剛改過的都不動）。
     /// 整個資料庫要重寫、分片清單還沒寫時一律不動（磁碟上的內容還不是最新的）
     pub fn evict_cold(&mut self, cutoff_ms: u64, persisted: &dyn Fn(usize) -> bool) -> Evicted {
-        self.evict_by(
-            ColdRule {
-                cutoff_ms,
-                once_cutoff_ms: 0,
-            },
-            &|_| false,
-            persisted,
-        )
-    }
-
-    /// 同 [`Db::evict_cold`]，條件照 [`ColdRule`]（3.5.1 G1：只問過一次的可以早一點算冷資料），
-    /// `busy(名稱)` = 這個網域正在排隊或正在做驗證、ECS、跨 CDN（不移出，不然結果回來時找不到它，白做一次）
-    pub fn evict_by(&mut self, rule: ColdRule, busy: &dyn Fn(&str) -> bool, persisted: &dyn Fn(usize) -> bool) -> Evicted {
-        let mut out = Evicted::default();
-        if self.dirty || self.manifest_pending.is_some() {
-            return out;
-        }
+        let Some(ok) = self.evictable_shards(persisted) else {
+            return Evicted::default();
+        };
         let n = self.shards;
-        let ok: Vec<bool> = (0..n).map(|i| self.marks[i] == Mark::Clean && persisted(i)).collect();
         let cold: Vec<Arc<str>> = self
             .domains
             .values()
-            .filter(|d| d.policy() == Policy::Auto && rule.is_cold(d) && ok[shard_of(&d.name, n)] && !busy(&d.name))
+            .filter(|d| d.policy() == Policy::Auto && d.last_seen < cutoff_ms && ok[shard_of(&d.name, n)])
             .map(|d| d.name.clone())
             .collect();
+        self.evict_names(cold)
+    }
+
+    /// 可以移出的分片（已經寫進磁碟、之後沒變動）；整個資料庫要重寫、分片清單還沒寫時是 None
+    fn evictable_shards(&self, persisted: &dyn Fn(usize) -> bool) -> Option<Vec<bool>> {
+        if self.dirty || self.manifest_pending.is_some() {
+            return None;
+        }
+        Some((0..self.shards).map(|i| self.marks[i] == Mark::Clean && persisted(i)).collect())
+    }
+
+    /// 記憶體吃緊（3.5.1 G1）：**從最冷的開始**移出，估計釋出的量到 `target` bytes 就停（`usize::MAX` = 能移的全部）。
+    ///
+    /// 順序：先移沒有學習資料的（[`has_learning`]：沒有驗證、ECS、跨 CDN 結果），再移有的；
+    /// 同一組裡最久沒出現的先（年齡分格 [`COLD_AGE_EDGES_MS`]）。有學習資料的網域最後才動，而且只是移出記憶體，磁碟上照樣保留、查到時讀回。
+    /// 不動：最後出現在 `protect_ms` 毫秒以內的、手動策略的、`busy(名稱)`（正在排隊或正在做驗證、ECS、跨 CDN）、
+    /// 有待寫內容的分片（同 [`Db::evict_cold`]）。
+    ///
+    /// 兩次掃描、不排序：第一次依（組，年齡格）累計估計用量，找出要移到哪一格；第二次只收那些名稱
+    /// （小機器上不為了排序另外配置一份 20 萬筆的陣列）
+    pub fn evict_coldest(
+        &mut self,
+        target: usize,
+        protect_ms: u64,
+        now: u64,
+        busy: &dyn Fn(&str) -> bool,
+        persisted: &dyn Fn(usize) -> bool,
+    ) -> Evicted {
+        let Some(ok) = self.evictable_shards(persisted) else {
+            return Evicted::default();
+        };
+        let n = self.shards;
+        const B: usize = COLD_AGE_EDGES_MS.len() + 1;
+        let slot = |d: &Domain| -> Option<usize> {
+            let age = now.saturating_sub(d.last_seen);
+            if d.policy() != Policy::Auto || age < protect_ms || !ok[shard_of(&d.name, n)] || busy(&d.name) {
+                return None;
+            }
+            // 冷的順序：沒有學習資料的在前（組 0），同一組裡年齡格大的（舊的）在前
+            let group = usize::from(has_learning(d));
+            Some(group * B + (B - 1 - age_bucket(age)))
+        };
+        let mut bytes = [0usize; 2 * B];
+        for d in self.domains.values() {
+            if let Some(k) = slot(d) {
+                bytes[k] += d.approx_bytes();
+            }
+        }
+        // 從最冷的那格往熱的累計，到 target 為止：那一格之前的全部移出，那一格移到補足為止
+        let mut sum = 0usize;
+        let mut last = None;
+        for (k, b) in bytes.iter().enumerate() {
+            if *b == 0 {
+                continue;
+            }
+            last = Some(k);
+            sum = sum.saturating_add(*b);
+            if sum >= target {
+                break;
+            }
+        }
+        let Some(last) = last else {
+            return Evicted::default();
+        };
+        let mut need_last = target.saturating_sub(sum - bytes[last]);
+        let mut names = Vec::new();
+        for d in self.domains.values() {
+            let Some(k) = slot(d) else { continue };
+            if k > last {
+                continue;
+            }
+            if k == last {
+                if need_last == 0 {
+                    continue;
+                }
+                need_last = need_last.saturating_sub(d.approx_bytes());
+            }
+            names.push(d.name.clone());
+        }
+        self.evict_names(names)
+    }
+
+    fn evict_names(&mut self, cold: Vec<Arc<str>>) -> Evicted {
+        let mut out = Evicted::default();
         for name in cold {
             if let Some(d) = self.domains.remove(&name) {
                 out.entries += 1;
@@ -2270,61 +2347,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cold_rule_once_and_busy() {
-        // 3.5.1 G1：只問過一次的網域 10 分鐘沒再出現就算冷資料；正在驗證的不移出；手動策略、分片有待寫的照舊不動
+    fn evict_coldest_order_and_target() {
+        // 3.5.1 G1：從最冷的開始、移到目標量就停。沒有學習資料的先（最久沒出現的先），有學習資料的最後；
+        // 2 分鐘內出現的、正在驗證的、手動策略的不動
         let mut db = Db::new(1000);
         db.set_shards(1);
         let now = now_ms();
-        for (name, hits, age_min) in [
-            ("once-old.example.com", 1u32, 20u64),
-            ("once-new.example.com", 1, 5),
-            ("many.example.com", 5, 20),
-            ("hour.example.com", 5, 90),
-            ("busy.example.com", 1, 20),
-            ("manual.example.com", 1, 90),
+        const MIN: u64 = 60_000;
+        for (name, hits, age, learned) in [
+            ("once-3m.example.com", 1u32, 3 * MIN, false),
+            ("once-30d.example.com", 1, 30 * 24 * 60 * MIN, false),
+            ("ok-90d.example.com", 3, 90 * 24 * 60 * MIN, true),
+            ("ok-1d.example.com", 3, 24 * 60 * MIN, true),
+            ("many-1h.example.com", 5, 60 * MIN, false),
+            ("once-1m.example.com", 1, MIN, false),
+            ("busy-1d.example.com", 1, 24 * 60 * MIN, false),
+            ("manual.example.com", 1, 90 * 24 * 60 * MIN, false),
         ] {
             let d = db.touch(name, "cloudflare", "ip", &[], &[], None);
             d.hits = hits;
-            d.last_seen = now - age_min * 60_000;
+            d.last_seen = now - age;
+            if learned {
+                d.v4 = Some(Box::default());
+            }
         }
         db.set_policy("manual.example.com", Policy::Always);
         db.marks = vec![Mark::Clean; 1];
         db.dirty = false;
         db.manifest_pending = None;
-        let rule = ColdRule {
-            cutoff_ms: now - 3_600_000,
-            once_cutoff_ms: now - 600_000,
-        };
-        let r = db.evict_by(rule, &|n| n == "busy.example.com", &|_| true);
-        assert_eq!(r.entries, 2);
-        for (n, gone) in [
-            ("once-old.example.com", true),
-            ("hour.example.com", true),
-            ("once-new.example.com", false),
-            ("many.example.com", false),
-            ("busy.example.com", false),
-            ("manual.example.com", false),
-        ] {
-            assert_eq!(db.get(n).is_none(), gone, "{n}");
+        let busy = |n: &str| n == "busy-1d.example.com";
+        let mut order = Vec::new();
+        loop {
+            let before: Vec<String> = db.domains.keys().map(|k| k.to_string()).collect();
+            let r = db.evict_coldest(1, 2 * MIN, now, &busy, &|_| true);
+            if r.entries == 0 {
+                break;
+            }
+            assert_eq!(r.entries, 1, "目標很小：一次只移一筆");
+            order.extend(before.into_iter().filter(|k| db.get(k).is_none()));
         }
-        // 只看一小時（3.5.0 的規則）：只問過一次、20 分鐘的不算
+        assert_eq!(
+            order,
+            [
+                "once-30d.example.com",
+                "many-1h.example.com",
+                "once-3m.example.com",
+                "ok-90d.example.com",
+                "ok-1d.example.com"
+            ]
+        );
+        let mut left: Vec<&str> = db.domains.keys().map(|k| &**k).collect();
+        left.sort();
+        assert_eq!(left, ["busy-1d.example.com", "manual.example.com", "once-1m.example.com"]);
+        // 忘掉：只有「只問過一次、沒有學習資料、自動策略」的
         let mut d = Domain {
             hits: 1,
-            last_seen: now - 20 * 60_000,
             ..Default::default()
         };
-        assert!(!ColdRule {
-            cutoff_ms: now - 3_600_000,
-            once_cutoff_ms: 0
-        }
-        .is_cold(&d));
-        // 忘掉：只有「只問過一次、沒有任何結果、自動策略」的
         assert!(forgettable(&d));
         d.v4 = Some(Box::default());
         assert!(!forgettable(&d), "有驗證結果的要讀回");
         d.v4 = None;
         d.hits = 2;
         assert!(!forgettable(&d), "問過兩次的要讀回");
+        assert_eq!(age_bucket(0), 0);
+        assert_eq!(age_bucket(2 * MIN), 1);
+        assert_eq!(age_bucket(365 * 24 * 60 * MIN), COLD_AGE_EDGES_MS.len());
     }
 
     #[test]
