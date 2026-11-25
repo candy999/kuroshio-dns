@@ -78,12 +78,24 @@ fn endpoint(v6: bool) -> Result<quinn::Endpoint> {
     Ok(ep)
 }
 
+/// DoQ／DoH3 共用的 QUIC 傳輸設定（用戶端與伺服器，3.5.1 K3）：不做路徑 MTU 探測，封包固定 1200 位元組以內。
+///
+/// quinn 預設每 10 分鐘探測一次、最大到 1452 位元組的 UDP 內容，IPv6 再加 48 位元組標頭剛好 1500。
+/// 台灣常見的 PPPoE（MTU 1492，路由器通告給電腦的 IPv6 MTU 也是 1492）、VPN 介面放不下，Windows 送出時
+/// 直接回 WSAEMSGSIZE（10040），quinn-udp 每次寫一行 WARN（Windows 實測 2 小時 44 分 18 行，跟每 10 分鐘探測一次對得上）。
+/// DNS 的訊息幾乎都在 1200 位元組以內，探測到更大的封包沒有好處，只是多送探測封包
+pub fn dns_transport() -> quinn::TransportConfig {
+    let mut t = quinn::TransportConfig::default();
+    t.mtu_discovery_config(None);
+    t
+}
+
 fn quic_config(alpn: &[u8]) -> Result<quinn::ClientConfig> {
     let tls = client_config(&[alpn]);
     let mut c = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(tls).map_err(|e| anyhow!("QUIC TLS 設定：{e}"))?,
     ));
-    let mut t = quinn::TransportConfig::default();
+    let mut t = dns_transport();
     // 閒置 30 秒關閉；每 10 秒送 keep-alive，避免 NAT 對應表過期
     t.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(10)));
@@ -364,5 +376,13 @@ mod tests {
         assert_eq!(r.headers()["content-length"], "33");
         let r = doh3_request("doh.example.com:8443", "/q", 12).unwrap();
         assert_eq!(r.uri().authority().unwrap().as_str(), "doh.example.com:8443");
+    }
+
+    /// 3.5.1 K3：DoQ／DoH3 不做路徑 MTU 探測（PPPoE、VPN 上探測封包送不出去，Windows 會一直寫 WSAEMSGSIZE）
+    #[test]
+    fn dns_transport_has_no_mtu_discovery() {
+        let t = format!("{:?}", super::dns_transport());
+        assert!(t.contains("mtu_discovery_config: None"), "{t}");
+        assert!(t.contains("initial_mtu: 1200"), "{t}");
     }
 }
