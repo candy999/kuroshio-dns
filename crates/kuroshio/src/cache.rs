@@ -46,6 +46,37 @@ const COMM_KEEP_BONUS: u64 = 1 << 40;
 /// 記憶體控制縮快取時，查詢次數每多一倍加的分數（0.1 秒為單位：5 分鐘）
 const HOT_BONUS_DS: u64 = 3000;
 
+/// 開機預熱名單：同一個主網域最多幾筆（[`crate::stats::site_of`] 的規則：最後兩段、常見的二級網域三段）
+pub const WARM_PER_SITE: usize = 8;
+/// 開機預熱名單：至少命中幾次才收（第一次查是寫入、之後才算命中）
+pub const WARM_MIN_HITS: u32 = 2;
+
+/// 開機預熱名單的共同過濾（寫出名單、讀進舊名單都用）：依原本的順序，同一個主網域最多 [`WARM_PER_SITE`] 筆，
+/// 重複的、格式不對的略過，最多 `n` 筆。
+/// 3.5.0 以前的名單只要查過一次就收，外部探測每 10 秒查一個隨機子網域就塞滿整份名單，重新啟動時逐一重問上游
+pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize) -> Vec<String> {
+    let mut per: HashMap<String, usize> = HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for k in keys {
+        if out.len() >= n {
+            break;
+        }
+        let Some((t, name)) = k.split_once('|') else { continue };
+        if t.parse::<u16>().is_err() || name.is_empty() {
+            continue;
+        }
+        let site = crate::stats::site_key(name).unwrap_or(name);
+        let c = per.entry(site.to_string()).or_insert(0);
+        if *c >= WARM_PER_SITE || !seen.insert(k.clone()) {
+            continue;
+        }
+        *c += 1;
+        out.push(k);
+    }
+    out
+}
+
 /// 單調時鐘（0.1 秒為單位，u32 可以撐 13 年）。32 位元 MIPS 沒有 64 位元原子操作，所以用 u32
 fn mono_ds(base: Instant, t: Instant) -> u32 {
     (t.saturating_duration_since(base).as_millis() / 100).min(u32::MAX as u128) as u32
@@ -270,18 +301,37 @@ impl Cache {
         (n, bytes)
     }
 
-    /// 最常被查的 n 個鍵（開機預熱用）；失敗與被擋的不算，也只列一般查詢（預熱只會重問 `類型|名稱`）
+    /// 開機預熱的名單（規格 06 第 1.2 節）：最多 n 個鍵，只列一般查詢（預熱只會重問 `類型|名稱`）。
+    ///
+    /// - 只收正常有答案的（[`Class::Ok`]、不是 CNAME 被擋）：不存在、沒有這個類型、被擋、失敗、拒絕的重問也沒用
+    /// - 至少命中 [`WARM_MIN_HITS`] 次：只查過一次的一次性網域（外部探測每次換一個隨機子網域）不收
+    /// - 依「命中次數 ÷（1 + 上次使用距今幾小時）」排：常用、最近還在用的在前
+    /// - 同一個主網域最多 [`WARM_PER_SITE`] 筆（[`cap_per_site`]）
+    ///
+    /// 每 10 分鐘與關機時各算一次（背景），不在查詢路徑上
     pub fn hot_keys(&self, n: usize) -> Vec<String> {
-        let mut v: Vec<(&String, u32)> = self
+        self.hot_keys_at(n, Instant::now())
+    }
+
+    /// 同 [`Cache::hot_keys`]，時間由呼叫端給（測試用）
+    pub fn hot_keys_at(&self, n: usize, now: Instant) -> Vec<String> {
+        let now_ds = mono_ds(self.base, now);
+        let mut v: Vec<(&String, f64)> = self
             .map
             .iter()
             .filter(|(k, _)| !k.split('|').next().unwrap_or("").contains('+'))
-            .filter(|(_, e)| e.class != Class::ServFail && e.blocked.is_none())
-            .map(|(k, e)| (k, e.hits.load(Ordering::Relaxed)))
-            .filter(|x| x.1 > 0)
+            .filter(|(_, e)| e.class == Class::Ok && e.blocked.is_none())
+            .filter_map(|(k, e)| {
+                let hits = e.hits.load(Ordering::Relaxed);
+                if hits < WARM_MIN_HITS {
+                    return None;
+                }
+                let age_h = now_ds.saturating_sub(e.last_access.load(Ordering::Relaxed)) as f64 / 36_000.0;
+                Some((k, f64::from(hits) / (1.0 + age_h)))
+            })
             .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        v.into_iter().take(n).map(|x| x.0.clone()).collect()
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+        cap_per_site(v.into_iter().map(|x| x.0.clone()), n)
     }
 
     pub fn approx_bytes(&self) -> usize {
@@ -483,8 +533,100 @@ mod tests {
         for k in ["1|a.test", "1+1d|a.test", "16+3|a.test"] {
             c.insert(k.into(), entry(60, false), now);
             c.get(k, now);
+            c.get(k, now);
         }
         assert_eq!(c.hot_keys(10), vec!["1|a.test"]);
+    }
+
+    fn with_class(class: Class) -> Entry {
+        let mut e = entry(300, false);
+        e.class = class;
+        e
+    }
+
+    /// 3.5.1：預熱名單不收一次性網域、否定與錯誤的答案，同一個主網域最多 8 筆，最近用過的在前
+    #[test]
+    fn hot_keys_skip_one_shot_negative_and_cap_per_site() {
+        let mut c = Cache::new(10_000);
+        let t0 = Instant::now();
+        // 外部探測：同一個網域底下 200 個隨機子網域，每個都被查了好幾次（最壞情況）
+        for i in 0..200 {
+            let k = format!("1|r{i:03}x.example.com");
+            c.insert(k.clone(), entry(300, false), t0);
+            for _ in 0..5 {
+                c.get(&k, t0);
+            }
+        }
+        // 只查過一次（命中 0）、命中 1 次的不收
+        c.insert("1|once.example.net".into(), entry(300, false), t0);
+        c.insert("1|twice.example.net".into(), entry(300, false), t0);
+        c.get("1|twice.example.net", t0);
+        // 否定、錯誤、被擋的答案不收
+        for (name, class) in [
+            ("nx.example.net", Class::NxDomain),
+            ("nodata.example.net", Class::NoData),
+            ("refused.example.net", Class::Refused),
+            ("servfail.example.net", Class::ServFail),
+            ("sinkhole.example.net", Class::Blocked),
+            ("err.example.net", Class::Error),
+        ] {
+            let k = format!("1|{name}");
+            c.insert(k.clone(), with_class(class), t0);
+            c.get(&k, t0);
+            c.get(&k, t0);
+        }
+        let mut b = entry(300, false);
+        b.blocked = Some("ads");
+        c.insert("1|cname-blocked.example.net".into(), b, t0);
+        c.get("1|cname-blocked.example.net", t0);
+        c.get("1|cname-blocked.example.net", t0);
+        // 真正常用的：www 查 4 次但很久沒用，api 查 3 次剛剛才用
+        c.insert("1|www.example.net".into(), entry(300, false), t0);
+        for _ in 0..4 {
+            c.get("1|www.example.net", t0);
+        }
+        c.insert("28|api.example.org".into(), entry(300, false), t0);
+        for _ in 0..3 {
+            c.get("28|api.example.org", t0 + Duration::from_secs(4 * 3600));
+        }
+        let keys = c.hot_keys_at(2000, t0 + Duration::from_secs(4 * 3600));
+        let probe = keys.iter().filter(|k| k.ends_with(".example.com")).count();
+        assert_eq!(probe, WARM_PER_SITE, "同一個主網域最多 8 筆：{keys:?}");
+        for k in keys.iter().filter(|k| !k.ends_with(".example.com")) {
+            assert!(["1|www.example.net", "28|api.example.org"].contains(&k.as_str()), "{k}");
+        }
+        assert_eq!(keys.len(), WARM_PER_SITE + 2);
+        // 依最近使用加權：4 小時沒用的 www（4 ÷ 5）排在剛用過的 api（3 ÷ 1）後面
+        let pos = |k: &str| keys.iter().position(|x| x == k).unwrap();
+        assert!(pos("28|api.example.org") < pos("1|www.example.net"), "{keys:?}");
+        assert_eq!(c.hot_keys(3).len(), 3, "最多 n 筆");
+    }
+
+    /// 3.5.1 升級遷移：讀進舊版寫的名單（只有鍵）也套同樣的上限，重複與格式不對的略過
+    #[test]
+    fn cap_per_site_filters_old_lists() {
+        let mut old: Vec<String> = (0..1878).map(|i| format!("1|p{i:04}abcdefgh.example.com")).collect();
+        old.extend(
+            [
+                "1|www.example.net",
+                "28|www.example.net",
+                "1|www.example.net",
+                "x|bad.example.net",
+                "nopipe",
+            ]
+            .map(String::from),
+        );
+        old.extend((0..10).map(|i| format!("1|s{i}.shop.example.com.tw")));
+        let kept = cap_per_site(old, usize::MAX);
+        assert_eq!(kept.iter().filter(|k| k.ends_with(".example.com")).count(), WARM_PER_SITE);
+        assert_eq!(
+            kept.iter().filter(|k| k.ends_with(".example.com.tw")).count(),
+            WARM_PER_SITE,
+            "常見二級網域算三段"
+        );
+        assert_eq!(kept.iter().filter(|k| k.contains("www.example.net")).count(), 2, "重複的只留一筆");
+        assert!(!kept.iter().any(|k| k.contains("bad") || k == "nopipe"));
+        assert_eq!(cap_per_site(kept.clone(), 3).len(), 3);
     }
 
     #[test]

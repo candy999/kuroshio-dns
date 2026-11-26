@@ -428,6 +428,25 @@ async fn warmup_from_hot_names() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// 3.5.1 升級遷移：舊版寫的預熱名單塞滿同一個網域底下的一次性子網域時，讀進來只重查前 8 筆，不逐一問上游
+#[tokio::test]
+async fn warmup_skips_one_shot_names_from_old_list() {
+    let (up, _, n) = switchable(300).await;
+    let dir = std::env::temp_dir().join(format!("kuroshio-warm-old-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut old: Vec<String> = (0..40).map(|i| format!("1|q{i:02}abcdefghij.example.com")).collect();
+    old.push("1|www.example.net".into());
+    std::fs::write(dir.join("hot-names.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+    let mut c = cfg(&[up], json!({ "resolver": { "warmRate": 50 } }));
+    c["system"]["persistDir"] = json!(dir.to_string_lossy());
+    c["listen"] = json!({ "plain": { "binds": ["127.0.0.1"], "port": 0 } });
+    let started = kuroshio::app::start(&c).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(3600)).await;
+    assert_eq!(n.load(Ordering::SeqCst), 9, "同一個網域最多重查 8 筆，加上另一個網域 1 筆");
+    started.shutdown();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// 3.4.2 Windows 實測：否定答案（NXDOMAIN／NODATA）不等不回應的上游逾時，只再等 collectWindowMs
 #[tokio::test]
 async fn negative_answer_does_not_wait_for_silent_upstream() {

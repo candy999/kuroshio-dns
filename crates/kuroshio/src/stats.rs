@@ -531,6 +531,11 @@ pub fn site_of(name: &str) -> Option<String> {
     site_slice(n).map(str::to_string)
 }
 
+/// [`site_of`] 的不配置版本（開機預熱名單分組用）：`n` 要已經是小寫、結尾沒有點；回傳 `n` 的一段
+pub fn site_key(n: &str) -> Option<&str> {
+    site_slice(n)
+}
+
 /// [`site_of`] 的本體：`n` 已經是小寫、結尾沒有點；回傳的是 `n` 的一段（每次查詢都會呼叫，不配置記憶體）
 fn site_slice(n: &str) -> Option<&str> {
     if n.is_empty() || !n.contains('.') || is_ipv4_literal(n) {

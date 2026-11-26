@@ -1353,16 +1353,26 @@ pub fn stage_hot_names(r: &Resolver, p: &Mutex<Persister>, n: usize) {
     }
 }
 
-/// 開機預熱：依序重新查詢上次最常用的網域，每秒 `rate` 筆
+/// 開機預熱：依序重新查詢上次最常用的網域，每秒 `rate` 筆。
+/// 讀進來的名單照寫出時的規則再過濾一次（[`crate::cache::cap_per_site`]）：3.5.0 以前寫的名單
+/// 可能塞滿同一個網域底下的一次性子網域，不再逐一重問上游
 fn spawn_warmup(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, rate: u64) {
-    let keys: Vec<String> = p
+    let raw: Vec<String> = p
         .lock()
         .unwrap()
         .load(HOT_NAMES)
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
+    let before = raw.len();
+    let keys = crate::cache::cap_per_site(raw, usize::MAX);
     if keys.is_empty() || rate == 0 {
         return;
+    }
+    if keys.len() < before {
+        info!(
+            "開機預熱：名單 {before} 筆裡有 {} 筆是同一個網域底下過多的子網域或格式不對，略過不重查",
+            before - keys.len()
+        );
     }
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
