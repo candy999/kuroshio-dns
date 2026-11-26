@@ -1005,6 +1005,11 @@ pub struct Db {
     seen_once: Vec<u32>,
     /// 一次性網域定期忘掉（3.5.1 H2）：下一輪從第幾個分片開始
     forget_cursor: usize,
+    /// 筆數上限的淘汰（[`Db::prune`]）還沒回報的筆數，依組（[`prune_group`]）分；回報時歸零（[`Db::take_cap_pruned`]）。
+    /// 淘汰可能發生在查詢路徑上（新網域把筆數推到上限），那裡只加計數，日誌由背景的整理合併成一行
+    cap_pruned: [u32; PRUNE_GROUPS],
+    /// 還沒回報的淘汰次數
+    cap_prune_rounds: u32,
 }
 
 /// 一次性網域（只問過一次、沒有學習資料）超過這麼久沒出現就忘掉（3.5.1 H2）
@@ -1082,7 +1087,7 @@ pub fn forgettable_stale(d: &Domain, now: u64) -> bool {
 }
 
 /// 筆數上限淘汰的組數（[`prune_group`]）
-const PRUNE_GROUPS: usize = 4;
+pub const PRUNE_GROUPS: usize = 4;
 
 /// 筆數到了 `cdn.maxEntries` 時淘汰的組（小的先刪；3.5.1 H1）：
 ///
@@ -1135,6 +1140,8 @@ impl Db {
             multi_cdn: true,
             seen_once: Vec::new(),
             forget_cursor: 0,
+            cap_pruned: [0; PRUNE_GROUPS],
+            cap_prune_rounds: 0,
         }
     }
 
@@ -1645,8 +1652,26 @@ impl Db {
     }
 
     /// 筆數到了上限：依價值淘汰到上限的 90%（手動設定策略的保留；順序見 [`prune_group`]）
+    /// 淘汰的筆數記進 [`Db::take_cap_pruned`]（載入時與執行中的都算）
     pub fn prune(&mut self) {
-        self.drop_cheapest((self.max_entries as f64 * 0.9) as usize, now_ms());
+        let g = self.drop_cheapest((self.max_entries as f64 * 0.9) as usize, now_ms());
+        if g.iter().any(|n| *n > 0) {
+            for (a, b) in self.cap_pruned.iter_mut().zip(g) {
+                *a = a.saturating_add(b);
+            }
+            self.cap_prune_rounds = self.cap_prune_rounds.saturating_add(1);
+        }
+    }
+
+    /// 取走還沒回報的筆數上限淘汰：（依組的筆數，淘汰次數）。沒有淘汰過是 None
+    pub fn take_cap_pruned(&mut self) -> Option<([u32; PRUNE_GROUPS], u32)> {
+        if self.cap_prune_rounds == 0 {
+            return None;
+        }
+        let out = (self.cap_pruned, self.cap_prune_rounds);
+        self.cap_pruned = [0; PRUNE_GROUPS];
+        self.cap_prune_rounds = 0;
+        Some(out)
     }
 
     /// 刪到剩 `keep` 筆（記憶體不足時也用這個）
@@ -1661,10 +1686,11 @@ impl Db {
     /// （18 萬筆剩下的 99.7% 是只問過一次的網域）。
     ///
     /// 兩次掃描、不排序整份陣列（同 [`Db::evict_coldest`]）：第一次依（組，年齡格）計數，找出刪到哪一格；
-    /// 第二次只收那些名稱，最後那一格不夠分時才在那一格裡挑最舊的
-    fn drop_cheapest(&mut self, keep: usize, now: u64) {
+    /// 第二次只收那些名稱，最後那一格不夠分時才在那一格裡挑最舊的。回傳各組刪了幾筆
+    fn drop_cheapest(&mut self, keep: usize, now: u64) -> [u32; PRUNE_GROUPS] {
+        let mut out = [0u32; PRUNE_GROUPS];
         if self.domains.len() <= keep {
-            return;
+            return out;
         }
         const B: usize = COLD_AGE_EDGES_MS.len() + 1;
         let slot = |d: &Domain| -> Option<usize> {
@@ -1683,7 +1709,7 @@ impl Db {
         let auto: usize = counts.iter().sum();
         let drop = (self.domains.len() - keep).min(auto);
         if drop == 0 {
-            return;
+            return out;
         }
         // 從最不值得留的那格累計到 drop：那一格之前的全部刪，那一格只刪補足的部分
         let mut sum = 0usize;
@@ -1720,9 +1746,13 @@ impl Db {
             names.extend(edge.into_iter().take(need_last).map(|(_, n)| n));
         }
         for n in names {
-            self.domains.remove(&n);
+            if let Some(d) = self.domains.remove(&n) {
+                let g = &mut out[usize::from(prune_group(&d)).min(PRUNE_GROUPS - 1)];
+                *g = g.saturating_add(1);
+            }
             self.mark(&n);
         }
+        out
     }
 
     // ------------------------------------------------------------ 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）
@@ -2778,6 +2808,63 @@ mod tests {
             ]
         );
         assert!(db.get("manual.example.com").is_some(), "手動策略的不刪");
+    }
+
+    /// 筆數上限的淘汰依組記下筆數，取走一次就歸零（日誌與 `prunedForCap` 用；3.5.1 測試版第二版 Windows C3：以前看不到）
+    #[test]
+    fn prune_counts_by_group() {
+        // 直接放進表裡（不經過 `touch`：那裡到了上限會自己淘汰）
+        let add = |db: &mut Db, name: &str, hits: u32, verdict: Option<&str>| {
+            let d = Domain {
+                name: Arc::from(name),
+                provider: Field::Val(util::intern("cloudflare")),
+                last_seen: NOW - 10 * DAY,
+                hits,
+                policy: Some(Policy::Auto),
+                v4: verdict.map(|v| {
+                    Box::new(Verdict {
+                        verdict: Some(Arc::from(v)),
+                        ..Default::default()
+                    })
+                }),
+                ..Default::default()
+            };
+            db.domains.insert(d.name.clone(), d);
+        };
+        let mut db = Db::new(100);
+        assert_eq!(db.take_cap_pruned(), None, "沒有淘汰過");
+        for i in 0..98 {
+            add(&mut db, &format!("once{i}.example.com"), 1, None);
+        }
+        add(&mut db, "twice.example.com", 2, None);
+        add(&mut db, "failed.example.com", 3, Some("fail"));
+        add(&mut db, "ok.example.com", 3, Some("ok"));
+        assert_eq!(db.domains.len(), 101);
+        db.prune();
+        assert_eq!(db.domains.len(), 90);
+        assert_eq!(db.take_cap_pruned(), Some(([11, 0, 0, 0], 1)), "刪的全部是只問過一次的");
+        assert_eq!(db.take_cap_pruned(), None, "取走之後歸零");
+        db.prune();
+        assert_eq!(db.take_cap_pruned(), None, "沒超過上限、沒刪就不算一次");
+        // 一次性的都刪光之後照組別往上：問過兩次的、沒通過的；有通過的不動
+        db.domains.retain(|_, d| d.hits >= 2);
+        for i in 0..100 {
+            add(&mut db, &format!("f{i}.example.net"), 3, Some("fail"));
+        }
+        db.prune();
+        add(&mut db, "late.example.net", 1, None);
+        add(&mut db, "late2.example.net", 1, None);
+        add(&mut db, "late3.example.net", 1, None);
+        for i in 0..8 {
+            add(&mut db, &format!("late-f{i}.example.net"), 3, Some("fail"));
+        }
+        db.prune();
+        assert_eq!(
+            db.take_cap_pruned(),
+            Some(([3, 1, (103 - 90 - 1) + (90 + 11 - 90 - 3), 0], 2)),
+            "兩次合併成一筆回報"
+        );
+        assert!(db.get("ok.example.com").is_some());
     }
 
     /// 3.5.1 H1：筆數到了上限的 90% 以後，新網域問第二次才記；降回去就恢復

@@ -1025,3 +1025,52 @@ fn cdn_dir_kb_is_informational_only() {
     assert_eq!(c.state().db.domains.len(), n0, "其他檔再大也不淘汰網域資料");
     assert_eq!(st["prunedForBudget"], 0);
 }
+
+/// 3.5.1（測試版第二版 Windows C3）：筆數上限（`cdn.maxEntries`）的淘汰看得到。以前載入時的淘汰沒有日誌、狀態也沒有統計
+/// （`prunedForBudget` 是磁碟預算的）。載入時與執行中的都累計在 `prunedForCap`／`prunedForCapGroups`；
+/// 執行中的（查詢路徑上）只加計數，由每 5 分鐘的整理合併成一行
+#[test]
+fn cap_prune_counted_at_load_and_runtime() {
+    let paths = paths_no_seed("cap-prune");
+    let dir = paths.state_dir.clone();
+    let c = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
+    c.with_state(|st| {
+        for i in 0..1200 {
+            st.db.touch(&format!("c{i}.example.net"), "cloudflare", "ip", &[], &[], None);
+        }
+        for i in 0..100 {
+            st.db.get_mut(&format!("c{i}.example.net")).unwrap().hits = 2;
+        }
+    });
+    let (_, ch) = c.snapshots_sharded(false);
+    write_changes(&c, &dir, &ch);
+    assert_eq!(c.status()["prunedForCap"], json!(0));
+
+    let mut cfg = full_cfg();
+    cfg["cdn"]["maxEntries"] = json!(1000);
+    let c2 = Cdn::load(&cfg, paths, MockNet::new());
+    assert_eq!(c2.state().db.domains.len(), 900, "載入時淘汰到上限的 90%");
+    for st in [c2.status(), c2.status_lite()] {
+        assert_eq!(st["prunedForCap"], json!(300), "{st}");
+        assert_eq!(st["prunedForCapGroups"], json!([300, 0, 0, 0]), "刪的都是只問過一次的：{st}");
+    }
+    assert_eq!(c2.status_lite()["prunedForBudget"], json!(0), "不算進磁碟預算的");
+    assert!(
+        (0..100).all(|i| c2.state().db.get(&format!("c{i}.example.net")).is_some()),
+        "問過兩次的留著"
+    );
+    assert_eq!(c2.report_cap_pruned("測試"), None, "載入時的已經回報過");
+
+    // 執行中：新網域把筆數推到上限，淘汰發生在查詢路徑上，下一輪整理才回報（一輪一行）
+    c2.with_state(|st| {
+        for i in 0..101 {
+            st.db.touch(&format!("n{i}.example.net"), "cloudflare", "ip", &[], &[], None);
+        }
+    });
+    assert_eq!(c2.status()["prunedForCap"], json!(300), "還沒整理");
+    c2.budget_round();
+    assert_eq!(c2.status()["prunedForCap"], json!(400));
+    assert_eq!(c2.status_lite()["prunedForCapGroups"], json!([400, 0, 0, 0]));
+    c2.budget_round();
+    assert_eq!(c2.status()["prunedForCap"], json!(400), "沒有新的淘汰就不變");
+}

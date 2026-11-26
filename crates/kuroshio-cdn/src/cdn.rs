@@ -332,6 +332,8 @@ pub struct Cdn {
     budget_rounds: AtomicU32,
     /// 定期忘掉的一次性網域累計筆數（3.5.1 H2）
     forgot_one_shot: AtomicU32,
+    /// 筆數上限（`cdn.maxEntries`）淘汰的累計筆數，依組（[`db::prune_group`]）分（3.5.1 H1；啟動以來，含載入時）
+    cap_pruned: [AtomicU32; db::PRUNE_GROUPS],
     disk_kb: AtomicU32,
     /// 分片目錄裡檔案長度的合計（KB；3.5.0 F8 之前的 `dbDiskKB`）、整個 `cdn/` 目錄實際佔用（KB，只顯示）。`u32::MAX` = 還沒量
     file_kb: AtomicU32,
@@ -542,10 +544,12 @@ impl Cdn {
             budget_pruned: AtomicU32::new(0),
             budget_rounds: AtomicU32::new(0),
             forgot_one_shot: AtomicU32::new(0),
+            cap_pruned: Default::default(),
             disk_kb: AtomicU32::new(u32::MAX),
             file_kb: AtomicU32::new(u32::MAX),
             cdn_dir_kb: AtomicU32::new(u32::MAX),
         };
+        me.report_cap_pruned("載入時");
         me.reset_octet_verdicts();
         me.clean_stale_learning();
         // 啟動時先量一次實際的磁碟用量（3.5.0 D3 回報：重新啟動後到第一輪預算之前 dbDiskKB 是 null，
@@ -593,8 +597,7 @@ impl Cdn {
                 return false;
             }
             let Some(ip) = base.as_ref().and_then(|b| b.ip) else { return false };
-            let has_range = pools.p.get(p).is_some_and(|d| d.range4.v4_len() > 0);
-            if ip.is_ipv6() || (has_range && !pools.in_ranges(p, ip)) {
+            if ip.is_ipv6() || !pools.fits_orig(p, ip) {
                 *base = None;
                 n[1] += 1;
                 return true;
@@ -650,6 +653,38 @@ impl Cdn {
             );
         }
         n
+    }
+
+    /// 筆數上限的淘汰（[`Db::prune`]）回報：累計進 `prunedForCap`，記一行 info（刪了幾筆、各是哪一組）。
+    /// 載入時呼叫一次；執行中的淘汰（新網域把筆數推到上限、寫分片之前）由每 5 分鐘的整理（[`Cdn::budget_round`]）
+    /// 合併成一行，不在查詢路徑上記日誌。回傳這次回報的各組筆數（沒有淘汰是 None）
+    pub(crate) fn report_cap_pruned(&self, when: &str) -> Option<[u32; db::PRUNE_GROUPS]> {
+        let (g, rounds, left, max) = {
+            let mut st = self.state();
+            let (g, rounds) = st.db.take_cap_pruned()?;
+            (g, rounds, st.db.total_entries(), st.db.max_entries)
+        };
+        for (a, n) in self.cap_pruned.iter().zip(g) {
+            a.store(a.load(Ordering::Relaxed).saturating_add(n), Ordering::Relaxed);
+        }
+        let total = g.iter().fold(0u32, |a, n| a.saturating_add(*n));
+        info!(
+            "CDN 網域筆數到了上限（cdn.maxEntries {max}）：{when}淘汰 {total} 筆{}，剩 {left} 筆。\
+             依組：沒有學習資料、只問過 1 次 {}；沒有學習資料、問過 2 次以上 {}；有學習資料、沒有通過 {}；有通過的 {}",
+            if rounds > 1 { format!("（{rounds} 次）") } else { String::new() },
+            g[0],
+            g[1],
+            g[2],
+            g[3]
+        );
+        Some(g)
+    }
+
+    /// `prunedForCap`（累計筆數）與 `prunedForCapGroups`（依組，[`db::prune_group`] 的 0～3）
+    fn cap_pruned_json(&self, v: &mut Value) {
+        let g: Vec<u32> = self.cap_pruned.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        v["prunedForCap"] = json!(g.iter().fold(0u32, |a, n| a.saturating_add(*n)));
+        v["prunedForCapGroups"] = json!(g);
     }
 
     /// 舊版用隨機 IP 驗證 Fastly 必然憑證不符；最後一段跟原始不同的失敗紀錄作廢，重新驗證
@@ -1199,6 +1234,8 @@ impl Cdn {
     /// 沒有設定預算（大磁碟、`cdn.dbDiskBudgetKB: 0`）時只量一下實際大小給狀態頁，什麼都不刪
     pub fn budget_round(&self) -> BudgetRound {
         let mut out = BudgetRound::default();
+        // 上一輪以來筆數上限的淘汰（查詢路徑上、寫分片之前發生的）合併成一行
+        self.report_cap_pruned("執行中（上次整理以來）");
         let disk = self.measure_disk();
         // 3.5.1 H2：一次性網域（只問過一次、沒有學習資料、3 天沒出現）不管有沒有預算都定期忘掉。
         // 有預算的小 Flash 只看本來就要寫的分片；沒有預算時另外輪流看幾片（分批、每輪有上限）
@@ -1299,6 +1336,7 @@ impl Cdn {
         v["prunedForBudget"] = json!(self.budget_pruned.load(Ordering::Relaxed));
         v["prunedRounds"] = json!(self.budget_rounds.load(Ordering::Relaxed));
         v["forgotOneShot"] = json!(self.forgot_one_shot.load(Ordering::Relaxed));
+        self.cap_pruned_json(v);
     }
 
     /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，
@@ -1715,10 +1753,14 @@ impl Cdn {
     /// 狀態（同 2.x `optimizer.status()`）
     pub fn status(&self) -> Value {
         let st = self.state();
-        json!({
+        let mut v = json!({
             "enabled": self.cfg.enabled, "stats": self.stats_of(&st), "pools": st.pools.status(), "domains": st.db.domains.len(),
             "cross": { "explored": st.cross_explored, "ok": st.cross_ok },
-        })
+        });
+        drop(st);
+        // 3.5.1：筆數上限的淘汰統計（`/api/status` 的 `cdn` 也有）
+        self.cap_pruned_json(&mut v);
+        v
     }
 
     /// `/api/cdn/pools`

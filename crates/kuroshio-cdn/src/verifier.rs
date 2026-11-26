@@ -3,6 +3,7 @@
 
 use crate::cdn::Cdn;
 use crate::db::Base;
+use crate::pools::Pools;
 use crate::providers::{self, detect_from_headers, hv, is_tw_pop};
 use crate::util::{self, intern, now_ms, Num, HOUR_MS};
 use kuroshio_net::probe::{HttpsOpts, ProbeResult};
@@ -194,6 +195,17 @@ enum Slot<'a> {
     Main,
     Alt(&'a crate::db::Alt),
     None,
+}
+
+/// 驗證用的「原本的 IP」（基準連線、`base.ip`、保留最後一段的候選）：要是這個位址家族、而且在這一家的官方範圍裡
+/// （[`Pools::fits_orig`]）。不是的話改用這一格最近一次答案裡第一個符合的；都不符合就沒有（不量基準）。
+///
+/// 3.5.1 測試版第二版 Windows C3：每小時的複驗、輪流抽驗、手動驗證拿 `orig_ip()`（基準 IP 或這次答案的第一個 A）當原本的 IP。
+/// 答案裡第一個 A 不一定是這一家的（CNAME 判斷出業者、或答案混著別家／非 CDN 的位址），拿它量的基準寫進 `base`，
+/// 之後複驗又優先用 `base.ip`，一直用錯的那一個，要到下次啟動的整理才清掉
+fn fit_orig(pools: &Pools, provider: &str, family: u8, orig: Option<IpAddr>, seen: &[IpAddr]) -> Option<IpAddr> {
+    let fits = |ip: &IpAddr| ip.is_ipv6() == (family == 6) && pools.fits_orig(provider, *ip);
+    orig.filter(fits).or_else(|| seen.iter().copied().find(fits))
 }
 
 fn slot_of<'a>(e: &'a crate::db::Domain, provider: &str, multi_cdn: bool) -> Slot<'a> {
@@ -446,21 +458,26 @@ impl Cdn {
     ) -> Option<&'static str> {
         let prov = providers::get(provider);
         let label = providers::label(provider);
-        // （上一次的失敗次數，上一次的握手比原本慢的狀態（3.5.0 F9），手動設成「一定換」）
-        let (prev_fails, prev_slow, always) = {
+        // （上一次的失敗次數，上一次的握手比原本慢的狀態（3.5.0 F9），手動設成「一定換」，原本的 IP）
+        let (prev_fails, prev_slow, always, orig) = {
             let st = self.state();
             let of = |v: Option<&crate::db::Verdict>| (v.and_then(|v| v.fails).unwrap_or(0), PrevSlow::of(v));
             // 多來源（3.5.0 B3）：這一家已經沒有格子（被別家擠掉、過期）→ 不驗證，結果沒有地方放
-            let ((f, w), always) = match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
-                Some((e, Slot::Main)) => (of(e.verdict(family)), e.policy() == crate::db::Policy::Always),
+            let ((f, w), always, seen) = match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
+                Some((e, Slot::Main)) => (
+                    of(e.verdict(family)),
+                    e.policy() == crate::db::Policy::Always,
+                    if family == 6 { &e.ips6[..] } else { &e.ips4[..] },
+                ),
                 Some((e, Slot::Alt(a))) => (
                     of(if family == 6 { a.v6.as_deref() } else { a.v4.as_deref() }),
                     e.policy() == crate::db::Policy::Always,
+                    if family == 6 { &a.ips6[..] } else { &a.ips4[..] },
                 ),
                 Some((_, Slot::None)) => return None,
-                None => ((0, PrevSlow::default()), false),
+                None => ((0, PrevSlow::default()), false, &[][..]),
             };
-            (f, w, always)
+            (f, w, always, fit_orig(&st.pools, provider, family, orig, seen))
         };
         let t = Duration::from_millis(self.cfg.verify_timeout_ms);
 
@@ -471,8 +488,9 @@ impl Cdn {
         let mut base_pop = String::new();
         let mut http_mode = false;
         let mut base_https: Option<HttpsFail> = None;
-        // 3.5.1 M2：原本的 IP 要是這個家族的（舊資料的 v4 基準 IP 可能被 v6 驗證蓋成 IPv6，拿它量到的 POP 會判錯 v4）
-        if let Some(o) = orig.filter(|o| o.is_ipv6() == (family == 6)) {
+        // 3.5.1 M2：原本的 IP 要是這個家族的（舊資料的 v4 基準 IP 可能被 v6 驗證蓋成 IPv6，拿它量到的 POP 會判錯 v4）；
+        // 也要是這一家的（上面的 `fit_orig`）
+        if let Some(o) = orig {
             let mut b = self.probe_site(o, name, false).await;
             if !b.ok && b.error.as_deref() != Some("TIMEOUT") {
                 let b2 = self.net.http_probe(o, name, "/", t).await;

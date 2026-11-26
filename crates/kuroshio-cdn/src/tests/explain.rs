@@ -53,6 +53,10 @@ fn explain_rewritten_and_failed() {
     let v = c.explain("ok.test", Context::default());
     assert_eq!(v["decision"], "rewritten");
     assert!(v["text"].as_str().unwrap().contains("TPE"), "{v}");
+    assert!(
+        v["text"].as_str().unwrap().contains("驗證的 HTTPS 請求 12 ms"),
+        "寫清楚是什麼時間：{v}"
+    );
     let v = c.explain("bad.test", Context::default());
     assert_eq!(v["decision"], "verify-failed");
     assert!(v["text"].as_str().unwrap().contains("試了 3 個節點"), "{v}");
@@ -207,6 +211,8 @@ fn explain_nearest_rewritten_matches_query_path() {
             v.until = Some(now_ms() + 3_600_000);
             v.ip = Some(ip("151.101.77.140"));
             v.pop = Some("HKG".into());
+            // 驗證時一次 HTTPS 請求的時間（連線＋握手＋網站回應），不是連線延遲
+            v.ms = crate::util::Num::V(2504.5);
         })
     });
     let mut m = msg(name, 1, &["151.101.65.140"], vec![]);
@@ -214,7 +220,19 @@ fn explain_nearest_rewritten_matches_query_path() {
     assert_eq!(r.rewritten, Some(crate::Rewrite::Alias), "{:?}", r.tags);
     let v = c.explain(name, Context::default());
     assert_eq!(v["decision"], "nearest", "{v}");
-    assert!(v["text"].as_str().unwrap().contains("HKG"), "{v}");
+    let text = v["text"].as_str().unwrap();
+    assert!(text.contains("HKG"), "{v}");
+    // 3.5.1 測試版第二版 Windows C4：「比原本快」用判斷時的同一種量法（連線延遲）寫新的對原本的，
+    // 不寫驗證的 HTTPS 請求時間（以前「（NRT，2504 ms）」讀起來像換到 2.5 秒的節點）
+    let (o, p) = c.with_state(|st| {
+        let needs = [ip("151.101.65.140")];
+        let pool = st.pools.map_ips("fastly", 4, &needs);
+        c.nearest_ms(&st.pools, "fastly", 4, &needs, &pool)
+    });
+    let (o, p) = (o.unwrap(), p.unwrap());
+    assert!(p < o, "{p} {o}");
+    assert!(text.contains(&format!("連線延遲約 {p:.0} ms，原本的答案約 {o:.0} ms")), "{text}");
+    assert!(!text.contains("2504") && !text.contains("2505"), "{text}");
     // 原本的答案已經夠近：查詢路徑不換，explain 也不說換
     net.set_cached("151.101.65.140", 26.5);
     let mut m = msg(name, 1, &["151.101.65.140"], vec![]);

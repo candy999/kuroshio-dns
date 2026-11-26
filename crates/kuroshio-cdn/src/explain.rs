@@ -378,10 +378,24 @@ impl Cdn {
                     if Cdn::verified_ips(pools, provider, 4, v, Some(&needs)).is_empty() {
                         return (d::POOL_CHANGED, String::new());
                     }
-                    let detail = match (v.pop.as_deref(), v.ms.get()) {
-                        (Some(p), Some(ms)) => format!("{p}，{ms:.0} ms"),
-                        (Some(p), None) => p.to_string(),
-                        _ => String::new(),
+                    // 3.5.1 測試版第二版 Windows C4：以前兩種都寫「（POP，驗證的 ms）」。那是驗證時一次 HTTPS 請求的時間
+                    // （連線＋握手＋網站回應，`ProbeResult::ms`），不是連線延遲；跟跨 CDN 步驟的 `origMs`（原本答案的 TCP 延遲）
+                    // 放在一起，最近節點型讀起來像「換到 2.5 秒的節點、還說比原本快」。
+                    // - 最近節點型：寫判斷用的那兩個數字（`nearest_ms`，同一種量法：連線延遲），新的對原本的。
+                    // - 台灣節點：寫清楚是驗證的 HTTPS 請求時間。
+                    let pop = v.pop.as_deref().filter(|p| !p.is_empty());
+                    let detail = if nearest {
+                        let lat = match self.nearest_ms(pools, provider, 4, &needs, &pool) {
+                            (Some(o), Some(p)) => Some(format!("連線延遲約 {p:.0} ms，原本的答案約 {o:.0} ms")),
+                            _ => None,
+                        };
+                        [pop.map(str::to_string), lat].into_iter().flatten().collect::<Vec<_>>().join("；")
+                    } else {
+                        match (pop, v.ms.get()) {
+                            (Some(p), Some(ms)) => format!("{p}，驗證的 HTTPS 請求 {ms:.0} ms"),
+                            (Some(p), None) => p.to_string(),
+                            _ => String::new(),
+                        }
                     };
                     return (if nearest { d::NEAREST } else { d::REWRITTEN }, detail);
                 }
@@ -429,7 +443,7 @@ impl Cdn {
                         .gain_ms
                         .get()
                         .filter(|g| *g > 0.0)
-                        .map(|g| format!("快 {g:.0} ms"))
+                        .map(|g| format!("連線延遲快 {g:.0} ms"))
                         .unwrap_or_default();
                     return (d::ECS, detail);
                 }
