@@ -760,7 +760,7 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
 ```
 
 - 分工：`warnings` = 現在需要處理的；`findings` = 觀察到的現象與經過。同一件事不兩邊都放。
-- `key`（約定）：`upstream-failing`、`upstream-all-down`、`serve-stale-high`、`cdn-verify-fail-high`、`chain-intercepted`、`chain-released-untrusted`、`chain-audit-released`、`list-copy-no-room`、`cdn-db-pruning`、`job-failing`、`friends-sync-failing`、`reach-single-pop`、`reach-none`、`pop-mismatch`、`pop-switched`、`pop-flapping`、`slower-fallback`、`slower-fuse`、`cdn-verify-paced`（3.5.0 F12：新網域很多，CDN 驗證減量中）。之後可能會加，不認得的 `key` 請照 `text` 顯示。
+- `key`（約定）：`upstream-failing`、`upstream-all-down`、`serve-stale-high`、`cdn-verify-fail-high`、`chain-intercepted`、`chain-released-untrusted`、`chain-audit-released`、`list-copy-no-room`、`cdn-db-pruning`、`job-failing`、`friends-sync-failing`、`reach-single-pop`、`reach-none`、`pop-mismatch`、`pop-switched`、`pop-flapping`、`slower-fallback`、`slower-fuse`、`cdn-verify-paced`（3.5.0 F12：新網域很多，CDN 驗證減量中）、`site-min-clients-1`（3.5.1：公開頁對外開放、網站排行最少人數還是 1）。之後可能會加，不認得的 `key` 請照 `text` 顯示。
 - 3.5.0 F3：`serve-stale-high` 要四個條件都成立才出現——最近 15 分鐘查詢 100 筆以上、過期快取回答的佔 5% 以上、背景更新失敗 5 次以上、而且過期回答裡至少四分之一是更新失敗（查詢少、重複多的家裡過期比例本來就高，不代表上游有狀況）；文字寫「…其中 M 次背景更新失敗：上游可能有狀況」。`cdn-db-pruning` 的文字改成「CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 N 筆）」。
 - `sev`：`warn` / `info`。排序：`warn` 在前，同級 `lastAt` 新的在前。
 - `text`：一句話（最長 200 個字元，內容不是約定）；只放數量、CDN 名稱、機房代碼，不放網域與用戶端 IP。

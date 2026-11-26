@@ -551,6 +551,8 @@ pub struct FindInputs {
     pub pool_nodes: usize,
     /// 記憶體控制的摘要（3.5.1 H3；記憶體控制關著是 None）
     pub memory: Option<crate::memgov::MemSummary>,
+    /// 公開頁對外開放、網站排行最少人數是 1（[`crate::site::public_min_clients_note`]，3.5.1）
+    pub site_min_clients: Option<String>,
 }
 
 fn state(key: &'static str, sev: Sev, on: bool, text: String) -> Obs {
@@ -695,6 +697,14 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
             ),
         ));
     }
+
+    // 公開頁的隱私（3.5.1）
+    out.push(state(
+        "site-min-clients-1",
+        Sev::Info,
+        i.site_min_clients.is_some(),
+        i.site_min_clients.clone().unwrap_or_default(),
+    ));
 
     // 清單副本
     if let Some(n) = i.lists_without_copy {
@@ -902,6 +912,7 @@ fn find_inputs(st: &AppState, now: u64) -> FindInputs {
         fresh: fresh_items(&fresh_inputs(st)),
         friends_failing3: st.community.as_ref().and_then(|c| c.sync_summary()).map_or(0, |s| s.failing3),
         memory: st.memgov.as_ref().map(|g| g.finding_summary()),
+        site_min_clients: crate::site::public_min_clients_note(&st.cfg),
     }
 }
 

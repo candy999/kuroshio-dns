@@ -399,7 +399,53 @@ fn noisy_inputs() -> FindInputs {
             protected: false,
             shed: vec!["縮小 DNS 快取", "暫時停用過濾清單"],
         }),
+        site_min_clients: crate::site::public_min_clients_note(&public_site_cfg(1)),
     }
+}
+
+fn public_site_cfg(min: u64) -> Value {
+    kuroshio_config::build(&json!({
+        "domain": "dns.example.net",
+        "site": { "enabled": true, "minClients": min },
+        "listen": { "doh": { "enabled": true } }
+    }))
+}
+
+/// 3.5.1：公開頁對外開放、網站排行最少人數是 1 時提醒（預設不改，站長自己決定）
+#[test]
+fn site_min_clients_note_only_for_public_site() {
+    assert!(crate::site::public_min_clients_note(&public_site_cfg(1)).is_some());
+    assert!(
+        crate::site::public_min_clients_note(&public_site_cfg(2)).is_none(),
+        "調高了就不提醒"
+    );
+    for extra in [
+        json!({ "site": { "enabled": false } }),
+        json!({ "listen": { "doh": { "enabled": false } } }),
+        json!({ "domain": "", "site": { "hostname": "" } }),
+    ] {
+        let mut c = public_site_cfg(1);
+        kuroshio_config::merge(&mut c, &extra);
+        assert!(crate::site::public_min_clients_note(&c).is_none(), "{extra}");
+    }
+    assert!(
+        crate::site::public_min_clients_note(&kuroshio_config::build(&json!({}))).is_none(),
+        "預設（公開頁關著）不提醒"
+    );
+    let i = FindInputs {
+        now: NOW,
+        site_min_clients: crate::site::public_min_clients_note(&public_site_cfg(1)),
+        ..FindInputs::default()
+    };
+    let on: Vec<(&str, Sev)> = rules(&i, &[])
+        .0
+        .into_iter()
+        .filter_map(|o| match o {
+            Obs::State { key, on: true, sev, .. } => Some((key, sev)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(on, vec![("site-min-clients-1", Sev::Info)]);
 }
 
 #[test]
@@ -499,6 +545,7 @@ fn finding_text_has_no_domain_or_client_ip() {
         "slower-fallback",
         "slower-fuse",
         "cdn-verify-paced",
+        "site-min-clients-1",
     ] {
         assert!(keys.contains(&k), "{k} 沒出現：{keys:?}");
     }

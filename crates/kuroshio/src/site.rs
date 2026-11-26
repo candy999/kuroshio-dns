@@ -401,6 +401,21 @@ fn page_file(cfg: &Value, key: &str, default_name: &str) -> PathBuf {
     }
 }
 
+/// 公開頁對外開放、網站排行最少人數（`site.minClients`）還是 1 時的提醒（3.5.1；沒有是 None）。
+/// 「對外開放」= 公開頁開著、DoH 開著（公開頁跟 DoH 共用網域與埠）、有設定網域（`site.hostname`，`domain` 會自動帶入）。
+/// 預設維持 1：家裡只有一兩台裝置時調成 2 排行就空了；公開伺服器會列出只有一台裝置去過的網站並保存 31 天，
+/// 所以啟動日誌與發現清單提醒站長自己決定
+pub fn public_min_clients_note(cfg: &Value) -> Option<String> {
+    let on = |k: &str| get(cfg, k).and_then(Value::as_bool).unwrap_or(false);
+    let host = get(cfg, "site.hostname").and_then(Value::as_str).unwrap_or("").trim();
+    let min = get(cfg, "site.minClients").and_then(Value::as_u64).unwrap_or(1);
+    (on("site.enabled") && on("listen.doh.enabled") && !host.is_empty() && min <= 1).then(|| {
+        "公開頁對外開放、網站排行最少人數（site.minClients）是 1：只有一台裝置去過的網站也會列出來，每日排行保存 31 天；\
+         公開給別人用的伺服器建議設 2 以上（OpenWrt：min_clients）"
+            .to_string()
+    })
+}
+
 impl Site {
     /// 由設定建立；`site.enabled` 為 false 時回 None。不會啟動背景工作（另外呼叫 [`Site::spawn`]）
     pub fn new(cfg: &Value, state: Arc<AppState>, presence: Option<Arc<Presence>>) -> Option<Arc<Site>> {
@@ -424,6 +439,9 @@ impl Site {
             info!("公開網頁：沒有設定 site.hostname，網頁改用瀏覽器連進來的網域；詳細數據頁在 {dp}/");
         } else {
             info!("詳細數據頁（擁有連結才能看）：https://{hostname}{dp}/");
+        }
+        if let Some(n) = public_min_clients_note(cfg) {
+            warn!("{n}");
         }
         Some(Arc::new(Site {
             presence,
