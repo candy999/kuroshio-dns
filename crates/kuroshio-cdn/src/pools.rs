@@ -1305,6 +1305,20 @@ impl Pools {
             .is_some()
     }
 
+    /// 這個 IP 能不能當這一家的「原本的 IP」（驗證的基準，`base.ip`）：這一家有這個位址家族的官方範圍時，
+    /// 要在範圍（含掃描分類）裡；沒有範圍資料的不比（3.5.1 測試版第二版 Windows C3）。
+    /// 載入時的整理（`Cdn::clean_stale_learning`）用同一個判斷清掉範圍外的基準
+    pub fn fits_orig(&self, provider: &str, ip: IpAddr) -> bool {
+        let ip = unmap(ip);
+        let Some(d) = self.p.get(provider) else { return true };
+        let has_range = if ip.is_ipv4() {
+            d.range4.v4_len() > 0
+        } else {
+            d.range6.v6_len() > 0
+        };
+        !has_range || d.class_of(ip, self.is_nearest(provider)).is_some()
+    }
+
     /// 目前範圍與分類的唯讀快照（共用同一份 `CidrSet`，只複製指標）
     pub fn classifier(&self) -> Classifier {
         // 所有 CDN 的範圍合成一個集合：不在裡面的 IP（絕大多數）查一次就知道不是 CDN

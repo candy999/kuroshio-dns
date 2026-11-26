@@ -809,6 +809,21 @@ impl Cdn {
     /// 最近節點型（Fastly）：最近的節點有沒有明顯比原本的答案快（`cdn.nearestMinGainMs`）。回傳（夠不夠，原本的延遲量過沒有）。
     /// 查詢路徑（`alias_family`）與 `explain` 共用（3.5.1 M5）；只讀測速快取與節點池的紀錄，不發請求
     pub(crate) fn nearest_gain(&self, pools: &Pools, provider: &str, family: u8, needs: &[IpAddr], pool: &[IpAddr]) -> (bool, bool) {
+        let (orig_ms, pool_ms) = self.nearest_ms(pools, provider, family, needs, pool);
+        let enough = matches!((orig_ms, pool_ms), (Some(o), Some(p)) if o - p >= self.cfg.nearest_min_gain_ms);
+        (enough, orig_ms.is_some())
+    }
+
+    /// [`Cdn::nearest_gain`] 比的兩個數字：（原本的答案，最近的節點）的連線延遲（毫秒；測速快取或節點池的紀錄，
+    /// 同一種量法）。`explain` 的 `nearest` 用它說明「比原本快」是快多少（3.5.1 測試版第二版 Windows C4）
+    pub(crate) fn nearest_ms(
+        &self,
+        pools: &Pools,
+        provider: &str,
+        family: u8,
+        needs: &[IpAddr],
+        pool: &[IpAddr],
+    ) -> (Option<f64>, Option<f64>) {
         let orig_ms = self.served_ms_in(pools, provider, needs);
         let pop = match pool.first() {
             Some(ip) => pools.pop_of_ip(provider, *ip),
@@ -818,8 +833,7 @@ impl Cdn {
             .and_then(|p| pools.pop_score(provider, &p))
             .filter(|s| *s != 0.0 && !s.is_nan())
             .or_else(|| pools.best_ms(provider, family));
-        let enough = matches!((orig_ms, pool_ms), (Some(o), Some(p)) if o - p >= self.cfg.nearest_min_gain_ms);
-        (enough, orig_ms.is_some())
+        (orig_ms, pool_ms)
     }
 
     /// 「針對這個網站驗證過」、而且現在還能用（[`Pools::usable`]：仍在節點池、沒被暫停）的 IP，驗證時用的那個排第一。

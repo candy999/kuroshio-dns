@@ -71,6 +71,62 @@ async fn v6_verify_does_not_overwrite_v4_base() {
         .is_none());
 }
 
+/// 3.5.1（測試版第二版 Windows C3）：複驗、輪流抽驗、手動驗證拿 `orig_ip()`（沒有基準時是答案裡第一個 A）當原本的 IP。
+/// 第一個 A 不一定是這一家的（答案混著非 CDN 的位址），以前照樣量、寫進 `base`，下次啟動的整理才清掉「範圍外的基準」。
+/// 現在改用這一格答案裡第一個在範圍裡的；都不在範圍裡就不量基準
+#[tokio::test]
+async fn out_of_range_orig_is_not_written_as_base() {
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        st.db.touch(
+            "mixed.example.com",
+            "cloudflare",
+            "ip",
+            &ips(&["198.51.100.7", "104.21.0.5"]),
+            &[],
+            None,
+        );
+        st.db
+            .touch("cname.example.com", "cloudflare", "cname", &ips(&["198.51.100.8"]), &[], None);
+    });
+    net.on_https(|i, _| match i.to_string().as_str() {
+        // 範圍外的那一台回「台灣」：拿它判「原本就在台灣、不換」就錯了
+        "198.51.100.7" | "198.51.100.8" => cf_ok("TPE"),
+        "104.21.0.5" => cf_ok("NRT"),
+        "104.16.161.36" | "104.18.20.216" => cf_ok("TPE"),
+        _ => fail("ECONNREFUSED"),
+    });
+    let orig = c.state().db.get("mixed.example.com").unwrap().orig_ip(4);
+    assert_eq!(orig, Some(ip("198.51.100.7")), "前提：答案的第一個 A 在範圍外");
+    assert_eq!(c.verify("mixed.example.com", "cloudflare", 4, orig).await, Some("ok"));
+    {
+        let st = c.state();
+        let e = st.db.get("mixed.example.com").unwrap();
+        let b = e.base.as_ref().unwrap();
+        assert_eq!(
+            (b.ip, b.pop.as_deref()),
+            (Some(ip("104.21.0.5")), Some("NRT")),
+            "用答案裡這一家的 IP 量基準"
+        );
+        assert!(
+            e.v4.as_ref().unwrap().extra.get("origTw").is_none(),
+            "不拿範圍外的 TPE 判原本就在台灣"
+        );
+        assert_eq!(e.orig_ip(4), Some(ip("104.21.0.5")), "之後的複驗用對的基準");
+    }
+    // 這一格答案裡沒有任何這一家的 IP：不量基準（驗證照做）
+    let orig = c.state().db.get("cname.example.com").unwrap().orig_ip(4);
+    c.verify("cname.example.com", "cloudflare", 4, orig).await;
+    assert!(c.state().db.get("cname.example.com").unwrap().base.is_none());
+    // 手動驗證（`POST /api/cdn/verify`）也一樣
+    c.verify_now("mixed.example.com", 4).await;
+    assert_eq!(
+        c.state().db.get("mixed.example.com").unwrap().base.as_ref().unwrap().ip,
+        Some(ip("104.21.0.5"))
+    );
+    assert_eq!(c.clean_stale_learning()[1], 0, "下次啟動沒有範圍外的基準要清");
+}
+
 /// 3.5.1 L4：驗證時本機通訊端出錯（連接埠用完、緩衝不足、檔案描述元用完）不當成網站或節點的結論
 #[tokio::test]
 async fn verifier_local_socket_errors_are_unsure() {
