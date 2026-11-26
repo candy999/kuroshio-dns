@@ -320,6 +320,44 @@ async fn verifier_hint_only_pass_is_not_ok() {
     assert!(c.state().db.get("ho.test").unwrap().v4.as_ref().unwrap().is("unknown"));
 }
 
+/// 3.5.1（L6）：好友給的節點連不上，原因在本機（記憶體不能長大、本機的通訊端錯誤）時不算好友的；
+/// 平常照算，憑證不符一律照算
+#[tokio::test]
+async fn verifier_hint_conn_fail_not_counted_when_local_is_strained() {
+    for (case, strained, err, counted) in [
+        ("平常連不上", false, "TIMEOUT", true),
+        ("記憶體不能長大", true, "TIMEOUT", false),
+        ("本機通訊端用完", false, "EADDRNOTAVAIL", false),
+        ("憑證不符", true, "ERR_TLS_CERT_ALTNAME_INVALID", true),
+    ] {
+        let (c, net) = setup(json!({}));
+        let h = Arc::new(ListHints {
+            list: vec![("104.16.99.1", "friend")],
+            results: Mutex::new(vec![]),
+        });
+        c.set_hints(Some(h.clone()));
+        c.set_admit_new(!strained);
+        c.with_state(|st| {
+            st.db.touch("hs.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+        });
+        let tls = err.starts_with("ERR_");
+        net.on_https(move |i, _| match i.to_string().as_str() {
+            "104.21.0.5" => cf_ok("NRT"),
+            "104.16.99.1" if tls => ProbeResult::failed(err, true),
+            "104.16.99.1" => fail(err),
+            _ => cf_ok("TPE"),
+        });
+        c.verify("hs.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await;
+        assert_eq!(net.calls("https 104.16.99.1").len(), 1, "{case}");
+        let r = h.results.lock().unwrap().clone();
+        if counted {
+            assert_eq!(r, [("friend".to_string(), false)], "{case}");
+        } else {
+            assert!(r.is_empty(), "{case}：{r:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn verifier_http_only_requires_consistent_https() {
     // 原始節點的 HTTPS 只是一時連不上（ECONNRESET）、HTTP 可以用 → 改用 HTTP 驗證。

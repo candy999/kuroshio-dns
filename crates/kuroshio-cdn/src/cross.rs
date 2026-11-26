@@ -442,8 +442,11 @@ impl Cdn {
         // 好友提示的命中率：試過的照結果算，一定錯的（家族不符、範圍外）算沒命中，本機沒辦法確認的不算
         if let (Some(h), Some(hs)) = (hint.as_ref(), self.hints()) {
             let passed: Vec<IpAddr> = ok_list.iter().find(|o| o.to == h.to).map(|o| o.ips.clone()).unwrap_or_default();
+            // 本機忙的時候沒過的不算好友的（3.5.1 L6）：可能只是這邊連不上
+            let strained = self.locally_strained();
             for (x, u) in h.ips.iter().zip(&hint_uses) {
                 match u {
+                    HintUse::Try if !passed.contains(&x.ip) && strained => {}
                     HintUse::Try => hs.hint_result(&x.from, HintKind::Cross, passed.contains(&x.ip)),
                     HintUse::Bad => hs.hint_result(&x.from, HintKind::Cross, false),
                     HintUse::Skip => {}
