@@ -305,6 +305,10 @@ impl Benchmark {
             finished: false,
         };
         let r = self.run_inner(ctx, &mut g.cache).await;
+        // 清理舊報表（3.5.1 L2）：評測失敗也清（以前只有成功才清，一直失敗時報表目錄只會變多）
+        if let Some(root) = &self.paths.out_root {
+            cleanup_reports(root, ctx.now_ms(), BenchCfg::from(&ctx.cfg).keep_days);
+        }
         g.finished = true;
         r
     }
@@ -2693,10 +2697,6 @@ impl Benchmark {
             calc.selection.covered
         );
 
-        // 清理舊報表
-        if let Some(root) = &self.paths.out_root {
-            cleanup_reports(root, ctx.now_ms(), cfg.keep_days);
-        }
         jinfo!(journal, "[{}] 結束 {}", JOB_NAME, fmt_time(ctx.now_ms()));
         // judge.log 最後才寫（3.5.1）：以前在「今日選出的上游」之前就寫了，報表目錄裡的那份看不到選出結果
         if let Some(d) = &out_dir {
@@ -3690,16 +3690,45 @@ fn report(path: &Path, data: &[u8]) {
     }
 }
 
-/// 刪掉超過 `keep_days` 天的報表目錄（YYYY-MM-DD）
+/// 刪掉超過 `keep_days` 天的報表目錄（YYYY-MM-DD，台北日期）：留今天在內的最近 `keep_days` 個日期。
+/// 3.5.1（L2）以前把目錄名稱當成 UTC 午夜、跟現在的時間比，台北清晨評測時實際留了 15 天
 fn cleanup_reports(root: &Path, now: u64, keep_days: u64) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
+    let today = learn::day_of(now) as u64;
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
+        // 目錄名稱的日數（`parse_date_utc` 給的是那天的 UTC 午夜，除以一天就是日數，跟台北的日數同一套算法）
         if let Some(t) = parse_date_utc(&name) {
-            if now.saturating_sub(t) > keep_days * DAY_MS {
+            if today >= t / DAY_MS + keep_days.max(1) && e.path().is_dir() {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    /// 3.5.1（L2）：目錄名稱是台北日期；留今天在內的最近 14 個日期（台北清晨評測也一樣）
+    #[test]
+    fn reports_kept_by_taipei_date() {
+        let root = std::env::temp_dir().join(format!("kuroshio-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["2026-11-12", "2026-11-13", "2026-11-26", "not-a-date"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("2026-11-01"), b"x").unwrap();
+        // 台北 2026-11-26 00:30（UTC 是 11-25 16:30）
+        let now = crate::time::days_from_civil(2026, 11, 26) as u64 * DAY_MS + 30 * crate::time::MIN_MS - crate::time::TPE_OFFSET_MS;
+        cleanup_reports(&root, now, 14);
+        assert!(!root.join("2026-11-12").exists(), "第 15 個日期");
+        assert!(root.join("2026-11-13").exists() && root.join("2026-11-26").exists());
+        assert!(
+            root.join("not-a-date").exists() && root.join("2026-11-01").exists(),
+            "不是報表目錄的不動"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

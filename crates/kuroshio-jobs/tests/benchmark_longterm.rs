@@ -374,3 +374,22 @@ async fn http_429_is_skipped_like_h3skip() {
     assert!(e.learn().rl429.is_empty(), "{log}");
     assert_eq!(state["counts"]["eliminated"], 0);
 }
+
+/// A10.10：評測失敗也清舊報表（以前只有成功才清）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_run_still_cleans_old_reports() {
+    let e = setup("cleanup", 2, "").await;
+    let out = e.p.out_root.clone().unwrap();
+    std::fs::create_dir_all(out.join("2026-11-06")).unwrap();
+    std::fs::create_dir_all(out.join("2026-11-07")).unwrap();
+    // 全部回 429：沒有任何 DNS 通過資格賽，評測失敗
+    for i in 1..=2 {
+        e.prober.limited.lock().unwrap().insert(format!("h{i}.example.com"));
+    }
+    let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(cfg())).with_clock(e.clock.clone());
+    let b = Benchmark::with(e.p.clone(), e.prober.clone(), asn());
+    assert!(b.run(&ctx).await.is_err());
+    // 今天是 11-20：留 11-07～11-20 這 14 個日期
+    assert!(!out.join("2026-11-06").exists());
+    assert!(out.join("2026-11-07").exists());
+}
