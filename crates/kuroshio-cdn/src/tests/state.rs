@@ -484,7 +484,8 @@ fn cold_entries_evicted_after_persist_and_lazily_reloaded() {
     });
     let original = {
         let st = c.state();
-        st.db.domains.values().find(|d| d.v4.is_some() && *d.name != *hot).unwrap().clone()
+        let d = st.db.domains.values().find(|d| d.v4.is_some() && *d.name != *hot).unwrap().clone();
+        d
     };
     let cold = original.name.to_string();
     // 搬家還沒寫進磁碟：一筆都不能移出
@@ -709,8 +710,15 @@ fn one_shot_domains_forgotten_without_budget() {
     });
     let shards = c.state().db.shards;
     let mut total = 0;
-    for _ in 0..(16 + 1) {
-        total += c.budget_round().forgot;
+    for k in 0..(16 + 1) {
+        let r = c.budget_round();
+        total += r.forgot;
+        // 有忘掉的那一輪寫一行 info，附上看了幾片（3.5.1）：第一輪只有輪流的 1/16；
+        // 之後再加上前幾輪忘掉、還沒寫出去（重要變動）的分片
+        assert_eq!(r.forgot_shards == 0, r.forgot == 0, "{r:?}");
+        if k == 0 {
+            assert_eq!(r.forgot_shards, shards / 16, "{r:?}");
+        }
     }
     assert_eq!(total, 2000, "{shards} 片、每輪 1/16，一圈之內忘光");
     assert!(c.state().db.get("kept.example.com").is_some(), "還有效的學習資料不動");
@@ -1061,16 +1069,19 @@ fn cap_prune_counted_at_load_and_runtime() {
     );
     assert_eq!(c2.report_cap_pruned("測試"), None, "載入時的已經回報過");
 
-    // 執行中：新網域把筆數推到上限，淘汰發生在查詢路徑上，下一輪整理才回報（一輪一行）
+    // 執行中：新網域把筆數推過上限。3.5.1：查詢路徑上不當場淘汰（到了硬上限才會），
+    // 下一輪整理分批淘汰到 90%、回報（一輪一行）
     c2.with_state(|st| {
         for i in 0..101 {
             st.db.touch(&format!("n{i}.example.net"), "cloudflare", "ip", &[], &[], None);
         }
     });
+    assert_eq!(c2.state().db.domains.len(), 1001, "查詢路徑上不淘汰");
     assert_eq!(c2.status()["prunedForCap"], json!(300), "還沒整理");
     c2.budget_round();
-    assert_eq!(c2.status()["prunedForCap"], json!(400));
-    assert_eq!(c2.status_lite()["prunedForCapGroups"], json!([400, 0, 0, 0]));
+    assert_eq!(c2.state().db.domains.len(), 900);
+    assert_eq!(c2.status()["prunedForCap"], json!(401));
+    assert_eq!(c2.status_lite()["prunedForCapGroups"], json!([401, 0, 0, 0]));
     c2.budget_round();
-    assert_eq!(c2.status()["prunedForCap"], json!(400), "沒有新的淘汰就不變");
+    assert_eq!(c2.status()["prunedForCap"], json!(401), "沒有新的淘汰就不變");
 }

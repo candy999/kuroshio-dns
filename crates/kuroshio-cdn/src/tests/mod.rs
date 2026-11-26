@@ -15,6 +15,7 @@ mod queue;
 mod selftest;
 mod share;
 mod speed;
+mod stall;
 mod state;
 
 use crate::cdn::{Cdn, Paths};

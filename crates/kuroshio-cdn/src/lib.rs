@@ -22,6 +22,7 @@ pub mod pace;
 pub mod pools;
 pub mod providers;
 pub mod reach;
+pub mod shardmap;
 pub mod speed;
 pub mod statefile;
 pub mod svcb;

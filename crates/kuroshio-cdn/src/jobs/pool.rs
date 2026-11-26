@@ -637,33 +637,13 @@ pub(crate) fn keep_ms_limit(worst: f64) -> f64 {
 /// 新節點要好過門檻才換得進來，量測的抖動不會讓池子來回換
 pub(crate) fn sticky_pick(ranked: &[PickCand], prev: &[IpAddr], pool_size: usize) -> Vec<usize> {
     let pool_size = pool_size.max(1);
-    let top: Vec<&PickCand> = ranked
-        .iter()
-        .filter(|x| !x.slow && x.loss < 1.0 && x.ms.is_finite())
-        .take(pool_size)
-        .collect();
     let mut out: Vec<usize> = Vec::with_capacity(pool_size);
-    if !top.is_empty() {
-        let worst_loss = top.iter().map(|x| x.loss).fold(0.0, f64::max);
-        let worst_ms = top.iter().map(|x| x.ms).filter(|m| m.is_finite()).fold(0.0, f64::max);
-        let min_speed = top.iter().filter_map(|x| x.mbps.filter(|s| *s > 0.0)).reduce(f64::min);
-        let ms_limit = keep_ms_limit(worst_ms);
+    if let Some(bar) = KeepBar::of(ranked, pool_size) {
         for (i, x) in ranked.iter().enumerate() {
             if out.len() >= pool_size {
                 break;
             }
-            let speed_ok = match (x.mbps.filter(|s| *s > 0.0), min_speed) {
-                (Some(s), Some(m)) => s >= m * KEEP_SPEED_RATIO,
-                _ => true,
-            };
-            if prev.contains(&x.ip)
-                && !x.slow
-                && x.loss < 1.0
-                && x.loss <= worst_loss + KEEP_LOSS_SLACK + 1e-9
-                && x.ms.is_finite()
-                && x.ms <= ms_limit
-                && speed_ok
-            {
+            if prev.contains(&x.ip) && bar.why_not(x).is_none() {
                 out.push(i);
             }
         }
@@ -681,6 +661,110 @@ pub(crate) fn sticky_pick(ranked: &[PickCand], prev: &[IpAddr], pool_size: usize
     }
     out.sort_unstable();
     out
+}
+
+/// 前一輪的節點留下的門檻（[`sticky_pick`]）：用這一輪「新的最好那批」（排名前 `pool_size` 個不算慢、連得上的）算
+struct KeepBar {
+    worst_loss: f64,
+    ms_limit: f64,
+    min_speed: Option<f64>,
+}
+
+impl KeepBar {
+    /// 這一輪一個連得上、不算慢的都沒有是 None
+    fn of(ranked: &[PickCand], pool_size: usize) -> Option<KeepBar> {
+        let top: Vec<&PickCand> = ranked
+            .iter()
+            .filter(|x| !x.slow && x.loss < 1.0 && x.ms.is_finite())
+            .take(pool_size.max(1))
+            .collect();
+        if top.is_empty() {
+            return None;
+        }
+        Some(KeepBar {
+            worst_loss: top.iter().map(|x| x.loss).fold(0.0, f64::max),
+            ms_limit: keep_ms_limit(top.iter().map(|x| x.ms).filter(|m| m.is_finite()).fold(0.0, f64::max)),
+            min_speed: top.iter().filter_map(|x| x.mbps.filter(|s| *s > 0.0)).reduce(f64::min),
+        })
+    }
+
+    /// 前一輪的節點為什麼不能留（日誌用的白話）；None = 可以留
+    fn why_not(&self, x: &PickCand) -> Option<String> {
+        if x.loss >= 1.0 || !x.ms.is_finite() {
+            return Some("重新量時連不上".into());
+        }
+        if x.slow {
+            return Some(match x.mbps {
+                Some(s) => format!("慢（{s} MB/s，比同一家其他節點的一半還低）"),
+                None => "慢".into(),
+            });
+        }
+        if x.loss > self.worst_loss + KEEP_LOSS_SLACK + 1e-9 {
+            return Some(format!("丟包 {:.0}%（新的最差 {:.0}%）", x.loss * 100.0, self.worst_loss * 100.0));
+        }
+        if x.ms > self.ms_limit {
+            return Some(format!("延遲 {:.2} ms，超過門檻 {:.2} ms", x.ms, self.ms_limit));
+        }
+        if let (Some(s), Some(m)) = (x.mbps.filter(|s| *s > 0.0), self.min_speed) {
+            if s < m * KEEP_SPEED_RATIO {
+                return Some(format!("速度 {s} MB/s，不到新的最慢 {m} MB/s 的八成"));
+            }
+        }
+        None
+    }
+}
+
+/// 日誌最多列幾個換掉的節點（每家）
+pub(crate) const REPLACED_LOG_MAX: usize = 6;
+
+/// 前一輪的節點有哪些被換掉、為什麼（3.5.1；日誌用）：`picked` 是 [`sticky_pick`] 的結果，
+/// `gone` 是在前面幾關就沒過的（連不上、不在台灣），其他的照 [`sticky_pick`] 的門檻說明
+pub(crate) fn replaced_why(
+    ranked: &[PickCand],
+    prev: &[IpAddr],
+    picked: &[usize],
+    pool_size: usize,
+    gone: &std::collections::HashMap<IpAddr, String>,
+) -> Vec<(IpAddr, String)> {
+    let bar = KeepBar::of(ranked, pool_size);
+    prev.iter()
+        .filter(|ip| !picked.iter().any(|i| ranked.get(*i).is_some_and(|x| x.ip == **ip)))
+        .map(|ip| {
+            let why = match ranked.iter().find(|x| x.ip == *ip) {
+                Some(x) => bar
+                    .as_ref()
+                    .and_then(|b| b.why_not(x))
+                    .unwrap_or_else(|| "節點池的位子已經滿了（合格的前一輪節點比位子多）".into()),
+                None => gone.get(ip).cloned().unwrap_or_else(|| "這一輪沒有量到".into()),
+            };
+            (*ip, why)
+        })
+        .collect()
+}
+
+/// 「192.0.2.1：延遲 4.20 ms，超過門檻 3.90 ms；192.0.2.2：連不上……（另 3 個）」，最多列 `max` 個
+pub(crate) fn replaced_line(why: &[(IpAddr, String)], max: usize) -> String {
+    let mut line = why
+        .iter()
+        .take(max)
+        .map(|(ip, w)| format!("{ip}：{w}"))
+        .collect::<Vec<_>>()
+        .join("；");
+    if why.len() > max {
+        line.push_str(&format!("……（另 {} 個）", why.len() - max));
+    }
+    line
+}
+
+/// 階段 A 沒過的原因（只記前一輪的節點）
+fn stage_a_why(loss: f64, ms: f64, max_loss: f64, max_lat: f64) -> String {
+    if loss >= 1.0 || !ms.is_finite() {
+        "連不上".into()
+    } else if loss > max_loss {
+        format!("連不上（丟包 {:.0}%）", loss * 100.0)
+    } else {
+        format!("延遲 {ms:.1} ms，超過 {max_lat} ms")
+    }
 }
 
 /// 尖峰時段的量測沿用舊節點池同一個 IP 的紀錄（規格 06 第 3.2 節），分數重新加權
@@ -832,15 +916,17 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         })
         .await;
         // 3.5.1 M1：前一輪的節點 4 次裡掉 1 次也先留著（高並行下偶爾會掉；決選時用低並行重新量，由那次決定）
-        let mut good: Vec<(IpAddr, f64)> = lat
-            .into_iter()
-            .flatten()
-            .filter(|(ip, (l, m))| {
-                let max_loss = if prev_set.contains(ip) { PREV_STAGE_A_LOSS } else { 0.0 };
-                *l <= max_loss && *m <= max_lat
-            })
-            .map(|(ip, (_, m))| (ip, m))
-            .collect();
+        // 前一輪的節點在哪一關、為什麼沒過（換掉時寫日誌用）
+        let mut gone: std::collections::HashMap<IpAddr, String> = std::collections::HashMap::new();
+        let mut good: Vec<(IpAddr, f64)> = Vec::new();
+        for (ip, (l, m)) in lat.into_iter().flatten() {
+            let max_loss = if prev_set.contains(&ip) { PREV_STAGE_A_LOSS } else { 0.0 };
+            if l <= max_loss && m <= max_lat {
+                good.push((ip, m));
+            } else if prev_set.contains(&ip) {
+                gone.insert(ip, stage_a_why(l, m, max_loss, max_lat));
+            }
+        }
         good.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         info!("階段 A 延遲：{} 個 0% 丟包且 ≤ {max_lat}ms", good.len());
 
@@ -869,7 +955,22 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             }
         })
         .await;
-        let checked: Vec<(IpAddr, f64, String)> = checked.into_iter().flatten().filter(|x| is_tw_pop(&x.2)).collect();
+        let checked: Vec<(IpAddr, f64, String)> = checked
+            .into_iter()
+            .flatten()
+            .filter(|x| {
+                let tw = is_tw_pop(&x.2);
+                if !tw && prev_set.contains(&x.0) {
+                    let why = if x.2.is_empty() {
+                        "連不上（確認 POP 的請求失敗）".to_string()
+                    } else {
+                        format!("不在台灣（POP {}）", x.2)
+                    };
+                    gone.insert(x.0, why);
+                }
+                tw
+            })
+            .collect();
         // 每個 /24 只留最快的一個，提高多樣性。3.5.1 M1：前一輪的節點優先（候選每次在網段裡隨機抽位址，
         // 同一個 /24 的新位址常常在階段 A 剛好快一點，就把前一輪的節點擠掉；同一個 /24 是同一批機器，換了沒有好處）
         let prev24: std::collections::HashSet<Option<u32>> = checked.iter().filter(|x| prev_set.contains(&x.0)).map(|x| p24(x.0)).collect();
@@ -1084,6 +1185,11 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
                 prev_ips.len().saturating_sub(prev_alive),
                 prev_alive.saturating_sub(stayed)
             );
+            // 3.5.1：換掉的是哪幾個、為什麼（每家最多列 REPLACED_LOG_MAX 個）
+            let why = replaced_why(&cand, &prev_ips, &picked, pool_size, &gone);
+            if !why.is_empty() {
+                info!("  換掉的節點：{}", replaced_line(&why, REPLACED_LOG_MAX));
+            }
         }
         let mut pool4: Vec<PoolNode> = picked
             .iter()

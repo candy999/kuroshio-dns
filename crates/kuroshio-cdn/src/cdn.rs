@@ -350,6 +350,8 @@ pub struct BudgetRound {
     pub forced: usize,
     /// 忘掉幾個一次性網域（3.5.1 H2；不管有沒有預算）
     pub forgot: usize,
+    /// 有忘掉的那一輪看了幾片（日誌用；沒有忘掉是 0）
+    pub forgot_shards: usize,
 }
 
 /// 冷資料移出 / 讀回的結果（記憶體控制，規格 09）
@@ -377,6 +379,15 @@ const SPIN_TRIES: u32 = 200;
 
 /// 寫網域資料庫的快照時，每拿一次鎖寫幾筆（一筆約 0.5 KB、幾微秒）
 const DUMP_CHUNK: usize = 256;
+
+/// 大批處理（冷資料移出、筆數上限與磁碟預算淘汰、一次性網域清理）每拿一次狀態鎖最多看幾筆（3.5.1）。
+/// 一批是幾個完整的分片（一片超過這個數也是一批）。查詢路徑（快取命中的也算）要拿同一把鎖，
+/// 以前整件事一次做完：D3（MT7621）上冷資料移出、淘汰時查詢等了好幾秒，看門狗切到業者 DNS。
+/// x86 實測每筆 0.1～0.3 µs（最重的是移出、刪除），2,048 筆一批約 0.2～0.6 ms；MT7621 慢 15～20 倍，約 3～12 ms
+pub const BATCH_ENTRIES: usize = 1024;
+
+/// 大批處理每批之間停多久（同 `dump_rest`：只 yield 的話，等著的查詢還沒被叫醒，這邊又把鎖拿走了）
+const BATCH_PAUSE: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// 網域資料庫的變動（`snapshots_sharded`）
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1042,20 +1053,137 @@ impl Cdn {
                 .chain(bg.cross.iter().cloned())
                 .collect()
         };
-        let r = {
-            let mut st = self.state();
+        let busy = |name: &str| busy.contains(name);
+        // 3.5.1：分批做（[`db::ColdSweep`]），每批放開一次鎖；規則、目標量跟一次做完一樣
+        let sw = {
+            let st = self.state();
             let n = st.db.shards;
             st.db
-                .evict_coldest(target, protect_ms, now_ms(), &|name| busy.contains(name), &|i| {
-                    persisted(&db::shard_file(n, i))
-                })
+                .cold_sweep(target, protect_ms, now_ms(), &|i| persisted(&db::shard_file(n, i)))
         };
+        let Some(mut sw) = sw else {
+            return ColdReport::default();
+        };
+        self.in_batches(|st, r| {
+            st.db.cold_scan(&mut sw, r, &busy);
+            true
+        });
+        if sw.plan() {
+            self.in_batches(|st, r| {
+                st.db.cold_take(&mut sw, r, &busy);
+                true
+            });
+        }
         self.sync_evicted();
         ColdReport {
-            entries: r.entries,
-            bytes: r.bytes,
+            entries: sw.out.entries,
+            bytes: sw.out.bytes,
             forgotten: 0,
         }
+    }
+
+    /// 把所有分片依筆數切成好幾批（每批大約 [`BATCH_ENTRIES`] 筆、至少一片），每批拿一次狀態鎖呼叫
+    /// `f(狀態, 這一批的分片)`，批與批之間放開鎖、停一下讓查詢先拿到鎖。`f` 回 false 就不做後面的（3.5.1）。
+    /// 會停頓（`sleep`）：只在背景的 blocking 執行緒上用，不在 tokio 的工作執行緒上（那裡用 [`Cdn::in_batches_yield`]）
+    pub(crate) fn in_batches(&self, f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
+        self.batches(true, f)
+    }
+
+    /// 同 [`Cdn::in_batches`]，但批與批之間只讓出執行緒、不停頓：給 tokio 的工作執行緒上的唯讀加總用（狀態頁）
+    pub(crate) fn in_batches_yield(&self, f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
+        self.batches(false, f)
+    }
+
+    fn batches(&self, pause: bool, mut f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
+        let mut i = 0;
+        loop {
+            let (more, done) = {
+                let mut st = self.state();
+                let n = st.db.shards;
+                if i >= n {
+                    return;
+                }
+                let start = i;
+                let mut seen = 0;
+                while i < n {
+                    let len = st.db.domains.shard(i).len();
+                    if i > start && seen + len > BATCH_ENTRIES {
+                        break;
+                    }
+                    seen += len;
+                    i += 1;
+                }
+                (f(&mut st, start..i), i >= n)
+            };
+            if !more || done {
+                return;
+            }
+            if pause {
+                std::thread::sleep(BATCH_PAUSE);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// 依價值淘汰到剩 `keep` 筆（同 [`db::Db::shrink_to`] 的規則），分批做（[`db::CapSweep`]）。回傳各組刪了幾筆
+    fn drop_cheapest_batched(&self, keep: usize) -> [u32; db::PRUNE_GROUPS] {
+        let Some(mut sw) = self.state().db.cap_sweep(keep, now_ms()) else {
+            return [0; db::PRUNE_GROUPS];
+        };
+        self.in_batches(|st, r| {
+            st.db.cap_scan(&mut sw, r);
+            true
+        });
+        let go = {
+            let st = self.state();
+            sw.plan(st.db.domains.len())
+        };
+        if !go {
+            return sw.out;
+        }
+        self.in_batches(|st, r| {
+            st.db.cap_take(&mut sw, r);
+            true
+        });
+        // 最後那一格挑最舊的：不拿鎖
+        sw.pick_edge();
+        while self.state().db.cap_take_edge(&mut sw, BATCH_ENTRIES) {
+            std::thread::sleep(BATCH_PAUSE);
+        }
+        sw.out
+    }
+
+    /// 筆數超過 `cdn.maxEntries`：分批淘汰到上限的 90%（背景的整理每一輪呼叫；查詢路徑只在超過硬上限時才當場做，
+    /// [`db::Db::hard_cap`]）。淘汰的筆數由 [`Cdn::report_cap_pruned`] 合併成一行
+    pub(crate) fn prune_cap(&self) {
+        let keep = {
+            let st = self.state();
+            if !st.db.over_cap() {
+                return;
+            }
+            st.db.prune_keep()
+        };
+        let g = self.drop_cheapest_batched(keep);
+        self.state().db.note_cap_pruned(g);
+    }
+
+    /// 一次性網域清理（[`db::Db::forget_one_shot`]）分批做：（忘掉幾筆，這一輪看了幾片）
+    fn forget_one_shot_batched(&self, now: u64, rotate: bool) -> (usize, usize) {
+        let Some(pick) = self.state().db.forget_pick(rotate) else {
+            return (0, 0);
+        };
+        let looked = pick.iter().filter(|p| **p).count();
+        let mut left = db::FORGET_ONE_SHOT_MAX;
+        let mut forgot = 0;
+        self.in_batches(|st, r| {
+            if !r.clone().any(|i| pick[i]) {
+                return true;
+            }
+            forgot += st.db.forget_in(&pick, r, now, &mut left);
+            left > 0
+        });
+        (forgot, looked)
     }
 
     /// 記憶體控制的「長大」開關（3.5.1 K4）：不能長大時新網域照上游的答案回、不記進資料庫（已經記著的照常）
@@ -1156,7 +1284,7 @@ impl Cdn {
     }
 
     /// 把第 `i` 個分片移出記憶體的冷資料讀回來（讀不到的就從移出名單拿掉）
-    fn restore_shard_cold(&self, n: usize, i: usize) -> ColdReport {
+    pub(crate) fn restore_shard_cold(&self, n: usize, i: usize) -> ColdReport {
         let mut out = ColdReport::default();
         let hashes = self.state().db.evicted_hashes(n, i);
         if hashes.is_empty() {
@@ -1234,20 +1362,23 @@ impl Cdn {
     /// 沒有設定預算（大磁碟、`cdn.dbDiskBudgetKB: 0`）時只量一下實際大小給狀態頁，什麼都不刪
     pub fn budget_round(&self) -> BudgetRound {
         let mut out = BudgetRound::default();
-        // 上一輪以來筆數上限的淘汰（查詢路徑上、寫分片之前發生的）合併成一行
+        // 筆數超過 `cdn.maxEntries`：分批淘汰（3.5.1：以前在查詢路徑上一次做完）
+        self.prune_cap();
+        // 上一輪以來筆數上限的淘汰（這裡的、超過硬上限時查詢路徑上的）合併成一行
         self.report_cap_pruned("執行中（上次整理以來）");
         let disk = self.measure_disk();
         // 3.5.1 H2：一次性網域（只問過一次、沒有學習資料、3 天沒出現）不管有沒有預算都定期忘掉。
         // 有預算的小 Flash 只看本來就要寫的分片；沒有預算時另外輪流看幾片（分批、每輪有上限）
-        let forgot = self.state().db.forget_one_shot(now_ms(), self.cfg.db_disk_budget.is_none());
+        let (forgot, looked) = self.forget_one_shot_batched(now_ms(), self.cfg.db_disk_budget.is_none());
         if forgot > 0 {
             out.forgot = forgot;
+            out.forgot_shards = looked;
             let total = self
                 .forgot_one_shot
                 .load(Ordering::Relaxed)
                 .saturating_add(forgot.min(u32::MAX as usize) as u32);
             self.forgot_one_shot.store(total, Ordering::Relaxed);
-            debug!("CDN 網域資料：忘掉 {forgot} 個 3 天沒出現、只問過一次的網域");
+            info!("CDN：忘掉 {forgot} 筆 3 天沒出現的一次性網域（這一輪看了 {looked} 片）");
         }
         let (Some(limit), Some(budget)) = (self.budget_limit(), self.cfg.db_disk_budget) else {
             self.budget_cap.store(0, Ordering::Relaxed);
@@ -1284,10 +1415,30 @@ impl Cdn {
             }
             self.sync_evicted();
         }
-        let (dropped, left, sweeping) = {
+        // 分批淘汰：一次給幾片（每片各自決定，結果跟一次給全部一樣），批與批之間放開鎖
+        let now = now_ms();
+        let mut dropped = 0;
+        let mut k = 0;
+        while k < plan.shards.len() {
+            if k > 0 {
+                std::thread::sleep(BATCH_PAUSE);
+            }
             let mut st = self.state();
-            let d = st.db.budget_prune(&plan.shards, now_ms());
-            (d, st.db.total_entries(), st.db.budget_sweeping())
+            let start = k;
+            let mut seen = 0;
+            while k < plan.shards.len() {
+                let len = st.db.domains.shard(plan.shards[k].0.min(n - 1)).len();
+                if k > start && seen + len > BATCH_ENTRIES {
+                    break;
+                }
+                seen += len;
+                k += 1;
+            }
+            dropped += st.db.budget_prune(&plan.shards[start..k], now);
+        }
+        let (left, sweeping) = {
+            let st = self.state();
+            (st.db.total_entries(), st.db.budget_sweeping())
         };
         out.dropped = dropped;
         out.shards = plan.shards.len();
@@ -1349,10 +1500,14 @@ impl Cdn {
     }
 
     /// 記憶體不足（規格 05 第 3.2 節的看門狗）：網域資料庫刪到剩 `keep_ratio`（例如 0.5）
+    /// 分批做（3.5.1，同 [`Cdn::prune_cap`]）；刪完把各片的表縮回去，也是一批一批
     pub fn shrink(&self, keep_ratio: f64) {
-        let mut st = self.state();
-        let n = (st.db.domains.len() as f64 * keep_ratio.clamp(0.0, 1.0)) as usize;
-        st.db.shrink_to(n);
+        let keep = (self.state().db.domains.len() as f64 * keep_ratio.clamp(0.0, 1.0)) as usize;
+        self.drop_cheapest_batched(keep);
+        self.in_batches(|st, r| {
+            r.for_each(|i| st.db.domains.shrink_shard(i));
+            true
+        });
     }
 
     /// 每週工作更新了範圍或分類檔之後重新讀取
@@ -1723,10 +1878,17 @@ impl Cdn {
     /// 記憶體裡的網域資料庫大約多大（bytes；狀態頁分項用量用，不必精確）
     pub fn approx_ram_bytes(&self) -> usize {
         // 每筆的估計裡含雜湊表的一格；雜湊表實際配置的格數（容量）比筆數多，空格也佔記憶體（3.4.1 起算進去）
+        // 3.5.1：分批加總（7 萬筆在 MT7621 上一次加完要拿著鎖幾十毫秒）
+        let slot = std::mem::size_of::<(Arc<str>, crate::db::Domain)>();
+        let mut items = 0usize;
+        self.in_batches_yield(|st, r| {
+            items += r
+                .map(|i| st.db.domains.shard(i).values().map(|d| d.approx_bytes()).sum::<usize>())
+                .sum::<usize>();
+            true
+        });
         let st = self.state();
         let m = &st.db.domains;
-        let slot = std::mem::size_of::<(Arc<str>, crate::db::Domain)>();
-        let items: usize = m.values().map(|d| d.approx_bytes()).sum();
         items + m.capacity().saturating_sub(m.len()) * slot + m.capacity() + 16
     }
 

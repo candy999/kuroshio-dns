@@ -1486,7 +1486,8 @@ fn spawn_maintenance(r: Arc<Resolver>, legacy: bool) {
                 let critical = legacy && pressure() == Pressure::Critical;
                 if critical && !was_critical {
                     if let Some(c) = r.cdn() {
-                        c.shrink(0.7);
+                        // 3.5.1：分批淘汰、批與批之間會停一下讓查詢拿鎖：放在 blocking 執行緒上，不佔查詢的工作執行緒
+                        let _ = tokio::task::spawn_blocking(move || c.shrink(0.7)).await;
                     }
                 }
                 was_critical = critical;
