@@ -2067,6 +2067,13 @@ async fn wait_next(
 }
 
 /// 設定裡的一份清單
+/// 清單命中次數加 1，到 `u32::MAX` 就停（3.5.1）。32 位元平台沒有 64 位元原子操作，計數器是 32 位元；
+/// 以前 `fetch_add` 會繞回 0，最常用的清單看起來變成最少用，記憶體不足時反而先被停用（[`shed_order`]）。
+/// `fetch_update` 跟 `fetch_add` 一樣是一個 LL/SC（CAS）迴圈，查詢路徑的成本只多一次比較
+fn bump_saturating(h: &AtomicU32) {
+    let _ = h.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1));
+}
+
 fn list_source(l: &Value) -> Option<ListSource> {
     let url = l.get("url")?.as_str()?.to_string();
     let category = l
@@ -2143,7 +2150,7 @@ impl FilterCheck for FilterService {
         }
         // 清單層的來源編號就是 sources 的位置（停用中的清單也佔一個位置）
         if let Some(h) = v.list.and_then(|i| self.hits.get(i)) {
-            h.fetch_add(1, Ordering::Relaxed);
+            bump_saturating(h);
             self.hits_dirty.store(true, Ordering::Relaxed);
         }
         let bypass = v.list.and_then(|i| self.sources.get(i)).is_some_and(|s| s.bypass);
@@ -2387,6 +2394,23 @@ mod copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.5.1：命中次數到上限就停，不繞回 0（不然最常用的清單在記憶體不足時先被停用）
+    #[test]
+    fn hits_saturate_instead_of_wrapping() {
+        let h = AtomicU32::new(u32::MAX - 2);
+        for _ in 0..5 {
+            bump_saturating(&h);
+        }
+        assert_eq!(h.load(Ordering::Relaxed), u32::MAX);
+        let z = AtomicU32::new(0);
+        bump_saturating(&z);
+        assert_eq!(z.load(Ordering::Relaxed), 1);
+        // 停用順序：命中到上限的清單排在最後
+        let sources = [src("hot", Category::Ads, false), src("cold", Category::Ads, false)];
+        let order = shed_order(&sources, &[u32::MAX, 3], &[1000, 1000], &[true, true]);
+        assert_eq!(order.first(), Some(&1), "少用的先停用：{order:?}");
+    }
 
     #[test]
     fn manual_failure_joins_retry_backoff() {
