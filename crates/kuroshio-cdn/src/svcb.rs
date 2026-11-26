@@ -51,10 +51,10 @@ pub fn hints(rdata: &[u8]) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
     let mut v6 = Vec::new();
     for (k, v) in &s.params {
         if *k == KEY_V4 {
-            v4.extend(v.chunks_exact(4).map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3])));
+            v4.extend(v.as_chunks::<4>().0.iter().map(|c| Ipv4Addr::from(*c)));
         }
         if *k == KEY_V6 {
-            v6.extend(v.chunks_exact(16).map(|c| Ipv6Addr::from(<[u8; 16]>::try_from(c).unwrap())));
+            v6.extend(v.as_chunks::<16>().0.iter().map(|c| Ipv6Addr::from(*c)));
         }
     }
     (v4, v6)

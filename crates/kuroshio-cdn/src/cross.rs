@@ -412,7 +412,7 @@ impl Cdn {
                     continue;
                 }
                 if let Some(ms) = r.timing.handshake_ms() {
-                    if score.map_or(true, |s| ms < s.0) {
+                    if score.is_none_or(|s| ms < s.0) {
                         score = Some((ms, ip));
                     }
                 }

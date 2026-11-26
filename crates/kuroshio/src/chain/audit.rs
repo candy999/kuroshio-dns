@@ -89,7 +89,7 @@ impl Audit {
 
     /// 這一筆要不要抽查（抽樣、間隔、同時一個）。要的話拿到名額；`now_s` 是單調時鐘秒
     pub fn claim(&'static self, now_s: u64) -> Option<Slot> {
-        if self.tick.fetch_add(1, Ordering::Relaxed) % SAMPLE != 0 {
+        if !self.tick.fetch_add(1, Ordering::Relaxed).is_multiple_of(SAMPLE) {
             return None;
         }
         let now_s = now_s.min(u32::MAX as u64) as u32;

@@ -253,12 +253,9 @@ trait OldDay {
 }
 
 impl OldDay for Option<u32> {
-    /// 沒有日期、或列入超過 [`PRUNE_AFTER_DAYS`] 天（MSRV 1.80：沒有 `Option::is_none_or`）
+    /// 沒有日期、或列入超過 [`PRUNE_AFTER_DAYS`] 天
     fn is_none_or_old(&self, today: u32) -> bool {
-        match self {
-            None => true,
-            Some(d) => today >= d.saturating_add(PRUNE_AFTER_DAYS),
-        }
+        self.is_none_or(|d| today >= d.saturating_add(PRUNE_AFTER_DAYS))
     }
 }
 

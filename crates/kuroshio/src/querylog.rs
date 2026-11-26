@@ -147,7 +147,7 @@ impl QueryLog {
             return;
         }
         let mut g = self.ring.lock().unwrap();
-        if g.as_ref().map_or(true, |r| r.buf.len() != cap) {
+        if g.as_ref().is_none_or(|r| r.buf.len() != cap) {
             *g = Some(Ring {
                 buf: vec![EMPTY; cap],
                 next: 0,

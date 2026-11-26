@@ -660,7 +660,7 @@ impl Persister {
             "headroomBytes": free.map(|f| f.saturating_sub(r.bytes)),
             "optionalFiles": n,
             "optionalBytes": bytes,
-            "keepingOptional": free.map_or(true, |f| f >= r.keep_line()),
+            "keepingOptional": free.is_none_or(|f| f >= r.keep_line()),
             "deleted": self.deleted.iter().rev().map(|(at, rel, size)| json!({ "at": at * 1000, "file": rel, "bytes": size })).collect::<Vec<_>>(),
         })
     }
@@ -709,7 +709,7 @@ impl Persister {
         let staged = std::mem::take(&mut self.staged_tmp);
         let list: Vec<_> = space::candidates(&self.dir, &self.extra_files)
             .into_iter()
-            .filter(|c| keep.map_or(true, |k| c.path != k) && c.tier < below)
+            .filter(|c| keep.is_none_or(|k| c.path != k) && c.tier < below)
             // 關機批次寫入中、還沒改名的暫存檔不能刪（3.4.2：被當成可刪的 .tmp 刪掉，改名時 No such file or directory）
             .filter(|c| !staged.contains(&c.path))
             .collect();
@@ -846,11 +846,7 @@ impl Persister {
             let (why, size, age) = {
                 let e = &self.entries[&name];
                 let Some(p) = e.pending.as_ref() else { continue };
-                let deps_ok = p
-                    .opts
-                    .after
-                    .iter()
-                    .all(|d| self.entries.get(d).map_or(true, |x| x.pending.is_none()));
+                let deps_ok = p.opts.after.iter().all(|d| self.entries.get(d).is_none_or(|x| x.pending.is_none()));
                 if !deps_ok {
                     continue;
                 }
@@ -1682,7 +1678,7 @@ mod tests {
         let c2 = calls.clone();
         p.set_free_probe(move |_| {
             let n = c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Some(if n % 2 == 0 { 1024 } else { 1 << 30 })
+            Some(if n.is_multiple_of(2) { 1024 } else { 1 << 30 })
         });
         let t = 6_000 * 86400;
         p.stage_with("a.json", Snapshot::Bytes(vec![b'a'; 100]), Opts::default(), t);

@@ -1299,7 +1299,7 @@ impl Client {
                 Some(ack)
             }
             Err(e) => {
-                if i.registered.as_ref().map_or(true, |r| r.ok) {
+                if i.registered.as_ref().is_none_or(|r| r.ok) {
                     warn!("串接：向上游黑潮登記失敗：{e}");
                 }
                 i.registered = Some(Registered {

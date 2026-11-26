@@ -1478,7 +1478,7 @@ impl Benchmark {
                 .paths
                 .default_list_dir
                 .as_ref()
-                .map_or(true, |d| d.join("blacklist.txt") != bl_file);
+                .is_none_or(|d| d.join("blacklist.txt") != bl_file);
         blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
         let protected = protected_ids(&self.paths);

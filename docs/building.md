@@ -6,9 +6,11 @@
 
 | 用途 | 工具鏈 |
 |---|---|
-| 測試、x86_64 / aarch64 / armv7、Windows | Rust stable（最低 1.80） |
+| 測試、x86_64 / aarch64 / armv7、Windows | Rust stable（`rust-version` 跟著最新的 stable，3.5.1 起是 1.100） |
 | MIPS（`mipsel` / `mips`） | **最新的 nightly**＋`rust-src`，用 `-Zbuild-std` 自己編標準函式庫；編不過時自動改用備用日期 |
 | Linux 各 CPU 的連結 | [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)（用 zig 當 C 編譯器與連結器，不必裝各 CPU 的 GCC） |
+
+**跟著最新的 stable**（3.5.1 起）：使用者拿到的都是 CI 編好的執行檔（Release、OpenWrt 套件、韌體都不在使用者那邊編譯），所以程式碼用最新 stable 的寫法，不為舊的編譯器保留相容寫法。新的 stable 把某個 API 標成棄用、或有更好的寫法時，直接改用新的，並把 `Cargo.toml` 的 `rust-version` 提高到那個版本；CI 一直用最新的 stable，警告一律當錯誤。MIPS 的 nightly（含備用日期）一定比 stable 新，不受影響。
 
 為什麼 MIPS 要 nightly：MIPS 在 Rust 是 **tier 3**，官方不提供編好的標準函式庫（`rustup target add` 裝不到），只能用 nightly 才有的 `-Zbuild-std` 從原始碼編。CI 平常跟著最新的 nightly 編；nightly 偶爾會壞，最新的編不過時會自動改用 workflow 開頭 `MIPS_NIGHTLY_FALLBACK` 指定的、已知能編也通過 QEMU 測試的日期（目前 `nightly-2026-11-13`），日誌會出現警告。
 

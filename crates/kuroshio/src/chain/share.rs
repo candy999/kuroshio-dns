@@ -217,7 +217,7 @@ impl ShareCache {
         let mut st = self.state.lock().unwrap();
         st.last_used = st.last_used.max(now_ms);
         // 還沒建、或已經超過 10 分鐘：背景重建（舊的照樣先用）
-        if st.built.as_ref().map_or(true, |b| now_ms.saturating_sub(b.at) >= MANIFEST_TTL_MS) {
+        if st.built.as_ref().is_none_or(|b| now_ms.saturating_sub(b.at) >= MANIFEST_TTL_MS) {
             self.spawn_build(now_ms);
         }
         let b = st.built.as_mut()?;
@@ -241,7 +241,7 @@ impl ShareCache {
         }
         let mut st = self.state.lock().unwrap();
         st.last_used = st.last_used.max(now_ms);
-        if st.built.as_ref().map_or(true, |b| now_ms.saturating_sub(b.at) >= MANIFEST_TTL_MS) {
+        if st.built.as_ref().is_none_or(|b| now_ms.saturating_sub(b.at) >= MANIFEST_TTL_MS) {
             self.spawn_build(now_ms);
         }
     }

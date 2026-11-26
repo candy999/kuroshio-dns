@@ -1196,7 +1196,7 @@ fn start_community(
             }
             // tick 內含每小時的維護（長期失聯的好友、品質分數、過期資料）
             n.tick().await;
-            if minute % 60 == 0 {
+            if minute.is_multiple_of(60) {
                 n.check().await;
             }
         }
@@ -1406,7 +1406,7 @@ fn spawn_maintenance(r: Arc<Resolver>, legacy: bool) {
             tokio::time::sleep(Duration::from_secs(30)).await;
             tick += 1;
             r.upstreams.reload_auto();
-            if tick % 2 == 0 {
+            if tick.is_multiple_of(2) {
                 r.sweep();
                 // 記憶體偏低：快取縮到一半（規格 05 第 3.2 節）；於事無補（缺口是其他程式造成）時不縮
                 if legacy && pressure() != Pressure::Normal && !crate::memgov::futile() {

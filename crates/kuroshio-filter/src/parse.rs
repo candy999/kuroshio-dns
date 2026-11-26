@@ -168,7 +168,7 @@ fn truthy(o: Opt<'_>) -> bool {
 fn literal_of(src: &str) -> Option<String> {
     let mut best: Option<&str> = None;
     for part in src.split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_')) {
-        if part.len() >= 3 && best.map_or(true, |b| part.len() > b.len()) {
+        if part.len() >= 3 && best.is_none_or(|b| part.len() > b.len()) {
             best = Some(part);
         }
     }

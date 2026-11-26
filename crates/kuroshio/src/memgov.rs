@@ -646,8 +646,8 @@ pub fn step_state(h: &mut Hyst, r: &Reading, res: &Reserve, dwell: u64, now: u64
         h.calm_since = None;
         return true;
     }
-    let psi_calm = r.psi.map_or(true, |p| p.calm());
-    let avail_ok = |lim: u64| r.avail.map_or(true, |a| a >= lim);
+    let psi_calm = r.psi.is_none_or(|p| p.calm());
+    let avail_ok = |lim: u64| r.avail.is_none_or(|a| a >= lim);
     let relax_to = match h.state {
         State::Critical if worst < State::Critical && avail_ok(res.bytes) => Some(State::Tight),
         State::Tight if worst == State::Comfortable && avail_ok(res.bytes + res.margin()) && psi_calm => Some(State::Comfortable),
@@ -1012,7 +1012,7 @@ impl Governor {
     /// 以前要等整體回到寬裕才恢復：musl 放掉的記憶體不還給系統，洪水過後可用記憶體回不到保留量以上，
     /// 過濾清單（26 萬條規則只佔約 1.9 MB）就一直停用到重新啟動（3.5.1 測試版 D3）
     fn partial_restore(&self, i: &Inner, r: &Reading, now: u64) -> Option<(usize, u64)> {
-        if now < i.next_restore_at || i.futile.on || !r.psi.map_or(true, |p| p.calm()) {
+        if now < i.next_restore_at || i.futile.on || !r.psi.is_none_or(|p| p.calm()) {
             return None;
         }
         let k = self.steps.iter().rposition(|s| s.is_shed())?;
@@ -1228,7 +1228,7 @@ impl Governor {
             } else if state > State::Comfortable
                 && r.avail
                     .is_some_and(|a| a >= self.reserve.bytes.saturating_add(self.reserve.margin()))
-                && r.psi.map_or(true, |p| p.calm())
+                && r.psi.is_none_or(|p| p.calm())
             {
                 // 狀態還在等穩定（`dwell`），但這一次的讀數已經回到保留量 + 遲滯以上、PSI 也平靜：沒有缺口，不讓出。
                 // 常見的是別的程式（Windows 上的大模型）一下子放掉記憶體：狀態要穩定 180 秒才降，這段時間照狀態去讓出

@@ -366,11 +366,7 @@ impl Engine {
             // 時鐘倒退：重新取樣
             self.samples.clear();
         }
-        // MSRV 1.80 沒有 `Option::is_none_or`
-        let gap_ok = match self.samples.last() {
-            None => true,
-            Some(l) => s.at.saturating_sub(l.at) >= SAMPLE_GAP_MS,
-        };
+        let gap_ok = self.samples.last().is_none_or(|l| s.at.saturating_sub(l.at) >= SAMPLE_GAP_MS);
         if gap_ok {
             self.samples.push(s);
             if self.samples.len() > SAMPLES_MAX {

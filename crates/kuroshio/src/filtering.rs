@@ -1402,7 +1402,7 @@ impl FilterService {
         let need = |i: usize| sz[i].0 + sz[i].1 * BUILD_BYTES_PER_RULE;
         let mut total: u64 = (0..self.sources.len()).filter(|&i| !ex[i]).map(|i| sizes[i]).sum();
         let mut peak: u64 = (0..self.sources.len()).filter(|&i| !ex[i]).map(need).sum();
-        let fits = |total: u64, peak: u64| total <= steady && room.map_or(true, |r| peak <= r);
+        let fits = |total: u64, peak: u64| total <= steady && room.is_none_or(|r| peak <= r);
         let limit = steady;
         if fits(total, peak) {
             return;
@@ -2069,17 +2069,9 @@ async fn wait_next(
 /// 設定裡的一份清單
 /// 清單命中次數加 1，到 `u32::MAX` 就停（3.5.1）。32 位元平台沒有 64 位元原子操作，計數器是 32 位元；
 /// 以前 `fetch_add` 會繞回 0，最常用的清單看起來變成最少用，記憶體不足時反而先被停用（[`shed_order`]）。
-/// CAS 迴圈跟 `fetch_add` 一樣是一個 LL/SC 迴圈，查詢路徑的成本只多一次比較
+/// `try_update` 跟 `fetch_add` 一樣是一個 LL/SC（CAS）迴圈，查詢路徑的成本只多一次比較
 fn bump_saturating(h: &AtomicU32) {
-    // 自己寫 CAS 迴圈：新版 Rust 把 `fetch_update` 改名成 `try_update`（舊名棄用、CI 把警告當錯誤），
-    // 但最低支援的 1.80 還沒有 `try_update`
-    let mut cur = h.load(Ordering::Relaxed);
-    while let Some(next) = cur.checked_add(1) {
-        match h.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(now) => cur = now,
-        }
-    }
+    let _ = h.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1));
 }
 
 fn list_source(l: &Value) -> Option<ListSource> {

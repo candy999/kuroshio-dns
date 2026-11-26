@@ -656,7 +656,7 @@ impl Learn {
             if gap == 0 {
                 h.extend(old.chars().skip(1));
             } else if !old.is_empty() {
-                h.extend(std::iter::repeat('-').take((gap - 1).min(CONTROL_DAYS)));
+                h.extend(std::iter::repeat_n('-', (gap - 1).min(CONTROL_DAYS)));
                 h.push_str(old);
             }
             out.insert(id.clone(), h.chars().take(CONTROL_DAYS).collect::<String>());

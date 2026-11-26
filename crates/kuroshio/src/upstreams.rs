@@ -450,7 +450,7 @@ impl Up {
             // 暫停結束後成功一筆就歸零的話，「時好時壞」的上游（3.4.2 Windows 實測：tls://ordns.he.net 每次接回後
             // 先答幾十筆、再連續逾時）永遠是「暫停 1 分鐘」，每 70 秒重來一輪，暫停時間不會拉長。
             // 改成暫停結束後穩定 10 分鐘才歸零
-            if s.open_until.map_or(true, |t| t + TRIP_RESET <= now) {
+            if s.open_until.is_none_or(|t| t + TRIP_RESET <= now) {
                 s.trips = 0;
             }
             s.ewma = Some(s.ewma.map(|e| e * 0.8 + ms * 0.2).unwrap_or(ms));
