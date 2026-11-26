@@ -144,7 +144,14 @@ impl Pulse {
 /// （規格 11 第 0.3 節）。行程層級（重新載入設定不會不見），最多 [`kuroshio_jobs::benchmark::learn::MAX_NEVER_OK`] 筆
 static NEVER_OK: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// 測試用：登記過的 id（不會被 [`take_never_ok`] 取走）。登記清單是行程層級的，同一批平行跑的測試
+/// （評測工作的測試也會取走）可能先把它清空，斷言改看這一份
+#[cfg(test)]
+static NEVER_OK_SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 fn note_never_ok(id: &str) {
+    #[cfg(test)]
+    NEVER_OK_SEEN.lock().unwrap().push(id.to_string());
     let mut v = NEVER_OK.lock().unwrap();
     if !v.iter().any(|x| x == id) {
         if v.len() >= kuroshio_jobs::benchmark::learn::MAX_NEVER_OK {
@@ -1470,7 +1477,7 @@ mod tests {
         assert_eq!(bad.json()["paused"], true);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "通知一次");
         assert!(
-            take_never_ok().contains(&"tls://never.example.com:853".to_string()),
+            NEVER_OK_SEEN.lock().unwrap().contains(&"tls://never.example.com:853".to_string()),
             "登記給下一次評測"
         );
         // 成功過的上游照舊 1 → 2 → 4 分鐘（時好時壞，不先不用）
