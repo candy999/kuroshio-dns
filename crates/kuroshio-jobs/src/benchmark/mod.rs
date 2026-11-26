@@ -725,6 +725,8 @@ struct Srv {
     malware_filter: bool,
     /// 惡意網站探測的結果（對照組用）：Some(true)＝有擋、Some(false)＝沒擋、None＝今天判不出來
     probe: Option<bool>,
+    /// 今天的汙染判斷記進評測歷史的可疑天數（3.5.1）：憑證不符，或「無法驗證」已經在 2 個以上網域發生
+    suspect_today: bool,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -749,6 +751,7 @@ impl Srv {
             preflight: None,
             malware_filter: false,
             probe: None,
+            suspect_today: false,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -1251,8 +1254,16 @@ fn append_blacklist(file: &Path, lines: &[String]) {
     }
 }
 
-/// 網站「無法驗證」幾天（不同日期）才列入永久黑名單
+/// 網站「無法驗證」幾天（30 天內不同日期）才列入永久黑名單
 const SUSPECT_DAYS: usize = 3;
+/// 網站「無法驗證」還要在幾個以上不同的網域（題目）發生才算（3.5.1）：同一題天天連不上，
+/// 多半是那個網站從這條線路連不上，不是那台 DNS 竄改（正式環境 44 台只因為同一個網站 TIMEOUT 3 天就被永久封殺）
+const SUSPECT_DOMAINS: usize = 2;
+/// 可疑紀錄的判斷規則版本（3.5.1 是 2；沒寫的是 3.5.0 以前的）。判斷規則改了就加一：
+/// 舊規則記下的「無法驗證」紀錄載入時清掉（憑證不符的保留）
+const STRIKE_RULES: u32 = 2;
+/// 一台 DNS 在可疑紀錄檔裡最多留幾筆（日期 × 網域；超過先丟最舊的）
+const STRIKE_MAX_ENTRIES: usize = 64;
 /// 同一個業者群組有幾家互相獨立（不同經營者）的加密 DNS 都「網站無法驗證」時，照常計分、不記可疑天數
 const INDEPENDENT_OPERATORS: usize = 3;
 /// 規則外但憑證有效的回答來自幾個以上不同業者時，這個網域算「多家 CDN」：連不上照常計分、不記可疑天數
@@ -1270,33 +1281,88 @@ const VERIFY_IPS: usize = 2;
 const VERIFY_CONC: usize = 16;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 每台 DNS 被判「網站無法驗證」的日期（`state/blacklist-suspects.json`）；30 天沒再發生就忘掉
+/// 可疑紀錄的一筆：`YYYY-MM-DD|r<規則版本>|<網域>`（3.5.1）；3.5.0 以前只有日期（規則版本當成 0、網域不知道）。
+/// 舊版讀到新格式也還能用（字串開頭照樣是日期，30 天的比較不受影響）
+fn strike_entry(day: &str, domain: &str) -> String {
+    format!("{day}|r{STRIKE_RULES}|{domain}")
+}
+
+/// 拆開一筆：（日期, 規則版本, 網域）
+fn parse_strike(e: &str) -> (&str, u32, &str) {
+    let mut it = e.splitn(3, '|');
+    let day = it.next().unwrap_or("");
+    let rules = it
+        .next()
+        .and_then(|r| r.strip_prefix('r'))
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(0);
+    (day, rules, it.next().unwrap_or(""))
+}
+
+/// 每台 DNS 被判「網站無法驗證」、「憑證不符」（鍵是 `cert|<id>`）的日期與網域（`state/blacklist-suspects.json`）；
+/// 30 天沒再發生就忘掉
 struct Strikes {
     file: PathBuf,
     map: BTreeMap<String, Vec<String>>,
     dirty: bool,
 }
 
+/// 累計：不同日期幾天、不同網域幾個
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrikeCount {
+    days: usize,
+    domains: usize,
+}
+
 impl Strikes {
     fn load(file: PathBuf, now_ms: u64) -> Strikes {
         let mut map: BTreeMap<String, Vec<String>> = read_json(&file).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
         let cutoff = local_date_str(now_ms.saturating_sub(30 * DAY_MS));
-        let before = map.len();
+        let mut dirty = false;
         map.retain(|_, days| {
-            days.retain(|d| *d >= cutoff);
+            let before = days.len();
+            days.retain(|d| parse_strike(d).0 >= cutoff.as_str());
+            dirty |= days.len() != before;
             !days.is_empty()
         });
-        let dirty = map.len() != before;
         Strikes { file, map, dirty }
     }
-    /// 記一天，回傳累計的不同日期數
-    fn add(&mut self, id: &str, day: &str) -> usize {
-        let days = self.map.entry(id.to_string()).or_default();
-        if !days.iter().any(|d| d == day) {
-            days.push(day.to_string());
+    /// 記一筆（同一天同一個網域只記一次），回傳累計
+    fn add(&mut self, id: &str, day: &str, domain: &str) -> StrikeCount {
+        let list = self.map.entry(id.to_string()).or_default();
+        let e = strike_entry(day, domain);
+        if !list.contains(&e) {
+            list.push(e);
+            if list.len() > STRIKE_MAX_ENTRIES {
+                list.sort();
+                let over = list.len() - STRIKE_MAX_ENTRIES;
+                list.drain(..over);
+            }
             self.dirty = true;
         }
-        days.len()
+        self.count(id)
+    }
+    /// 累計（3.5.0 以前的紀錄沒有網域：每一筆各算一個不知道的網域，不會因為沒寫網域就被當成同一題）
+    fn count(&self, id: &str) -> StrikeCount {
+        let Some(list) = self.map.get(id) else {
+            return StrikeCount { days: 0, domains: 0 };
+        };
+        let mut days: HashSet<&str> = HashSet::new();
+        let mut domains: HashSet<&str> = HashSet::new();
+        let mut unknown = 0usize;
+        for e in list {
+            let (d, _, dom) = parse_strike(e);
+            days.insert(d);
+            if dom.is_empty() {
+                unknown += 1;
+            } else {
+                domains.insert(dom);
+            }
+        }
+        StrikeCount {
+            days: days.len(),
+            domains: domains.len() + unknown,
+        }
     }
     /// 有變動才寫（同步寫檔）；寫過（不論成敗）就不再重寫，`Drop` 不會重複記錄失敗
     fn save(&mut self) {
@@ -1883,6 +1949,33 @@ impl Benchmark {
                 }
                 seen.len() >= MULTI_CDN_GROUPS
             };
+            // 「網站無法驗證」的回答裡，別的經營者的加密 DNS 也回了同一個位址的（3.5.1）：那個位址多半是真的節點、
+            // 只是從這條線路連不上，不是這台 DNS 編出來的 → 今天照樣不用，但不記可疑天數。
+            // 只看加密 DNS：一般 DNS 可能被路上的設備竄改，好幾台被塞同一批假位址的不能互相作證
+            let shared: HashSet<usize> = {
+                let mut by_ip: HashMap<Ipv4Addr, Vec<String>> = HashMap::new();
+                for (i, ips, _) in ok.iter().filter(|(i, _, _)| !all[*i].control_like() && !is_plain(all[*i].kind)) {
+                    let op = all[*i].op_key();
+                    for ip in ips {
+                        let v = by_ip.entry(*ip).or_default();
+                        if !v.contains(&op) {
+                            v.push(op.clone());
+                        }
+                    }
+                }
+                verdict
+                    .iter()
+                    .filter(|(_, (c, _))| *c == SiteCheck::Unverified)
+                    .map(|(k, _)| *k)
+                    .filter(|k| {
+                        let own = all[ok[*k].0].op_key();
+                        ok[*k]
+                            .1
+                            .iter()
+                            .any(|ip| by_ip.get(ip).is_some_and(|ops| ops.iter().any(|o| *o != own)))
+                    })
+                    .collect()
+            };
             let (mut polluted, mut suspicious, mut rescued, mut lenient) = (0usize, 0usize, 0usize, 0usize);
             let mut newly_bl: Vec<String> = Vec::new();
             for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {
@@ -1912,7 +2005,8 @@ impl Benchmark {
                             continue;
                         }
                         polluted += 1;
-                        if s.learns() && strikes.add(&cert_key(&s.id), &today) >= CERT_DAYS {
+                        s.suspect_today |= s.learns();
+                        if s.learns() && strikes.add(&cert_key(&s.id), &today, domain).days >= CERT_DAYS {
                             jinfo!(
                                 journal,
                                 "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
@@ -1962,23 +2056,47 @@ impl Benchmark {
                             continue;
                         }
                         suspicious += 1;
-                        if s.learns() && strikes.add(&s.id, &today) >= SUSPECT_DAYS && blacklist.insert(s.id.clone()) {
+                        if shared.contains(&k) {
+                            if !s.pinned {
+                                jinfo!(
+                                    journal,
+                                    "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但別的經營者的 DNS 也回了同樣的位址，不記可疑",
+                                    s.id,
+                                    info.label()
+                                );
+                            }
+                            continue;
+                        }
+                        let c = if s.learns() {
+                            strikes.add(&s.id, &today, domain)
+                        } else {
+                            StrikeCount { days: 0, domains: 0 }
+                        };
+                        // 同一題天天連不上不累積：要 2 個以上不同的網域，才算進評測歷史的可疑天數、才會定罪
+                        s.suspect_today |= c.domains >= SUSPECT_DOMAINS;
+                        if c.days >= SUSPECT_DAYS && c.domains >= SUSPECT_DOMAINS && blacklist.insert(s.id.clone()) {
                             jinfo!(
                                 journal,
-                                "   [淘汰] {} -> 連續 {SUSPECT_DAYS} 天回答無法驗證的位址（加入永久黑名單）",
-                                s.id
+                                "   [淘汰] {} -> 30 天內 {} 天、{} 個網域回答無法驗證的位址（加入永久黑名單）",
+                                s.id,
+                                c.days,
+                                c.domains
                             );
                             newly_bl.push(format!(
-                                "{}  # {today} 汙染：{domain} → {}（連續 {SUSPECT_DAYS} 天網站無法驗證）",
+                                "{}  # {today} 汙染：{domain} → {}（30 天內 {} 天、{} 個網域網站無法驗證）",
                                 s.id,
-                                info.label()
+                                info.label(),
+                                c.days,
+                                c.domains
                             ));
                         } else if !s.pinned {
                             jinfo!(
                                 journal,
-                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}）",
+                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}；可疑 {} 天、{} 個網域）",
                                 s.id,
-                                info.label()
+                                info.label(),
+                                c.days,
+                                c.domains
                             );
                         }
                     }
@@ -2175,7 +2293,8 @@ impl Benchmark {
                     manual: s.tag.tier,
                     // 惡意網站探測判出有擋的：今天不選，算沒倖存
                     survived: s.alive && !s.malware_filter,
-                    suspect: !s.alive && ["汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p)),
+                    // 3.5.1：憑證不符、或「無法驗證」已經在 2 個以上網域發生的才算（同一題天天連不上不算）
+                    suspect: s.suspect_today,
                     ms: (s.alive && !s.malware_filter && s.lat_count > 0).then(|| s.avg() as f32),
                     trial_ok: !s.never_ok && cfg.select.auto_types.iter().any(|t| t == s.kind),
                 })
@@ -3575,5 +3694,50 @@ mod shared_tests {
         let (_, n) = candidate_ids(&paths);
         assert_eq!(n, MAX_SHARED, "好友的上游候選最多 100 個");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod strike_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("kuroshio-strikes-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("blacklist-suspects.json")
+    }
+
+    /// 3.5.1：每一筆記日期、規則版本、網域；同一天同一個網域只記一次；累計分開算日期與網域
+    #[test]
+    fn strikes_count_days_and_domains() {
+        let f = tmp("count");
+        let now = crate::time::days_from_civil(2026, 11, 20) as u64 * DAY_MS;
+        let mut s = Strikes::load(f.clone(), now);
+        assert_eq!(s.add("a", "2026-11-18", "www.example.com"), StrikeCount { days: 1, domains: 1 });
+        assert_eq!(s.add("a", "2026-11-18", "www.example.com"), StrikeCount { days: 1, domains: 1 });
+        assert_eq!(s.add("a", "2026-11-19", "www.example.com"), StrikeCount { days: 2, domains: 1 });
+        assert_eq!(
+            s.add("a", "2026-11-20", "www.example.com"),
+            StrikeCount { days: 3, domains: 1 },
+            "同一題天天連不上：網域只有 1 個"
+        );
+        assert_eq!(s.add("a", "2026-11-20", "cdn.example.net"), StrikeCount { days: 3, domains: 2 });
+        s.save();
+        let v: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert_eq!(v["a"][0], "2026-11-18|r2|www.example.com");
+        assert_eq!(parse_strike("2026-11-18|r2|www.example.com"), ("2026-11-18", 2, "www.example.com"));
+        assert_eq!(parse_strike("2026-11-18"), ("2026-11-18", 0, ""), "3.5.0 以前只有日期");
+        // 超過 30 天的忘掉（新舊格式都一樣用開頭的日期比）
+        let s = Strikes::load(f.clone(), now + 31 * DAY_MS);
+        assert!(s.map.is_empty(), "{:?}", s.map);
+        // 一台最多留 64 筆，先丟最舊的
+        let mut s = Strikes::load(f.clone(), now);
+        for i in 0..70 {
+            s.add("b", "2026-11-20", &format!("d{i:02}.example.com"));
+        }
+        assert_eq!(s.map["b"].len(), STRIKE_MAX_ENTRIES);
+        assert!(!s.map["b"].iter().any(|e| e.ends_with("|d00.example.com")));
+        let _ = std::fs::remove_dir_all(f.parent().unwrap());
     }
 }

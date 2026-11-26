@@ -437,11 +437,15 @@ async fn pollution_requires_site_verification() {
         .collect();
     std::fs::write(list.join("iplist.txt"), ids.join("\n")).unwrap();
     std::fs::write(list.join("web.txt"), "www.alpha.com\ncdn.beta.com\nhttp.only.net\n").unwrap();
-    // 「無法驗證」已經記了前兩天：今天是第 3 天 → 列入永久黑名單。
-    // 「憑證不符」昨天記過一次：今天是第 2 天 → 列入永久黑名單
+    // 「無法驗證」已經記了前兩天（3.5.1 的格式，兩個不同的網域）：今天是第 3 天 → 列入永久黑名單。
+    // 「憑證不符」昨天記過一次（3.5.0 的格式也照算）：今天是第 2 天 → 列入永久黑名單
     std::fs::write(
         root.join("state/blacklist-suspects.json"),
-        serde_json::to_vec(&json!({ quiet.to_string(): ["2026-11-08", "2026-11-09"], format!("cert|{hijack}"): ["2026-11-09"] })).unwrap(),
+        serde_json::to_vec(&json!({
+            quiet.to_string(): ["2026-11-08|r2|cdn.beta.com", "2026-11-09|r2|www.alpha.com"],
+            format!("cert|{hijack}"): ["2026-11-09"]
+        }))
+        .unwrap(),
     )
     .unwrap();
     let cfg = kuroshio_config::with_overrides(&json!({
@@ -478,11 +482,21 @@ async fn pollution_requires_site_verification() {
         "只有一天憑證不符：今天不用，但不能永久排除：{bl}"
     );
     let suspects: Value = read(&root.join("state/blacklist-suspects.json"));
-    assert_eq!(suspects[quiet.to_string()], json!(["2026-11-08", "2026-11-09", "2026-11-10"]));
-    assert_eq!(suspects[format!("cert|{hijack}")], json!(["2026-11-09", "2026-11-10"]));
+    assert_eq!(
+        suspects[quiet.to_string()],
+        json!([
+            "2026-11-08|r2|cdn.beta.com",
+            "2026-11-09|r2|www.alpha.com",
+            "2026-11-10|r2|www.alpha.com"
+        ])
+    );
+    assert_eq!(
+        suspects[format!("cert|{hijack}")],
+        json!(["2026-11-09", "2026-11-10|r2|www.alpha.com"])
+    );
     assert_eq!(
         suspects[format!("cert|{first_time}")],
-        json!(["2026-11-10"]),
+        json!(["2026-11-10|r2|www.alpha.com"]),
         "記下來，再發生一天就定罪"
     );
     // 規則外但驗證通過的 CDN 照常計分，可以被選上
@@ -656,7 +670,7 @@ async fn dropped_run_clears_progress_and_saves() {
     let cache = read(&out_root.join("cidr_cache.json"));
     assert!(cache.get("98.6.0").is_some(), "ASN 快取要存（3.5.1 起以 /24 為鍵）：{cache}");
     let suspects = read(&root.join("state/blacklist-suspects.json"));
-    assert_eq!(suspects[quiet.to_string()], json!(["2026-11-10"]), "{suspects}");
+    assert_eq!(suspects[quiet.to_string()], json!(["2026-11-10|r2|www.alpha.com"]), "{suspects}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
