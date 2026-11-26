@@ -136,6 +136,9 @@ pub struct Stats {
 /// 但不能無限長；淘汰追上之後自己恢復
 pub const ADMIT_BUDGET_FACTOR: usize = 2;
 
+/// 載入時清掉到期超過這麼久的 ECS、跨 CDN 結果（3.5.1 L2）：早就不用了，留著只會讓它看起來像有學習資料
+pub const STALE_LEARNING_MS: u64 = 7 * 24 * 3600 * 1000;
+
 /// 背景工作
 #[derive(Debug, Clone, PartialEq)]
 pub enum Task {
@@ -544,12 +547,109 @@ impl Cdn {
             cdn_dir_kb: AtomicU32::new(u32::MAX),
         };
         me.reset_octet_verdicts();
+        me.clean_stale_learning();
         // 啟動時先量一次實際的磁碟用量（3.5.0 D3 回報：重新啟動後到第一輪預算之前 dbDiskKB 是 null，
         // 預算換算的筆數也沒辦法用實測校正）。只有設了預算（小 Flash）才量：讀分片目錄裡每個檔的大小
         if me.cfg.db_disk_budget.is_some() {
             me.measure_disk();
         }
         Arc::new(me)
+    }
+
+    /// 載入時清掉舊資料裡不成立的學習資料（3.5.1 L1、L2；啟動時一次，記一行 info）。這些會讓 `has_learning()` 誤判
+    /// （淘汰、讀回時當成有學習資料），也會讓複驗、explain 用錯的資料：
+    ///
+    /// - App 層（只辨識、不改寫）的那一格：v4／v6／基準（3.5.0 B3 以前驗證過的；手動「一定換」、`cdn.appLayer: false` 的不動）。
+    /// - 基準 IP 家族不對（IPv6，見 M2）或不在這一格業者的官方範圍裡（有範圍檔時才比）。
+    /// - 到期超過 [`STALE_LEARNING_MS`] 的 ECS、跨 CDN 結果。
+    /// - `best` 指向已經不成立的策略：`ecs`／`cross` 但那個結果沒有或不是 ok；`alias` 但 v4、v6 都沒有驗證結果。
+    ///
+    /// 回傳（App 層，基準，ECS，跨 CDN，最佳策略）各清掉幾筆
+    pub(crate) fn clean_stale_learning(&self) -> [usize; 5] {
+        let mut st = self.state();
+        let st = &mut *st;
+        let now = now_ms();
+        let app_layer = self.cfg.app_layer;
+        let mut n = [0usize; 5];
+        let mut touched: Vec<Arc<str>> = Vec::new();
+        // 一格（業者、v4、v6、基準）的清理：回傳有沒有改
+        let pools = &st.pools;
+        let clean_slot = |provider: Option<&str>,
+                          always: bool,
+                          v4: &mut Option<Box<db::Verdict>>,
+                          v6: &mut Option<Box<db::Verdict>>,
+                          base: &mut Option<Box<db::Base>>,
+                          n: &mut [usize; 5]|
+         -> bool {
+            let Some(p) = provider else { return false };
+            if app_layer && !always && crate::providers::get(p).is_some_and(|x| x.app_layer) {
+                if v4.is_some() || v6.is_some() || base.is_some() {
+                    *v4 = None;
+                    *v6 = None;
+                    *base = None;
+                    n[0] += 1;
+                    return true;
+                }
+                return false;
+            }
+            let Some(ip) = base.as_ref().and_then(|b| b.ip) else { return false };
+            let has_range = pools.p.get(p).is_some_and(|d| d.range4.v4_len() > 0);
+            if ip.is_ipv6() || (has_range && !pools.in_ranges(p, ip)) {
+                *base = None;
+                n[1] += 1;
+                return true;
+            }
+            false
+        };
+        for e in st.db.domains.values_mut() {
+            let always = e.policy() == db::Policy::Always;
+            let p = e.provider.val().cloned();
+            let mut changed = clean_slot(p.as_deref(), always, &mut e.v4, &mut e.v6, &mut e.base, &mut n);
+            if let Some(a) = e.src.as_mut().and_then(|s| s.alt.as_deref_mut()) {
+                let p = a.provider.val().map(|x| x.to_string());
+                changed |= clean_slot(p.as_deref(), always, &mut a.v4, &mut a.v6, &mut a.base, &mut n);
+            }
+            let stale = |until: Option<u64>| until.unwrap_or(0).saturating_add(STALE_LEARNING_MS) < now;
+            if e.ecs.as_ref().is_some_and(|x| stale(x.until)) {
+                e.ecs = None;
+                n[2] += 1;
+                changed = true;
+            }
+            if e.cross4.as_ref().is_some_and(|x| stale(x.until)) {
+                e.cross4 = None;
+                n[3] += 1;
+                changed = true;
+            }
+            let holds = match e.best {
+                Some(db::Strategy::Ecs) => e.ecs.as_ref().is_some_and(|x| x.is("ok")),
+                Some(db::Strategy::Cross) => e.cross4.as_ref().is_some_and(|x| x.is("ok")),
+                Some(db::Strategy::Alias) => e.v4.is_some() || e.v6.is_some(),
+                None => true,
+            };
+            if !holds {
+                e.best = None;
+                n[4] += 1;
+                changed = true;
+            }
+            if changed {
+                touched.push(e.name.clone());
+            }
+        }
+        for name in &touched {
+            st.db.mark(name);
+        }
+        if !touched.is_empty() {
+            info!(
+                "CDN 網域資料整理（舊資料）：{} 個網域，清掉 App 層的驗證結果 {} 筆、不對的基準 {} 筆、過期很久的 ECS {} 筆、跨 CDN {} 筆、不成立的最佳策略 {} 筆",
+                touched.len(),
+                n[0],
+                n[1],
+                n[2],
+                n[3],
+                n[4]
+            );
+        }
+        n
     }
 
     /// 舊版用隨機 IP 驗證 Fastly 必然憑證不符；最後一段跟原始不同的失敗紀錄作廢，重新驗證

@@ -103,7 +103,21 @@ fn round_trip_keeps_format_and_unknown_fields() {
             let (la, lb) = (key(&a), key(&b));
             assert_eq!(la.len(), lb.len());
             for (x, y) in la.iter().zip(&lb) {
-                assert_eq!(x, y, "網域 {} 讀寫後不一樣", x.0);
+                assert_eq!(x.0, y.0);
+                // 3.5.1 L1／L2：載入時清掉的舊資料（App 層的驗證結果、不對的基準、過期很久的 ECS／跨 CDN、不成立的 best）
+                // 可以少掉；其他欄位（含不認識的）一個都不能變
+                let (xo, yo) = (x.1.as_object().unwrap(), y.1.as_object().unwrap());
+                for (k, v) in xo {
+                    match yo.get(k) {
+                        Some(w) => assert_eq!(v, w, "網域 {} 的 {k} 讀寫後不一樣", x.0),
+                        None => assert!(
+                            ["ecs", "cross4", "base", "best", "v4", "v6"].contains(&k.as_str()),
+                            "網域 {} 少了 {k}",
+                            x.0
+                        ),
+                    }
+                }
+                assert!(yo.keys().all(|k| xo.contains_key(k)), "網域 {} 多了欄位", x.0);
             }
             a.as_object_mut().unwrap().remove("domains");
             b.as_object_mut().unwrap().remove("domains");
@@ -614,6 +628,24 @@ fn seeded_shards(tag: &str) -> (Paths, usize, usize) {
     std::fs::copy(repo().join("data/seed/cdn-domains.json"), dir.join(crate::db::FILE)).unwrap();
     let c = Cdn::load(&full_cfg(), paths.clone(), MockNet::new());
     assert_eq!(c.budget_limit(), None, "預設（auto 還沒換算、或大磁碟）沒有預算");
+    // 3.5.1 L1／L2：載入時清掉種子裡的舊資料之後分片變小，多放一些問過幾次的網域，讓磁碟上照樣超過 512 KB 的預算
+    c.with_state(|st| {
+        let old = now_ms() - 2 * 86_400_000;
+        for i in 0..3000u32 {
+            let n = format!("p{:08x}.example.net", crate::db::name_hash(&i.to_string()));
+            st.db.touch(
+                &n,
+                "cloudflare",
+                "ip",
+                &ips(&["104.21.0.5"]),
+                &[],
+                Some("pad.example.net.cdn.cloudflare.net"),
+            );
+            let d = st.db.get_mut(&n).unwrap();
+            d.hits = 3;
+            d.last_seen = old;
+        }
+    });
     let (_, ch) = c.snapshots_sharded(false);
     write_changes(&c, &dir, &ch);
     let n = c.state().db.domains.len();

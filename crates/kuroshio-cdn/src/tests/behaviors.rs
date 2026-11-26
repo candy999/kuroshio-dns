@@ -71,6 +71,79 @@ async fn v6_verify_does_not_overwrite_v4_base() {
         .is_none());
 }
 
+/// 3.5.1 L1／L2：載入時清掉舊資料裡不成立的學習資料（會讓 `has_learning()` 誤判）
+#[test]
+fn stale_learning_cleaned_on_load() {
+    use crate::db::{Policy, Strategy};
+    let (c, _) = setup(json!({}));
+    let now = now_ms();
+    let ok = || {
+        Some(Box::new(crate::db::Verdict {
+            verdict: Some(intern("ok")),
+            until: Some(now + 3_600_000),
+            ..Default::default()
+        }))
+    };
+    let base = |s: &str| {
+        Some(Box::new(crate::db::Base {
+            ip: Some(ip(s)),
+            ..Default::default()
+        }))
+    };
+    c.with_state(|st| {
+        // App 層（只辨識不改寫）的格子：v4／v6／基準都清掉
+        st.db.touch("app.example.com", "google", "cname", &[], &[], None);
+        let e = st.db.get_mut("app.example.com").unwrap();
+        e.v4 = ok();
+        e.base = base("192.0.2.40");
+        // 手動「一定換」的 App 層不動
+        st.db.touch("app-always.example.com", "google", "cname", &[], &[], None);
+        st.db.set_policy("app-always.example.com", Policy::Always);
+        st.db.get_mut("app-always.example.com").unwrap().v4 = ok();
+        // 基準 IP 是 IPv6、不在這家的範圍：清掉；在範圍裡的留著
+        for (n, b) in [
+            ("b6.example.com", "2606:4700::5"),
+            ("bout.example.com", "198.51.100.1"),
+            ("bok.example.com", "104.21.0.5"),
+        ] {
+            st.db.touch(n, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+            st.db.get_mut(n).unwrap().base = base(b);
+        }
+        // 過期很久的 ECS、跨 CDN；best 指向不成立的策略
+        st.db.touch("stale.example.com", "akamai", "cname", &[], &[], None);
+        let e = st.db.get_mut("stale.example.com").unwrap();
+        e.ecs = Some(Box::new(crate::db::Ecs {
+            verdict: Some(intern("ok")),
+            until: Some(now - 8 * 86_400_000),
+            ..Default::default()
+        }));
+        e.cross4 = Some(Box::new(crate::db::Cross {
+            verdict: Some(intern("none")),
+            until: Some(now - 6 * 86_400_000),
+            ..Default::default()
+        }));
+        e.best = Some(Strategy::Ecs);
+        st.db.touch("alias.example.com", "cloudflare", "ip", &[], &[], None);
+        st.db.get_mut("alias.example.com").unwrap().best = Some(Strategy::Alias);
+        st.db.take_marks(false);
+    });
+    assert_eq!(c.clean_stale_learning(), [1, 2, 1, 0, 2]);
+    let st = c.state();
+    let g = |n: &str| st.db.get(n).unwrap();
+    assert!(g("app.example.com").v4.is_none() && g("app.example.com").base.is_none());
+    assert!(g("app-always.example.com").v4.is_some());
+    assert!(g("b6.example.com").base.is_none() && g("bout.example.com").base.is_none());
+    assert!(g("bok.example.com").base.is_some());
+    let s = g("stale.example.com");
+    assert!(s.ecs.is_none() && s.best.is_none(), "到期超過 7 天的 ECS 清掉，best 跟著清");
+    assert!(s.cross4.is_some(), "到期 6 天的留著");
+    assert!(g("alias.example.com").best.is_none());
+    assert!(!crate::db::has_learning(g("app.example.com")));
+    assert!(st.db.changed(), "清掉的要寫回去");
+    drop(st);
+    assert_eq!(c.clean_stale_learning(), [0; 5], "第二次沒有東西可以清");
+}
+
 #[tokio::test]
 async fn verifier_ok_collects_all_passing_ips() {
     let (c, net) = setup(json!({}));
