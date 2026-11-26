@@ -1508,6 +1508,7 @@ impl Benchmark {
             blacklist.remove(id);
         }
         let mut h3_skipped = 0usize;
+        let mut rl_skipped = 0usize;
         // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
         let mut journal = Journal::default();
         // 路徑檢查：一般 DNS 被接走、IPv6 不能用、協定被擋時，那些候選今天不測（測了也只會冤枉它們）
@@ -1574,6 +1575,11 @@ impl Benchmark {
                 && learned.as_ref().is_some_and(|l| l.h3_skipping(spec, today_n))
             {
                 h3_skipped += 1;
+                continue;
+            }
+            // 連續好幾天回 HTTP 429（限流）的：跳過期間不測（3.5.1 L1）；重測的永久黑名單不受影響（它們本來就不在這裡）
+            if !pinned_or_control && learned.as_ref().is_some_and(|l| l.rl_skipping(&up.id, today_n)) {
+                rl_skipped += 1;
                 continue;
             }
             let mut s = Srv::new(spec.clone(), up, pinned, tag.clone());
@@ -1745,6 +1751,13 @@ impl Benchmark {
             jinfo!(
                 journal,
                 "HTTP/3 先不測 {h3_skipped} 個：連續 {} 天以上 QUIC 連不上、HTTPS 正常（跳過 7～30 天，到期再試）",
+                learn::H3_FAIL_DAYS
+            );
+        }
+        if rl_skipped > 0 {
+            jinfo!(
+                journal,
+                "限流（HTTP 429）先不測 {rl_skipped} 個：連續 {} 天以上回 429（跳過 7～30 天，到期再試）",
                 learn::H3_FAIL_DAYS
             );
         }
@@ -2237,6 +2250,20 @@ impl Benchmark {
         journal.enter_tail();
         if learned_bl {
             self.tidy_blacklist(&bl_file, &all, &retest, &known, today_n, &today, &mut journal);
+        }
+        if let Some(l) = learned.as_mut() {
+            let c = record_rl429(l, &all, &pf, &known, today_n, &mut journal);
+            learn_dirty |= c.any();
+            if c.any() || l.rl_skipping_count(today_n) > 0 {
+                jimp!(
+                    journal,
+                    "限流（HTTP 429）：多記一天 {}、開始跳過 {}、恢復 {}（目前跳過 {} 個）",
+                    c.counted,
+                    c.skipped,
+                    c.cleared,
+                    l.rl_skipping_count(today_n)
+                );
+            }
         }
         let finals: Vec<usize> = verified
             .iter()
@@ -3281,6 +3308,47 @@ fn record_h3(l: &mut learn::Learn, all: &[Srv], pf: &[Option<Preflight>], today:
             None => H3Seen::Neutral,
         };
         l.h3_record(&all[i].id, today, seen, &mut change);
+    }
+    change
+}
+
+/// 一次評測裡回 HTTP 429 的超過這麼多台：多半是這台送得太快（或共用出口被限流），不是那些伺服器的問題，今天不記
+const RL_FUSE: usize = 32;
+
+/// 一直回 HTTP 429（限流）的上游（3.5.1 L1）：今天測到的一般候選各記一筆（鍵是正規化後的 id）。
+/// 資格賽或之後的查詢回 429＝失敗；過了資格賽、沒有 429＝恢復（整筆刪掉）；資格賽是別的錯誤、今天沒測到＝不動。
+/// 名單裡已經沒有的刪掉。回 429 的超過 [`RL_FUSE`] 台時今天不記（寫進 judge.log）
+fn record_rl429(
+    l: &mut learn::Learn,
+    all: &[Srv],
+    pf: &[Option<Preflight>],
+    known: &HashSet<String>,
+    today: u32,
+    journal: &mut Journal,
+) -> learn::H3Change {
+    use learn::H3Seen;
+    let mut change = learn::H3Change::default();
+    // 名單裡已經沒有的刪掉（評測成功時學習檔一定會寫，見評測歷史）
+    l.rl429.retain(|k, _| known.contains(k));
+    let general = |s: &Srv| s.selectable() && !s.never_ok;
+    let limited = |s: &Srv| s.fail_reason.contains("HTTP 429");
+    let n = all.iter().filter(|s| general(s) && limited(s)).count();
+    if n > RL_FUSE {
+        jimp!(
+            journal,
+            "限流（HTTP 429）：今天有 {n} 台回 429，超過 {RL_FUSE} 台，多半是這台送得太快或共用的出口被限流，今天不記"
+        );
+        return change;
+    }
+    for (i, s) in all.iter().enumerate().filter(|(_, s)| general(s)) {
+        let seen = if limited(s) {
+            H3Seen::Fail
+        } else if pf[i] == Some(Preflight::Pass) {
+            H3Seen::Ok
+        } else {
+            H3Seen::Neutral
+        };
+        l.rl_record(&s.up.id, today, seen, &mut change);
     }
     change
 }

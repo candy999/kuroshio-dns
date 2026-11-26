@@ -340,3 +340,37 @@ async fn judge_log_has_selection() {
     assert!(log.contains("總涵蓋率"), "{log}");
     assert!(log.lines().last().unwrap().starts_with("[dns-benchmark] 結束 "), "{log}");
 }
+
+/// A10.9：每天回 HTTP 429 的（https 與 h3 都算）連續 3 天之後跳過 7～30 天；到期再測沒有 429 就恢復
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_429_is_skipped_like_h3skip() {
+    let e = setup("rl429", 4, "").await;
+    e.prober.limited.lock().unwrap().insert("h4.example.com".into());
+    let h3 = "h3://h4.example.com/dns-query";
+    for day in 1..=3u32 {
+        let (_, log) = e.run(&cfg()).await;
+        let l = e.learn();
+        assert_eq!(l.rl429[e.id(4)].f, day, "{log}");
+        assert_eq!(l.rl429[h3].f, day);
+        if day == 3 {
+            assert!(l.rl429[e.id(4)].until > e.today(), "第 3 天開始跳過");
+            assert!(log.contains("限流（HTTP 429）：多記一天 0、開始跳過 2"), "{log}");
+        }
+        e.next_day();
+    }
+    // 跳過期間：不測（一筆查詢都沒有）
+    e.prober.asked.lock().unwrap().clear();
+    let (_, log) = e.run(&cfg()).await;
+    assert!(log.contains("限流（HTTP 429）先不測 2 個"), "{log}");
+    assert!(!e.prober.asked.lock().unwrap().contains_key(e.id(4)));
+    // 到期：再測，沒有 429 就恢復（整筆刪掉）
+    // https 與 h3 的跳過天數各自加了亂數：等兩個都到期
+    let until = e.learn().rl429.values().map(|x| x.until).max().unwrap();
+    assert!(until - e.today() <= 30);
+    e.prober.limited.lock().unwrap().clear();
+    e.clock.advance((until - e.today()) as u64 * DAY_MS);
+    let (state, log) = e.run(&cfg()).await;
+    assert!(e.prober.asked.lock().unwrap().contains_key(e.id(4)));
+    assert!(e.learn().rl429.is_empty(), "{log}");
+    assert_eq!(state["counts"]["eliminated"], 0);
+}

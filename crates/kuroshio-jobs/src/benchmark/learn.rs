@@ -6,12 +6,13 @@
 //!   "control": { "<id>": "ddddpd-u…" }, "controlDay": 20781,
 //!   "hist":    { "<id>": [t, s, q, ms, dv, e, last] },
 //!   "h3skip":  { "<h3:// 的 id>": { "f": 3, "n": 1, "until": 20790, "last": 20783 } },
+//!   "rl429":   { "<正規化後的 id>": { "f": 3, "n": 1, "until": 20790, "last": 20783 } },
 //!   "neverOk": { "<id>": { "since": 20780, "n": 2 } } }
 //! ```
 //!
 //! - 丟了只是重新學，不影響正確性（`space.rs` 歸 `Rebuildable`）；不進備份的分享檔、不傳給下游與好友。
 //! - 讀不到、格式不對、`v` 不認識、太大：當成空的，不失敗。
-//! - 用到的區段：`neverOk`（A7）、`h3skip`（A6）、`control`／`controlDay`（A2）、`hist`（A4）；不認得的區段原樣保留，不會被這裡蓋掉。
+//! - 用到的區段：`neverOk`（A7）、`h3skip`（A6）、`rl429`（3.5.1 L1：一直回 HTTP 429 的，規則同 `h3skip`）、`control`／`controlDay`（A2）、`hist`（A4）；不認得的區段原樣保留，不會被這裡蓋掉。
 //! - `hist`（A4）：每個測過的一般候選一筆，寫成陣列省空間（2,000 筆要放得進上限）：
 //!   `t`／`s`／`q` 是近 30 天的位元遮罩（最低位是 `last` 那天）：哪幾天測到、哪幾天倖存到最後、哪幾天有汙染／可疑；
 //!   `ms`／`dv` 是倖存那幾天平均延遲的 EWMA 與它的平均偏差；`e` 是升降狀態（見 [`HistState`]）；`last` 是最後記錄的日數。
@@ -307,6 +308,91 @@ pub fn h3_skip_days(id: &str, today: u32, n: u32) -> u32 {
     ((H3_SKIP_BASE << n.min(H3_MAX_ROUND)) + jitter).min(H3_MAX_SKIP)
 }
 
+/// `rl429` 最多幾筆（3.5.1 L1）
+pub const MAX_RL_SKIP: usize = 256;
+
+fn load_skips(o: &mut Map<String, Value>, key: &str) -> BTreeMap<String, H3Skip> {
+    let mut out = BTreeMap::new();
+    if let Some(Value::Object(m)) = o.remove(key) {
+        for (id, e) in m {
+            let f = |k: &str| e.get(k).and_then(Value::as_u64).map(|x| x.min(u32::MAX as u64) as u32);
+            if let (Some(fd), Some(n), Some(until)) = (f("f"), f("n"), f("until")) {
+                let last = f("last").unwrap_or(until);
+                out.insert(
+                    id,
+                    H3Skip {
+                        f: fd,
+                        n: n.min(H3_MAX_ROUND),
+                        until,
+                        last,
+                    },
+                );
+            }
+        }
+    }
+    out
+}
+
+fn skips_json(m: &BTreeMap<String, H3Skip>) -> Value {
+    Value::Object(
+        m.iter()
+            .map(|(k, e)| (k.clone(), json!({ "f": e.f, "n": e.n, "until": e.until, "last": e.last })))
+            .collect(),
+    )
+}
+
+/// 超過上限時丟 `last` 最舊的
+fn cap_skips(m: &mut BTreeMap<String, H3Skip>, max: usize) {
+    let over = m.len().saturating_sub(max);
+    if over == 0 {
+        return;
+    }
+    let mut by_age: Vec<(u32, String)> = m.iter().map(|(k, e)| (e.last, k.clone())).collect();
+    by_age.sort();
+    for (_, k) in by_age.into_iter().take(over) {
+        m.remove(&k);
+    }
+}
+
+/// 「連續幾天失敗就逐次拉長跳過」的共用規則（`h3skip` 與 `rl429`）
+fn record_skip(m: &mut BTreeMap<String, H3Skip>, id: &str, today: u32, seen: H3Seen, change: &mut H3Change) -> bool {
+    match seen {
+        H3Seen::Neutral => false,
+        H3Seen::Ok => {
+            let hit = m.remove(id).is_some();
+            change.cleared += hit as usize;
+            hit
+        }
+        H3Seen::Fail => {
+            let e = m.entry(id.to_string()).or_default();
+            if e.until > 0 {
+                // 跳過到期、再測又失敗：直接進下一輪
+                if e.until > today && e.until - today <= H3_MAX_SKIP {
+                    return false; // 還在跳過期間（照理不會測到）
+                }
+                e.until = today + h3_skip_days(id, today, e.n);
+                e.n = (e.n + 1).min(H3_MAX_ROUND);
+                e.last = today;
+                change.skipped += 1;
+                return true;
+            }
+            if e.f > 0 && e.last == today {
+                return false;
+            }
+            e.f += 1;
+            e.last = today;
+            if e.f >= H3_FAIL_DAYS {
+                e.until = today + h3_skip_days(id, today, e.n);
+                e.n = (e.n + 1).min(H3_MAX_ROUND);
+                change.skipped += 1;
+            } else {
+                change.counted += 1;
+            }
+            true
+        }
+    }
+}
+
 /// 執行時上線以來從未成功、被先停用的自動上游（A7）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NeverOk {
@@ -322,6 +408,8 @@ pub struct Learn {
     pub never_ok: BTreeMap<String, NeverOk>,
     /// 不支援 HTTP/3 的 DoH（A6），以 `h3://` 的 id 為鍵
     pub h3skip: BTreeMap<String, H3Skip>,
+    /// 一直回 HTTP 429（限流）的上游（3.5.1 L1），以正規化後的 id 為鍵；跳過的規則同 `h3skip`
+    pub rl429: BTreeMap<String, H3Skip>,
     /// 對照組最近 30 天的結果（A2）：第一個字元是 `control_day` 那天
     pub control: BTreeMap<String, String>,
     /// `control` 最後記錄的日數（跟檔案的 `day` 分開：主程式登記 `neverOk` 時也會更新 `day`）
@@ -377,24 +465,8 @@ impl Learn {
                 }
             }
         }
-        let mut h3skip = BTreeMap::new();
-        if let Some(Value::Object(m)) = o.remove("h3skip") {
-            for (id, e) in m {
-                let f = |k: &str| e.get(k).and_then(Value::as_u64).map(|x| x.min(u32::MAX as u64) as u32);
-                if let (Some(fd), Some(n), Some(until)) = (f("f"), f("n"), f("until")) {
-                    let last = f("last").unwrap_or(until);
-                    h3skip.insert(
-                        id,
-                        H3Skip {
-                            f: fd,
-                            n: n.min(H3_MAX_ROUND),
-                            until,
-                            last,
-                        },
-                    );
-                }
-            }
-        }
+        let h3skip = load_skips(&mut o, "h3skip");
+        let rl429 = load_skips(&mut o, "rl429");
         let mut control = BTreeMap::new();
         if let Some(Value::Object(m)) = o.remove("control") {
             for (id, e) in m {
@@ -420,6 +492,7 @@ impl Learn {
             hist,
             never_ok,
             h3skip,
+            rl429,
             control,
             control_day,
             rest: o,
@@ -437,6 +510,7 @@ impl Learn {
             self.never_ok.remove(&oldest);
         }
         self.cap_h3();
+        cap_skips(&mut self.rl429, MAX_RL_SKIP);
         self.hist_cap(|_| true);
         // control：超過上限時丟「最後一次有結果」最久以前的
         while self.control.len() > MAX_CONTROL {
@@ -475,12 +549,8 @@ impl Learn {
             .map(|(k, e)| (k.clone(), json!({ "since": e.since, "n": e.n })))
             .collect();
         o.insert("neverOk".into(), Value::Object(m));
-        let h: Map<String, Value> = self
-            .h3skip
-            .iter()
-            .map(|(k, e)| (k.clone(), json!({ "f": e.f, "n": e.n, "until": e.until, "last": e.last })))
-            .collect();
-        o.insert("h3skip".into(), Value::Object(h));
+        o.insert("h3skip".into(), skips_json(&self.h3skip));
+        o.insert("rl429".into(), skips_json(&self.rl429));
         let c: Map<String, Value> = self.control.iter().map(|(k, h)| (k.clone(), json!(h))).collect();
         o.insert("control".into(), Value::Object(c));
         o.insert("controlDay".into(), json!(self.control_day));
@@ -554,42 +624,9 @@ impl Learn {
         if today < self.day {
             return false;
         }
-        match seen {
-            H3Seen::Neutral => false,
-            H3Seen::Ok => {
-                let hit = self.h3skip.remove(id).is_some();
-                change.cleared += hit as usize;
-                hit
-            }
-            H3Seen::Fail => {
-                let e = self.h3skip.entry(id.to_string()).or_default();
-                if e.until > 0 {
-                    // 跳過到期、再測又失敗：直接進下一輪
-                    if e.until > today && e.until - today <= H3_MAX_SKIP {
-                        return false; // 還在跳過期間（照理不會測到）
-                    }
-                    e.until = today + h3_skip_days(id, today, e.n);
-                    e.n = (e.n + 1).min(H3_MAX_ROUND);
-                    e.last = today;
-                    change.skipped += 1;
-                    return true;
-                }
-                if e.f > 0 && e.last == today {
-                    return false;
-                }
-                e.f += 1;
-                e.last = today;
-                if e.f >= H3_FAIL_DAYS {
-                    e.until = today + h3_skip_days(id, today, e.n);
-                    e.n = (e.n + 1).min(H3_MAX_ROUND);
-                    change.skipped += 1;
-                } else {
-                    change.counted += 1;
-                }
-                self.cap_h3();
-                true
-            }
-        }
+        let hit = record_skip(&mut self.h3skip, id, today, seen, change);
+        self.cap_h3();
+        hit
     }
 
     /// 名單裡已經沒有的（它的 `https://` 不在名單了）刪掉；回傳刪了幾筆
@@ -662,6 +699,31 @@ impl Learn {
             }
         }
         moved.len()
+    }
+
+    /// 這個上游今天要不要因為一直回 HTTP 429 跳過（3.5.1 L1；規則同 [`h3_skipping`](Self::h3_skipping)）
+    pub fn rl_skipping(&self, id: &str, today: u32) -> bool {
+        today >= self.day
+            && self
+                .rl429
+                .get(id)
+                .is_some_and(|e| e.until > today && e.until - today <= H3_MAX_SKIP)
+    }
+
+    /// 記下一個上游今天有沒有回 HTTP 429（3.5.1 L1）：`Fail`＝回了 429、`Ok`＝測到了、沒有 429（整筆刪掉）、
+    /// `Neutral`＝今天沒測到。連續 [`H3_FAIL_DAYS`] 天就跳過 7 → 14 → 28 天（加亂數，最多 30 天），到期再測又 429 進下一輪
+    pub fn rl_record(&mut self, id: &str, today: u32, seen: H3Seen, change: &mut H3Change) -> bool {
+        if today < self.day {
+            return false;
+        }
+        let hit = record_skip(&mut self.rl429, id, today, seen, change);
+        cap_skips(&mut self.rl429, MAX_RL_SKIP);
+        hit
+    }
+
+    /// 今天因為 HTTP 429 跳過的筆數
+    pub fn rl_skipping_count(&self, today: u32) -> usize {
+        self.rl429.keys().filter(|k| self.rl_skipping(k, today)).count()
     }
 
     /// 今天在跳過期間的筆數
