@@ -5,6 +5,9 @@
 //! - `dataFormat` 跟執行檔的 [`DATA_FORMAT`] 不同：警告，列出兩邊
 //! - 只有 `version` 不同（格式相同）：只記一行資訊（Windows 小改版可能只換執行檔）
 //!
+//! - 舊版留下、這一版已經不讀的檔（[`RETIRED`]，3.5.1）：啟動時記一行資訊，提醒可以刪、升級時整個替換 data/。
+//!   不在執行時刪（安裝目錄可能是唯讀的，也不該由服務去動）
+//!
 //! 一律照常執行，不拒絕啟動。結果放在 `/api/status.data` 與 `kuroshio status --json`。
 
 use serde_json::{json, Value};
@@ -15,6 +18,10 @@ use tracing::{info, warn};
 pub const DATA_FORMAT: u64 = 1;
 
 pub const FILE: &str = "manifest.json";
+
+/// 舊版附帶、這一版已經不讀的檔（相對 data/）：（路徑, 從哪一版起不用）。
+/// 解壓覆蓋舊的 data/ 時會留下來（Windows、Linux 通用包）；OpenWrt 套件升級會自己移除
+pub const RETIRED: &[(&str, &str)] = &[("seed/upstreams.json", "3.5.0")];
 
 /// 檢查結果
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +37,8 @@ pub struct DataCheck {
     pub warning: Option<String>,
     /// 只是提醒（版本不同但格式相同）
     pub note: Option<String>,
+    /// 舊版留下、已經不讀的檔（[`RETIRED`] 裡實際存在的）
+    pub leftovers: Vec<String>,
 }
 
 /// 純函式：manifest 的內容（沒有檔案是 None）對照這個執行檔的格式與版本
@@ -41,6 +50,7 @@ pub fn evaluate(dir: &Path, content: Option<&str>, data_format: u64, bin_version
         ok: false,
         warning: None,
         note: None,
+        leftovers: Vec::new(),
     };
     let Some(text) = content else {
         c.warning = Some("data/ 沒有版本標記，可能是舊版的 data/（請用跟執行檔同一版的 data/）".into());
@@ -78,10 +88,40 @@ pub fn evaluate(dir: &Path, content: Option<&str>, data_format: u64, bin_version
     c
 }
 
-/// 讀 `<dir>/manifest.json` 檢查
+/// 讀 `<dir>/manifest.json` 檢查，順便看有沒有舊版留下的檔
 pub fn check(dir: &Path) -> DataCheck {
     let text = std::fs::read_to_string(dir.join(FILE)).ok();
-    evaluate(dir, text.as_deref(), DATA_FORMAT, env!("CARGO_PKG_VERSION"))
+    let mut c = evaluate(dir, text.as_deref(), DATA_FORMAT, env!("CARGO_PKG_VERSION"));
+    c.leftovers = leftovers(dir);
+    c
+}
+
+/// `dir` 裡實際存在的 [`RETIRED`] 檔（只看是不是檔案，不讀、不刪）
+pub fn leftovers(dir: &Path) -> Vec<String> {
+    RETIRED
+        .iter()
+        .filter(|(f, _)| dir.join(f).is_file())
+        .map(|(f, _)| f.to_string())
+        .collect()
+}
+
+/// 舊版留下的檔的提醒（沒有是 None）
+pub fn leftovers_note(dir: &Path, files: &[String]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = files
+        .iter()
+        .map(|f| {
+            let since = RETIRED.iter().find(|(r, _)| r == f).map_or("", |(_, v)| *v);
+            format!("{f}（{since} 起不用）")
+        })
+        .collect();
+    Some(format!(
+        "data/ 裡有舊版留下、這一版已經不讀的檔：{}，略過不用，可以刪掉（{}）。升級時請整個替換 data/，不要只解壓覆蓋",
+        list.join("、"),
+        dir.display()
+    ))
 }
 
 impl DataCheck {
@@ -90,6 +130,9 @@ impl DataCheck {
         if let Some(w) = &self.warning {
             warn!("{w}（{}）", self.dir.display());
         } else if let Some(n) = &self.note {
+            info!("{n}");
+        }
+        if let Some(n) = leftovers_note(&self.dir, &self.leftovers) {
             info!("{n}");
         }
     }
@@ -104,6 +147,7 @@ impl DataCheck {
             "ok": self.ok,
             "warning": self.warning,
             "note": self.note,
+            "leftovers": self.leftovers,
         })
     }
 }
@@ -156,5 +200,30 @@ mod tests {
         assert!(c.ok && c.warning.is_none() && c.note.is_none());
         assert_eq!(c.json()["version"], "3.1.0");
         assert_eq!(c.json()["format"], 1);
+        assert_eq!(c.json()["leftovers"], json!([]));
+    }
+
+    /// 3.5.1：解壓覆蓋留下的舊檔（3.4.x 的 `seed/upstreams.json`）列出來、提醒可以刪，但不刪
+    #[test]
+    fn leftovers_listed_not_deleted() {
+        let d = std::env::temp_dir().join(format!("kuroshio-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("seed")).unwrap();
+        std::fs::write(d.join(FILE), r#"{"dataFormat": 1, "version": "x"}"#).unwrap();
+        assert!(check(&d).leftovers.is_empty());
+        assert_eq!(leftovers_note(&d, &[]), None);
+        std::fs::write(d.join("seed/upstreams.json"), "{}").unwrap();
+        let c = check(&d);
+        assert_eq!(c.leftovers, vec!["seed/upstreams.json"]);
+        assert_eq!(c.json()["leftovers"], json!(["seed/upstreams.json"]));
+        let n = leftovers_note(&d, &c.leftovers).unwrap();
+        assert!(n.contains("seed/upstreams.json（3.5.0 起不用）") && n.contains("整個替換"), "{n}");
+        c.log();
+        assert!(d.join("seed/upstreams.json").exists(), "不在執行時刪安裝目錄的檔");
+        // 同名的資料夾不算
+        std::fs::remove_file(d.join("seed/upstreams.json")).unwrap();
+        std::fs::create_dir_all(d.join("seed/upstreams.json")).unwrap();
+        assert!(leftovers(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

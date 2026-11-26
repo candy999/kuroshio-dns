@@ -7,6 +7,8 @@
 檔案擺放：
   kuroshio 與 data/ 要放在同一個資料夾。執行檔會自動使用自己旁邊的 data/
   （台灣 IP 清單、種子資料、評測名單、設定頁、公開頁，不要刪）。
+  升級：先停止，kuroshio 換新的，data/ 整個刪掉再換成新版的 data/（不要只解壓覆蓋，
+  不然舊版的檔會留下來；黑潮啟動時會在日誌提醒）。設定檔與 persistDir 不用動。
 
 附的設定範例：
   config.example.json       最小的 JSON 設定（複製成 config.json 再改）

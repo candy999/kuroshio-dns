@@ -254,7 +254,7 @@ kuroshio.exe query www.google.com -s quic://dns.example.net
 
 ## 6. 升級
 
-停止（`quit` 或 `service stop`）→ 用新版的 `kuroshio.exe` 和 `data\` 取代舊的 → 啟動。`config.json`、`state\`、`custom-rules.txt` 不用動，新設定的預設值就是建議值。每一版的變更見 [release-notes](release-notes/)。
+停止（`quit` 或 `service stop`）→ 用新版的 `kuroshio.exe` 和 `data\` 取代舊的 → 啟動。`data\` 要**整個刪掉再換成新的**，不要把新版的 zip 解壓覆蓋上去：舊版的檔會留下來（例如 3.4.x 的 `data\seed\upstreams.json`，3.5.0 起不讀），3.5.1 起啟動時日誌會列出這些檔、提醒可以刪（黑潮不會自己刪安裝目錄的檔）。`config.json`、`state\`、`custom-rules.txt` 不用動，新設定的預設值就是建議值。每一版的變更見 [release-notes](release-notes/)。
 
 ## 常見問題
 

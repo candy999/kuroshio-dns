@@ -126,6 +126,7 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 | `data.version` | string \| null | `data/manifest.json` 的 `version` |
 | `data.ok` | bool | data/ 跟執行檔相容（有版本標記而且格式相同） |
 | `data.warning` | string \| null | data/ 的問題 |
+| `data.leftovers` | array of string | 3.5.1：data/ 裡舊版留下、這一版已經不讀的檔（相對 data/ 的路徑，例如 `seed/upstreams.json`）；沒有是 `[]`。不放進 `warnings`，只在啟動日誌記一行 INFO |
 | `warnings` | array of string | 需要注意的事：data/ 不相容、系統時間沒對時、記憶體吃緊、訂閱清單因為記憶體不足被停用、訂閱清單下載失敗、存取控制的台灣 IP 資料讀不到（公網來源擋下中）、新設定無法套用。沒有是 `[]`。文字內容不是約定，只約定「空陣列 = 沒事」 |
 | `freshness` | array | 3.5.0：資料新鮮度，同 `/api/status` 的 `freshness`（見下面「觀測與線路感知」）；舊版服務沒有是 `[]` |
 | `findings` | array | 3.5.0：發現清單，同 `/api/status` 的 `findings`；舊版服務沒有是 `[]`。`warnings` 不受影響（同一件事不兩邊都放） |

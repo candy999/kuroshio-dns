@@ -11,6 +11,8 @@
 
 檔案擺放：
   kuroshio.exe 與 data\ 要放在同一個資料夾（data\ 是台灣 IP 清單、種子資料、設定頁、公開頁，不要刪）。
+  升級：先停止，kuroshio.exe 換新的，data\ 整個刪掉再換成新版的 data\（不要只解壓覆蓋，
+  不然舊版的檔會留下來；黑潮啟動時會在日誌提醒）。config.json、state\、custom-rules.txt 不用動。
   在 kuroshio.exe 旁邊放 config.json 就是攜帶版：設定、state\、自訂規則都在這個資料夾。
   config.json 只寫跟預設值不同的欄位；路徑用 / 或 \\；記事本存檔注意不要變成 config.json.txt。
   kuroshio.exe paths          列出實際讀的設定檔、狀態資料夾、data\、憑證位置
