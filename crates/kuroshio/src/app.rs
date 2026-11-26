@@ -169,8 +169,11 @@ fn filter_fingerprint(cfg: &Value) -> String {
     .to_string()
 }
 
-/// 結束這一輪：把快取留給下一輪（重新載入時用；1 分鐘內沒人接手就丟掉）
+/// 結束這一輪：把快取留給下一輪（重新載入時用；1 分鐘內沒人接手就丟掉）。
+/// 交出之後這一輪不再回 SERVFAIL（[`crate::server::Serving::retire`]）：還有查詢進來（已經建立的 TCP／TLS 連線）
+/// 時快取是空的、要問上游，碰上執行環境關閉就會失敗，那種失敗不能當成答案回給用戶端
 fn hand_over_cache(cfg: &Value, r: &Resolver) {
+    r.serving.retire();
     let c = r.cache.lock().unwrap().take();
     if c.is_empty() {
         return;
@@ -192,6 +195,7 @@ fn adopt_cache(cfg: &Value, r: &Resolver) {
         return;
     }
     let n = r.cache.lock().unwrap().adopt(c, ffp != filter_fingerprint(cfg), Instant::now());
+    r.cache_adopted.store(true, Ordering::Relaxed);
     info!("重新載入：沿用上一輪的 DNS 快取（{n} 筆）");
 }
 
@@ -1360,8 +1364,16 @@ pub fn stage_hot_names(r: &Resolver, p: &Mutex<Persister>, n: usize) {
 
 /// 開機預熱：依序重新查詢上次最常用的網域，每秒 `rate` 筆。
 /// 讀進來的名單照寫出時的規則再過濾一次（[`crate::cache::cap_per_site`]）：3.5.0 以前寫的名單
-/// 可能塞滿同一個網域底下的一次性子網域，不再逐一重問上游
-fn spawn_warmup(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, rate: u64) {
+/// 可能塞滿同一個網域底下的一次性子網域，不再逐一重問上游。
+///
+/// 重新載入時接手了上一輪的 DNS 快取（3.5.1）：不預熱。名單本來就是從那份快取取的，快取裡有的照常命中，
+/// 沒有或過期的上一輪也是一樣、照一般查詢的流程更新；以前每次重新載入都把整份名單再問一次上游
+/// （而且新的一輪上游的成敗紀錄是空的，每筆都同時問好幾台）。回傳有沒有排預熱
+fn spawn_warmup(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, rate: u64) -> bool {
+    if r.cache_adopted.load(Ordering::Relaxed) {
+        info!("重新載入：已經接手上一輪的 DNS 快取，不重跑開機預熱");
+        return false;
+    }
     let raw: Vec<String> = p
         .lock()
         .unwrap()
@@ -1371,7 +1383,7 @@ fn spawn_warmup(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, rate: u64) {
     let before = raw.len();
     let keys = crate::cache::cap_per_site(raw, usize::MAX, r.params.special_use);
     if keys.is_empty() || rate == 0 {
-        return;
+        return false;
     }
     if keys.len() < before {
         info!(
@@ -1391,6 +1403,7 @@ fn spawn_warmup(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, rate: u64) {
             tokio::time::sleep(gap).await;
         }
     });
+    true
 }
 
 fn spawn_hot_names(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, n: usize) {
@@ -1657,14 +1670,41 @@ impl StopReason {
 impl Started {
     /// 重新載入設定時結束這一輪：把有變動的快照全部寫出（規格 05 第 5.3 節），最多 10 秒；
     /// 排隊中與執行中的背景工作交給下一輪（3.5.0 F14）。程式結束走 [`Started::shutdown_for`]，不交接工作
+    ///
+    /// 這個同步版本照舊在寫完快照時直接交出快取（測試、沒有執行環境可以等的地方用）；正式的重新載入走
+    /// [`Started::shutdown_reload`]，交出快取之前先停止監聽、等處理中的查詢做完
     pub fn shutdown(&self) {
+        self.hand_over_state();
+        self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
+    }
+
+    /// 重新載入設定時結束這一輪（`main.rs` 的 `generation`；3.5.1）：
+    /// 1. 背景工作、上游狀態、過濾清單層交給下一輪，寫出快照——這段時間照常回答查詢（快取還在）；
+    /// 2. 停止收新的查詢（監聽 socket 還開在 `listenbank`，封包、連線留給下一輪），處理中的最多等
+    ///    [`crate::server::QUIESCE_MAX`] 做完——它們的答案照常送出，問上游拿到的新答案也會跟著快取交出去；
+    /// 3. 交出快取。之後這一輪不再收一般 DNS 的查詢，快取交出去的那一刻起每一筆都由下一輪回答
+    pub async fn shutdown_reload(&self) {
+        self.hand_over_state();
+        self.flush_within(crate::persist::SHUTDOWN_BUDGET);
+        let t0 = Instant::now();
+        let (loops, left) = self.state.resolver.serving.quiesce(crate::server::QUIESCE_MAX).await;
+        let ms = t0.elapsed().as_millis();
+        if left > 0 {
+            warn!("重新載入：停止收查詢（{loops} 個監聽），還有 {left} 筆查詢等了 {ms} ms 沒做完，交給用戶端重送");
+        } else {
+            info!("重新載入：停止收查詢（{loops} 個監聽），處理中的都回完了（{ms} ms），把快取交給新的一輪");
+        }
+        hand_over_cache(&self.state.cfg, &self.state.resolver);
+    }
+
+    /// 重新載入時交給下一輪的狀態（快取以外）：背景工作、上游狀態、過濾清單層
+    fn hand_over_state(&self) {
         self.hand_over_jobs();
         self.hand_over_upstreams();
         // 3.5.1：建好的過濾清單層交給下一輪（清單沒變就不重建）
         if let Some(f) = &self.state.filter {
             f.hand_over_lists(&persist_dir(&self.state.cfg));
         }
-        self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
     }
 
     /// 3.5.0 F14：排隊中與執行中的工作交給下一輪（沒有就不放）
@@ -1692,12 +1732,17 @@ impl Started {
 
     /// 關機，寫快照（含準備快照內容）最多 `budget`；小檔先寫，寫不完的下次啟動用上一次存的
     pub fn shutdown_within(&self, budget: std::time::Duration) {
+        // 快照寫完之後才交出快取（常用網域的快照要從快取裡取）
+        let _hand = HandOver(&self.state.cfg, &self.state.resolver);
+        self.flush_within(budget);
+    }
+
+    /// 寫出快照（含準備快照內容）最多 `budget`，不交出快取
+    fn flush_within(&self, budget: std::time::Duration) {
         // 模式 B：先移除 HTTP.sys 的網址（重新載入時新的一輪要重新登記）
         if let Some(h) = &self.encrypted.httpsys {
             h.stop();
         }
-        // 快照寫完之後才交出快取（常用網域的快照要從快取裡取）
-        let _hand = HandOver(&self.state.cfg, &self.state.resolver);
         // 記下寫了幾份、多少、花多久：整合方可以依這個決定停止服務時要等多久
         let t0 = Instant::now();
         stage_hot_names(&self.state.resolver, &self.state.persister, self.state.warm_names);

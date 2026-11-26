@@ -247,6 +247,10 @@ pub struct Resolver {
     pub ecs_subnet: RwLock<Option<(IpAddr, u8)>>,
     /// 查詢紀錄（3.5.0）：只在記憶體、預設關閉、有上限；只給管理 API
     pub querylog: crate::querylog::QueryLog,
+    /// 這一輪的監聽迴圈與處理中的查詢（重新載入時先停下來、等做完才交出快取，3.5.1）
+    pub serving: crate::server::Serving,
+    /// 這一輪接手了上一輪的 DNS 快取（重新載入；接手了就不重跑開機預熱，3.5.1）
+    pub cache_adopted: std::sync::atomic::AtomicBool,
     /// 通訊類網域預取中的數量（3.5.0）
     comm_prefetching: AtomicU32,
     inflight: Mutex<HashMap<String, Waiters>>,
@@ -331,6 +335,8 @@ impl Resolver {
             chain: std::sync::OnceLock::new(),
             ecs_subnet: RwLock::new(None),
             querylog: Default::default(),
+            serving: Default::default(),
+            cache_adopted: Default::default(),
             comm_prefetching: AtomicU32::new(0),
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
@@ -655,6 +661,11 @@ impl Resolver {
             self.stats.blocked_name(&qname, ctx.client, cat);
         }
         if e.class == Class::ServFail {
+            // 快取已經交給下一輪、這一輪正在結束（重新載入）：問上游的工作可能是因為執行環境關閉才失敗的，
+            // 不回 SERVFAIL，讓用戶端重送給新的一輪（3.5.1；只在失敗的路徑多一次原子讀取）
+            if self.serving.retired() {
+                return None;
+            }
             self.stats.count(StatKind::ServFail);
         }
         let out = self.serve(&query, &e, stale.then_some(10), Some(ctx.client));

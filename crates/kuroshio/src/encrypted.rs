@@ -677,7 +677,9 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
     };
     let acceptor = tokio_rustls::TlsAcceptor::from(certs.server_config(alpn));
     info!("DoT 監聽 {bound}");
-    tokio::spawn(async move {
+    // 重新載入時先停止接新的連線（`Serving::quiesce`；已經接上的照舊）
+    let owner = resolver.clone();
+    let accept = tokio::spawn(async move {
         loop {
             let (tcp, peer) = match l.accept().await {
                 Ok(x) => x,
@@ -728,6 +730,7 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
             });
         }
     });
+    owner.serving.add_loop(accept.abort_handle());
     Ok(bound)
 }
 
@@ -1062,6 +1065,8 @@ pub async fn doh_core(
             }
             (StatusCode::OK, h, Bytes::from(resp))
         }
+        // 重新載入：這一輪已經把快取交出去、正在結束，沒有答案的（問上游失敗）請用戶端稍後重試（新的一輪會回答）
+        Ok(None) if r.serving.retired() => busy_reply(),
         Ok(None) => txt(StatusCode::BAD_REQUEST, "bad dns message\n"),
     }
 }
@@ -1130,7 +1135,9 @@ pub async fn listen_doh(
         .map(|c| tokio_rustls::TlsAcceptor::from(c.server_config(&[b"h2", b"http/1.1"])));
     info!("DoH 監聽 {}://{bound}{}", if certs.is_some() { "https" } else { "http" }, opts.path);
     let opts = Arc::new(opts);
-    tokio::spawn(async move {
+    // 重新載入時先停止接新的連線（`Serving::quiesce`；已經接上的照舊）
+    let owner = resolver.clone();
+    let accept = tokio::spawn(async move {
         loop {
             let (tcp, peer) = match l.accept().await {
                 Ok(x) => x,
@@ -1186,6 +1193,7 @@ pub async fn listen_doh(
             });
         }
     });
+    owner.serving.add_loop(accept.abort_handle());
     Ok(bound)
 }
 

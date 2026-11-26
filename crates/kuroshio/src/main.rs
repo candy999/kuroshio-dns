@@ -940,7 +940,8 @@ async fn generation(
     // 停止：依原因決定寫快照的時間上限（主控台關閉／登出／關機只有大約 5 秒，3.5.0 C1）；重新載入照舊
     match why {
         Some(w) => started.shutdown_for(w),
-        None => started.shutdown(),
+        // 重新載入：交出快取之前先停止收查詢、等處理中的做完（3.5.1）
+        None => started.shutdown_reload().await,
     }
     Ok(again)
 }
