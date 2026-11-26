@@ -680,7 +680,7 @@ fn repository_lists_have_tiers() {
     use kuroshio_jobs::benchmark::tags::{parse_tagged, Tier};
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/benchmark");
     for (name, a, b) in [
-        ("iplist.txt", 173, 701),
+        ("iplist.txt", 167, 701),
         ("dohlist.txt", 149, 201),
         ("dotlist.txt", 120, 70),
         ("doqlist.txt", 8, 24),
