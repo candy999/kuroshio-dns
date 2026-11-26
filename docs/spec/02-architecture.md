@@ -151,6 +151,7 @@ kuroshio check-config <file>                     檢查設定檔
 | `/api/backup/last-import` | 上一次匯入的合併結果（`<state>/import-last.json`；沒有時 `{none:true}`） |
 | `/api/persist/flush`（POST） | 立即儲存學習資料：有變動的快照全部寫進快照目錄（同 SIGUSR1、`kuroshio notify save`）；回 `{ok, files, bytes, at（Unix 毫秒）, dir}` |
 | `/api/filter/reset-rules`（POST） | 恢復預設自訂規則：`filter.customRules` 的第一個檔案先複製成 `<檔名>.bak`，再寫入這個版本的預設規則（`<shareDir>/default-custom-rules.txt`，沒有就用執行檔內建的），立刻重新載入；已經是預設時不動檔案。回 `{ok, changed, file, backup, source（檔案路徑或 builtin）, bytes, reloaded}` |
+| `/api/stats/exclude`（`?date=YYYY-MM-DD` 是 POST，`&on=0` 取消；不帶 `date` 是 GET） | 3.5.1：把某一天標成「異常、不計入期間統計」（例如壓測那天）。公開頁與儀表板的 7 天、30 天統計（計數、命中率、CDN、網站排行）跳過這一天，`days` 少一天、`excludedDays` 列出被跳過的日子；只看今天時照常。每日紀錄照樣保留（`stats.json` 的那一天多 `"excluded": true`，備份一起帶走）。只能標還保留著的日子（最多 31 天，跟著每日紀錄到期），沒有這一天回 404；回 `{excluded:[日期…], date, changed}`。沒有設定頁的按鈕，OpenWrt 的 rpcd 也不開放（在路由器上用 `curl` 呼叫本機的管理 API） |
 
 `rpcd.sh` 的允許清單同步加入新路徑。備份不走 `api` / `action`：rpcd 另有 `backup_export {kind}`（執行 `kuroshio export --uci`，檔案放在 `/tmp/kuroshio-backup.kuroshio` 讓 LuCI 下載）與 `backup_import {}`（匯入 LuCI 上傳的 `/tmp/kuroshio-import.kuroshio`），兩個都需要 ACL 寫入權限。
 
@@ -184,6 +185,7 @@ kuroshio check-config <file>                     檢查設定檔
 - 設定教學依實際開啟的協議產生：DoH、DoH3、DoT、DoQ 網址，`sdns://` stamp，Android「私人 DNS」主機名稱，Windows 11 DoH 範本，各平台 App 建議。
 - 頁面檔案放在 `data/site/`（安裝後是 `/usr/share/kuroshio/site/`），可以用 `site.htmlFile` / `site.detailFile` 換成自己的版本（同 2.x）；`{{HOST}}` 代入 `site.hostname`，沒設定時用請求的 Host。DoH 不在 443 時網址要帶埠號，用 `{{DOH_URL}}`（完整 DoH 網址）、`{{SITE_URL}}`（這一頁的網址）、`{{DOH_HOSTPORT}}`（網域加埠號）、`{{DOH_PORT}}`；舊的 `{{HOST}}{{DOH_PATH}}` 寫法不會帶埠號。實作見 `crates/kuroshio/src/site.rs`、`presence.rs`。
 - 網站排行（`topSites`、`topBlocked`）只列出至少 `site.minClients` 位不同使用者造訪過的網站，預設 1（全部列出）。
+- **排除異常日（3.5.1）**：`/api/stats/exclude?date=YYYY-MM-DD`（POST）把壓測那種日子標成異常，7 天、30 天的統計跳過它（見第 6 節的管理 API 表）。以前一天的壓測就把 7 天、30 天的命中率從 49.6% 拉到 8.6%，要等 30 天才恢復。
 - **隱私提醒（3.5.1）**：公開頁開著、DoH 開著、有設定網域（`site.hostname`，`domain` 會自動帶入）——也就是公開頁對外開放——而且 `site.minClients` 還是 1 時，啟動時記一行 WARN、發現清單有一筆 info（`site-min-clients-1`），建議公開給別人用的伺服器設 2 以上。**預設維持 1**：大部分是家裡的路由器，只有一兩台裝置，改成 2 排行就空了；已經在用的公開頁也不會因為升級突然變空。公開伺服器會列出只有一台裝置去過的網站、每日排行保存 31 天，由站長自己決定。
 - 排行的資料（3.5.1）：今天的網站與被擋網站各最多 20,000 個（`stats.rs` 的 `Limits.anon_sites`），過去每一天各留前 300 名。收滿時一次淘汰次數最少的一半（同樣次數時最久沒被查到的先，`evict_half()`），再收新的網站；以前收滿就不再加，壓測那天被單一來源的一次性網域佔滿，之後真正使用者的新網站都記不到。每收一萬個新網站才整理一次（攤銷 O(1)），在既有的統計鎖裡做、只比次數與順序兩個數字、不複製網站名稱。
 

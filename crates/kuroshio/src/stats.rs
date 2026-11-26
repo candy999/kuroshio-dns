@@ -120,6 +120,9 @@ struct Day {
     /// 匿名網站排行（過去的日子；今天的在 `Inner::sites`）
     sites: Vec<SiteRow>,
     blocked_sites: Vec<SiteRow>,
+    /// 站長標成「異常、不計入期間統計」的日子（3.5.1，例如壓測那天）：7 天、30 天的統計與網站排行跳過這一天，
+    /// 每日紀錄照樣保留（`/api/stats/exclude`）
+    excluded: bool,
 }
 
 /// 機會成本：一般 DNS 會不會出國、我們有沒有拉回台灣（同 2.x `stats.route`）
@@ -695,8 +698,18 @@ fn rows_from_json(v: Option<&Value>) -> Vec<SiteRow> {
 }
 
 impl Day {
-    /// 對齊 2.x 每日紀錄的欄位（不含網站排行）
+    /// 對齊 2.x 每日紀錄的欄位（不含網站排行）；標成異常的日子多 `"excluded": true`
     fn json(&self) -> Value {
+        let mut v = self.json_base();
+        if self.excluded {
+            if let Some(o) = v.as_object_mut() {
+                o.insert("excluded".into(), Value::Bool(true));
+            }
+        }
+        v
+    }
+
+    fn json_base(&self) -> Value {
         let d = self;
         json!({
             "date": d.date, "query": d.query, "hit": d.hit, "miss": d.miss, "servfail": d.servfail, "local": d.local,
@@ -804,11 +817,13 @@ impl Day {
             route,
             sites: rows_from_json(v.get("sites")),
             blocked_sites: rows_from_json(v.get("blockedSites")),
+            excluded: v.get("excluded") == Some(&Value::Bool(true)),
         })
     }
 
     /// 把另一天的計數加進來（還原快照時，今天已經有計數的話合併）
     fn add(&mut self, o: &Day) {
+        self.excluded |= o.excluded;
         self.query += o.query;
         self.hit += o.hit;
         self.miss += o.miss;
@@ -1251,6 +1266,31 @@ impl Stats {
             .collect()
     }
 
+    /// 把某一天標成「異常、不計入期間統計」（`on`）或取消（3.5.1）。只能標還保留著的日子（最多 [`RETENTION_DAYS`] 天，
+    /// 跟著每日紀錄存進 `stats.json`、到期一起刪），所以有上限。回傳之前的狀態；沒有這一天回 None
+    pub fn set_excluded(&self, date: &str, on: bool) -> Option<bool> {
+        self.with(|i| {
+            let d = if i.day.date == date {
+                &mut i.day
+            } else {
+                i.history.iter_mut().find(|d| d.date == date)?
+            };
+            Some(std::mem::replace(&mut d.excluded, on))
+        })
+    }
+
+    /// 標成異常的日子（舊的在前）
+    pub fn excluded_days(&self) -> Vec<String> {
+        self.with(|i| {
+            i.history
+                .iter()
+                .chain(std::iter::once(&i.day))
+                .filter(|d| d.excluded && !d.date.is_empty())
+                .map(|d| d.date.clone())
+                .collect()
+        })
+    }
+
     /// 每日各 CDN 的機會成本（`/api/routing`：`{日期: {CDN: {...}}}`）
     pub fn routing_json(&self) -> Value {
         let days = self.with(|i| i.days());
@@ -1275,18 +1315,23 @@ impl Stats {
     /// 只列出人數 ≥ `min_clients` 的網站。`blocked`：被擋網站排行。回傳 `[{site, count}]`
     pub fn anon_ranking(&self, days: usize, blocked: bool, min_clients: u64, n: usize) -> Value {
         let all = self.with(|i| {
-            let mut v: Vec<Vec<SiteRow>> = i
+            let mut v: Vec<(bool, Vec<SiteRow>)> = i
                 .history
                 .iter()
-                .map(|d| if blocked { d.blocked_sites.clone() } else { d.sites.clone() })
+                .map(|d| (d.excluded, if blocked { d.blocked_sites.clone() } else { d.sites.clone() }))
                 .collect();
             if !i.day.date.is_empty() {
-                v.push(dump(if blocked { &i.blocked_sites } else { &i.sites }));
+                v.push((i.day.excluded, dump(if blocked { &i.blocked_sites } else { &i.sites })));
             }
             v
         });
         let mut agg: HashMap<String, (u64, u32)> = HashMap::new();
-        for rows in all.iter().skip(all.len().saturating_sub(days)) {
+        // 期間（7 天、30 天）跳過標成異常的日子；只看今天時照樣列（3.5.1）
+        for (_, rows) in all
+            .iter()
+            .skip(all.len().saturating_sub(days))
+            .filter(|(excluded, _)| days <= 1 || !*excluded)
+        {
             for (site, cnt, c) in rows {
                 let e = agg.entry(site.clone()).or_default();
                 e.0 += cnt;
@@ -1509,6 +1554,39 @@ mod tests {
         assert_eq!(d.len(), RETENTION_DAYS);
         assert_eq!(d.last().unwrap().0, today);
         assert_eq!(d[0].0, "2001-01-11", "只留最近的日子");
+    }
+
+    /// 3.5.1：標成異常的日子不算進 7 天／30 天的網站排行，跟著快照保存；只能標還保留著的日子
+    #[test]
+    fn excluded_days_skip_period_ranking_and_persist() {
+        let st = Stats::default();
+        let old = json!({ "days": [
+            { "date": "2000-01-01", "query": 5, "sites": { "example.net": [5, 2] } },
+            { "date": "2000-01-02", "query": 90_000, "sites": { "flood.example.com": [90_000, 1] } },
+        ] });
+        assert!(st.restore(&serde_json::to_vec(&old).unwrap()));
+        assert_eq!(st.anon_ranking(30, false, 1, 10)[0]["site"], "flood.example.com");
+        assert_eq!(st.set_excluded("2000-01-02", true), Some(false));
+        assert_eq!(st.set_excluded("2000-01-02", true), Some(true), "已經標過");
+        assert_eq!(st.set_excluded("1999-12-31", true), None, "沒有這一天");
+        assert_eq!(st.excluded_days(), vec!["2000-01-02"]);
+        assert_eq!(st.anon_ranking(30, false, 1, 10), json!([{ "site": "example.net", "count": 5 }]));
+        let daily = st.daily();
+        assert_eq!(daily[1].1["excluded"], true);
+        assert!(daily[0].1.get("excluded").is_none(), "沒標的日子欄位不變");
+        // 存檔、讀回來還在；取消
+        let back = Stats::default();
+        assert!(back.restore(&st.snapshot()));
+        assert_eq!(back.excluded_days(), vec!["2000-01-02"]);
+        assert_eq!(back.set_excluded("2000-01-02", false), Some(true));
+        assert!(back.excluded_days().is_empty());
+        assert_eq!(back.anon_ranking(30, false, 1, 10)[0]["site"], "flood.example.com");
+        // 今天也可以標：只看今天時照樣列，期間統計跳過
+        let today = taipei_date(now_unix());
+        st.site("www.example.org", "192.0.2.1".parse().unwrap());
+        assert_eq!(st.set_excluded(&today, true), Some(false));
+        assert_eq!(st.anon_ranking(1, false, 1, 10)[0]["site"], "example.org");
+        assert!(!st.anon_ranking(7, false, 1, 10).to_string().contains("example.org"));
     }
 
     /// 3.5.1：匿名排行收滿時淘汰次數最少的一半，不再拒收新網站（壓測那天一次性網域佔滿，真正的網站記不到）

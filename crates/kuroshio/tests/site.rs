@@ -391,6 +391,42 @@ async fn public_stats_ranges() {
     let m = s.public_stats("30d");
     assert_eq!(m["days"], 30);
     assert_eq!(m["totals"]["queries"], (12..=40).sum::<u64>() + 4);
+    // 3.5.1：站長把某一天標成異常（壓測那天）→ 7 天、30 天的統計與排行跳過那一天，今天照常；可以取消
+    let ex = |q: &str| kuroshio::admin::parse_query(q);
+    assert!(
+        kuroshio::admin::is_action("/api/stats/exclude", &ex("date=2001-02-12")),
+        "改標記只接受 POST"
+    );
+    assert!(!kuroshio::admin::is_action("/api/stats/exclude", &ex("")));
+    let r = kuroshio::admin::route(&st, "/api/stats/exclude", &ex("date=2001-02-12")).await;
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert_eq!(r.body["excluded"], json!(["2001-02-12"]));
+    assert_eq!(r.body["changed"], true);
+    // 公開頁的統計有 1 分鐘的快取：用管理 API 的儀表板（同一份統計、不快取）看
+    let dash = |range: &str| {
+        let st = st.clone();
+        let q = ex(&format!("range={range}"));
+        async move { kuroshio::admin::route(&st, "/api/dashboard", &q).await.body }
+    };
+    let w2 = dash("7d").await;
+    assert_eq!(w2["totals"]["queries"], (35..=39).sum::<u64>() + 4, "第 40 天不算");
+    assert_eq!(w2["days"], 6);
+    assert_eq!(w2["excludedDays"], json!(["2001-02-12"]));
+    assert_eq!(dash("30d").await["totals"]["queries"], (12..=39).sum::<u64>() + 4);
+    assert_eq!(dash("today").await["excludedDays"], json!([]), "只看今天不受影響");
+    assert_eq!(
+        kuroshio::admin::route(&st, "/api/stats/exclude", &ex("")).await.body["excluded"],
+        json!(["2001-02-12"])
+    );
+    assert_eq!(
+        kuroshio::admin::route(&st, "/api/stats/exclude", &ex("date=1999-01-01")).await.code,
+        404,
+        "沒有這一天"
+    );
+    assert_eq!(kuroshio::admin::route(&st, "/api/stats/exclude", &ex("date=bad")).await.code, 400);
+    let r = kuroshio::admin::route(&st, "/api/stats/exclude", &ex("date=2001-02-12&on=0")).await;
+    assert_eq!(r.body["excluded"], json!([]));
+    assert_eq!(dash("7d").await["totals"]["queries"], (35..=40).sum::<u64>() + 4);
     assert_eq!(s.public_stats("bogus")["range"], "today", "不認識的期間當成今天");
     let r = get(&s, "/api/public/stats?range=30d").await.unwrap();
     assert_eq!(r.header("cache-control"), Some("no-cache"));

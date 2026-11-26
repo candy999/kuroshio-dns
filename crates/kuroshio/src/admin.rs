@@ -164,6 +164,8 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         | "/api/notify/wan-changed"
         | "/api/chain/recheck"
         | "/api/querylog/enable" => true,
+        // 帶 date 是改標記（動作）；不帶是看目前標了哪些
+        "/api/stats/exclude" => q.contains_key("date"),
         p => match p.strip_prefix("/api/community/") {
             Some("status" | "peers" | "events" | "scores" | "invite") => false,
             // 不帶 channel 是查詢，帶了是指定管道
@@ -1010,6 +1012,37 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
         }
         // 每日各 CDN 的機會成本（最多 31 天）
         "/api/routing" => ok(r.stats.routing_json()),
+        // 把某一天標成「異常、不計入公開頁的 7 天／30 天統計」（3.5.1，例如壓測那天）：`date=YYYY-MM-DD`、`on=0` 取消。
+        // 只能標還保留著的日子（最多 31 天），跟著每日紀錄存進 stats.json（POST）；不帶 date 是看目前標了哪些
+        "/api/stats/exclude" => {
+            let list = |r: &crate::resolver::Resolver| json!({ "excluded": r.stats.excluded_days() });
+            let Some(date) = q.get("date") else {
+                return ok(list(r));
+            };
+            if date.len() != 10 {
+                return bad("date 要是 YYYY-MM-DD", 400);
+            }
+            let on = !matches!(q.get("on").map(String::as_str), Some("0" | "false"));
+            match r.stats.set_excluded(date, on) {
+                Some(was) => {
+                    if was != on {
+                        info!(
+                            "統計：{date} {}",
+                            if on {
+                                "標成異常、不計入期間統計"
+                            } else {
+                                "取消異常標記"
+                            }
+                        );
+                    }
+                    let mut v = list(r);
+                    v["date"] = json!(date);
+                    v["changed"] = json!(was != on);
+                    ok(v)
+                }
+                None => bad("沒有這一天的統計（只保留最近 31 天）", 404),
+            }
+        }
         // 儀表板（LuCI、Windows 設定頁）：跟公開頁同一份統計，但排行不受 site.minClients 限制、列得比較多
         "/api/dashboard" => ok(crate::site::dashboard_stats(
             st,

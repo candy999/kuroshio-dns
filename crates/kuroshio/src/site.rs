@@ -932,7 +932,14 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     let r = &state.resolver;
     let stats = &r.stats;
     let daily = stats.daily();
-    let keys = &daily[daily.len().saturating_sub(days)..];
+    let window = &daily[daily.len().saturating_sub(days)..];
+    // 期間（7 天、30 天）跳過站長標成異常的日子（3.5.1，`/api/stats/exclude`）；只看今天時照樣算
+    let excluded_days: Vec<&str> = window
+        .iter()
+        .filter(|(_, d)| days > 1 && d.get("excluded") == Some(&Value::Bool(true)))
+        .map(|(date, _)| date.as_str())
+        .collect();
+    let keys: Vec<&(String, Value)> = window.iter().filter(|(date, _)| !excluded_days.contains(&date.as_str())).collect();
     let n = |d: &Value, k: &str| d.get(k).and_then(Value::as_u64).unwrap_or(0);
     let f = |d: &Value, k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     const SUM: [&str; 12] = [
@@ -954,7 +961,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     // 機會成本：一般 DNS 會把多少 CDN 連線送出國、我們拉回台灣多少
     let mut route_agg: BTreeMap<String, [f64; 6]> = BTreeMap::new();
     let mut cross_pairs: BTreeMap<String, u64> = BTreeMap::new();
-    for (_, d) in keys {
+    for (_, d) in keys.iter().copied() {
         for k in SUM {
             *sum.get_mut(k).expect("SUM") += n(d, k);
         }
@@ -1126,7 +1133,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     let min_c = min_clients.max(1);
     let mut out = json!({
         "generatedAt": crate::stats::iso_utc(now_ms()),
-        "range": range, "days": keys.len(),
+        "range": range, "days": keys.len(), "excludedDays": excluded_days,
         "totals": {
             "queries": q, "blocked": blocked, "blockedAds": s("blockedAds"), "blockedMalware": s("blockedMalware"),
             "blockedTelemetry": s("blockedTelemetry"), "blockedCustom": s("blockedCustom"),
