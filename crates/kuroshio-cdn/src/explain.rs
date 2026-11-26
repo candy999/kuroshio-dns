@@ -137,6 +137,10 @@ fn verdict_step(what: &str, v: Option<&Verdict>, now: u64) -> Value {
             if let Some(p) = crate::verifier::orig_tw_pop(v) {
                 j["origTw"] = json!(p);
             }
+            // 最近節點型換到同一個 POP 不算改善、不換（3.5.1 L11）
+            if let Some(p) = crate::verifier::same_pop_of(v) {
+                j["samePop"] = json!(p);
+            }
             j
         }
     }
@@ -395,6 +399,10 @@ impl Cdn {
                 if v.is("fail") {
                     if let Some(pop) = crate::verifier::orig_tw_pop(v) {
                         return (d::ALREADY_TW, format!("驗證時原本的答案在 {pop}"));
+                    }
+                    // 最近節點型：原本的答案跟最近的節點在同一個 POP（3.5.1 L11）
+                    if let Some(pop) = crate::verifier::same_pop_of(v) {
+                        return (d::NO_TW_NODE, format!("原本的答案已經在 {pop}，換到同一個 POP 不會比較近"));
                     }
                     return (d::VERIFY_FAILED, v.reason.clone().unwrap_or_default());
                 }

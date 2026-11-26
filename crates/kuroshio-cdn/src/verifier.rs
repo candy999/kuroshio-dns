@@ -256,6 +256,14 @@ pub(crate) fn slow1_at(v: &crate::db::Verdict) -> Option<u64> {
 /// 驗證結果 `extra` 裡「原本的答案已經在台灣機房」的 POP（3.5.1）：有這個欄位的 `fail` 不是驗證失敗，是「不用換」
 pub const ORIG_TW: &str = "origTw";
 
+/// 驗證結果 `extra` 裡「最近節點型換到同一個 POP 不算改善」的 POP（3.5.1 L11）：有這個欄位的 `fail` 是「不用換」
+pub const SAME_POP: &str = "samePop";
+
+/// 「最近節點型換到同一個 POP」的 POP（沒有回 None）
+pub fn same_pop_of(v: &crate::db::Verdict) -> Option<&str> {
+    v.extra.get(SAME_POP).and_then(serde_json::Value::as_str)
+}
+
 /// 「原本的答案已經在台灣機房」的 POP（沒有回 None）
 pub fn orig_tw_pop(v: &crate::db::Verdict) -> Option<&str> {
     v.extra.get(ORIG_TW).and_then(serde_json::Value::as_str)
@@ -515,7 +523,7 @@ impl Cdn {
                 && b.status < 500
                 && looks_broken_r(provider, b).is_none()
             {
-                return Some(self.done_orig_tw(name, provider, family, prev_fails, o, &base_pop, b));
+                return Some(self.done_orig_tw(name, provider, family, prev_fails, o, &base_pop, b, false));
             }
         }
 
@@ -736,6 +744,13 @@ impl Cdn {
                 continue;
             }
             self.with_state(|st| st.pools.zone_note_site(provider, ip, true, name));
+            // 3.5.1 L11：最近節點型（Fastly）換到跟原本同一個 POP 不算改善（比照「原本就在台灣不換」）：
+            // 同一個城市的另一台機器，連線的路一樣，量到的延遲差多半是雜訊。不加失敗次數、不標壞節點
+            if let (Some(b), Some(o)) = (base_ok, orig) {
+                if family == 4 && Cdn::is_nearest(provider) && !always && !base_pop.is_empty() && pop == base_pop {
+                    return Some(self.done_orig_tw(name, provider, family, prev_fails, o, &base_pop, b, true));
+                }
+            }
             // 3.5.0 F9（E7 第二版）：台灣節點能用，但握手連續兩次（相隔 10 分鐘以上）比原本慢 → 暫時用原本的答案
             // （既有的「驗證失敗 → 原始」），15 分鐘後有人查再重驗。節點沒有壞：不標壞、不增加失敗次數；好友的提示照樣算命中
             let chk = self.slower_check(provider, family, orig, http_mode, base_ok, &r, prev_slow, always);
@@ -941,11 +956,14 @@ impl Cdn {
         orig: IpAddr,
         pop: &str,
         b: &ProbeResult,
+        same_pop: bool,
     ) -> &'static str {
         let now = now_ms();
         let until = now + (self.cfg.verify_fail_hours * HOUR_MS as f64) as u64;
         self.with_state(|st| {
-            st.stats.orig_tw = st.stats.orig_tw.saturating_add(1);
+            if !same_pop {
+                st.stats.orig_tw = st.stats.orig_tw.saturating_add(1);
+            }
             st.db.with_slot(name, provider, |db| {
                 db.set_verdict(name, family, |v| {
                     v.verdict = Some(intern("fail"));
@@ -956,19 +974,32 @@ impl Cdn {
                     v.ms = if b.ms > 0.0 { Num::V(util::round(b.ms, 1)) } else { Num::Null };
                     v.status = Num::V(b.status as f64);
                     v.ip = Some(orig);
-                    v.reason = Some(format!("原本的答案已經在台灣機房（{pop}），不換"));
+                    v.reason = Some(if same_pop {
+                        format!("原本的答案已經在 {pop}，最近的節點也在 {pop}：換到同一個 POP 不會比較近，不換")
+                    } else {
+                        format!("原本的答案已經在台灣機房（{pop}），不換")
+                    });
                     apply_slow(&mut v.extra, SlowMark::Clear, now);
+                    clear_key(&mut v.extra, UNSURE);
+                    clear_key(&mut v.extra, if same_pop { ORIG_TW } else { SAME_POP });
                     v.extra
                         .0
                         .get_or_insert_with(Default::default)
-                        .insert(ORIG_TW.into(), serde_json::json!(pop));
+                        .insert((if same_pop { SAME_POP } else { ORIG_TW }).into(), serde_json::json!(pop));
                 })
             })
         });
-        info!(
-            "◎ {name} IPv{family} 原本的答案已經在台灣機房（{pop}），不換；{} 小時後有人查再看一次",
-            self.cfg.verify_fail_hours
-        );
+        if same_pop {
+            info!(
+                "◎ {name} IPv{family} 原本的答案已經在 {pop}，最近的節點也在 {pop}：不換；{} 小時後有人查再看一次",
+                self.cfg.verify_fail_hours
+            );
+        } else {
+            info!(
+                "◎ {name} IPv{family} 原本的答案已經在台灣機房（{pop}），不換；{} 小時後有人查再看一次",
+                self.cfg.verify_fail_hours
+            );
+        }
         "fail"
     }
 
@@ -1167,6 +1198,7 @@ impl Cdn {
                     apply_slow(&mut v.extra, d.slow, now);
                     clear_orig_tw(&mut v.extra);
                     clear_key(&mut v.extra, UNSURE);
+                    clear_key(&mut v.extra, SAME_POP);
                 })
             })
         });

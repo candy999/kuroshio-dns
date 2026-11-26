@@ -160,6 +160,7 @@ impl Cdn {
                             !v.reason.as_deref().unwrap_or("").contains("試了")
                                 && v.extra.get(crate::verifier::SLOWER).is_none()
                                 && v.extra.get(crate::verifier::ORIG_TW).is_none()
+                                && v.extra.get(crate::verifier::SAME_POP).is_none()
                                 && pools.is_restricted(p, ip)
                         }
                         _ => false,

@@ -1186,9 +1186,10 @@ async fn verifier_octet_mode_verifies_backup_ips_for_this_site() {
         st.db.touch("fo.test", "fastly", "ip", &ips(&["151.101.65.140"]), &[], None);
     });
     let ok = || resp(200, &[("x-served-by", "cache-hkg17920-HKG")], "<html>ok</html>");
-    // .78.140 的憑證不是這個網站的
+    // .78.140 的憑證不是這個網站的；原本的答案在東京
     net.on_https(move |i, _| match i.to_string().as_str() {
         "151.101.78.140" => ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true),
+        "151.101.65.140" => resp(200, &[("x-served-by", "cache-nrt12345-NRT")], "<html>ok</html>"),
         _ => ok(),
     });
     assert_eq!(c.verify("fo.test", "fastly", 4, Some(ip("151.101.65.140"))).await, Some("ok"));
@@ -1196,6 +1197,21 @@ async fn verifier_octet_mode_verifies_backup_ips_for_this_site() {
     assert_eq!(v.ip, Some(ip("151.101.76.140")));
     assert_eq!(v.ips, Some(ips(&["151.101.76.140", "151.101.77.140"])), "憑證不符的 .78 不列入");
     assert_eq!(net.calls("https 151.101.78.140").len(), 1);
+    // 3.5.1 L11：原本的答案就在 HKG，最近的節點也在 HKG → 換到同一個 POP 不算改善，不換、不算失敗
+    net.on_https(move |i, _| match i.to_string().as_str() {
+        "151.101.78.140" => ProbeResult::failed("ERR_TLS_CERT_ALTNAME_INVALID", true),
+        _ => ok(),
+    });
+    assert_eq!(c.verify("fo.test", "fastly", 4, Some(ip("151.101.65.140"))).await, Some("fail"));
+    let v = c.state().db.get("fo.test").unwrap().v4.clone().unwrap();
+    assert_eq!(crate::verifier::same_pop_of(&v), Some("HKG"));
+    assert_eq!(v.fails, Some(0), "不加失敗次數");
+    assert_eq!(v.ip, Some(ip("151.101.65.140")));
+    let e = c.explain("fo.test", crate::explain::Context::default());
+    assert_eq!(e["decision"], "no-tw-node", "{e}");
+    assert_eq!(e["steps"][0]["samePop"], "HKG", "{e}");
+    let mut m = msg("fo.test", 1, &["151.101.65.140"], vec![]);
+    assert_eq!(c.apply(&mut m, "fo.test", rtype::A).rewritten, None, "查詢路徑照原本的答案");
 }
 
 #[tokio::test]

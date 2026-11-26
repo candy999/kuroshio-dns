@@ -991,7 +991,7 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
   | `essential` | 3.5.0 F11：內建的時間同步、連線偵測、憑證撤銷、地震速報服務：不改寫、不擋。多 `known: true` 與 `essential`（類別代碼 `ntp`、`netcheck`、`revocation`、`quake`），沒有 `provider`／`steps`（這些網域不記進資料庫，`/api/cdn/domain` 查不到） |
   | `verify-failed` | 台灣節點驗證沒通過（到期後重新驗證） |
   | `pool-changed` | 3.5.1：驗證通過過，但驗證過的節點已經不在節點池（或被暫停）；跟查詢路徑一樣先回原本的答案（TTL 10 秒），下次查詢重新驗證 |
-  | `no-tw-node` | 找不到可用的台灣節點，跨 CDN 也沒有 |
+  | `no-tw-node` | 找不到可用的台灣節點，跨 CDN 也沒有。3.5.1：最近節點型（Fastly）原本的答案已經夠近、或跟最近的節點在同一個 POP（`steps` 的 `v4` 多 `samePop`）時也是這個 |
   | `no-pool` | 這家 CDN 的台灣節點池還沒建好；3.5.1 起也包括「建過了，但裡面沒有可用的節點」（查詢路徑直接回原本的答案，不縮短 TTL） |
   | `nearest` | 3.5.1：最近節點型（Fastly，在台灣沒有節點）已經換成驗證過、比原本快的最近節點 |
   | `cross` | 換成同一個網站在別家 CDN 的台灣節點 |
