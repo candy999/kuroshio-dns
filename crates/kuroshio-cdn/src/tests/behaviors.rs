@@ -816,6 +816,30 @@ fn new_domains_held_when_far_over_budget() {
 }
 
 #[test]
+fn new_domains_need_second_ask_near_max_entries() {
+    // 3.5.1 H1：沒有磁碟預算（Windows、大磁碟）時 K4 不會擋；筆數到了 cdn.maxEntries 的 90%，新網域問第二次才記
+    let (c, _net) = setup(json!({ "maxEntries": 100 }));
+    c.with_state(|st| st.pools.p.get_mut("cloudflare").unwrap().range4 = crate::pools::cidr(&["198.51.100.0/24"]));
+    c.with_state(|st| {
+        for i in 0..90 {
+            st.db.touch(&format!("d{i}.example.com"), "cloudflare", "ip", &[], &[], None);
+        }
+    });
+    let mut m = msg("once.example.net", 1, &["198.51.100.9"], vec![]);
+    let r = c.apply(&mut m, "once.example.net", rtype::A);
+    assert!(r.tags.iter().any(|t| t.contains("問第二次才記")), "{:?}", r.tags);
+    assert!(c.state().db.get("once.example.net").is_none());
+    assert!(c.take_tasks().is_empty(), "不記也不排驗證");
+    let mut m = msg("once.example.net", 1, &["198.51.100.9"], vec![]);
+    c.apply(&mut m, "once.example.net", rtype::A);
+    assert!(c.state().db.get("once.example.net").is_some(), "第二次就記");
+    let hits = c.state().db.get("d1.example.com").unwrap().hits;
+    let mut m = msg("d1.example.com", 1, &["198.51.100.9"], vec![]);
+    c.apply(&mut m, "d1.example.com", rtype::A);
+    assert_eq!(c.state().db.get("d1.example.com").unwrap().hits, hits + 1, "已經記著的照常");
+}
+
+#[test]
 fn classifier_snapshot_follows_range_changes() {
     // `apply()` 用唯讀快照判斷是不是 CDN（不拿狀態鎖）；範圍 / 分類不管怎麼換，放開鎖之後快照都要跟上
     let (c, _net) = setup(json!({}));

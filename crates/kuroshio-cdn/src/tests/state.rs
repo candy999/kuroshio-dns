@@ -638,9 +638,11 @@ fn shard_dir_size(dir: &std::path::Path) -> u64 {
 #[test]
 fn budget_zero_disables() {
     // 沒有預算（`cdn.dbDiskBudgetKB` 是 0、或 "auto" 在大磁碟上換算成 0）：一筆都不淘汰、不標任何變動，只量大小
+    // （3.5.1 H2 的「忘掉一次性網域」不管有沒有預算都做，這裡先把種子裡的一次性網域當成問過兩次，只看預算）
     let (paths, _, n0) = seeded_shards("budget-off");
     for cfg in [budget_cfg(0), full_cfg()] {
         let c = Cdn::load(&cfg, paths.clone(), MockNet::new());
+        c.with_state(|st| st.db.domains.values_mut().for_each(|d| d.hits = d.hits.max(2)));
         let n = c.state().db.domains.len();
         assert_eq!(n, n0);
         assert_eq!(c.budget_round(), crate::cdn::BudgetRound::default());
@@ -652,6 +654,32 @@ fn budget_zero_disables() {
         assert!(st["dbDiskKB"].as_u64().unwrap() > 300, "實際大小照樣量：{st}");
         assert_eq!(st["prunedForBudget"], json!(0));
     }
+}
+
+#[test]
+fn one_shot_domains_forgotten_without_budget() {
+    // 3.5.1 H2：沒有磁碟預算（Windows、大磁碟）也定期忘掉 3 天沒出現、只問過一次、沒有學習資料的網域；
+    // 每 5 分鐘的預算整理那一輪做，輪流幾個分片，學習資料不動
+    let c = Cdn::load(&budget_cfg(0), paths_no_seed("forget-one-shot"), MockNet::new());
+    let old = crate::util::now_ms() - 4 * 86_400_000;
+    c.with_state(|st| {
+        for i in 0..2000 {
+            st.db.touch(&format!("o{i}.example.net"), "cloudflare", "ip", &[], &[], None);
+            st.db.get_mut(&format!("o{i}.example.net")).unwrap().last_seen = old;
+        }
+        st.db.touch("kept.example.com", "cloudflare", "ip", &[], &[], None);
+        st.db.get_mut("kept.example.com").unwrap().last_seen = old;
+        st.db.set_verdict("kept.example.com", 4, |v| v.verdict = Some("ok".into()));
+        st.db.take_marks(false);
+    });
+    let shards = c.state().db.shards;
+    let mut total = 0;
+    for _ in 0..(16 + 1) {
+        total += c.budget_round().forgot;
+    }
+    assert_eq!(total, 2000, "{shards} 片、每輪 1/16，一圈之內忘光");
+    assert!(c.state().db.get("kept.example.com").is_some(), "有學習資料的不動");
+    assert_eq!(c.status_lite()["forgotOneShot"], json!(2000));
 }
 
 #[test]

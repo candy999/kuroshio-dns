@@ -2,7 +2,7 @@
 //! 跨 CDN 結果、手動策略，以及節點池工作用的候選 IP（harvest）。
 //!
 //! 每筆紀錄保持精簡：常見字串（CDN 名稱、判定）共用、選填的子物件放在 `Box` 裡，沒有就只佔一個指標。
-//! 筆數上限 `cdn.maxEntries`（安全上限，不分機器；記憶體由記憶體控制把冷資料移到磁碟），超過時刪掉最久沒出現的（手動設定策略的不刪）。
+//! 筆數上限 `cdn.maxEntries`（安全上限，不分機器；記憶體由記憶體控制把冷資料移到磁碟），超過時依價值淘汰：沒有學習資料、只問過一次的先刪，有學習資料的最後才動（手動設定策略的不刪；3.5.1 H1）。
 
 use crate::util::{
     self, de_arc, de_ips, de_opt_arc, de_opt_bool, de_opt_ip, de_opt_ips, de_opt_string, de_opt_u32, de_opt_u64, de_u32, de_u64, now_ms,
@@ -984,7 +984,22 @@ pub struct Db {
     budget_sweep: bool,
     /// 尊重多來源 CDN、第一層 CNAME 變了就失效（3.5.0 B3，`cdn.multiCdn`）。關掉時同 3.4.x：業者欄位直接改寫
     pub multi_cdn: bool,
+    /// 筆數接近上限時「問第二次才記」的名單（3.5.1 H1）：名稱雜湊的直接對應表，固定 [`SEEN_ONCE_SLOTS`] 格、
+    /// 新的蓋掉舊的（不必清，也不會長大）。沒接近上限時是空的、不佔記憶體
+    seen_once: Vec<u32>,
+    /// 一次性網域定期忘掉（3.5.1 H2）：下一輪從第幾個分片開始
+    forget_cursor: usize,
 }
+
+/// 一次性網域（只問過一次、沒有學習資料）超過這麼久沒出現就忘掉（3.5.1 H2）
+pub const FORGET_ONE_SHOT_MS: u64 = 3 * 24 * 3600 * 1000;
+/// 每一輪最多忘掉幾筆（拿鎖的時間有上限）
+pub const FORGET_ONE_SHOT_MAX: usize = 8192;
+
+/// 筆數到了 `cdn.maxEntries` 的這個比例（90%）以上，新網域問第二次才記（3.5.1 H1）
+pub const ADMIT_SECOND_PERCENT: usize = 90;
+/// 「問第二次才記」的名單有幾格（每格 4 bytes，共 16 KB）：大約記得最近 4,096 個只問過一次的新網域
+pub const SEEN_ONCE_SLOTS: usize = 4096;
 
 /// `switch_provider()` 的結果
 enum Switch {
@@ -1031,6 +1046,34 @@ pub fn has_learning(d: &Domain) -> bool {
     d.v4.is_some() || d.v6.is_some() || d.ecs.is_some() || d.cross4.is_some() || d.best.is_some()
 }
 
+/// 筆數上限淘汰的組數（[`prune_group`]）
+const PRUNE_GROUPS: usize = 4;
+
+/// 筆數到了 `cdn.maxEntries` 時淘汰的組（小的先刪；3.5.1 H1）：
+///
+/// | 組 | 是什麼 |
+/// |---|---|
+/// | 0 | 沒有學習資料（[`has_learning`]）、只問過 1 次 |
+/// | 1 | 沒有學習資料、問過 2 次以上 |
+/// | 2 | 有學習資料、但沒有任何成功的結果（驗證失敗、ECS 或跨 CDN 沒有找到） |
+/// | 3 | 有成功的結果（驗證通過、ECS、跨 CDN 找到台灣節點）：每筆省下一次重新驗證 |
+///
+/// 不看最後出現的時間（同一組裡才看）：大量一次性網域湧入時它們全都是「剛出現」，只看時間會把舊的學習資料先刪光
+pub fn prune_group(d: &Domain) -> u8 {
+    if !has_learning(d) {
+        return u8::from(d.hits >= 2);
+    }
+    let ok = d.v4.as_ref().is_some_and(|v| v.is("ok"))
+        || d.v6.as_ref().is_some_and(|v| v.is("ok"))
+        || d.ecs.as_ref().is_some_and(|e| e.is("ok"))
+        || d.cross4.as_ref().is_some_and(|c| c.is("ok"));
+    if ok {
+        3
+    } else {
+        2
+    }
+}
+
 /// 冷資料移出記憶體的結果
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Evicted {
@@ -1055,6 +1098,8 @@ impl Db {
             evicted: Vec::new(),
             budget_sweep: false,
             multi_cdn: true,
+            seen_once: Vec::new(),
+            forget_cursor: 0,
         }
     }
 
@@ -1558,34 +1603,82 @@ impl Db {
         serde_json::to_vec(&out).unwrap_or_default()
     }
 
-    /// 刪掉最久沒出現的，降到上限的 90%（手動設定策略的保留）
+    /// 筆數到了上限：依價值淘汰到上限的 90%（手動設定策略的保留；順序見 [`prune_group`]）
     pub fn prune(&mut self) {
-        self.drop_oldest((self.max_entries as f64 * 0.9) as usize);
+        self.drop_cheapest((self.max_entries as f64 * 0.9) as usize, now_ms());
     }
 
     /// 刪到剩 `keep` 筆（記憶體不足時也用這個）
     pub fn shrink_to(&mut self, keep: usize) {
-        self.drop_oldest(keep);
+        self.drop_cheapest(keep, now_ms());
         // 把空出來的記憶體還回去（要重排整個表：只有記憶體不足時才做，平常的整理不做——反正馬上又會長回來）
         self.domains.shrink_to_fit();
     }
 
-    fn drop_oldest(&mut self, keep: usize) {
+    /// 依價值淘汰到剩 `keep` 筆（3.5.1 H1）：先刪最不值得留的組（[`prune_group`]），同一組裡最久沒出現的先
+    /// （年齡分格 [`COLD_AGE_EDGES_MS`]）。以前只看最後出現的時間，大量一次性網域湧入時，把一個半月的學習資料刪光
+    /// （18 萬筆剩下的 99.7% 是只問過一次的網域）。
+    ///
+    /// 兩次掃描、不排序整份陣列（同 [`Db::evict_coldest`]）：第一次依（組，年齡格）計數，找出刪到哪一格；
+    /// 第二次只收那些名稱，最後那一格不夠分時才在那一格裡挑最舊的
+    fn drop_cheapest(&mut self, keep: usize, now: u64) {
         if self.domains.len() <= keep {
             return;
         }
-        let mut arr: Vec<(u64, Arc<str>)> = self
-            .domains
-            .values()
-            .filter(|d| d.policy() == Policy::Auto)
-            .map(|d| (d.last_seen, d.name.clone()))
-            .collect();
-        let drop = (self.domains.len() - keep).min(arr.len());
-        // 只需要「最舊的 drop 筆」，不必整個排序
-        if drop > 0 && drop < arr.len() {
-            arr.select_nth_unstable(drop - 1);
+        const B: usize = COLD_AGE_EDGES_MS.len() + 1;
+        let slot = |d: &Domain| -> Option<usize> {
+            if d.policy() != Policy::Auto {
+                return None;
+            }
+            // 同一組裡舊的（年齡格大的）在前
+            Some(usize::from(prune_group(d)) * B + (B - 1 - age_bucket(now.saturating_sub(d.last_seen))))
+        };
+        let mut counts = [0usize; PRUNE_GROUPS * B];
+        for d in self.domains.values() {
+            if let Some(k) = slot(d) {
+                counts[k] += 1;
+            }
         }
-        for (_, n) in arr.into_iter().take(drop) {
+        let auto: usize = counts.iter().sum();
+        let drop = (self.domains.len() - keep).min(auto);
+        if drop == 0 {
+            return;
+        }
+        // 從最不值得留的那格累計到 drop：那一格之前的全部刪，那一格只刪補足的部分
+        let mut sum = 0usize;
+        let mut last = 0usize;
+        for (k, c) in counts.iter().enumerate() {
+            if *c == 0 {
+                continue;
+            }
+            last = k;
+            sum += *c;
+            if sum >= drop {
+                break;
+            }
+        }
+        let need_last = drop - (sum - counts[last]);
+        let mut names: Vec<Arc<str>> = Vec::with_capacity(drop);
+        let mut edge: Vec<(u64, Arc<str>)> = Vec::new();
+        for d in self.domains.values() {
+            let Some(k) = slot(d) else { continue };
+            if k < last {
+                names.push(d.name.clone());
+            } else if k == last {
+                if need_last == counts[last] {
+                    names.push(d.name.clone());
+                } else {
+                    edge.push((d.last_seen, d.name.clone()));
+                }
+            }
+        }
+        if !edge.is_empty() && need_last > 0 {
+            if need_last < edge.len() {
+                edge.select_nth_unstable(need_last - 1);
+            }
+            names.extend(edge.into_iter().take(need_last).map(|(_, n)| n));
+        }
+        for n in names {
             self.domains.remove(&n);
             self.mark(&n);
         }
@@ -1737,6 +1830,72 @@ impl Db {
             dropped += 1;
         }
         dropped
+    }
+
+    /// 定期忘掉一次性網域（3.5.1 H2；背景的預算整理那一輪呼叫，不在查詢路徑上）：只問過一次、沒有學習資料、
+    /// 自動策略、超過 [`FORGET_ONE_SHOT_MS`] 沒出現（同 [`forgettable`]）。以前只有小 Flash 的磁碟預算會淘汰它們，
+    /// 沒有預算的大機器（Windows、大磁碟）上一直留著，直到筆數上限把淘汰推著跑。
+    ///
+    /// 分批、有上限：只看本來就有重要變動（反正要寫）的分片，`rotate` 時另外輪流看「分片數 ÷ 16」片
+    /// （有磁碟預算的小 Flash 不輪流，不為了忘掉多寫任何檔）；分片裡還有移出記憶體的冷資料時跳過
+    /// （讀回時本來就會忘掉）；每輪最多 [`FORGET_ONE_SHOT_MAX`] 筆。回傳忘掉幾筆
+    pub fn forget_one_shot(&mut self, now: u64, rotate: bool) -> usize {
+        let n = self.shards;
+        let mut pick = vec![false; n];
+        for (i, m) in self.marks.iter().enumerate() {
+            pick[i] = *m == Mark::Important || self.dirty;
+        }
+        if rotate {
+            let k = (n / 16).max(1);
+            for j in 0..k {
+                pick[(self.forget_cursor + j) % n] = true;
+            }
+            self.forget_cursor = (self.forget_cursor + k) % n;
+        }
+        for h in &self.evicted {
+            pick[(*h as usize) & (n - 1)] = false;
+        }
+        if !pick.iter().any(|p| *p) {
+            return 0;
+        }
+        let cutoff = now.saturating_sub(FORGET_ONE_SHOT_MS);
+        let names: Vec<Arc<str>> = self
+            .domains
+            .values()
+            .filter(|d| d.last_seen < cutoff && forgettable(d) && pick[shard_of(&d.name, n)])
+            .take(FORGET_ONE_SHOT_MAX)
+            .map(|d| d.name.clone())
+            .collect();
+        for name in &names {
+            self.domains.remove(name);
+            self.mark(name);
+        }
+        names.len()
+    }
+
+    /// 新網域收不收（3.5.1 H1；呼叫端先確定 `name` 不在資料庫裡）。筆數不到上限的 [`ADMIT_SECOND_PERCENT`]% 一律收；
+    /// 到了以後只收「最近問過一次」的（第二次才記）：大量一次性網域湧入時，不讓它們把淘汰一直推著跑、擠掉學習資料。
+    /// 沒有磁碟預算的大機器 K4 不會擋，靠這個。查詢路徑：一次雜湊、一格比對；筆數降回去就自己恢復（名單清掉）
+    pub fn admit_new(&mut self, name: &str) -> bool {
+        let near = self.total_entries().saturating_mul(100) >= self.max_entries.saturating_mul(ADMIT_SECOND_PERCENT);
+        if !near {
+            if !self.seen_once.is_empty() {
+                self.seen_once = Vec::new();
+            }
+            return true;
+        }
+        if self.seen_once.is_empty() {
+            self.seen_once = vec![0; SEEN_ONCE_SLOTS];
+        }
+        // 雜湊 0 當成「空格」：真的算出 0 的名稱改用 1（只是多一個極少見的碰撞）
+        let h = name_hash(name).max(1);
+        let slot = &mut self.seen_once[(h as usize) % SEEN_ONCE_SLOTS];
+        if *slot == h {
+            *slot = 0;
+            return true;
+        }
+        *slot = h;
+        false
     }
 
     pub fn get(&self, name: &str) -> Option<&Domain> {
@@ -2502,6 +2661,152 @@ mod tests {
         assert!(db.get("d1.test").is_none(), "最久沒出現的先刪");
         assert!(db.get("d99.test").is_some());
         assert!(db.get("new.test").is_some());
+    }
+
+    /// 3.5.1 H1：大量一次性網域把筆數推到 `cdn.maxEntries`：學習資料一筆都不能被擠掉
+    /// （以前只看最後出現時間，一個半月的學習資料被壓測刪光）
+    #[test]
+    fn flood_of_one_shot_domains_keeps_learning() {
+        let mut db = Db::new(200_000);
+        let now = now_ms();
+        for i in 0..1000 {
+            let n = format!("learned{i}.example.com");
+            db.touch(&n, "cloudflare", "ip", &[], &[], None);
+            let d = db.get_mut(&n).unwrap();
+            d.last_seen = now - 45 * DAY;
+            d.hits = 3;
+            let v = Verdict {
+                verdict: Some(Arc::from(if i % 4 == 0 { "fail" } else { "ok" })),
+                ..Default::default()
+            };
+            d.v4 = Some(Box::new(v));
+        }
+        // 問過幾次、但沒有學習資料的
+        for i in 0..500 {
+            put(&mut db, &format!("asked{i}.example.net"), 0, 4, None);
+            db.get_mut(&format!("asked{i}.example.net")).unwrap().last_seen = now - 10 * DAY;
+        }
+        for i in 0..250_000 {
+            db.touch(&format!("o{i}.example.net"), "cloudflare", "ip", &[], &[], None);
+        }
+        assert!(db.domains.len() <= 200_000, "{}", db.domains.len());
+        let learned = (0..1000).filter(|i| db.get(&format!("learned{i}.example.com")).is_some()).count();
+        assert_eq!(learned, 1000, "有學習資料的全部留著");
+        let asked = (0..500).filter(|i| db.get(&format!("asked{i}.example.net")).is_some()).count();
+        assert_eq!(asked, 500, "問過兩次以上的排在一次性的後面");
+        assert!(db.get("o249999.example.net").is_some(), "剛出現的這一筆不會被自己觸發的淘汰刪掉");
+    }
+
+    #[test]
+    fn prune_order_groups_then_age() {
+        let mut db = one_shard();
+        put(&mut db, "ok-old.example.com", 80, 9, Some("ok"));
+        put(&mut db, "fail-old.example.com", 80, 9, Some("fail"));
+        put(&mut db, "twice-old.example.com", 80, 2, None);
+        put(&mut db, "once-new.example.com", 0, 1, None);
+        put(&mut db, "once-old.example.com", 80, 1, None);
+        put(&mut db, "twice-new.example.com", 0, 2, None);
+        put(&mut db, "manual.example.com", 300, 1, None);
+        db.set_policy("manual.example.com", Policy::Never);
+        let g = |db: &Db, n: &str| prune_group(db.get(n).unwrap());
+        assert_eq!(g(&db, "once-new.example.com"), 0);
+        assert_eq!(g(&db, "twice-old.example.com"), 1);
+        assert_eq!(g(&db, "fail-old.example.com"), 2);
+        assert_eq!(g(&db, "ok-old.example.com"), 3);
+        let mut gone = Vec::new();
+        for keep in (1..7).rev() {
+            let before: Vec<Arc<str>> = db.domains.keys().cloned().collect();
+            db.drop_cheapest(keep, NOW);
+            assert_eq!(db.domains.len(), keep);
+            gone.push(before.iter().find(|k| db.get(k).is_none()).unwrap().to_string());
+        }
+        assert_eq!(
+            gone,
+            [
+                "once-old.example.com",
+                "once-new.example.com",
+                "twice-old.example.com",
+                "twice-new.example.com",
+                "fail-old.example.com",
+                "ok-old.example.com",
+            ]
+        );
+        assert!(db.get("manual.example.com").is_some(), "手動策略的不刪");
+    }
+
+    /// 3.5.1 H1：筆數到了上限的 90% 以後，新網域問第二次才記；降回去就恢復
+    #[test]
+    fn admit_second_ask_near_cap() {
+        let mut db = Db::new(100);
+        for i in 0..89 {
+            assert!(db.admit_new(&format!("d{i}.example.com")));
+            db.touch(&format!("d{i}.example.com"), "cloudflare", "ip", &[], &[], None);
+        }
+        assert!(db.admit_new("x.example.com"), "89% 還照收");
+        db.touch("x.example.com", "cloudflare", "ip", &[], &[], None);
+        assert!(!db.admit_new("y.example.com"), "90%：第一次不記");
+        assert!(!db.admit_new("z.example.com"));
+        assert!(db.admit_new("y.example.com"), "第二次才記");
+        assert!(!db.admit_new("y.example.net"));
+        assert!(db.seen_once.len() == SEEN_ONCE_SLOTS, "名單固定大小");
+        db.domains.remove("x.example.com");
+        assert!(db.admit_new("w.example.com"), "降回去就照收");
+        assert!(db.seen_once.is_empty(), "名單放掉");
+    }
+
+    /// 3.5.1 H2：沒有磁碟預算時也定期忘掉一次性網域；分批（輪流的分片）、有上限，學習資料、問過兩次的、手動的、
+    /// 最近出現的都不動
+    #[test]
+    fn forget_one_shot_in_batches() {
+        let mut db = Db::new(100_000);
+        db.set_shards(32);
+        for i in 0..3200 {
+            put(&mut db, &format!("o{i}.example.net"), 5, 1, None);
+        }
+        put(&mut db, "fresh.example.com", 1, 1, None);
+        put(&mut db, "twice.example.com", 30, 2, None);
+        put(&mut db, "failed.example.com", 30, 1, Some("fail"));
+        put(&mut db, "manual.example.com", 30, 1, None);
+        db.set_policy("manual.example.com", Policy::Always);
+        db.take_marks(false);
+        // 有預算（不輪流）、沒有要寫的分片：什麼都不動
+        assert_eq!(db.forget_one_shot(NOW, false), 0);
+        assert!(!db.changed());
+        // 沒有預算：每輪輪流 32 / 16 = 2 片
+        let mut rounds = 0;
+        let mut total = 0;
+        loop {
+            let n = db.forget_one_shot(NOW, true);
+            rounds += 1;
+            total += n;
+            assert!(n <= 3200 * 3 / 32, "一輪只動輪到的分片：{n}");
+            let marked = db.take_marks(false).len();
+            assert!(marked <= 2, "不為了忘掉一次重寫全部分片：{marked}");
+            if rounds == 16 {
+                break;
+            }
+        }
+        assert_eq!(total, 3200, "輪完一圈全部忘掉");
+        let mut left: Vec<&str> = db.domains.keys().map(|k| &**k).collect();
+        left.sort_unstable();
+        assert_eq!(
+            left,
+            ["failed.example.com", "fresh.example.com", "manual.example.com", "twice.example.com"]
+        );
+        // 有預算時順便整理本來就要寫的分片
+        put(&mut db, "o-again.example.net", 9, 1, None);
+        assert_eq!(db.forget_one_shot(NOW, false), 1);
+    }
+
+    #[test]
+    fn forget_one_shot_cap_per_round() {
+        let mut db = one_shard();
+        db.max_entries = 100_000;
+        for i in 0..(FORGET_ONE_SHOT_MAX + 100) {
+            put(&mut db, &format!("o{i}.example.net"), 5, 1, None);
+        }
+        assert_eq!(db.forget_one_shot(NOW, true), FORGET_ONE_SHOT_MAX);
+        assert_eq!(db.forget_one_shot(NOW, true), 100);
     }
 
     // ---- 磁碟預算（3.5.0 C5）----

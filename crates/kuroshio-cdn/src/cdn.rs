@@ -327,6 +327,8 @@ pub struct Cdn {
     budget_pruned: AtomicU32,
     /// 有淘汰的磁碟預算整理輪數（發現清單的次數用；3.5.1：以前用筆數，一下子就到 9999 的上限）
     budget_rounds: AtomicU32,
+    /// 定期忘掉的一次性網域累計筆數（3.5.1 H2）
+    forgot_one_shot: AtomicU32,
     disk_kb: AtomicU32,
     /// 分片目錄裡檔案長度的合計（KB；3.5.0 F8 之前的 `dbDiskKB`）、整個 `cdn/` 目錄實際佔用（KB，只顯示）。`u32::MAX` = 還沒量
     file_kb: AtomicU32,
@@ -341,6 +343,8 @@ pub struct BudgetRound {
     /// 整理了幾個分片，其中幾個是為了淘汰主動重寫的
     pub shards: usize,
     pub forced: usize,
+    /// 忘掉幾個一次性網域（3.5.1 H2；不管有沒有預算）
+    pub forgot: usize,
 }
 
 /// 冷資料移出 / 讀回的結果（記憶體控制，規格 09）
@@ -534,6 +538,7 @@ impl Cdn {
             budget_cap: AtomicU32::new(0),
             budget_pruned: AtomicU32::new(0),
             budget_rounds: AtomicU32::new(0),
+            forgot_one_shot: AtomicU32::new(0),
             disk_kb: AtomicU32::new(u32::MAX),
             file_kb: AtomicU32::new(u32::MAX),
             cdn_dir_kb: AtomicU32::new(u32::MAX),
@@ -924,16 +929,24 @@ impl Cdn {
     }
 
     /// 這個網域收不收（3.5.1 K4）：已經在資料庫（含移出記憶體的）一定收；新網域要記憶體能長大、
-    /// 而且總筆數沒超過磁碟預算的 [`ADMIT_BUDGET_FACTOR`] 倍
-    pub(crate) fn admits(&self, st: &State, name: &str) -> bool {
+    /// 而且總筆數沒超過磁碟預算的 [`ADMIT_BUDGET_FACTOR`] 倍。不收的時候回傳原因（標籤用）。
+    /// 3.5.1 H1：筆數到了 `cdn.maxEntries` 的 90% 以上，新網域問第二次才記（[`db::Db::admit_new`]；
+    /// 沒有磁碟預算的大機器上 K4 不會擋，靠這個）
+    pub(crate) fn admits(&self, st: &mut State, name: &str) -> Result<(), &'static str> {
         if st.db.get(name).is_some() || st.db.is_evicted(name) {
-            return true;
+            return Ok(());
         }
         if !self.admit_new.load(Ordering::Relaxed) {
-            return false;
+            return Err("新網域先不記:記憶體或磁碟預算");
         }
         let cap = self.budget_cap.load(Ordering::Relaxed) as usize;
-        cap == 0 || st.db.total_entries() < cap.saturating_mul(ADMIT_BUDGET_FACTOR)
+        if cap != 0 && st.db.total_entries() >= cap.saturating_mul(ADMIT_BUDGET_FACTOR) {
+            return Err("新網域先不記:記憶體或磁碟預算");
+        }
+        if !st.db.admit_new(name) {
+            return Err("新網域先不記:筆數接近上限，問第二次才記");
+        }
+        Ok(())
     }
 
     /// 移出記憶體的冷資料分佈在幾個分片（記憶體恢復時估計一次讀回一片要多少用）
@@ -1087,6 +1100,18 @@ impl Cdn {
     pub fn budget_round(&self) -> BudgetRound {
         let mut out = BudgetRound::default();
         let disk = self.measure_disk();
+        // 3.5.1 H2：一次性網域（只問過一次、沒有學習資料、3 天沒出現）不管有沒有預算都定期忘掉。
+        // 有預算的小 Flash 只看本來就要寫的分片；沒有預算時另外輪流看幾片（分批、每輪有上限）
+        let forgot = self.state().db.forget_one_shot(now_ms(), self.cfg.db_disk_budget.is_none());
+        if forgot > 0 {
+            out.forgot = forgot;
+            let total = self
+                .forgot_one_shot
+                .load(Ordering::Relaxed)
+                .saturating_add(forgot.min(u32::MAX as usize) as u32);
+            self.forgot_one_shot.store(total, Ordering::Relaxed);
+            debug!("CDN 網域資料：忘掉 {forgot} 個 3 天沒出現、只問過一次的網域");
+        }
         let (Some(limit), Some(budget)) = (self.budget_limit(), self.cfg.db_disk_budget) else {
             self.budget_cap.store(0, Ordering::Relaxed);
             return out;
@@ -1173,6 +1198,7 @@ impl Cdn {
         v["dbDiskEstKB"] = json!(db::budget_disk_estimate(total, shards).div_ceil(1024));
         v["prunedForBudget"] = json!(self.budget_pruned.load(Ordering::Relaxed));
         v["prunedRounds"] = json!(self.budget_rounds.load(Ordering::Relaxed));
+        v["forgotOneShot"] = json!(self.forgot_one_shot.load(Ordering::Relaxed));
     }
 
     /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，
