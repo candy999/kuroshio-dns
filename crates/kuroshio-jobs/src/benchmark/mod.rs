@@ -866,6 +866,8 @@ impl Srv {
             // compute() 裡用台灣網段算（3.5.0 B5）
             tw_rate: None,
             ecs: self.tag.ecs,
+            // Phase 2 跟昨天的結果比過之後才填
+            incumbent: 0,
         }
     }
 }
@@ -1044,6 +1046,30 @@ fn incumbent_ids(file: &Path) -> HashSet<String> {
         .flat_map(|k| v[*k].as_array().into_iter().flatten())
         .filter_map(|x| x["id"].as_str().map(str::to_string))
         .collect()
+}
+
+/// 昨天選上的上游（`upstreams.json` 的 `selected[]`，3.5.1 M3）：（正規化後的 id, 經營者）。
+/// 經營者：今天名單裡有同一台的用它的 [`Srv::op_key`]，沒有就用昨天寫下的 `op`、再沒有就用主機名稱。讀不到是空的
+fn yesterday_selected(file: &Path, all: &[Srv]) -> (HashSet<String>, HashSet<String>) {
+    let (mut ids, mut ops) = (HashSet::new(), HashSet::new());
+    let Some(v) = read_json(file) else {
+        return (ids, ops);
+    };
+    for x in v["selected"].as_array().into_iter().flatten() {
+        let Some(up) = x["id"].as_str().and_then(|id| Upstream::parse(id).ok()) else {
+            continue;
+        };
+        let op = match all.iter().find(|s| s.up.id == up.id) {
+            Some(s) => s.op_key(),
+            None => match x["op"].as_str().filter(|o| !o.is_empty()) {
+                Some(o) => o.to_ascii_lowercase(),
+                None => operator_of(&up.host),
+            },
+        };
+        ops.insert(op);
+        ids.insert(up.id);
+    }
+    (ids, ops)
 }
 
 /// 分級評測的統計（`upstreams.json` 的 `tiers`）
@@ -2233,6 +2259,8 @@ impl Benchmark {
         let owner_info = cache
             .lookup(&*self.asn, &host_ip.iter().flatten().copied().collect::<Vec<_>>(), true, today_n)
             .await;
+        // 昨天選上的（3.5.1 M3）：正規化後的 id 與經營者。今天差不多好就留昨天那台，不要天天換
+        let (yday_ids, yday_ops) = yesterday_selected(&self.paths.upstreams_file, &all);
         // 所在地（規格 10 的 6.1）：台灣網段 → ip-api 的國別 → 都沒有；鄰近再看量到的最低延遲
         let tw_nets = self.tw.as_ref().map(|t| t.all());
         let scored_list: Vec<Scored> = finals
@@ -2246,6 +2274,13 @@ impl Benchmark {
                 let cc = info.map(|x| x.cc.as_str()).unwrap_or("");
                 (s.region, s.near) = select::classify_region(in_tw, cc, s.min, cfg.near_max_ms);
                 s.region_source = select::region_source(in_tw);
+                s.incumbent = if yday_ids.contains(&all[i].up.id) {
+                    2
+                } else if yday_ops.contains(&all[i].op_key()) {
+                    1
+                } else {
+                    0
+                };
                 s
             })
             .collect();
@@ -2577,15 +2612,18 @@ impl Benchmark {
             }
         }
         jinfo!(journal, "=== 今日選出的上游 ===");
+        let kept: HashSet<&str> = calc.selection.kept.iter().map(|&i| calc.finals[i].id.as_str()).collect();
         for x in state["selected"].as_array().into_iter().flatten() {
+            let id = x["id"].as_str().unwrap_or("");
             jinfo!(
                 journal,
-                "  {:<48} {:<4} {:>7}ms  +{}  ({}) {}",
-                x["id"].as_str().unwrap_or(""),
+                "  {:<48} {:<4} {:>7}ms  +{}  ({}{}) {}",
+                id,
                 x["type"].as_str().unwrap_or(""),
                 x["avgMs"].to_string(),
                 x["newItems"],
                 x["reason"].as_str().unwrap_or(""),
+                if kept.contains(id) { "，沿用昨天的" } else { "" },
                 x["owner"].as_str().unwrap_or("")
             );
         }
