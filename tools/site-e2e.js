@@ -17,7 +17,7 @@ const ROOT = path.resolve(__dirname, '..');
 const BIN = process.env.KUROSHIO_BIN ? path.resolve(process.env.KUROSHIO_BIN) : path.join(ROOT, 'target', 'debug', process.platform === 'win32' ? 'kuroshio.exe' : 'kuroshio');
 const SHOTS = path.resolve(process.env.SHOTS || 'screenshots-site');
 const HOST = 'dns.example';
-const { checkFlow, checkFlowEmpty, checkOtherParts } = require('./flow-check.js');
+const { checkFlow, checkFlowEmpty, checkOtherParts, checkDataTables } = require('./flow-check.js');
 
 let pass = 0, fail = 0;
 const ok = m => { pass++; console.log(`  ✔ ${m}`); };
@@ -155,6 +155,8 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
             check(/youtube\.com/.test(sites) && /大家最常造訪的網站/.test(await page.textContent('#sitesCap')), '熱門網站（site.minClients = 1）', sites.slice(0, 120));
             const sw = await page.evaluate(() => document.documentElement.scrollWidth);
             check(sw <= w + 1, '沒有水平捲動', `scrollWidth = ${sw}`);
+            // 3.5.1：展開所有數據表之後也沒有水平捲動、最後一欄捲得到（以前手機上最後一欄被切掉、滑不過去）
+            for (const c of await checkDataTables(page, w, `公開頁 ${tag}`)) check(...c);
             const dupAxes = await page.evaluate(() => [...document.querySelectorAll('.chart svg')].map((s, i) => {
                 const ends = [...s.querySelectorAll('text.axis[text-anchor="end"]')];
                 // y 軸刻度在左側同一個 x（L - 8）；最後一個 x 軸標籤也是靠右對齊，但在圖的右邊，排除掉
@@ -179,6 +181,7 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
             check(await page.getAttribute('.seg button[data-range="7d"]', 'aria-pressed') === 'true', '詳細頁：切換 7 天');
             const dsw = await page.evaluate(() => document.documentElement.scrollWidth);
             check(dsw <= w + 1, '詳細頁：沒有水平捲動（寬表格在框裡捲動）', `scrollWidth = ${dsw}`);
+            for (const c of await checkDataTables(page, w, `詳細頁 ${tag}`)) check(...c);
             await page.screenshot({ path: path.join(SHOTS, `detail-${scheme}-${w}.png`), fullPage: true });
             await page.close();
         }

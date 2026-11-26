@@ -364,7 +364,9 @@ details.table tr.other td:first-child, details.table tr.unknown td:first-child {
 .rank-row .bar { height: 10px; border-radius: 0 4px 4px 0; min-width: 3px; transition: width .6s; }
 .rank-row .val { font: 12.5px var(--mono); color: var(--text-2); white-space: nowrap; }
 .rank-row:hover .bar { filter: brightness(1.2); }
-details.table { margin-top: 12px; font-size: 13px; color: var(--text-2); }
+details.table { margin-top: 12px; font-size: 13px; color: var(--text-2); min-width: 0; max-width: 100%; }
+/* 數據表在卡片裡自己左右滑（3.5.1）：整頁鎖住不能左右捲（html 的 overflow-x: clip），表格比卡片寬時以前最後一欄被切掉、滑不過去 */
+details.table .tbl { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; touch-action: pan-x pan-y; }
 details.table summary { cursor: pointer; }
 details.table table { border-collapse: collapse; margin-top: 8px; width: 100%; font-variant-numeric: tabular-nums; }
 details.table th, details.table td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); }
@@ -549,7 +551,7 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
         <h3>CDN 連線去向</h3>
         <p class="cap">每次回應算一次連線：左邊是各家 CDN（前 5 家，其餘合併成「其他」），右邊是連線最後到哪裡。只有彙總數字，不含任何網站或裝置</p>
         <div class="chart flowchart" id="flow"></div>
-        <details class="table"><summary>數據表</summary><table id="flowTable"></table></details>
+        <details class="table"><summary>數據表</summary><div class="tbl"><table id="flowTable"></table></div></details>
       </div>
       <div class="grid g2" style="margin-top:14px">
         <div class="card glass" style="grid-column:1/-1">
@@ -557,7 +559,7 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
           <p class="cap">實測各 CDN 原本分配的機房，以及改走的台灣節點（依查詢量加權）</p>
           <div class="mapwrap chart" id="map"></div>
           <div class="map-legend"><span><i></i>改走台灣的路線（越粗＝越多連線）</span><span id="mapNote"></span></div>
-          <details class="table"><summary>數據表</summary><table id="mapTable"></table></details>
+          <details class="table"><summary>數據表</summary><div class="tbl"><table id="mapTable"></table></div></details>
         </div>
       </div>
 
@@ -592,7 +594,7 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
         <p class="cap">每日查詢與攔截（不含尚未結束的今天）</p>
         <div class="legend"><span><i style="background:var(--s1)"></i>查詢</span><span><i style="background:var(--s2)"></i>攔截</span></div>
         <div class="chart" id="trend"></div>
-        <details class="table"><summary>數據表</summary><table id="trendTable"></table></details>
+        <details class="table"><summary>數據表</summary><div class="tbl"><table id="trendTable"></table></div></details>
       </div>
       <div class="grid g3">
         <div class="card glass"><h3>最常用到的 CDN</h3><p class="cap">網站內容實際由誰提供</p><div class="rank" id="cdnRank"></div></div>
@@ -835,7 +837,8 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
   const nf = new Intl.NumberFormat('zh-TW');
   const cf = new Intl.NumberFormat('zh-TW', { notation: 'compact', maximumFractionDigits: 1 });
   const compact = n => (n >= 10000 ? cf.format(n) : nf.format(Math.round(n)));
-  const pct = (x, d = 0) => (x * 100).toFixed(d) + '%';
+  // 百分比跟儀表板同一份規則（3.5.1：不是全部最多 99%、不是 0 最少 <1%）
+  const pct = (x, d = 0) => window.KuroshioDashboard.pct(x, d);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
   const NS = 'http://www.w3.org/2000/svg';
   const sv = (tag, attrs = {}, parent) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (parent) parent.appendChild(n); return n; };
@@ -1013,7 +1016,8 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
       // 中位數含台灣節點比較慢的網站（3.5.1），可以是負的：負的時照實寫「慢」，不寫「省」
       const med = typeof ac.medianSavedMs === 'number' && ac.samples > 0
         ? `${KD.samplesText(ac.samples, '個網站')}兩邊都量到延遲：中位數${ac.medianSavedMs > 0 ? `是台灣節點快 ${ac.medianSavedMs} ms` : ac.medianSavedMs < 0 ? `是台灣節點反而慢 ${-ac.medianSavedMs} ms` : '兩邊一樣'}。` : '';
-      $('#oppSub').textContent = `共比對 ${nf.format(o.connections)} 次 CDN 連線，其中 ${nf.format(o.wouldGoAbroad)} 次原本會出國，${nf.format(o.accelerated)} 次成功改走台灣節點。` + med;
+      // 3.5.1：改走台灣節點用連線去向的範圍（routedAccelerated），跨 CDN 備援的另外寫（KD.oppSentence）
+      $('#oppSub').textContent = KD.oppSentence(o) + med;
     } else {
       $('#oppHead').textContent = '資料累積中…';
       $('#oppSub').textContent = '有人瀏覽 Cloudflare、CloudFront 等 CDN 網站後，這裡就會開始比對。';

@@ -1649,3 +1649,50 @@ fn imported_never_queried_domains_are_not_rechecked() {
     c.with_state(|st| st.db.load_domains(&file(now_ms()), false).unwrap());
     assert_eq!(c.recheck(), 1, "最近有人查過的照常複驗");
 }
+
+/// 3.5.1：「特定產品專用」消退時寫一行（同一家 CDN 合併）；`/api/cdn/pools` 列出目前被標成特定產品專用的節點與網站數
+#[test]
+fn zone_restricted_listed_and_lift_logged() {
+    use crate::pools::lifted_text;
+    assert_eq!(lifted_text(&[]), None);
+    assert_eq!(
+        lifted_text(&["fastly|192.0.2.1", "cloudflare|198.51.100.3", "fastly|192.0.2.2"]).unwrap(),
+        "fastly 2 個（192.0.2.1、192.0.2.2）、cloudflare 1 個（198.51.100.3）",
+        "同一家 CDN 合併成一段"
+    );
+    let many: Vec<String> = (1..=7).map(|i| format!("fastly|192.0.2.{i}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert_eq!(
+        lifted_text(&many).unwrap(),
+        "fastly 7 個（192.0.2.1、192.0.2.2、192.0.2.3、192.0.2.4、192.0.2.5 等）",
+        "每家最多列 5 個"
+    );
+
+    let (c, _) = setup(json!({}));
+    let (x, y) = (ip("192.0.2.10"), ip("192.0.2.11"));
+    c.with_state(|st| {
+        let p = &mut st.pools;
+        for s in ["a.example.com", "b.example.com", "c.example.com"] {
+            p.zone_note_site("cloudflare", x, false, s);
+        }
+        // 只有一個網站不能用：還不是特定產品專用，不列
+        p.zone_note_site("cloudflare", y, false, "a.example.com");
+        let v = p.status();
+        let cf = &v["cloudflare"];
+        assert_eq!(cf["restrictedTotal"], 1);
+        let r = &cf["restricted"][0];
+        assert_eq!(
+            (r["ip"].as_str(), r["sites"].as_u64(), r["hit"].as_u64(), r["inPool"].as_bool()),
+            (Some("192.0.2.10"), Some(3), Some(0), Some(false))
+        );
+        assert!(r["until"].as_u64().unwrap() > r["missAt"].as_u64().unwrap());
+        for (name, d) in v.as_object().unwrap() {
+            if name != "cloudflare" {
+                assert_eq!(d["restrictedTotal"], 0, "{name}");
+            }
+        }
+        // 消退之後不再列出
+        assert_eq!(p.decay_zone(now_ms() + 8 * 86_400_000), 2);
+        assert_eq!(p.status()["cloudflare"]["restrictedTotal"], 0);
+    });
+}

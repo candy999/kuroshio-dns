@@ -19,7 +19,8 @@ var MODES = {
 var JOBS = { 'dns-benchmark': _('DNS 評測'), 'cdn-ranges': _('CDN IP 範圍'), 'cdn-scan': _('CDN 網段分類'), 'cdn-pool': _('台灣節點池'), 'tw-ip': _('台灣 IP 清單') };
 
 function fmtNum(n) { return (n == null) ? '-' : Number(n).toLocaleString(); }
-function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
+// 百分比（3.5.1：ui-core.js 的 pct，不是全部最多 99.9%、不是 0 最少 <0.1%）
+function pct(a, b) { return b ? common.pct(a / b, 1) : '-'; }
 function fmtTime(t, mode) { return common.time(t, mode); }
 function fmtBytes(b) { return common.bytes(b); }
 /* 還沒存的時間：0 = 都存了 */

@@ -549,6 +549,8 @@ pub struct FindInputs {
     pub memory: Option<crate::memgov::MemSummary>,
     /// 公開頁對外開放、網站排行最少人數是 1（[`crate::site::public_min_clients_note`]，3.5.1）
     pub site_min_clients: Option<String>,
+    /// data/ 裡舊版留下、這一版已經不讀的檔（[`crate::manifest::leftovers`]，3.5.1）
+    pub data_leftovers: Vec<String>,
 }
 
 fn state(key: &'static str, sev: Sev, on: bool, text: String) -> Obs {
@@ -700,6 +702,18 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
         Sev::Info,
         i.site_min_clients.is_some(),
         i.site_min_clients.clone().unwrap_or_default(),
+    ));
+
+    // data/ 的舊檔（3.5.1）：以前只有啟動日誌與 `/api/status.data.leftovers`，發現清單看不到
+    out.push(state(
+        "data-leftovers",
+        Sev::Info,
+        !i.data_leftovers.is_empty(),
+        format!(
+            "安裝目錄的 data/ 有 {} 個舊版留下的檔（{}），這一版已經不讀，可以刪掉；升級時請整個替換 data/",
+            i.data_leftovers.len(),
+            i.data_leftovers.join("、")
+        ),
     ));
 
     // 清單副本
@@ -909,6 +923,8 @@ fn find_inputs(st: &AppState, now: u64) -> FindInputs {
         friends_failing3: st.community.as_ref().and_then(|c| c.sync_summary()).map_or(0, |s| s.failing3),
         memory: st.memgov.as_ref().map(|g| g.finding_summary()),
         site_min_clients: crate::site::public_min_clients_note(&st.cfg),
+        // 只看 `manifest::RETIRED` 裡的幾個檔在不在（不讀、不掃目錄）；評估最多 30 秒一次
+        data_leftovers: crate::manifest::leftovers(&crate::app::share_dir(&st.cfg)),
     }
 }
 

@@ -400,6 +400,7 @@ fn noisy_inputs() -> FindInputs {
             shed: vec!["縮小 DNS 快取", "暫時停用過濾清單"],
         }),
         site_min_clients: crate::site::public_min_clients_note(&public_site_cfg(1)),
+        data_leftovers: vec!["seed/upstreams.json".into()],
     }
 }
 
@@ -566,6 +567,7 @@ fn finding_text_has_no_domain_or_client_ip() {
         "slower-fuse",
         "cdn-verify-paced",
         "site-min-clients-1",
+        "data-leftovers",
     ] {
         assert!(keys.contains(&k), "{k} 沒出現：{keys:?}");
     }
@@ -911,4 +913,63 @@ fn cdn_verify_paced_finding() {
     assert!(with(lite).is_none(), "小機器減量是常態");
     assert!(with(json!({})).is_none(), "還沒有欄位");
     assert!(with(Value::Null).is_none(), "CDN 關著");
+}
+
+/// 3.5.1：data/ 的舊檔（`data.leftovers`）也進發現清單：info、寫幾個檔、可以刪；刪掉之後不再成立
+#[test]
+fn data_leftovers_finding() {
+    let on = |files: Vec<String>| {
+        let i = FindInputs {
+            now: NOW,
+            data_leftovers: files,
+            ..FindInputs::default()
+        };
+        rules(&i, &[]).0.into_iter().find_map(|o| match o {
+            Obs::State {
+                key: "data-leftovers",
+                sev,
+                on,
+                text,
+                ..
+            } => Some((sev, on, text)),
+            _ => None,
+        })
+    };
+    let (sev, active, text) = on(vec!["seed/upstreams.json".into()]).unwrap();
+    assert_eq!(sev, Sev::Info);
+    assert!(active);
+    assert!(
+        text.contains("1 個") && text.contains("seed/upstreams.json") && text.contains("可以刪"),
+        "{text}"
+    );
+    let (_, active, _) = on(Vec::new()).unwrap();
+    assert!(!active, "沒有舊檔不成立");
+
+    // 實際的目錄：放一個退役的檔就出現，刪掉就不 active
+    let d = std::env::temp_dir().join(format!("kuroshio-leftover-find-{}", std::process::id()));
+    std::fs::create_dir_all(d.join("seed")).unwrap();
+    std::fs::write(d.join("seed/upstreams.json"), "{}").unwrap();
+    let mut e = Engine::new();
+    let i = FindInputs {
+        now: NOW,
+        data_leftovers: crate::manifest::leftovers(&d),
+        ..FindInputs::default()
+    };
+    e.apply(&rules(&i, &[]).0, NOW);
+    let v = e.json();
+    let f = find(&v, "data-leftovers").expect("有舊檔要出現在發現清單");
+    assert_eq!((f["sev"].as_str(), f["active"].as_bool()), (Some("info"), Some(true)));
+    std::fs::remove_file(d.join("seed/upstreams.json")).unwrap();
+    let i = FindInputs {
+        now: NOW + 60_000,
+        data_leftovers: crate::manifest::leftovers(&d),
+        ..FindInputs::default()
+    };
+    e.apply(&rules(&i, &[]).0, NOW + 60_000);
+    assert_eq!(
+        find(&e.json(), "data-leftovers").unwrap()["active"],
+        false,
+        "刪掉之後不再 active（6 小時後過期）"
+    );
+    let _ = std::fs::remove_dir_all(&d);
 }

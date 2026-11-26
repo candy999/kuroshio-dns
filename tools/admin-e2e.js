@@ -20,7 +20,7 @@ const ROOT = path.resolve(__dirname, '..');
 const BIN = process.env.KUROSHIO_BIN ? path.resolve(process.env.KUROSHIO_BIN) : path.join(ROOT, 'target', 'debug', process.platform === 'win32' ? 'kuroshio.exe' : 'kuroshio');
 const SHOTS = path.resolve(process.env.SHOTS || 'screenshots-admin');
 const WEB = path.join(ROOT, 'data', 'admin');
-const { checkFlow, checkFlowEmpty, checkOtherParts } = require('./flow-check.js');
+const { checkFlow, checkFlowEmpty, checkOtherParts, checkDataTables } = require('./flow-check.js');
 
 let pass = 0, fail = 0;
 const ok = m => { pass++; console.log(`  ✔ ${m}`); };
@@ -1020,7 +1020,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             check(typeof med !== 'number' || (med < 0 ? /台灣節點慢/.test(tilesText) : med > 0 ? /台灣節點快/.test(tilesText) : /兩邊一樣/.test(tilesText)), '儀表板：網站中位數的說明跟正負一致', `${med} / ${tilesText.slice(0, 200)}`);
             const mt = await sp.evaluate(() => [-5, 12.5, 0, null].map(v => window.KuroshioDashboard.medianText(v)));
             check(JSON.stringify(mt) === JSON.stringify(['台灣節點慢 5 ms', '台灣節點快 12.5 ms', '兩邊一樣', '—']) && !mt.some(t => /縮短/.test(t)), '儀表板：中位數是負的時寫「慢」、不寫「縮短」', JSON.stringify(mt));
-            const rtHead = await sp.textContent('#kd-routing .tbl table tr');
+            const rtHead = await sp.textContent('#kd-routing .card:not(.kd-flowcard) > .tbl table tr');
             check(/原本就在台灣/.test(rtHead) && /量測樣本/.test(rtHead), '儀表板：機會成本表多「原本就在台灣」「量測樣本」', rtHead);
             await flowShot('flow-admin-light-1280');
             // 每張折線圖的 y 軸刻度（text-anchor = end 的 axis 標籤）不能重複；剛啟動的服務流量幾乎為 0，涵蓋最大值 0～1 的情況
@@ -1053,6 +1053,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             check(dw <= 391, '儀表板：390 px 寬沒有水平捲動（寬表格在框裡捲動）', `scrollWidth = ${dw}`);
             const week = await dashApi('7d');
             for (const c of await checkFlow(sp, '#kd-routing .flowchart', '#kd-routing .kd-flowcard table', week.routing, 390, '管理頁 淺色 390 px（7 天）')) check(...c);
+            // 3.5.1：展開所有數據表之後也沒有水平捲動、最後一欄捲得到（以前整頁被撐到 466 px）
+            for (const c of await checkDataTables(sp, 390, '管理頁 淺色 390 px')) check(...c);
             await flowShot('flow-admin-light-390');
             await sp.screenshot({ path: path.join(SHOTS, '14-dashboard-mobile.png'), fullPage: true });
             await sp.emulateMedia({ colorScheme: 'dark' });
@@ -1067,6 +1069,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             await sp.setViewportSize({ width: 390, height: 844 });
             await sp.waitForTimeout(500);
             for (const c of await checkFlow(sp, '#kd-routing .flowchart', '#kd-routing .kd-flowcard table', week.routing, 390, '管理頁 深色 390 px')) check(...c);
+            for (const c of await checkDataTables(sp, 390, '管理頁 深色 390 px')) check(...c);
             await flowShot('flow-admin-dark-390');
             await sp.screenshot({ path: path.join(SHOTS, '16-dashboard-dark-mobile.png'), fullPage: true });
             check(csp.length === 0, '儀表板：沒有 JavaScript 錯誤、沒有違反 CSP', csp.join('\n     '));

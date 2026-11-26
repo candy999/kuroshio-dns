@@ -246,6 +246,13 @@ return baseclass.extend({
 	/** 日期時間（固定格式，見上方 fmtTime） */
 	time: fmtTime,
 
+	/** 比例 → 百分比（ui-core.js 的 pct，3.5.1：不是全部最多 99%、不是 0 最少 <1%）；ui-core.js 是舊的時照舊四捨五入 */
+	pct: function(x, d) {
+		var c = core();
+		if (c && typeof c.pct === 'function') return c.pct(x, d);
+		return typeof x === 'number' ? (x * 100).toFixed(d || 0) + '%' : '-';
+	},
+
 	/** 位元組 → 1023 B / 12 KB / 1.5 MB（ui-core.js 的 fmtBytes） */
 	bytes: function(b) { return needCore().fmtBytes(b); },
 

@@ -1,6 +1,28 @@
 {
   "$comment": "data/shared/ui-core.js 的測試向量（tools/ui-core-test.js 檢查）。args = 傳給函式的參數；expect = 預期回傳值（JSON 比較，undefined 的屬性不列）。沒給時區參數的 fmtTime 案例以 TZ=Asia/Taipei 執行。網址一律用 example.com / example.net / example.org。restoreSummary、controlSummary、benchScope、regionLabel、agoText、freshnessView、findingsView、reachView、pathsView、ispGroupText 的參數 \"bracket\" = 翻譯函式 s => \"[\" + s + \"]\"。",
   "tz": "Asia/Taipei",
+  "dashboard": {
+    "$comment": "只有共用儀表板（data/dashboard/dashboard.js 的 KuroshioDashboard）有的函式（3.5.1）",
+    "oppSentence": [
+      {"name":"跨 CDN 備援另外寫（不算進 714 次裡）","args":[{"connections":714,"wouldGoAbroad":588,"accelerated":675,"routedAccelerated":573,"crossAccelerated":102}],"expect":"共比對 714 次 CDN 連線，其中 588 次原本會出國，573 次成功改走台灣節點；另外跨 CDN 備援改走台灣 102 次。"},
+      {"name":"沒有跨 CDN","args":[{"connections":1200,"wouldGoAbroad":800,"accelerated":760,"routedAccelerated":760,"crossAccelerated":0}],"expect":"共比對 1,200 次 CDN 連線，其中 800 次原本會出國，760 次成功改走台灣節點。"},
+      {"name":"舊版核心沒有 routedAccelerated","args":[{"connections":10,"wouldGoAbroad":6,"accelerated":5}],"expect":"共比對 10 次 CDN 連線，其中 6 次原本會出國，5 次成功改走台灣節點。"}
+    ]
+  },
+  "pct": [
+    {"name":"261／262 不寫成 100%","args":[0.9962],"expect":"99%"},
+    {"name":"小數一位","args":[0.9996,1],"expect":"99.9%"},
+    {"name":"全部","args":[1],"expect":"100%"},
+    {"name":"一般","args":[0.805],"expect":"81%"},
+    {"name":"一般（小數一位）","args":[0.1914,1],"expect":"19.1%"},
+    {"name":"不是 0 不寫成 0%","args":[0.004],"expect":"<1%"},
+    {"name":"不是 0（小數一位）","args":[0.0004,1],"expect":"<0.1%"},
+    {"name":"剛好 0","args":[0],"expect":"0%"},
+    {"name":"四捨五入到 1%","args":[0.005],"expect":"1%"},
+    {"name":"超過 100% 照實寫","args":[1.25],"expect":"125%"},
+    {"name":"不是數字","args":[null],"expect":"-"},
+    {"name":"不是數字（指定顯示）","args":[null,1,"—"],"expect":"—"}
+  ],
   "fmtTime": [
     {"args":[1794450123000],"expect":"2026-11-12 10:22"},
     {"args":[1794450123000,"sec"],"expect":"2026-11-12 10:22:03"},

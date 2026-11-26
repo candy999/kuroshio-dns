@@ -321,6 +321,33 @@ pub(crate) fn sites_text(names: &[Box<str>], total: usize) -> String {
     t
 }
 
+/// `/api/cdn/pools` 每家 CDN 列出幾個「特定產品專用」的節點（3.5.1；總數另外給 `restrictedTotal`）
+pub const RESTRICTED_LIST_MAX: usize = 32;
+/// 消退的日誌每家 CDN 列出幾個節點
+const LIFTED_LOG_IPS: usize = 5;
+
+/// 「特定產品專用」消退的日誌內容（`keys` 是相容性紀錄的鍵 `provider|ip`）：同一家 CDN 合併，
+/// 「fastly 2 個（192.0.2.1、192.0.2.2）、cloudflare 1 個（198.51.100.3）」；每家最多列 5 個 IP。沒有回 None
+pub(crate) fn lifted_text(keys: &[&str]) -> Option<String> {
+    let mut by: IndexMap<&str, Vec<&str>> = IndexMap::new();
+    for k in keys {
+        let (p, ip) = k.split_once('|').unwrap_or((k, ""));
+        by.entry(p).or_default().push(ip);
+    }
+    if by.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = by
+        .iter()
+        .map(|(p, ips)| {
+            let shown: Vec<&str> = ips.iter().take(LIFTED_LOG_IPS).copied().collect();
+            let more = if ips.len() > shown.len() { " 等" } else { "" };
+            format!("{p} {} 個（{}{more}）", ips.len(), shown.join("、"))
+        })
+        .collect();
+    Some(parts.join("、"))
+}
+
 /// 網站名稱的雜湊（FNV-1a，只用來分辨「是不是同一個網站」）
 fn site_hash(name: &str) -> u32 {
     name.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193))
@@ -998,7 +1025,9 @@ impl Pools {
     /// 就把 `miss` 清掉（舊資料沒有 `missAt` 時看 `at`）；同時也沒有「服務」的整筆拿掉。回傳動了幾筆
     pub fn decay_zone(&mut self, now: u64) -> usize {
         let mut n = 0;
-        self.zone.retain(|_, z| {
+        // 消退的「特定產品專用」節點（3.5.1）：寫一行 INFO，同一家 CDN 的合併
+        let mut lifted_keys: Vec<String> = Vec::new();
+        self.zone.retain(|k, z| {
             if z.miss == 0 {
                 return true;
             }
@@ -1007,6 +1036,9 @@ impl Pools {
                 return true;
             }
             n += 1;
+            if restricted(z) {
+                lifted_keys.push(k.clone());
+            }
             z.miss = 0;
             z.miss_at = None;
             z.sites.clear();
@@ -1017,7 +1049,32 @@ impl Pools {
         }
         let zone = &self.zone;
         self.zone_names.retain(|k, _| zone.get(k).is_some_and(|z| z.miss > 0));
+        let lifted: Vec<&str> = lifted_keys.iter().map(String::as_str).collect();
+        if let Some(t) = lifted_text(&lifted) {
+            info!(
+                "特定產品專用的標記消退（{} 天沒有新的網站無法使用）：{t}",
+                ZONE_MISS_KEEP_MS / 86_400_000
+            );
+        }
         n
+    }
+
+    /// 目前被標成「特定產品專用」的節點，依 CDN 分組（`/api/cdn/pools` 每家 CDN 的 `restricted`，3.5.1）：
+    /// 相容性紀錄只走一次；每組網站數（不同的網站，`sites`）多的在前
+    fn restricted_by_provider(&self) -> HashMap<&str, Vec<(IpAddr, &Zone)>> {
+        let mut by: HashMap<&str, Vec<(IpAddr, &Zone)>> = HashMap::new();
+        for (k, z) in &self.zone {
+            if !restricted(z) {
+                continue;
+            }
+            if let Some((p, Ok(ip))) = k.split_once('|').map(|(p, ip)| (p, ip.parse::<IpAddr>())) {
+                by.entry(p).or_default().push((ip, z));
+            }
+        }
+        for v in by.values_mut() {
+            v.sort_by(|a, b| b.1.miss.cmp(&a.1.miss).then_with(|| a.0.cmp(&b.0)));
+        }
+        by
     }
 
     /// 記著的「不服務」網站名稱（日誌用，最多 [`LOG_SITES`] 個；測試與除錯用）
@@ -1500,7 +1557,21 @@ impl Pools {
     /// 狀態（管理介面 `/api/cdn/pools`）
     pub fn status(&self) -> Value {
         let mut o = Map::new();
+        let restricted_by = self.restricted_by_provider();
         for (name, d) in &self.p {
+            let rs = restricted_by.get(name).map(Vec::as_slice).unwrap_or(&[]);
+            let restricted: Vec<Value> = rs
+                .iter()
+                .take(RESTRICTED_LIST_MAX)
+                .map(|(ip, z)| {
+                    let at = z.miss_at.or(z.at);
+                    json!({ "ip": ip, "sites": z.miss, "hit": z.hit, "missAt": at,
+                            "inPool": d.pool4.iter().chain(&d.pool6).any(|x| x.ip == *ip),
+                            // 7 天沒有新的網站無法使用就消退（毫秒）
+                            "until": at.map(|t| t.saturating_add(ZONE_MISS_KEEP_MS)) })
+                })
+                .collect();
+            let restricted_total = rs.len();
             let list = |pool: &Vec<PoolNode>| -> Vec<Value> {
                 pool.iter()
                     .map(|x| {
@@ -1527,6 +1598,8 @@ impl Pools {
                     "quickRef": d.rest.get("quickRef"),
                     "scan": { "tw": d.tw.v4_len(), "global": d.global.v4_len(), "dead": d.dead.v4_len() },
                     "ranges": { "v4": d.range4.v4_len(), "v6": d.range6.v6_len() },
+                    // 被標成「特定產品專用」的節點（3.5.1）：`sites` = 不能用的網站數，7 天沒有新的就消退（`until`）
+                    "restricted": restricted, "restrictedTotal": restricted_total,
                 }),
             );
         }

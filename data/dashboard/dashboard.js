@@ -16,9 +16,37 @@
   const nf = new Intl.NumberFormat('zh-TW');
   const cf = new Intl.NumberFormat('zh-TW', { notation: 'compact', maximumFractionDigits: 1 });
   const compact = n => (n >= 10000 ? cf.format(n) : nf.format(Math.round(n)));
-  const pct = (x, d = 0) => (x * 100).toFixed(d) + '%';
-  /** 詳細頁的百分比（null / undefined 顯示 —） */
-  const pct1 = (x, d = 1) => x === null || x === undefined ? '—' : (x * 100).toFixed(d) + '%';
+  /**
+   * 比例 → 百分比（3.5.1）：四捨五入不把「不是全部」寫成 100%、「不是 0」寫成 0%。
+   * 0 < x < 1 時最多 99%（小數一位時 99.9%），四捨五入成 0 時寫 <1%（<0.1%）。
+   * 跟 data/shared/ui-core.js 的 pct 同一份規則（tools/ui-core-test.js 用同一組向量檢查）
+   */
+  const pct = (x, d = 0) => {
+    if (typeof x !== 'number' || !isFinite(x)) return '—';
+    let s = (x * 100).toFixed(d);
+    const step = Math.pow(10, -d);
+    if (x > 0 && x < 1) {
+      if (+s >= 100) s = (100 - step).toFixed(d);
+      else if (+s <= 0) return '<' + step.toFixed(d) + '%';
+    }
+    return s + '%';
+  };
+  /** 詳細頁的百分比（小數一位；null / undefined 顯示 —） */
+  const pct1 = (x, d = 1) => pct(x, d);
+  /**
+   * 機會成本的說明句（3.5.1）：連線數、原本會出國的是連線去向圖的範圍，成功改走台灣節點也用同一個範圍的
+   * `routedAccelerated`；跨 CDN 備援改走的（不在連線數裡）另外寫，不然讀起來像「588 次會出國、拉回了 675 次」。
+   * 舊版核心沒有 `routedAccelerated` 時照舊用 `accelerated`
+   */
+  const oppSentence = o => {
+    const has = typeof o.routedAccelerated === 'number';
+    const routed = has ? o.routedAccelerated : o.accelerated || 0;
+    const cross = has ? Math.max(0, (o.accelerated || 0) - o.routedAccelerated) : 0;
+    return `共比對 ${nf.format(o.connections || 0)} 次 CDN 連線，其中 ${nf.format(o.wouldGoAbroad || 0)} 次原本會出國，${nf.format(routed)} 次成功改走台灣節點` +
+      (cross > 0 ? `；另外跨 CDN 備援改走台灣 ${nf.format(cross)} 次` : '') + '。';
+  };
+  /** 拉回台灣（含跨 CDN 備援）裡跨 CDN 的次數（舊版核心沒有 routedAccelerated 時是 0） */
+  const crossExtra = o => typeof o.routedAccelerated === 'number' ? Math.max(0, (o.accelerated || 0) - o.routedAccelerated) : 0;
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
   const NS = 'http://www.w3.org/2000/svg';
   const sv = (tag, attrs = {}, parent) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (parent) parent.appendChild(n); return n; };
@@ -41,7 +69,7 @@
     const hm = p2(d.getHours()) + ':' + p2(d.getMinutes()), sec = ':' + p2(d.getSeconds());
     return mode === 'date' ? date : mode === 'time' ? hm : mode === 'timesec' ? hm + sec : date + ' ' + hm + (mode === 'sec' ? sec : '');
   };
-  Object.assign(KD, { nf, cf, compact, pct, el, sv, ago, fmtTime, LABEL, SHORT, CDN_COLOR });
+  Object.assign(KD, { nf, cf, compact, pct, pct1, oppSentence, el, sv, ago, fmtTime, LABEL, SHORT, CDN_COLOR });
 
   // ---------- 共用：提示框 ----------
   function tooltip(container) { const t = el('div', 'tip'); container.appendChild(t); return t; }
@@ -919,6 +947,8 @@
     };
     const card = (parent, cls) => { const c = el('div', 'card glass' + (cls ? ' ' + cls : '')); parent.appendChild(c); return c; };
     const tblBox = (parent, cls) => { const w = el('div', cls || 'tbl'); const t = el('table'); w.appendChild(t); parent.appendChild(w); return t; };
+    // 摺疊的數據表（3.5.1）：表格包在 .tbl 裡，在卡片裡自己左右滑；以前直接放在 details 裡，手機上整頁被撐寬
+    const detTable = (parent, label) => { const d = el('details', 'table'); d.appendChild(el('summary', '', label)); const t = tblBox(d); parent.appendChild(d); return t; };
     const legend = (parent, items) => { const lg = el('div', 'legend'); items.forEach(([n, c]) => { const s = el('span'); const i = el('i'); i.style.background = c; s.appendChild(i); s.appendChild(document.createTextNode(n)); lg.appendChild(s); }); parent.appendChild(lg); return lg; };
 
     if (o.toolbar) {
@@ -978,7 +1008,7 @@
       const c2 = card(g); c2.appendChild(el('h3', '', '近 30 天')); c2.appendChild(el('p', 'cap', '每日查詢與攔截（不含尚未結束的今天）'));
       legend(c2, [['查詢', 'var(--s1)'], ['攔截', 'var(--s2)']]);
       sec.trend = el('div', 'chart'); c2.appendChild(sec.trend);
-      const d = el('details', 'table'); d.appendChild(el('summary', '', '數據表')); sec.trendTable = el('table'); d.appendChild(sec.trendTable); c2.appendChild(d);
+      sec.trendTable = detTable(c2, '數據表');
       const g3 = el('div', 'grid g3'); g.appendChild(g3);
       const r1 = card(g3); r1.appendChild(el('h3', '', '最常用到的 CDN')); r1.appendChild(el('p', 'cap', '網站內容實際由誰提供')); sec.cdnRank = el('div', 'rank'); r1.appendChild(sec.cdnRank);
       const r2 = card(g3); r2.appendChild(el('h3', '', '熱門網站')); sec.sitesCap = el('p', 'cap', '所有裝置合計（不限人數）'); r2.appendChild(sec.sitesCap); sec.siteRank = el('div', 'rank'); r2.appendChild(sec.siteRank);
@@ -998,7 +1028,7 @@
       fc.appendChild(el('h3', '', 'CDN 連線去向'));
       fc.appendChild(el('p', 'cap', '每次回應算一次連線：左邊是各家 CDN（前 5 家，其餘合併成「其他」），右邊是連線最後到哪裡。跨 CDN 備援改走的連線不在這張圖裡（見「跨 CDN 備援」）'));
       sec.flowBox = el('div', 'chart flowchart'); fc.appendChild(sec.flowBox);
-      const fd = el('details', 'table'); fd.appendChild(el('summary', '', '數據表')); sec.flowTable = el('table'); fd.appendChild(sec.flowTable); fc.appendChild(fd);
+      sec.flowTable = detTable(fc, '數據表');
       const c = card(sec.routing, 'kd-mt12');
       c.appendChild(el('p', 'muted kd-mt0', '「一般 DNS 出國」= 固定上游以外的其他上游給的答案在國外節點；「拉回」= 這裡回給用戶的是台灣節點。每次回應算一次連線。'));
       sec.routeTable = tblBox(c);
@@ -1012,7 +1042,7 @@
       sec.mapBox = el('div', 'mapwrap chart'); c.appendChild(sec.mapBox);
       const lg = el('div', 'map-legend'); const sp = el('span'); sp.appendChild(el('i')); sp.appendChild(document.createTextNode('改走台灣的路線（越粗＝越多連線）')); lg.appendChild(sp);
       sec.mapNote = el('span'); lg.appendChild(sec.mapNote); c.appendChild(lg);
-      const d = el('details', 'table'); d.appendChild(el('summary', '', '數據表')); sec.mapTable = el('table'); d.appendChild(sec.mapTable); c.appendChild(d);
+      sec.mapTable = detTable(c, '數據表');
     }
     // ---- 節點池 ----
     if (on('pools')) { sec.poolCards = el('div', 'grid g2'); sec.pools.appendChild(sec.poolCards); }
@@ -1075,7 +1105,8 @@
           ['DNS 查詢', nf.format(t.queries), `快取命中 ${pct1(t.cacheHitRate)}`],
           ['攔截', nf.format(t.blocked), `廣告 ${nf.format(t.blockedAds)} · 惡意 ${nf.format(t.blockedMalware)} · 自訂 ${nf.format(t.blockedCustom)}`],
           ['CDN 連線比對', nf.format(o2.connections), `一般 DNS 出國 ${pct1(o2.otherDnsAbroadShare)}`],
-          ['拉回台灣', nf.format(o2.accelerated), `仍在國外 ${nf.format(o2.stillAbroad)}（${pct1(o2.oursAbroadShare)}）`],
+          // 3.5.1：大數字含跨 CDN 備援（不在「CDN 連線比對」的連線數裡），說明另外寫出來
+          ['拉回台灣', nf.format(o2.accelerated), (crossExtra(o2) ? `含跨 CDN 備援 ${nf.format(crossExtra(o2))} · ` : '') + `仍在國外 ${nf.format(o2.stillAbroad)}（${pct1(o2.oursAbroadShare)}）`],
           // 估計值都標樣本數（3.5.1）：平均縮短是幾次連線量到的、網站中位數是幾個網站量到的
           ['平均縮短', o2.avgSavedMs !== null ? o2.avgSavedMs + ' ms' : '—', (typeof o2.savedSamples === 'number' ? samplesText(o2.savedSamples) + ' · ' : '') + `合計 ${o2.totalSavedSec} 秒`],
           ['網站中位數差距', medianText(p.acceleration.medianSavedMs), samplesText(p.acceleration.samples || 0, '個網站兩邊都量到')],
@@ -1152,8 +1183,7 @@
         [rv.note, rv.unconfirmed, rv.audit].filter(Boolean).forEach(l => b.appendChild(el('p', 'muted', l)));
         if (rv.fuse) b.appendChild(el('p', 'kd-warn', rv.fuse));
         if (rv.pops.length || rv.nearby.length) {
-          const d = el('details', 'table'); d.appendChild(el('summary', '', '機房明細'));
-          const t = el('table'); d.appendChild(t); b.appendChild(d);
+          const t = detTable(b, '機房明細');
           table(t, rv.pops.concat(rv.nearby.map(n => ({ family: '鄰近', pop: n.pop + '（' + (LABEL[n.provider] || n.provider) + '）', city: '', nodes: '-', prefixes: n.prefixes, providers: '-', ms: '-' }))), [
             { h: '家族', v: r => r.family }, { h: '機房', v: r => r.pop + (r.city ? ' ' + r.city : '') },
             { h: '節點', v: r => r.nodes, num: 1 }, { h: '網段', v: r => r.prefixes, num: 1 }, { h: 'CDN', v: r => r.providers, num: 1 }, { h: '延遲', v: r => r.ms, num: 1 }
@@ -1163,7 +1193,7 @@
           const d = el('details', 'table'); d.appendChild(el('summary', '', '機房健康'));
           if (rv.health.text) d.appendChild(el('p', 'muted', rv.health.text));
           if (rv.health.rows.length) {
-            const t = el('table'); d.appendChild(t);
+            const t = tblBox(d);
             table(t, rv.health.rows, [
               { h: 'CDN', v: r => LABEL[r.provider] || r.provider }, { h: '家族', v: r => r.family }, { h: '機房', v: r => r.pop },
               { h: '節點', v: r => r.nodes, num: 1 }, { h: '壞的', v: r => r.bad, num: 1 }, { h: '失敗率', v: r => r.failRate, num: 1 },

@@ -103,7 +103,9 @@
 .kd .kd-seg button[aria-pressed="true"] { background: var(--btn); color: #fff; font-weight: 650; }
 
 /* ---------- 公開頁的圖表元件（管理介面也用） ---------- */
-.kd details.table { margin-top: 12px; font-size: 13px; color: var(--text-2); }
+.kd details.table { margin-top: 12px; font-size: 13px; color: var(--text-2); min-width: 0; max-width: 100%; }
+/* 數據表包在 .tbl 裡，在卡片裡自己左右滑（3.5.1；以前直接放在 details 裡，手機上整頁被撐寬） */
+.kd details.table .tbl { overscroll-behavior-x: contain; }
 .kd details.table summary { cursor: pointer; }
 .kd details.table table { margin-top: 8px; }
 .kd details.table th, .kd details.table td { text-align: right; padding: 4px 8px; }

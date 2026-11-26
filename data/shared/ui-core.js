@@ -5,6 +5,7 @@
  * 只放跟介面框架無關的純函式（不碰 DOM、不發請求），載入後是全域的 KuroshioUiCore：
  *   fmtTime(t, mode, tzOffsetMin)   日期時間固定格式（2026-11-12 10:22）
  *   fmtBytes(b)                     位元組 → B / KB / MB
+ *   pct(x, digits, empty)           比例 → 百分比（3.5.1：不是全部最多 99%、不是 0 最少 <1%）
  *   certCovers(info, domain)        憑證的 SAN 有沒有涵蓋這個網域（含萬用字元）
  *   restorePlan(cur, defs, removeOwn)  「恢復預設清單」的比對結果
  *   restoreSummary(changes, tr)     「恢復預設清單」的變更清單（文字，畫面由各介面自己組）
@@ -35,6 +36,22 @@
 	'use strict';
 
 	function p2(n) { return (n < 10 ? '0' : '') + n; }
+
+	/**
+	 * 比例（0～1）→ 百分比文字（3.5.1）。四捨五入不把「不是全部」寫成 100%、「不是 0」寫成 0%：
+	 * 0 < x < 1 時最多 99%（小數一位時 99.9%），四捨五入成 0 時寫 <1%（<0.1%）；剛好 0、1 與超出範圍的照實寫。
+	 * digits = 小數位數（預設 0）；不是數字回 empty（預設 '-'）。
+	 * 共用儀表板（data/dashboard/dashboard.js 的 pct）是同一份規則，tools/ui-core-test.js 用同一組向量檢查
+	 */
+	function pct(x, digits, empty) {
+		if (typeof x !== 'number' || !isFinite(x)) return empty === undefined ? '-' : empty;
+		var d = digits > 0 ? digits : 0, s = (x * 100).toFixed(d), step = Math.pow(10, -d);
+		if (x > 0 && x < 1) {
+			if (+s >= 100) s = (100 - step).toFixed(d);
+			else if (+s <= 0) return '<' + step.toFixed(d) + '%';
+		}
+		return s + '%';
+	}
 
 	/**
 	 * 日期時間一律用台灣習慣的固定格式，不跟瀏覽器語系（英文瀏覽器原本會顯示 11/12/2026, 10:22:03 AM）：
@@ -530,7 +547,7 @@
 			rows: ph.map(function (h) {
 				var until = msOf(h.heldUntil);
 				return { provider: h.provider || '-', family: h.family === 6 ? 'IPv6' : 'IPv4', pop: h.pop || '-', nodes: h.nodes || 0, bad: h.bad || 0,
-					failRate: typeof h.failRate === 'number' ? (h.failRate * 100).toFixed(0) + '%' : '-',
+					failRate: pct(h.failRate),
 					ms: typeof h.medianMs === 'number' ? h.medianMs + ' ms' : '-',
 					held: h.held ? (until ? format(t('暫時排到後面，到 %s'), [fmtTime(until)]) : t('暫時排到後面')) : '' };
 			})
@@ -553,7 +570,7 @@
 		};
 	}
 
-	var pctText = function (x) { return typeof x === 'number' ? (x * 100).toFixed(1) + '%' : '-'; };
+	var pctText = function (x) { return pct(x, 1); };
 	var msText = function (x) { return typeof x === 'number' ? x + ' ms' : '-'; };
 
 	/**
@@ -614,6 +631,7 @@
 	var core = {
 		fmtTime: fmtTime,
 		fmtBytes: fmtBytes,
+		pct: pct,
 		certCovers: certCovers,
 		format: format,
 		restorePlan: restorePlan,

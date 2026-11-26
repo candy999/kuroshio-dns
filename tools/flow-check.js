@@ -1,7 +1,8 @@
 'use strict';
 // 「CDN 連線去向」圖（3.5.1，data/dashboard/dashboard.js 的 cdnFlow）的瀏覽器檢查：site-e2e.js、admin-e2e.js 共用。
 // 數字跟 API 一致（前 5 家、其餘合併成「其他」、沒辨識出來的另外一塊；三塊加起來等於連線數）、
-// 桌機是 SVG 流向圖、手機寬度（小於 600 px）是每家 CDN 一條堆疊橫條、沒有水平捲動、沒有資料與只有一兩筆時的空狀態。
+// 桌機是 SVG 流向圖、手機寬度（小於 600 px）是每家 CDN 一條堆疊橫條、沒有水平捲動、沒有資料與只有一兩筆時的空狀態；
+// 展開所有數據表之後也沒有水平捲動、表格在卡片裡自己左右滑（checkDataTables）。
 
 /** 照 API 的 routing[] 算出圖上應該有的節點：[{ key, n, tw, acc, still }]，最後一筆是合計 */
 function expectFlow(routing, top = 5) {
@@ -122,4 +123,53 @@ async function checkOtherParts(page, tag) {
     ];
 }
 
-module.exports = { expectFlow, checkFlow, checkFlowEmpty, checkOtherParts };
+/**
+ * 展開頁面上所有「數據表」（details.table，3.5.1）之後：整頁沒有水平捲動，每張表格在卡片裡自己左右滑、
+ * 最後一欄捲得到（捲到最右邊時最後一欄整個在捲動框與畫面裡）。檢查完恢復原本的展開狀態。
+ * `w` 是視窗寬度；回傳 [[條件, 說明, 細節], …]
+ */
+async function checkDataTables(page, w, tag) {
+    const r = await page.evaluate(async () => {
+        const all = [...document.querySelectorAll('details.table')];
+        const was = all.map(d => d.open);
+        all.forEach(d => { d.open = true; });
+        await new Promise(res => requestAnimationFrame(() => requestAnimationFrame(res)));
+        const de = document.documentElement;
+        const vw = de.clientWidth;
+        const tables = all.filter(d => d.offsetParent !== null).map(d => {
+            const t = d.querySelector('table');
+            const sum = (d.querySelector('summary') || {}).textContent || '';
+            const card = d.closest('.card') || d.parentElement;
+            const box = t && t.closest('.tbl');
+            const out = { label: (card.querySelector('h3') || {}).textContent || sum, rows: t ? t.rows.length : 0 };
+            if (!t || !t.rows.length) return out;
+            out.wrapped = !!box && d.contains(box);
+            const scroller = box || d;
+            scroller.scrollLeft = scroller.scrollWidth;
+            const cells = [...t.rows].map(tr => tr.cells[tr.cells.length - 1]).filter(Boolean);
+            const sr = scroller.getBoundingClientRect(), cr = card.getBoundingClientRect();
+            const right = Math.max(...cells.map(c => c.getBoundingClientRect().right));
+            const left = Math.min(...cells.map(c => c.getBoundingClientRect().left));
+            out.overflow = Math.round(scroller.scrollWidth - scroller.clientWidth);
+            out.lastVisible = right <= sr.right + 1 && left >= sr.left - 1 && right <= vw + 1;
+            out.inCard = sr.right <= cr.right + 1;
+            out.tableW = Math.round(t.getBoundingClientRect().width);
+            out.boxW = Math.round(sr.width);
+            scroller.scrollLeft = 0;
+            return out;
+        });
+        const sw = Math.max(de.scrollWidth, document.body.scrollWidth);
+        all.forEach((d, i) => { d.open = was[i]; });
+        return { n: all.length, sw, vw, tables };
+    });
+    const withRows = r.tables.filter(t => t.rows);
+    const badWrap = withRows.filter(t => !t.wrapped), badLast = withRows.filter(t => !t.lastVisible || !t.inCard);
+    return [
+        [r.n > 0 && withRows.length > 0, `${tag}：頁面上有數據表`, JSON.stringify(r).slice(0, 300)],
+        [r.sw <= w + 1, `${tag}：展開所有數據表後沒有水平捲動`, `scrollWidth = ${r.sw}（${JSON.stringify(r.tables).slice(0, 400)}）`],
+        [badWrap.length === 0, `${tag}：數據表包在自己的捲動框（.tbl）裡`, JSON.stringify(badWrap)],
+        [badLast.length === 0, `${tag}：數據表的最後一欄捲得到、表格不超出卡片`, JSON.stringify(badLast)]
+    ];
+}
+
+module.exports = { expectFlow, checkFlow, checkFlowEmpty, checkOtherParts, checkDataTables };

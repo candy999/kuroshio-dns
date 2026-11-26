@@ -96,7 +96,8 @@
 
 	var nf = new Intl.NumberFormat('zh-TW');
 	function fmtNum(n) { return n == null || n === '' || isNaN(n) ? '-' : nf.format(n); }
-	function pct(a, b) { return b ? (100 * a / b).toFixed(1) + '%' : '-'; }
+	// 百分比（3.5.1：ui-core.js 的 pct，不是全部最多 99.9%、不是 0 最少 <0.1%）
+	function pct(a, b) { return b ? core.pct(a / b, 1) : '-'; }
 	/**
 	 * 跟介面框架無關的共用邏輯（日期時間、位元組、憑證涵蓋、恢復預設清單）：shared/ui-core.js（data/shared/，
 	 * 跟 LuCI、第三方韌體同一份），index.html 在這個檔之前載入成全域的 KuroshioUiCore

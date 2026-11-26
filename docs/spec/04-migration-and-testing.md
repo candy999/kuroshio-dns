@@ -95,7 +95,7 @@ Rust 版對齊前，在真實路由器上**同時跑兩個版本**：
 - OpenWrt：3.0 的 `kuroshio` 套件取代 2.x 的 `candydns`（宣告 `PROVIDES` / `CONFLICTS` 舊名）。`uci-defaults` 把 `/etc/config/candydns` 搬成 `/etc/config/kuroshio`、`/etc/candydns/` 搬成 `/etc/kuroshio/`，並補上 3.0 的新欄位；LuCI 改成 `luci-app-kuroshio`。
 - state 檔格式不變，所以**回退到 2.x 也能用**（社群要重新同步一次；v2 的 `peers.json` 回退時由 2.x 讀到不認識的格式會當成空的，所以升級時保留一份 `peers.v1.json` 備份）。
 - Windows：先停用 IIS 站台與舊的排程，再安裝服務；`state/` 直接複製到 `%ProgramData%\kuroshio\state\`。
-- **data/ 的舊檔（3.5.1）**：Windows 與 Linux 通用包升級時要整個替換 `data/`；只解壓覆蓋會留下舊版的檔。`manifest.rs` 的 `RETIRED` 列出已經不讀的檔（目前是 3.4.x 的 `seed/upstreams.json`，3.5.0 起不讀；`chain/share.rs` 只拿它比對「這是不是退役種子的評測時間」），啟動時實際存在就記一行 INFO（列出檔名、可以刪、升級時整個替換），`/api/status.data.leftovers` 也列出。**不在執行時刪**：安裝目錄可能是唯讀的（OpenWrt 的 `/usr/share/kuroshio`、Windows 的 Program Files），也不該由服務去動；OpenWrt 套件升級本來就會移除舊檔。之後再退役 data/ 的檔時加進 `RETIRED`。
+- **data/ 的舊檔（3.5.1）**：Windows 與 Linux 通用包升級時要整個替換 `data/`；只解壓覆蓋會留下舊版的檔。`manifest.rs` 的 `RETIRED` 列出已經不讀的檔（目前是 3.4.x 的 `seed/upstreams.json`，3.5.0 起不讀；`chain/share.rs` 只拿它比對「這是不是退役種子的評測時間」），啟動時實際存在就記一行 INFO（列出檔名、可以刪、升級時整個替換），`/api/status.data.leftovers` 也列出，發現清單有一筆 info（`data-leftovers`，3.5.1 測試版第五版：以前只有日誌與 `data.leftovers`）。**不在執行時刪**：安裝目錄可能是唯讀的（OpenWrt 的 `/usr/share/kuroshio`、Windows 的 Program Files），也不該由服務去動；OpenWrt 套件升級本來就會移除舊檔。之後再退役 data/ 的檔時加進 `RETIRED`。
 
 ## 6. 開源前檢查清單
 

@@ -126,7 +126,7 @@ kuroshio status [-c 設定檔] [--uci] [--json]
 | `data.version` | string \| null | `data/manifest.json` 的 `version` |
 | `data.ok` | bool | data/ 跟執行檔相容（有版本標記而且格式相同） |
 | `data.warning` | string \| null | data/ 的問題 |
-| `data.leftovers` | array of string | 3.5.1：data/ 裡舊版留下、這一版已經不讀的檔（相對 data/ 的路徑，例如 `seed/upstreams.json`）；沒有是 `[]`。不放進 `warnings`，只在啟動日誌記一行 INFO |
+| `data.leftovers` | array of string | 3.5.1：data/ 裡舊版留下、這一版已經不讀的檔（相對 data/ 的路徑，例如 `seed/upstreams.json`）；沒有是 `[]`。不放進 `warnings`，啟動日誌記一行 INFO，發現清單（`findings`）有一筆 info（`data-leftovers`） |
 | `warnings` | array of string | 需要注意的事：data/ 不相容、系統時間沒對時、記憶體吃緊、訂閱清單因為記憶體不足被停用、訂閱清單下載失敗、存取控制的台灣 IP 資料讀不到（公網來源擋下中）、新設定無法套用。沒有是 `[]`。文字內容不是約定，只約定「空陣列 = 沒事」 |
 | `freshness` | array | 3.5.0：資料新鮮度，同 `/api/status` 的 `freshness`（見下面「觀測與線路感知」）；舊版服務沒有是 `[]` |
 | `findings` | array | 3.5.0：發現清單，同 `/api/status` 的 `findings`；舊版服務沒有是 `[]`。`warnings` 不受影響（同一件事不兩邊都放） |
@@ -762,7 +762,7 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
 ```
 
 - 分工：`warnings` = 現在需要處理的；`findings` = 觀察到的現象與經過。同一件事不兩邊都放。
-- `key`（約定）：`upstream-failing`、`upstream-all-down`、`serve-stale-high`、`cdn-verify-fail-high`、`chain-intercepted`、`chain-released-untrusted`、`chain-audit-released`、`list-copy-no-room`、`cdn-db-pruning`、`job-failing`、`friends-sync-failing`、`reach-single-pop`、`reach-none`、`pop-mismatch`、`pop-switched`、`pop-flapping`、`slower-fallback`、`slower-fuse`、`cdn-verify-paced`（3.5.0 F12：新網域很多，CDN 驗證減量中）、`site-min-clients-1`（3.5.1：公開頁對外開放、網站排行最少人數還是 1）。之後可能會加，不認得的 `key` 請照 `text` 顯示。
+- `key`（約定）：`upstream-failing`、`upstream-all-down`、`serve-stale-high`、`cdn-verify-fail-high`、`chain-intercepted`、`chain-released-untrusted`、`chain-audit-released`、`list-copy-no-room`、`cdn-db-pruning`、`job-failing`、`friends-sync-failing`、`reach-single-pop`、`reach-none`、`pop-mismatch`、`pop-switched`、`pop-flapping`、`slower-fallback`、`slower-fuse`、`cdn-verify-paced`（3.5.0 F12：新網域很多，CDN 驗證減量中）、`site-min-clients-1`（3.5.1：公開頁對外開放、網站排行最少人數還是 1）、`data-leftovers`（3.5.1：data/ 有舊版留下、已經不讀的檔，可以刪）。之後可能會加，不認得的 `key` 請照 `text` 顯示。
 - 3.5.0 F3：`serve-stale-high` 要四個條件都成立才出現——最近 15 分鐘查詢 100 筆以上、過期快取回答的佔 5% 以上、背景更新失敗 5 次以上、而且過期回答裡至少四分之一是更新失敗（查詢少、重複多的家裡過期比例本來就高，不代表上游有狀況）；文字寫「…其中 M 次背景更新失敗：上游可能有狀況」。`cdn-db-pruning` 的文字改成「CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 N 筆）」。
 - `sev`：`warn` / `info`。排序：`warn` 在前，同級 `lastAt` 新的在前。
 - `text`：一句話（最長 200 個字元，內容不是約定）；只放數量、CDN 名稱、機房代碼，不放網域與用戶端 IP。
@@ -836,7 +836,7 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
 | `slowerFuseUntil` | 跳了才有（毫秒）：一小時裡「台灣節點比原本慢」超過 30%（至少 10 次），之前照常換台灣節點 |
 | `stats.verifyOk`／`verifyFail`／`slowerFallback` | 台灣節點驗證通過／沒通過（不含比原本慢）／比原本慢暫時用原本答案的次數（啟動後累計，32 位元）。3.5.0 F9 多 `slowerFirst`（第一次量到慢，照樣換台灣節點）、`slowerReturned`（退回之後重驗不慢、回台灣節點）。3.5.1 多 `origTw`（驗證時原本的答案已經在台灣機房、不換；不算在 `verifyFail`）、`dedicated`（業者專用 IP 照原本的答案回的次數） |
 
-其他：`/api/cdn/pools` 還沒確認的節點多 `upPop`；3.5.1：被驗證暫停的節點多 `strikes`（24 小時內第幾次，暫停 30 分鐘 × 2^(次數−1)、最多 8 小時，期間健檢通過也不恢復）；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。
+其他：`/api/cdn/pools` 每家多 `restricted`（3.5.1：目前被標成「特定產品專用」的節點，`[{ ip, sites, hit, missAt, until, inPool }]`；`sites` 是不能用的網站數、`hit` 是可以用的次數、`until` 是沒有新的失敗時哪個時間消退（毫秒）、`inPool` 是不是在節點池裡；網站數多的在前、每家最多 32 個）與 `restrictedTotal`（總數）；還沒確認的節點多 `upPop`；3.5.1：被驗證暫停的節點多 `strikes`（24 小時內第幾次，暫停 30 分鐘 × 2^(次數−1)、最多 8 小時，期間健檢通過也不恢復）；`/api/cdn/domain` 的 `v4` 在「比原本慢」時多 `slower: true`、`score`、`origScore`（毫秒）；`/api/cdn/explain` 多決定代碼 `slower`。
 
 3.5.0 F9（比原本慢的第二版）：`score`／`origScore` 的意義改成**連線＋TLS 握手**的毫秒數（台灣節點／原本的 IP；不含收到回應標頭的時間）。判斷是「台灣 × 0.7 > 原本 ＋ 10 毫秒」，要連續 2 次驗證、相隔 10 分鐘以上都慢才退回；第一次慢時 `v4` 多 `slow1: { at, score, origScore }`、照常換台灣節點（`explain` 的 `text` 多一句「上一次驗證握手比原本慢，再確認一次才會退回」）。退回 15 分鐘（`cdn.lite` 1 小時），到期後有人查才重驗，重驗一次不慢就回台灣節點並清掉 `slower`／`score`／`origScore`／`reason`。分數只存在 `slow1`／`slower` 的那幾筆。手動 `POST /api/cdn/verify` 走同一套（不受 F12 的名額限制，但算進用量），回應是 `{ "result": 網域紀錄, "error": "ok"｜"fail"｜…, "entry": …, "speed": … }`，`speed` 是 `{ "score", "origScore", "weighted"（台灣 × 0.7）, "slower"（這一次慢不慢）, "state", "confirmAfter" }`：`state` 是 `ok`、`slow1`（第一次慢，或第一次慢之後不到 10 分鐘又驗：不算確認、`slow1` 的時間不重設）或 `slower`（確認退回）；`confirmAfter` 是 `slow1` 時還要等幾毫秒下一次驗證才算確認，其他是 0。沒有判的時候 `speed` 是 `null`：IPv6、Fastly 這類最近節點型、手動「一定換」、只能用 HTTP 驗證的網站、量不到握手、保險絲跳了、`cdn.slowerFallback` 關掉（這幾種都照驗證通過處理，並清掉 `slow1`）。第一次慢的日誌併在既有的 ✔ 那一行：「✔ example.com IPv4 台灣節點可用 (TPE 200 5ms)；握手比原本慢（250 對 100 毫秒），先照常換，10 分鐘後有人查再確認一次」；確認退回「↷ example.com IPv4 台灣節點能用，但握手連續兩次比原本慢（250 對 100 毫秒，相隔 12 分鐘）：暫時用原本的答案，15 分鐘後有人查再重驗」；退回後重驗還是慢「↷ … 重驗握手還是比原本慢（…）：繼續用原本的答案，15 分鐘後有人查再重驗」；回來「✔ … 台灣節點可用 (…)；重驗握手不比原本慢，回到台灣節點」。`kuroshio notify wan-changed`（`/api/notify/wan-changed`）多做一件事：把 `reach` 標成過期、清掉機房切換的連續計數與暫緩，不補跑健檢或掃描。
 

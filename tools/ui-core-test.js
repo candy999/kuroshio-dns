@@ -50,5 +50,23 @@ for (const fn of Object.keys(vectors)) {
     });
 }
 
+// 3.5.1：百分比的規則兩份一致（dashboard.js 不是數字時顯示 —，其他跟 ui-core.js 的 pct 一樣）
+(vectors.pct || []).forEach((c, i) => {
+    if (c.args.length > 2) return;
+    const want = typeof c.args[0] === 'number' ? c.expect : '—';
+    const d = dash.KuroshioDashboard.pct.apply(null, c.args);
+    check(d === want, `pct #${i + 1}${c.name ? '（' + c.name + '）' : ''}：dashboard.js 的 pct 結果不同（${JSON.stringify(d)}，預期 ${JSON.stringify(want)}）`);
+});
+// 只有 dashboard.js 有的函式（向量在 ui-core.tests.json 的 dashboard 底下）
+for (const [fn, list] of Object.entries(vectors.dashboard || {})) {
+    if (!Array.isArray(list)) continue;
+    if (typeof dash.KuroshioDashboard[fn] !== 'function') { check(false, `dashboard.js 沒有 ${fn}`); continue; }
+    list.forEach((c, i) => {
+        let got;
+        try { got = norm(dash.KuroshioDashboard[fn].apply(null, c.args)); } catch (e) { check(false, `dashboard ${fn} #${i + 1}：${e.message}`); return; }
+        check(JSON.stringify(got) === JSON.stringify(c.expect), `dashboard ${fn} #${i + 1}${c.name ? '（' + c.name + '）' : ''}\n     預期 ${JSON.stringify(c.expect)}\n     實際 ${JSON.stringify(got)}`);
+    });
+}
+
 console.log(`ui-core 測試向量：通過 ${pass}，失敗 ${fail}`);
 process.exit(fail ? 1 : 0);
