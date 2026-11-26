@@ -316,7 +316,9 @@ impl Cache {
     /// 同 [`Cache::hot_keys`]，時間由呼叫端給（測試用）
     pub fn hot_keys_at(&self, n: usize, now: Instant) -> Vec<String> {
         let now_ds = mono_ds(self.base, now);
-        let mut v: Vec<(&String, f64)> = self
+        // 分數用整數算（MT7621 沒有浮點運算單元）：命中次數 × 1 小時 ÷（1 小時 + 上次使用距今），0.1 秒為單位
+        const HOUR_DS: u64 = 36_000;
+        let mut v: Vec<(&String, u64)> = self
             .map
             .iter()
             .filter(|(k, _)| !k.split('|').next().unwrap_or("").contains('+'))
@@ -326,11 +328,11 @@ impl Cache {
                 if hits < WARM_MIN_HITS {
                     return None;
                 }
-                let age_h = now_ds.saturating_sub(e.last_access.load(Ordering::Relaxed)) as f64 / 36_000.0;
-                Some((k, f64::from(hits) / (1.0 + age_h)))
+                let age = u64::from(now_ds.saturating_sub(e.last_access.load(Ordering::Relaxed)));
+                Some((k, u64::from(hits) * HOUR_DS * 16 / (HOUR_DS + age)))
             })
             .collect();
-        v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         // 特殊用途網域在本機回答時根本不會進快取；關掉時照一般網域
         cap_per_site(v.into_iter().map(|x| x.0.clone()), n, false)
     }
