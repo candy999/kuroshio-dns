@@ -235,7 +235,20 @@ pub struct CopyMeta {
     pub rules: u64,
     /// 上次成功檢查更新的時間（Unix 秒；3.4.2 起，舊版的索引沒有是 0）：重新啟動後不必馬上再問一次
     pub checked: u64,
+    /// 上次還是啟用中的清單的時間（Unix 秒；3.5.1 起，每天最多記一次，舊版的索引沒有是 0）：
+    /// 不在設定裡（或停用）超過 [`COPY_GRACE_SECS`] 的副本刪掉（[`ListCopies::prune`]）
+    pub used: u64,
 }
+
+impl CopyMeta {
+    /// 最後一次還用得到的時間：啟用中的記號、下載、檢查更新取最晚的（舊版的索引沒有 `used`）
+    fn last_used(&self) -> u64 {
+        self.used.max(self.at).max(self.checked)
+    }
+}
+
+/// 不在設定裡、或停用中的清單，副本留多久（秒）：期間重新啟用不必重新下載（3.5.1）
+pub const COPY_GRACE_SECS: u64 = 7 * 86400;
 
 /// [`ListCopies::stream`] 送回來的一段
 pub enum CopyChunk {
@@ -390,6 +403,7 @@ impl ListCopies {
                             at: n("at"),
                             rules: n("rules"),
                             checked: n("checked"),
+                            used: n("used"),
                         },
                     );
                 }
@@ -488,6 +502,7 @@ impl ListCopies {
             }
             let file = url_id(url);
             let checked = idx.get(url).map_or(0, |m| m.checked);
+            let used = idx.get(url).map_or(0, |m| m.used);
             idx.insert(
                 url.to_string(),
                 CopyMeta {
@@ -499,6 +514,7 @@ impl ListCopies {
                     at: now,
                     rules,
                     checked,
+                    used,
                 },
             );
             self.persister.lock().unwrap().stage(&file, z);
@@ -566,11 +582,45 @@ impl ListCopies {
                 let c = &idx[k];
                 (
                     k.clone(),
-                    json!({ "hash": format!("{:016x}", c.hash), "etag": c.etag, "lastModified": c.last_modified, "bytes": c.bytes, "at": c.at, "rules": c.rules, "checked": c.checked }),
+                    json!({ "hash": format!("{:016x}", c.hash), "etag": c.etag, "lastModified": c.last_modified, "bytes": c.bytes, "at": c.at, "rules": c.rules, "checked": c.checked, "used": c.used }),
                 )
             })
             .collect();
         serde_json::to_vec(&Value::Object(m)).unwrap_or_default()
+    }
+
+    /// 清理不再使用的副本（3.5.1）：`active` = 設定裡啟用中的清單網址。
+    ///
+    /// - 啟用中的：記下「還在用」的時間（每天最多更新一次索引）
+    /// - 不在 `active` 裡（從設定拿掉、或停用中）而且最後一次用到（[`CopyMeta::last_used`]）超過 `grace` 秒：
+    ///   索引拿掉、副本檔刪掉。寬限期內重新啟用就直接讀副本，不必重新下載
+    ///
+    /// 以前只會新增、更新，從設定拿掉的清單副本一直留在磁碟上，狀態頁的副本份數也算進去。
+    /// 回傳（刪掉幾份, 釋出的 bytes）
+    pub fn prune(&self, active: &[&str], now: u64, grace: u64) -> (usize, u64) {
+        let mut idx = self.index.lock().unwrap();
+        let mut changed = false;
+        let mut gone: Vec<String> = Vec::new();
+        for (url, m) in idx.iter_mut() {
+            if active.contains(&url.as_str()) {
+                if now >= m.used.saturating_add(86400) {
+                    m.used = now;
+                    changed = true;
+                }
+            } else if now.saturating_sub(m.last_used()) > grace {
+                gone.push(url.clone());
+            }
+        }
+        if gone.is_empty() && !changed {
+            return (0, 0);
+        }
+        let files: Vec<String> = gone.iter().filter_map(|u| idx.remove(u)).map(|m| m.file).collect();
+        let body = Self::index_json(&idx);
+        drop(idx);
+        let mut p = self.persister.lock().unwrap();
+        let freed = files.iter().map(|f| p.discard(f)).sum();
+        p.stage(COPY_INDEX, body);
+        (files.len(), freed)
     }
 
     /// 狀態頁：副本份數、大小
@@ -1081,6 +1131,7 @@ impl FilterService {
     /// 更新訂閱清單；回傳是否重建。`force` = 不管有沒有變都重新下載
     pub async fn update_lists(&self, force: bool) -> anyhow::Result<bool> {
         let _g = self.rebuild_lock.lock().await;
+        self.prune_copies();
         if self.all_suspended() {
             // 記憶體最低限度：清單暫停中，恢復時才重新載入
             return Ok(false);
@@ -1128,6 +1179,24 @@ impl FilterService {
             self.note_checked(&active);
         }
         r
+    }
+
+    /// 清單副本的清理（[`ListCopies::prune`]）：每次檢查更新時做一次（每天最多幾次、背景）。
+    /// 系統時間還沒對時不做（時間不可信時算不出寬限期）
+    fn prune_copies(&self) {
+        let Some(c) = self.copies.get() else { return };
+        if !crate::clock::synced() {
+            return;
+        }
+        let active: Vec<&str> = self.sources.iter().map(|s| s.url.as_str()).collect();
+        let (n, bytes) = c.prune(&active, crate::persist::now_secs(), COPY_GRACE_SECS);
+        if n > 0 {
+            info!(
+                "刪掉 {n} 份已經不在設定裡（或停用超過 {} 天）的過濾清單副本，釋出 {} KB",
+                COPY_GRACE_SECS / 86400,
+                bytes / 1024
+            );
+        }
     }
 
     /// 記下這幾份清單剛檢查過更新
@@ -2249,6 +2318,68 @@ mod copy_tests {
         // 儲存空間不夠（低於保留量 + 遲滯）時不留副本（記憶體能不能長大由記憶體控制決定，見 memgov 的測試）
         p.lock().unwrap().set_free_probe(|_| Some(1 << 20));
         assert!(!c.wanted(1000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.5.1：不在設定裡（或停用）超過 7 天的副本刪掉（索引與檔案），寬限期內的留著；啟用中的記下「還在用」
+    #[test]
+    fn prune_drops_copies_not_in_config_after_grace() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-listprune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Arc::new(Mutex::new(Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096))));
+        p.lock().unwrap().set_free_probe(|_| Some(10 << 30));
+        let c = ListCopies::new(p.clone());
+        let day = 86400;
+        let t0 = 1_800_000_000;
+        let v = Validators::default();
+        let copy = |url: &str, at: u64| {
+            let mut s = CopySink::new(true);
+            s.feed(format!("||{url}^\n").repeat(50).as_bytes());
+            let (h, z) = s.finish();
+            assert!(c.offer(url, h, z, &v, at, 50));
+        };
+        let (keep, old31, paused, removed) = (
+            "https://lists.example.com/keep.txt",
+            "https://lists.example.com/v31.txt",
+            "https://lists.example.com/paused.txt",
+            "https://lists.example.net/recent.txt",
+        );
+        copy(keep, t0);
+        // 3.1 時代的舊副本：舊版索引沒有 `used`，30 天前下載、之後沒再檢查
+        copy(old31, t0 - 30 * day);
+        copy(paused, t0);
+        copy(removed, t0 - 2 * day);
+        p.lock().unwrap().flush_all(t0).unwrap();
+        let file = |u: &str| p.lock().unwrap().file_path(&c.meta(u).unwrap().file);
+        let old_file = file(old31);
+        assert!(old_file.exists());
+        // 啟用中的是 keep 與 paused：v31 超過寬限期刪掉；recent 拿掉才 2 天，留著
+        let (n, bytes) = c.prune(&[keep, paused], t0, COPY_GRACE_SECS);
+        assert_eq!(n, 1);
+        assert!(bytes > 0);
+        assert!(c.meta(old31).is_none() && !old_file.exists(), "索引與檔案都刪掉");
+        assert!(
+            c.meta(removed).is_some() && c.available(removed),
+            "寬限期內留著（重新加回不必重新下載）"
+        );
+        assert_eq!(c.meta(keep).unwrap().used, t0, "啟用中的記下還在用");
+        assert_eq!(c.status()["count"], 3);
+        // 同一天再做一次：什麼都不變（不重寫索引）
+        assert_eq!(c.prune(&[keep, paused], t0 + 3600, COPY_GRACE_SECS), (0, 0));
+        assert_eq!(c.meta(keep).unwrap().used, t0);
+        // 之後 paused 停用：從最後一次還在用的那天起算 7 天才刪；recent 也到期
+        let later = t0 + 7 * day + 1;
+        let paused_file = file(paused);
+        assert_eq!(c.prune(&[keep], later, COPY_GRACE_SECS).0, 2);
+        assert!(c.meta(paused).is_none() && !paused_file.exists());
+        assert!(c.meta(removed).is_none());
+        assert!(c.meta(keep).is_some());
+        assert_eq!(c.status()["count"], 1);
+        // 索引寫出去之後重新讀回來也一樣
+        p.lock().unwrap().flush_all(later).unwrap();
+        let c2 = ListCopies::new(Arc::new(Mutex::new(Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096)))));
+        assert_eq!(c2.status()["count"], 1);
+        assert_eq!(c2.meta(keep).unwrap().used, later);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

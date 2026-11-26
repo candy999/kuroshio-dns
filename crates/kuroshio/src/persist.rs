@@ -512,6 +512,22 @@ impl Persister {
         }
     }
 
+    /// 不再需要的快照（3.5.1：已經不在設定裡的過濾清單副本）：丟掉還沒寫出的內容、刪掉磁碟上的檔
+    /// （一般與 .zst 兩種格式都刪）。回傳刪掉的 bytes
+    pub fn discard(&mut self, name: &str) -> u64 {
+        self.entries.remove(name);
+        let p = self.path(name);
+        let mut freed = 0;
+        for f in [statefile::zst_path(&p), p] {
+            if let Ok(m) = std::fs::metadata(&f) {
+                if std::fs::remove_file(&f).is_ok() {
+                    freed += m.len();
+                }
+            }
+        }
+        freed
+    }
+
     /// 登記最新內容（還不寫）；內容跟已寫入的一樣就什麼都不做
     pub fn stage(&mut self, name: &str, data: Vec<u8>) {
         self.stage_with(name, Snapshot::Bytes(data), Opts::default(), now_secs());
