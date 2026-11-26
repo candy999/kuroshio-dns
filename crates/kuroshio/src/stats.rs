@@ -348,6 +348,8 @@ struct Anon {
     c: Vec<u32>,
     /// 重新啟動前已知的人數（無法還原雜湊，當作下限）
     base: u32,
+    /// 上次被查到的順序（[`Inner::anon_seq`]）：收滿要淘汰時，次數一樣的先淘汰比較久沒被查到的
+    last: u32,
 }
 
 /// 記憶體上限（小記憶體機器可以調低）
@@ -355,7 +357,7 @@ struct Anon {
 pub struct Limits {
     /// 熱門網域 / 被擋網域 / 用戶端各自最多幾筆（超過就只留前 1/4）
     pub top_max: usize,
-    /// 今天的匿名網站排行最多幾個網站（超過就不再加新網站）
+    /// 今天的匿名網站排行最多幾個網站（收滿時一次淘汰次數最少的一半，見 [`evict_half`]）
     pub anon_sites: usize,
 }
 
@@ -381,6 +383,8 @@ struct Inner {
     salt: RandomState,
     sites: HashMap<Box<str>, Anon>,
     blocked_sites: HashMap<Box<str>, Anon>,
+    /// 匿名排行每被查到一次加 1（只用來比先後，繞回也只影響同次數時誰先被淘汰）
+    anon_seq: u32,
     limits: Limits,
     /// 記憶體控制縮小排行之前的上限（恢復用）
     saved_top_max: Option<usize>,
@@ -401,6 +405,7 @@ impl Default for Inner {
             salt: RandomState::new(),
             sites: HashMap::new(),
             blocked_sites: HashMap::new(),
+            anon_seq: 0,
             limits: Limits::default(),
             saved_top_max: None,
             hist: Hist::default(),
@@ -614,6 +619,32 @@ fn top_n<K: ToString + Ord>(map: &HashMap<K, u64>, n: usize) -> Value {
     )
 }
 
+/// 匿名排行收滿時：淘汰次數最少的一半（同樣次數時 `last` 比較小、比較久沒被查到的先）。
+/// 只排序（次數, 順序）兩個數字、找出分界，再用 `retain` 刪，不複製網站名稱
+fn evict_half(map: &mut HashMap<Box<str>, Anon>) {
+    let k = map.len() / 2;
+    if k == 0 {
+        return;
+    }
+    let mut v: Vec<(u64, u32)> = map.values().map(|a| (a.n, a.last)).collect();
+    let (_, pivot, _) = v.select_nth_unstable(k - 1);
+    let pivot = *pivot;
+    // 比分界小的全部刪；剛好等於分界的只刪到湊滿 k 個（還原的資料 `last` 都是 0，可能很多筆一樣）
+    let less = v.iter().filter(|x| **x < pivot).count();
+    let mut eq_quota = k - less;
+    map.retain(|_, a| {
+        let key = (a.n, a.last);
+        if key < pivot {
+            return false;
+        }
+        if key == pivot && eq_quota > 0 {
+            eq_quota -= 1;
+            return false;
+        }
+        true
+    });
+}
+
 /// 今天的匿名計數 → 每日紀錄（前 300 名）
 fn dump(map: &HashMap<Box<str>, Anon>) -> Vec<SiteRow> {
     let mut v: Vec<SiteRow> = map
@@ -635,6 +666,7 @@ fn undump(rows: &[SiteRow]) -> HashMap<Box<str>, Anon> {
                     n: *n,
                     c: Vec::new(),
                     base: *c,
+                    last: 0,
                 },
             )
         })
@@ -882,16 +914,22 @@ impl Inner {
     fn anon(&mut self, blocked: bool, site: &str, client: IpAddr) {
         let h = self.salt.hash_one(client) as u32;
         let max = self.limits.anon_sites;
+        self.anon_seq = self.anon_seq.wrapping_add(1);
+        let seq = self.anon_seq;
         let map = if blocked { &mut self.blocked_sites } else { &mut self.sites };
         let e = match map.get_mut(site) {
             Some(e) => e,
             None => {
-                if map.len() >= max {
-                    return;
+                // 收滿：一次淘汰次數最少（同樣次數時最久沒被查到）的一半，再收新的。
+                // 3.5.0 以前收滿就不再加，壓測那天被單一來源的一次性網域佔滿，之後真正使用者的新網站都記不到。
+                // 每收 max/2 個新網站才做一次（攤銷 O(1)），在既有的鎖裡、不另外配置鍵
+                if map.len() >= max.max(2) {
+                    evict_half(map);
                 }
                 map.entry(site.into()).or_default()
             }
         };
+        e.last = seq;
         e.n += 1;
         if e.c.len() < ANON_CLIENTS && !e.c.contains(&h) {
             e.c.push(h);
@@ -1307,6 +1345,7 @@ impl Stats {
                                     n: *n,
                                     c: Vec::new(),
                                     base: *c,
+                                    last: 0,
                                 },
                             );
                         }
@@ -1470,6 +1509,60 @@ mod tests {
         assert_eq!(d.len(), RETENTION_DAYS);
         assert_eq!(d.last().unwrap().0, today);
         assert_eq!(d[0].0, "2001-01-11", "只留最近的日子");
+    }
+
+    /// 3.5.1：匿名排行收滿時淘汰次數最少的一半，不再拒收新網站（壓測那天一次性網域佔滿，真正的網站記不到）
+    #[test]
+    fn anon_full_evicts_least_counted_half() {
+        let mut i = Inner::default();
+        i.roll("2001-01-01");
+        i.limits.anon_sites = 100;
+        let ip = |n: u8| -> IpAddr { format!("192.0.2.{n}").parse().unwrap() };
+        // 真正使用者的網站：查很多次
+        for _ in 0..20 {
+            i.anon(false, "example.net", ip(1));
+            i.anon(false, "example.org", ip(2));
+        }
+        // 單一來源的一次性網域塞滿
+        for k in 0..98 {
+            i.anon(false, &format!("p{k}.example"), ip(9));
+        }
+        assert_eq!(i.sites.len(), 100);
+        // 收滿之後的新網站照樣記得到：淘汰一半（次數最少、最久沒被查到的先）
+        i.anon(false, "new.example.com", ip(3));
+        assert_eq!(i.sites.len(), 51, "淘汰 50 筆、加 1 筆");
+        for s in ["example.net", "example.org", "new.example.com"] {
+            assert!(i.sites.contains_key(s), "{s} 要留著");
+        }
+        assert!(!i.sites.contains_key("p0.example"), "最早的一次性網域先淘汰");
+        assert!(i.sites.contains_key("p97.example"), "同樣次數時最近的留著");
+        assert_eq!(i.sites["example.net"].n, 20, "留下的計數不變");
+        // 一直湧入也有上限，常用的網站一直都在
+        for k in 0..1000 {
+            i.anon(false, &format!("q{k}.example"), ip(9));
+        }
+        assert!(i.sites.len() <= 100);
+        assert!(i.sites.contains_key("example.net") && i.sites.contains_key("example.org"));
+        // 被擋網站的排行同樣處理
+        i.limits.anon_sites = 10;
+        for k in 0..30 {
+            i.anon(true, &format!("b{k}.example"), ip(9));
+        }
+        assert!(i.blocked_sites.len() <= 10 && i.blocked_sites.contains_key("b29.example"));
+    }
+
+    /// 次數一樣（還原的資料順序都是 0）時剛好淘汰一半，不會全部刪掉
+    #[test]
+    fn evict_half_with_ties_removes_exactly_half() {
+        let mut m: HashMap<Box<str>, Anon> = (0..10)
+            .map(|k| (format!("s{k}.example").into_boxed_str(), Anon { n: 1, ..Anon::default() }))
+            .collect();
+        evict_half(&mut m);
+        assert_eq!(m.len(), 5);
+        let mut one: HashMap<Box<str>, Anon> = HashMap::new();
+        one.insert("a.example".into(), Anon::default());
+        evict_half(&mut one);
+        assert_eq!(one.len(), 1, "只有 1 筆時不刪");
     }
 
     #[test]

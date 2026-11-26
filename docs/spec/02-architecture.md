@@ -182,6 +182,7 @@ kuroshio check-config <file>                     檢查設定檔
 - 設定教學依實際開啟的協議產生：DoH、DoH3、DoT、DoQ 網址，`sdns://` stamp，Android「私人 DNS」主機名稱，Windows 11 DoH 範本，各平台 App 建議。
 - 頁面檔案放在 `data/site/`（安裝後是 `/usr/share/kuroshio/site/`），可以用 `site.htmlFile` / `site.detailFile` 換成自己的版本（同 2.x）；`{{HOST}}` 代入 `site.hostname`，沒設定時用請求的 Host。DoH 不在 443 時網址要帶埠號，用 `{{DOH_URL}}`（完整 DoH 網址）、`{{SITE_URL}}`（這一頁的網址）、`{{DOH_HOSTPORT}}`（網域加埠號）、`{{DOH_PORT}}`；舊的 `{{HOST}}{{DOH_PATH}}` 寫法不會帶埠號。實作見 `crates/kuroshio/src/site.rs`、`presence.rs`。
 - 網站排行（`topSites`、`topBlocked`）只列出至少 `site.minClients` 位不同使用者造訪過的網站，預設 1（全部列出）。
+- 排行的資料（3.5.1）：今天的網站與被擋網站各最多 20,000 個（`stats.rs` 的 `Limits.anon_sites`），過去每一天各留前 300 名。收滿時一次淘汰次數最少的一半（同樣次數時最久沒被查到的先，`evict_half()`），再收新的網站；以前收滿就不再加，壓測那天被單一來源的一次性網域佔滿，之後真正使用者的新網站都記不到。每收一萬個新網站才整理一次（攤銷 O(1)），在既有的統計鎖裡做、只比次數與順序兩個數字、不複製網站名稱。
 
 ### 7.2 設定頁
 
