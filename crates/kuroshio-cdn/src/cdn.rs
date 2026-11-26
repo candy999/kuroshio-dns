@@ -1726,7 +1726,11 @@ impl Cdn {
     }
 
     /// 每小時：熱門且即將到期的「驗證通過」網域先重新驗證，避免掉回 10 秒試用；
-    /// 另外輪流抽一小批還在有效期內、最近真的有在改寫的網域複驗（見 `reverify_pick`）。回傳排入幾個
+    /// 另外輪流抽一小批還在有效期內、最近真的有在改寫的網域複驗（見 `reverify_pick`）。回傳排入幾個。
+    ///
+    /// 3.5.1 M3：只複驗真的有在用的——`best` 是換節點（`Alias`，真的有在改寫），或問過 2 次以上的；
+    /// 只問過一次的網域到期就讓它到期（以前「3 天內出現過＋通過＋1 小時內到期」全部重驗，大量一次性網域每天被重驗）。
+    /// L13：多來源網域另一家的那一格（`src.alt`）用同樣的條件複驗（那一家最後回答在 3 天內）
     pub fn recheck(self: &Arc<Self>) -> usize {
         let now = now_ms();
         let soon = now + util::HOUR_MS;
@@ -1735,22 +1739,51 @@ impl Cdn {
         let sampled;
         {
             let st = self.state();
+            let due = |v: Option<&db::Verdict>| v.is_some_and(|v| v.is("ok") && v.until.unwrap_or(0) < soon);
             for e in st.db.domains.values() {
-                if e.last_seen < recent {
+                if e.best != Some(db::Strategy::Alias) && e.hits < 2 {
                     continue;
                 }
-                let Some(p) = e.provider() else { continue };
-                if !st.pools.has(p) {
+                if e.last_seen >= recent {
+                    if let Some(p) = e.provider().filter(|p| st.pools.has(p)) {
+                        for fam in [4u8, 6] {
+                            if due(e.verdict(fam)) {
+                                tasks.push(Task::Verify {
+                                    name: e.name.to_string(),
+                                    provider: p.to_string(),
+                                    family: fam,
+                                    orig: e.orig_ip(fam),
+                                });
+                            }
+                        }
+                    }
+                }
+                // L13：另一家的那一格
+                let Some(a) = e.src.as_ref().and_then(|s| s.alt.as_deref()) else {
+                    continue;
+                };
+                if a.last < recent {
                     continue;
                 }
-                for fam in [4u8, 6] {
-                    let Some(v) = e.verdict(fam) else { continue };
-                    if v.is("ok") && v.until.unwrap_or(0) < soon {
+                let Some(p) = a.provider.val().filter(|p| st.pools.has(p)) else {
+                    continue;
+                };
+                for (fam, v) in [(4u8, a.v4.as_deref()), (6, a.v6.as_deref())] {
+                    if due(v) {
+                        let orig = if fam == 4 {
+                            a.base
+                                .as_ref()
+                                .and_then(|b| b.ip)
+                                .filter(IpAddr::is_ipv4)
+                                .or_else(|| a.ips4.first().copied())
+                        } else {
+                            a.ips6.first().copied()
+                        };
                         tasks.push(Task::Verify {
                             name: e.name.to_string(),
                             provider: p.to_string(),
                             family: fam,
-                            orig: e.orig_ip(fam),
+                            orig,
                         });
                     }
                 }

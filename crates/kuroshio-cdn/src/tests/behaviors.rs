@@ -814,6 +814,7 @@ fn recheck_and_shrink() {
                 v.verdict = Some(intern("ok"));
                 v.until = Some(now_ms() + if i < 4 { 600_000 } else { 86_400_000 });
             });
+            st.db.get_mut(&n).unwrap().hits = 2;
         }
     });
     assert_eq!(c.recheck(), 4, "一小時內到期的先重新驗證");
@@ -1225,12 +1226,70 @@ fn friend_nodes_capped_per_batch_never_above_default() {
 }
 
 #[test]
+fn recheck_skips_one_shot_and_covers_alt_slot() {
+    // 3.5.1 M3：只複驗真的有在改寫（best = 換節點）或問過 2 次以上的；只問過一次的到期就讓它到期。
+    // L13：多來源網域另一家的那一格也用同樣的條件複驗
+    let (c, _) = setup(json!({ "reverifyRatio": 0 }));
+    let soon = now_ms() + 600_000;
+    c.with_state(|st| {
+        for (n, hits, alias) in [("once.test", 1, false), ("twice.test", 2, false), ("alias.test", 1, true)] {
+            st.db.touch(n, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+            st.db.set_verdict(n, 4, |v| {
+                v.verdict = Some(intern("ok"));
+                v.until = Some(soon);
+            });
+            let e = st.db.get_mut(n).unwrap();
+            e.hits = hits;
+            if alias {
+                e.best = Some(crate::db::Strategy::Alias);
+            }
+        }
+        // 多來源：主格是別家、另一格是 Cloudflare 而且快到期
+        st.db.touch("multi.test", "cloudfront", "ip", &ips(&["198.51.100.20"]), &[], None);
+        let e = st.db.get_mut("multi.test").unwrap();
+        e.hits = 5;
+        e.src = Some(Box::new(crate::db::Src {
+            alt: Some(Box::new(crate::db::Alt {
+                provider: crate::util::Field::Val(intern("cloudflare")),
+                ips4: ips(&["104.21.0.9"]).into_boxed_slice(),
+                v4: Some(Box::new(crate::db::Verdict {
+                    verdict: Some(intern("ok")),
+                    until: Some(soon),
+                    ..Default::default()
+                })),
+                last: now_ms(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }));
+    });
+    assert_eq!(c.recheck(), 3);
+    let mut got: Vec<(String, String, Option<IpAddr>)> = c
+        .take_tasks()
+        .into_iter()
+        .filter_map(|t| match t {
+            Task::Verify { name, provider, orig, .. } => Some((name, provider, orig)),
+            _ => None,
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("alias.test".to_string(), "cloudflare".to_string(), Some(ip("104.21.0.5"))),
+            ("multi.test".to_string(), "cloudflare".to_string(), Some(ip("104.21.0.9"))),
+            ("twice.test".to_string(), "cloudflare".to_string(), Some(ip("104.21.0.5"))),
+        ]
+    );
+}
+
+#[test]
 fn imported_never_queried_domains_are_not_rechecked() {
     // 分享檔匯入的網域（lastSeen = 0、已過期的通過）：每小時的複驗不去驗證，等這台有人查到才驗證
     let (c, _net) = setup(json!({ "reverifyRatio": 0 }));
     let file = |last: u64| {
         serde_json::to_vec(&json!({ "domains": [
-            { "name": "imported.example.com", "provider": "cloudflare", "firstSeen": now_ms(), "lastSeen": last,
+            { "name": "imported.example.com", "provider": "cloudflare", "firstSeen": now_ms(), "lastSeen": last, "hits": 3,
               "v4": { "verdict": "ok", "until": 0 } }
         ] }))
         .unwrap()
