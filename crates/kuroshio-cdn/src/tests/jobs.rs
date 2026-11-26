@@ -459,3 +459,83 @@ fn scan_yield_capped_at_three() {
     r.finish(&scan::Report::default(), t0);
     assert_eq!(r.prepare(t0), (vec![], true));
 }
+
+/// 3.5.1 M1：前一輪還合格的節點優先留下；排名掉下去的每輪最多換 1/3；不合格的照換
+#[test]
+fn pool_sticky_pick_keeps_previous_nodes() {
+    use crate::jobs::pool::sticky_pick;
+    let v4 = |i: u8| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, i));
+    // 這一輪排好的 24 個：1～12 是新的（2.0 ms 起），13～24 是前一輪的（延遲差 10% 以內）
+    let ranked: Vec<(IpAddr, f64, f64, bool)> = (1..=24).map(|i| (v4(i), 0.0, 2.0 + f64::from(i) * 0.01, false)).collect();
+    let prev: Vec<IpAddr> = (13..=24).map(v4).collect();
+    let got = sticky_pick(&ranked, &prev, 12);
+    assert_eq!(got, (12..24).collect::<Vec<_>>(), "延遲差在 15% 以內：一個都不換");
+    // 前一輪的慢很多：每輪最多換 4 個（排名最後的先換），三輪換完
+    let mut prev: Vec<IpAddr> = (13..=24).map(v4).collect();
+    let mut rounds = 0;
+    loop {
+        let ranked: Vec<(IpAddr, f64, f64, bool)> = (1..=24)
+            .map(|i| (v4(i), 0.0, if i <= 12 { 2.0 } else { 9.0 } + f64::from(i) * 0.01, false))
+            .collect();
+        let got = sticky_pick(&ranked, &prev, 12);
+        assert_eq!(got.len(), 12);
+        let next: Vec<IpAddr> = got.iter().map(|i| ranked[*i].0).collect();
+        let replaced = prev.iter().filter(|p| !next.contains(p)).count();
+        assert!(replaced <= 4, "每輪最多換 1/3：{replaced}");
+        rounds += 1;
+        if next.iter().all(|ip| (1..=12).map(v4).any(|x| x == *ip)) {
+            break;
+        }
+        prev = next;
+        assert!(rounds < 10, "要會收斂");
+    }
+    assert_eq!(rounds, 3);
+    // 前一輪的不在這一輪的候選裡（連不上、不在台灣）或算慢：照換
+    let ranked: Vec<(IpAddr, f64, f64, bool)> = (1..=12).map(|i| (v4(i), 0.0, 2.0, i == 1)).collect();
+    let prev = vec![v4(1), v4(200), v4(201)];
+    let got = sticky_pick(&ranked, &prev, 3);
+    assert_eq!(got, vec![1, 2, 3], "慢的、不見的都換掉");
+    // 丟包比新的前幾名差：不在容忍範圍
+    let ranked: Vec<(IpAddr, f64, f64, bool)> = vec![(v4(1), 0.0, 2.0, false), (v4(2), 0.0, 2.0, false), (v4(3), 0.2, 2.0, false)];
+    assert_eq!(sticky_pick(&ranked, &[v4(3)], 2), vec![0, 1], "前一輪只有 1 個，換掉它也只是 1 個");
+    assert!(sticky_pick(&[], &[v4(1)], 3).is_empty());
+}
+
+/// 3.5.1 L8：決選（重新量過、測過速度）的節點只要有一次連線失敗，以前就排到沒測過速的後面，
+/// 節點池全是 `speed: null`。現在決選的排在前面
+#[tokio::test]
+async fn pool_job_prefers_measured_finalists() {
+    let (ctx, net, paths) = ctx_for(
+        json!({ "cloudflare": {"enabled": true} }),
+        json!({ "pool": { "candidatesPerProvider": 60, "poolSize": 3, "speedTop": 4 } }),
+    );
+    let subnets: String = (0..30).map(|i| format!("104.16.{i}.0/24\n")).collect();
+    write(&paths, "scan/cloudflare-ipv4-TW.txt", &subnets);
+    let third = |i: IpAddr| match i {
+        IpAddr::V4(v) => v.octets()[2],
+        IpAddr::V6(_) => 0,
+    };
+    net.on_ping(move |i| match i {
+        IpAddr::V4(_) => lat(1.0 + f64::from(third(i)) * 0.1),
+        IpAddr::V6(_) => Latency {
+            ok: false,
+            ms: f64::INFINITY,
+        },
+    });
+    net.on_http(|_, _| resp(200, &[], "colo=TPE"));
+    net.on_speed(|_| 55.5);
+    // 重新量的時候每個都掉一次（本機的問題）
+    net.on_quality(move |i| Quality {
+        ms: 1.0 + f64::from(third(i)) * 0.1,
+        jitter: 0.1,
+        loss: 0.2,
+        n: 5,
+    });
+    pool::run(&ctx).await.unwrap();
+    let st = ctx.cdn.state();
+    let p = &st.pools.p["cloudflare"].pool4;
+    assert_eq!(p.len(), 3);
+    assert!(p.iter().all(|n| n.speed == Num::V(55.5)), "{p:?}");
+    let thirds: Vec<u8> = p.iter().map(|n| third(n.ip)).collect();
+    assert_eq!(thirds, vec![0, 1, 2]);
+}

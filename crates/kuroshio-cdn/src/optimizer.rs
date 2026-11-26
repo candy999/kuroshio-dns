@@ -814,6 +814,28 @@ impl Cdn {
         res.rewritten = Some(Rewrite::Alias);
     }
 
+    /// 「針對這個網站驗證過」、而且現在還能用（[`Pools::usable`]：仍在節點池、沒被暫停）的 IP，驗證時用的那個排第一。
+    /// 查詢路徑（`serve_pool`）與 `explain` 共用同一個判斷（3.5.1 M1）。
+    ///
+    /// - 保留最後一段的 CDN（v4）：最後一段要跟這次答案（`orig`）一樣才能用（網站換了憑證組就不能用舊的）。
+    ///   以前驗證用的 IP 不能用（POP 變差、網站換了憑證組）時會改回節點池裡「別的網站驗證過」的 IP，
+    ///   那些沒有針對這個網站驗證過憑證；現在回空的，讓呼叫端先回原始結果並重新驗證。
+    /// - 任播型（Cloudflare 等）：池內其他 IP 不一定能服務這個網站（Error 1034 Edge IP Restricted），不能當備援塞進去
+    pub(crate) fn verified_ips(pools: &Pools, provider: &str, family: u8, v: &crate::db::Verdict, orig: Option<&[IpAddr]>) -> Vec<IpAddr> {
+        let octet = pools.octet_mode(provider) && family == 4;
+        let mut out: Vec<IpAddr> = Vec::new();
+        for ip in v.ip.iter().chain(v.ips.iter().flatten()) {
+            let same_octet = !octet
+                || orig
+                    .map(|o| o.iter().any(|x| util::last_octet(*x) == util::last_octet(*ip)))
+                    .unwrap_or(true);
+            if same_octet && !out.contains(ip) && pools.usable(provider, *ip) {
+                out.push(*ip);
+            }
+        }
+        out
+    }
+
     /// 驗證通過時用的那個 IP 排第一（確定能服務這個網站），其餘接在後面當備援
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn serve_pool(
@@ -828,32 +850,11 @@ impl Cdn {
     ) -> Vec<IpAddr> {
         let entry = st.db.get(name);
         let v = entry.and_then(|e| e.verdict(family));
-        if st.pools.octet_mode(provider) && family == 4 {
-            let Some(v) = v.filter(|v| v.is("ok")) else { return pool.to_vec() };
-            // 只回「針對這個網站驗證過」的 IP：驗證時用的那個排第一，其餘驗證通過的當備援。
-            // 以前驗證用的 IP 不能用（POP 變差、網站換了憑證組）時會改回節點池裡「別的網站驗證過」的 IP，
-            // 那些沒有針對這個網站驗證過憑證；現在回空的，讓呼叫端先回原始結果並重新驗證
-            let mut out: Vec<IpAddr> = Vec::new();
-            for ip in v.ip.iter().chain(v.ips.iter().flatten()) {
-                // 最後一段要跟這次答案一樣才能用（網站換了憑證組就不能用舊的）
-                let same_octet = orig
-                    .map(|o| o.iter().any(|x| util::last_octet(*x) == util::last_octet(*ip)))
-                    .unwrap_or(true);
-                if same_octet && !out.contains(ip) && st.pools.usable(provider, *ip) {
-                    out.push(*ip);
-                }
-            }
-            out.truncate(pool.len().max(1));
-            return out;
-        }
-        // 任播型（Cloudflare 等）：只回「針對這個網站驗證過」的 IP。
-        // 池內其他 IP 不一定能服務這個網站（Error 1034 Edge IP Restricted），不能當備援塞進去
         let Some(v) = v.filter(|v| v.is("ok")) else { return pool.to_vec() };
-        let mut verified: Vec<IpAddr> = Vec::new();
-        for ip in v.ip.iter().chain(v.ips.iter().flatten()) {
-            if !verified.contains(ip) && st.pools.usable(provider, *ip) {
-                verified.push(*ip);
-            }
+        let mut verified = Self::verified_ips(&st.pools, provider, family, v, orig);
+        if st.pools.octet_mode(provider) && family == 4 {
+            verified.truncate(pool.len().max(1));
+            return verified;
         }
         if verified.is_empty() {
             if v.ip.is_some() {

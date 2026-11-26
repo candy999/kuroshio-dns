@@ -590,6 +590,76 @@ async fn build_nearest(
     (nodes, prefixes, speed_ref)
 }
 
+/// 前一輪的節點這一輪還合格時，延遲在新的前幾名最慢的那個的這個比例以內就不換（3.5.1 M1）
+pub(crate) const KEEP_MS_TOLERANCE: f64 = 1.15;
+/// 每一輪最多換掉前一輪節點的幾分之一（還活著、只是排名掉下去的；本輪不合格的照換）
+pub(crate) const REPLACE_DIVISOR: usize = 3;
+
+/// 決定這一輪的節點池（3.5.1 M1）：`ranked` 是這一輪排好的候選（丟包 → 速度 → 延遲，決選的在前），
+/// 回傳選中的索引（照 `ranked` 的順序）。
+///
+/// 以前每天直接取前 `pool_size` 名，Cloudflare、CloudFront 各 12 個、Azure 4 個節點每天整批換掉；
+/// 網站的驗證結果只認節點池裡的 IP（`Pools::usable`），一換池子就全部失效（一台機器 996 筆 v4 通過只剩 1 筆的 IP 還在池裡），
+/// 查詢路徑退回原本的答案、TTL 10 秒，再排重新驗證。現在：
+///
+/// 1. 前一輪的節點這一輪也合格（通過延遲、POP 檢查，不算慢）、丟包不比新的前幾名差，
+///    延遲在新的前幾名最慢的那個的 [`KEEP_MS_TOLERANCE`] 以內 → 留著。
+/// 2. 前一輪的節點還合格、但排名掉出容忍範圍的：每輪最多換掉前一輪節點數的 1/[`REPLACE_DIVISOR`]（排名最後的先換），
+///    其他這一輪先留著，幾輪之內換完（會自己收斂，不會一直卡著）。
+/// 3. 本輪不合格的（連不上、不在台灣、不在候選裡）照換。
+/// 4. 剩下的位置由這一輪排名最前的新節點補上。
+pub(crate) fn sticky_pick(ranked: &[(IpAddr, f64, f64, bool)], prev: &[IpAddr], pool_size: usize) -> Vec<usize> {
+    let pool_size = pool_size.max(1);
+    let top = &ranked[..ranked.len().min(pool_size)];
+    if top.is_empty() {
+        return Vec::new();
+    }
+    // 新的前幾名裡最差的丟包與延遲
+    let worst_loss = top.iter().map(|x| x.1).fold(0.0, f64::max);
+    let worst_ms = top.iter().map(|x| x.2).fold(0.0, f64::max);
+    let mut keep = vec![false; ranked.len()];
+    // （索引）前一輪的節點、這一輪還合格、但不在容忍範圍內
+    let mut weaker: Vec<usize> = Vec::new();
+    let mut alive_prev = 0usize;
+    for (i, (ip, loss, ms, slow)) in ranked.iter().enumerate() {
+        if !prev.contains(ip) || *slow {
+            continue;
+        }
+        alive_prev += 1;
+        if i < pool_size || (*loss <= worst_loss && *ms <= worst_ms * KEEP_MS_TOLERANCE) {
+            keep[i] = true;
+        } else {
+            weaker.push(i);
+        }
+    }
+    // 排名掉下去的：最多換掉 1/3，排名比較前面的先留
+    let max_replace = prev.len().max(alive_prev).div_ceil(REPLACE_DIVISOR).max(1);
+    let stay = weaker.len().saturating_sub(max_replace);
+    for i in weaker.iter().take(stay) {
+        keep[*i] = true;
+    }
+    let mut out: Vec<usize> = (0..ranked.len()).filter(|i| keep[*i]).take(pool_size).collect();
+    for i in 0..ranked.len() {
+        if out.len() >= pool_size {
+            break;
+        }
+        if !keep[i] && !prev.contains(&ranked[i].0) {
+            out.push(i);
+        }
+    }
+    // 新節點不夠時，掉下去的舊節點也可以補回來
+    for i in 0..ranked.len() {
+        if out.len() >= pool_size {
+            break;
+        }
+        if !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// 尖峰時段的量測沿用舊節點池同一個 IP 的紀錄（規格 06 第 3.2 節），分數重新加權
 fn carry_peak(nodes: &mut [PoolNode], prev: &[PoolNode], w: f64, rescore: bool) {
     let now = now_ms();
@@ -884,6 +954,7 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         // 階段 A 同時測很多個，本機會塞車、延遲偏高：決選名單用低並行重新量一次
         ctx.checkpoint().await;
         let finalists: Vec<IpAddr> = good.iter().take(pool_size * 2).map(|x| x.ip).collect();
+        let finalist_set: std::collections::HashSet<IpAddr> = finalists.iter().copied().collect();
         let c = cdn.clone();
         let rq = map_limit(finalists, 4, move |ip| {
             let c = c.clone();
@@ -932,10 +1003,22 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         }
         let ranked: Vec<speed::Ranked> = good.iter().map(Scored::ranked).collect();
         let order = speed::order(&ranked, jc.relative_speed);
-        let good: Vec<Scored> = order.into_iter().map(|i| good[i].clone()).collect();
-        let mut pool4: Vec<PoolNode> = good
+        // 3.5.1 L8：決選（測過速度、用低並行重新量過延遲與丟包）的排在前面，沒進決選的只在不夠時補。
+        // 以前混在一起排：重新量的那 24 個只要有一次連線失敗（例如 Windows 剛量完大量候選、本機的連接埠還沒釋放），
+        // 就排到階段 A「0% 丟包」、沒重新量也沒測速的節點後面，節點池 12 個全部是沒測過速的（`speed` 全是 null）
+        let (fin, rest): (Vec<usize>, Vec<usize>) = order.into_iter().partition(|i| finalist_set.contains(&good[*i].ip));
+        let good: Vec<Scored> = fin.into_iter().chain(rest).map(|i| good[i].clone()).collect();
+        // 3.5.1 M1：前一輪還合格的節點優先留下（不必每天整批換掉，網站的驗證結果才不會一起失效）
+        let prev_ips: Vec<IpAddr> = prev.v4.iter().map(|x| x.ip).collect();
+        let cand: Vec<(IpAddr, f64, f64, bool)> = good.iter().map(|x| (x.ip, x.loss, x.ms, x.slow == Some(true))).collect();
+        let picked = sticky_pick(&cand, &prev_ips, pool_size);
+        let stayed = picked.iter().filter(|i| prev_ips.contains(&good[**i].ip)).count();
+        if !prev_ips.is_empty() && !picked.is_empty() {
+            info!("  前一輪的 {} 個節點留下 {stayed} 個", prev_ips.len());
+        }
+        let mut pool4: Vec<PoolNode> = picked
             .iter()
-            .take(pool_size)
+            .map(|i| &good[*i])
             .map(|x| {
                 let mut n = PoolNode::new(x.ip);
                 n.ms = Num::V(util::round(x.ms, 2));

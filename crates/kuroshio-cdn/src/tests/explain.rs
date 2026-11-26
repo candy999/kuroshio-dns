@@ -42,6 +42,7 @@ fn explain_rewritten_and_failed() {
             v.until = Some(until);
             v.pop = Some("TPE".into());
             v.ms = crate::util::Num::of(12.0);
+            v.ip = Some(ip("104.16.161.36"));
         });
         st.db.set_verdict("bad.test", 4, |v| {
             v.verdict = Some("fail".into());
@@ -55,6 +56,25 @@ fn explain_rewritten_and_failed() {
     let v = c.explain("bad.test", Context::default());
     assert_eq!(v["decision"], "verify-failed");
     assert!(v["text"].as_str().unwrap().contains("試了 3 個節點"), "{v}");
+    // 3.5.1 M1：驗證過的節點不在節點池了（節點池換過）：跟查詢路徑一樣先回原本的答案、下次查詢重新驗證
+    c.with_state(|st| {
+        st.pools
+            .p
+            .get_mut("cloudflare")
+            .unwrap()
+            .pool4
+            .retain(|n| n.ip != ip("104.16.161.36"))
+    });
+    let v = c.explain("ok.test", Context::default());
+    assert_eq!(v["decision"], "pool-changed", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("下次查詢重新驗證"), "{v}");
+    let mut m = msg("ok.test", 1, &["104.21.0.5"], vec![]);
+    let r = c.apply(&mut m, "ok.test", 1);
+    assert!(r.rewritten.is_none() && r.ttl_cap.is_some(), "查詢路徑同樣不換：{:?}", r.tags);
+    assert!(
+        c.take_tasks().iter().any(|t| matches!(t, crate::cdn::Task::Verify { .. })),
+        "排重新驗證"
+    );
     // 過期的「通過」不算：回到驗證中
     c.with_state(|st| st.db.set_verdict("ok.test", 4, |v| v.until = Some(1)));
     assert_eq!(decision(&c, "ok.test"), "trial");

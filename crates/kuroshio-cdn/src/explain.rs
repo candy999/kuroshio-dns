@@ -18,6 +18,8 @@ pub mod decision {
     /// 新網域很多（驗證減量中）：只問過一次的網域先不驗證（3.5.0 F12）
     pub const PACED_WAITING: &str = "paced-waiting";
     pub const VERIFY_FAILED: &str = "verify-failed";
+    /// 驗證通過過，但驗證過的節點已經不在節點池（或被暫停）：先回原本的答案（TTL 10 秒），下次查詢重新驗證（3.5.1 M1）
+    pub const POOL_CHANGED: &str = "pool-changed";
     /// 台灣節點能用，但握手連續兩次比原本的答案慢：暫時用原本的答案（3.5.0 E7；F9 起比握手時間）
     pub const SLOWER: &str = "slower";
     pub const NO_TW_NODE: &str = "no-tw-node";
@@ -64,6 +66,7 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::TRIAL => format!("這個網域用 {label}，台灣節點還在驗證中（試用期先回原本的答案，TTL 10 秒）{detail}。"),
         d::LITE_WAITING => format!("這個網域用 {label}；這台是小記憶體減量模式，問過 2 次以上才驗證台灣節點，現在先回原本的答案。"),
         d::PACED_WAITING => format!("這個網域用 {label}；新網域很多（或 CPU 很忙），CDN 驗證減量中，問過 2 次以上才驗證台灣節點，現在先回原本的答案。"),
+        d::POOL_CHANGED => format!("這個網域用 {label}，驗證過的節點已不在節點池，下次查詢重新驗證（這段期間先回原本的答案，TTL 10 秒）{detail}。"),
         d::VERIFY_FAILED => format!("這個網域用 {label}，台灣節點驗證沒通過，暫時用原本的答案{detail}；到期後會重新驗證。"),
         d::SLOWER => slower_text(label, &detail, crate::reach::SLOWER_RETEST_MS / 60_000),
         d::NO_TW_NODE => format!("這個網域用 {label}，找不到可用的台灣節點，跨 CDN 也沒有可用的替代{detail}。"),
@@ -139,6 +142,19 @@ fn is_slower(v: &Verdict) -> bool {
     v.extra.get(crate::verifier::SLOWER).and_then(Value::as_bool) == Some(true)
 }
 
+/// 最近一次答案（`ips4`）裡這家 CDN、需要換的 IP（節點池的分類是 `Global`／`Unknown`；同 `alias_family()` 的 `needs`）
+fn needs_of(pools: &crate::pools::Pools, e: &Domain, provider: &str) -> Vec<std::net::IpAddr> {
+    e.ips4
+        .iter()
+        .copied()
+        .filter(|ip| {
+            pools
+                .classify(*ip)
+                .is_some_and(|c| c.provider == provider && matches!(c.cls, crate::Cls::Global | crate::Cls::Unknown))
+        })
+        .collect()
+}
+
 /// 最近一次答案（`ips4`）裡這家 CDN 的 IP 是不是都已經是台灣節點（或 Dead）：跟 `alias_family()` 同一個判斷
 /// （節點池的分類 `Tw`／`Dead` 不換，`Global`／`Unknown` 才換）。這家的 IP 一個都沒有（舊資料、別家的答案）回 None
 fn answer_tw(pools: &crate::pools::Pools, e: &Domain, provider: &str) -> Option<bool> {
@@ -194,7 +210,7 @@ impl Cdn {
         } else if ctx.suspended {
             (d::MEMORY_FLOOR, String::new())
         } else {
-            self.decide(e, &provider, st.pools.has(&provider), answer_tw(&st.pools, e, &provider), now)
+            self.decide(&st.pools, e, &provider, now)
         };
         let mut v = base(decision, &label, &detail);
         if decision == d::SLOWER && self.cfg.lite {
@@ -247,10 +263,11 @@ impl Cdn {
         v
     }
 
-    /// 依資料庫紀錄判斷（跟 `apply_locked` 的順序一致：手動策略 → 跨 CDN 最佳 → IP 置換型 → ECS 型 → 只能用 CNAME 認的）
-    /// `has_pool`：這家 CDN 有沒有台灣節點池；`answer_tw`：最近一次答案是不是已經是台灣節點（見 [`answer_tw`]）。
-    /// 兩個都由呼叫端拿著狀態鎖時算好，這裡不再拿鎖
-    fn decide(&self, e: &Domain, provider: &str, has_pool: bool, answer_tw: Option<bool>, now: u64) -> (&'static str, String) {
+    /// 依資料庫紀錄判斷（跟 `apply_locked` 的順序一致：手動策略 → 跨 CDN 最佳 → IP 置換型 → ECS 型 → 只能用 CNAME 認的）。
+    /// `pools` 由呼叫端拿著狀態鎖時給，這裡不再拿鎖
+    fn decide(&self, pools: &crate::pools::Pools, e: &Domain, provider: &str, now: u64) -> (&'static str, String) {
+        let has_pool = pools.has(provider);
+        let answer_tw = answer_tw(pools, e, provider);
         match e.policy() {
             Policy::Never => return (d::POLICY_NEVER, String::new()),
             Policy::Always => return (d::POLICY_ALWAYS, String::new()),
@@ -315,6 +332,12 @@ impl Cdn {
             }
             if let Some(v) = e.v4.as_deref().filter(|v| v.valid(now)) {
                 if v.is("ok") {
+                    // 3.5.1 M1：跟查詢路徑（`serve_pool`）一樣，驗證過的 IP 要現在還能用（仍在節點池、沒被暫停）；
+                    // 都不能用時查詢路徑先回原本的答案（TTL 10 秒）、重新驗證
+                    let needs = needs_of(pools, e, provider);
+                    if Cdn::verified_ips(pools, provider, 4, v, Some(&needs)).is_empty() {
+                        return (d::POOL_CHANGED, String::new());
+                    }
                     let detail = match (v.pop.as_deref(), v.ms.get()) {
                         (Some(p), Some(ms)) => format!("{p}，{ms:.0} ms"),
                         (Some(p), None) => p.to_string(),

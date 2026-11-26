@@ -990,6 +990,7 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
   | `slower` | 3.5.0 E7、F9：台灣節點能用，但握手連續兩次比原本的答案慢，暫時用原本的答案（15 分鐘、小機器 60 分鐘後有人查再重驗） |
   | `essential` | 3.5.0 F11：內建的時間同步、連線偵測、憑證撤銷、地震速報服務：不改寫、不擋。多 `known: true` 與 `essential`（類別代碼 `ntp`、`netcheck`、`revocation`、`quake`），沒有 `provider`／`steps`（這些網域不記進資料庫，`/api/cdn/domain` 查不到） |
   | `verify-failed` | 台灣節點驗證沒通過（到期後重新驗證） |
+  | `pool-changed` | 3.5.1：驗證通過過，但驗證過的節點已經不在節點池（或被暫停）；跟查詢路徑一樣先回原本的答案（TTL 10 秒），下次查詢重新驗證 |
   | `no-tw-node` | 找不到可用的台灣節點，跨 CDN 也沒有 |
   | `no-pool` | 這家 CDN 的台灣節點池還沒建好 |
   | `cross` | 換成同一個網站在別家 CDN 的台灣節點 |
