@@ -317,7 +317,7 @@ async fn end_to_end_with_mock_servers() {
     assert!(out_root.join("cidr_cache.json").exists());
     let cache = read(&out_root.join("cidr_cache.json"));
     assert_eq!(
-        cache["93.1"]["keywords"],
+        cache["93.1.0"]["keywords"],
         json!(["alpha", "networks", "alpha", "networks", "as100", "alpha", "networks"])
     );
 
@@ -654,7 +654,7 @@ async fn dropped_run_clears_progress_and_saves() {
     assert_eq!(kuroshio_jobs::Job::detail(&bench), None, "進度要清掉");
     let out_root = p.out_root.clone().unwrap();
     let cache = read(&out_root.join("cidr_cache.json"));
-    assert!(cache.get("98.6").is_some(), "ASN 快取要存：{cache}");
+    assert!(cache.get("98.6.0").is_some(), "ASN 快取要存（3.5.1 起以 /24 為鍵）：{cache}");
     let suspects = read(&root.join("state/blacklist-suspects.json"));
     assert_eq!(suspects[quiet.to_string()], json!(["2026-11-10"]), "{suspects}");
     let _ = std::fs::remove_dir_all(&root);

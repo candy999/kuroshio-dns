@@ -538,14 +538,40 @@ pub fn select_opts(cfg: &Value) -> SelectOpts {
     }
 }
 
-// ---------------- ASN 快取（以 /16 為鍵，同 2.x 的 cidr_cache.json） ----------------
+// ---------------- ASN 快取（3.5.1 起以 /24 為鍵，`cidr_cache.json`） ----------------
+
+/// ASN 快取一筆的有效天數：超過就用同一個代表 IP 重問一次（業者換了網段、ip-api 的資料更新了都會跟上）
+pub const ASN_TTL_DAYS: u32 = 30;
+/// ASN 快取最多幾筆（超過時先丟最舊的；一筆約 200 bytes，評測一天大約幾千個 /24）
+pub const ASN_CACHE_MAX: usize = 16_384;
+
+/// 快取的鍵：IPv4 的 /24（`a.b.c`）。3.5.0 以前用 /16（同 2.x），同一個 /16 裡不同業者的位址會互相蓋掉
+/// （例如某家社群網站的 /16 被另一家的候選蓋成別的業者，之後每天的回答都被當成規則外、白做幾百次網站驗證）
+pub fn asn_key(ip: Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("{}.{}.{}", o[0], o[1], o[2])
+}
+
+/// 是不是 3.5.1 的鍵（三段數字）；/16 的舊鍵不是
+fn is_asn_key(k: &str) -> bool {
+    let parts: Vec<&str> = k.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+/// 快取的一筆：業者資料、當初問的代表 IP、查到的日數（台北）
+#[derive(Debug, Clone, PartialEq)]
+struct AsnEntry {
+    info: AsnInfo,
+    ip: Ipv4Addr,
+    day: u32,
+}
 
 struct AsnCache {
-    map: HashMap<String, AsnInfo>,
-    /// 這次執行查不到的 /16（不重複查；2.x 每個網域都會重查，ip-api 連不上時每題都要等）
+    map: HashMap<String, AsnEntry>,
+    /// 這次執行查不到的 /24（不重複查；2.x 每個網域都會重查，ip-api 連不上時每題都要等）
     failed: HashSet<String>,
-    /// 這次執行已經向 ip-api 問過的 /16（含補問國別的）：快取裡沒有國別的舊資料只補問一次，查不到也不重問
-    cc_tried: HashSet<String>,
+    /// 這次執行已經向 ip-api 問過的 /24（含補問國別、到期重問的）：查不到也不重問
+    tried: HashSet<String>,
     dirty: bool,
 }
 
@@ -556,56 +582,106 @@ impl AsnCache {
             .as_ref()
             .and_then(|r| read_json(&r.join("cidr_cache.json")))
             .or_else(|| read_json(&paths.list_dir.join("cidr_cache.json")));
-        let map: HashMap<String, AsnInfo> = v
-            .as_ref()
-            .and_then(Value::as_object)
-            .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), AsnInfo::from_json(v)?))).collect())
-            .unwrap_or_default();
-        info!("[Cache] 已載入 {} 筆 /16 ASN 資料", map.len());
-        AsnCache {
+        let mut dropped = 0usize;
+        let mut map: HashMap<String, AsnEntry> = HashMap::new();
+        for (k, v) in v.as_ref().and_then(Value::as_object).into_iter().flatten() {
+            // 3.5.0 以前的紀錄（/16 鍵；2.x 留下的沒有國別）、沒有代表 IP 或日數的：不知道是哪一個位址、哪一天查的，丟掉重查。
+            // 3.5.1 的紀錄 ip-api 沒給國別時照留（到期才重問，補國別只在決選時）
+            let entry = (|| {
+                if !is_asn_key(k) {
+                    return None;
+                }
+                let info = AsnInfo::from_json(v)?;
+                let ip: Ipv4Addr = v.get("ip")?.as_str()?.parse().ok()?;
+                let day = v.get("t")?.as_u64()?.min(u32::MAX as u64) as u32;
+                (asn_key(ip) == *k).then_some(AsnEntry { info, ip, day })
+            })();
+            match entry {
+                Some(e) => {
+                    map.insert(k.clone(), e);
+                }
+                None => dropped += 1,
+            }
+        }
+        let mut c = AsnCache {
             map,
             failed: HashSet::new(),
-            cc_tried: HashSet::new(),
-            dirty: false,
+            tried: HashSet::new(),
+            dirty: dropped > 0,
+        };
+        c.cap();
+        if dropped > 0 {
+            info!(
+                "[Cache] 已載入 {} 筆 /24 ASN 資料（3.5.0 以前的 {dropped} 筆丟掉重查）",
+                c.map.len()
+            );
+        } else {
+            info!("[Cache] 已載入 {} 筆 /24 ASN 資料", c.map.len());
         }
+        c
     }
 
-    /// 查業者。`want_cc`：快取裡有這個 /16 但沒有國別（3.4.0 以前的快取）時當成沒查過、補問一次
-    /// （只用在 Phase 2 決選的上游位址；汙染判斷的查詢量很大，不補問，也不整批重查 cidr_cache.json）
-    async fn lookup(&mut self, src: &dyn AsnSource, ips: &[IpAddr], want_cc: bool) -> HashMap<IpAddr, AsnInfo> {
-        // 每個 /16 只查一個代表
+    /// 超過上限時先丟最舊的
+    fn cap(&mut self) {
+        let over = self.map.len().saturating_sub(ASN_CACHE_MAX);
+        if over == 0 {
+            return;
+        }
+        let mut by_age: Vec<(u32, String)> = self.map.iter().map(|(k, e)| (e.day, k.clone())).collect();
+        by_age.sort();
+        for (_, k) in by_age.into_iter().take(over) {
+            self.map.remove(&k);
+        }
+        self.dirty = true;
+    }
+
+    /// 查業者。每個 /24 只問一個代表：快取裡有的用當初那個代表 IP 重問（到期、或 `want_cc` 時沒有國別），
+    /// 回來的資料是同一個位址的，整筆換掉；沒有的用這次看到的第一個位址。查不到的留著舊資料。
+    /// `want_cc` 只用在 Phase 2 決選的上游位址；`today` 是台北的日數（到期判斷）。
+    /// 回傳的業者沒有 AS 編號時，[`AsnInfo::is_unknown`] 是真的：汙染判斷當成查不到
+    async fn lookup(&mut self, src: &dyn AsnSource, ips: &[IpAddr], want_cc: bool, today: u32) -> HashMap<IpAddr, AsnInfo> {
         let mut reps: Vec<Ipv4Addr> = Vec::new();
         let mut seen = HashSet::new();
         for ip in ips {
             if let IpAddr::V4(v4) = ip {
-                let k = sub_key(*v4);
-                let need = match self.map.get(&k) {
-                    None => !self.failed.contains(&k),
-                    Some(i) => want_cc && i.cc.is_empty() && !self.cc_tried.contains(&k),
+                let k = asn_key(*v4);
+                let rep = match self.map.get(&k) {
+                    None => (!self.failed.contains(&k)).then_some(*v4),
+                    Some(e) => {
+                        // 到期；系統時間倒退一點點（還沒對時）不算，日數比今天晚超過有效天數（時間曾經跳到很遠的未來）算到期
+                        let stale = today >= e.day.saturating_add(ASN_TTL_DAYS) || e.day > today.saturating_add(ASN_TTL_DAYS);
+                        ((stale || (want_cc && e.info.cc.is_empty())) && !self.tried.contains(&k)).then_some(e.ip)
+                    }
                 };
-                if need && seen.insert(k) {
-                    reps.push(*v4);
+                if let Some(rep) = rep {
+                    if seen.insert(k) {
+                        reps.push(rep);
+                    }
                 }
             }
         }
         if !reps.is_empty() {
             let got = src.lookup(reps.clone()).await;
+            let asked: HashSet<Ipv4Addr> = reps.iter().copied().collect();
             for (ip, info) in got {
-                self.map.insert(sub_key(ip), info);
-                self.dirty = true;
+                // 只收問過的位址（來源回了別的就不理，不能用別的位址的資料蓋掉這個 /24）
+                if asked.contains(&ip) {
+                    self.map.insert(asn_key(ip), AsnEntry { info, ip, day: today });
+                    self.dirty = true;
+                }
             }
             for ip in reps {
-                let k = sub_key(ip);
+                let k = asn_key(ip);
                 if !self.map.contains_key(&k) {
                     self.failed.insert(k.clone());
                 }
-                self.cc_tried.insert(k);
+                self.tried.insert(k);
             }
         }
         let mut out = HashMap::new();
         for ip in ips {
             let info = match ip {
-                IpAddr::V4(v4) => self.map.get(&sub_key(*v4)).cloned(),
+                IpAddr::V4(v4) => self.map.get(&asn_key(*v4)).map(|e| e.info.clone()),
                 IpAddr::V6(_) => None,
             };
             out.insert(*ip, info.unwrap_or_else(AsnInfo::unknown));
@@ -613,8 +689,18 @@ impl AsnCache {
         out
     }
 
-    fn save(&self, path: &Path) -> std::io::Result<()> {
-        let o: Map<String, Value> = self.map.iter().map(|(k, v)| (k.clone(), v.to_json())).collect();
+    fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        self.cap();
+        let o: Map<String, Value> = self
+            .map
+            .iter()
+            .map(|(k, e)| {
+                let mut v = e.info.to_json();
+                v["ip"] = json!(e.ip.to_string());
+                v["t"] = json!(e.day);
+                (k.clone(), v)
+            })
+            .collect();
         write_json(path, &Value::Object(o))
     }
 }
@@ -1669,7 +1755,7 @@ impl Benchmark {
 
             // 污染判斷（v16.1 邏輯）
             let all_ips: Vec<IpAddr> = ok.iter().flat_map(|(_, ips, _)| ips.iter().map(|i| IpAddr::V4(*i))).collect();
-            let ip_info = cache.lookup(&*self.asn, &all_ips, false).await;
+            let ip_info = cache.lookup(&*self.asn, &all_ips, false, today_n).await;
             for (_, ips, _) in ok.iter().filter(|(i, _, _)| !all[*i].control_like()) {
                 universe.extend(ips.iter().map(|ip| select::item(dix, u32::from(*ip))));
             }
@@ -1681,7 +1767,7 @@ impl Benchmark {
             if unknown > 0 {
                 jinfo!(
                     journal,
-                    "   ⚠ {unknown} 筆結果查不到 ASN（ip-api 無法連線或受限），這些結果不做污染判斷"
+                    "   ⚠ {unknown} 筆結果查不到 ASN（ip-api 無法連線、受限，或查到的沒有 AS 編號），這些結果不做污染判斷"
                 );
             }
             let mut groups: Vec<Group> = Vec::new();
@@ -1933,7 +2019,7 @@ impl Benchmark {
             host_ip.push(ip);
         }
         let owner_info = cache
-            .lookup(&*self.asn, &host_ip.iter().flatten().copied().collect::<Vec<_>>(), true)
+            .lookup(&*self.asn, &host_ip.iter().flatten().copied().collect::<Vec<_>>(), true, today_n)
             .await;
         // 所在地（規格 10 的 6.1）：台灣網段 → ip-api 的國別 → 都沒有；鄰近再看量到的最低延遲
         let tw_nets = self.tw.as_ref().map(|t| t.all());
@@ -3306,66 +3392,161 @@ mod asn_cache_tests {
         s.parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn asn_cache_reads_old_format_and_backfills_cc() {
-        let root = std::env::temp_dir().join(format!("kuroshio-asncc-{}", std::process::id()));
+    fn cache_root(name: &str) -> (PathBuf, BenchPaths) {
+        let root = std::env::temp_dir().join(format!("kuroshio-asn-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut p = BenchPaths::from_config(&json!({}), &root.join("state"), &root);
         p.out_root = Some(root.join("out"));
         std::fs::create_dir_all(root.join("out")).unwrap();
-        // 3.3.7 的快取：沒有 cc
+        (root, p)
+    }
+
+    fn calls(src: &Counting) -> Vec<Vec<Ipv4Addr>> {
+        src.calls.lock().unwrap().clone()
+    }
+
+    fn ip4(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    /// 3.5.0 以前的快取（/16 鍵、沒有國別、沒有代表 IP）整份丟掉重查；新的鍵是 /24，存代表 IP 與日數
+    #[tokio::test]
+    async fn asn_cache_drops_old_format_and_keys_by_24() {
+        let (root, p) = cache_root("old");
         std::fs::write(
             root.join("out/cidr_cache.json"),
-            r#"{"198.51":{"raw":"Old_Net__AS64501_Old","keywords":["old","as64501"]},"203.0":{"raw":"Other__AS64502","keywords":["other"]}}"#,
+            r#"{"198.51":{"raw":"Old_Net__AS64501_Old","keywords":["old","as64501"]},"203.0":{"raw":"Other__AS64502","keywords":["other"],"cc":"JP"},"198.51.100":{"raw":"X__AS64503_X","keywords":["x"],"cc":"JP"}}"#,
         )
         .unwrap();
+        let mut c = AsnCache::load(&p);
+        assert!(c.map.is_empty(), "/16 的舊鍵、沒有代表 IP 的都丟掉：{:?}", c.map);
+        assert!(c.dirty, "丟掉的要寫回去");
+        let src = Counting {
+            calls: Mutex::new(Vec::new()),
+            offline: false,
+        };
+        // 同一個 /16、不同 /24：各問一次（以前同一個 /16 只問一個，後問的蓋掉先問的）
+        let r = c
+            .lookup(&src, &[v4("198.51.100.1"), v4("198.51.100.2"), v4("198.51.7.1")], false, 100)
+            .await;
+        assert_eq!(calls(&src), vec![vec![ip4("198.51.100.1"), ip4("198.51.7.1")]]);
+        assert_eq!(r[&v4("198.51.100.2")].cc, "JP");
+        // 存檔：/24 鍵，多 ip 與 t；2.x 的兩個鍵不動
+        let f = root.join("out/cidr_cache.json");
+        c.save(&f).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert_eq!(v["198.51.100"]["ip"], "198.51.100.1");
+        assert_eq!(v["198.51.100"]["t"], 100);
+        assert!(v["198.51.100"]["raw"].is_string() && v["198.51.100"]["keywords"].is_array());
+        // 讀回來照用，不重問
+        let mut c = AsnCache::load(&p);
+        assert_eq!(c.map.len(), 2);
+        assert!(!c.dirty);
+        c.lookup(&src, &[v4("198.51.100.9")], true, 101).await;
+        assert_eq!(calls(&src).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 到期（30 天）或沒有國別時，用當初的代表 IP 重問；查不到留著舊資料，同一次執行不重問
+    #[tokio::test]
+    async fn asn_cache_refreshes_with_same_rep_ip() {
+        let (_root, p) = cache_root("ttl");
         for offline in [false, true] {
             let mut c = AsnCache::load(&p);
-            assert_eq!(c.map.len(), 2, "舊格式讀得進來");
-            assert_eq!(c.map["198.51"].cc, "");
+            c.map.insert(
+                "198.51.100".into(),
+                AsnEntry {
+                    info: AsnInfo::from_ip_api("Old Net", "", "AS64501 Old", "JP"),
+                    ip: ip4("198.51.100.7"),
+                    day: 100,
+                },
+            );
+            c.map.insert(
+                "203.0.113".into(),
+                AsnEntry {
+                    info: AsnInfo::from_ip_api("No CC", "", "AS64502 Nocc", ""),
+                    ip: ip4("203.0.113.5"),
+                    day: 100,
+                },
+            );
             let src = Counting {
                 calls: Mutex::new(Vec::new()),
                 offline,
             };
-            // 汙染判斷那邊（want_cc = false）不補查
-            let r = c.lookup(&src, &[v4("198.51.100.1"), v4("203.0.113.1")], false).await;
-            assert_eq!(r[&v4("198.51.100.1")].raw, "Old_Net__AS64501_Old");
-            assert!(src.calls.lock().unwrap().is_empty());
-            // 決選的上游位址（want_cc）：沒有國別的 /16 補查一次（同一個 /16 只送一個代表）
-            let r = c.lookup(&src, &[v4("198.51.100.1"), v4("198.51.100.2")], true).await;
-            assert_eq!(*src.calls.lock().unwrap(), vec![vec!["198.51.100.1".parse::<Ipv4Addr>().unwrap()]]);
-            let got = &r[&v4("198.51.100.1")];
+            // 還沒到期：不問
+            c.lookup(&src, &[v4("198.51.100.1")], false, 100 + ASN_TTL_DAYS - 1).await;
+            assert!(calls(&src).is_empty());
+            // 汙染判斷那邊（want_cc = false）沒有國別也不補問
+            c.lookup(&src, &[v4("203.0.113.1")], false, 101).await;
+            assert!(calls(&src).is_empty());
+            // 決選（want_cc）：用當初的代表 IP 補問，不是這次看到的位址
+            c.lookup(&src, &[v4("203.0.113.1")], true, 101).await;
+            assert_eq!(calls(&src), vec![vec![ip4("203.0.113.5")]]);
+            // 到期：同樣用代表 IP 重問
+            let r = c.lookup(&src, &[v4("198.51.100.1")], false, 100 + ASN_TTL_DAYS).await;
+            assert_eq!(calls(&src)[1], vec![ip4("198.51.100.7")]);
             if offline {
-                // 查不到：留著舊資料、國別是空的，不算失敗
-                assert_eq!(got.raw, "Old_Net__AS64501_Old");
-                assert_eq!(got.cc, "");
+                assert_eq!(r[&v4("198.51.100.1")].raw, "Old_Net__AS64501_Old", "查不到留著舊資料");
                 assert!(!c.dirty);
             } else {
-                assert_eq!(got.cc, "JP");
-                assert!(c.dirty);
+                assert_eq!(r[&v4("198.51.100.1")].raw, "Example_Net__AS64500_Example");
+                assert_eq!(c.map["198.51.100"].day, 100 + ASN_TTL_DAYS);
+                assert_eq!(c.map["203.0.113"].info.cc, "JP");
             }
-            // 同一次執行不重複補查
-            c.lookup(&src, &[v4("198.51.100.3")], true).await;
-            assert_eq!(src.calls.lock().unwrap().len(), 1);
-            // 還沒補查過的另一個 /16 照樣補一次
-            c.lookup(&src, &[v4("203.0.113.9")], true).await;
-            assert_eq!(src.calls.lock().unwrap().len(), 2);
-            // 存檔：有國別的才多 "cc"，2.x 的兩個鍵不動
-            let f = root.join(format!("saved-{offline}.json"));
-            c.save(&f).unwrap();
-            let v: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
-            assert_eq!(v["198.51"].get("cc").is_some(), !offline);
-            assert!(v["198.51"]["raw"].is_string() && v["198.51"]["keywords"].is_array());
+            // 同一次執行不重問
+            c.lookup(&src, &[v4("198.51.100.2"), v4("203.0.113.2")], true, 100 + ASN_TTL_DAYS)
+                .await;
+            assert_eq!(calls(&src).len(), 2);
         }
-        // 這次執行查不到的 /16：want_cc 時也不重問
+        // 這次執行查不到的 /24：want_cc 時也不重問
         let mut c = AsnCache::load(&p);
         let src = Counting {
             calls: Mutex::new(Vec::new()),
             offline: true,
         };
-        c.lookup(&src, &[v4("192.0.2.1")], false).await;
-        c.lookup(&src, &[v4("192.0.2.1")], true).await;
-        assert_eq!(src.calls.lock().unwrap().len(), 1);
+        c.lookup(&src, &[v4("192.0.2.1")], false, 1).await;
+        c.lookup(&src, &[v4("192.0.2.1")], true, 1).await;
+        assert_eq!(calls(&src).len(), 1);
+    }
+
+    /// 來源回了沒問過的位址不收；沒有 AS 編號的業者當成查不到；超過上限先丟最舊的
+    #[tokio::test]
+    async fn asn_cache_ignores_foreign_answers_and_caps() {
+        struct Wrong;
+        impl AsnSource for Wrong {
+            fn lookup(&self, _ips: Vec<Ipv4Addr>) -> BoxFuture<Vec<(Ipv4Addr, AsnInfo)>> {
+                Box::pin(async move {
+                    vec![
+                        (ip4("198.51.100.9"), AsnInfo::from_ip_api("Other", "", "AS64509 Other", "BG")),
+                        (ip4("192.0.2.1"), AsnInfo::from_ip_api("NOASN", "", "", "CN")),
+                    ]
+                })
+            }
+        }
+        let (root, p) = cache_root("cap");
+        let mut c = AsnCache::load(&p);
+        let r = c.lookup(&Wrong, &[v4("192.0.2.1"), v4("198.51.7.1")], false, 5).await;
+        assert!(!c.map.contains_key("198.51.100"), "沒問過的不收");
+        assert!(r[&v4("192.0.2.1")].is_unknown(), "沒有 AS 編號的當成查不到");
+        assert_eq!(r[&v4("192.0.2.1")].label(), "NOASN（查不到 AS 編號）");
+        assert!(r[&v4("198.51.7.1")].is_unknown());
+        for i in 0..(ASN_CACHE_MAX + 3) as u32 {
+            let ip = Ipv4Addr::from(0x0a00_0000 + (i << 8));
+            c.map.insert(
+                asn_key(ip),
+                AsnEntry {
+                    info: AsnInfo::from_ip_api("N", "", "AS1 N", "JP"),
+                    ip,
+                    day: 1000 + i,
+                },
+            );
+        }
+        c.save(&root.join("x.json")).unwrap();
+        assert_eq!(c.map.len(), ASN_CACHE_MAX);
+        assert!(!c.map.contains_key("10.0.0"), "最舊的先丟");
+        assert!(c
+            .map
+            .contains_key(&asn_key(Ipv4Addr::from(0x0a00_0000 + ((ASN_CACHE_MAX as u32 + 2) << 8)))));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

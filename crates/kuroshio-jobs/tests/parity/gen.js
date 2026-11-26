@@ -29,7 +29,8 @@ const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed
 const pick = a => a[Math.floor(rnd() * a.length)];
 
 // ---------------- rules ----------------
-const cache = JSON.parse(fs.readFileSync(path.join(root, 'data/benchmark/cidr_cache.json'), 'utf-8').replace(/^﻿/, ''));
+// 2.x 的 cidr_cache.json（/16 鍵、沒有國別）：3.5.1 起不再隨程式附帶（評測改用 /24 鍵，舊格式載入時丟掉），只留在這裡產生對照向量
+const cache = JSON.parse(fs.readFileSync(path.join(__dirname, 'cidr_cache-2x.json'), 'utf-8').replace(/^﻿/, ''));
 const infos = Object.values(cache).filter((_, i) => i % 7 === 0).slice(0, 150);
 const domains = fs.readFileSync(path.join(root, 'data/benchmark/web.txt'), 'utf-8').replace(/^﻿/, '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 const extra = ['x.com', 'abs.twimg.com', 'www.google.com.tw', 'a.b.co.jp', 'line-apps.com', 'net', 'foo.net.tw', 'ne.jp', 'WWW.APPLE.COM', 'localhost'];

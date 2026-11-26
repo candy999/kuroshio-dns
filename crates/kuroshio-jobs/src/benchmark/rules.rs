@@ -56,8 +56,15 @@ impl AsnInfo {
         }
     }
 
+    /// 查不到：沒有關鍵字，或 ip-api 沒給 AS 編號（3.5.1 起：只有業者名稱、沒有 AS 編號的分不出是哪一家，
+    /// 汙染判斷當成查不到，不拿來定罪）
     pub fn is_unknown(&self) -> bool {
-        self.keywords.is_empty()
+        self.keywords.is_empty() || self.no_asn()
+    }
+
+    /// ip-api 沒給 AS 編號（`raw` 是「名稱__」這種半截的）
+    pub fn no_asn(&self) -> bool {
+        self.raw.ends_with("__") || extract_asn_number(&self.raw).is_none()
     }
 
     /// 2.x 相容的兩個鍵不動；`cc` 不是空的時才寫
