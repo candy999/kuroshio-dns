@@ -186,6 +186,12 @@ kuroshio check-config <file>                     檢查設定檔
 - 設定教學依實際開啟的協議產生：DoH、DoH3、DoT、DoQ 網址，`sdns://` stamp，Android「私人 DNS」主機名稱，Windows 11 DoH 範本，各平台 App 建議。
 - 頁面檔案放在 `data/site/`（安裝後是 `/usr/share/kuroshio/site/`），可以用 `site.htmlFile` / `site.detailFile` 換成自己的版本（同 2.x）；`{{HOST}}` 代入 `site.hostname`，沒設定時用請求的 Host。DoH 不在 443 時網址要帶埠號，用 `{{DOH_URL}}`（完整 DoH 網址）、`{{SITE_URL}}`（這一頁的網址）、`{{DOH_HOSTPORT}}`（網域加埠號）、`{{DOH_PORT}}`；舊的 `{{HOST}}{{DOH_PATH}}` 寫法不會帶埠號。實作見 `crates/kuroshio/src/site.rs`、`presence.rs`。
 - 網站排行（`topSites`、`topBlocked`）只列出至少 `site.minClients` 位不同使用者造訪過的網站，預設 `auto`（對外開放時 2、其他 1）。
+- **「網站」怎麼算（3.5.1）**：網域的主網域（`stats.rs` 的 `site_of`），一般是最後兩段（`www.example.com` → `example.com`）。
+  頂級網域是兩個字母的國碼、第二層是常見的類別（`com`、`net`、`org`、`edu`、`gov`、`mil`、`ac`、`co`、`or`、`ne`、`go`、`gob`、`gouv`、`ltd`、`plc`、`sch`、`nom`，
+  `stats.rs` 的 `CC_CATEGORY`）時算三段：`shop.example.com.ua` → `example.com.ua`、`example.co.za`、`example.co.uk`、`example.com.tw`。
+  另外 `idv.tw`、`game.tw`、`ebiz.tw`、`club.tw`、`in.th`（`MULTI_SUFFIX`）與託管平台（`PLATFORM_SUFFIX`，例如 `github.io`）也算三段。
+  以前只有一份四十幾個的清單，清單外的國家（`xxx.com.ua`、`xxx.co.za`）整個國家的網站算成同一個，排行與開機預熱名單「同一個主網域最多 8 筆」都被影響。
+  每筆查詢都會算：只比對最後兩段的長度與內容，不配置記憶體，比以前逐一比對四十幾個字串少。
 - **排除異常日（3.5.1）**：`/api/stats/exclude?date=YYYY-MM-DD`（POST）把壓測那種日子標成異常，7 天、30 天的統計跳過它（見第 6 節的管理 API 表）。以前一天的壓測就把 7 天、30 天的命中率從 49.6% 拉到 8.6%，要等 30 天才恢復。
 - **最少人數預設自動（3.5.1）**：公開頁開著、DoH 開著、有設定網域（`site.hostname`，`domain` 會自動帶入）——也就是公開頁對外開放——時用 2：公開伺服器用 1 會列出只有一台裝置去過的網站、每日排行保存 31 天。其他情況（大部分是家裡的路由器，只有一兩台裝置）用 1，改成 2 排行就空了。自己填了數字的照填的；對外開放又自己填 1 時，啟動時記一行 WARN、發現清單有一筆 info（`site-min-clients-1`）。
 - **CDN 連線去向（3.5.1）**：首頁「加速成效」多一張圖，資料是 `/api/public/stats` 的 `routing[]`（每家 CDN 的彙總數字，沒有網域、用戶端），畫法見 7.3。

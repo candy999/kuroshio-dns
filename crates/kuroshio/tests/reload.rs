@@ -511,6 +511,7 @@ fn reload_with_adopted_cache_skips_warmup() {
     // 解析的設定改了（快取重新開始）：照舊預熱
     let mut changed = cfg.clone();
     changed["resolver"]["timeoutMs"] = json!(1400);
-    assert_eq!(round(&changed), (false, 7), "快取沒接手：照舊預熱");
+    // 名單是上一輪寫出的（3.5.1 起跟上一份合併）：`28|w1` 在假的上游是沒有 AAAA（否定答案）不留，其他 3 個照舊預熱
+    assert_eq!(round(&changed), (false, 6), "快取沒接手：照舊預熱");
     let _ = std::fs::remove_dir_all(&dir);
 }

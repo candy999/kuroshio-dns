@@ -516,3 +516,125 @@ async fn doh_busy_is_immediate_and_abandoned_requests_free_slots() {
     assert!(kuroshio::resolver::perf::json()["server"]["dohBusy"].as_u64().unwrap() >= 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 送一筆查詢、收回應（阻塞式，跟伺服器的執行環境無關）：2 bytes 長度 + 訊息
+fn framed_exchange(s: &mut (impl std::io::Read + std::io::Write), query: &[u8]) -> std::io::Result<Message> {
+    let mut f = (query.len() as u16).to_be_bytes().to_vec();
+    f.extend_from_slice(query);
+    s.write_all(&f)?;
+    s.flush()?;
+    let mut len = [0u8; 2];
+    s.read_exact(&mut len)?;
+    let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+    s.read_exact(&mut buf)?;
+    Message::parse(&buf).map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
+/// 3.5.1（Windows 測試機第五版 S1）：重新載入交接的那一刻剛連上、還沒送查詢的一般 DNS TCP、DoT、DoH 連線，
+/// 之後送的第一筆查詢照常拿到答案。以前「已經接受、查詢還沒讀進來」的連線不算處理中：交接馬上做完、
+/// 舊的執行環境結束時連線被關掉，用戶端收到 RST（10054）要重送。
+/// 預先連上、一直不送東西的連線只等 `FRESH_GRACE`（200 ms），不讓交接等滿 1 秒
+#[test]
+fn quiesce_waits_for_fresh_connections() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("kuroshio-enc-fresh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let der = write_cert(&dir);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (plain, dot, doh, r) = rt.block_on(async {
+        let r = stuck_resolver(&dir, upstream().await);
+        let server = std::sync::Arc::new(kuroshio::server::Server {
+            resolver: r.clone(),
+            acl: std::sync::Arc::new(kuroshio::acl::Acl::new(["127.0.0.0/8"])),
+        });
+        let plain = server.listen("127.0.0.1:0".parse().unwrap(), true).await.unwrap()[1];
+        let certs = kuroshio::encrypted::CertStore::new(dir.join("cert.pem"), dir.join("key.pem"));
+        let limits = kuroshio::encrypted::Limits::new(64);
+        let dot = kuroshio::encrypted::listen_dot("127.0.0.1:0".parse().unwrap(), certs, r.clone(), limits)
+            .await
+            .unwrap();
+        let opts = kuroshio::encrypted::DohOptions::new("/dns-query", kuroshio::encrypted::DohGate::new(16));
+        let limits = kuroshio::encrypted::Limits::new(64);
+        let doh = kuroshio::encrypted::listen_doh("127.0.0.1:0".parse().unwrap(), None, r.clone(), opts, limits)
+            .await
+            .unwrap();
+        (plain, dot, doh, r)
+    });
+    let connect = |a: SocketAddr| {
+        let s = std::net::TcpStream::connect(a).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        s
+    };
+    // 交接之前連上（伺服器已經接受），交接開始之後才送查詢
+    let (c_plain, c_dot, c_doh) = (connect(plain), connect(dot), connect(doh));
+    // 預先連上、一直不送的連線
+    let idle = connect(plain);
+    std::thread::sleep(Duration::from_millis(30));
+    let later = Duration::from_millis(60);
+    let t_plain = std::thread::spawn(move || {
+        std::thread::sleep(later);
+        let mut s = c_plain;
+        framed_exchange(&mut s, &q(1, "fresh-tcp.example.com"))
+    });
+    let t_dot = std::thread::spawn(move || {
+        std::thread::sleep(later);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"dot".to_vec()];
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), name).unwrap();
+        let mut s = rustls::StreamOwned::new(conn, c_dot);
+        framed_exchange(&mut s, &q(2, "fresh-dot.example.com"))
+    });
+    let t_doh = std::thread::spawn(move || -> std::io::Result<Message> {
+        std::thread::sleep(later);
+        let mut s = c_doh;
+        let req = format!(
+            "GET /dns-query?dns={} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            base64url(&q(3, "fresh-doh.example.com"))
+        );
+        s.write_all(req.as_bytes())?;
+        let mut out = Vec::new();
+        s.read_to_end(&mut out)?;
+        let p = out
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| std::io::Error::other("沒有回應"))?
+            + 4;
+        if !out.starts_with(b"HTTP/1.1 200") {
+            return Err(std::io::Error::other(String::from_utf8_lossy(&out[..p]).to_string()));
+        }
+        Message::parse(&out[p..]).map_err(|e| std::io::Error::other(format!("{e:?}")))
+    });
+    // 交接：停止收查詢、等處理中的與剛接受的連線，然後跟正式的重新載入一樣馬上結束執行環境
+    let t0 = std::time::Instant::now();
+    let (loops, left) = rt.block_on(r.serving.quiesce(kuroshio::server::QUIESCE_MAX));
+    let waited = t0.elapsed();
+    rt.shutdown_timeout(Duration::from_millis(200));
+    drop(idle);
+    for (what, t, id) in [("TCP", t_plain, 1), ("DoT", t_dot, 2), ("DoH", t_doh, 3)] {
+        let m = t
+            .join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{what}：交接時剛連上的連線要拿到答案，結果 {e}"));
+        assert_eq!((m.id, m.rcode), (id, 0), "{what}");
+        assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::new(9, 8, 7, 6)), "{what}");
+    }
+    assert_eq!((loops, left), (4, 0), "四個監聽（UDP、TCP、DoT、DoH）都停了，剛接受的連線都做完");
+    assert!(
+        waited < Duration::from_millis(800),
+        "閒著的連線只等 200 ms，不等滿 1 秒：{waited:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

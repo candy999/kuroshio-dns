@@ -251,6 +251,8 @@ pub struct Resolver {
     pub serving: crate::server::Serving,
     /// 這一輪接手了上一輪的 DNS 快取（重新載入；接手了就不重跑開機預熱，3.5.1）
     pub cache_adopted: std::sync::atomic::AtomicBool,
+    /// 上一次寫出（或開機時讀進來）的預熱名單：下一次寫出時跟它合併（3.5.1，`app::stage_hot_names`；背景用，不在查詢路徑上）
+    pub hot_prev: Mutex<Vec<crate::cache::HotName>>,
     /// 通訊類網域預取中的數量（3.5.0）
     comm_prefetching: AtomicU32,
     inflight: Mutex<HashMap<String, Waiters>>,
@@ -337,6 +339,7 @@ impl Resolver {
             querylog: Default::default(),
             serving: Default::default(),
             cache_adopted: Default::default(),
+            hot_prev: Default::default(),
             comm_prefetching: AtomicU32::new(0),
             inflight: Mutex::new(HashMap::new()),
             last_outage: AtomicU32::new(0),
