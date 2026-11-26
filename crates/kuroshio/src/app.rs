@@ -1348,18 +1348,62 @@ pub const HOT_NAMES: &str = "hot-names.json";
 /// 統計歷史快照
 pub const STATS_FILE: &str = "stats.json";
 
-/// 把最常查的網域（只有名稱與類型）交給快照排程（規格 06 第 1.2 節）
+/// 把最常查的網域（只有名稱與類型）交給快照排程（規格 06 第 1.2 節）。
+/// 跟上一份名單合併（3.5.1，[`crate::cache::Cache::hot_merge_at`]）：這次開機的在前，上一份裡 7 天內出現過的接在後面
 pub fn stage_hot_names(r: &Resolver, p: &Mutex<Persister>, n: usize) {
     if n == 0 {
         return;
     }
-    let keys = r.cache.lock().unwrap().hot_keys(n);
-    if keys.is_empty() {
+    let today = today_utc();
+    let mut prev = r.hot_prev.lock().unwrap();
+    let names = r.cache.lock().unwrap().hot_merge_at(n, &prev, today, Instant::now());
+    if names.is_empty() {
         return;
     }
-    if let Ok(b) = serde_json::to_vec(&keys) {
+    if let Ok(b) = serde_json::to_vec(&encode_hot_names(&names)) {
         p.lock().unwrap().stage(HOT_NAMES, b);
     }
+    *prev = names;
+}
+
+/// 今天（UTC 的 Unix 日數）；系統時間還沒對時時 None（預熱名單不衰退）
+fn today_utc() -> Option<u32> {
+    crate::clock::clock_synced().then(|| (crate::persist::now_secs() / 86_400).min(u32::MAX as u64 - 1) as u32)
+}
+
+/// 預熱名單的檔案格式（3.5.1）：還是字串陣列，`@` 加日數的一筆標記「後面這些名稱最後一次出現在哪一天」
+/// （UTC 的 Unix 日數；`@?` 是不知道哪一天，系統時間還沒對時時寫的），例如
+/// `["@20418", "1|www.example.com", "@20415", "28|www.example.net"]`。
+/// 舊版讀到標記時當成格式不對的一筆略過（沒有 `|`），其他照舊預熱：降版也不會整份讀不進來
+pub fn encode_hot_names(names: &[crate::cache::HotName]) -> Vec<String> {
+    let mut out = Vec::with_capacity(names.len() + 8);
+    let mut last = None;
+    for (k, d) in names {
+        if last != Some(*d) {
+            out.push(if *d == crate::cache::UNKNOWN_DAY {
+                "@?".to_string()
+            } else {
+                format!("@{d}")
+            });
+            last = Some(*d);
+        }
+        out.push(k.clone());
+    }
+    out
+}
+
+/// 讀預熱名單（[`encode_hot_names`]）：沒有標記的（3.5.0 以前的名單）是不知道哪一天（[`crate::cache::UNKNOWN_DAY`]），
+/// 下一次寫出時當成那一天
+pub fn decode_hot_names(raw: Vec<String>) -> Vec<crate::cache::HotName> {
+    let mut day = crate::cache::UNKNOWN_DAY;
+    let mut out = Vec::with_capacity(raw.len());
+    for s in raw {
+        match s.strip_prefix('@') {
+            Some(d) => day = d.parse().unwrap_or(crate::cache::UNKNOWN_DAY),
+            None => out.push((s, day)),
+        }
+    }
+    out
 }
 
 /// 開機預熱：依序重新查詢上次最常用的網域，每秒 `rate` 筆。
@@ -1370,16 +1414,20 @@ pub fn stage_hot_names(r: &Resolver, p: &Mutex<Persister>, n: usize) {
 /// 沒有或過期的上一輪也是一樣、照一般查詢的流程更新；以前每次重新載入都把整份名單再問一次上游
 /// （而且新的一輪上游的成敗紀錄是空的，每筆都同時問好幾台）。回傳有沒有排預熱
 fn spawn_warmup(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, rate: u64) -> bool {
-    if r.cache_adopted.load(Ordering::Relaxed) {
-        info!("重新載入：已經接手上一輪的 DNS 快取，不重跑開機預熱");
-        return false;
-    }
+    // 上一份名單（下一次寫出時跟它合併，3.5.1）：接手快取、不預熱時也要讀
     let raw: Vec<String> = p
         .lock()
         .unwrap()
         .load(HOT_NAMES)
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
+    let prev = decode_hot_names(raw);
+    let raw: Vec<String> = prev.iter().map(|x| x.0.clone()).collect();
+    *r.hot_prev.lock().unwrap() = prev;
+    if r.cache_adopted.load(Ordering::Relaxed) {
+        info!("重新載入：已經接手上一輪的 DNS 快取，不重跑開機預熱");
+        return false;
+    }
     let before = raw.len();
     let keys = crate::cache::cap_per_site(raw, usize::MAX, r.params.special_use);
     if keys.is_empty() || rate == 0 {
@@ -1690,7 +1738,9 @@ impl Started {
         let (loops, left) = self.state.resolver.serving.quiesce(crate::server::QUIESCE_MAX).await;
         let ms = t0.elapsed().as_millis();
         if left > 0 {
-            warn!("重新載入：停止收查詢（{loops} 個監聽），還有 {left} 筆查詢等了 {ms} ms 沒做完，交給用戶端重送");
+            warn!(
+                "重新載入：停止收查詢（{loops} 個監聽），還有 {left} 筆查詢（含剛連上、第一筆還沒回完的連線）等了 {ms} ms 沒做完，交給用戶端重送"
+            );
         } else {
             info!("重新載入：停止收查詢（{loops} 個監聽），處理中的都回完了（{ms} ms），把快取交給新的一輪");
         }
@@ -2531,6 +2581,37 @@ pub async fn start(cfg: &Value) -> Result<Started> {
 
 #[cfg(test)]
 mod tests {
+    /// 3.5.1：預熱名單的檔案還是字串陣列，日子用 `@` 開頭的標記；3.5.0 以前的名單（沒有標記）是不知道哪一天。
+    /// 舊版讀新的檔案時標記沒有 `|`，當成格式不對的一筆略過（`cap_per_site`），其他照舊預熱
+    #[test]
+    fn hot_names_file_format() {
+        use crate::cache::UNKNOWN_DAY;
+        let names = vec![
+            ("1|a.example.com".to_string(), UNKNOWN_DAY),
+            ("1|b.example.com".to_string(), 20_418),
+            ("28|b.example.com".to_string(), 20_418),
+            ("1|c.example.net".to_string(), 20_415),
+        ];
+        let enc = super::encode_hot_names(&names);
+        assert_eq!(
+            enc,
+            [
+                "@?",
+                "1|a.example.com",
+                "@20418",
+                "1|b.example.com",
+                "28|b.example.com",
+                "@20415",
+                "1|c.example.net"
+            ]
+        );
+        assert_eq!(super::decode_hot_names(enc.clone()), names);
+        let old = vec!["1|x.example.com".to_string(), "28|x.example.com".to_string()];
+        assert!(super::decode_hot_names(old).iter().all(|x| x.1 == UNKNOWN_DAY));
+        // 舊版的讀法：標記略過，名稱照讀
+        assert_eq!(crate::cache::cap_per_site(enc, usize::MAX, false).len(), 4);
+    }
+
     /// 3.5.0 C1：停止原因的日誌文字、主控台關閉／登出／關機時寫快照只給 3 秒
     #[test]
     fn stop_reason_labels() {

@@ -813,6 +813,7 @@ ip-api 查不到（離線、被限速）時只靠 `tw-ip.json` 與延遲，功�
 2. 停止收新的查詢：一般 DNS 的 UDP 接收、TCP accept，DoT、DoH 的 accept 迴圈都停下來（`Serving::quiesce`，停在等封包、等連線的地方，
    已經讀進來的不會丟）。核心裡的 socket 還開在 `ListenBank`，之後到的封包留在接收緩衝區、連線留在 accept 佇列，給新的一輪。
 3. 等處理中的一般 DNS 查詢（讀進來到送出回應）做完，最多 1 秒（`QUIESCE_MAX`）：它們照常回答，問上游拿到的新答案也進了快取、跟著交出去。
+   **剛接受、第一筆查詢還沒回完的 TCP、DoT、DoH 連線也等**（見下面「剛接受的連線」）。
 4. 交出 DNS 快取，記下「這一輪已經交出」（`Serving::retire`）。
 
 以前快取在寫完快照的那一刻就交出去，舊的一輪卻還在讀同一個（共用的）監聽 socket，直到執行環境關閉：
@@ -827,12 +828,29 @@ ip-api 查不到（離線、被限速）時只靠 `tw-ip.json` 與延遲，功�
 要問上游而失敗的**不回 SERVFAIL**（一般 DNS、DoT 不回應，TCP 關掉連線；DoH 回 503 `Retry-After: 1`），讓用戶端重送給新的一輪。
 這個判斷只在失敗的路徑上（一次原子讀取），快取命中的路徑不變；每筆一般 DNS 查詢多兩個 32 位元原子操作（處理中的計數），不加鎖。
 
+**剛接受的連線（3.5.1）**：以前一般 DNS 的 TCP 連線要等查詢讀完才算進處理中。「已經接受、查詢還沒讀進來」的連線（剛好在寫快照～停止收查詢那幾毫秒連上的）
+交接時看起來是 0 筆，快取馬上交出去、舊的執行環境結束時連線被關掉，核心回 RST，用戶端要重送（Windows 測試機重新載入 40 次裡 3 次各有 1 筆 TCP 查詢收到 10054）。
+DoT、DoH 在 accept 之後、TLS 握手與第一筆查詢之前也一樣（而且它們的查詢本來就不算進處理中）。現在：
+
+- accept 迴圈接到連線、交給連線的工作之前就算進處理中（`Serving::accept`，同時最多 64 條，`FRESH_MAX`；超過的照以前，不等）；
+- 第一筆查詢的回應寫出去（DoH：第一個請求回完；沒有回應的也算）才放掉，之後跟一般的連線一樣；
+- 每一個階段太久沒有動靜就提早放掉，不讓預先連上、閒著的連線拖住交接（`hold_while`；等的東西不取消，讀到一半的資料不會丟）：
+  - 連上之後 200 ms（`FRESH_GRACE`）內要送來第一個位元組（一般 DNS 是查詢的長度，DoT、DoH 是 TLS 的 ClientHello，純 HTTP 的 DoH 是請求）；
+  - TLS 握手 500 ms（`FRESH_HANDSHAKE`）內要完成；
+  - 握手之後 200 ms 內要送第一筆查詢（DoH：第一個請求要進來；進來了就等它回完）；
+- 交接等的總時間上限照舊是 1 秒（`QUIESCE_MAX`）。社群的連線（DoT 埠的 `kuroshio/2`）不算。
+
+成本：每條 TCP／TLS 連線多幾個 32 位元原子操作與一個計時器，查詢的路徑不變（DoH 之後的請求只多一次原子讀取），不加鎖。
+最壞情況：閒著的連線讓交接多等最多 200 ms（只有交接前 200 ms 內連上的）；握手或查詢卡住的最多等到 1 秒，跟處理中的查詢卡住一樣。
+已經回過第一筆、之後閒著的連線照舊隨執行環境結束（用戶端在連線之間本來就要能重連，RFC 7766）；QUIC（DoQ／DoH3）、HTTP.sys 模式不在範圍。
+
 上限與最壞情況：停止收查詢之後最多等 1 秒（處理中的查詢一般幾十毫秒內做完，只有上游卡住才會等滿）；時間到還沒做完的跟以前一樣被丟掉、
 用戶端重送，日誌記一行警告。QUIC（DoQ／DoH3）的端點不在這次的範圍：進行中的 QUIC 連線照舊會斷。
 
 測試：`tests/reload.rs` 的 `reload_stops_reading_before_handing_over_cache`（交接期間每 10 ms 一筆查詢，每一筆都剛好得到一次正確的答案；
 交接時正在問上游的那一筆照常回完、答案跟著快取交出去；快取交出去之後舊的一輪不再讀監聽 socket，那一筆由新的一輪回答；上游只被問過一次），
-`tests/resolver.rs` 的 `retired_round_does_not_answer_servfail`。
+`tests/resolver.rs` 的 `retired_round_does_not_answer_servfail`，`tests/encrypted.rs` 的 `quiesce_waits_for_fresh_connections`（交接之前連上、交接開始之後才送查詢的
+一般 DNS TCP、DoT、DoH 連線都拿到答案；一直不送的連線不讓交接等滿 1 秒），`server.rs` 的 `fresh_is_capped_and_released_once`、`hold_while_releases_idle_connections_only`。
 
 列為選做：跟其他五項沒有相依；驗收是「重新載入期間連續查詢，沒有任何一筆被拒絕」。來不及就延到 3.4.1，不影響其他項目。
 

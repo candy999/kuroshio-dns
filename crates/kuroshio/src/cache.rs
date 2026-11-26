@@ -54,19 +54,32 @@ pub const WARM_MIN_HITS: u32 = 2;
 /// 平台底下每個名稱是不同的網站，各自照 [`WARM_PER_SITE`]；但這些平台大多對任何子網域都回答，外部探測用平台底下的隨機名稱、
 /// 每個查幾次，就能塞滿 2,000 筆的名單。32 筆 ≈ 16 個網站的 A 與 AAAA，家裡常用的平台網站通常比這少；超過的只是開機時不預熱
 pub const WARM_PER_PLATFORM: usize = 32;
+/// 開機預熱名單：上一份名單裡的名稱，最後一次出現在名單裡（或這次開機有人查過）之後保留幾天（3.5.1，[`Cache::hot_merge_at`]）
+pub const WARM_KEEP_DAYS: u32 = 7;
+
+/// 預熱名單的一筆：鍵（`類型|名稱`）與最後一次出現的日子（UTC 的 Unix 日數；不知道是 [`UNKNOWN_DAY`]）
+pub type HotName = (String, u32);
+/// 不知道是哪一天出現的（3.5.0 以前的名單、系統時間還沒對時時寫的）：下一次對時之後寫出時當成那一天
+pub const UNKNOWN_DAY: u32 = u32::MAX;
 
 /// 開機預熱名單的共同過濾（寫出名單、讀進舊名單都用）：依原本的順序，同一個主網域最多 [`WARM_PER_SITE`] 筆、
 /// 同一個託管平台底下最多 [`WARM_PER_PLATFORM`] 筆，重複的、格式不對的略過；`skip_special` 時特殊用途網域（RFC 6761，本機直接回答、不必預熱）也略過，最多 `n` 筆。
 /// 3.5.0 以前的名單只要查過一次就收，外部探測每 10 秒查一個隨機子網域就塞滿整份名單，重新啟動時逐一重問上游
 pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize, skip_special: bool) -> Vec<String> {
+    cap_per_site_by(keys, |k| k, n, skip_special)
+}
+
+/// 同 [`cap_per_site`]，每一筆帶著別的資料（`key` 取出鍵）
+pub fn cap_per_site_by<T>(items: impl IntoIterator<Item = T>, key: impl Fn(&T) -> &str, n: usize, skip_special: bool) -> Vec<T> {
     let mut per: HashMap<String, usize> = HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut platform = [0usize; crate::stats::PLATFORM_SUFFIX.len()];
     let mut out = Vec::new();
-    for k in keys {
+    for item in items {
         if out.len() >= n {
             break;
         }
+        let k = key(&item);
         let Some((t, name)) = k.split_once('|') else { continue };
         if t.parse::<u16>().is_err() || name.is_empty() || (skip_special && crate::resolver::special_use(name).is_some()) {
             continue;
@@ -77,14 +90,14 @@ pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize, skip_speci
             continue;
         }
         let c = per.entry(site.to_string()).or_insert(0);
-        if *c >= WARM_PER_SITE || !seen.insert(k.clone()) {
+        if *c >= WARM_PER_SITE || !seen.insert(k.to_string()) {
             continue;
         }
         *c += 1;
         if let Some(p) = p {
             platform[p] += 1;
         }
-        out.push(k);
+        out.push(item);
     }
     out
 }
@@ -327,6 +340,43 @@ impl Cache {
 
     /// 同 [`Cache::hot_keys`]，時間由呼叫端給（測試用）
     pub fn hot_keys_at(&self, n: usize, now: Instant) -> Vec<String> {
+        // 特殊用途網域在本機回答時根本不會進快取；關掉時照一般網域
+        cap_per_site(self.hot_ranked(now).into_iter().cloned(), n, false)
+    }
+
+    /// 寫出的預熱名單（3.5.1）：這次開機的（[`Cache::hot_keys`] 的規則）在前，接著是上一份名單 `prev` 裡還沒太舊的，
+    /// 總數、同一個主網域、同一個平台的上限照舊（[`cap_per_site_by`]）。以前只收這次開機的，重新啟動之間用戶端查得少，
+    /// 名單就一路縮小（Windows 測試機重新載入幾次之後只剩 1 個網域）。
+    ///
+    /// 上一份名單裡的：
+    /// - 最後一次出現超過 [`WARM_KEEP_DAYS`] 天的不留（會衰退，不會永遠留著）；
+    /// - 這次開機有人查過（命中 1 次以上；開機預熱自己查的不算）的記成今天；
+    /// - 快取裡現在是不存在、被擋、失敗的不留；
+    /// - 依最後出現的日子排（新的在前），同一天的照上一份的順序。
+    ///
+    /// `today`：UTC 的 Unix 日數；系統時間還沒對時（沒有 RTC 的路由器開機時是 1970 年）時是 None：
+    /// 不衰退、上一份的日子照舊，這次開機的記成 [`UNKNOWN_DAY`]（對時之後下一次寫出時當成那一天）。
+    /// 每 10 分鐘與關機時各算一次（背景），不在查詢路徑上
+    pub fn hot_merge_at(&self, n: usize, prev: &[HotName], today: Option<u32>, now: Instant) -> Vec<HotName> {
+        let stamp = today.unwrap_or(UNKNOWN_DAY);
+        let cur = self.hot_ranked(now).into_iter().map(|k| (k.clone(), stamp));
+        // 不知道日子的當成今天；比今天晚的（時鐘被調回去）也當成今天
+        let day = |d: u32| today.map_or(d, |t| d.min(t));
+        let mut old: Vec<HotName> = prev
+            .iter()
+            .filter(|(_, d)| today.is_none_or(|t| t.saturating_sub(day(*d)) <= WARM_KEEP_DAYS))
+            .filter_map(|(k, d)| match self.map.get(k) {
+                Some(e) if e.class != Class::Ok || e.blocked.is_some() => None,
+                Some(e) if e.hits.load(Ordering::Relaxed) > 0 => Some((k.clone(), stamp)),
+                _ => Some((k.clone(), day(*d))),
+            })
+            .collect();
+        old.sort_by_key(|x| std::cmp::Reverse(x.1));
+        cap_per_site_by(cur.chain(old), |x| &x.0, n, false)
+    }
+
+    /// 這次開機的預熱候選，依分數排好（還沒套上限）
+    fn hot_ranked(&self, now: Instant) -> Vec<&String> {
         let now_ds = mono_ds(self.base, now);
         // 分數用整數算（MT7621 沒有浮點運算單元）：命中次數 × 1 小時 ÷（1 小時 + 上次使用距今），0.1 秒為單位
         const HOUR_DS: u64 = 36_000;
@@ -345,8 +395,7 @@ impl Cache {
             })
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        // 特殊用途網域在本機回答時根本不會進快取；關掉時照一般網域
-        cap_per_site(v.into_iter().map(|x| x.0.clone()), n, false)
+        v.into_iter().map(|x| x.0).collect()
     }
 
     pub fn approx_bytes(&self) -> usize {
@@ -687,6 +736,70 @@ mod tests {
         assert_eq!(kept.iter().filter(|k| k.ends_with(".example")).count(), 40, "一般網站不受影響");
         assert_eq!(kept.iter().filter(|k| k.ends_with(".example.net")).count(), WARM_PER_SITE);
         assert_eq!(kept.len(), WARM_PER_PLATFORM + 5 + 40 + WARM_PER_SITE);
+    }
+
+    /// 3.5.1（Windows 測試機 W2：重新啟動幾次之後名單只剩 1 個網域）：寫出的預熱名單跟上一份合併。
+    /// 這次開機的在前；上一份裡 7 天內出現過的接在後面，新的在前；這次有人查過的記成今天；
+    /// 超過 7 天的、快取裡現在是否定答案的不留；總數與同一個主網域的上限照舊；不查就會衰退
+    #[test]
+    fn hot_names_merge_with_previous_list() {
+        let t0 = Instant::now();
+        let today = 20_000u32;
+        let mut c = Cache::new(100);
+        let hit = |c: &mut Cache, k: &str, n: usize| {
+            c.insert(k.into(), entry(300, false), t0);
+            for _ in 0..n {
+                c.get(k, t0);
+            }
+        };
+        hit(&mut c, "1|a.example.com", 3);
+        // 這次開機只查過 1 次（不夠進這次的名單，但算「有人用」）
+        hit(&mut c, "1|used.example.org", 1);
+        // 開機預熱自己查的（命中 0）：照上一份的日子
+        hit(&mut c, "1|warm.example.org", 0);
+        c.insert("1|nx.example.org".into(), with_class(Class::NxDomain), t0);
+        let p = |k: &str, d: u32| (k.to_string(), d);
+        let prev = vec![
+            p("1|b.example.com", today - 1),
+            p("1|a.example.com", today - 3),
+            p("1|c.example.net", today - 7),
+            p("1|old.example.net", today - 8),
+            p("1|used.example.org", today - 5),
+            p("1|warm.example.org", today - 2),
+            p("1|nx.example.org", today - 1),
+            p("1|legacy.example.org", UNKNOWN_DAY),
+        ];
+        let m = c.hot_merge_at(100, &prev, Some(today), t0);
+        assert_eq!(
+            m,
+            vec![
+                p("1|a.example.com", today),
+                p("1|used.example.org", today),
+                p("1|legacy.example.org", today),
+                p("1|b.example.com", today - 1),
+                p("1|warm.example.org", today - 2),
+                p("1|c.example.net", today - 7),
+            ]
+        );
+        // 總數上限：這次開機的優先
+        assert_eq!(c.hot_merge_at(2, &prev, Some(today), t0), m[..2].to_vec());
+        // 同一個主網域最多 8 筆：這次開機的先佔
+        let mut c2 = Cache::new(100);
+        for i in 0..8 {
+            hit(&mut c2, &format!("1|n{i}.example.com"), 2);
+        }
+        let m2 = c2.hot_merge_at(100, &[p("1|z.example.com", today), p("1|z.example.net", today)], Some(today), t0);
+        assert_eq!(m2.iter().filter(|x| x.0.ends_with(".example.com")).count(), WARM_PER_SITE);
+        assert!(!m2.iter().any(|x| x.0 == "1|z.example.com") && m2.iter().any(|x| x.0 == "1|z.example.net"));
+        // 之後都沒人查（新開機、快取是空的）：7 天內照留，超過就衰退
+        let empty = Cache::new(100);
+        let later = empty.hot_merge_at(100, &m, Some(today + 6), t0);
+        assert_eq!(later, m[..4].to_vec(), "最後出現超過 7 天的不留");
+        assert!(empty.hot_merge_at(100, &later, Some(today + 8), t0).is_empty(), "全部超過 7 天");
+        // 系統時間還沒對時：不衰退，這次開機的記成不知道哪一天
+        let m3 = c.hot_merge_at(100, &prev, None, t0);
+        assert_eq!(m3[0], p("1|a.example.com", UNKNOWN_DAY));
+        assert!(m3.contains(&p("1|old.example.net", today - 8)), "沒對時不丟：{m3:?}");
     }
 
     #[test]

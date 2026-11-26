@@ -11,6 +11,7 @@
 //! - 每筆查詢最多 [`QUERY_DEADLINE`]，逾時回 SERVFAIL；拒絕與逾時有計數（`perf.server`），日誌每一類每分鐘最多一行
 
 use crate::resolver::{Ctx, Resolver};
+use crate::server::{hold_while, Fresh, FRESH_GRACE, FRESH_HANDSHAKE};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -665,6 +666,27 @@ async fn answer(r: &Arc<Resolver>, q: &[u8], proto: Proto, client: IpAddr) -> Op
 
 // ---------------- DoT ----------------
 
+/// 剛接受的連線（3.5.1，`Serving::accept`）：連上之後 [`FRESH_GRACE`] 內要送來第一個位元組（TLS 的 ClientHello、
+/// HTTP 的請求），不然不再算進處理中（預先連上、閒著的連線，重新載入時交接不等它）
+async fn fresh_first_byte(fresh: Option<&Fresh>, tcp: &tokio::net::TcpStream) {
+    let _ = hold_while(fresh, FRESH_GRACE, tcp.readable()).await;
+}
+
+/// TLS 握手最多 10 秒。剛接受的連線：第一個位元組 [`FRESH_GRACE`] 內要到、握手 [`FRESH_HANDSHAKE`] 內要完成，
+/// 不然不再算進處理中（3.5.1）
+async fn fresh_tls(
+    fresh: Option<&Fresh>,
+    tcp: tokio::net::TcpStream,
+    acc: &tokio_rustls::TlsAcceptor,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    fresh_first_byte(fresh, &tcp).await;
+    let handshake = tokio::time::timeout(Duration::from_secs(10), acc.accept(tcp));
+    match hold_while(fresh, FRESH_HANDSHAKE, handshake).await {
+        Ok(Ok(s)) => Some(s),
+        _ => None,
+    }
+}
+
 pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<Resolver>, limits: Limits) -> Result<SocketAddr> {
     let l = crate::netif::shared_tcp("dot", addr).with_context(|| format!("DoT 監聽 {addr} 失敗"))?;
     let bound = l.local_addr()?;
@@ -703,12 +725,14 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
             if !certs.ready() {
                 continue;
             }
+            // 接受了就算進處理中，第一筆查詢回完才放（重新載入時交接會等它，3.5.1；`Serving::accept`）
+            let fresh = resolver.serving.accept().map(Arc::new);
             let (acc, r) = (acceptor.clone(), resolver.clone());
             tokio::spawn(async move {
                 // 名額跟著這個工作：正常關閉、被重設、握手失敗或逾時、panic，結束時都會還回來
                 let _permit = permit;
                 let _ = tcp.set_nodelay(true);
-                let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(10), acc.accept(tcp)).await else {
+                let Some(s) = fresh_tls(fresh.as_deref(), tcp, &acc).await else {
                     return;
                 };
                 let community = s.get_ref().1.alpn_protocol() == Some(kuroshio_community::ALPN);
@@ -716,13 +740,15 @@ pub async fn listen_dot(addr: SocketAddr, certs: Arc<CertStore>, resolver: Arc<R
                     return;
                 }
                 if community {
+                    // 社群（節點之間）的連線不算一般查詢：不等
+                    drop(fresh);
                     if let Some(c) = r.community.get().cloned() {
                         c.serve_stream(s, peer.ip()).await;
                     }
                     return;
                 }
                 let client = peer.ip();
-                dot_conn(s, move |q: Vec<u8>| {
+                dot_conn(s, fresh, move |q: Vec<u8>| {
                     let r = r.clone();
                     async move { answer(&r, &q, Proto::Dot, client).await }
                 })
@@ -775,7 +801,10 @@ async fn read_dot_query<R: tokio::io::AsyncRead + Unpin>(rd: &mut R, inflight: &
 ///   以前要等每一筆查詢都結束才還：卡住的查詢讓已經斷掉的連線一直佔著這個來源的名額，
 ///   用戶端重新連線時被「每個來源的上限」拒絕，比例隨著卡住的查詢越積越高；
 /// - 對方正常關閉寫的那一邊、閒置逾時：處理中的照常回完（每筆最多 [`QUERY_DEADLINE`]），這段期間寫失敗就全部取消
-pub(crate) async fn dot_conn<S, H, F>(s: S, handle: H)
+///
+/// `fresh`：剛接受、第一筆查詢還沒回完（3.5.1，`Serving::accept`）。握手之後 [`FRESH_GRACE`] 內沒送查詢、
+/// 第一筆回應寫出（或沒有回應）時放掉
+pub(crate) async fn dot_conn<S, H, F>(s: S, fresh: Option<Arc<Fresh>>, handle: H)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     H: Fn(Vec<u8>) -> F,
@@ -784,6 +813,7 @@ where
     let (mut rd, mut wr) = tokio::io::split(s);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
     // 寫出端：回應完成一筆寫一筆（不必照查詢順序）。對方 30 秒都不收就關掉連線
+    let mut wrote_first = fresh.clone();
     let mut writer = tokio::spawn(async move {
         while let Some(resp) = rx.recv().await {
             let mut frame = (resp.len() as u16).to_be_bytes().to_vec();
@@ -794,6 +824,10 @@ where
             ) {
                 return;
             }
+            // 第一筆回應寫出去了：之後跟一般的連線一樣
+            if let Some(f) = wrote_first.take() {
+                f.release();
+            }
         }
         let _ = tokio::time::timeout(Duration::from_secs(5), wr.shutdown()).await;
     });
@@ -801,6 +835,8 @@ where
     let inflight = Arc::new(Semaphore::new(DOT_MAX_INFLIGHT));
     // 處理中的查詢（最多 DOT_MAX_INFLIGHT 個）：連線斷掉時一起取消
     let mut tasks = tokio::task::JoinSet::new();
+    // 第一筆查詢讀進來之前：握手之後 FRESH_GRACE 內沒送查詢就不再算進處理中
+    let mut first = fresh;
     let clean = loop {
         // 收掉已經結束的（JoinSet 留著結束的工作直到被收走）
         while tasks.try_join_next().is_some() {}
@@ -811,13 +847,21 @@ where
                 writer_done = true;
                 break false;
             }
-            r = read_dot_query(&mut rd, &inflight) => match r {
+            r = hold_while(first.as_deref(), FRESH_GRACE, read_dot_query(&mut rd, &inflight)) => match r {
                 DotRead::Query(q, slot) => {
-                    let (fut, tx) = (handle(q), tx.clone());
+                    let (fut, tx, first) = (handle(q), tx.clone(), first.take());
                     tasks.spawn(async move {
                         let _slot = slot;
-                        if let Some(resp) = fut.await {
-                            let _ = tx.send(resp).await;
+                        match fut.await {
+                            Some(resp) => {
+                                let _ = tx.send(resp).await;
+                            }
+                            // 第一筆沒有回應：不必等寫出端
+                            None => {
+                                if let Some(f) = first {
+                                    f.release();
+                                }
+                            }
                         }
                     });
                 }
@@ -1160,13 +1204,27 @@ pub async fn listen_doh(
             if certs.as_ref().map(|c| !c.ready()).unwrap_or(false) {
                 continue;
             }
+            // 接受了就算進處理中，第一個請求回完才放（重新載入時交接會等它，3.5.1；`Serving::accept`）
+            let fresh = resolver.serving.accept().map(Arc::new);
             let (acc, r, o) = (acceptor.clone(), resolver.clone(), opts.clone());
             tokio::spawn(async move {
                 let _permit = permit;
                 let _ = tcp.set_nodelay(true);
+                let f = fresh.clone();
                 let svc = hyper::service::service_fn(move |req| {
                     let (r, o) = (r.clone(), o.clone());
-                    async move { Ok::<_, std::convert::Infallible>(handle_doh(req, peer.ip(), r, o).await) }
+                    // 第一個請求（還算在處理中時）：開始處理時標記、回完放掉；之後的請求只多一次原子讀取
+                    let first = f.as_ref().filter(|f| f.held()).cloned();
+                    async move {
+                        if let Some(f) = &first {
+                            f.start();
+                        }
+                        let resp = handle_doh(req, peer.ip(), r, o).await;
+                        if let Some(f) = first {
+                            f.release();
+                        }
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
                 });
                 let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
                 // 標頭要在 10 秒內送完；HTTP/2 每條連線最多 64 個同時進行的請求，定時 ping 清掉斷線的
@@ -1180,12 +1238,20 @@ pub async fn listen_doh(
                     .max_concurrent_streams(DOH_MAX_STREAMS)
                     .keep_alive_interval(Duration::from_secs(30))
                     .keep_alive_timeout(Duration::from_secs(10));
+                // 剛接受的連線：握手之後（純 HTTP 是連上之後）FRESH_GRACE 內第一個請求沒進來就不再算進處理中
                 let res = match acc {
-                    Some(acc) => match tokio::time::timeout(Duration::from_secs(10), acc.accept(tcp)).await {
-                        Ok(Ok(s)) => builder.serve_connection(hyper_util::rt::TokioIo::new(s), svc).await,
-                        _ => return,
+                    Some(acc) => match fresh_tls(fresh.as_deref(), tcp, &acc).await {
+                        Some(s) => {
+                            let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(s), svc);
+                            hold_while(fresh.as_deref(), FRESH_GRACE, conn).await
+                        }
+                        None => return,
                     },
-                    None => builder.serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await,
+                    None => {
+                        fresh_first_byte(fresh.as_deref(), &tcp).await;
+                        let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(tcp), svc);
+                        hold_while(fresh.as_deref(), FRESH_GRACE, conn).await
+                    }
                 };
                 if let Err(e) = res {
                     debug!("DoH 連線結束：{e}");
@@ -1603,7 +1669,7 @@ mod tests {
         let d = dropped.clone();
         let conn = tokio::spawn(async move {
             let _permit = permit;
-            dot_conn(ResetOnEof(server), move |_q| {
+            dot_conn(ResetOnEof(server), None, move |_q| {
                 let g = Dropped(d.clone());
                 async move {
                     let _g = g;
@@ -1635,7 +1701,7 @@ mod tests {
     #[tokio::test]
     async fn dot_half_close_still_answers() {
         let (client, server) = tokio::io::duplex(4096);
-        let conn = tokio::spawn(dot_conn(server, |q: Vec<u8>| async move {
+        let conn = tokio::spawn(dot_conn(server, None, |q: Vec<u8>| async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let m = kuroshio_proto::Message::parse(&q).ok()?;
             Some(kuroshio_proto::Message::response_to(&m, 0).encode())

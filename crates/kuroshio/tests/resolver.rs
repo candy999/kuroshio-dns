@@ -434,7 +434,14 @@ async fn warmup_from_hot_names() {
     started.resolver.handle(&q(9, "hot-a.test", 1), &CTX).await.unwrap();
     started.shutdown();
     let saved: Vec<String> = serde_json::from_slice(&std::fs::read(dir.join("hot-names.json")).unwrap()).unwrap();
-    assert_eq!(saved[0], "1|hot-a.test", "{saved:?}");
+    // 3.5.1：跟上一份合併。這次開機命中 2 次以上的在前，上一份裡的（這次只有預熱查過）接在後面；
+    // 以前只收這次開機命中 2 次以上的，重新啟動之間查得少，名單就一路縮小
+    assert!(saved[0].starts_with('@'), "日子的標記：{saved:?}");
+    let names = kuroshio::app::decode_hot_names(saved.clone());
+    let keys: Vec<&str> = names.iter().map(|x| x.0.as_str()).collect();
+    // 28|hot-b.test：假的上游對 AAAA 回的是 A，快取裡不是正常的答案，上一份裡的也不留
+    assert_eq!(keys, ["1|hot-a.test", "1|hot-c.test"], "{saved:?}");
+    assert!(names.iter().all(|x| x.1 == names[0].1), "都是今天：{saved:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

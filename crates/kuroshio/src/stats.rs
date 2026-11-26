@@ -465,58 +465,37 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// 常見的多層公共尾碼（不需要完整 Public Suffix List 也能處理大部分台灣 / 亞洲網站，同 2.x）
+/// 國碼頂級網域（兩個字母）底下常見的類別：`example.com.ua`、`example.co.za`、`example.co.uk`、`example.com.tw`、
+/// `example.go.jp` 這類的主網域是三段（3.5.1）。以前只有一份四十幾個的清單（同 2.x），清單外的國家
+/// （`xxx.com.ua`、`xxx.co.za`）整個國家的網站都算成同一個「網站」，排行與預熱名單「同一個主網域最多 8 筆」都被影響。
+///
+/// 每次查詢都會比對（[`site_slice`]）：只看最後兩段的長度與內容，不配置記憶體
+#[rustfmt::skip]
+const CC_CATEGORY: &[&str] = &[
+    "com", "net", "org", "edu", "gov", "mil",
+    "ac", "co", "or", "ne", "go",
+    "gob", "gouv", "ltd", "plc", "sch", "nom",
+];
+
+/// 通用規則（[`CC_CATEGORY`]）以外的多層公共尾碼：台灣的個人、遊戲、商務、社團，泰國的 `in.th`
 #[rustfmt::skip]
 const MULTI_SUFFIX: &[&str] = &[
-    "com.tw",
-    "net.tw",
-    "org.tw",
-    "edu.tw",
-    "gov.tw",
     "idv.tw",
     "game.tw",
     "ebiz.tw",
     "club.tw",
-    "com.hk",
-    "net.hk",
-    "org.hk",
-    "edu.hk",
-    "gov.hk",
-    "com.cn",
-    "net.cn",
-    "org.cn",
-    "gov.cn",
-    "edu.cn",
-    "co.jp",
-    "ne.jp",
-    "or.jp",
-    "ac.jp",
-    "go.jp",
-    "co.kr",
-    "or.kr",
-    "ne.kr",
-    "co.uk",
-    "org.uk",
-    "ac.uk",
-    "gov.uk",
-    "com.au",
-    "net.au",
-    "org.au",
-    "com.sg",
-    "com.my",
-    "com.ph",
-    "co.th",
     "in.th",
-    "com.vn",
-    "co.id",
-    "co.in",
-    "com.br",
-    "com.mx",
-    "co.nz",
-    "com.tr",
 ];
 
-/// 託管平台的尾碼（Public Suffix List 的 private 段）：底下每一個名稱是不同使用者的網站，所以跟 [`MULTI_SUFFIX`] 一樣
+/// 最後兩段是「兩個字母的國碼 + 常見類別」（`com.ua`、`co.uk`、`com.tw`）
+fn is_cc_category(last2: &str) -> bool {
+    let Some((sld, tld)) = last2.split_once('.') else {
+        return false;
+    };
+    tld.len() == 2 && tld.bytes().all(|b| b.is_ascii_lowercase()) && CC_CATEGORY.contains(&sld)
+}
+
+/// 託管平台的尾碼（Public Suffix List 的 private 段）：底下每一個名稱是不同使用者的網站，所以跟國碼的類別（[`CC_CATEGORY`]）一樣
 /// 多算一段當主網域。開機預熱名單另外限制同一個平台底下的總筆數（`cache::WARM_PER_PLATFORM`，3.5.1）：
 /// 這些平台大多對任何子網域都回答，隨機名稱查幾次就是「正常有答案、命中 2 次以上」
 pub const PLATFORM_SUFFIX: &[&str] = &[
@@ -565,7 +544,7 @@ fn site_slice(n: &str) -> Option<&str> {
     // 從右邊數第 k 個點之後的部分（沒有那麼多層就是整個名稱）
     let tail = |k: usize| n.rmatch_indices('.').nth(k - 1).map_or(n, |(i, _)| &n[i + 1..]);
     let last2 = tail(2);
-    if MULTI_SUFFIX.contains(&last2) || PLATFORM_SUFFIX.contains(&last2) {
+    if is_cc_category(last2) || MULTI_SUFFIX.contains(&last2) || PLATFORM_SUFFIX.contains(&last2) {
         return Some(tail(3));
     }
     Some(last2)
@@ -1506,6 +1485,27 @@ mod tests {
         assert_eq!(site_of("com.tw").as_deref(), Some("com.tw"));
         assert_eq!(site_of("example.com.tw").as_deref(), Some("example.com.tw"));
         assert_eq!(site_of("a.b.c.d.example.org").as_deref(), Some("example.org"));
+        // 3.5.1：國碼頂級網域底下的常見類別一律算三段（以前清單外的國家整個國家算成同一個網站）
+        assert_eq!(site_of("www.shop.example.com.ua").as_deref(), Some("example.com.ua"));
+        assert_eq!(site_of("cdn.example.co.za").as_deref(), Some("example.co.za"));
+        assert_eq!(site_of("news.example.co.uk").as_deref(), Some("example.co.uk"));
+        assert_eq!(site_of("www.example.net.tw").as_deref(), Some("example.net.tw"));
+        assert_eq!(site_of("www.example.go.jp").as_deref(), Some("example.go.jp"));
+        assert_eq!(site_of("a.example.gob.mx").as_deref(), Some("example.gob.mx"));
+        assert_ne!(site_of("a.example.com.ua"), site_of("b.example2.com.ua"), "不同網站不再合併");
+        // 特別的項目照舊
+        assert_eq!(site_of("blog.someone.idv.tw").as_deref(), Some("someone.idv.tw"));
+        assert_eq!(site_of("www.example.in.th").as_deref(), Some("example.in.th"));
+        assert_eq!(site_of("user.github.io").as_deref(), Some("user.github.io"));
+        // 不是國碼（不是兩個字母）、不是常見類別：照一般的兩段
+        assert_eq!(site_of("www.example.com").as_deref(), Some("example.com"));
+        assert_eq!(site_of("a.b.example.net").as_deref(), Some("example.net"));
+        assert_eq!(site_of("www.shop.example.de").as_deref(), Some("example.de"));
+        assert_eq!(site_of("api.example.io").as_deref(), Some("example.io"));
+        assert_eq!(site_of("www.example.co").as_deref(), Some("example.co"));
+        assert_eq!(site_of("www.com.example").as_deref(), Some("com.example"));
+        assert_eq!(site_of("x.shop.example.xn--kpry57d").as_deref(), Some("example.xn--kpry57d"));
+        assert_eq!(site_of("co.za").as_deref(), Some("co.za"));
         assert_eq!(site_of(""), None);
         assert_eq!(site_of("."), None);
     }
