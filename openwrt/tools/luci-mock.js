@@ -85,7 +85,7 @@ const DDNS = () => (uci.kuroshio.ddns.enabled === '1' ? { enabled: true, lastRun
         { name: 'dns.example.com', type: 'A', content: '198.51.100.7', ip: '198.51.100.7', ok: true, action: 'kept' },
         { name: 'dns.example.com', type: 'HTTPS', ok: false, action: 'error', error: 'Cloudflare API 403' }] } : { enabled: false });
 const STATUS = {
-    version: '3.5.0', stats: { uptimeSec: 3700, today: { date: '2026-11-11', query: 1234, hit: 900, hitRate: 72.9, blocked: 50, blockedAds: 40, blockedTelemetry: 8, blockedMalware: 2, route: {}, latency: { hit: { p50: 1, p95: 2 }, miss: { p50: 20, p95: 80 } } } },
+    version: '3.5.1', stats: { uptimeSec: 3700, today: { date: '2026-11-11', query: 1234, hit: 900, hitRate: 72.9, blocked: 50, blockedAds: 40, blockedTelemetry: 8, blockedMalware: 2, route: {}, latency: { hit: { p50: 1, p95: 2 }, miss: { p50: 20, p95: 80 } } } },
     cacheEntries: 800, cacheBytes: 300000, errors: { count: 0, recent: [] }, ownIp: null,
     upstreams: [{ id: 'udp://192.0.2.53', role: 'pinned', ok: 100, fail: 1, avgMs: 12, servfail: 2, late: 5, unanswered: 1 },
       { id: 'https://doh.example/dns-query', role: 'auto', reason: '最快', ok: 50, fail: 0, avgMs: 20 },
@@ -420,7 +420,7 @@ function kuroshio(method, args) {
         if (args.path === '/api/persist/flush') return DOWN ? wrap(args.path) : { ok: true, result: { ok: true, files: 7, bytes: 345678, at: Date.now(), dir: '/etc/kuroshio/state' } };
         return { ok: true, result: { ok: true } };
     case 'defaults': return { result: defaults };
-    case 'about': return { core: { name: '黑潮 DNS', version: '3.5.0', language: 'Rust', target: 'mock', features: ['doh', 'dot'], license: 'GPL-3.0-or-later', licenseUrl: 'https://www.gnu.org/licenses/gpl-3.0.html', source: 'https://github.com/candy999/kuroshio-dns', qrSource: QR_SOURCE }, ui: '3.5.0-r1' };
+    case 'about': return { core: { name: '黑潮 DNS', version: '3.5.1', language: 'Rust', target: 'mock', features: ['doh', 'dot'], license: 'GPL-3.0-or-later', licenseUrl: 'https://www.gnu.org/licenses/gpl-3.0.html', source: 'https://github.com/candy999/kuroshio-dns', qrSource: QR_SOURCE }, ui: '3.5.1-r1' };
     case 'acme_status': return { running: false, log: '', cert: PATHS.tls.info };
     case 'acme_issue': return { started: true };
     case 'log': return { lines: ['kuroshio: mock'] };

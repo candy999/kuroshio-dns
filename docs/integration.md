@@ -162,6 +162,7 @@ kuroshio notify simulate-memory --avail-mb MB [--minutes 分鐘] | --off [-c 設
 - `save`：`POST /api/persist/flush`，回應 `{"ok":true,"files":寫了幾份,"bytes":磁碟上一共幾 bytes,"at":完成時間（Unix 毫秒）,"dir":"快照目錄"}`；沒有新的變動時 `files` 是 `0`。寫入失敗回 HTTP 500 與 `{"error":"..."}`。
 - `trim`：`POST /api/memory/trim?holdSec=秒`，回應 `{"ok":true,"steps":[{"step","label","freedBytes","detail"} 或 {"step","label","skipped"}],"freedBytes":估計釋出的 bytes,"holdSec":實際的秒數,"availBeforeKB","availKB"}`。記憶體控制關掉（`system.memoryGovernor: false`）時回 `{"ok":true,"enabled":false,...}`。暫停期間 `/api/status` 的 `memory.holdUntil` 是結束時間（Unix 毫秒）。
 - `simulate-memory`（3.5.0，測試用）：`POST /api/memory/simulate?availMB=N&minutes=M`，回應 `{"ok":true,"minutes":實際的分鐘數,"simulated":{"availMB","until":到期時間（Unix 毫秒）,"remainingSec"}}`；`?off=1` 回 `{"ok":true,"wasOn":bool,"simulated":null}`。沒開 `system.testHooks` 回 HTTP 403，少了 `availMB` 回 400。生效期間 `/api/status` 的 `memory.simulated` 是同樣的物件（沒開是 `null`）。LuCI 不需要這個路徑（`rpcd.sh` 不加）。
+- `memory/restart`（3.5.1，測試用）：`POST /api/memory/restart`，回應 `{"ok":true,"requested":bool}`，接著照正常停止寫完快照、用同一個 PID 原地重新執行（只有 Linux；其他平台回 400）。沒開 `system.testHooks` 回 HTTP 403。正式使用時是記憶體控制自己判斷（`system.memoryRestart`，預設開，見規格 09 第 13 節），不用呼叫這個路徑；LuCI 不需要（`rpcd.sh` 不加）。
 
 ### 管理 API 版本
 
@@ -970,7 +971,7 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
   | `/api/querylog/enable` | 動作（POST） | 3.5.0 | 日誌頁「開啟 10 分鐘」「關閉」 |
   | `/api/cdn/status`、`/api/protocols`、`/api/backup/last-import` | 唯讀 | 3.0～3.3（rpcd 3.5.0 才開放） | 沒有（給查詢用） |
 
-  刻意不開放：`/api/memory/simulate`（只給測試，`system.testHooks` 開著才能用）、`/api/notify/wan-changed`（系統通知用）、`/api/session`（網頁登入）；`/api/about`、`/api/defaults`、ACME 走 rpcd 自己的方法。
+  刻意不開放：`/api/memory/simulate`、`/api/memory/restart`（只給測試，`system.testHooks` 開著才能用）、`/api/notify/wan-changed`（系統通知用）、`/api/session`（網頁登入）；`/api/about`、`/api/defaults`、ACME 走 rpcd 自己的方法。
 
   `kuroshio` 套件裡有一個測試確認 rpcd 的唯讀白名單沒有會改變狀態的路徑、動作白名單都是會改變狀態的路徑。
 - **查詢紀錄**（3.5.0）：`GET /api/querylog?limit=200&name=&client=&since=` 讀最近的查詢（新的在前，`limit` 最多 1,000；`name` 是「包含這段文字」，`client` 是來源 IP，`since` 是毫秒時間戳）；`POST /api/querylog/enable?minutes=10` 暫時開啟（1～60 分鐘，到時間自動關閉並釋放；`minutes=0` 關閉）。`log.queryLog: true` 是常開。每一筆是 `{at, name, type, client, result（hit／miss／blocked／stale）, rcode, ms, source}`。

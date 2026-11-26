@@ -377,6 +377,7 @@ fn noisy_inputs() -> FindInputs {
             "popSwitch": { "holds": [ { "provider": "cdn.example.net", "pop": "192.0.2.1", "family": 4, "until": NOW + 600_000, "other": "198.51.100.2" } ] },
         }),
         cdn_pruned: Some(12),
+        cdn_pruned_rounds: 1,
         cdn_pace: json!({ "enabled": true, "perMin": 30, "maxPerMin": 60, "paced": true }),
         chain: json!({ "state": "released", "reason": "tampered", "upstream": { "via": "intercept", "since": NOW - 3_600_000, "address": "192.168.1.1" },
                        "audit": { "releases": 1, "last": { "name": "www.example.com", "ip": "198.51.100.9" } } }),
@@ -452,10 +453,12 @@ fn memory_findings_follow_governor_state() {
         avail: Some(8 << 20),
         protected: true,
         floor: true,
+        shed: vec!["最低限度：只轉送（暫停 CDN 調整、快取最小）", "暫停全部過濾清單（含保護清單）"],
         ..base.clone()
     });
+    assert_eq!(crit[0].1.matches("只轉送").count(), 1, "不重複：{}", crit[0].1);
     assert_eq!(crit[0].0, "memory-critical");
-    assert!(crit[0].1.contains("連保護清單都暫停了"), "{}", crit[0].1);
+    assert!(crit[0].1.contains("只剩自訂規則"), "{}", crit[0].1);
     let futile = on(crate::memgov::MemSummary {
         state: crate::memgov::State::Critical,
         futile: true,
@@ -799,12 +802,14 @@ fn cdn_db_pruning_text() {
     let inp = FindInputs {
         now: NOW,
         cdn_pruned: Some(3645),
+        cdn_pruned_rounds: 2,
         ..FindInputs::default()
     };
     let (obs, _) = rules(&inp, &[]);
     let mut e = Engine::new();
     e.apply(&obs, NOW);
     let f = find(&e.json(), "cdn-db-pruning").unwrap().clone();
+    assert_eq!(f["count"], 2, "次數是整理輪數，不是筆數（3.5.1）");
     assert_eq!(
         f["text"],
         "CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 3645 筆）"

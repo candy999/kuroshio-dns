@@ -876,6 +876,78 @@ struct Inner {
     hold_until: u64,
     /// 退讓於事無補（3.5.0）：由記憶體監看每一輪 [`Governor::observe_futile`] 更新
     futile: FutileGate,
+    /// 這一次不寬裕從什麼時候開始（回到寬裕時清掉；3.5.1 N1）
+    pressed_since: Option<u64>,
+    /// 上一次讓出 [`USEFUL_SHED_BYTES`] 以上的時間
+    last_useful_shed: u64,
+}
+
+/// 讓出這麼多以上才算「還有東西可以讓」（判斷記憶體回不來用；3.5.1 N1）
+pub const USEFUL_SHED_BYTES: u64 = 256 * 1024;
+/// 不寬裕而且什麼都讓不出來，持續這麼久才考慮原地重新啟動（秒）
+pub const RESTART_STUCK_SECS: u64 = 600;
+/// 兩次原地重新啟動至少隔多久（秒；用環境變數 [`RESTART_ENV`] 帶到下一個行程）
+pub const RESTART_MIN_GAP_SECS: u64 = 6 * 3600;
+/// 最近 15 分鐘平均每秒查詢少於這個才算離峰
+pub const RESTART_LOW_QPS: u64 = 10;
+/// 自己的用量（RSS）至少佔實體記憶體這麼多 % 才算「是自己回不來」（不是別的程式）
+pub const RESTART_OWN_PERCENT: u64 = 30;
+/// 上一次原地重新啟動的時間（Unix 秒），重新執行時帶給新的行程
+pub const RESTART_ENV: &str = "KUROSHIO_MEMORY_RESTART_AT";
+
+static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
+static RESTART_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+fn restart_notify() -> &'static tokio::sync::Notify {
+    RESTART_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// 記憶體控制要求原地重新啟動（3.5.1 N1）：主程式的停止訊號也等它，收到就照正常停止寫完快照，
+/// 再用同一個 PID 重新執行（[`reexec_self`]）
+pub async fn restart_requested() {
+    if RESTART_PENDING.load(Ordering::Relaxed) {
+        return;
+    }
+    restart_notify().notified().await
+}
+
+/// 要求原地重新啟動（記憶體控制判斷回不來時；測試開關 `POST /api/memory/restart`）。已經要求過的不再重複
+pub fn request_restart(msg: &str) -> bool {
+    if RESTART_PENDING.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    warn!("{msg}");
+    restart_notify().notify_waiters();
+    true
+}
+
+/// 停止之後要不要原地重新執行
+pub fn restart_pending() -> bool {
+    RESTART_PENDING.load(Ordering::Relaxed)
+}
+
+/// 上一次原地重新啟動的時間（Unix 秒；沒有是 0）
+fn last_restart_at() -> u64 {
+    std::env::var(RESTART_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// 用同一個 PID 重新執行自己（Linux：execve）。參數、環境變數照舊，另外帶上這次的時間（[`RESTART_ENV`]）。
+/// 執行檔路徑用 `current_exe()`（`/usr/bin/kuroshio`，行程名稱照舊，看門狗用 `pidof` 找得到）；
+/// 檔案被換掉、讀不到時用 `/proc/self/exe`。成功時不會回來；失敗回傳錯誤（呼叫端照一般停止結束）
+#[cfg(target_os = "linux")]
+pub fn reexec_self() -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()
+        .ok()
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc/self/exe"));
+    let mut args = std::env::args_os();
+    let arg0 = args.next().unwrap_or_else(|| exe.clone().into_os_string());
+    std::process::Command::new(&exe)
+        .arg0(arg0)
+        .args(args)
+        .env(RESTART_ENV, crate::persist::now_secs().to_string())
+        .exec()
 }
 
 type Reader = Box<dyn Fn() -> Reading + Send + Sync>;
@@ -890,6 +962,10 @@ pub struct Governor {
     /// 放鬆前條件要持續多久、狀態至少停留多久（秒）
     pub dwell: u64,
     reader: Mutex<Reader>,
+    /// 記憶體回不來時原地重新啟動（`system.memoryRestart`，只有 Linux；3.5.1 N1）
+    pub restart: AtomicBool,
+    /// 最近 15 分鐘的查詢數（離峰判斷；沒有設定時不重新啟動）
+    load_probe: Mutex<Option<Box<dyn Fn() -> u64 + Send + Sync>>>,
 }
 
 const MAX_EVENTS: usize = 20;
@@ -918,11 +994,74 @@ impl Governor {
                 growth: true,
                 hold_until: 0,
                 futile: FutileGate::default(),
+                pressed_since: None,
+                last_useful_shed: 0,
             }),
             gap: 5,
             dwell: 180,
             reader: Mutex::new(Box::new(Reading::now)),
+            restart: AtomicBool::new(false),
+            load_probe: Mutex::new(None),
         }
+    }
+
+    /// 不寬裕的時候也可以先恢復的一步（3.5.1 N1）：只在「真的不足」時才做的步驟（[`Step::min_state`] 是不足：
+    /// 停用過濾清單、只轉送、暫停保護清單），觸發它的條件已經不成立（[`Step::wanted`] 是 false）、PSI 平靜、
+    /// 讓出之後過了 `dwell`、可用記憶體 − 保留量的一半 ≥ 這一步要的 × 1.3。從最後讓出的開始，一次一步。
+    ///
+    /// 以前要等整體回到寬裕才恢復：musl 放掉的記憶體不還給系統，洪水過後可用記憶體回不到保留量以上，
+    /// 過濾清單（26 萬條規則只佔約 1.9 MB）就一直停用到重新啟動（3.5.1 測試版 D3）
+    fn partial_restore(&self, i: &Inner, r: &Reading, now: u64) -> Option<(usize, u64)> {
+        if now < i.next_restore_at || i.futile.on || !r.psi.map_or(true, |p| p.calm()) {
+            return None;
+        }
+        let k = self.steps.iter().rposition(|s| s.is_shed())?;
+        let s = &self.steps[k];
+        if s.min_state() != State::Critical || s.wanted(r, &self.reserve) {
+            return None;
+        }
+        let last_shed = i.shed.iter().rev().find(|x| x.key == s.key()).map_or(0, |x| x.at);
+        if now.saturating_sub(last_shed) < self.dwell {
+            return None;
+        }
+        let room = r.avail?.saturating_sub(self.reserve.bytes / 2);
+        (room as u128 >= s.restore_need() as u128 * 13 / 10).then_some((k, room))
+    }
+
+    /// 最近 15 分鐘的查詢數從哪裡來（離峰判斷；3.5.1 N1）
+    pub fn set_load_probe(&self, f: impl Fn() -> u64 + Send + Sync + 'static) {
+        *self.load_probe.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// 該不該原地重新啟動（3.5.1 N1）：讓得出的都讓了還回不來（不寬裕持續 10 分鐘以上、10 分鐘內沒有讓出
+    /// 256 KB 以上、現在也沒有能做的步驟）、是自己回不來（RSS ≥ 實體記憶體 30%，不是於事無補）、離峰（最近 15 分鐘
+    /// 平均每秒 10 筆以下）、離上一次 6 小時以上。原因：musl 的配置器放掉的小塊記憶體不還給系統，洪水過後就一直
+    /// 卡在吃緊／不足，過濾清單、快取、CDN 新網域一直減量到重新啟動為止（3.5.1 測試版 D3：停了 15 分鐘 RSS 還是 309 MB）
+    fn restart_due(&self, i: &Inner, state: State, r: &Reading, now: u64, wall: u64) -> bool {
+        if !self.restart.load(Ordering::Relaxed) || RESTART_PENDING.load(Ordering::Relaxed) {
+            return false;
+        }
+        if state == State::Comfortable || i.futile.on {
+            return false;
+        }
+        let stuck = i.pressed_since.is_some_and(|t| now.saturating_sub(t) >= RESTART_STUCK_SECS)
+            && now.saturating_sub(i.last_useful_shed) >= RESTART_STUCK_SECS
+            && self.pick(i, state, r, now).is_none();
+        if !stuck {
+            return false;
+        }
+        let mine = match (r.rss, r.total) {
+            (Some(rss), Some(t)) if t > 0 => rss.saturating_mul(100) >= t.saturating_mul(RESTART_OWN_PERCENT),
+            _ => false,
+        };
+        let quiet = self
+            .load_probe
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|f| f() < RESTART_LOW_QPS * 15 * 60);
+        let last = last_restart_at();
+        mine && quiet && (last == 0 || wall.saturating_sub(last) >= RESTART_MIN_GAP_SECS)
     }
 
     /// 換掉量測的方法（測試注入固定的數字）
@@ -1052,6 +1191,23 @@ impl Governor {
                 Self::event(i, now, msg);
             }
             let state = i.hyst.state;
+            if state == State::Comfortable {
+                i.pressed_since = None;
+            } else if i.pressed_since.is_none() {
+                i.pressed_since = Some(now);
+            }
+            if self.restart_due(i, state, &r, now, crate::persist::now_secs()) {
+                let msg = format!(
+                    "記憶體控制：讓得出的都讓了，可用記憶體還是回不來（系統可用 {} MB，保留 {} MB，黑潮用了 {} MB；\
+                     配置器放掉的記憶體沒有還給系統）。現在是離峰：先寫出快照，原地重新啟動一次拿回記憶體（DNS 中斷幾秒；6 小時最多一次）",
+                    r.avail.map_or(0, mb_round),
+                    mb_round(self.reserve.bytes),
+                    r.rss.map_or(0, mb_round)
+                );
+                if request_restart(&msg) {
+                    Self::event(i, now, msg);
+                }
+            }
             // 長大：寬裕而且離保留量 + 遲滯還有空間（`trim` 要求暫停的期間不長大）
             let held = now < i.hold_until;
             let growth = !held && state == State::Comfortable && pressure_of(&r, &self.reserve) == Pressure::Normal;
@@ -1082,11 +1238,15 @@ impl Governor {
                 None
             } else if state > State::Comfortable {
                 let any = self.pick(i, state, &r, now).is_some();
-                (now >= i.next_shed_at && any).then(|| {
-                    let deficit = r.avail.map_or(0, |a| self.reserve.bytes.saturating_sub(a));
-                    let far = state == State::Critical || r.avail.is_some_and(|a| a < self.reserve.bytes / 4 * 3);
-                    Plan::Shed { far, deficit }
-                })
+                if any {
+                    (now >= i.next_shed_at).then(|| {
+                        let deficit = r.avail.map_or(0, |a| self.reserve.bytes.saturating_sub(a));
+                        let far = state == State::Critical || r.avail.is_some_and(|a| a < self.reserve.bytes / 4 * 3);
+                        Plan::Shed { far, deficit }
+                    })
+                } else {
+                    self.partial_restore(i, &r, now).map(|(k, room)| Plan::Restore(k, room))
+                }
             } else if held {
                 i.waiting = Some(format!("應要求先讓出記憶體，{} 秒內不恢復", i.hold_until - now));
                 None
@@ -1157,6 +1317,9 @@ impl Governor {
                             }
                             i.freed_total += o.bytes;
                             freed += o.bytes;
+                            if o.bytes >= USEFUL_SHED_BYTES {
+                                i.last_useful_shed = now;
+                            }
                             Self::event(i, now, format!("釋出：{} {}（約 {} KB）", s.label(), o.detail, o.bytes / 1024));
                             push_shed(
                                 &mut i.shed,
@@ -2458,6 +2621,86 @@ mod tests {
             now += 5;
         }
         assert!(log.lock().unwrap().iter().any(|x| x == "shed:filter"), "{:?}", log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn critical_only_steps_restore_when_their_trigger_is_gone() {
+        // 3.5.1 N1：洪水過後可用記憶體回不到保留量以上（musl 不還記憶體），狀態一直是不足。
+        // 停用過濾清單只在「真的不足」（可用 < 保留量一半）時做：那個條件不成立、空間夠，就先恢復，不必等寬裕
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let g = Governor::new(res100(), ladder(&log, 2 * MB), 0);
+        let mut now = 1000;
+        for _ in 0..40 {
+            g.tick(rd(30), now).await;
+            now += 5;
+        }
+        assert!(log.lock().unwrap().iter().any(|x| x == "shed:filter"), "{:?}", log.lock().unwrap());
+        log.lock().unwrap().clear();
+        // 可用 70 MB：保留量 100 MB 以下（狀態不會回到寬裕），但已經不是「真的不足」
+        for _ in 0..100 {
+            g.tick(rd(70), now).await;
+            now += 5;
+        }
+        assert_ne!(g.state(), State::Comfortable);
+        let l = log.lock().unwrap().clone();
+        assert!(l.iter().any(|x| x == "restore:filter"), "{l:?}");
+        assert!(
+            !l.iter().any(|x| x == "restore:cdn" || x == "restore:cache"),
+            "吃緊就會做的步驟照舊等寬裕：{l:?}"
+        );
+        assert!(!l.iter().any(|x| x.starts_with("shed:")), "恢復之後不再讓出：{l:?}");
+    }
+
+    #[test]
+    fn restart_only_when_stuck_mine_quiet_and_enabled() {
+        // 3.5.1 N1：原地重新啟動的條件：不寬裕 10 分鐘以上、10 分鐘內沒讓出 256 KB 以上、沒有能做的步驟、
+        // RSS ≥ 實體記憶體 30%、最近 15 分鐘平均每秒不到 10 筆、有開
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut steps = ladder(&log, 2 * MB);
+        steps.truncate(3); // 只有吃緊的步驟，而且都讓過了（units = 1）
+        for s in &steps {
+            futures_lite_block(s.shed(&rd(30))).unwrap();
+        }
+        let g = Governor::new(res100(), steps, 0);
+        let q = Arc::new(AtomicU32::new(100));
+        let q2 = q.clone();
+        g.set_load_probe(move || q2.load(Ordering::Relaxed) as u64);
+        let r = |rss_mb: u64| Reading {
+            rss: Some(rss_mb * MB),
+            total: Some(1000 * MB),
+            avail: Some(80 * MB),
+            psi: None,
+        };
+        let stuck = |g: &Governor, since: u64, useful: u64| {
+            let mut i = g.inner.lock().unwrap();
+            i.pressed_since = Some(since);
+            i.last_useful_shed = useful;
+        };
+        let due = |g: &Governor, rss: u64, now: u64| {
+            let i = g.inner.lock().unwrap();
+            g.restart_due(&i, State::Tight, &r(rss), now, 2_000_000_000)
+        };
+        stuck(&g, 1000, 1000);
+        assert!(!due(&g, 400, 2000), "沒開");
+        g.restart.store(true, Ordering::Relaxed);
+        assert!(due(&g, 400, 2000), "都成立");
+        assert!(!due(&g, 400, 1500), "不寬裕還不到 10 分鐘");
+        stuck(&g, 1000, 1700);
+        assert!(!due(&g, 400, 2000), "10 分鐘內還讓得出東西");
+        stuck(&g, 1000, 1000);
+        assert!(!due(&g, 200, 2000), "RSS 不到 30%：不是自己回不來");
+        q.store(10 * 15 * 60, Ordering::Relaxed);
+        assert!(!due(&g, 400, 2000), "不是離峰");
+        q.store(100, Ordering::Relaxed);
+        g.inner.lock().unwrap().futile.on = true;
+        assert!(!due(&g, 400, 2000), "於事無補（別的程式造成的）");
+        g.inner.lock().unwrap().futile.on = false;
+        let i = g.inner.lock().unwrap();
+        assert!(!g.restart_due(&i, State::Comfortable, &r(400), 2000, 2_000_000_000), "寬裕");
+    }
+
+    fn futures_lite_block<T>(f: BoxFut<'_, T>) -> T {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
     }
 
     #[test]

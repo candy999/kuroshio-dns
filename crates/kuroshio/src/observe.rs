@@ -535,6 +535,8 @@ pub struct FindInputs {
     pub cdn_observe: Value,
     /// `cdn.prunedForBudget`
     pub cdn_pruned: Option<u32>,
+    /// `cdn.prunedRounds`：有淘汰的整理輪數（發現清單的次數；3.5.1）
+    pub cdn_pruned_rounds: u32,
     /// `Cdn::pace_json()`（3.5.0 F12：CDN 驗證節流；CDN 關著是 `null`）
     pub cdn_pace: Value,
     /// `/api/chain`（含 `audit`）
@@ -665,10 +667,9 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
         } else {
             format!("已經讓出：{}", m.shed.join("、"))
         };
+        // 讓出清單裡已經有那一步的名稱（「最低限度：只轉送…」「暫停全部過濾清單（含保護清單）」）：不再重複寫一次（3.5.1）
         let tail = if m.protected {
-            "；連保護清單都暫停了，只剩自訂規則".to_string()
-        } else if m.floor {
-            "；只轉送（CDN 調整暫停、快取最小）".to_string()
+            "，只剩自訂規則".to_string()
         } else {
             String::new()
         };
@@ -707,10 +708,11 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
 
     // 磁碟預算淘汰 CDN 網域資料
     if let Some(n) = i.cdn_pruned {
+        // 次數是「有淘汰的整理輪數」（每 5 分鐘最多一輪）；以前用筆數，一輪就幾千筆，很快就到次數上限 9999（3.5.1 測試版 D3）
         out.push(event(
             "cdn-db-pruning",
             Sev::Info,
-            n,
+            i.cdn_pruned_rounds,
             0,
             format!("CDN 網域資料超過筆數上限（依磁碟預算與實際大小換算），淘汰了最久沒用的（累計 {n} 筆）"),
         ));
@@ -891,6 +893,10 @@ fn find_inputs(st: &AppState, now: u64) -> FindInputs {
             .as_ref()
             .and_then(|c| c.status_lite()["prunedForBudget"].as_u64())
             .map(|n| n.min(u32::MAX as u64) as u32),
+        cdn_pruned_rounds: cdn
+            .as_ref()
+            .and_then(|c| c.status_lite()["prunedRounds"].as_u64())
+            .map_or(0, |n| n.min(u32::MAX as u64) as u32),
         chain: crate::chain::client::api_json(),
         lists_without_copy: st.filter.as_ref().and_then(|f| f.lists_without_copy()),
         fresh: fresh_items(&fresh_inputs(st)),

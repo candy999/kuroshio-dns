@@ -1266,7 +1266,15 @@ async fn real_main(cli: Cli, threads: usize) -> Result<()> {
                 }
             }
         }
-        Cmd::Run { config, uci } => serve(config, uci, threads, None, shutdown_signal()).await?,
+        Cmd::Run { config, uci } => {
+            serve(config, uci, threads, None, shutdown_signal()).await?;
+            // 3.5.1 N1：記憶體控制要求的原地重新啟動：快照已經照正常停止寫完，用同一個 PID 重新執行
+            #[cfg(target_os = "linux")]
+            if kuroshio::memgov::restart_pending() {
+                let e = kuroshio::memgov::reexec_self();
+                eprintln!("原地重新啟動失敗（{e}），照一般停止結束；看門狗或服務管理會重新啟動");
+            }
+        }
         Cmd::Health {
             config,
             uci,
@@ -2425,6 +2433,7 @@ async fn shutdown_signal() -> StopReason {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => StopReason::CtrlC,
             _ = term.recv() => StopReason::Terminate,
+            _ = kuroshio::memgov::restart_requested() => StopReason::MemoryRestart,
         }
     }
     #[cfg(windows)]

@@ -23,6 +23,7 @@
     "queryLogRing": 20000,
     "memoryWatchdog": true,
     "memoryGovernor": true,
+    "memoryRestart": true,
     "memoryReserveMB": 0,
     "memoryReservePercent": 0,
     "oomScoreAdj": -500,

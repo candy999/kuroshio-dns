@@ -1588,6 +1588,8 @@ pub enum StopReason {
     Service,
     /// 主控台輸入 `quit`
     Quit,
+    /// 記憶體回不來、離峰時原地重新啟動（3.5.1 N1；停完之後用同一個 PID 重新執行）
+    MemoryRestart,
 }
 
 impl StopReason {
@@ -1602,6 +1604,7 @@ impl StopReason {
             StopReason::SystemShutdown => "關機",
             StopReason::Service => "服務停止",
             StopReason::Quit => "quit 指令",
+            StopReason::MemoryRestart => "記憶體控制的原地重新啟動要求",
         }
     }
 
@@ -1846,6 +1849,9 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
     }
     tokio::spawn(async move {
         let mut last = Pressure::Normal;
+        // 「接近保留量」「回到保留量以上」兩種 info 每分鐘各最多一行（3.5.1：可用記憶體在門檻附近跳動時，
+        // D3 壓測 6 分鐘內寫了十幾行）；「不足」的 WARN 照舊每次都寫
+        let mut quiet_until: [Option<Instant>; 2] = [None, None];
         // 記憶體控制關掉時自己判斷「於事無補」（開著時由記憶體控制判斷，狀態頁看得到同一份）
         let mut gate = crate::memgov::FutileGate::default();
         // 「缺口是其他程式造成」那一行同一段於事無補只寫一次（3.5.0 J3）
@@ -1880,6 +1886,14 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                     c.set_load(pct);
                 }
             }
+            let quiet = |i: usize, q: &mut [Option<Instant>; 2]| {
+                let now = Instant::now();
+                if q[i].is_some_and(|t| now < t) {
+                    return false;
+                }
+                q[i] = Some(now + Duration::from_secs(60));
+                true
+            };
             if p != last {
                 let (a, res) = (
                     crate::memgov::mb_round(r.avail.unwrap_or(0)),
@@ -1893,7 +1907,11 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                             info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆（缺口是其他程式造成的這一段，讀數再跳動不另外記）")
                         }
                     }
-                    Pressure::Normal => info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆"),
+                    Pressure::Normal => {
+                        if quiet(0, &mut quiet_until) {
+                            info!("記憶體回到保留量以上（可用 {a} MB，保留 {res} MB）；記憶體控制穩定幾分鐘後才放鬆")
+                        }
+                    }
                     Pressure::Low if futile => {
                         if note.take() {
                             info!(
@@ -1901,7 +1919,11 @@ fn spawn_monitor(reserve: crate::memgov::Reserve, gov: Option<Arc<crate::memgov:
                             )
                         }
                     }
-                    Pressure::Low => info!("記憶體接近保留量（可用 {a} MB，保留 {res} MB）：背景工作延後、記憶體結構不再長大"),
+                    Pressure::Low => {
+                        if quiet(1, &mut quiet_until) {
+                            info!("記憶體接近保留量（可用 {a} MB，保留 {res} MB）：背景工作延後、記憶體結構不再長大")
+                        }
+                    }
                     Pressure::Critical => warn!("記憶體不足（可用 {a} MB，保留 {res} MB）：快照立刻寫出、暫不接受新的加密連線"),
                 }
                 last = p;
@@ -2016,6 +2038,7 @@ fn start_governor(
     sources: &[SnapSource],
     cdn: Option<&Arc<kuroshio_cdn::Cdn>>,
     filter: Option<&Arc<crate::filtering::FilterService>>,
+    restart: bool,
 ) -> Arc<crate::memgov::Governor> {
     use crate::memgov::{self, Governor, Step};
     let cache = memgov::CacheStep::new(resolver.clone());
@@ -2038,6 +2061,11 @@ fn start_governor(
         steps.push(Box::new(memgov::ProtectedStep { filter: f.clone() }));
     }
     let g = Arc::new(Governor::new(reserve.clone(), steps, crate::persist::now_secs()));
+    g.restart.store(restart, std::sync::atomic::Ordering::Relaxed);
+    {
+        let r = resolver.clone();
+        g.set_load_probe(move || r.stats.stale_15m().1);
+    }
     if let Some(f) = filter {
         // 清單載入前先看空間：可以長大的部分放不下的不載入
         let (w, gw, res) = (Arc::downgrade(f), Arc::downgrade(&g), reserve.clone());
@@ -2328,7 +2356,19 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         snap_sources.push(bytes_source(move || c.snapshots()));
     }
     spawn_persist_loop(persister.clone(), snap_sources.clone(), reserve.clone(), cdn.clone());
-    let memgov = governor_on.then(|| start_governor(reserve.clone(), &resolver, &persister, &snap_sources, cdn.as_ref(), filter.as_ref()));
+    // 3.5.1 N1：記憶體回不來時離峰原地重新啟動（只有 Linux：用 execve 保留同一個 PID）
+    let restart = cfg!(target_os = "linux") && get(cfg, "system.memoryRestart").and_then(Value::as_bool).unwrap_or(true);
+    let memgov = governor_on.then(|| {
+        start_governor(
+            reserve.clone(),
+            &resolver,
+            &persister,
+            &snap_sources,
+            cdn.as_ref(),
+            filter.as_ref(),
+            restart,
+        )
+    });
     // 測試開關（3.5.0 C9）：開著時明顯提醒；重新載入設定時關掉了就連進行中的模擬一起取消
     if crate::memgov::test_hooks(cfg) {
         warn!("設定開了 system.testHooks（只給測試用）：可以用 POST /api/memory/simulate 模擬記憶體不足；正式使用請關掉");

@@ -159,7 +159,11 @@ pub fn trim_heap() {
     }
 }
 
-/// 系統實體記憶體與可用記憶體（bytes）。Linux：/proc/meminfo；Windows：GlobalMemoryStatusEx
+/// 系統實體記憶體與可用記憶體（bytes）。Linux：/proc/meminfo；Windows：GlobalMemoryStatusEx。
+///
+/// Linux 上黑潮在有記憶體上限的 cgroup 裡（韌體用 cgroup 限制它、Docker 的 `--memory`）、而且上限比實體記憶體小時，
+/// 用 cgroup 的上限當「實體記憶體」、上限 − 已用（扣掉可以回收的檔案快取）當「可用」，取兩者較小的（3.5.1 N2）。
+/// 以前只看整台機器：韌體把上限設得比黑潮自己的判斷低時（D3 實測 150 MB），黑潮一直長到被核心砍，不會先讓出
 pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
     #[cfg(windows)]
     {
@@ -167,7 +171,7 @@ pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
     }
     #[cfg(not(windows))]
     {
-        match std::fs::read_to_string("/proc/meminfo") {
+        let (total, avail) = match std::fs::read_to_string("/proc/meminfo") {
             Ok(t) => {
                 let field = |name: &str| {
                     t.lines()
@@ -179,7 +183,97 @@ pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
                 (field("MemTotal:"), field("MemAvailable:"))
             }
             Err(_) => (None, None),
+        };
+        #[cfg(target_os = "linux")]
+        {
+            apply_cgroup(total, avail, cgroup::read())
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (total, avail)
+        }
+    }
+}
+
+/// 套用 cgroup 的上限（`cg` =（上限，已用）；沒有上限是 None）：上限比實體記憶體小時，實體記憶體 = 上限、
+/// 可用 = min(系統可用, 上限 − 已用)
+pub fn apply_cgroup(total: Option<u64>, avail: Option<u64>, cg: Option<(u64, u64)>) -> (Option<u64>, Option<u64>) {
+    let Some((limit, used)) = cg else {
+        return (total, avail);
+    };
+    if total.is_some_and(|t| limit >= t) {
+        return (total, avail);
+    }
+    let room = limit.saturating_sub(used);
+    (Some(limit), Some(avail.map_or(room, |a| a.min(room))))
+}
+
+/// 自己所在的記憶體 cgroup（v1 `memory` 控制器、v2 統一階層）的上限與已用（3.5.1 N2）
+#[cfg(target_os = "linux")]
+pub mod cgroup {
+    /// 上限比這個大當成「沒有上限」（v1 沒設時是 2^63 附近的值、v2 是 `max`）
+    const UNLIMITED: u64 = 1 << 60;
+
+    /// `/proc/self/cgroup` 的內容 → （v1 memory 的路徑，v2 的路徑）
+    pub fn paths(text: &str) -> (Option<String>, Option<String>) {
+        let mut v1 = None;
+        let mut v2 = None;
+        for l in text.lines() {
+            let mut it = l.splitn(3, ':');
+            let (Some(_), Some(ctrl), Some(path)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            if ctrl.is_empty() {
+                v2 = Some(path.to_string());
+            } else if ctrl.split(',').any(|c| c == "memory") {
+                v1 = Some(path.to_string());
+            }
+        }
+        (v1, v2)
+    }
+
+    /// `memory.stat` 裡某一欄的值
+    pub fn stat_field(stat: &str, key: &str) -> Option<u64> {
+        stat.lines().find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == key).then(|| v.trim().parse().ok()).flatten()
+        })
+    }
+
+    /// （上限，已用 − 可以回收的檔案快取）；沒有上限、讀不到時 None
+    pub fn from_files(limit: &str, usage: &str, stat: Option<&str>, inactive_key: &str) -> Option<(u64, u64)> {
+        let limit: u64 = limit.trim().parse().ok()?;
+        if limit >= UNLIMITED {
+            return None;
+        }
+        let usage: u64 = usage.trim().parse().ok()?;
+        let inactive = stat.and_then(|s| stat_field(s, inactive_key)).unwrap_or(0);
+        Some((limit, usage.saturating_sub(inactive)))
+    }
+
+    pub fn read() -> Option<(u64, u64)> {
+        let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let (v1, v2) = paths(&text);
+        let rd = |p: String| std::fs::read_to_string(p).ok();
+        if let Some(p) = v1 {
+            let base = format!("/sys/fs/cgroup/memory{}", p.trim_end_matches('/'));
+            if let (Some(l), Some(u)) = (
+                rd(format!("{base}/memory.limit_in_bytes")),
+                rd(format!("{base}/memory.usage_in_bytes")),
+            ) {
+                return from_files(&l, &u, rd(format!("{base}/memory.stat")).as_deref(), "total_inactive_file");
+            }
+        }
+        if let Some(p) = v2 {
+            let base = format!("/sys/fs/cgroup{}", p.trim_end_matches('/'));
+            let l = rd(format!("{base}/memory.max"))?;
+            if l.trim() == "max" {
+                return None;
+            }
+            let u = rd(format!("{base}/memory.current"))?;
+            return from_files(&l, &u, rd(format!("{base}/memory.stat")).as_deref(), "inactive_file");
+        }
+        None
     }
 }
 
@@ -346,6 +440,56 @@ impl Pressure {
             Pressure::Low => "low",
             Pressure::Critical => "critical",
         }
+    }
+}
+
+#[cfg(test)]
+mod cgroup_tests {
+    use super::*;
+
+    const MB: u64 = 1 << 20;
+
+    #[test]
+    fn cgroup_limit_replaces_total_when_smaller() {
+        // 3.5.1 N2：韌體把黑潮放進 150 MB 的 cgroup（D3 437 MB）：實體記憶體當 150 MB、可用 = 上限 − 已用
+        let (t, a) = apply_cgroup(Some(437 * MB), Some(300 * MB), Some((150 * MB, 120 * MB)));
+        assert_eq!((t, a), (Some(150 * MB), Some(30 * MB)));
+        // 系統可用比 cgroup 剩的還少：取小的
+        assert_eq!(
+            apply_cgroup(Some(437 * MB), Some(10 * MB), Some((150 * MB, 20 * MB))).1,
+            Some(10 * MB)
+        );
+        // 上限比實體記憶體大（80% 以上也一樣是上限，這裡 500 > 437）：照舊
+        assert_eq!(
+            apply_cgroup(Some(437 * MB), Some(300 * MB), Some((500 * MB, 100 * MB))),
+            (Some(437 * MB), Some(300 * MB))
+        );
+        assert_eq!(apply_cgroup(Some(437 * MB), Some(300 * MB), None), (Some(437 * MB), Some(300 * MB)));
+        // 用完了：可用 0
+        assert_eq!(apply_cgroup(Some(437 * MB), Some(300 * MB), Some((150 * MB, 160 * MB))).1, Some(0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_files_parse() {
+        use super::cgroup::*;
+        // padavan-tw（v1）：memory 控制器的那一行
+        let (v1, v2) = paths("4:memory:/kuroshio\n3:cpu,cpuacct:/\n");
+        assert_eq!((v1.as_deref(), v2), (Some("/kuroshio"), None));
+        let (v1, v2) = paths("0::/system.slice/kuroshio.service\n");
+        assert_eq!((v1, v2.as_deref()), (None, Some("/system.slice/kuroshio.service")));
+        // 可以回收的檔案快取不算已用（黑潮寫檔的頁快取也算在 cgroup 裡）
+        let stat = "cache 1000\ntotal_inactive_file 4194304\nrss 5\n";
+        assert_eq!(
+            from_files("157286400\n", "125829120\n", Some(stat), "total_inactive_file"),
+            Some((150 * MB, 116 * MB))
+        );
+        assert_eq!(
+            from_files("9223372036854771712", "1", None, "total_inactive_file"),
+            None,
+            "v1 沒設上限"
+        );
+        assert_eq!(stat_field("anon 1\ninactive_file 2048\n", "inactive_file"), Some(2048));
     }
 }
 

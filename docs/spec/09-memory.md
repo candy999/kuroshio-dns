@@ -361,3 +361,43 @@ D3 的自動保留量約 25.6 MB（`kuroshio sysinfo` 的 `reserve`）。「不�
 **小機器的行為不變**：路由器上的自動保留量是 16～26 MB（D3 約 25.6 MB），缺口最多就是保留量；黑潮自己的用量通常好幾十 MB，
 用量 × 2 一定 ≥ 缺口，所以不會成立（測試 `futile_never_on_small_routers` 從可用 0 到保留量逐一驗證 128 MB、512 MB 的數字）。
 只有使用者自己把保留量設得比「黑潮用量 × 2」還大時，小機器上才可能成立。
+
+## 13. 洪水過後記憶體回不來（3.5.1 N1、N2）
+
+**情境**：3.5.1 測試版 D3 壓測（約 92 萬個新網域）時，記憶體控制照順序讓出（診斷緩衝、快取、CDN 冷資料多次、過濾清單、只轉送），
+但 musl 內建的配置器放掉的小塊記憶體不還給系統：讓出合計約 37 MB，系統可用記憶體只回升 0～7 MB；RSS 長到 315 MB。
+壓測停了 15 分鐘，RSS 還停在 309 MB、可用 28 MB（保留量 36 MB），狀態一直是「不足」：過濾清單 7 份（26 萬條規則，只佔約 1.9 MB）
+一直停用、快取只剩 64 筆、CDN 調整暫停，直到重新啟動。同一份負載用 mimalloc 版只長到 120～133 MB（碎片少很多），
+但閒置時一樣不還給系統。配置器要不要換等 128 MB 的機器重測後再決定（3.5.2）；3.5.1 先給這個情況出口。
+
+**1. 只在「真的不足」時才做的步驟，觸發的條件不在了就先恢復**（`Governor::partial_restore`）：
+
+- 對象：`min_state` 是不足的步驟（停用過濾清單、只轉送、暫停保護清單），從最後讓出的開始、一次一步。
+- 條件：這一步的 `wanted()` 已經不成立（例如過濾清單是「可用 < 保留量的一半」），PSI 平靜，讓出之後過了 `dwell`（180 秒），
+  可用記憶體 − 保留量的一半 ≥ 這一步要的 × 1.3，不是於事無補，恢復的間隔照舊（`next_restore_at`，反覆時加倍）。
+- 不用等整體回到寬裕；吃緊就會做的步驟（診斷緩衝、快取、CDN 冷資料）照舊等寬裕。恢復之後 `wanted()` 還是不成立，所以不會馬上又讓出。
+
+**2. 離峰時原地重新啟動一次拿回記憶體**（`Governor::restart_due`、`memgov::reexec_self`；`system.memoryRestart`，預設開，只有 Linux）：
+
+| 條件 | 值 |
+|---|---|
+| 不寬裕持續 | 10 分鐘以上（`RESTART_STUCK_SECS`） |
+| 讓得出的都讓了 | 10 分鐘內沒有讓出 256 KB 以上（`USEFUL_SHED_BYTES`），現在也沒有能做的步驟 |
+| 是自己回不來 | 自己的 RSS ≥ 實體記憶體的 30%（`RESTART_OWN_PERCENT`），而且不是於事無補（第 12 節） |
+| 離峰 | 最近 15 分鐘平均每秒不到 10 筆查詢（`RESTART_LOW_QPS`；`Stats::stale_15m` 的查詢數） |
+| 頻率 | 離上一次 6 小時以上（`RESTART_MIN_GAP_SECS`；上一次的時間用環境變數 `KUROSHIO_MEMORY_RESTART_AT` 帶到新的行程） |
+
+- 成立時寫一行 WARN（可用、保留量、黑潮的用量），主程式的停止訊號收到 `StopReason::MemoryRestart`，**照正常停止寫完快照**，
+  然後用 `execve` 以同一個 PID 重新執行（參數、環境變數照舊；執行檔用 `current_exe()`，行程名稱照舊，韌體看門狗用 `pidof` 找得到、
+  procd／Docker 也不會當成結束）。所有 socket 都是 CLOEXEC，新的行程照常綁定。DNS 中斷約啟動時間（幾秒）。
+- 失敗（`execve` 回錯誤）時照一般停止結束，交給看門狗或服務管理重新啟動。
+- Windows 不做（沒有 `execve`；Windows 的情況由第 12 節的於事無補處理）。
+- 測試開關：`POST /api/memory/restart`（要 `system.testHooks`）直接走一次停止＋重新執行（整合測試 `memory_restart_reexecs_with_same_pid`）。
+
+**3. cgroup 的記憶體上限當成實體記憶體**（`sysinfo::mem_bytes`、`sysinfo::cgroup`；3.5.1 N2）：
+
+- Linux 上黑潮在有記憶體上限的 cgroup 裡（padavan-tw 3.5.1 起用 cgroup 限制它；Docker 的 `--memory`），而且上限比實體記憶體小時：
+  實體記憶體 = cgroup 上限，可用 = min(系統可用, 上限 − 已用)。已用扣掉可以回收的檔案快取（v1 `total_inactive_file`、v2 `inactive_file`），
+  不然黑潮自己寫檔的頁快取也算進去。v1 讀 `memory.limit_in_bytes`／`memory.usage_in_bytes`，v2 讀 `memory.max`／`memory.current`。
+- 保留量、DNS 快取上限（`resolver.cacheMax` 的 auto）、記憶體控制的狀態都跟著這兩個數字算。
+- 以前只看整台機器：D3 實測把 cgroup 上限暫時設成 150 MB 時，黑潮照 437 MB 判斷一直長，碰到上限被核心砍（韌體 2 秒內重新接管）。

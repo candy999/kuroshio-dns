@@ -157,6 +157,7 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
         | "/api/persist/flush"
         | "/api/memory/trim"
         | "/api/memory/simulate"
+        | "/api/memory/restart"
         | "/api/cdn/verify"
         | "/api/cdn/policy"
         | "/api/cdn/ecs"
@@ -175,6 +176,18 @@ pub fn is_action(path: &str, q: &HashMap<String, String>) -> bool {
 
 /// `POST /api/memory/simulate?availMB=N&minutes=M`（`M` 1～30，預設 5）／`?off=1`（3.5.0 C9）：
 /// 到期前記憶體控制讀到的系統可用記憶體 = min(真實值, N MB)。沒開 `system.testHooks` 時 403
+/// `POST /api/memory/restart`（3.5.1 N1，要 `system.testHooks`）：馬上走一次「寫出快照、用同一個 PID 原地重新執行」
+fn memory_restart(cfg: &Value) -> Response {
+    if !crate::memgov::test_hooks(cfg) {
+        return bad("測試開關沒有開：要在設定檔把 system.testHooks 設成 true（只給測試用）", 403);
+    }
+    if !cfg!(target_os = "linux") {
+        return bad("原地重新啟動只有 Linux 有", 400);
+    }
+    let first = crate::memgov::request_restart("測試模式：應要求原地重新啟動（POST /api/memory/restart；system.testHooks）");
+    ok(json!({ "ok": true, "requested": first }))
+}
+
 fn memory_simulate(cfg: &Value, q: &HashMap<String, String>, sim: &crate::memgov::SimState, now: u64) -> Response {
     if !crate::memgov::test_hooks(cfg) {
         return bad(
@@ -950,6 +963,8 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
         }
         // 測試開關（3.5.0 C9）：模擬記憶體不足。要設定 `system.testHooks: true` 才接受，最長 30 分鐘、到期自動恢復
         "/api/memory/simulate" => memory_simulate(&st.cfg, q, &crate::memgov::SIM, crate::memgov::steady_secs()),
+        // 3.5.1 N1：原地重新啟動的測試開關（記憶體控制判斷回不來時會自己做；這裡只給測試用）
+        "/api/memory/restart" => memory_restart(&st.cfg),
         // 立即儲存學習資料：有變動的快照全部寫進快照目錄（Windows 沒有 SIGUSR1，就靠這個或 `kuroshio notify save`）
         "/api/persist/flush" => {
             let s2 = st.clone();

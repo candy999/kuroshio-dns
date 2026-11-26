@@ -325,6 +325,8 @@ pub struct Cdn {
     bg_done: [AtomicU32; 4],
     /// 磁碟預算（3.5.0 C5）：因為預算淘汰的網域累計筆數、上次量到分片目錄實際佔多少（KB；`u32::MAX` = 還沒量）
     budget_pruned: AtomicU32,
+    /// 有淘汰的磁碟預算整理輪數（發現清單的次數用；3.5.1：以前用筆數，一下子就到 9999 的上限）
+    budget_rounds: AtomicU32,
     disk_kb: AtomicU32,
     /// 分片目錄裡檔案長度的合計（KB；3.5.0 F8 之前的 `dbDiskKB`）、整個 `cdn/` 目錄實際佔用（KB，只顯示）。`u32::MAX` = 還沒量
     file_kb: AtomicU32,
@@ -531,6 +533,7 @@ impl Cdn {
             admit_new: std::sync::atomic::AtomicBool::new(true),
             budget_cap: AtomicU32::new(0),
             budget_pruned: AtomicU32::new(0),
+            budget_rounds: AtomicU32::new(0),
             disk_kb: AtomicU32::new(u32::MAX),
             file_kb: AtomicU32::new(u32::MAX),
             cdn_dir_kb: AtomicU32::new(u32::MAX),
@@ -1133,6 +1136,7 @@ impl Cdn {
                 .load(Ordering::Relaxed)
                 .saturating_add(dropped.min(u32::MAX as usize) as u32);
             self.budget_pruned.store(total, Ordering::Relaxed);
+            self.budget_rounds.fetch_add(1, Ordering::Relaxed);
             if plan.forced > 0 || sweeping {
                 info!(
                     "CDN 網域資料磁碟預算：淘汰 {dropped} 筆（整理 {} 個分片，其中 {} 個是為了淘汰重寫的），剩 {left} 筆（預算約 {} 筆）",
@@ -1168,6 +1172,7 @@ impl Cdn {
         v["cdnDirKB"] = json!(opt(self.cdn_dir_kb.load(Ordering::Relaxed)));
         v["dbDiskEstKB"] = json!(db::budget_disk_estimate(total, shards).div_ceil(1024));
         v["prunedForBudget"] = json!(self.budget_pruned.load(Ordering::Relaxed));
+        v["prunedRounds"] = json!(self.budget_rounds.load(Ordering::Relaxed));
     }
 
     /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，

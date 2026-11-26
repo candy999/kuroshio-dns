@@ -467,6 +467,99 @@ fn run_signals_and_init_config() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 3.5.1 N1：記憶體回不來時的原地重新啟動：照正常停止寫完快照，用同一個 PID 重新執行（看門狗、procd 不會誤判），
+/// 新的行程帶著這次的時間（`KUROSHIO_MEMORY_RESTART_AT`，6 小時內不再做），DNS 幾秒內恢復
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_restart_reexecs_with_same_pid() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let dir = tmp("memrestart");
+    let (dns, admin) = (free_port(), free_port());
+    let conf = dir.join("config.json");
+    let mut cfg = user_cfg(&dir, dns, admin, false);
+    cfg["system"]["testHooks"] = json!(true);
+    write_cfg(&conf, &cfg);
+    let c = conf.to_string_lossy().to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kuroshio"))
+        .args(["run", "-c", &c])
+        .env("NO_COLOR", "1")
+        .env("KUROSHIO_LOG", "info")
+        .env_remove(kuroshio::memgov::RESTART_ENV)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let log = Arc::new(Mutex::new(String::new()));
+    for pipe in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            for l in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let mut g = log.lock().unwrap();
+                g.push_str(&l);
+                g.push('\n');
+            }
+        });
+    }
+    let healthy = || {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(30) {
+            if run(&["health", "-c", &c, "--timeout", "500"]).0 == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        panic!("服務沒有回答：\n{}", log.lock().unwrap());
+    };
+    healthy();
+    let pid = child.id();
+    let environ = || std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    let has_env = |e: &[u8]| {
+        e.split(|b| *b == 0)
+            .any(|kv| kv.starts_with(kuroshio::memgov::RESTART_ENV.as_bytes()))
+    };
+    assert!(!has_env(&environ()));
+    // 測試開關要求原地重新啟動（沒有登入：測試設定沒開 auth）
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", admin)).unwrap();
+    write!(
+        s,
+        "POST /api/memory/restart HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut resp = String::new();
+    let _ = s.read_to_string(&mut resp);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    let t0 = Instant::now();
+    while !has_env(&environ()) {
+        assert!(t0.elapsed() < Duration::from_secs(30), "等不到重新執行：\n{}", log.lock().unwrap());
+        assert!(child.try_wait().unwrap().is_none(), "不能結束：\n{}", log.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    healthy();
+    assert!(child.try_wait().unwrap().is_none(), "同一個 PID 繼續跑");
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+    assert_eq!(comm.trim(), "kuroshio", "行程名稱照舊（pidof 找得到）");
+    let l = log.lock().unwrap().clone();
+    assert!(l.contains("原地重新啟動"), "{l}");
+    assert!(l.contains("正常停止"), "照正常停止寫完快照：{l}");
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    let t0 = Instant::now();
+    let st = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "SIGTERM 後要結束");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(st.success(), "{st:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// UCI 模式（第三方韌體）：SIGHUP 時新設定讀不進來 → 照舊用上一份設定跑，`/api/status` 看得到原因；
 /// 設定目錄在快照目錄以外（Padavan 的 KUROSHIO_ETC）時，恢復預設自訂規則照樣觸發 KUROSHIO_ON_CONFIG_WRITE
 #[cfg(unix)]
