@@ -9,7 +9,16 @@
 #   B：品質都過、經營者看不出來，每個 ASN 最多 2 台（不對同一家打幾百台）。
 #   舊名單照同一個標準分級（品質不夠的淘汰）；不在 public-dns.info 的 43 台同一天補測 1 輪、照同一個標準分級，
 #   另外收經營者明確、官方寫明不過濾的 5 台（TWNIC、Cloudflare 1.0.0.1、DNS4EU 不過濾版）。
-# 共 839 筆：A 81、B 758（3.5.1 依一台正式環境 14 天的評測紀錄，4 台一直很穩、經營者明確的 B 升 A：AliDNS 2 台、NTT 2 台）
+# 2026-11-26 重新分級（3.5.1）：照上面的標準重看每一筆 B 級，經營者明確卻標成 B 的 59 台改成 A
+#   （包括依一台正式環境 14 天的評測紀錄先升的 AliDNS 2 台、NTT 2 台），例如 Comodo Secure DNS、114DNS、DNSPod、
+#   Hurricane Electric、CZ.NIC、DNS.SB、Bharat Public DNS、Level 3，以及 Swisscom、Deutsche Telekom、BT、Virgin Media、
+#   Cogent 這些電信商的官方 DNS；每一筆的註解寫「3.5.1 改 A：理由」。看不出經營者的、家用、主機商的照舊是 B；
+#   同一家已經到 A 級上限的（NextDNS、Cisco OpenDNS、Vercara 各 8 台）多出來的也照舊是 B。
+# 2026-11-26 補候選（3.5.1）：A 級經營者在 public-dns.info（同一天下載）裡、這份名單還沒有的位址補到上限為止，共 40 筆：
+#   reliability ≥ 0.95、7 天內檢查過、反解名稱在經營者自己的網域；不收對照組、黑名單、有過濾的名稱（例如 dns9.quad9.net、
+#   p1.freedns.controld.com、protected.canadianshield.cira.ca）與 DNS64。放在 A 級區塊最後、註解寫「3.5.1 補的候選」：
+#   還沒經過台灣線路直連三輪測試、沒有延遲資料，跟其他候選一樣走每日評測的所有檢查。
+# 共 879 筆：A 176（其中 3.5.1 補的候選 40）、B 703
 
 # ---- A 級 ----
 # A TWNIC（台灣網路資訊中心）TW 101.101.101.101（不在 public-dns.info；D3 直連評測倖存）
@@ -166,24 +175,217 @@
 156.154.71.46
 # A Vercara（AS12008）US 68.7 ms
 156.154.71.5
+# A NuCDN_LLC（AS23393）US ns2.recursive.dnsbycomodo.com 34.5 ms 3.5.1 改 A：Comodo Secure DNS
+8.20.247.20
+# A Alibaba_(US)_Technology_Co.（AS45102）CN public2.alidns.com 26.2 ms ECS
+223.6.6.6
+# A Alibaba_(US)_Technology_Co.（AS45102）CN public1.alidns.com 27.9 ms ECS
+223.5.5.5
+# A CONTROLD_INC.（AS398962）CA p5.freedns.controld.com 57.3 ms 3.5.1 改 A：ControlD 公共 DNS（s5 已是 A）
+2606:1a40::5
+# A Fortinet_Inc.（AS40934）CA fortinet-public-dns-52.fortinet.com 5.2 ms ECS 3.5.1 改 A：Fortinet（FortiGuard）公共 DNS
+208.91.112.52
+# A Zenlayer_Inc（AS21859）CN public2.114dns.com 53.8 ms 3.5.1 改 A：114DNS 公共 DNS
+114.114.115.115
+# A NTT_America（AS2914）US y.ns.gin.ntt.net 32.1 ms
+129.250.35.251
+# A NTT_America（AS2914）US x.ns.gin.ntt.net 32.9 ms
+129.250.35.250
+# A Level_3_Parent（AS3356）US d.resolvers.level3.net 132.2 ms 3.5.1 改 A：電信商官方 DNS：Level 3（Lumen）
+4.2.2.4
+# A Level_3_Parent（AS3356）US c.resolvers.level3.net 132.7 ms 3.5.1 改 A：電信商官方 DNS：Level 3（Lumen）
+4.2.2.3
+# A Hurricane_Electric_LLC（AS6939）US ordns.he.net 21.6 ms 3.5.1 改 A：Hurricane Electric 公共 DNS
+74.82.42.42
+# A SB_Professional_Services（AS24013）DE public-dns-b.dns.sb 33.5 ms 3.5.1 改 A：DNS.SB 公共 DNS
+45.11.45.11
+# A NuCDN_LLC（AS23393）US ns1.recursive.dnsbycomodo.com 33.6 ms 3.5.1 改 A：Comodo Secure DNS
+8.26.56.26
+# A Tencent_Building（AS132203）CN pdns.dnspod.cn 42.0 ms ECS 3.5.1 改 A：DNSPod（騰訊）公共 DNS
+119.29.29.29
+# A AT&T_Enterprises（AS7018）US rmtu.mt.rs.els-gms.att.net 141.1 ms 3.5.1 改 A：電信商官方 DNS：AT&T
+12.127.16.67
+# A HGC_Global_Communications_Limited（AS9304）HK ns250.on-nets.com 24.0 ms 3.5.1 改 A：電信商官方 DNS：HGC（和記環球電訊，香港）
+210.0.128.250
+# A SB_Professional_Services（AS24013）DE public-dns-a.dns.sb 44.0 ms 3.5.1 改 A：DNS.SB 公共 DNS
+185.222.222.222
+# A CenturyLink_Communications（AS209）US redirect.centurytel.net 156.4 ms 3.5.1 改 A：電信商官方 DNS：Lumen（CenturyLink）
+205.171.202.166
+# A IDDQD-AS（AS1273）GB cns2.cw.net 149.9 ms 3.5.1 改 A：電信商官方 DNS：Cable & Wireless（Vodafone）
+195.27.1.1
+# A HGC_Global_Communications_Limited（AS9304）HK ns251.on-nets.com 33.6 ms 3.5.1 改 A：電信商官方 DNS：HGC（和記環球電訊，香港）
+210.0.128.251
+# A CenturyLink_Communications（AS209）US redirect1.qwest.net 139.2 ms 補測 1 輪 3.5.1 改 A：電信商官方 DNS：Lumen（CenturyLink）
+205.171.3.25
+# A IDDQD-AS（AS1273）GB euro-cns1.cw.net 149.4 ms 3.5.1 改 A：電信商官方 DNS：Cable & Wireless（Vodafone）
+141.1.27.249
+# A Cogent_Communications（AS174）US na-res1.dns.cogentco.com 146.0 ms 3.5.1 改 A：電信商官方 DNS：Cogent
+2001:550:1:1::d
+# A Freie_Netze_Muenchen_e.V.（AS212567）DE anycast01.ffmuc.net 223.1 ms 3.5.1 改 A：FFMUC（Freifunk München）公共 DNS
+5.1.66.255
+# A Quad9（AS19281）US dns12.quad9.net 49.8 ms ECS 3.5.1 改 A：Quad9 dns12
+149.112.112.12
+# A Lightning_Wire_Labs_GmbH（AS204867）DE recursor01.haj.ipfire.org 246.7 ms 3.5.1 改 A：Lightning Wire Labs（IPFire）公共 DNS
+2001:678:b28::54
+# A kyberio_GmbH（AS24679）DE recursor01.dns.lightningwirelabs.com 253.1 ms 3.5.1 改 A：Lightning Wire Labs（IPFire）公共 DNS
+81.3.27.54
+# A Materialism_s.r.l.（AS39287）RO dns.njal.la 221.8 ms 3.5.1 改 A：Njalla 公共 DNS
+95.215.19.53
+# A Freie_Netze_Muenchen_e.V.（AS212567）DE anycast02.ffmuc.net 254.5 ms 3.5.1 改 A：FFMUC（Freifunk München）公共 DNS
+185.150.99.255
+# A BHARAT_PUBLIC_DNS_(1.10.10.10)（AS148000）IN dns.nic.in 95.3 ms 3.5.1 改 A：Bharat Public DNS（印度政府）
+1.10.10.10
+# A Hurricane_Electric_LLC（AS6939）US ordns.he.net 150.9 ms 3.5.1 改 A：Hurricane Electric 公共 DNS
+2001:470:20::2
+# A CZ.NIC（AS20701）CZ odvr.nic.cz 248.2 ms 3.5.1 改 A：CZ.NIC ODVR 公共 DNS
+2001:148f:fffe::1
+# A Virgin_Media（AS5089）GB buscache1.service.virginmedia.net 278.0 ms 3.5.1 改 A：電信商官方 DNS：Virgin Media（英國）
+194.168.4.123
+# A Deutsche_Telekom_AG（AS3320）DE d-nxr-a02.isp.t-ipnet.de 292.3 ms 3.5.1 改 A：電信商官方 DNS：Deutsche Telekom（德國）
+217.0.43.50
+# A Cogent_Communications（AS174）US na-res2.dns.cogentco.com 147.4 ms 3.5.1 改 A：電信商官方 DNS：Cogent
+2001:550:1:2::d
+# A Vietnam_Internet_network_information_cen（AS23902）VN nscache1.vnnic.net.vn 83.1 ms 3.5.1 改 A：VNNIC（越南網路資訊中心）
+203.119.8.106
+# A JSC_Ukrtelecom（AS6849）UA nss3.ukrtel.net 308.1 ms 3.5.1 改 A：電信商官方 DNS：Ukrtelecom（烏克蘭）
+213.179.228.4
+# A IDDQD-AS（AS12956）ES gnsalhta1-pub.net.telefonicaglobalsolutions.com 311.4 ms 3.5.1 改 A：電信商官方 DNS：Telefónica（西班牙）
+213.140.41.194
+# A BHARAT_PUBLIC_DNS_(1.10.10.10)（AS148000）IN dns.nic.in 140.9 ms 3.5.1 改 A：Bharat Public DNS（印度政府）
+2001:de2::1
+# A Vietnam_Internet_network_information_cen（AS23902）VN nscache1.vnnic.net.vn 215.9 ms 3.5.1 改 A：VNNIC（越南網路資訊中心）
+2001:dc8:0:2::106
+# A Bluewin（AS3303）CH v4cnswin2.cnsp.bluewin.ch 239.3 ms 3.5.1 改 A：電信商官方 DNS：Swisscom（瑞士）
+195.186.4.192
+# A Bluewin（AS3303）CH v4mobprx1.cnsp.swisscom.ch 239.4 ms 3.5.1 改 A：電信商官方 DNS：Swisscom（瑞士）
+193.135.142.198
+# A FlokiNET_ehf（AS200651）NL nl.resolv.flokinet.net 250.6 ms 3.5.1 改 A：FlokiNET 公共 DNS
+185.246.188.51
+# A Virgin_Media（AS5089）GB buscache2.service.virginmedia.net 286.8 ms 3.5.1 改 A：電信商官方 DNS：Virgin Media（英國）
+194.168.8.123
+# A Probe_Networks（AS29686）DE ns2.probe-networks.de 237.8 ms 3.5.1 改 A：Probe Networks 公共 DNS
+2001:1bc0::ffff:bbbb:2
+# A Probe_Networks（AS29686）DE bandit.probe-networks.de 257.1 ms 3.5.1 改 A：Probe Networks 公共 DNS
+82.96.64.2
+# A Delta_Telecom_Ltd（AS215148）AZ ns2.az-ix.net 313.4 ms 3.5.1 改 A：電信商官方 DNS：Delta Telecom（亞塞拜然）
+85.132.85.85
+# A FlokiNET_ehf（AS200651）RO ro.resolv.flokinet.net 247.2 ms 3.5.1 改 A：FlokiNET 公共 DNS
+185.247.225.17
+# A Association_Alsace_Reseau_Neutre（AS60630）FR recursif.arn-fai.net 252.9 ms 3.5.1 改 A：ARN（Alsace Réseau Neutre，非營利 ISP）公共 DNS
+89.234.141.66
+# A British_Telecommunications_Limited（AS5400）GB nsr2.bticglobal.net 275.1 ms 3.5.1 改 A：電信商官方 DNS：BT（英國）
+195.99.66.220
+# A Liquid_Telecommunications_Ltd（AS30844）GB africadns2.liquidtelecom.net 264.9 ms 3.5.1 改 A：電信商官方 DNS：Liquid Telecom
+5.11.11.11
+# A National_Infrastructures_for_Research_an（AS5408）GR pdns1.grnet.gr 299.1 ms 3.5.1 改 A：GRNET（希臘學術網路）公共 DNS
+194.177.210.210
+# A TREX_Regional_Exchanges_Oy（AS29432）FI resolver1.dns.trex.fi 308.2 ms 3.5.1 改 A：TREX（芬蘭網路交換中心）公共 DNS
+2001:67c:2b0::1
+# A CZ.NIC（AS20701）CZ odvr.nic.cz 249.1 ms 3.5.1 改 A：CZ.NIC ODVR 公共 DNS
+2001:148f:ffff::1
+# A CMPak_Limited（AS59257）PK pub-dns01.zongcloud.com.pk 309.9 ms ECS 3.5.1 改 A：電信商官方 DNS：Zong（巴基斯坦）
+209.150.154.1
+# A Delta_Telecom_Ltd（AS215148）AZ ns1.az-ix.net 313.1 ms 3.5.1 改 A：電信商官方 DNS：Delta Telecom（亞塞拜然）
+94.20.20.20
+# A PacketHub_S.A.（AS136787）SG 34.0 ms 3.5.1 改 A：NordVPN 官方公布的 DNS 位址
+103.86.99.100
+# A G-Core_Labs_S.A.（AS199524）LU 35.4 ms ECS 3.5.1 改 A：G-Core Public DNS
+95.85.95.85
+# A G-Core_Labs_S.A.（AS199524）RU 83.3 ms ECS 3.5.1 改 A：G-Core Public DNS
+2a03:90c0:999d::1
+
+# 以下 40 筆是 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）：
+#   經營者已經是 A 級、反解名稱在經營者自己的網域，reliability ≥ 0.95、2026-11-19 之後檢查過；沒有延遲資料
+# A Alibaba_(US)_Technology_Co.（AS45102）CN public1.alidns.com 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2400:3200::1
+# A BHARAT_PUBLIC_DNS_(1.10.10.10)（AS148000）IN dns.nic.in 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+36.50.50.50
+# A Bluewin（AS3303）CH dns1.bluewin.ch 電信商官方 DNS：Swisscom（瑞士） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+195.186.1.110
+# A Bluewin（AS3303）CH dns2.bluewin.ch 電信商官方 DNS：Swisscom（瑞士） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+195.186.1.111
+# A Bluewin（AS3303）CH dns3.bluewin.ch 電信商官方 DNS：Swisscom（瑞士） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+195.186.4.110
+# A Bluewin（AS3303）CH dns4.bluewin.ch 電信商官方 DNS：Swisscom（瑞士） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+195.186.4.111
+# A Bluewin（AS3303）CH cns7.bluewin.ch 電信商官方 DNS：Swisscom（瑞士） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+195.186.1.162
+# A Bluewin（AS3303）CH cns8.bluewin.ch 電信商官方 DNS：Swisscom（瑞士） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+195.186.4.162
+# A CONTROLD_INC.（AS398962）CA p0.freedns.controld.com 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+76.76.2.0
+# A CONTROLD_INC.（AS398962）CA s5.freedns.controld.com 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2606:1a40:1::5
+# A CZ.NIC（AS20701）CZ odvr.nic.cz 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+185.43.135.1
+# A CZ.NIC（AS20701）CZ odvr.nic.cz 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+193.17.47.1
+# A Cogent_Communications（AS174）US res2.dns.cogentco.com 電信商官方 DNS：Cogent 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+66.28.0.61
+# A Cogent_Communications（AS174）US eu-res1.dns.cogentco.com 電信商官方 DNS：Cogent 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2001:978:1:1::d
+# A Cogent_Communications（AS174）US eu-res2.dns.cogentco.com 電信商官方 DNS：Cogent 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2001:978:1:2::d
+# A Deutsche_Telekom_AG（AS3320）DE resolv-l.dtag.de 電信商官方 DNS：Deutsche Telekom（德國） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+194.25.0.52
+# A Deutsche_Telekom_AG（AS3320）DE resolv-h.dtag.de 電信商官方 DNS：Deutsche Telekom（德國） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+194.25.0.60
+# A Deutsche_Telekom_AG（AS3320）DE resolv-f.dtag.de 電信商官方 DNS：Deutsche Telekom（德國） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+194.25.0.68
+# A Deutsche_Telekom_AG（AS3320）DE resolvbpa-h.t-ipnet.de 電信商官方 DNS：Deutsche Telekom（德國） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+194.25.0.62
+# A Fortinet_Inc.（AS40934）US dns1.fortiguard.net 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+96.45.45.45
+# A Freie_Netze_Muenchen_e.V.（AS212567）DE anycast01.ffmuc.net 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2001:678:e68:f000::
+# A HGC_Global_Communications_Limited（AS9304）HK bbdns1.on-nets.com 電信商官方 DNS：HGC（和記環球電訊，香港） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+210.0.255.250
+# A HGC_Global_Communications_Limited（AS9304）HK bbdns2.on-nets.com 電信商官方 DNS：HGC（和記環球電訊，香港） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+210.0.255.251
+# A IDDQD-AS（AS1273）GB cns1.cw.net 電信商官方 DNS：Cable & Wireless（Vodafone） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+141.1.1.1
+# A Level_3_Parent（AS3356）US a.resolvers.level3.net 電信商官方 DNS：Level 3（Lumen） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+4.2.2.1
+# A Level_3_Parent（AS3356）US b.resolvers.level3.net 電信商官方 DNS：Level 3（Lumen） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+4.2.2.2
+# A Level_3_Parent（AS3356）US resolver1.level3.net 電信商官方 DNS：Level 3（Lumen） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+209.244.0.3
+# A Level_3_Parent（AS3356）US resolver2.level3.net 電信商官方 DNS：Level 3（Lumen） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+209.244.0.4
+# A Level_3_Parent（AS3356）US e.resolvers.level3.net 電信商官方 DNS：Level 3（Lumen） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+4.2.2.5
+# A Level_3_Parent（AS3356）US f.resolvers.level3.net 電信商官方 DNS：Level 3（Lumen） 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+4.2.2.6
+# A Liquid_Telecommunications_Ltd（AS30844）GB africadns1.liquidtelecom.net 電信商官方 DNS：Liquid Telecom 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+5.11.11.5
+# A NTT_America（AS2914）US x.ns.gin.ntt.net 電信商官方 DNS：NTT 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2001:418:3ff::53
+# A NTT_America（AS2914）US y.ns.gin.ntt.net 電信商官方 DNS：NTT 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2001:418:3ff::1:53
+# A Probe_Networks（AS29686）DE trance.probe-networks.de 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+82.96.65.2
+# A Probe_Networks（AS29686）DE trance.probe-networks.de 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2001:1bc0::ffff:aaaa:2
+# A Quad9（AS19281）US dns12.quad9.net 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+9.9.9.12
+# A SB_Professional_Services（AS24013）DE public-dns-a.dns.sb 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2a09::
+# A SB_Professional_Services（AS24013）AU public-dns-b.dns.sb 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2a11::
+# A TREX_Regional_Exchanges_Oy（AS29432）FI resolver2.dns.trex.fi 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+2001:67c:2b0::2
+# A Zenlayer_Inc（AS21859）CN public1.114dns.com 3.5.1 補的候選（public-dns.info，還沒經過台灣線路直連三輪測試）
+114.114.114.114
 
 # ---- B 級 ----
 # B Cloudie_Limited（AS133731）JP scdc.worra.com 24.0 ms
 103.51.144.216
-# B NuCDN_LLC（AS23393）US ns2.recursive.dnsbycomodo.com 34.5 ms
-8.20.247.20
 # B Akamai_Connected_Cloud（AS63949）SG li1637-181.members.linode.com 44.5 ms ECS
 172.104.57.181
 # B HKBN（AS17444）HK 059188010029.static.ctinets.com 30.0 ms ECS
 59.188.10.29
-# A Alibaba_(US)_Technology_Co.（AS45102）CN public2.alidns.com 26.2 ms ECS
-223.6.6.6
 # B Companhia_de_Telecomunicacoes_de_Macau_S（AS4609）MO n18293z25l100.static.ctmip.net 37.7 ms ECS
 182.93.25.100
-# A Alibaba_(US)_Technology_Co.（AS45102）CN public1.alidns.com 27.9 ms ECS
-223.5.5.5
-# B CONTROLD_INC.（AS398962）CA p5.freedns.controld.com 57.3 ms
-2606:1a40::5
 # B KDDI_CORPORATION（AS2516）JP zz20204023607195FE61.userreverse.dion.ne.jp 57.2 ms
 113.149.254.97
 # B HKBN（AS9269）HK 183178058215.ctinets.com 36.1 ms
@@ -200,10 +402,6 @@
 117.103.228.101
 # B HKBN（AS10103）HK 061244186189.ctinets.com 28.4 ms ECS
 61.244.186.189
-# B Fortinet_Inc.（AS40934）CA fortinet-public-dns-52.fortinet.com 5.2 ms ECS
-208.91.112.52
-# B Zenlayer_Inc（AS21859）CN public2.114dns.com 53.8 ms
-114.114.115.115
 # B DOUZONEBIZON（AS55615）KR ns.duzon.com 50.5 ms
 14.41.60.10
 # B SK_Co.（AS10049）KR osf2.skchemicals.com 63.5 ms
@@ -220,8 +418,6 @@
 99.83.147.72
 # B Taiwan_Fixed_Network（AS9924）TW dns.ssf-steel.com.tw 9.9 ms
 219.87.164.152
-# A NTT_America（AS2914）US y.ns.gin.ntt.net 32.1 ms
-129.250.35.251
 # B Amazon.com（AS16509）US a58798f21a0ff9d38.awsglobalaccelerator.com 22.0 ms
 75.2.53.153
 # B Korea_Telecom（AS4766）KR mail.hanjucorp.co.kr 31.8 ms ECS
@@ -232,8 +428,6 @@
 45.90.28.167
 # B Skylink_Fibernet_Private_Limited（AS135139）IN ns1.skylinkfibernet.com 105.9 ms
 103.99.150.10
-# A NTT_America（AS2914）US x.ns.gin.ntt.net 32.9 ms
-129.250.35.250
 # B HKBN（AS17444）HK 059188010022.static.ctinets.com 28.9 ms ECS
 59.188.10.22
 # B Sony_Network_Communications_Inc.（AS2527）JP ipa0566d21.ap.nuro.jp 54.8 ms
@@ -244,12 +438,6 @@
 150.242.17.4
 # B Companhia_de_Telecomunicacoes_de_Macau_S（AS4609）MO z66l122.static.ctm.net 32.0 ms
 202.175.66.122
-# B Level_3_Parent（AS3356）US d.resolvers.level3.net 132.2 ms
-4.2.2.4
-# B Level_3_Parent（AS3356）US c.resolvers.level3.net 132.7 ms
-4.2.2.3
-# B Hurricane_Electric_LLC（AS6939）US ordns.he.net 21.6 ms
-74.82.42.42
 # B VNPT_Corp（AS45899）VN static.vnpt.vn 118.8 ms ECS
 14.241.35.56
 # B Level_3_Parent（AS3549）US cache2.xspedius.net 138.1 ms
@@ -262,16 +450,12 @@
 64.212.106.85
 # B TDS_TELECOM（AS4181）US ns8.dns.tds.net 135.3 ms
 216.170.153.146
-# B SB_Professional_Services（AS24013）DE public-dns-b.dns.sb 33.5 ms
-45.11.45.11
 # B Cloudie_Limited（AS55933）HK sec2.alpinaasia.com 24.6 ms
 103.246.244.143
 # B Data_Communication_Business_Group（AS3462）TW mail.fonetai.com.tw 15.8 ms
 61.221.26.25
 # B Tata_Teleservices_(Maharashtra)_Ltd（AS134540）IN mail.tataidc.com 135.1 ms ECS
 182.156.152.68
-# B NuCDN_LLC（AS23393）US ns1.recursive.dnsbycomodo.com 33.6 ms
-8.26.56.26
 # B Vietnam_News_Agency（AS23999）VN ns1.vnanet.vn 56.4 ms ECS
 202.6.96.3
 # B Google_LLC（AS396982）US 140.84.94.34.bc.googleusercontent.com 136.0 ms
@@ -280,34 +464,24 @@
 202.43.108.1
 # B SK_Telecom（AS9644）KR infoblox.localdomain 65.7 ms
 203.236.1.12
-# B Tencent_Building（AS132203）CN pdns.dnspod.cn 42.0 ms ECS
-119.29.29.29
 # B Dien_May_Xanh_Investment_Joint_Stock_Com（AS131425）VN ns1.thegioididong.com 73.7 ms ECS
 103.48.78.156
 # B HKT_Limited（AS4760）HK mail.pokfulam.com.hk 27.0 ms
 94.190.213.131
 # B Exa_Bytes_Network_Sdn.Bhd.（AS46015）MY ns10.hostpro2u.com 58.4 ms
 117.53.152.76
-# B AT&T_Enterprises（AS7018）US rmtu.mt.rs.els-gms.att.net 141.1 ms
-12.127.16.67
 # B The_Constant_Company（AS20473）US host1.lconly.top 136.4 ms ECS
 66.42.98.203
-# B HGC_Global_Communications_Limited（AS9304）HK ns250.on-nets.com 24.0 ms
-210.0.128.250
 # B Sony_Network_Communications_Inc.（AS2527）JP fs5ccb7bed.kytj001.ap.nuro.jp 60.5 ms
 92.203.123.237
 # B NTT_DOCOMO_BUSINESS（AS4713）JP ns.ace-net.co.jp 41.5 ms
 218.44.234.170
-# B SB_Professional_Services（AS24013）DE public-dns-a.dns.sb 44.0 ms
-185.222.222.222
 # B HKBN（AS9381）HK ns2.diversity.hk 25.0 ms
 175.45.16.253
 # B Philippine_Long_Distance_Telephone_Compa（AS9299）PH host.4.static.com.ph 58.9 ms
 122.52.251.163
 # B SAKURA_Internet_Inc.（AS9370）JP openresolver.initiative.jp 37.5 ms
 160.16.111.164
-# B CenturyLink_Communications（AS209）US redirect.centurytel.net 156.4 ms
-205.171.202.166
 # B SingNet（AS3758）SG allied-tech.com.sg 52.6 ms 補測 1 輪
 203.127.232.194
 # B Dien_May_Xanh_Investment_Joint_Stock_Com（AS131425）VN ns.thegioididong.com 76.5 ms ECS
@@ -318,8 +492,6 @@
 24.182.14.205
 # B XMission（AS6315）US rns1.xmission.com 166.2 ms
 198.60.22.2
-# B IDDQD-AS（AS1273）GB cns2.cw.net 149.9 ms
-195.27.1.1
 # B Mobifone_Global_JSC（AS45896）VN ns2.mobifoneglobal.vn 81.5 ms
 45.125.211.11
 # B UNIVERSITY_OF_INCHEON（AS23570）KR ns1.incheon.ac.kr 57.9 ms
@@ -330,8 +502,6 @@
 208.67.222.222
 # B HKBN（AS9381）HK dns1.ibn-ipv6.info 28.5 ms
 202.130.97.65
-# B HGC_Global_Communications_Limited（AS9304）HK ns251.on-nets.com 33.6 ms
-210.0.128.251
 # B Cisco_OpenDNS（AS36692）US pdns.umbrella.com 144.1 ms ECS
 204.194.234.200
 # B ELIMNET（AS4663）KR star.elim.co.kr 67.0 ms
@@ -340,8 +510,6 @@
 202.152.80.38
 # B DACOM-PUBNETPLUS（AS9316）KR ping.check.pubnetplus.ne.kr 71.6 ms
 210.220.16.6
-# B CenturyLink_Communications（AS209）US redirect1.qwest.net 139.2 ms 補測 1 輪
-205.171.3.25
 # B SK_Telecom（AS9644）KR gate2.sktelecom.com 63.8 ms
 203.236.20.11
 # B SK_Co.（AS10049）KR ns.sk-net.com 68.2 ms
@@ -368,16 +536,12 @@
 201.140.114.161
 # B Cloudflare（AS13335）? ns2.xplornet.com 126.5 ms
 162.159.27.162
-# B IDDQD-AS（AS1273）GB euro-cns1.cw.net 149.4 ms
-141.1.27.249
 # B PT._Universal_Broadband（AS55670）ID host-31-83.universal.net.id 124.3 ms ECS
 103.12.31.83
 # B Com_Net（AS7106）US primary.dns.bright.net 202.5 ms
 209.143.0.10
 # B Charter_Communications（AS22516）US syn-144-129-045-042.biz.spectrum.com 194.0 ms ECS
 144.129.45.42
-# B Cogent_Communications（AS174）US na-res1.dns.cogentco.com 146.0 ms
-2001:550:1:1::d
 # B XMission（AS6315）US rns2.xmission.com 165.6 ms
 198.60.22.22
 # B SoftBank_Corp.（AS17676）JP softbank126249064222.biz.bbtec.net 59.0 ms ECS
@@ -396,12 +560,8 @@
 211.115.194.2
 # B Transwave_Communications_Systems（AS31864）US netmon.transwaveisp.com 193.9 ms
 67.222.123.6
-# B Freie_Netze_Muenchen_e.V.（AS212567）DE anycast01.ffmuc.net 223.1 ms
-5.1.66.255
 # B RCN（AS6079）US static.rcn.com 187.8 ms ECS
 216.80.113.2
-# B Quad9（AS19281）US dns12.quad9.net 49.8 ms ECS
-149.112.112.12
 # B Clodo_Cloud_Service_Co._L.L.C（AS216154）NL davidbudz228.fvds.ru 207.9 ms
 103.90.75.9
 # B Quad9（AS19281）US dns11.quad9.net 60.7 ms ECS
@@ -428,8 +588,6 @@
 169.55.102.246
 # B Charter_Communications（AS20115）US syn-071-086-003-190.biz.spectrum.com 228.1 ms ECS
 71.86.3.190
-# B Lightning_Wire_Labs_GmbH（AS204867）DE recursor01.haj.ipfire.org 246.7 ms
-2001:678:b28::54
 # B Sherwood_Broadband（AS393626）US faxback.com 176.1 ms
 70.97.122.111
 # B Neterra_Ltd.（AS34224）BG pns.neterra.net 218.2 ms
@@ -444,8 +602,6 @@
 216.120.247.231
 # B Strato_GmbH（AS6724）DE h2904531.stratoserver.net 254.2 ms
 85.215.89.8
-# B kyberio_GmbH（AS24679）DE recursor01.dns.lightningwirelabs.com 253.1 ms
-81.3.27.54
 # B NETPLANET_GmbH（AS24953）AT pns1.netplanet.at 209.0 ms
 89.185.121.250
 # B Limestone_Networks（AS46475）? cns1.lstn.net 34.9 ms
@@ -456,22 +612,12 @@
 96.10.126.38
 # B CenturyLink_Communications（AS3561）US rdns01.stng01.exodus.net 212.1 ms 補測 1 輪
 216.33.116.102
-# B Materialism_s.r.l.（AS39287）RO dns.njal.la 221.8 ms
-95.215.19.53
-# B Freie_Netze_Muenchen_e.V.（AS212567）DE anycast02.ffmuc.net 254.5 ms
-185.150.99.255
 # B IP-Projects_GmbH_&_Co._KG（AS48314）DE unassigned.hosterapi.de 266.7 ms
 37.114.62.26
 # B Strato_GmbH（AS6724）DE h2910571.stratoserver.net 254.5 ms
 85.214.252.174
-# B BHARAT_PUBLIC_DNS_(1.10.10.10)（AS148000）IN dns.nic.in 95.3 ms
-1.10.10.10
 # B Comcast_Cable_Communications（AS7922）US mail.mjspackaging.com 222.1 ms ECS
 50.237.34.1
-# B Hurricane_Electric_LLC（AS6939）US ordns.he.net 150.9 ms
-2001:470:20::2
-# B CZ.NIC（AS20701）CZ odvr.nic.cz 248.2 ms
-2001:148f:fffe::1
 # B National_Internet_Backbone（AS9829）IN ns3.mactech.net.in 148.4 ms
 117.239.157.244
 # B TOTAL_PLAY_TELECOMUNICACIONES（AS22884）MX fana.eicoba.com.mx 204.2 ms
@@ -504,8 +650,6 @@
 24.124.66.35
 # B novatel_Eood（AS41313）BG ns2.novatel.bg 272.2 ms
 95.158.129.2
-# B Virgin_Media（AS5089）GB buscache1.service.virginmedia.net 278.0 ms
-194.168.4.123
 # B Charter_Communications（AS33363）US syn-097-079-042-154.biz.spectrum.com 268.4 ms
 97.79.42.154
 # B LLC_Universalna_Merezheva_Kompaniya（AS34136）UA InstitutPidgotovkiKa-gw.lukyan65d67-1.kie.ua.wnet.kie.wnet.ua 277.9 ms
@@ -528,14 +672,8 @@
 190.11.225.2
 # B Wolfpaw_Data_Centres_Inc（AS30500）CA exchange.trailbuildingsupplies.com 190.9 ms ECS
 204.209.20.154
-# B Deutsche_Telekom_AG（AS3320）DE d-nxr-a02.isp.t-ipnet.de 292.3 ms
-217.0.43.50
-# B Cogent_Communications（AS174）US na-res2.dns.cogentco.com 147.4 ms
-2001:550:1:2::d
 # B Vectra_S.A.（AS29314）PL 095160116006.business.static.vectranet.pl 283.1 ms
 95.160.116.6
-# B Vietnam_Internet_network_information_cen（AS23902）VN nscache1.vnnic.net.vn 83.1 ms
-203.119.8.106
 # B New_Dream_Network（AS26347）US trackshort.link 232.9 ms ECS
 208.113.128.45
 # B OVH_SAS（AS16276）FR ns10.pasionporelruido.net 290.2 ms
@@ -554,8 +692,6 @@
 103.144.146.19
 # B A1_Bulgaria_EAD（AS13124）BG sns.linkbg.com 251.4 ms
 89.215.246.3
-# B JSC_Ukrtelecom（AS6849）UA nss3.ukrtel.net 308.1 ms
-213.179.228.4
 # B ZSCALER（AS22616）US resolver-a.zpath.net 145.6 ms
 8.34.34.34
 # B Virus_Net_LLC（AS207810）AM dns1.vtelecom.am 263.8 ms
@@ -566,8 +702,6 @@
 199.44.194.2
 # B C_Spire_Fiber（AS11272）US dns1.gtpdd.com 204.1 ms ECS
 66.175.146.133
-# B IDDQD-AS（AS12956）ES gnsalhta1-pub.net.telefonicaglobalsolutions.com 311.4 ms
-213.140.41.194
 # B mnemonic_AS（AS60848）NO host-63-9.mnemonic.no 289.4 ms
 94.127.63.9
 # B Yettel_d.o.o.（AS31042）RS mail.mind.rs 312.1 ms ECS
@@ -586,8 +720,6 @@
 97.68.236.229
 # B INEA_sp._z_o.o.（AS13110）PL c162-46.icpnet.pl 266.7 ms
 85.221.162.46
-# B BHARAT_PUBLIC_DNS_(1.10.10.10)（AS148000）IN dns.nic.in 140.9 ms
-2001:de2::1
 # B Liquid_Web（AS32244）US host.dentricity.com 202.1 ms
 67.225.250.66
 # B Telekom_Austria（AS8447）AT mail2.rivola-immobilien.at 227.7 ms
@@ -610,8 +742,6 @@
 134.195.4.2
 # B 1_Cloud_Lab_s.r.o.（AS15497）UA cc92605-07.cc.colocall.com 271.9 ms
 62.149.23.91
-# B Vietnam_Internet_network_information_cen（AS23902）VN nscache1.vnnic.net.vn 215.9 ms
-2001:dc8:0:2::106
 # B Xtra_Telecom_S.A.（AS15704）ES ns2.xtratelecom.es 286.7 ms
 212.230.255.1
 # B mnemonic_AS（AS48469）NO osl-clouddnsdist1.mnemonic.no 303.8 ms
@@ -626,12 +756,8 @@
 85.9.129.38
 # B WideOpenWest_Finance_LLC（AS12083）US dns1.wideopenwest.com 215.9 ms
 64.233.206.99
-# B Bluewin（AS3303）CH v4cnswin2.cnsp.bluewin.ch 239.3 ms
-195.186.4.192
 # B Domtel_Telecom_Dariusz_Dombek（AS44692）PL PC-150-6.wegrow.domtel.com.pl 247.6 ms
 78.31.150.6
-# B Bluewin（AS3303）CH v4mobprx1.cnsp.swisscom.ch 239.4 ms
-193.135.142.198
 # B Aptum_Technologies（AS13768）US computer.defino.com 236.6 ms ECS
 66.135.47.183
 # B QualityHosting_GmbH（AS25260）DE vs84011c.qualityserver.de 296.9 ms
@@ -674,18 +800,10 @@
 208.74.69.5
 # B AT&T_Enterprises（AS7018）US support.ekeepersystems.com 196.8 ms
 69.223.55.106
-# B FlokiNET_ehf（AS200651）NL nl.resolv.flokinet.net 250.6 ms
-185.246.188.51
-# B Virgin_Media（AS5089）GB buscache2.service.virginmedia.net 286.8 ms
-194.168.8.123
 # B WIDE_Project（AS2500）JP nons.wide.ad.jp 33.9 ms
 203.178.136.36
-# B Probe_Networks（AS29686）DE ns2.probe-networks.de 237.8 ms
-2001:1bc0::ffff:bbbb:2
 # B TV_AZTECA_SUCURSAL_COLOMBIA（AS262186）CO azteca-comunicaciones.com 282.1 ms
 177.93.44.53
-# B Probe_Networks（AS29686）DE bandit.probe-networks.de 257.1 ms
-82.96.64.2
 # B TOT_Public_Company_Limited（AS131293）TH ns1.prd.go.th 200.8 ms ECS
 118.175.16.66
 # B Aussie_Broadband（AS4764）AU smtp.swfc.com.au 257.5 ms ECS
@@ -706,12 +824,8 @@
 130.93.184.27
 # B CLICK_PACIFIC_LTD（AS136239）PG ns1.lspngdns.com 250.1 ms
 103.83.33.13
-# B Delta_Telecom_Ltd（AS215148）AZ ns2.az-ix.net 313.4 ms
-85.132.85.85
 # B INVEST_sLLC（AS34368）BG 207-230.thezone.bg 239.6 ms
 85.217.207.230
-# B FlokiNET_ehf（AS200651）RO ro.resolv.flokinet.net 247.2 ms
-185.247.225.17
 # B Charter_Communications（AS10796）US syn-071-067-154-107.biz.spectrum.com 244.3 ms ECS
 71.67.154.107
 # B ALPHA_TELECOMMUNICATION_MALI-ATEL-S.A（AS328253）ML segou_bkp.telecelmali.com 338.9 ms ECS
@@ -744,8 +858,6 @@
 198.82.247.34
 # B King_Abdul_Aziz_City_for_Science_and_Tec（AS8895）SA dns3.sfh.med.sa 361.4 ms ECS
 212.26.7.10
-# B Association_Alsace_Reseau_Neutre（AS60630）FR recursif.arn-fai.net 252.9 ms
-89.234.141.66
 # B Virginia_Polytechnic_Institute_and_State（AS1312）US jeru.cns.ipv6.vt.edu 203.8 ms
 2001:468:c80:4101:0:100:0:42
 # B Korbank_S._A.（AS35179）PL redmine.clearcode.cc 294.9 ms
@@ -766,8 +878,6 @@
 161.200.96.9
 # B NATIONAL_INFORMATION_RESOURCES_SERVICE（AS17841）KR ns2.gcc.go.kr 66.4 ms
 152.99.200.6
-# B British_Telecommunications_Limited（AS5400）GB nsr2.bticglobal.net 275.1 ms
-195.99.66.220
 # B Deutsche_Glasfaser_Wholesale_GmbH（AS60294）DE 140-078-198-082.ip-addr.inexio.net 282.4 ms
 82.198.78.140
 # B Orange_Polska_Spolka_Akcyjna（AS5617）PL alpnet.pl 314.6 ms
@@ -778,16 +888,10 @@
 185.244.217.202
 # B ALKOM_Security（AS196762）CZ alkom-126.profinet.cz 342.3 ms ECS
 91.223.74.126
-# B Liquid_Telecommunications_Ltd（AS30844）GB africadns2.liquidtelecom.net 264.9 ms
-5.11.11.11
 # B Infinity_Developments_Limited（AS12496）GB lexgreen.com 285.1 ms
 91.135.7.77
 # B Xtra_Telecom_S.A.（AS15704）ES ns1.xtratelecom.es 289.0 ms
 212.230.255.129
-# B National_Infrastructures_for_Research_an（AS5408）GR pdns1.grnet.gr 299.1 ms
-194.177.210.210
-# B TREX_Regional_Exchanges_Oy（AS29432）FI resolver1.dns.trex.fi 308.2 ms
-2001:67c:2b0::1
 # B NV_Telecom_LLC（AS205784）RU ws61.nv-tel.ru 313.2 ms ECS
 88.210.29.61
 # B Iran_Information_Technology_Company_PJSC（AS12880）IR recursive2.dci.ir 375.6 ms
@@ -798,8 +902,6 @@
 61.19.251.237
 # B Comcast_Cable_Communications（AS7922）US proxy.chicopmr.org 248.8 ms
 50.79.154.34
-# B CZ.NIC（AS20701）CZ odvr.nic.cz 249.1 ms
-2001:148f:ffff::1
 # B Amnet_Telecomunicaciones_S.A.（AS27742）NI static.navega.com.ni 353.2 ms ECS
 190.124.39.34
 # B Telenet_BV（AS6848）BE mail.micos.be 299.0 ms
@@ -856,8 +958,6 @@
 41.217.204.165
 # B Jordanian_Universities_Network_L.L.C.（AS35656）JO dns2.bau.edu.jo 357.7 ms ECS
 87.236.233.117
-# B CMPak_Limited（AS59257）PK pub-dns01.zongcloud.com.pk 309.9 ms ECS
-209.150.154.1
 # B Teknet_Yazilim_Ve_Bilgisayar_Teknolojile（AS7768）TR resolve01.tek.net.tr 329.0 ms
 31.7.36.36
 # B SIA_RixHost（AS52048）LV ip-220-64.dataclub.info 405.1 ms ECS
@@ -870,8 +970,6 @@
 190.15.193.168
 # B Jordanian_Universities_Network_L.L.C.（AS35656）JO gateway2.ahu.edu.jo 341.2 ms ECS
 87.236.233.70
-# B Delta_Telecom_Ltd（AS215148）AZ ns1.az-ix.net 313.1 ms
-94.20.20.20
 # B Unit_802_Orient_Square_Building（AS23665）PH dns2.77globalservices.com 72.2 ms
 203.158.9.5
 # B Globe_Telecoms（AS4775）PH hari-realm.hyundai-asia.com 78.8 ms
@@ -1004,10 +1102,6 @@
 199.127.219.254
 # B Vercara（AS12008）US 71.0 ms
 156.154.71.22
-# B PacketHub_S.A.（AS136787）SG 34.0 ms
-103.86.99.100
-# B G-Core_Labs_S.A.（AS199524）LU 35.4 ms ECS
-95.85.95.85
 # B DACOM-PUBNETPLUS（AS9316）KR 79.4 ms
 61.108.103.134
 # B Adsota_Corporation（AS135942）VN 84.7 ms
@@ -1032,8 +1126,6 @@
 211.63.64.11
 # B CS_LOXINFO_PUBLIC_COMPANY_LIMITED（AS4750）TH 83.2 ms
 210.1.43.99
-# B G-Core_Labs_S.A.（AS199524）RU 83.3 ms ECS
-2a03:90c0:999d::1
 # B Gyeong_Sang_Buk-Do_Office_of_Education（AS9871）KR 83.4 ms
 203.190.27.234
 # B UNINET-TH（AS4621）TH 200.1 ms

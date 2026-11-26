@@ -5,7 +5,9 @@
 #   tier=A：經營者明確（知名的公共 DNS、國家級電信商自己的伺服器，carrier=1）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
 #   連不上的、有改寫的不在這裡；有過濾的大型 DNS 是對照組，另外列在 protected.txt（照常評測、永遠不選）。
 #   op＝經營者：AS 名稱（租機房的經營者會是機房的名字）；3.5.1 起同一個服務放在好幾家機房的（同一個網域，例如 NextDNS、dnscry.pt、DNS.SB）用服務的名稱，選上游與候補時同一個經營者各最多 1 台；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
-# 共 190 筆：A 114、B 76
+#   3.5.1 重新分級（2026-11-26）：經營者明確卻標成 B 的 6 筆改成 A：Bharat Public DNS（dns.nic.in）、IN-Berlin 2、
+#   FlokiNET、Privex 2。個人、小型主機、看不出經營者的照舊是 B。
+# 共 190 筆：A 120、B 70
 
 # ---- A 級 ----
 tls://dns.nextdns.io  # tier=A op=NextDNS ms=3.2 src=kuroshio-default checked=2026-11-22
@@ -38,6 +40,7 @@ tls://jkt01.dnscry.pt  # tier=A op=dnscry.pt ms=78.7 src=kuroshio-default checke
 tls://doh.mullvad.net  # tier=A op=LOCIX_LIMITED ms=84.0 src=hagezi checked=2026-11-22
 tls://dns.mullvad.net  # tier=A op=LOCIX_LIMITED ms=84.1 src=hagezi checked=2026-11-22
 tls://dns1.nordvpn.com  # tier=A op=PacketHub_S.A. ms=88.1 src=hagezi checked=2026-11-22
+tls://dns.nic.in  # tier=A op=BHARAT_PUBLIC_DNS_(1.10.10.10) ms=102.2 src=hagezi checked=2026-11-22
 tls://sin03.dnscry.pt  # tier=A op=dnscry.pt ms=104.6 src=kuroshio-default checked=2026-11-22
 tls://blr01.dnscry.pt  # tier=A op=dnscry.pt ms=108.0 src=kuroshio-default checked=2026-11-22
 tls://bom02.dnscry.pt  # tier=A op=dnscry.pt ms=112.7 src=kuroshio-default checked=2026-11-22
@@ -83,10 +86,14 @@ tls://ns0.fdn.fr  # tier=A op=Association__Gitoyen_ ms=232.0 src=hagezi checked=
 tls://moe01.dnscry.pt  # tier=A op=dnscry.pt ms=240.7 src=hagezi checked=2026-11-22
 tls://bne01.dnscry.pt  # tier=A op=dnscry.pt ms=241.3 src=kuroshio-default checked=2026-11-22
 tls://dus03.dnscry.pt  # tier=A op=dnscry.pt ms=241.4 src=hagezi checked=2026-11-22
+tls://resolv.flokinet.net  # tier=A op=FlokiNET_ehf ms=242.6 src=hagezi checked=2026-11-22
 tls://zrh01.dnscry.pt  # tier=A op=dnscry.pt ms=245.3 src=hagezi checked=2026-11-22
 tls://dot.libredns.gr  # tier=A op=Hetzner_Online_GmbH ms=246.8 src=kuroshio-default checked=2026-11-22
 tls://dus02.dnscry.pt  # tier=A op=dnscry.pt ms=248.5 src=hagezi checked=2026-11-22
+tls://dns1.in-berlin.de  # tier=A op=Individual_Network_Berlin_(_IN-Berlin_)_ ms=252.4 ecs=1 src=hagezi checked=2026-11-22
+tls://de.dns.privex.io  # tier=A op=Privex ms=255.4 ecs=1 src=hagezi checked=2026-11-22
 tls://dns.switch.ch  # tier=A op=SWITCH ms=256.2 src=hagezi checked=2026-11-22
+tls://dns2.in-berlin.de  # tier=A op=Individual_Network_Berlin_(_IN-Berlin_)_ ms=257.0 src=hagezi checked=2026-11-22
 tls://dns-cache.switch.ch  # tier=A op=SWITCH ms=257.1 src=hagezi checked=2026-11-22
 tls://dot.ffmuc.net  # tier=A op=Freie_Netze_Muenchen_e.V. ms=260.0 src=kuroshio-default checked=2026-11-22
 tls://dns.aa.net.uk  # tier=A op=Andrews_&_Arnold_Ltd ms=260.1 src=hagezi checked=2026-11-22
@@ -99,6 +106,7 @@ tls://per01.dnscry.pt  # tier=A op=dnscry.pt ms=279.9 src=kuroshio-default check
 tls://fra01.dnscry.pt  # tier=A op=dnscry.pt ms=281.5 src=hagezi checked=2026-11-22
 tls://bre01.dnscry.pt  # tier=A op=dnscry.pt ms=281.9 src=hagezi checked=2026-11-22
 tls://mrs01.dnscry.pt  # tier=A op=dnscry.pt ms=285.4 src=hagezi checked=2026-11-22
+tls://nl.dns.privex.io  # tier=A op=Privex ms=289.8 ecs=1 src=hagezi checked=2026-11-22
 tls://unicast2.servers.censurfridns.dk  # tier=A op=UncensoredDNS ms=292.3 src=hagezi checked=2026-11-22
 tls://doh.appliedprivacy.net  # tier=A op=Nessus_GmbH ms=295.0 src=hagezi checked=2026-11-22
 tls://iev02.dnscry.pt  # tier=A op=dnscry.pt ms=295.3 src=hagezi checked=2026-11-22
@@ -132,7 +140,6 @@ tls://admin-dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=73.0 src=hagezi c
 tls://dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=73.2 src=hagezi checked=2026-11-22
 tls://dns-idx2.itsec.my.id  # tier=B op=itsec.my.id ms=77.7 src=hagezi checked=2026-11-22
 tls://dns-telkominfra.disacloud.com  # tier=B op=PT_Deneva ms=81.0 src=hagezi checked=2026-11-22
-tls://dns.nic.in  # tier=B op=BHARAT_PUBLIC_DNS_(1.10.10.10) ms=102.2 src=hagezi checked=2026-11-22
 tls://dns.zzuhacker.cn  # tier=B op=Shenzhen_Tencent_Computer_Systems_Compan ms=119.4 src=hagezi checked=2026-11-22
 tls://dns.scott-smith.us  # tier=B op=Akamai_Connected_Cloud ms=133.3 src=hagezi checked=2026-11-22
 tls://dns.efficientdocuments.com  # tier=B op=Akamai_Connected_Cloud ms=133.7 src=hagezi checked=2026-11-22
@@ -163,16 +170,12 @@ tls://getdnsapi.net  # tier=B op=Infracom_Holding_B.V. ms=239.3 src=hagezi check
 tls://ns2.opennameserver.org  # tier=B op=OpenNameServer ms=239.6 src=hagezi checked=2026-11-22
 tls://dns1.slowb.ro  # tier=B op=slowb.ro ms=241.2 src=hagezi checked=2026-11-22
 tls://dns.keweon.center  # tier=B op=Leaseweb_Deutschland_GmbH ms=242.2 src=hagezi checked=2026-11-22
-tls://resolv.flokinet.net  # tier=B op=FlokiNET_ehf ms=242.6 src=hagezi checked=2026-11-22
 tls://doh.defaultroutes.de  # tier=B op=active_1_GmbH ms=244.3 src=hagezi checked=2026-11-22
 tls://agh.mihanentalpo.me  # tier=B op=JSC_Selectel ms=245.0 src=hagezi checked=2026-11-22
 tls://ams.core.access.zznet.fun  # tier=B op=The_Infrastructure_Group_B.V. ms=245.2 ecs=1 src=hagezi checked=2026-11-22
 tls://carolinareaper.heeremans.net  # tier=B op=Enreach_Netherlands_B.V. ms=245.3 src=hagezi checked=2026-11-22
 tls://dns.shareworx.net  # tier=B op=Hetzner_Online_GmbH ms=246.1 src=hagezi checked=2026-11-22
-tls://dns1.in-berlin.de  # tier=B op=Individual_Network_Berlin_(_IN-Berlin_)_ ms=252.4 ecs=1 src=hagezi checked=2026-11-22
 tls://rfree2.blue-shield.at  # tier=B op=LINZ_STROM_GAS_WAERME_GmbH_fuer_Energied ms=255.1 ecs=1 src=hagezi checked=2026-11-22
-tls://de.dns.privex.io  # tier=B op=Privex ms=255.4 ecs=1 src=hagezi checked=2026-11-22
-tls://dns2.in-berlin.de  # tier=B op=Individual_Network_Berlin_(_IN-Berlin_)_ ms=257.0 src=hagezi checked=2026-11-22
 tls://rfree1.blue-shield.at  # tier=B op=LINZ_STROM_GAS_WAERME_GmbH_fuer_Energied ms=259.3 ecs=1 src=hagezi checked=2026-11-22
 tls://dns.envs.net  # tier=B op=Hetzner_Online_GmbH ms=263.8 ecs=1 src=hagezi checked=2026-11-22
 tls://dns.as212683.net  # tier=B op=Olilo_UK_&_Ireland_Ltd. ms=264.0 src=hagezi checked=2026-11-22
@@ -185,7 +188,6 @@ tls://dnscache0.ns71.net  # tier=B op=IONOS_SE ms=286.4 src=hagezi checked=2026-
 tls://dns.t53.de  # tier=B op=Deutsche_Telekom_AG ms=286.7 src=hagezi checked=2026-11-22
 tls://dns-uk.puregeni.us  # tier=B op=OVH_SAS ms=286.9 src=hagezi checked=2026-11-22
 tls://korridor.semia-infra.net  # tier=B op=Hohl_IT_e.U. ms=289.0 src=hagezi checked=2026-11-22
-tls://nl.dns.privex.io  # tier=B op=Privex ms=289.8 ecs=1 src=hagezi checked=2026-11-22
 tls://dns.dremaxx.de  # tier=B op=iFog_GmbH ms=291.3 src=hagezi checked=2026-11-22
 tls://open.dns.dremaxx.com  # tier=B op=iFog_GmbH ms=292.9 src=kuroshio-default checked=2026-11-22
 tls://ledns.eu  # tier=B op=OVH_SAS ms=293.8 src=hagezi checked=2026-11-22
