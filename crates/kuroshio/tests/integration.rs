@@ -460,7 +460,11 @@ fn run_signals_and_init_config() {
         if r.0 == 0 {
             break;
         }
-        assert!(t0.elapsed() < Duration::from_secs(30), "重新載入後管理 API 一直沒回來：{r:?}\n{}", log.lock().unwrap());
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "重新載入後管理 API 一直沒回來：{r:?}\n{}",
+            log.lock().unwrap()
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     kill(libc::SIGTERM);
