@@ -1100,7 +1100,14 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
         "/api/cdn/status" => ok(c.status()),
         "/api/cdn/pools" => ok(c.pools_status()),
         "/api/cdn/v6nodes" => ok(c.v6_nodes()),
-        "/api/cdn/summary" => ok(c.summary()),
+        // 3.5.1：分批走過全部網域、批與批之間會停一下：放在 blocking 執行緒上
+        "/api/cdn/summary" => {
+            let c = c.clone();
+            match tokio::task::spawn_blocking(move || c.summary()).await {
+                Ok(v) => ok(v),
+                Err(e) => bad(&format!("統計中途結束：{e}"), 500),
+            }
+        }
         "/api/cdn/cross" => ok(c.cross_summary()),
         "/api/cdn/domains" => {
             let query = kuroshio_cdn::db::Query {
@@ -1112,15 +1119,19 @@ async fn cdn_route(c: &Arc<kuroshio_cdn::Cdn>, path: &str, q: &HashMap<String, S
                 offset: q.get("offset").and_then(|o| o.parse().ok()).unwrap_or(0),
                 cross: q.get("cross").map(String::as_str) == Some("1"),
             };
-            if q.get("format").map(String::as_str) == Some("csv") {
-                let file = safe_filename(&format!("cdn-domains-{}.csv", query.provider.as_deref().unwrap_or("all")));
-                return Response {
+            // 3.5.1：分批拿鎖（整份匯出 7 萬筆時以前一次拿著鎖做完）；會停頓，放在 blocking 執行緒上
+            let (c2, csv) = (c.clone(), q.get("format").map(String::as_str) == Some("csv"));
+            let file = safe_filename(&format!("cdn-domains-{}.csv", query.provider.as_deref().unwrap_or("all")));
+            let r = tokio::task::spawn_blocking(move || if csv { Err(c2.query_csv(&query)) } else { Ok(c2.query(&query)) }).await;
+            match r {
+                Ok(Ok(v)) => ok(v),
+                Ok(Err(text)) => Response {
                     code: 200,
                     body: Value::Null,
-                    raw: Some(("text/csv; charset=utf-8", file, c.query_csv(&query))),
-                };
+                    raw: Some(("text/csv; charset=utf-8", file, text)),
+                },
+                Err(e) => bad(&format!("查詢中途結束：{e}"), 500),
             }
-            ok(c.query(&query))
         }
         "/api/cdn/domain" => match name.and_then(|n| c.domain(&n)) {
             Some(v) => ok(v),

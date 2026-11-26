@@ -782,6 +782,115 @@ pub struct Query {
     pub cross: bool,
 }
 
+impl Query {
+    /// 符合條件的網域的排序鍵（不符合是 None）：（依哪個欄位遞減，名稱）
+    pub fn key(&self, e: &Domain) -> Option<(u64, Arc<str>)> {
+        let q = self;
+        let ok = q.provider.as_deref().map(|p| e.provider() == Some(p)).unwrap_or(true)
+            && q.verdict
+                .as_deref()
+                .map(|v| e.v4.as_ref().map(|x| x.is(v)).unwrap_or(false) || e.v6.as_ref().map(|x| x.is(v)).unwrap_or(false))
+                .unwrap_or(true)
+            && q.search.as_deref().map(|t| e.name.contains(t)).unwrap_or(true)
+            && (!q.cross || e.cross4.as_ref().is_some_and(|c| c.verdict.as_deref().is_some_and(|v| v != "none")));
+        if !ok {
+            return None;
+        }
+        let k = match q.sort.as_deref().unwrap_or("hits") {
+            "lastSeen" => e.last_seen,
+            "firstSeen" => e.first_seen,
+            _ => e.hits as u64,
+        };
+        Some((k, e.name.clone()))
+    }
+
+    /// 排序（欄位遞減、同值依名稱）、跳過 `offset`、留 `limit`（預設 1,000）
+    pub fn order(keys: &mut Vec<(u64, Arc<str>)>, q: &Query) {
+        keys.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        keys.drain(..q.offset.min(keys.len()));
+        keys.truncate(q.limit.unwrap_or(1000));
+    }
+}
+
+/// 各家 CDN 統計摘要的累計（[`Db::summary`]）：一筆一筆加、順序不影響結果，分批走過全部網域時也能用（3.5.1）。
+/// 以前先依（第一次出現，名稱）排序整份再累計：業者、POP 的順序是「依這個順序第一次出現」，
+/// 這裡記每個業者、每個 POP 最早的（第一次出現，名稱），最後依它排，結果一樣
+#[derive(Default)]
+pub struct SummaryAcc {
+    by: HashMap<String, SummarySlot>,
+}
+
+/// （第一次出現，名稱）：摘要裡業者、POP 的順序
+type FirstKey = (u64, Arc<str>);
+
+#[derive(Default)]
+struct SummarySlot {
+    first: Option<FirstKey>,
+    s: Summary,
+    pops: HashMap<String, (FirstKey, u32)>,
+}
+
+impl SummaryAcc {
+    pub fn add(&mut self, e: &Domain) {
+        let key = (e.first_seen, e.name.clone());
+        let p = e.provider().unwrap_or("unknown");
+        if !self.by.contains_key(p) {
+            self.by.insert(p.to_string(), SummarySlot::default());
+        }
+        let slot = self.by.get_mut(p).unwrap();
+        if slot.first.as_ref().is_none_or(|f| key < *f) {
+            slot.first = Some(key.clone());
+        }
+        let s = &mut slot.s;
+        s.domains += 1;
+        s.hits += e.hits as u64;
+        if let Some(pop) = e.base.as_ref().and_then(|b| b.pop.as_deref()).filter(|p| !p.is_empty()) {
+            let x = slot.pops.entry(pop.to_string()).or_insert_with(|| (key.clone(), 0));
+            x.1 += 1;
+            if key < x.0 {
+                x.0 = key;
+            }
+            // 2.x 這裡用大小寫有別的比對
+            if ["TPE", "KHH", "TSA", "RMQ", "TXG", "TNN"].iter().any(|t| pop.starts_with(t)) {
+                s.base_pop_tw += 1;
+            } else {
+                s.base_pop_abroad += 1;
+            }
+        }
+        if let Some(v) = &e.v4 {
+            s.v4ok += v.is("ok") as u32;
+            s.v4fail += v.is("fail") as u32;
+        }
+        if let Some(v) = &e.v6 {
+            s.v6ok += v.is("ok") as u32;
+            s.v6fail += v.is("fail") as u32;
+        }
+        if e.ecs.as_ref().map(|x| x.is("ok")).unwrap_or(false) {
+            s.ecs_gain += 1;
+        }
+    }
+
+    pub fn finish(self) -> Vec<Summary> {
+        let mut slots: Vec<(String, SummarySlot)> = self.by.into_iter().collect();
+        slots.sort_by(|a, b| a.1.first.cmp(&b.1.first));
+        let mut v: Vec<Summary> = slots
+            .into_iter()
+            .map(|(p, slot)| {
+                let mut pops: Vec<(String, (FirstKey, u32))> = slot.pops.into_iter().collect();
+                pops.sort_by(|a, b| (a.1).0.cmp(&(b.1).0));
+                Summary {
+                    provider: p,
+                    pops: pops.into_iter().map(|(k, (_, n))| (k, n)).collect(),
+                    ..slot.s
+                }
+            })
+            .collect();
+        // 穩定排序：同樣的查詢次數照第一次出現的順序（同以前）
+        v.sort_by_key(|s| std::cmp::Reverse(s.hits));
+        v
+    }
+}
+
 /// 分段寫快照時要寫的網域：（查詢次數，名稱）
 pub type DumpKeys = Vec<(u32, Arc<str>)>;
 
@@ -2705,73 +2814,27 @@ impl Db {
 
     /// 分析摘要：各 CDN 有多少網域、多少原本繞國外、置換成功率
     pub fn summary(&self) -> Vec<Summary> {
-        let mut out: IndexMap<String, Summary> = IndexMap::new();
-        let mut names: Vec<&Domain> = self.domains.values().collect();
-        names.sort_by(|a, b| a.first_seen.cmp(&b.first_seen).then_with(|| a.name.cmp(&b.name)));
-        for e in names {
-            let p = e.provider().unwrap_or("unknown").to_string();
-            let s = out.entry(p.clone()).or_insert_with(|| Summary {
-                provider: p,
-                ..Default::default()
-            });
-            s.domains += 1;
-            s.hits += e.hits as u64;
-            if let Some(pop) = e.base.as_ref().and_then(|b| b.pop.as_deref()).filter(|p| !p.is_empty()) {
-                *s.pops.entry(pop.to_string()).or_default() += 1;
-                // 2.x 這裡用大小寫有別的比對
-                if ["TPE", "KHH", "TSA", "RMQ", "TXG", "TNN"].iter().any(|t| pop.starts_with(t)) {
-                    s.base_pop_tw += 1;
-                } else {
-                    s.base_pop_abroad += 1;
-                }
-            }
-            if let Some(v) = &e.v4 {
-                s.v4ok += v.is("ok") as u32;
-                s.v4fail += v.is("fail") as u32;
-            }
-            if let Some(v) = &e.v6 {
-                s.v6ok += v.is("ok") as u32;
-                s.v6fail += v.is("fail") as u32;
-            }
-            if e.ecs.as_ref().map(|x| x.is("ok")).unwrap_or(false) {
-                s.ecs_gain += 1;
-            }
-        }
-        let mut v: Vec<Summary> = out.into_values().collect();
-        v.sort_by_key(|s| std::cmp::Reverse(s.hits));
-        v
+        let mut acc = SummaryAcc::default();
+        self.domains.values().for_each(|e| acc.add(e));
+        acc.finish()
     }
 
     /// 查詢（管理介面 `/api/cdn/domains`）
     pub fn query(&self, q: &Query) -> Vec<&Domain> {
-        let mut arr: Vec<&Domain> = self
-            .domains
-            .values()
-            .filter(|e| q.provider.as_deref().map(|p| e.provider() == Some(p)).unwrap_or(true))
-            .filter(|e| {
-                q.verdict
-                    .as_deref()
-                    .map(|v| e.v4.as_ref().map(|x| x.is(v)).unwrap_or(false) || e.v6.as_ref().map(|x| x.is(v)).unwrap_or(false))
-                    .unwrap_or(true)
-            })
-            .filter(|e| q.search.as_deref().map(|t| e.name.contains(t)).unwrap_or(true))
-            .filter(|e| !q.cross || e.cross4.as_ref().is_some_and(|c| c.verdict.as_deref().is_some_and(|v| v != "none")))
-            .collect();
-        let key = |e: &Domain| -> u64 {
-            match q.sort.as_deref().unwrap_or("hits") {
-                "lastSeen" => e.last_seen,
-                "firstSeen" => e.first_seen,
-                _ => e.hits as u64,
-            }
-        };
-        arr.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.name.cmp(&b.name)));
-        arr.drain(..q.offset.min(arr.len()));
-        arr.truncate(q.limit.unwrap_or(1000));
-        arr
+        let mut keys: Vec<(u64, Arc<str>)> = self.domains.values().filter_map(|e| q.key(e)).collect();
+        Query::order(&mut keys, q);
+        keys.iter().filter_map(|(_, n)| self.domains.get(n)).collect()
     }
 
     /// CSV 匯出（欄位同 2.x）
     pub fn to_csv(rows: &[&Domain]) -> String {
+        let mut out = String::new();
+        Self::csv_into(rows, true, &mut out);
+        out
+    }
+
+    /// CSV 接到 `out` 後面；`header` = 先寫表頭（分批匯出時只有第一批寫，3.5.1）
+    pub fn csv_into(rows: &[&Domain], header: bool, out: &mut String) {
         let cols = [
             "name",
             "provider",
@@ -2812,8 +2875,10 @@ impl Db {
         };
         let ips = |v: &[IpAddr]| v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
         let s = |x: Option<&str>| x.unwrap_or("").to_string();
-        let mut out = cols.join(",");
-        out.push('\n');
+        if header {
+            out.push_str(&cols.join(","));
+            out.push('\n');
+        }
         for e in rows {
             let b = e.base.as_deref();
             let v4 = e.v4.as_deref();
@@ -2848,7 +2913,6 @@ impl Db {
             out.push_str(&row.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
             out.push('\n');
         }
-        out
     }
 }
 

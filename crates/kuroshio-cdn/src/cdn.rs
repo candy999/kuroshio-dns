@@ -1951,26 +1951,51 @@ impl Cdn {
     }
 
     /// `/api/cdn/summary`
+    /// 3.5.1：分批走過全部網域（[`Cdn::scan_domains`]），結果跟一次拿著鎖做完一樣（`db::SummaryAcc`）
     pub fn summary(&self) -> Value {
-        serde_json::to_value(self.state().db.summary()).unwrap_or_default()
+        let mut acc = db::SummaryAcc::default();
+        self.scan_domains(|_, e| acc.add(e));
+        serde_json::to_value(acc.finish()).unwrap_or_default()
     }
 
-    /// `/api/cdn/domains`（JSON）
+    /// `/api/cdn/domains` 要列的網域（依排序、分頁之後）：分批走過全部網域只收排序鍵，排序不拿鎖（3.5.1）
+    fn query_keys(&self, q: &db::Query) -> Vec<(u64, Arc<str>)> {
+        let mut keys = Vec::new();
+        self.scan_domains(|_, e| keys.extend(q.key(e)));
+        db::Query::order(&mut keys, q);
+        keys
+    }
+
+    /// 依排好的名稱分批取出內容（每批 [`DUMP_CHUNK`] 筆拿一次鎖；期間被刪掉的略過，同寫快照）
+    fn query_rows(&self, keys: &[(u64, Arc<str>)], mut f: impl FnMut(&[&db::Domain])) {
+        for (k, chunk) in keys.chunks(DUMP_CHUNK).enumerate() {
+            if k > 0 {
+                std::thread::sleep(BATCH_PAUSE);
+            }
+            let st = self.state();
+            let rows: Vec<&db::Domain> = chunk.iter().filter_map(|(_, n)| st.db.get(n)).collect();
+            f(&rows);
+        }
+    }
+
+    /// `/api/cdn/domains`（JSON）。3.5.1：分批拿鎖（7 萬筆整份匯出時，以前一次拿著鎖走完、排序、序列化）。
+    /// 會停頓：放在 blocking 執行緒上
     pub fn query(&self, q: &db::Query) -> Value {
-        let st = self.state();
-        Value::Array(
-            st.db
-                .query(q)
-                .into_iter()
-                .map(|d| serde_json::to_value(d).unwrap_or_default())
-                .collect(),
-        )
+        let keys = self.query_keys(q);
+        let mut out = Vec::with_capacity(keys.len());
+        self.query_rows(&keys, |rows| {
+            out.extend(rows.iter().map(|d| serde_json::to_value(d).unwrap_or_default()))
+        });
+        Value::Array(out)
     }
 
-    /// `/api/cdn/domains?format=csv`
+    /// `/api/cdn/domains?format=csv`（同 [`Cdn::query`]，分批）
     pub fn query_csv(&self, q: &db::Query) -> String {
-        let st = self.state();
-        Db::to_csv(&st.db.query(q))
+        let keys = self.query_keys(q);
+        let mut out = String::new();
+        db::Db::csv_into(&[], true, &mut out);
+        self.query_rows(&keys, |rows| db::Db::csv_into(rows, false, &mut out));
+        out
     }
 
     /// 某個網域的紀錄（`/api/trace` 的 cdnDb）

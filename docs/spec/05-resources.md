@@ -466,7 +466,15 @@ MT7621 上換算約 20 ms 以內。測試 `bulk_work_does_not_hold_the_state_loc
 - 快取：公開頁的統計本來就有 10 秒快取（`STATS_CACHE`，同時開著的多個瀏覽器共用一份）；`/api/dashboard` 照舊不快取
   （管理介面要看最新的數字，測試也靠這個），開著的通常只有一個；每次都是分批，查詢不會被整份統計擋住。
 
-還是一次拿著鎖做完的：管理 API 的網域查詢與分析摘要（`/api/cdn/domains`、`/api/cdn/summary`，有人操作時才會呼叫）。
+**管理介面的網域列表、匯出與摘要也分批**（`/api/cdn/domains`、`?format=csv`、`/api/cdn/summary`）：測試單會用
+`/api/cdn/domains?format=csv&limit=200000` 匯出整份，設定頁打開 CDN 網域列表也走這裡；7 萬筆以前一次拿著鎖篩選、排序、序列化，D3 上要停好幾百毫秒到一秒。
+
+- 列表與匯出（`Cdn::query`、`query_csv`）：分批走過全部網域只收（排序欄位，名稱）（`db::Query::key`），排序、分頁不拿鎖（`Query::order`，
+  規則照舊：欄位遞減、同值依名稱），再依排好的名稱每 256 筆拿一次鎖取出內容、序列化（期間被刪掉的略過，同寫快照）。內容與排序跟以前一樣。
+- 摘要（`db::SummaryAcc`）：以前先依（第一次出現，名稱）排序整份再累計，業者與 POP 的順序是「依這個順序第一次出現」；
+  現在一筆一筆加（順序不影響），記每個業者、每個 POP 最早的（第一次出現，名稱），最後依它排，再依查詢次數穩定排序，結果一樣
+  （測試 `batched_listing_and_summary_match_one_shot` 跟以前的做法逐項比對）。
+- 都在 blocking 執行緒上做（`admin.rs` 的 `spawn_blocking`）。
 
 ## 6. 防止低階硬體被拖垮
 

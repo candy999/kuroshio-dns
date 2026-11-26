@@ -374,6 +374,121 @@ fn bulk_work_does_not_hold_the_state_lock() {
     assert!(worst < STALL_LIMIT, "統計（scan_domains）：最久等鎖 {worst:?}");
     let (_, _, worst) = with_probe(&c, || c.cross_summary());
     assert!(worst < STALL_LIMIT, "跨 CDN 統計：最久等鎖 {worst:?}");
+    // 管理介面：CDN 網域列表、整份匯出 CSV、各家摘要
+    let all = crate::db::Query {
+        limit: Some(200_000),
+        ..Default::default()
+    };
+    let (csv, _, worst) = with_probe(&c, || c.query_csv(&all));
+    assert_eq!(csv.lines().count(), n + 1);
+    assert!(worst < STALL_LIMIT, "整份匯出 CSV：最久等鎖 {worst:?}");
+    let (v, _, worst) = with_probe(&c, || c.query(&all));
+    assert_eq!(v.as_array().unwrap().len(), n);
+    assert!(worst < STALL_LIMIT, "網域列表：最久等鎖 {worst:?}");
+    let (_, _, worst) = with_probe(&c, || c.summary());
+    assert!(worst < STALL_LIMIT, "各家摘要：最久等鎖 {worst:?}");
+}
+
+/// 3.5.1 以前的 `Db::summary`（先依第一次出現排序整份再累計）：比對分批累計的結果
+fn summary_one_shot(db: &crate::db::Db) -> Vec<crate::db::Summary> {
+    use indexmap::IndexMap;
+    let mut out: IndexMap<String, crate::db::Summary> = IndexMap::new();
+    let mut names: Vec<&crate::db::Domain> = db.domains.values().collect();
+    names.sort_by(|a, b| a.first_seen.cmp(&b.first_seen).then_with(|| a.name.cmp(&b.name)));
+    for e in names {
+        let p = e.provider().unwrap_or("unknown").to_string();
+        let s = out.entry(p.clone()).or_insert_with(|| crate::db::Summary {
+            provider: p,
+            ..Default::default()
+        });
+        s.domains += 1;
+        s.hits += e.hits as u64;
+        if let Some(pop) = e.base.as_ref().and_then(|b| b.pop.as_deref()).filter(|p| !p.is_empty()) {
+            *s.pops.entry(pop.to_string()).or_default() += 1;
+            if ["TPE", "KHH", "TSA", "RMQ", "TXG", "TNN"].iter().any(|t| pop.starts_with(t)) {
+                s.base_pop_tw += 1;
+            } else {
+                s.base_pop_abroad += 1;
+            }
+        }
+        if let Some(v) = &e.v4 {
+            s.v4ok += v.is("ok") as u32;
+            s.v4fail += v.is("fail") as u32;
+        }
+        if let Some(v) = &e.v6 {
+            s.v6ok += v.is("ok") as u32;
+            s.v6fail += v.is("fail") as u32;
+        }
+        if e.ecs.as_ref().map(|x| x.is("ok")).unwrap_or(false) {
+            s.ecs_gain += 1;
+        }
+    }
+    let mut v: Vec<crate::db::Summary> = out.into_values().collect();
+    v.sort_by_key(|s| std::cmp::Reverse(s.hits));
+    v
+}
+
+#[test]
+fn batched_listing_and_summary_match_one_shot() {
+    // `/api/cdn/domains`（JSON、CSV）與 `/api/cdn/summary` 分批做：內容與排序跟一次拿著鎖做完一樣
+    let c = big_cdn("list-same", 12_000, kuroshio_config::defaults());
+    c.with_state(|st| {
+        let names: Vec<Arc<str>> = st.db.domains.keys().cloned().collect();
+        let provs = ["cloudflare", "cloudfront", "akamai", "fastly"];
+        let pops = ["TPE51", "HKG12", "NRT20", "KHH1", "SIN3"];
+        for (k, name) in names.iter().enumerate() {
+            let d = st.db.domains.get_mut(name).unwrap();
+            d.provider = crate::util::Field::Val(crate::util::intern(provs[k % 4]));
+            // 同一個第一次出現時間的很多：同時間時依名稱
+            d.first_seen = 1_700_000_000_000 + (k as u64 % 97) * 1000;
+            d.hits = (k % 13) as u32;
+            if k % 3 == 0 {
+                d.base = Some(Box::new(crate::db::Base {
+                    pop: Some(crate::util::intern(pops[k % 5])),
+                    ..Default::default()
+                }));
+            }
+        }
+    });
+    let (want, got) = {
+        let st = c.state();
+        (summary_one_shot(&st.db), st.db.summary())
+    };
+    assert_eq!(got, want, "累計的順序不影響結果（含業者與 POP 的順序）");
+    assert_eq!(c.summary(), serde_json::to_value(&want).unwrap(), "各家摘要");
+    for q in [
+        crate::db::Query {
+            limit: Some(200_000),
+            ..Default::default()
+        },
+        crate::db::Query {
+            provider: Some("akamai".into()),
+            sort: Some("firstSeen".into()),
+            offset: 50,
+            limit: Some(300),
+            ..Default::default()
+        },
+        crate::db::Query {
+            verdict: Some("ok".into()),
+            sort: Some("lastSeen".into()),
+            search: Some("s1".into()),
+            ..Default::default()
+        },
+    ] {
+        let (json, csv) = {
+            let st = c.state();
+            let rows = st.db.query(&q);
+            let json = serde_json::Value::Array(rows.iter().map(|d| serde_json::to_value(d).unwrap()).collect());
+            (json, crate::db::Db::to_csv(&rows))
+        };
+        assert!(!rows_is_empty(&json), "{q:?}");
+        assert_eq!(c.query(&q), json, "{q:?}");
+        assert_eq!(c.query_csv(&q), csv, "{q:?}");
+    }
+}
+
+fn rows_is_empty(v: &serde_json::Value) -> bool {
+    v.as_array().is_none_or(|a| a.is_empty())
 }
 
 #[test]
