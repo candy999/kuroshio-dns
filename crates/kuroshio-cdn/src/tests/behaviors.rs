@@ -134,6 +134,40 @@ fn zone_restricted_counts_sites_and_decays() {
     });
 }
 
+/// 3.5.1：「多個網站無法使用」的日誌附上網站數與前 3 個網站（名稱只在記憶體裡；重新啟動前記的沒有名稱）
+#[test]
+fn zone_restricted_log_lists_sites() {
+    use crate::pools::sites_text;
+    let n = |v: &[&str]| v.iter().map(|s| Box::<str>::from(*s)).collect::<Vec<_>>();
+    assert_eq!(
+        sites_text(&n(&["a.example.com", "b.example.com"]), 2),
+        "a.example.com、b.example.com"
+    );
+    assert_eq!(
+        sites_text(&n(&["a.example.com", "b.example.com", "c.example.com"]), 5),
+        "a.example.com、b.example.com、c.example.com 等"
+    );
+    assert_eq!(sites_text(&n(&["a.example.com"]), 2), "a.example.com；另 1 個是之前記的，沒有名稱");
+    assert_eq!(sites_text(&[], 3), "3 個是之前記的，沒有名稱");
+    let (c, _) = setup(json!({}));
+    let x = ip("104.16.161.36");
+    c.with_state(|st| {
+        let p = &mut st.pools;
+        for s in ["a.example.com", "a.example.com", "b.example.com", "c.example.com", "d.example.com"] {
+            p.zone_note_site("cloudflare", x, false, s);
+        }
+        assert!(p.is_restricted("cloudflare", x));
+        assert_eq!(
+            p.zone_site_names("cloudflare", x),
+            n(&["a.example.com", "b.example.com", "c.example.com"]),
+            "同一個網站只記一次，最多 3 個"
+        );
+        // 7 天沒有新的「不服務」：名稱跟著清掉
+        assert_eq!(p.decay_zone(now_ms() + 8 * 86_400_000), 1);
+        assert!(p.zone_site_names("cloudflare", x).is_empty());
+    });
+}
+
 /// 3.5.1 L1／L2：載入時清掉舊資料裡不成立的學習資料（會讓 `has_learning()` 誤判）
 #[test]
 fn stale_learning_cleaned_on_load() {
@@ -825,6 +859,12 @@ async fn conn_fail_needs_two_sites_before_pausing() {
         assert!(p.p["cloudflare"].bad.is_empty());
         assert!(p.note_conn_fail("cloudflare", cf, "b.example.com", "x"), "第 2 個網站：暫停");
         assert!(p.p["cloudflare"].bad[&cf].reason.contains("2 個網站"));
+        // 3.5.1：暫停的原因寫出是哪幾個網站（日誌與 `/api/cdn/pools` 的 `bad`）
+        assert!(
+            p.p["cloudflare"].bad[&cf].reason.contains("a.example.com、b.example.com"),
+            "{}",
+            p.p["cloudflare"].bad[&cf].reason
+        );
         // Fastly：同一個 /24、不同最後一段（不同網站的憑證組）
         assert!(!p.note_conn_fail("fastly", ip("198.51.100.140"), "a.example.com", "x"));
         assert!(p.p["fastly"].bad.is_empty() && p.p["fastly"].bad24.is_empty());
