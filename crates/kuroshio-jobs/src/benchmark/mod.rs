@@ -29,6 +29,7 @@
 //! 3.4.0 的差異（上游多樣性，規格 10 第 6 節）：Phase 2 判斷每台上游的所在地（台灣網段、ip-api 的國別、
 //! 量到的最低延遲），`benchmark.coverageRegion = near`（預設）時「覆蓋」階段先挑鄰近的（台灣、日本、香港、新加坡）。
 
+pub mod blacklist;
 pub mod learn;
 pub mod malware;
 pub mod probe;
@@ -725,6 +726,8 @@ struct Srv {
     malware_filter: bool,
     /// 惡意網站探測的結果（對照組用）：Some(true)＝有擋、Some(false)＝沒擋、None＝今天判不出來
     probe: Option<bool>,
+    /// 永久黑名單裡「網站無法驗證」列入 30～60 天、今天重測的（3.5.1 A10.4）
+    retest: bool,
     /// 今天的汙染判斷記進評測歷史的可疑天數（3.5.1）：憑證不符，或「無法驗證」已經在 2 個以上網域發生
     suspect_today: bool,
     alive: bool,
@@ -751,6 +754,7 @@ impl Srv {
             preflight: None,
             malware_filter: false,
             probe: None,
+            retest: false,
             suspect_today: false,
             alive: true,
             fail_reason: String::new(),
@@ -1229,7 +1233,25 @@ fn reason_of(r: &QueryResult) -> String {
     }
 }
 
-/// 永久黑名單：曾被判定「汙染」的 DNS 不再測試（可手動編輯，# 後為註解）
+/// 今天名單裡有的上游（原始寫法與正規化後的 id 都放）：候選（含好友提供的）、對照組、固定上游
+fn known_ids(ids: &[Cand], protected: &[(String, String, Tag)], pinned: &[String]) -> HashSet<String> {
+    let mut known: HashSet<String> = HashSet::new();
+    for spec in ids
+        .iter()
+        .map(|c| c.id.as_str())
+        .chain(protected.iter().map(|(p, _, _)| p.as_str()))
+        .chain(pinned.iter().map(String::as_str))
+    {
+        known.insert(spec.to_string());
+        if let Ok(u) = Upstream::parse(spec) {
+            known.insert(u.id);
+        }
+    }
+    known
+}
+
+/// 永久黑名單：曾被判定「汙染」的 DNS 不再測試（可手動編輯，# 後為註解）。
+/// 學到的那份（`state/blacklist.txt`）3.5.1 起會整理：「網站無法驗證」的 30～60 天後重測（見 [`blacklist`]）
 fn read_blacklist(file: &Path) -> HashSet<String> {
     read_list(file)
         .iter()
@@ -1239,11 +1261,7 @@ fn read_blacklist(file: &Path) -> HashSet<String> {
 }
 
 fn append_blacklist(file: &Path, lines: &[String]) {
-    let head = if file.exists() {
-        ""
-    } else {
-        "# 永久黑名單：每日評測判定「汙染」（解析到錯誤業者）的 DNS，之後不再測試\n# 要恢復某台就刪掉那一行\n"
-    };
+    let head = if file.exists() { "" } else { blacklist::HEADER };
     let r = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1414,6 +1432,14 @@ impl Benchmark {
         if let Some(d) = &self.paths.default_list_dir {
             blacklist.extend(read_blacklist(&d.join("blacklist.txt")));
         }
+        // 程式附帶的唯讀名單（重測也拿不掉）；學到的那份跟它是同一個檔時不整理（3.5.1 A10.4）
+        let fixed_bl = blacklist.clone();
+        let learned_bl = bl_file != base_bl
+            && self
+                .paths
+                .default_list_dir
+                .as_ref()
+                .map_or(true, |d| d.join("blacklist.txt") != bl_file);
         blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
         let protected = protected_ids(&self.paths);
@@ -1426,6 +1452,21 @@ impl Benchmark {
         if let Some(l) = learned.as_mut() {
             let h3_ids: HashSet<&str> = ids.iter().filter(|c| c.id.starts_with("h3://")).map(|c| c.id.as_str()).collect();
             learn_dirty |= l.h3_prune(|k| h3_ids.contains(k)) > 0;
+        }
+        // 永久黑名單裡「網站無法驗證」列入 30～60 天的：今天重測（從黑名單的集合拿掉、分級評測一定測），結果在 Phase 1 之後整理
+        // 今天名單裡有的（原始寫法與正規化後的都算）：好友提供的候選、對照組、固定上游也算
+        let known = known_ids(&ids, &protected, &cfg.pinned);
+        let retest: HashSet<String> = if learned_bl {
+            let text = std::fs::read_to_string(&bl_file).unwrap_or_default();
+            let entries: Vec<blacklist::Entry> = text.lines().filter_map(blacklist::parse_line).collect();
+            blacklist::due(&entries, today_n, |id| fixed_bl.contains(id) || !known.contains(id))
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        for id in &retest {
+            blacklist.remove(id);
         }
         let mut h3_skipped = 0usize;
         // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
@@ -1499,6 +1540,7 @@ impl Benchmark {
             let mut s = Srv::new(spec.clone(), up, pinned, tag.clone());
             s.protected = expect.cloned();
             s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
+            s.retest = !pinned_or_control && (retest.contains(spec.as_str()) || retest.contains(&s.up.id));
             all.push(s);
         }
         // 分級評測（3.5.0 A3）：`a` 只用 A 級（B 級一個都不測、不選）；小機器的 `auto` 測 A 級、使用者的、
@@ -1549,7 +1591,7 @@ impl Benchmark {
                         tier: eff[i],
                         op: s.op_key(),
                         ms: s.tag.ms,
-                        always: s.pinned || s.protected.is_some() || s.never_ok,
+                        always: s.pinned || s.protected.is_some() || s.never_ok || s.retest,
                         fixed: s.pinned || s.protected.is_some(),
                         incumbent: incumbents.contains(s.id.as_str()),
                         score: aged.as_ref().and_then(learn::Hist::score),
@@ -2137,6 +2179,9 @@ impl Benchmark {
 
         drop(raw);
         strikes.save();
+        if learned_bl {
+            self.tidy_blacklist(&bl_file, &all, &retest, &known, today_n, &today, &mut journal);
+        }
         let finals: Vec<usize> = verified
             .iter()
             .copied()
@@ -2561,6 +2606,50 @@ impl Benchmark {
             keep_last_report(d, keep, &journal);
         }
         Ok(state)
+    }
+
+    /// 整理學到的永久黑名單（3.5.1 A10.4）：今天重測的「網站無法驗證」通過就移除、沒通過從今天重新算；
+    /// 名單裡已經沒有的（列入 30 天以上）、重複的、超過上限的移除。有變動才寫（暫存檔＋改名）
+    #[allow(clippy::too_many_arguments)]
+    fn tidy_blacklist(
+        &self,
+        file: &Path,
+        all: &[Srv],
+        retest: &HashSet<String>,
+        known: &HashSet<String>,
+        today_n: u32,
+        today: &str,
+        journal: &mut Journal,
+    ) {
+        let Ok(text) = std::fs::read_to_string(file) else { return };
+        let mut results: HashMap<String, blacklist::Retest> = HashMap::new();
+        for id in retest {
+            let r = match all.iter().find(|s| s.id == *id || s.up.id == *id) {
+                None => blacklist::Retest::Untested,
+                Some(s) if s.alive || s.fail_reason.starts_with("封殺") => blacklist::Retest::Passed,
+                Some(s) => blacklist::Retest::Failed(s.fail_reason.clone()),
+            };
+            results.insert(id.clone(), r);
+        }
+        let (out, st) = blacklist::tidy(&text, &results, |id| known.contains(id), today_n, today);
+        if st.any() || st.untested > 0 {
+            jinfo!(
+                journal,
+                "[永久黑名單] 重測「網站無法驗證」{} 台：通過移除 {}、沒通過 {}（從今天重新算 30～60 天）、今天沒測到 {}；名單裡已經沒有的移除 {}、超過上限 {} 筆移除 {}",
+                retest.len(),
+                st.passed,
+                st.failed,
+                st.untested,
+                st.pruned,
+                blacklist::BLACKLIST_MAX,
+                st.capped
+            );
+        }
+        if out != text {
+            if let Err(e) = write_atomic(file, out.as_bytes()) {
+                warn!("永久黑名單整理後寫入失敗（{}）：{e}", file.display());
+            }
+        }
     }
 
     /// 惡意網站探測的自我檢查（3.5.0 A5；探測網域的來源 F10）：`probe.txt`（排前面）加上主程式抽樣、先確認還解析得到的，

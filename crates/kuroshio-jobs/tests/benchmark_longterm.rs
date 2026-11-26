@@ -260,3 +260,73 @@ async fn unverified_needs_two_domains_and_unshared_answer() {
     assert_eq!(l.hist[e.id(sh1)].suspect(), 0);
     assert_eq!(l.hist[e.id(multi)].suspect(), 2, "{:?}", l.hist[e.id(multi)]);
 }
+
+/// A10.4：永久黑名單裡「網站無法驗證」的 30～60 天後重測一次：通過就移除、沒通過從今天重新算；
+/// 憑證不符的永久（不重測）；名單裡已經沒有的移除；檔頭換成新的說明
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_blacklist_entries_are_retested() {
+    let e = setup("retest", 15, "").await;
+    let q = "Quiet_Hosting__AS64498_Quiet_Hosting";
+    let lines = [
+        "# 永久黑名單：每日評測判定「汙染」（解析到錯誤業者）的 DNS，之後不再測試".to_string(),
+        "# 要恢復某台就刪掉那一行".to_string(),
+        format!("{}  # 2026-11-15 汙染：{} → {q}（連續 3 天網站無法驗證）", e.id(13), WEB[0]),
+        format!(
+            "{}  # 2026-09-15 汙染：{} → {q}（30 天內 3 天、2 個網域網站無法驗證）",
+            e.id(14),
+            WEB[0]
+        ),
+        format!(
+            "{}  # 2026-09-15 汙染：{} → Evil（憑證不符 ERR_TLS_CERT_ALTNAME_INVALID）",
+            e.id(15),
+            WEB[1]
+        ),
+        format!(
+            "{}  # 2026-11-19 汙染：{} → {q}（30 天內 3 天、2 個網域網站無法驗證）",
+            e.id(12),
+            WEB[0]
+        ),
+        format!(
+            "https://gone.example.net/dns-query  # 2026-09-15 汙染：{} → X（30 天內 3 天、2 個網域網站無法驗證）",
+            WEB[0]
+        ),
+    ];
+    std::fs::write(e.root.join("state/blacklist.txt"), lines.join("\n") + "\n").unwrap();
+    // 第 14 台重測時還是連不上
+    e.answer(14, WEB[0], "98.6.0.14");
+    let (state, log) = e.run(&cfg()).await;
+    let out = e.blacklist();
+    assert!(
+        log.contains(
+            "[永久黑名單] 重測「網站無法驗證」2 台：通過移除 1、沒通過 1（從今天重新算 30～60 天）、今天沒測到 0；名單裡已經沒有的移除 1"
+        ),
+        "{log}"
+    );
+    assert!(out.starts_with("# 永久黑名單：每日評測判定竄改的 DNS"), "{out}");
+    assert!(
+        !out.contains(&format!("{}  #", e.id(13))),
+        "3.5.0 以前的規則列入的：重測通過就移除 {out}"
+    );
+    assert!(
+        out.contains(&format!("{}  # 2026-11-20 重測：網站無法驗證（可疑 {}", e.id(14), WEB[0])),
+        "沒通過：從今天重新算 {out}"
+    );
+    assert!(out.contains("第一次列入 2026-09-15）"), "{out}");
+    assert!(out.contains(&format!("{}  # 2026-09-15", e.id(15))), "憑證不符的永久：{out}");
+    assert!(out.contains(&format!("{}  # 2026-11-19", e.id(12))), "還沒到重測的不動：{out}");
+    assert!(!out.contains("gone.example.net"), "名單裡已經沒有的移除：{out}");
+    let asked = e.prober.asked.lock().unwrap().clone();
+    assert!(asked.contains_key(e.id(13)) && asked.contains_key(e.id(14)));
+    assert!(
+        !asked.contains_key(e.id(15)) && !asked.contains_key(e.id(12)),
+        "還在黑名單的不測：{asked:?}"
+    );
+    assert_eq!(state["counts"]["eliminated"], 2, "第 14 台的 https 與 h3：{state}");
+    // 隔天：第 14 台剛重測過，不會再測；移除的第 13 台照常每天測
+    e.next_day();
+    e.prober.asked.lock().unwrap().clear();
+    let (_, log) = e.run(&cfg()).await;
+    assert!(!log.contains("[永久黑名單] 重測"), "{log}");
+    assert!(!e.prober.asked.lock().unwrap().contains_key(e.id(14)));
+    assert!(e.prober.asked.lock().unwrap().contains_key(e.id(13)));
+}
