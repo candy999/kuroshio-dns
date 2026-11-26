@@ -453,7 +453,16 @@ fn run_signals_and_init_config() {
     wait_for(&|l| l.contains("收到 SIGHUP") && l.contains("重新載入"), "SIGHUP 的紀錄");
     assert!(child.try_wait().unwrap().is_none(), "收到 SIGHUP / SIGUSR1 不結束");
     healthy();
-    assert_eq!(run(&["status", "--json", "-c", &c]).0, 0);
+    // 重新載入後 DNS 先回來，管理 API 稍後才重新監聽（機器忙時可能要一兩秒）：等它起來再查
+    let t0 = Instant::now();
+    loop {
+        let r = run(&["status", "--json", "-c", &c]);
+        if r.0 == 0 {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "重新載入後管理 API 一直沒回來：{r:?}\n{}", log.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+    }
     kill(libc::SIGTERM);
     let t0 = Instant::now();
     let st = loop {
