@@ -879,6 +879,13 @@ fn median(v: &mut [f64]) -> Option<f64> {
     v.get(v.len() / 2).copied()
 }
 
+/// 一個網域改走台灣節點省下的毫秒數：原本的答案 − 台灣節點，兩邊都量到延遲才有；台灣比較慢時是負的。
+/// 「兩條路」（`paths.medianSavedMs`）與 `acceleration.medianSavedMs`（3.5.1 起）用同一個定義
+pub fn saved_ms(base: Option<&kuroshio_cdn::db::Base>, v4: Option<&kuroshio_cdn::db::Verdict>) -> Option<f64> {
+    let ms = |n: &kuroshio_cdn::util::Num| n.get().filter(|m| m.is_finite() && *m > 0.0);
+    Some(ms(&base?.ms)? - ms(&v4?.ms)?)
+}
+
 impl PathAcc {
     /// 一個網域：`abroad` = 原本的答案在國外機房
     pub fn add(&mut self, base: Option<&kuroshio_cdn::db::Base>, v4: Option<&kuroshio_cdn::db::Verdict>, abroad: bool) {
@@ -918,8 +925,8 @@ impl PathAcc {
                 self.tw_slower += 1;
             }
         }
-        if let (Some(b), Some(t)) = (bms, vms) {
-            self.diff.push(b - t);
+        if let Some(d) = saved_ms(base, v4) {
+            self.diff.push(d);
         }
     }
 
@@ -951,13 +958,13 @@ const FLOWS_TOP: usize = 12;
 /// `Stats::route()` 每次連線 `n` 加 1，原本出國的再分成拉回（`acc`）或仍在國外（`miss`），所以
 /// `n = 原本就在台灣 + acc + miss`，也就是 `n − abroad`。這裡用 `n − acc − miss`：三塊加起來一定等於連線數
 /// （匯入的舊資料不一致時也不會畫出加總不對的圖）；不會小於 0
-fn already_tw(a: &[f64; 6]) -> f64 {
+fn already_tw(a: &[f64; 7]) -> f64 {
     (a[0] - a[2] - a[3]).max(0.0)
 }
 
-/// `routing[]` 的一列（`a` = [n, abroad, acc, miss, saved, savedN]，期間內每一天的合計）。
+/// `routing[]` 的一列（`a` = [n, abroad, acc, miss, saved, savedN, cross]，期間內每一天的合計）。
 /// 3.5.1 多 `alreadyTw`（連線去向圖的第三塊）與 `savedSamples`（平均縮短是幾次連線量到的）；都在讀統計時算，查詢路徑不變
-fn routing_row(p: &str, label: &str, a: &[f64; 6]) -> Value {
+fn routing_row(p: &str, label: &str, a: &[f64; 7]) -> Value {
     json!({
         "provider": p, "label": label,
         "connections": a[0], "wouldGoAbroad": a[1], "accelerated": a[2], "stillAbroad": a[3], "alreadyTw": already_tw(a),
@@ -1014,7 +1021,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     let mut sum: HashMap<&str, u64> = SUM.iter().map(|k| (*k, 0)).collect();
     let mut cdn_agg: BTreeMap<String, u64> = BTreeMap::new();
     // 機會成本：一般 DNS 會把多少 CDN 連線送出國、我們拉回台灣多少
-    let mut route_agg: BTreeMap<String, [f64; 6]> = BTreeMap::new();
+    let mut route_agg: BTreeMap<String, [f64; 7]> = BTreeMap::new();
     let mut cross_pairs: BTreeMap<String, u64> = BTreeMap::new();
     for (_, d) in keys.iter().copied() {
         for k in SUM {
@@ -1025,7 +1032,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
         }
         for (p, rt) in d.get("route").and_then(Value::as_object).into_iter().flatten() {
             let a = route_agg.entry(p.clone()).or_default();
-            for (i, k) in ["n", "abroad", "acc", "miss", "saved", "savedN"].iter().enumerate() {
+            for (i, k) in ["n", "abroad", "acc", "miss", "saved", "savedN", "cross"].iter().enumerate() {
                 a[i] += f(rt, k);
             }
         }
@@ -1077,19 +1084,9 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
             if view == View::Admin {
                 paths.add(e.base.as_deref(), e.v4.as_deref(), abroad);
             }
-            if ok4 && abroad {
-                let bms = e.base.as_ref().and_then(|b| b.ms.get()).filter(|m| *m != 0.0);
-                let vms = e.v4.as_ref().and_then(|v| v.ms.get()).filter(|m| *m != 0.0);
-                if let (Some(b), Some(v)) = (bms, vms) {
-                    if b > v {
-                        saved.push(b - v);
-                    }
-                }
-            }
-            if ok_ecs {
-                if let Some(g) = e.ecs.as_ref().and_then(|x| x.gain_ms.get()).filter(|g| *g > 0.0) {
-                    saved.push(g);
-                }
+            // 網站中位數（3.5.1）：跟「兩條路」（paths）同一個定義，兩邊都量到延遲的網站都算，台灣比較慢的也算（負的）
+            if let Some(d) = saved_ms(e.base.as_deref(), e.v4.as_deref()) {
+                saved.push(d);
             }
             if let (true, Some(pop)) = (abroad, base_pop) {
                 let w = (e.hits as u64).max(1);
@@ -1108,19 +1105,18 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
         }
         cs = st.db.cross_summary();
     }
-    saved.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = saved.get(saved.len() / 2).copied();
+    let median = median(&mut saved);
 
-    let mut routing_rows: Vec<(String, [f64; 6])> = route_agg.into_iter().filter(|(_, a)| a[0] > 0.0).collect();
+    let mut routing_rows: Vec<(String, [f64; 7])> = route_agg.into_iter().filter(|(_, a)| a[0] > 0.0).collect();
     routing_rows.sort_by(|a, b| {
         b.1[0]
             .partial_cmp(&a.1[0])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    let mut rt = [0f64; 6];
+    let mut rt = [0f64; 7];
     for (_, a) in &routing_rows {
-        for i in 0..6 {
+        for i in 0..7 {
             rt[i] += a[i];
         }
     }
@@ -1157,9 +1153,11 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
         },
     });
 
-    // 跨 CDN 的連線也是「原本出國、改走台灣」：算進加速次數
+    // 跨 CDN 的連線也是「原本出國、改走台灣」：算進加速次數。在台灣有節點的 CDN 走跨 CDN、
+    // 又記成那家 CDN 的「拉回」的（`cross`，3.5.1 起才有）兩邊都算過，扣掉一次
+    let accelerated = rt[2] + (cross_serves as f64 - rt[6]).max(0.0);
     let opportunity = json!({
-        "connections": rt[0], "wouldGoAbroad": rt[1], "accelerated": rt[2] + cross_serves as f64, "stillAbroad": rt[3],
+        "connections": rt[0], "wouldGoAbroad": rt[1], "accelerated": accelerated, "stillAbroad": rt[3],
         // 3.5.1：連線去向圖的三塊（`routing[]` 的合計；跨 CDN 另外算，不在這三塊裡）
         "alreadyTw": already_tw(&rt), "routedAccelerated": rt[2], "savedSamples": rt[5],
         "otherDnsAbroadShare": if rt[0] > 0.0 { r4(rt[1] / rt[0]) } else { 0.0 },
@@ -1201,7 +1199,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
             "blockRate": if q > 0 { r4(blocked as f64 / q as f64) } else { 0.0 },
             "cacheHitRate": if q > 0 { r4(s("hit") as f64 / q as f64) } else { 0.0 },
             "cdnServed": s("cdnServed"), "cdnAccelerated": s("cdnRewrite") + s("ecsRewrite") + cross_serves,
-            "accelerated": rt[2] + cross_serves as f64,
+            "accelerated": accelerated,
         },
         "acceleration": {
             "verifiedSites": verified, "sitesRoutedAbroad": was_abroad, "medianSavedMs": median.map(r1), "samples": saved.len(),
@@ -1441,7 +1439,7 @@ mod tests {
     /// 連線去向圖（3.5.1）：三塊加起來等於連線數；舊資料不一致時「原本就在台灣」不會是負的；平均縮短帶樣本數
     #[test]
     fn routing_row_three_parts() {
-        let v = routing_row("cloudflare", "Cloudflare", &[820.0, 330.0, 296.0, 34.0, 8436.0, 296.0]);
+        let v = routing_row("cloudflare", "Cloudflare", &[820.0, 330.0, 296.0, 34.0, 8436.0, 296.0, 0.0]);
         assert_eq!(v["alreadyTw"], 490.0);
         let sum = v["alreadyTw"].as_f64().unwrap() + v["accelerated"].as_f64().unwrap() + v["stillAbroad"].as_f64().unwrap();
         assert_eq!(sum, v["connections"].as_f64().unwrap());
@@ -1452,7 +1450,7 @@ mod tests {
         );
         assert_eq!(v["avgSavedMs"], 28.5);
         assert_eq!(v["savedSamples"], 296.0);
-        let broken = routing_row("cloudflare", "Cloudflare", &[3.0, 5.0, 4.0, 1.0, 0.0, 0.0]);
+        let broken = routing_row("cloudflare", "Cloudflare", &[3.0, 5.0, 4.0, 1.0, 0.0, 0.0, 0.0]);
         assert_eq!(broken["alreadyTw"], 0.0);
         assert_eq!(broken["avgSavedMs"], Value::Null);
         assert_eq!(broken["savedSamples"], 0.0);
@@ -1628,5 +1626,15 @@ mod tests {
         );
         assert_eq!(v["medianSavedMs"], 30.0, "中位數含台灣比較慢的那一筆（-52、30、45）");
         assert_eq!(PathAcc::default().json()["medianSavedMs"], Value::Null);
+        // 3.5.1：acceleration.medianSavedMs 用同一個定義（saved_ms），台灣比較慢的是負的、也算進中位數
+        assert_eq!(saved_ms(Some(&base(true, 8.0)), Some(&v4("fail", 60.0, true))), Some(-52.0));
+        assert_eq!(saved_ms(Some(&base(true, 50.0)), Some(&v4("ok", 5.0, false))), Some(45.0));
+        assert_eq!(saved_ms(Some(&base(true, 30.0)), None), None);
+        assert_eq!(saved_ms(Some(&base(false, 0.0)), Some(&v4("fail", 0.0, false))), None);
+        let mut all: Vec<f64> = [(8.0, 60.0), (8.0, 70.0), (50.0, 5.0)]
+            .iter()
+            .filter_map(|(b, t)| saved_ms(Some(&base(true, *b)), Some(&v4("ok", *t, false))))
+            .collect();
+        assert_eq!(median(&mut all), Some(-52.0), "多數網站台灣比較慢時，中位數是負的");
     }
 }

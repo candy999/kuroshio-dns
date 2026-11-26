@@ -1010,7 +1010,9 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
       h.appendChild(el('strong', '', pct(o.oursAbroadShare)));
       // 估計值標樣本數（3.5.1）：網站中位數是幾個已驗證的網站量到的
       const ac = s.acceleration || {};
-      const med = typeof ac.medianSavedMs === 'number' && ac.samples > 0 ? `已驗證的網站中，${KD.samplesText(ac.samples, '個網站')}量到改走台灣節點的差距，中位數省 ${ac.medianSavedMs} ms。` : '';
+      // 中位數含台灣節點比較慢的網站（3.5.1），可以是負的：負的時照實寫「慢」，不寫「省」
+      const med = typeof ac.medianSavedMs === 'number' && ac.samples > 0
+        ? `${KD.samplesText(ac.samples, '個網站')}兩邊都量到延遲：中位數${ac.medianSavedMs > 0 ? `是台灣節點快 ${ac.medianSavedMs} ms` : ac.medianSavedMs < 0 ? `是台灣節點反而慢 ${-ac.medianSavedMs} ms` : '兩邊一樣'}。` : '';
       $('#oppSub').textContent = `共比對 ${nf.format(o.connections)} 次 CDN 連線，其中 ${nf.format(o.wouldGoAbroad)} 次原本會出國，${nf.format(o.accelerated)} 次成功改走台灣節點。` + med;
     } else {
       $('#oppHead').textContent = '資料累積中…';

@@ -215,11 +215,12 @@ Windows 設定頁用原生 JS（不用前端框架、不需要編譯步驟），
 - 安全：不組 HTML 字串、不寫 `style` 屬性（只用 CSSOM），在設定頁的嚴格 CSP 下可用。淺色 / 深色跟著系統（LuCI 跟著 `data-darkmode`），手機寬度下寬表格在框裡捲動。
 - **CDN 連線去向（3.5.1，`cdnFlow()`）**：「機會成本（各 CDN）」與公開頁的「加速成效」各一張。左邊是各家 CDN，寬度是 `routing[].connections`；右邊三塊是「原本就在台灣」（`alreadyTw`）、「拉回台灣」（`accelerated`）、「仍在國外」（`stillAbroad`）。
   - 資料核對：`Stats::route()` 每次 A 回應 `n` 加 1，一般 DNS 的答案在國外（`abroad`）的再分成拉回（`acc`）或仍在國外（`miss`），所以每一天、每一家 `n = (n − abroad) + acc + miss`，三塊加起來就是連線數。`alreadyTw` 在讀統計時算（`n − acc − miss`，不小於 0；跟 `connections − wouldGoAbroad` 同一個數），查詢路徑不變；舊版核心沒有這個欄位時畫面自己算。
-  - 跨 CDN 不重複算：在台灣沒有節點的 CDN（`nearest`，例如 Fastly）沒有「原本」可以比，不進 `routing[]`，改走別家的次數只在 `crossCdn`；`opportunity.accelerated` 照舊加上跨 CDN 的次數，三塊的「拉回台灣」合計另外是 `opportunity.routedAccelerated`。
+  - 跨 CDN 不重複算：在台灣沒有節點的 CDN（`nearest`，例如 Fastly）沒有「原本」可以比，不進 `routing[]`，改走別家的次數只在 `crossCdn`；三塊的「拉回台灣」合計是 `opportunity.routedAccelerated`。
+  - 加速次數只算一次（3.5.1）：在台灣有節點的 CDN 也可能走跨 CDN，這種連線 `Stats::cdn()` 記一次跨 CDN（`crossRewrite`、這一分鐘的拉回），`Stats::route()` 又記成那家 CDN 的拉回（`acc`），以前 `opportunity.accelerated`、`totals.accelerated`、每分鐘的拉回都算兩次。現在 `Route` 帶 `cross`（`res.rewritten == Cross` 的一次比較），`route()` 在既有的鎖裡多記一筆 `route.<cdn>.cross`、這一分鐘的拉回不再加；合計用 `acc + max(0, crossRewrite − cross)`。`acc` 照舊包含它（連線去向的三塊要加得起來）。3.5.1 之前存下來的日子沒有 `cross`（0），照舊相加，不回頭修。
   - 上限：前 5 家，其餘合併成「其他 N 家」；provider 空白（看得出是 CDN 但沒辨識出是哪一家）另外一塊「未辨識的 CDN」。最多 7 個節點。
   - 桌機（容器 600 px 以上）是兩段式流向圖：節點是 `rect`，流線是三次貝茲曲線圍成的帶狀 `path`，滑過顯示數字；手機改成每家 CDN 一條 100% 堆疊橫條，下面一行三塊的比例。兩種都附數據表（含合計）。顏色以外加圖樣（拉回 = 斜線、國外 = 點點）與文字。連線數 0 顯示「資料累積中」，少於 10 次只說明累積中、數據表照列，不畫圖。
 - **其他與沒辨識出來（3.5.1）**：環形儀表前 5 家＋「其他」；「最常用到的 CDN」前 8 家（後端 `cdnOther`）、跨 CDN 配對前 8 組（`crossCdn.pairsOther`）、路由地圖前 12 個機房（`flowsOther`），其餘合併成「其他」、排最後（以前直接丟掉，比例加起來不到 100%）。沒辨識出來的另外標：改走的 CDN 沒記到（`?`）的配對標「未辨識的 CDN」；機房代碼沒有座標的不上地圖、在數據表標「沒辨識出位置」。
-- **估計值標樣本數（3.5.1）**：`routing[].savedSamples`、`opportunity.savedSamples` 是平均縮短用了幾次連線的量測；`acceleration.samples` 是網站中位數（`medianSavedMs`）用了幾個網站。總覽、環形儀表、機會成本表、公開頁的「平均每次縮短」旁邊標樣本數，少於 10 加註「樣本少」。查詢去向的比例旁邊附次數。
+- **估計值標樣本數（3.5.1）**：`routing[].savedSamples`、`opportunity.savedSamples` 是平均縮短用了幾次連線的量測；`acceleration.samples` 是網站中位數（`medianSavedMs`）用了幾個網站。網站中位數 3.5.1 起跟「兩條路」（`paths.medianSavedMs`）同一個定義（`site::saved_ms`）：原本的答案與台灣節點兩邊都量到延遲的網站，原本 − 台灣，台灣比較慢的是負的也算（以前只收原本出國、驗證成功、台灣比較快的，再加 ECS 的增益，偏高）；畫面上正的寫「台灣節點快」、負的寫「台灣節點慢」，不寫「縮短」。總覽、環形儀表、機會成本表、公開頁的「平均每次縮短」旁邊標樣本數，少於 10 加註「樣本少」。查詢去向的比例旁邊附次數。
 
 ## 8. 平台層
 

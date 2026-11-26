@@ -457,6 +457,11 @@
   ];
   const unknownCdn = p => !p || p === '?';
   const cdnName = r => SHORT[r.provider] || String(r.label || r.provider || '').split(' / ')[0];
+  /**
+   * 網站中位數（3.5.1 起跟「兩條路」同一個定義：台灣比較慢的網站也算，可以是負的）：
+   * 正的「台灣節點快 12 ms」、負的「台灣節點慢 5 ms」、0「兩邊一樣」；沒有資料是 —。負的時不寫「縮短」
+   */
+  const medianText = ms => typeof ms !== 'number' ? '—' : ms > 0 ? `台灣節點快 ${ms} ms` : ms < 0 ? `台灣節點慢 ${-ms} ms` : '兩邊一樣';
   /** 樣本數的說明：「296 次量測」；少於 10 次加註樣本少 */
   const samplesText = (n, unit = '次量測') => nf.format(n) + ' ' + unit + (n > 0 && n < 10 ? '（樣本少）' : '');
   /**
@@ -789,7 +794,7 @@
   /** 最近 60 分鐘（公開頁的樣式） */
   function realtime(container, rows) { lineChart(container, rows, RT_SERIES, { xLabel: (d) => fmtHM(d.t), height: 200 }); }
 
-  Object.assign(KD, { niceTicks, tooltip, tipRows, placeTip, lineChart, lineChartCompact, routeMap, gauges, crossCard, rank, cdnOtherRow, outcomes, trend, realtime, POPS, flowRows, cdnFlow, samplesText, FLOW_TOP, FLOW_MIN });
+  Object.assign(KD, { niceTicks, tooltip, tipRows, placeTip, lineChart, lineChartCompact, routeMap, gauges, crossCard, rank, cdnOtherRow, outcomes, trend, realtime, POPS, flowRows, cdnFlow, samplesText, medianText, FLOW_TOP, FLOW_MIN });
 
   // =====================================================================================
   // 表格類（詳細頁、管理介面）
@@ -1073,7 +1078,7 @@
           ['拉回台灣', nf.format(o2.accelerated), `仍在國外 ${nf.format(o2.stillAbroad)}（${pct1(o2.oursAbroadShare)}）`],
           // 估計值都標樣本數（3.5.1）：平均縮短是幾次連線量到的、網站中位數是幾個網站量到的
           ['平均縮短', o2.avgSavedMs !== null ? o2.avgSavedMs + ' ms' : '—', (typeof o2.savedSamples === 'number' ? samplesText(o2.savedSamples) + ' · ' : '') + `合計 ${o2.totalSavedSec} 秒`],
-          ['網站中位數縮短', typeof p.acceleration.medianSavedMs === 'number' ? p.acceleration.medianSavedMs + ' ms' : '—', samplesText(p.acceleration.samples || 0, '個網站量到')],
+          ['網站中位數差距', medianText(p.acceleration.medianSavedMs), samplesText(p.acceleration.samples || 0, '個網站兩邊都量到')],
           ['已驗證可加速網站', nf.format(p.acceleration.verifiedSites), `台灣節點 v4 ${p.acceleration.twNodesV4} · v6 ${p.acceleration.twNodesV6}`]
         ];
         sec.tiles.textContent = '';

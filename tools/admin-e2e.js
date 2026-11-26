@@ -1014,7 +1014,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             check(await sp.locator('#kd-routing .gauge').count() === 6 && await sp.locator('#kd-routing .gauge.other').count() === 1, '儀表板：環形儀表前 5 家＋「其他」一張');
             check(/其他 2 家/.test(await sp.textContent('#kd-live .rank-row.other')), '儀表板：CDN 排行前 8 家以外合併成「其他」');
             const tilesText = await sp.textContent('#kd-overview .tiles');
-            check(/次量測/.test(tilesText) && /網站中位數縮短/.test(tilesText) && /個網站量到/.test(tilesText), '儀表板：平均縮短、網站中位數旁邊標樣本數', tilesText.slice(0, 300));
+            check(/次量測/.test(tilesText) && /網站中位數差距/.test(tilesText) && /個網站兩邊都量到/.test(tilesText), '儀表板：平均縮短、網站中位數旁邊標樣本數', tilesText.slice(0, 300));
+            // 3.5.1：網站中位數含台灣比較慢的網站，可以是負的：負的寫「慢」、不寫「縮短」，跟 API 的正負一致
+            const med = today.acceleration.medianSavedMs;
+            check(typeof med !== 'number' || (med < 0 ? /台灣節點慢/.test(tilesText) : med > 0 ? /台灣節點快/.test(tilesText) : /兩邊一樣/.test(tilesText)), '儀表板：網站中位數的說明跟正負一致', `${med} / ${tilesText.slice(0, 200)}`);
+            const mt = await sp.evaluate(() => [-5, 12.5, 0, null].map(v => window.KuroshioDashboard.medianText(v)));
+            check(JSON.stringify(mt) === JSON.stringify(['台灣節點慢 5 ms', '台灣節點快 12.5 ms', '兩邊一樣', '—']) && !mt.some(t => /縮短/.test(t)), '儀表板：中位數是負的時寫「慢」、不寫「縮短」', JSON.stringify(mt));
             const rtHead = await sp.textContent('#kd-routing .tbl table tr');
             check(/原本就在台灣/.test(rtHead) && /量測樣本/.test(rtHead), '儀表板：機會成本表多「原本就在台灣」「量測樣本」', rtHead);
             await flowShot('flow-admin-light-1280');

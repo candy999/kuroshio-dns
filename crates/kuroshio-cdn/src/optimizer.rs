@@ -138,6 +138,9 @@ pub struct Route {
     pub abroad: bool,
     pub tw: bool,
     pub saved_ms: Option<f64>,
+    /// 這次是跨 CDN 備援改寫的（3.5.1）：「改走台灣」已經在 `stats.cdn()` 的跨 CDN 次數算過一次，
+    /// 統計要知道，免得加速次數重複算
+    pub cross: bool,
 }
 
 impl Cdn {
@@ -1112,6 +1115,7 @@ impl Cdn {
                 abroad: b.abroad,
                 tw: served_tw,
                 saved_ms: saved,
+                cross: res.rewritten == Some(Rewrite::Cross),
             });
         }
         if res.rewritten == Some(Rewrite::Ecs) {
@@ -1120,6 +1124,7 @@ impl Cdn {
                 abroad: true,
                 tw: true,
                 saved_ms: res.gain_ms,
+                cross: false,
             });
         }
         None

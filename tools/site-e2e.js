@@ -144,7 +144,11 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
             // 跨 CDN 卡片要等資料庫裡有測過的網站才畫（種子資料的跨 CDN 紀錄在啟動整理時清掉了）：沒有時只看說明
             if (fr.crossCdn.explored) check(await page.locator('#cross .pair.unknown').count() === 1 && /其他 2 組/.test(await page.textContent('#cross .pair.other')), '跨 CDN：改走的 CDN 沒記到的標「未辨識」，跟「其他 2 組」分開');
             else check(/資料累積中/.test(await page.textContent('#cross')), '跨 CDN：還沒有測過的網站時顯示說明');
-            check(/次量測/.test(await page.textContent('#o-ms-l')) && /個網站/.test(await page.textContent('#oppSub')) || !fr.acceleration.samples, '平均縮短、網站中位數旁邊標樣本數', await page.textContent('#o-ms-l'));
+            const oppSub = await page.textContent('#oppSub');
+            check(/次量測/.test(await page.textContent('#o-ms-l')) && /個網站/.test(oppSub) || !fr.acceleration.samples, '平均縮短、網站中位數旁邊標樣本數', await page.textContent('#o-ms-l'));
+            // 3.5.1：網站中位數可以是負的（台灣比較慢的網站也算）：負的寫「反而慢」、不寫「省」
+            const fm = fr.acceleration.medianSavedMs;
+            check(typeof fm !== 'number' || !fr.acceleration.samples || (fm < 0 ? /反而慢/.test(oppSub) && !/中位數省/.test(oppSub) : fm > 0 ? /台灣節點快/.test(oppSub) : /兩邊一樣/.test(oppSub)), '網站中位數的說明跟正負一致', `${fm} / ${oppSub}`);
             check(/\d+ 次/.test(await page.textContent('#stackLegend')), '查詢去向的比例旁邊附次數');
             await page.locator('.card:has(> #flow)').screenshot({ path: path.join(SHOTS, `flow-site-${scheme}-${w}.png`) });
             const sites = await page.locator('#siteRank').textContent();
