@@ -1603,7 +1603,7 @@ impl CacheCap {
         }
         let base = self.frozen.unwrap_or(self.configured).min(self.configured);
         if self.quarter {
-            (base / 4).max(256).min(base)
+            (base / 4).max(shrink_floor(self.configured)).min(base)
         } else {
             base
         }
@@ -1611,6 +1611,13 @@ impl CacheCap {
 }
 
 pub type SharedCap = Arc<Mutex<CacheCap>>;
+
+/// 縮小快取（第 2 步）、停止長大時最少留幾筆（3.5.1）：設定上限的 1/8，夾在 256～4,096 筆（不超過設定上限）。
+/// 以前固定 256 筆：128 MB 的機器（上限約 1.8 萬筆）吃緊時縮到 256 筆，家裡常用的網域通常比這多，
+/// 命中率掉下來、每筆都要問上游；多留到約 2,200 筆只多用約 1.3 MB。只轉送（最低限度）照舊 [`FLOOR_CACHE`]
+pub fn shrink_floor(configured: usize) -> usize {
+    (configured / 8).clamp(256, 4096).min(configured)
+}
 
 /// 套用上限並縮到上限以內（留下熱門的）。回傳（之前筆數，之後筆數，釋出 bytes）
 fn apply_cap(resolver: &crate::resolver::Resolver, cap: &CacheCap) -> (usize, usize, usize) {
@@ -1657,7 +1664,7 @@ impl Step for CacheStep {
         if allowed {
             cap.frozen = None;
         } else if cap.frozen.is_none() {
-            cap.frozen = Some(self.resolver.cache.lock().unwrap().len().max(256));
+            cap.frozen = Some(self.resolver.cache.lock().unwrap().len().max(shrink_floor(cap.configured)));
         }
         self.resolver.cache.lock().unwrap().max = cap.effective().max(16);
     }
@@ -2480,7 +2487,10 @@ mod tests {
         c.frozen = Some(3000);
         assert_eq!(c.effective(), 3000, "接近保留量：停在目前的筆數");
         c.quarter = true;
-        assert_eq!(c.effective(), 750);
+        assert_eq!(c.effective(), 3000, "1/4 是 750，但下限 4,096（3.5.1）、不超過目前的 3,000：不縮");
+        c.frozen = Some(40_000);
+        assert_eq!(c.effective(), 10_000, "比下限多：照舊縮到 1/4");
+        c.frozen = Some(3000);
         c.floor = true;
         assert_eq!(c.effective(), FLOOR_CACHE);
         c.floor = false;
@@ -2488,6 +2498,18 @@ mod tests {
         c.frozen = None;
         assert_eq!(c.effective(), 100_000, "使用者設定的上限照樣是上限");
         assert_eq!(CacheCap::new(500).effective(), 500);
+        // 3.5.1：縮小時的下限依設定上限換算（128 MB 的機器約 1.8 萬筆 → 至少約 2,200 筆）
+        assert_eq!(shrink_floor(17_895), 2_236);
+        assert_eq!(shrink_floor(8_947), 1_118);
+        assert_eq!(shrink_floor(62_634), 4_096, "最多 4,096");
+        assert_eq!(shrink_floor(1_000), 256, "最少 256");
+        assert_eq!(shrink_floor(100), 100, "不超過設定上限");
+        let mut c = CacheCap::new(17_895);
+        c.frozen = Some(4_000);
+        c.quarter = true;
+        assert_eq!(c.effective(), 2_236, "1/4 是 1,000，下限 2,236");
+        c.frozen = Some(1_500);
+        assert_eq!(c.effective(), 1_500, "已經比下限少：不再縮");
     }
 
     /// 假的步驟：記錄呼叫順序；`units` = 還能釋出幾次（過濾清單一次一份）
