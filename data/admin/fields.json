@@ -493,7 +493,7 @@
           "fields": [
             { "key": "site.enabled", "type": "bool", "label": "啟用" },
             { "key": "site.hostname", "type": "host", "label": "網域", "placeholder": "dns.example.com" },
-            { "key": "site.minClients", "type": "int", "label": "排行最少人數", "help": "公開頁的網站排行只列出至少這麼多位不同使用者造訪過的網站。預設 1 = 全部列出；不想讓訪客看到只有一台裝置去過的網站，就調高（例如 2）。公開給別人用的伺服器建議 2 以上（還是 1 時啟動日誌與發現清單會提醒）。儀表板不受限制。", "pro": true, "min": 1 },
+            { "key": "site.minClients", "type": "int", "label": "排行最少人數", "help": "公開頁的網站排行只列出至少這麼多位不同使用者造訪過的網站。留空 = 自動：對外開放（公開頁、DoH 都開著、有設定網域）時 2，其他 1。公開給別人用的伺服器填 1 的話，只有一台裝置去過的網站也會列出來（啟動日誌與發現清單會提醒）。儀表板不受限制。", "pro": true, "min": 1 },
             { "key": "site.detailPath", "type": "text", "label": "詳細資料頁路徑", "pro": true },
             { "key": "site.htmlFile", "type": "path", "label": "自訂首頁檔", "help": "空白 = 內建首頁。", "pro": true },
             { "key": "site.detailFile", "type": "path", "label": "自訂詳細資料頁檔", "pro": true },

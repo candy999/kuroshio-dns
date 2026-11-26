@@ -60,7 +60,8 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
             // DoH 不在 443（例如 443 被占用改用 8443）：公開頁跟 DoH 同一個埠
             doh: { enabled: true, host: '127.0.0.1', port, tls: true, cert: path.join(dir, 'cert.pem'), key: path.join(dir, 'key.pem') }
         },
-        site: { enabled: true, hostname: HOST },
+        // 3.5.1：對外開放時 site.minClients 的 auto 是 2；這裡測資料只有一台裝置，明確填 1 才看得到排行
+        site: { enabled: true, hostname: HOST, minClients: 1 },
         admin: { port: adminPort, auth: false },
         filter: { enabled: false },
         upstream: { pinned: ['udp://127.0.0.1:9'] },
@@ -125,7 +126,7 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
             check(await page.locator('#rt svg').count() === 1 && await page.locator('#trend svg').count() === 1 && await page.locator('#map svg').count() >= 1, '圖表：最近 60 分鐘、近 30 天、路由地圖');
             check(await page.locator('#gauges .gauge').count() >= 3 && await page.locator('#cdnRank .rank-row').count() >= 3, '圖表：各 CDN 環形儀表、CDN 排行');
             const sites = await page.locator('#siteRank').textContent();
-            check(/youtube\.com/.test(sites) && /大家最常造訪的網站/.test(await page.textContent('#sitesCap')), '熱門網站（預設 site.minClients = 1）', sites.slice(0, 120));
+            check(/youtube\.com/.test(sites) && /大家最常造訪的網站/.test(await page.textContent('#sitesCap')), '熱門網站（site.minClients = 1）', sites.slice(0, 120));
             const sw = await page.evaluate(() => document.documentElement.scrollWidth);
             check(sw <= w + 1, '沒有水平捲動', `scrollWidth = ${sw}`);
             const dupAxes = await page.evaluate(() => [...document.querySelectorAll('.chart svg')].map((s, i) => {

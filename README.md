@@ -339,7 +339,7 @@ LuCI「進階 → 上游 DNS」（專業模式）、Windows 設定頁（專業�
 
 ### 公開頁
 - 可以開一個設定說明頁給親友，依實際開啟的協議產生 iPhone 描述檔、Android 私人 DNS、Windows 設定方式，附 QR 碼。
-- 「這台裝置有沒有在用黑潮 DNS」偵測、統計歷史、匿名的網站排行（預設全部列出；`site.minClients` 調高後只列出多位使用者共同造訪的網站，不想讓訪客看到只有一台裝置去過的網站時用）；每個網頁都顯示版本、原始碼網址與授權。
+- 「這台裝置有沒有在用黑潮 DNS」偵測、統計歷史、匿名的網站排行（`site.minClients` 預設自動：對外開放的公開伺服器只列出至少 2 位使用者共同造訪的網站，家裡的路由器全部列出；可以自己填）；每個網頁都顯示版本、原始碼網址與授權。
 - 公開的詳細頁不顯示本機路徑，上游只顯示主機名稱（個人化的 DoH 路徑不會外流）。
 - **DoH 可以用任何埠號**：443 被占用時改用例如 8443，網址寫成 `https://dns.example.net:8443/dns-query`，公開頁也在同一個埠。公開頁的網址、QR 碼、iPhone 描述檔、Windows 範本、`kuroshio url`、Alt-Svc、Cloudflare HTTPS 記錄都跟著帶埠號。DoH3 預設用同一個數字的 UDP 埠，只有那個 UDP 埠被占用時（例如 HTTP.sys 開了 HTTP/3、或另一個 QUIC 服務）才用 `listen.doh.http3Port` 另外指定；用戶端從 Alt-Svc 或 HTTPS 記錄知道 HTTP/3 在哪裡。路由器把外面的 443 轉到本機其他埠時填 `listen.doh.publicPort`（OpenWrt 開放外網時自動帶入）。注意 Android「私人 DNS」只支援 DoT、固定 853 埠（不能帶埠號、不能填 DoH 網址），公開頁會說明。
 

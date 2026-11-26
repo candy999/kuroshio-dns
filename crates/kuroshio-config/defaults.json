@@ -103,7 +103,7 @@
   "site": {
     "enabled": false,
     "hostname": "",
-    "minClients": 1,
+    "minClients": "auto",
     "htmlFile": "",
     "detailFile": "",
     "detailPath": "/detail"

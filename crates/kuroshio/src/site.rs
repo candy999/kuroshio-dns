@@ -401,17 +401,30 @@ fn page_file(cfg: &Value, key: &str, default_name: &str) -> PathBuf {
     }
 }
 
-/// 公開頁對外開放、網站排行最少人數（`site.minClients`）還是 1 時的提醒（3.5.1；沒有是 None）。
-/// 「對外開放」= 公開頁開著、DoH 開著（公開頁跟 DoH 共用網域與埠）、有設定網域（`site.hostname`，`domain` 會自動帶入）。
-/// 預設維持 1：家裡只有一兩台裝置時調成 2 排行就空了；公開伺服器會列出只有一台裝置去過的網站並保存 31 天，
-/// 所以啟動日誌與發現清單提醒站長自己決定
-pub fn public_min_clients_note(cfg: &Value) -> Option<String> {
+/// 公開頁對外開放：公開頁開著、DoH 開著（公開頁跟 DoH 共用網域與埠）、有設定網域（`site.hostname`，`domain` 會自動帶入）
+fn site_public(cfg: &Value) -> bool {
     let on = |k: &str| get(cfg, k).and_then(Value::as_bool).unwrap_or(false);
     let host = get(cfg, "site.hostname").and_then(Value::as_str).unwrap_or("").trim();
-    let min = get(cfg, "site.minClients").and_then(Value::as_u64).unwrap_or(1);
-    (on("site.enabled") && on("listen.doh.enabled") && !host.is_empty() && min <= 1).then(|| {
-        "公開頁對外開放、網站排行最少人數（site.minClients）是 1：只有一台裝置去過的網站也會列出來，每日排行保存 31 天；\
-         公開給別人用的伺服器建議設 2 以上（OpenWrt：min_clients）"
+    on("site.enabled") && on("listen.doh.enabled") && !host.is_empty()
+}
+
+/// 網站排行最少人數（`site.minClients`；3.5.1）：填了數字照填的（至少 1）；`auto`（預設）：對外開放時 2、其他 1。
+/// 公開給別人用的伺服器用 1 的話，只有一台裝置去過的網站也會列出來、每日排行保存 31 天；
+/// 家裡只有一兩台裝置時用 2 排行就空了，所以依「有沒有對外開放」自動決定
+pub fn min_clients(cfg: &Value) -> u64 {
+    match kuroshio_config::num_or_auto(get(cfg, "site.minClients")) {
+        Some(n) => n.max(1),
+        None if site_public(cfg) => 2,
+        None => 1,
+    }
+}
+
+/// 對外開放、而且自己把網站排行最少人數（`site.minClients`）填成 1 時的提醒（3.5.1；沒有是 None）
+pub fn public_min_clients_note(cfg: &Value) -> Option<String> {
+    let explicit_one = kuroshio_config::num_or_auto(get(cfg, "site.minClients")).is_some_and(|n| n <= 1);
+    (site_public(cfg) && explicit_one).then(|| {
+        "公開頁對外開放、網站排行最少人數（site.minClients）設成 1：只有一台裝置去過的網站也會列出來，每日排行保存 31 天；\
+         公開給別人用的伺服器建議 2 以上，或改回 auto（對外開放時自動用 2；OpenWrt：min_clients）"
             .to_string()
     })
 }
@@ -446,7 +459,7 @@ impl Site {
         Some(Arc::new(Site {
             presence,
             about: crate::about::json(cfg),
-            min_clients: get(cfg, "site.minClients").and_then(Value::as_u64).unwrap_or(1).max(1),
+            min_clients: min_clients(cfg),
             html_file: page_file(cfg, "site.htmlFile", "index.html"),
             detail_file: page_file(cfg, "site.detailFile", "detail.html"),
             detail_path: dp,

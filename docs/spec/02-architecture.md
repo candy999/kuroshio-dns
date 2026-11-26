@@ -67,7 +67,7 @@ kuroshio check-config <file>                     檢查設定檔
   | `listen.doh.http3` | `false` | 開啟 DoH3（同埠 UDP） |
   | `listen.doh.http3Port` | `0` | DoH3 改用的 UDP 埠（0 = 跟 DoH 同一個數字）；只有那個 UDP 埠被占用時才需要（見 01 第 1.1.1 節） |
   | `listen.doh.publicPort` | `0` | 外面看到的 DoH 埠號（0 = 跟 `listen.doh.port` 一樣）：埠號轉送時填；公開頁、描述檔、Alt-Svc、HTTPS 記錄用它 |
-  | `site.minClients` | `1` | 公開頁網站排行最少要有幾位不同使用者造訪過（2.x 是 2）。1 = 全部列出；不想讓訪客看到只有一台裝置去過的網站就調高。管理介面的儀表板不受限制。公開頁對外開放而且還是 1 時，啟動日誌（WARN）與發現清單（`site-min-clients-1`）提醒（3.5.1，見 7.1） |
+  | `site.minClients` | `auto` | 公開頁網站排行最少要有幾位不同使用者造訪過（2.x 是 2）。`auto`（3.5.1）：公開頁對外開放（公開頁、DoH 開著、有設定網域）時 2，其他 1（`site::min_clients`）。填了數字照填的（至少 1）。管理介面的儀表板不受限制。對外開放又自己填 1 時，啟動日誌（WARN）與發現清單（`site-min-clients-1`）提醒（見 7.1） |
   | `listen.ddr` | `false` | DDR 自動發現 |
   | `listen.proxyProtocol` | `false` | PROXY protocol v2 |
   | `resolver.stripEch` | `false` | 移除 HTTPS 記錄的 ECH |
@@ -184,9 +184,9 @@ kuroshio check-config <file>                     檢查設定檔
 3.0 新增：
 - 設定教學依實際開啟的協議產生：DoH、DoH3、DoT、DoQ 網址，`sdns://` stamp，Android「私人 DNS」主機名稱，Windows 11 DoH 範本，各平台 App 建議。
 - 頁面檔案放在 `data/site/`（安裝後是 `/usr/share/kuroshio/site/`），可以用 `site.htmlFile` / `site.detailFile` 換成自己的版本（同 2.x）；`{{HOST}}` 代入 `site.hostname`，沒設定時用請求的 Host。DoH 不在 443 時網址要帶埠號，用 `{{DOH_URL}}`（完整 DoH 網址）、`{{SITE_URL}}`（這一頁的網址）、`{{DOH_HOSTPORT}}`（網域加埠號）、`{{DOH_PORT}}`；舊的 `{{HOST}}{{DOH_PATH}}` 寫法不會帶埠號。實作見 `crates/kuroshio/src/site.rs`、`presence.rs`。
-- 網站排行（`topSites`、`topBlocked`）只列出至少 `site.minClients` 位不同使用者造訪過的網站，預設 1（全部列出）。
+- 網站排行（`topSites`、`topBlocked`）只列出至少 `site.minClients` 位不同使用者造訪過的網站，預設 `auto`（對外開放時 2、其他 1）。
 - **排除異常日（3.5.1）**：`/api/stats/exclude?date=YYYY-MM-DD`（POST）把壓測那種日子標成異常，7 天、30 天的統計跳過它（見第 6 節的管理 API 表）。以前一天的壓測就把 7 天、30 天的命中率從 49.6% 拉到 8.6%，要等 30 天才恢復。
-- **隱私提醒（3.5.1）**：公開頁開著、DoH 開著、有設定網域（`site.hostname`，`domain` 會自動帶入）——也就是公開頁對外開放——而且 `site.minClients` 還是 1 時，啟動時記一行 WARN、發現清單有一筆 info（`site-min-clients-1`），建議公開給別人用的伺服器設 2 以上。**預設維持 1**：大部分是家裡的路由器，只有一兩台裝置，改成 2 排行就空了；已經在用的公開頁也不會因為升級突然變空。公開伺服器會列出只有一台裝置去過的網站、每日排行保存 31 天，由站長自己決定。
+- **最少人數預設自動（3.5.1）**：公開頁開著、DoH 開著、有設定網域（`site.hostname`，`domain` 會自動帶入）——也就是公開頁對外開放——時用 2：公開伺服器用 1 會列出只有一台裝置去過的網站、每日排行保存 31 天。其他情況（大部分是家裡的路由器，只有一兩台裝置）用 1，改成 2 排行就空了。自己填了數字的照填的；對外開放又自己填 1 時，啟動時記一行 WARN、發現清單有一筆 info（`site-min-clients-1`）。
 - 排行的資料（3.5.1）：今天的網站與被擋網站各最多 20,000 個（`stats.rs` 的 `Limits.anon_sites`），過去每一天各留前 300 名。收滿時一次淘汰次數最少的一半（同樣次數時最久沒被查到的先，`evict_half()`），再收新的網站；以前收滿就不再加，壓測那天被單一來源的一次性網域佔滿，之後真正使用者的新網站都記不到。每收一萬個新網站才整理一次（攤銷 O(1)），在既有的統計鎖裡做、只比次數與順序兩個數字、不複製網站名稱。
 
 ### 7.2 設定頁

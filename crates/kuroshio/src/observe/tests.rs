@@ -411,7 +411,27 @@ fn public_site_cfg(min: u64) -> Value {
     }))
 }
 
-/// 3.5.1：公開頁對外開放、網站排行最少人數是 1 時提醒（預設不改，站長自己決定）
+/// 3.5.1：網站排行最少人數預設 auto：對外開放時 2、其他 1；填了數字照填的（auto 不提醒）
+#[test]
+fn site_min_clients_auto_follows_public() {
+    let mut public = public_site_cfg(1);
+    public["site"]["minClients"] = json!("auto");
+    assert_eq!(crate::site::min_clients(&public), 2, "對外開放");
+    assert!(crate::site::public_min_clients_note(&public).is_none(), "auto 不提醒");
+    let home = kuroshio_config::build(&json!({ "site": { "enabled": true } }));
+    assert_eq!(crate::site::min_clients(&home), 1, "沒有對外開放（沒設網域、DoH 沒開）");
+    assert_eq!(crate::site::min_clients(&public_site_cfg(1)), 1, "自己填 1");
+    assert_eq!(crate::site::min_clients(&public_site_cfg(3)), 3);
+    let mut zero = public_site_cfg(1);
+    zero["site"]["minClients"] = json!(0);
+    assert_eq!(crate::site::min_clients(&zero), 1, "至少 1");
+    assert_eq!(
+        kuroshio_config::get(&kuroshio_config::build(&json!({})), "site.minClients"),
+        Some(&json!("auto"))
+    );
+}
+
+/// 3.5.1：公開頁對外開放、自己把網站排行最少人數填成 1 時提醒
 #[test]
 fn site_min_clients_note_only_for_public_site() {
     assert!(crate::site::public_min_clients_note(&public_site_cfg(1)).is_some());

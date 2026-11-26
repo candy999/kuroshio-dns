@@ -519,9 +519,9 @@ return view.extend({
 			o = s.option(form.Flag, 'enabled', _('啟用'));
 			o.rmempty = false;
 			o = s.option(form.Value, 'min_clients', _('排行最少人數'),
-				_('公開頁的網站排行只列出至少這麼多位不同使用者造訪過的網站。預設 1 = 全部列出；不想讓訪客看到只有一台裝置去過的網站，就調高（例如 2）。LuCI 的儀表板不受限制。'));
+				_('公開頁的網站排行只列出至少這麼多位不同使用者造訪過的網站。留空 = 自動：對外開放（公開頁、DoH 都開著、有設定網域）時 2，其他 1。LuCI 的儀表板不受限制。'));
 			o.datatype = 'and(uinteger,min(1))';
-			o.placeholder = String(common.def('site.minClients') || 1);
+			o.placeholder = _('自動');
 			o.depends('enabled', '1');
 		}
 
