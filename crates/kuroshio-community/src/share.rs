@@ -55,6 +55,16 @@ fn mkey(kind: &str, key: &str) -> String {
     format!("{kind}\0{key}")
 }
 
+/// 網站記錄的鍵：網站雜湊 + `/` + 位址家族（`to_wire` 與「還存在」的鍵共用）
+pub fn site_key(h: &[u8], fam: u8) -> String {
+    format!("{}/{fam}", hex(h))
+}
+
+/// 跨 CDN 記錄的鍵：網站雜湊
+pub fn cross_key(h: &[u8]) -> String {
+    hex(h)
+}
+
 fn ips_str(v: &[IpAddr]) -> Vec<String> {
     v.iter().take(MAX_IPS).map(|i| i.to_string()).collect()
 }
@@ -92,7 +102,7 @@ pub fn to_wire(r: &LocalRecord, now: u64) -> Option<WireRecord> {
             let h = site_hash(name);
             WireRecord {
                 kind: "site".into(),
-                key: format!("{}/{fam}", hex(&h)),
+                key: site_key(&h, *fam),
                 obs: *obs,
                 exp: obs + ttl_of(Kind::Site),
                 p: Some(p.clone()),
@@ -107,7 +117,7 @@ pub fn to_wire(r: &LocalRecord, now: u64) -> Option<WireRecord> {
             let h = site_hash(name);
             WireRecord {
                 kind: "cross".into(),
-                key: hex(&h),
+                key: cross_key(&h),
                 obs: *obs,
                 exp: obs + ttl_of(Kind::Cross),
                 h: Some(serde_bytes::ByteBuf::from(h.to_vec())),
@@ -227,6 +237,14 @@ impl ShareSet {
 
     /// 用本機目前的資料更新；有變動回 true
     pub fn refresh(&mut self, incoming: Vec<WireRecord>, now: u64) -> bool {
+        self.refresh_keeping(incoming, &[], now)
+    }
+
+    /// 同 [`ShareSet::refresh`]，但 `keep`（kind, key）裡的記錄就算這次沒有也不刪（還存在、只是不在記憶體裡，
+    /// [`crate::provider::DataProvider::kept_keys`]），到期（`exp`）才拿掉。3.5.1 以前記憶體控制把網域移出記憶體時，
+    /// 這裡當成刪除、發出刪除標記：壓測時分享集合被換成壓測網域，已經同步給好友
+    pub fn refresh_keeping(&mut self, incoming: Vec<WireRecord>, keep: &[(String, String)], now: u64) -> bool {
+        let keep: std::collections::HashSet<String> = keep.iter().map(|(k, key)| mkey(k, key)).collect();
         // 每種 kind 有上限：新觀測的優先
         let mut by_kind: HashMap<String, Vec<WireRecord>> = HashMap::new();
         for r in incoming.into_iter().filter(|r| r.exp > now) {
@@ -248,7 +266,12 @@ impl ShareSet {
             }
         }
         let before = self.seq;
-        let gone: Vec<String> = self.recs.keys().filter(|k| !want.contains_key(*k)).cloned().collect();
+        let gone: Vec<String> = self
+            .recs
+            .iter()
+            .filter(|(k, r)| !want.contains_key(*k) && !(r.exp > now && keep.contains(*k)))
+            .map(|(k, _)| k.clone())
+            .collect();
         for k in gone {
             if let Some(r) = self.recs.remove(&k) {
                 self.seq += 1;
@@ -576,6 +599,29 @@ mod tests {
             obs,
             permanent: false,
         }
+    }
+
+    /// 3.5.1：還存在、只是不在記憶體裡的記錄（`keep`）不刪，到期才拿掉；不在 `keep` 裡的照樣刪
+    #[test]
+    fn refresh_keeping_does_not_tombstone_kept() {
+        let now = 100 * DAY;
+        let mut s = ShareSet::new();
+        let w = |v: &[LocalRecord]| v.iter().filter_map(|r| to_wire(r, now)).collect::<Vec<_>>();
+        s.refresh(w(&[node("104.16.1.1", now), node("104.16.1.2", now)]), now);
+        let e = s.epoch;
+        let keep = vec![("node".to_string(), "cloudflare/104.16.1.2".to_string())];
+        assert!(!s.refresh_keeping(w(&[node("104.16.1.1", now)]), &keep, now + HOUR), "沒有變動");
+        assert_eq!(s.len(), 2);
+        assert!(s.delta(Some(&e), Some(2)).unchanged);
+        // 到期（exp）就拿掉，就算還在 keep 裡
+        let late = now + ttl_of(Kind::Node) + 1;
+        s.refresh_keeping(w(&[node("104.16.1.1", late)]), &keep, late);
+        assert_eq!(s.len(), 1);
+        // 不在 keep 裡的照樣刪
+        s.refresh_keeping(Vec::new(), &[], late);
+        assert_eq!(s.len(), 0);
+        assert_eq!(site_key(&[0xab; 12], 4), format!("{}/4", "ab".repeat(12)));
+        assert_eq!(cross_key(&[0xab; 12]), "ab".repeat(12));
     }
 
     #[test]

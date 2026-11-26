@@ -1162,11 +1162,11 @@ fn start_community(
     }
     let key_dir = crate::chain::ident::key_dir(cfg, base_dir);
     let mut opts = Options::new(key_dir, persist_dir(cfg));
-    opts.provider = Arc::new(crate::community_bridge::CdnData {
-        cdn: cdn.clone(),
-        upstreams: Some(resolver.upstreams.clone()),
-        own_bases: kuroshio_config::own_base_domains(cfg),
-    });
+    opts.provider = Arc::new(crate::community_bridge::CdnData::new(
+        cdn.clone(),
+        Some(resolver.upstreams.clone()),
+        kuroshio_config::own_base_domains(cfg),
+    ));
     let node = match Community::open(c, opts) {
         Ok(n) => n,
         Err(e) => {

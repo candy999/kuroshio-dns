@@ -1179,6 +1179,12 @@ impl Db {
         !self.evicted.is_empty() && self.evicted.binary_search(&name_hash(name)).is_ok()
     }
 
+    /// 名稱雜湊（[`name_hash`]）是 `h` 的網域可能在磁碟上（被移出記憶體）：記著名稱雜湊、不記名稱的呼叫端用
+    /// （社群分享記著分享過哪些網域，3.5.1）
+    pub fn is_evicted_hash(&self, h: u32) -> bool {
+        !self.evicted.is_empty() && self.evicted.binary_search(&h).is_ok()
+    }
+
     /// 移出記憶體的筆數
     pub fn evicted_count(&self) -> usize {
         self.evicted.len()

@@ -9,8 +9,9 @@ use kuroshio_cdn::{Cdn, CrossHint as CdnCross, HintIp, HintKind, Hints};
 use kuroshio_community::provider::{DataProvider, LocalRecord, RangeCheck, Received};
 use kuroshio_community::score::{Kind, Outcome};
 use kuroshio_community::Community;
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// 每類最多分享幾筆（同 2.x LIMITS）
 const MAX_NODES: usize = 400;
@@ -20,12 +21,131 @@ const MAX_CROSS: usize = 5000;
 const IPS_PER_ITEM: usize = 4;
 /// 只分享最近 30 天內驗證過的
 const SINCE_MS: u64 = 30 * 86400 * 1000;
+/// 網站、跨 CDN 結果只分享被查過幾次以上的網域（3.5.1）：一次性網域（壓測、外部探測的隨機子網域）不分享
+const MIN_HITS: u32 = 2;
+
+/// 分享過哪些網域的網站、跨 CDN 記錄（3.5.1）：名稱雜湊（[`kuroshio_cdn::db::name_hash`]）→（網站雜湊, 分享了哪些：
+/// [`SHARED_V4`]、[`SHARED_V6`]、[`SHARED_CROSS`]）。只用來認出「這次沒有、是因為移出記憶體」的網域，
+/// 每筆 20 位元組左右，筆數不超過分享的上限（[`MAX_SITES`] + [`MAX_CROSS`]）
+pub type SharedMemo = HashMap<u32, ([u8; 12], u8)>;
+const SHARED_V4: u8 = 1;
+const SHARED_V6: u8 = 2;
+const SHARED_CROSS: u8 = 4;
 
 pub struct CdnData {
     pub cdn: Option<Arc<Cdn>>,
     pub upstreams: Option<Arc<crate::upstreams::Manager>>,
     /// 自己網域的上層網域（[`kuroshio_config::own_base_domains`]）：這底下的網站、跨 CDN 結果不分享給好友
     pub own_bases: Vec<String>,
+    /// 上一次分享的網域（[`SharedMemo`]）
+    pub shared: Mutex<SharedMemo>,
+    /// 這一次「還存在、只是不在記憶體裡」的記錄（[`DataProvider::kept_keys`]）
+    pub kept: Mutex<Vec<(String, String)>>,
+}
+
+impl CdnData {
+    pub fn new(cdn: Option<Arc<Cdn>>, upstreams: Option<Arc<crate::upstreams::Manager>>, own_bases: Vec<String>) -> CdnData {
+        CdnData {
+            cdn,
+            upstreams,
+            own_bases,
+            shared: Mutex::new(HashMap::new()),
+            kept: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+/// 從 CDN 資料庫挑要分享的網站與跨 CDN 記錄（加到 `out`），回傳（這次分享的網域, 還存在但不在記憶體裡的記錄鍵）。
+///
+/// - 只分享被查過 [`MIN_HITS`] 次以上、有學習資料（驗證、跨 CDN 結果）的網域：一次性網域不分享
+/// - `prev`（上一次分享的）裡這次沒有的網域：如果只是被記憶體控制移出記憶體（[`kuroshio_cdn::db::Db::is_evicted_hash`]），
+///   回傳它的鍵，分享集合照樣保留（到期為止）、不發刪除標記；真的不在了（刪掉、驗證不再通過）才刪。
+///   以前直接從記憶體裡的資料取，移出記憶體就當成刪除：壓測時分享集合被換成壓測網域，已經同步給好友
+pub fn share_domains(
+    db: &kuroshio_cdn::db::Db,
+    own_bases: &[String],
+    now: u64,
+    prev: &SharedMemo,
+    out: &mut Vec<LocalRecord>,
+) -> (SharedMemo, Vec<(String, String)>) {
+    use kuroshio_community::share::{cross_key, site_key};
+    let mut memo: SharedMemo = HashMap::new();
+    let (mut sites, mut cross) = (0, 0);
+    for e in db.domains.values() {
+        let Some(p) = e.provider.val() else { continue };
+        if e.hits < MIN_HITS || !kuroshio_cdn::db::has_learning(e) || kuroshio_config::is_own_domain(&e.name, own_bases) {
+            continue;
+        }
+        let mut bits = 0u8;
+        for (fam, v) in [(4u8, &e.v4), (6u8, &e.v6)] {
+            let Some(v) = v else { continue };
+            let at = v.at.unwrap_or(0);
+            if sites >= MAX_SITES || v.verdict.as_deref() != Some("ok") || now.saturating_sub(at) > SINCE_MS {
+                continue;
+            }
+            let ips: Vec<IpAddr> = v
+                .ips
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(v.ip)
+                .take(IPS_PER_ITEM)
+                .collect();
+            if ips.is_empty() {
+                continue;
+            }
+            sites += 1;
+            bits |= if fam == 4 { SHARED_V4 } else { SHARED_V6 };
+            out.push(LocalRecord::Site {
+                name: e.name.to_string(),
+                p: p.to_string(),
+                fam,
+                ips,
+                pop: v.pop.as_deref().unwrap_or("").to_string(),
+                obs: at,
+            });
+        }
+        if let Some(c) = &e.cross4 {
+            let at = c.at.unwrap_or(0);
+            let ips: Vec<IpAddr> = c.ips.clone().unwrap_or_default().into_iter().take(IPS_PER_ITEM).collect();
+            if cross < MAX_CROSS && c.verdict.as_deref() == Some("ok") && now.saturating_sub(at) <= SINCE_MS && !ips.is_empty() {
+                cross += 1;
+                bits |= SHARED_CROSS;
+                out.push(LocalRecord::Cross {
+                    name: e.name.to_string(),
+                    from: c.from.as_deref().unwrap_or(p).to_string(),
+                    to: c.to.as_deref().unwrap_or("").to_string(),
+                    ips,
+                    obs: at,
+                });
+            }
+        }
+        if bits != 0 {
+            memo.insert(
+                kuroshio_cdn::db::name_hash(&e.name),
+                (kuroshio_community::util::site_hash(&e.name), bits),
+            );
+        }
+    }
+    // 上一次分享、這次沒有的：只是移出記憶體的照樣保留（記號也留著，讀回來或真的不在了再說）
+    let mut kept = Vec::new();
+    if db.evicted_count() > 0 {
+        for (nh, (h, bits)) in prev {
+            if memo.contains_key(nh) || !db.is_evicted_hash(*nh) {
+                continue;
+            }
+            for (bit, fam) in [(SHARED_V4, 4u8), (SHARED_V6, 6)] {
+                if bits & bit != 0 {
+                    kept.push(("site".to_string(), site_key(h, fam)));
+                }
+            }
+            if bits & SHARED_CROSS != 0 {
+                kept.push(("cross".to_string(), cross_key(h)));
+            }
+            memo.insert(*nh, (*h, *bits));
+        }
+    }
+    (memo, kept)
 }
 
 /// 拿掉自己網域底下的網站與跨 CDN 記錄（即使只分享雜湊，也不讓好友能比對出自己的子網域）
@@ -73,55 +193,10 @@ impl DataProvider for CdnData {
                         }
                     }
                 }
-                let (mut sites, mut cross) = (0, 0);
-                for e in st.db.domains.values() {
-                    let Some(p) = e.provider.val() else { continue };
-                    if kuroshio_config::is_own_domain(&e.name, &self.own_bases) {
-                        continue;
-                    }
-                    for (fam, v) in [(4u8, &e.v4), (6u8, &e.v6)] {
-                        let Some(v) = v else { continue };
-                        let at = v.at.unwrap_or(0);
-                        if sites >= MAX_SITES || v.verdict.as_deref() != Some("ok") || now.saturating_sub(at) > SINCE_MS {
-                            continue;
-                        }
-                        let ips: Vec<IpAddr> = v
-                            .ips
-                            .clone()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .chain(v.ip)
-                            .take(IPS_PER_ITEM)
-                            .collect();
-                        if ips.is_empty() {
-                            continue;
-                        }
-                        sites += 1;
-                        out.push(LocalRecord::Site {
-                            name: e.name.to_string(),
-                            p: p.to_string(),
-                            fam,
-                            ips,
-                            pop: v.pop.as_deref().unwrap_or("").to_string(),
-                            obs: at,
-                        });
-                    }
-                    if let Some(c) = &e.cross4 {
-                        let at = c.at.unwrap_or(0);
-                        let ips: Vec<IpAddr> = c.ips.clone().unwrap_or_default().into_iter().take(IPS_PER_ITEM).collect();
-                        if cross < MAX_CROSS && c.verdict.as_deref() == Some("ok") && now.saturating_sub(at) <= SINCE_MS && !ips.is_empty()
-                        {
-                            cross += 1;
-                            out.push(LocalRecord::Cross {
-                                name: e.name.to_string(),
-                                from: c.from.as_deref().unwrap_or(p).to_string(),
-                                to: c.to.as_deref().unwrap_or("").to_string(),
-                                ips,
-                                obs: at,
-                            });
-                        }
-                    }
-                }
+                let mut memo = self.shared.lock().unwrap();
+                let (next, kept) = share_domains(&st.db, &self.own_bases, now, &memo, &mut out);
+                *memo = next;
+                *self.kept.lock().unwrap() = kept;
             });
         }
         if let Some(m) = &self.upstreams {
@@ -137,6 +212,10 @@ impl DataProvider for CdnData {
         }
         drop_own(&mut out, &self.own_bases);
         out
+    }
+
+    fn kept_keys(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.kept.lock().unwrap())
     }
 
     /// 好友給的資料：網站與跨 CDN 提示等有人查到時才經 [`CommunityHints`] 拿；台灣節點在這裡放進
@@ -318,6 +397,93 @@ mod own_domain_tests {
         // 跨 CDN 提示的結果記在跨 CDN 的分數（以前一律記成網站，跨 CDN 提示再不準也不會暫停）
         assert_eq!(score_kind(HintKind::Site), Kind::Site);
         assert_eq!(score_kind(HintKind::Cross), Kind::Cross);
+    }
+
+    /// 3.5.1：只分享查過 2 次以上、有學習資料的網域；記憶體控制移出記憶體的不算刪除（分享集合照樣保留），
+    /// 真的不在了才刪
+    #[test]
+    fn evicted_domains_are_kept_one_shot_not_shared() {
+        use kuroshio_cdn::db::{Cross, Db, Verdict};
+        use kuroshio_community::share::{to_wire, ShareSet};
+        let now = 1_800_000_000_000u64;
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let ok = || {
+            Some(Box::new(Verdict {
+                verdict: Some("ok".into()),
+                at: Some(now - 1000),
+                ips: Some(vec![ip]),
+                ..Default::default()
+            }))
+        };
+        let mut db = Db::new(1000);
+        db.set_shards(1);
+        for (name, hits, cold) in [
+            ("www.example.com", 5u32, true),
+            ("img.example.com", 3, false),
+            ("p0abcdefgh.example.net", 1, false),
+            ("p1abcdefgh.example.net", 1, true),
+        ] {
+            let d = db.touch(name, "cloudflare", "ip", &[ip], &[], None);
+            d.hits = hits;
+            d.v4 = ok();
+            d.last_seen = if cold { now - 86_400_000 } else { now };
+        }
+        db.touch("cross.example.com", "cloudflare", "ip", &[ip], &[], None).hits = 4;
+        db.domains.get_mut("cross.example.com").unwrap().cross4 = Some(Box::new(Cross {
+            verdict: Some("ok".into()),
+            to: Some("akamai".into()),
+            at: Some(now - 1000),
+            ips: Some(vec![ip]),
+            ..Default::default()
+        }));
+        db.domains.get_mut("cross.example.com").unwrap().last_seen = now - 86_400_000;
+        let names = |out: &[LocalRecord]| -> Vec<String> {
+            let mut v: Vec<String> = out
+                .iter()
+                .filter_map(|r| match r {
+                    LocalRecord::Site { name, .. } => Some(format!("site:{name}")),
+                    LocalRecord::Cross { name, .. } => Some(format!("cross:{name}")),
+                    _ => None,
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let mut out = Vec::new();
+        let (memo, kept) = share_domains(&db, &[], now, &HashMap::new(), &mut out);
+        assert_eq!(
+            names(&out),
+            ["cross:cross.example.com", "site:img.example.com", "site:www.example.com"],
+            "只查過一次的不分享"
+        );
+        assert!(kept.is_empty());
+        assert_eq!(memo.len(), 3);
+        let mut set = ShareSet::new();
+        set.refresh(out.iter().filter_map(|r| to_wire(r, now)).collect(), now);
+        assert_eq!(set.len(), 3);
+        // 記憶體控制把冷的移出記憶體：www 與 cross 不在記憶體裡了，但不是刪除
+        db.take_marks(true);
+        let ev = db.evict_cold(now - 3_600_000, &|_| true);
+        assert_eq!(ev.entries, 3, "www、cross、p1 移出");
+        let mut out = Vec::new();
+        let (memo, kept) = share_domains(&db, &[], now + 600_000, &memo, &mut out);
+        assert_eq!(names(&out), ["site:img.example.com"]);
+        assert_eq!(kept.len(), 2, "www 的網站記錄與 cross 的跨 CDN 記錄：{kept:?}");
+        let before = set.len();
+        set.refresh_keeping(out.iter().filter_map(|r| to_wire(r, now)).collect(), &kept, now + 600_000);
+        assert_eq!(set.len(), before, "移出記憶體的照樣分享，不發刪除標記");
+        // 真的不在了（不在記憶體、移出的名單裡也沒有，例如磁碟上的分片被淘汰）才刪
+        db.unevict("www.example.com");
+        let mut out = Vec::new();
+        let (memo, kept) = share_domains(&db, &[], now + 1_200_000, &memo, &mut out);
+        assert_eq!(kept.len(), 1, "只剩 cross 還在磁碟上");
+        assert!(memo.len() >= 2);
+        set.refresh_keeping(out.iter().filter_map(|r| to_wire(r, now)).collect(), &kept, now + 1_200_000);
+        assert_eq!(set.len(), 2, "www 不在記憶體也不在磁碟上：刪除");
+        // 記錄到期（觀測後 3 天）就算還在磁碟上也拿掉
+        let late = now + 4 * 86_400_000;
+        set.refresh_keeping(Vec::new(), &kept, late);
+        assert_eq!(set.len(), 0);
     }
 
     #[test]

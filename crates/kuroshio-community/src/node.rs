@@ -1212,9 +1212,20 @@ impl Community {
             })
             .filter_map(|r| crate::share::to_wire(r, now))
             .collect();
+        // 還存在、只是不在記憶體裡的（3.5.1）：照同樣的開關，關掉分享的照樣刪
+        let keep: Vec<(String, String)> = self
+            .provider
+            .kept_keys()
+            .into_iter()
+            .filter(|(k, _)| match k.as_str() {
+                "site" | "cross" => cfg.share_domains,
+                "upstream" => cfg.share_upstreams,
+                _ => true,
+            })
+            .collect();
         let mut st = self.lock();
         st.share_at = now;
-        st.share.refresh(recs, now)
+        st.share.refresh_keeping(recs, &keep, now)
     }
 
     /// state 重置：換新的 epoch，好友下次同步拿完整集合

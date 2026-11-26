@@ -122,6 +122,12 @@ pub trait DataProvider: Send + Sync {
     fn local_records(&self) -> Vec<LocalRecord> {
         vec![]
     }
+    /// 這次 `local_records()` 沒有、但**還存在**的記錄的（kind, key）（3.5.1）：例如記憶體控制把冷資料移出記憶體、
+    /// 內容還在磁碟上。分享集合照樣保留已經分享出去的那一筆（到期為止），不當成刪除、不發刪除標記。
+    /// 每次在 `local_records()` 之後呼叫
+    fn kept_keys(&self) -> Vec<(String, String)> {
+        vec![]
+    }
     /// 我的網路（ASN、Cloudflare 機房），放在身分文件與同步回應
     fn net_ctx(&self) -> NetInfo {
         NetInfo::default()
