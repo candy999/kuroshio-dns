@@ -1062,6 +1062,25 @@ pub fn has_learning(d: &Domain) -> bool {
     d.v4.is_some() || d.v6.is_some() || d.ecs.is_some() || d.cross4.is_some() || d.best.is_some()
 }
 
+/// 學習資料裡還有效、下次查詢真的會用到的（3.5.1 H2）：v4／v6 驗證還沒到期，或 ECS、跨 CDN 的結果還沒到期。
+/// 到期的驗證結果下次查詢一樣當試用期、重新驗證（`vstate`），跨 CDN 到期是 `none`、ECS 到期不用；`best` 只記上次哪一招成功，
+/// 對應的結果到期了也用不到
+pub fn has_live_learning(d: &Domain, now: u64) -> bool {
+    let live = |until: Option<u64>| until.is_some_and(|u| u > now);
+    d.v4.as_ref().is_some_and(|v| v.valid(now))
+        || d.v6.as_ref().is_some_and(|v| v.valid(now))
+        || d.ecs.as_ref().is_some_and(|x| live(x.until))
+        || d.cross4.as_ref().is_some_and(|x| live(x.until))
+}
+
+/// 定期忘掉的一次性網域（3.5.1 H2，[`Db::forget_one_shot`]）：只問過一次、自動策略，而且**沒有還有效的學習資料**
+/// （[`has_live_learning`]）。比讀回冷資料時的 [`forgettable`] 寬：不是 `cdn.lite` 的機器（D3、Windows）第一次查詢就驗證，
+/// 一次性網域幾乎都帶著驗證結果（多半還有 `best`）；照 [`forgettable`] 的條件它們永遠不會被忘掉。
+/// 呼叫端另外要求 3 天沒出現（[`FORGET_ONE_SHOT_MS`]）：驗證成功 24 小時、失敗 6 小時就到期，到那時已經沒有結果可以重用
+pub fn forgettable_stale(d: &Domain, now: u64) -> bool {
+    d.hits <= 1 && d.policy() == Policy::Auto && !has_live_learning(d, now)
+}
+
 /// 筆數上限淘汰的組數（[`prune_group`]）
 const PRUNE_GROUPS: usize = 4;
 
@@ -1854,8 +1873,9 @@ impl Db {
         dropped
     }
 
-    /// 定期忘掉一次性網域（3.5.1 H2；背景的預算整理那一輪呼叫，不在查詢路徑上）：只問過一次、沒有學習資料、
-    /// 自動策略、超過 [`FORGET_ONE_SHOT_MS`] 沒出現（同 [`forgettable`]）。以前只有小 Flash 的磁碟預算會淘汰它們，
+    /// 定期忘掉一次性網域（3.5.1 H2；背景的預算整理那一輪呼叫，不在查詢路徑上）：只問過一次、沒有還有效的學習資料、
+    /// 自動策略、超過 [`FORGET_ONE_SHOT_MS`] 沒出現（[`forgettable_stale`]：到期的驗證結果不算，不然第一次查詢就驗證的機器上
+    /// 一筆都忘不掉）。以前只有小 Flash 的磁碟預算會淘汰它們，
     /// 沒有預算的大機器（Windows、大磁碟）上一直留著，直到筆數上限把淘汰推著跑。
     ///
     /// 分批、有上限：只看本來就有重要變動（反正要寫）的分片，`rotate` 時另外輪流看「分片數 ÷ 16」片
@@ -1884,7 +1904,7 @@ impl Db {
         let names: Vec<Arc<str>> = self
             .domains
             .values()
-            .filter(|d| d.last_seen < cutoff && forgettable(d) && pick[shard_of(&d.name, n)])
+            .filter(|d| d.last_seen < cutoff && forgettable_stale(d, now) && pick[shard_of(&d.name, n)])
             .take(FORGET_ONE_SHOT_MAX)
             .map(|d| d.name.clone())
             .collect();
@@ -2791,7 +2811,12 @@ mod tests {
         }
         put(&mut db, "fresh.example.com", 1, 1, None);
         put(&mut db, "twice.example.com", 30, 2, None);
+        // 驗證結果還沒到期的留著；到期的（一次性網域第一次查詢就驗證過、之後沒人再問）跟沒有結果一樣忘掉
         put(&mut db, "failed.example.com", 30, 1, Some("fail"));
+        db.get_mut("failed.example.com").unwrap().v4.as_mut().unwrap().until = Some(NOW + DAY);
+        put(&mut db, "expired.example.com", 30, 1, Some("ok"));
+        db.get_mut("expired.example.com").unwrap().v4.as_mut().unwrap().until = Some(NOW - 29 * DAY);
+        db.get_mut("expired.example.com").unwrap().best = Some(Strategy::Alias);
         put(&mut db, "manual.example.com", 30, 1, None);
         db.set_policy("manual.example.com", Policy::Always);
         db.take_marks(false);
@@ -2812,7 +2837,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(total, 3200, "輪完一圈全部忘掉");
+        assert_eq!(total, 3201, "輪完一圈全部忘掉（含驗證結果已經到期的）");
         let mut left: Vec<&str> = db.domains.keys().map(|k| &**k).collect();
         left.sort_unstable();
         assert_eq!(
@@ -2833,6 +2858,45 @@ mod tests {
         }
         assert_eq!(db.forget_one_shot(NOW, true), FORGET_ONE_SHOT_MAX);
         assert_eq!(db.forget_one_shot(NOW, true), 100);
+    }
+
+    /// 3.5.1 H2（D3 R1）：3.5.0 寫的資料裡，不是 `cdn.lite` 的機器第一次查詢就驗證，一次性網域幾乎都帶著到期的驗證結果
+    /// 與 `best`。到期的不算學習資料；還有效的驗證、ECS、跨 CDN 結果照樣留著
+    #[test]
+    fn forgettable_stale_ignores_expired_learning() {
+        let old = NOW - 5 * DAY;
+        let rec = |extra: Value| -> Domain {
+            let mut v = json!({ "name": "a.example.com", "provider": "cloudflare", "via": "ip",
+                "firstSeen": old, "lastSeen": old, "hits": 1, "policy": "auto" });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        // 3.5.0 的樣子：驗證成功、24 小時到期、best 是 alias
+        let verified = rec(json!({ "v4": { "verdict": "ok", "until": old + DAY, "algo": 2, "pop": "TPE" }, "best": "alias" }));
+        assert!(has_learning(&verified) && !forgettable(&verified), "讀回冷資料的條件不變");
+        assert!(!has_live_learning(&verified, NOW) && forgettable_stale(&verified, NOW));
+        let failed = rec(json!({ "v4": { "verdict": "fail", "fails": 1, "until": old + 6 * 3_600_000 } }));
+        assert!(forgettable_stale(&failed, NOW));
+        let no_until = rec(json!({ "v4": { "verdict": "fail" }, "v6": { "verdict": "ok" } }));
+        assert!(forgettable_stale(&no_until, NOW), "沒有到期時間的當成到期");
+        let cross_old = rec(json!({ "cross4": { "verdict": "fail", "until": old + DAY, "at": old } }));
+        assert!(forgettable_stale(&cross_old, NOW));
+        // 還有效的留著
+        for live in [
+            json!({ "v4": { "verdict": "ok", "until": NOW + DAY } }),
+            json!({ "v6": { "verdict": "fail", "until": NOW + 1 } }),
+            json!({ "ecs": { "verdict": "none", "until": NOW + DAY } }),
+            json!({ "cross4": { "verdict": "fail", "until": NOW + 7 * DAY } }),
+        ] {
+            let d = rec(live.clone());
+            assert!(has_live_learning(&d, NOW) && !forgettable_stale(&d, NOW), "{live}");
+        }
+        let mut twice = verified.clone();
+        twice.hits = 2;
+        assert!(!forgettable_stale(&twice, NOW), "問過兩次的不動");
+        let mut manual = verified.clone();
+        manual.policy = Some(Policy::Never);
+        assert!(!forgettable_stale(&manual, NOW), "手動策略的不動");
     }
 
     // ---- 磁碟預算（3.5.0 C5）----
