@@ -407,13 +407,30 @@ pub fn read_min_free_kb() -> Option<u64> {
 /// 依設定與這台機器決定保留量
 pub fn reserve_from_cfg(cfg: &Value) -> Reserve {
     let n = |k: &str| kuroshio_config::num_or_auto(kuroshio_config::get(cfg, k)).unwrap_or(0);
-    derive_reserve(
+    reserve_for(
         sysinfo::mem_bytes().0,
         Platform::current(),
         read_min_free_kb(),
+        sysinfo::in_smaller_cgroup(),
         n("system.memoryReserveMB"),
         n("system.memoryReservePercent"),
     )
+}
+
+/// 保留量；`cgroup` = 實體記憶體是 cgroup 的上限（比整台機器小）。
+///
+/// cgroup 裡不看 `min_free_kbytes`（3.5.1 8 號單）：那是整台機器的核心參數，跟 cgroup 的大小無關。D3 的 12,288 KB × 3
+/// 在 150 MB 的 cgroup 裡保留 36 MB（24%），黑潮可以用的少了一大塊。整台機器那一側仍然有保護：可用取「系統可用」與
+/// 「上限 − 已用」較小的（[`sysinfo::apply_cgroup`]），而系統可用（`MemAvailable`）本來就扣掉了核心的低水位
+fn reserve_for(total: Option<u64>, platform: Platform, min_free_kb: Option<u64>, cgroup: bool, user_mb: u64, user_pct: u64) -> Reserve {
+    if !cgroup {
+        return derive_reserve(total, platform, min_free_kb, user_mb, user_pct);
+    }
+    let mut r = derive_reserve(total, platform, None, user_mb, user_pct);
+    if r.auto {
+        r.how = "自動（在 cgroup 的上限裡）：max(16 MB, min(上限的 5%, 1 GB))，不看整台機器的 min_free_kbytes".into();
+    }
+    r
 }
 
 /// 遲滯：可用記憶體回到「保留量 + 這麼多」以上才恢復、才繼續長大（保留量的一半，至少 8 MB）
@@ -880,6 +897,10 @@ struct Inner {
     pressed_since: Option<u64>,
     /// 上一次讓出 [`USEFUL_SHED_BYTES`] 以上的時間
     last_useful_shed: u64,
+    /// 只差「6 小時最多一次」而沒有原地重新啟動：最快這個時間（Unix 秒）才會再做；0 = 沒有在等
+    restart_blocked_until: u64,
+    /// 下一次可以寫「6 小時內做過」說明的時間（[`steady_secs`]）
+    restart_note_at: u64,
 }
 
 /// 讓出這麼多以上才算「還有東西可以讓」（判斷記憶體回不來用；3.5.1 N1）
@@ -894,6 +915,19 @@ pub const RESTART_LOW_QPS: u64 = 10;
 pub const RESTART_OWN_PERCENT: u64 = 30;
 /// 上一次原地重新啟動的時間（Unix 秒），重新執行時帶給新的行程
 pub const RESTART_ENV: &str = "KUROSHIO_MEMORY_RESTART_AT";
+/// 「本來會原地重新啟動、但 6 小時內做過」的說明多久最多寫一次（秒）
+pub const RESTART_GAP_NOTE_SECS: u64 = 3600;
+
+/// [`Governor::restart_check`] 的結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartCheck {
+    /// 不需要（或條件不成立）
+    No,
+    /// 該重新啟動了
+    Due,
+    /// 其他條件都成立，只是離上一次不到 6 小時：最快這個時間（Unix 秒）才會再做
+    Gap(u64),
+}
 
 static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 static RESTART_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
@@ -996,6 +1030,8 @@ impl Governor {
                 futile: FutileGate::default(),
                 pressed_since: None,
                 last_useful_shed: 0,
+                restart_blocked_until: 0,
+                restart_note_at: 0,
             }),
             gap: 5,
             dwell: 180,
@@ -1037,18 +1073,21 @@ impl Governor {
     /// 256 KB 以上、現在也沒有能做的步驟）、是自己回不來（RSS ≥ 實體記憶體 30%，不是於事無補）、離峰（最近 15 分鐘
     /// 平均每秒 10 筆以下）、離上一次 6 小時以上。原因：musl 的配置器放掉的小塊記憶體不還給系統，洪水過後就一直
     /// 卡在吃緊／不足，過濾清單、快取、CDN 新網域一直減量到重新啟動為止（3.5.1 測試版 D3：停了 15 分鐘 RSS 還是 309 MB）
-    fn restart_due(&self, i: &Inner, state: State, r: &Reading, now: u64, wall: u64) -> bool {
+    ///
+    /// `last` 是上一次原地重新啟動的時間（Unix 秒，沒有是 0）；只差「6 小時最多一次」時回 [`RestartCheck::Gap`]，
+    /// 讓日誌與狀態說得出在等什麼（3.5.1 8 號單：一直「不足」27 分鐘、沒有重新啟動，看不出原因）
+    fn restart_check(&self, i: &Inner, state: State, r: &Reading, now: u64, wall: u64, last: u64) -> RestartCheck {
         if !self.restart.load(Ordering::Relaxed) || RESTART_PENDING.load(Ordering::Relaxed) {
-            return false;
+            return RestartCheck::No;
         }
         if state == State::Comfortable || i.futile.on {
-            return false;
+            return RestartCheck::No;
         }
         let stuck = i.pressed_since.is_some_and(|t| now.saturating_sub(t) >= RESTART_STUCK_SECS)
             && now.saturating_sub(i.last_useful_shed) >= RESTART_STUCK_SECS
             && self.pick(i, state, r, now).is_none();
         if !stuck {
-            return false;
+            return RestartCheck::No;
         }
         let mine = match (r.rss, r.total) {
             (Some(rss), Some(t)) if t > 0 => rss.saturating_mul(100) >= t.saturating_mul(RESTART_OWN_PERCENT),
@@ -1060,8 +1099,13 @@ impl Governor {
             .unwrap()
             .as_ref()
             .is_some_and(|f| f() < RESTART_LOW_QPS * 15 * 60);
-        let last = last_restart_at();
-        mine && quiet && (last == 0 || wall.saturating_sub(last) >= RESTART_MIN_GAP_SECS)
+        if !(mine && quiet) {
+            RestartCheck::No
+        } else if last == 0 || wall.saturating_sub(last) >= RESTART_MIN_GAP_SECS {
+            RestartCheck::Due
+        } else {
+            RestartCheck::Gap(last + RESTART_MIN_GAP_SECS)
+        }
     }
 
     /// 換掉量測的方法（測試注入固定的數字）
@@ -1106,7 +1150,15 @@ impl Governor {
             let labels: Vec<&'static str> = i.shed.iter().map(|s| s.label).collect();
             (i.hyst.state, i.last.avail, i.futile.on, labels)
         };
-        shed.dedup();
+        // 同一步讓了好幾輪（例如 CDN 冷資料移出、中間夾著別的步驟）只列一次，照第一次讓出的順序（3.5.1 8 號單）
+        let mut seen: Vec<&'static str> = Vec::with_capacity(shed.len());
+        shed.retain(|l| {
+            let new = !seen.contains(l);
+            if new {
+                seen.push(l);
+            }
+            new
+        });
         MemSummary {
             state,
             avail,
@@ -1196,7 +1248,31 @@ impl Governor {
             } else if i.pressed_since.is_none() {
                 i.pressed_since = Some(now);
             }
-            if self.restart_due(i, state, &r, now, crate::persist::now_secs()) {
+            let wall = crate::persist::now_secs();
+            let check = self.restart_check(i, state, &r, now, wall, last_restart_at());
+            i.restart_blocked_until = match check {
+                RestartCheck::Gap(until) => until,
+                _ => 0,
+            };
+            if let RestartCheck::Gap(until) = check {
+                if now >= i.restart_note_at {
+                    i.restart_note_at = now + RESTART_GAP_NOTE_SECS;
+                    let ago = wall.saturating_sub(until.saturating_sub(RESTART_MIN_GAP_SECS));
+                    let left = until.saturating_sub(wall);
+                    let msg = format!(
+                        "記憶體控制：讓得出的都讓了，可用記憶體還是回不來（系統可用 {} MB，黑潮用了 {} MB），\
+                         但 {} 分鐘前已經原地重新啟動過一次（6 小時最多一次），約 {} 分鐘後才會再考慮；\
+                         要馬上拿回記憶體可以手動重新啟動黑潮",
+                        r.avail.map_or(0, mb_round),
+                        r.rss.map_or(0, mb_round),
+                        ago / 60,
+                        left.div_ceil(60)
+                    );
+                    info!("{msg}");
+                    Self::event(i, now, msg);
+                }
+            }
+            if check == RestartCheck::Due {
                 let msg = format!(
                     "記憶體控制：讓得出的都讓了，可用記憶體還是回不來（系統可用 {} MB，保留 {} MB，黑潮用了 {} MB；\
                      配置器放掉的記憶體沒有還給系統）。現在是離峰：先寫出快照，原地重新啟動一次拿回記憶體（DNS 中斷幾秒；6 小時最多一次）",
@@ -1508,6 +1584,8 @@ impl Governor {
             "freedTotalBytes": i.freed_total,
             "lastChange": i.last_change.map(|(at, from, to)| json!({ "at": steady_to_wall_ms(at), "from": from.as_str(), "to": to.as_str() })),
             "waiting": i.waiting,
+            // 只差「6 小時最多一次」而沒有原地重新啟動時，最快什麼時候會再做（Unix 毫秒；3.5.1 8 號單）
+            "restartBlockedUntil": (i.restart_blocked_until > 0).then(|| i.restart_blocked_until.saturating_mul(1000)),
             "nextRestoreAt": (i.next_restore_at > 0 && !i.shed.is_empty()).then(|| steady_to_wall_ms(i.next_restore_at)),
             "events": i.events.iter().rev().map(|e| json!({ "at": steady_to_wall_ms(e.at), "msg": e.msg })).collect::<Vec<_>>(),
             // 測試開關（3.5.0 C9）：模擬可用記憶體中（null = 沒開）
@@ -2160,6 +2238,55 @@ mod tests {
     }
 
     #[test]
+    fn finding_summary_lists_each_step_once() {
+        // 3.5.1 8 號單：CDN 冷資料移出做了兩輪、中間夾著停用過濾清單，發現清單的文字列了兩次
+        let g = Governor::new(res100(), Vec::new(), 0);
+        {
+            let mut i = g.inner.lock().unwrap();
+            for (key, label) in [
+                ("diag", "縮小診斷緩衝"),
+                ("cdn", "CDN 冷資料"),
+                ("filter", "停用過濾清單"),
+                ("cdn", "CDN 冷資料"),
+                ("floor", "只轉送"),
+            ] {
+                i.shed.push(ShedRec {
+                    key,
+                    label,
+                    detail: String::new(),
+                    bytes: 0,
+                    avail_before: None,
+                    avail_delta: None,
+                    at: 0,
+                });
+            }
+        }
+        assert_eq!(
+            g.finding_summary().shed,
+            vec!["縮小診斷緩衝", "CDN 冷資料", "停用過濾清單", "只轉送"]
+        );
+    }
+
+    #[test]
+    fn reserve_in_cgroup_ignores_min_free() {
+        // 3.5.1 8 號單：D3 min_free_kbytes 12,288，cgroup 上限 150 MB → 以前 36 MB，現在 16 MB
+        let host = reserve_for(Some(150 * MB), Platform::Linux, Some(12288), false, 0, 0);
+        assert_eq!(host.bytes, 36 * MB);
+        let cg = reserve_for(Some(150 * MB), Platform::Linux, Some(12288), true, 0, 0);
+        assert_eq!(cg.bytes, 16 * MB);
+        assert!(cg.auto && cg.how.contains("cgroup"));
+        // 大的 cgroup 照 5%
+        assert_eq!(
+            reserve_for(Some(2000 * MB), Platform::Linux, Some(12288), true, 0, 0).bytes,
+            100 * MB
+        );
+        // 使用者自己填的照填
+        let user = reserve_for(Some(150 * MB), Platform::Linux, Some(12288), true, 40, 0);
+        assert_eq!(user.bytes, 40 * MB);
+        assert!(!user.auto);
+    }
+
+    #[test]
     fn reserve_derivation() {
         // Linux 自動：max(16 MB, 5%（最多 1 GB）, min_free_kbytes × 3)，不超過一半
         let r = derive_reserve(Some(128 * MB), Platform::Linux, Some(1024), 0, 0);
@@ -2700,7 +2827,7 @@ mod tests {
         };
         let due = |g: &Governor, rss: u64, now: u64| {
             let i = g.inner.lock().unwrap();
-            g.restart_due(&i, State::Tight, &r(rss), now, 2_000_000_000)
+            g.restart_check(&i, State::Tight, &r(rss), now, 2_000_000_000, 0) == RestartCheck::Due
         };
         stuck(&g, 1000, 1000);
         assert!(!due(&g, 400, 2000), "沒開");
@@ -2718,7 +2845,26 @@ mod tests {
         assert!(!due(&g, 400, 2000), "於事無補（別的程式造成的）");
         g.inner.lock().unwrap().futile.on = false;
         let i = g.inner.lock().unwrap();
-        assert!(!g.restart_due(&i, State::Comfortable, &r(400), 2000, 2_000_000_000), "寬裕");
+        assert_eq!(
+            g.restart_check(&i, State::Comfortable, &r(400), 2000, 2_000_000_000, 0),
+            RestartCheck::No,
+            "寬裕"
+        );
+        // 6 小時最多一次：其他條件都成立時說出最快什麼時候會再做；過了 6 小時就照常
+        let wall = 2_000_000_000;
+        assert_eq!(
+            g.restart_check(&i, State::Tight, &r(400), 2000, wall, wall - 3600),
+            RestartCheck::Gap(wall - 3600 + RESTART_MIN_GAP_SECS)
+        );
+        assert_eq!(
+            g.restart_check(&i, State::Tight, &r(400), 2000, wall, wall - RESTART_MIN_GAP_SECS),
+            RestartCheck::Due
+        );
+        assert_eq!(
+            g.restart_check(&i, State::Tight, &r(200), 2000, wall, wall - 3600),
+            RestartCheck::No,
+            "條件不成立時不是在等 6 小時"
+        );
     }
 
     fn futures_lite_block<T>(f: BoxFut<'_, T>) -> T {

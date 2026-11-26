@@ -44,6 +44,8 @@
 | Linux | max(16 MB, 實體記憶體 5%（最多 1 GB）, `vm.min_free_kbytes` × 3) | 16 MB | 25.6 MB（min_free_kbytes 小時） | 200 MB | 800 MB |
 | Windows | max(128 MB, 實體記憶體 5%)（3.5.0） | — | — | 204.8 MB | 819.2 MB |
 
+3.5.1：黑潮在有記憶體上限、而且上限比實體記憶體小的 cgroup 裡時，「實體記憶體」是 cgroup 的上限，自動保留量是 max(16 MB, min(上限的 5%, 1 GB))，**不看** `min_free_kbytes`。那是整台機器的核心參數，跟 cgroup 的大小無關：D3（12,288 KB）在 150 MB 的上限裡要保留 36 MB（24%）。整台機器那一側照舊有保護：可用 = min(系統可用, 上限 − 已用)，系統可用（`MemAvailable`）本來就扣掉了核心的低水位。
+
 一律不超過實體記憶體的一半。
 
 Windows 3.5.0 前後對照（以前是 max(512 MB, min(10%, 4 GB))）：
@@ -272,6 +274,7 @@ Windows 3.5.0 前後對照（以前是 max(512 MB, min(10%, 4 GB))）：
 | `shed[]` | 釋出中的項目：`step`（`diagnostics` / `cache` / `cdn` / `filter` / `floor` / `protected`）、`label`、`detail`、`freedBytes`（估計）、`availDeltaKB`（下一輪量到的可用記憶體差）、`at` |
 | `freedBytes` / `freedTotalBytes` | 目前釋出中合計 / 啟動以來合計 |
 | `lastChange`、`waiting`、`nextRestoreAt`、`events[]` | 最近一次狀態變化、在等什麼、下次可以恢復的時間、最近 20 筆事件 |
+| `restartBlockedUntil` | 3.5.1：原地重新啟動的其他條件都成立、只差「6 小時最多一次」時，最快會再做的時間（Unix 毫秒）；沒有在等是 null。這段期間每小時最多寫一行 info |
 
 | `simulated` | 測試開關（3.5.0，第 11 節）：`{ availMB, until, remainingSec }`，沒開是 null |
 

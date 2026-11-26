@@ -195,6 +195,25 @@ pub fn mem_bytes() -> (Option<u64>, Option<u64>) {
     }
 }
 
+/// 黑潮在有記憶體上限、而且上限比實體記憶體小的 cgroup 裡（[`mem_bytes`] 用上限當實體記憶體時）
+pub fn in_smaller_cgroup() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map(|kb| kb * 1024)
+        });
+        cgroup::read().is_some_and(|(limit, _)| total.is_some_and(|t| limit < t))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// 套用 cgroup 的上限（`cg` =（上限，已用）；沒有上限是 None）：上限比實體記憶體小時，實體記憶體 = 上限、
 /// 可用 = min(系統可用, 上限 − 已用)
 pub fn apply_cgroup(total: Option<u64>, avail: Option<u64>, cg: Option<(u64, u64)>) -> (Option<u64>, Option<u64>) {
