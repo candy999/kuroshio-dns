@@ -1305,6 +1305,8 @@ struct Strikes {
     file: PathBuf,
     map: BTreeMap<String, Vec<String>>,
     dirty: bool,
+    /// 載入時清掉的舊規則「無法驗證」紀錄（筆數, 台數）：寫進 judge.log
+    cleared: (usize, usize),
 }
 
 /// 累計：不同日期幾天、不同網域幾個
@@ -1319,13 +1321,24 @@ impl Strikes {
         let mut map: BTreeMap<String, Vec<String>> = read_json(&file).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
         let cutoff = local_date_str(now_ms.saturating_sub(30 * DAY_MS));
         let mut dirty = false;
-        map.retain(|_, days| {
+        let mut cleared = (0usize, 0usize);
+        map.retain(|k, days| {
             let before = days.len();
             days.retain(|d| parse_strike(d).0 >= cutoff.as_str());
+            // 舊規則（沒寫版本的是 3.5.0 以前）記下的「無法驗證」：那時候的判斷比較容易誤判
+            // （還沒有「多家 CDN」「不同經營者也回同一個位址」「要 2 個網域」），升級時清掉重新累積。憑證不符的保留
+            if !k.starts_with("cert|") {
+                let n = days.len();
+                days.retain(|d| parse_strike(d).1 >= STRIKE_RULES);
+                if days.len() != n {
+                    cleared.0 += n - days.len();
+                    cleared.1 += 1;
+                }
+            }
             dirty |= days.len() != before;
             !days.is_empty()
         });
-        Strikes { file, map, dirty }
+        Strikes { file, map, dirty, cleared }
     }
     /// 記一筆（同一天同一個網域只記一次），回傳累計
     fn add(&mut self, id: &str, day: &str, domain: &str) -> StrikeCount {
@@ -1749,6 +1762,14 @@ impl Benchmark {
         // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
         let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
         let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
+        if strikes.cleared.0 > 0 {
+            jinfo!(
+                journal,
+                "可疑紀錄：清掉舊規則記下的「網站無法驗證」{} 筆（{} 台），用目前的規則重新累積（憑證不符的保留）",
+                strikes.cleared.0,
+                strikes.cleared.1
+            );
+        }
         let mut universe: HashSet<u64> = HashSet::new();
         let mut blocked_report: Vec<Value> = Vec::new();
         let mut scored = 0usize;
@@ -3738,6 +3759,42 @@ mod strike_tests {
         }
         assert_eq!(s.map["b"].len(), STRIKE_MAX_ENTRIES);
         assert!(!s.map["b"].iter().any(|e| e.ends_with("|d00.example.com")));
+        let _ = std::fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    /// 3.5.1（H2）：舊規則（沒寫版本＝3.5.0 以前）記下的「無法驗證」載入時清掉；憑證不符的保留
+    #[test]
+    fn old_rule_unverified_strikes_are_cleared() {
+        let f = tmp("rules");
+        let now = crate::time::days_from_civil(2026, 11, 26) as u64 * DAY_MS;
+        std::fs::write(
+            &f,
+            serde_json::to_vec(&json!({
+                // 3.0.x 時期記的兩天（只差一天就永久封殺）
+                "https://dns.example.com/dns-query": ["2026-11-13", "2026-11-15"],
+                "https://mixed.example.com/dns-query": ["2026-11-13", "2026-11-20|r2|www.example.com", "2026-11-21|r1|www.example.com"],
+                "cert|https://bad.example.net/dns-query": ["2026-11-14"],
+                "https://new.example.net/dns-query": ["2026-11-25|r2|cdn.example.net"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut s = Strikes::load(f.clone(), now);
+        assert_eq!(s.cleared, (4, 2));
+        assert!(!s.map.contains_key("https://dns.example.com/dns-query"));
+        assert_eq!(s.map["https://mixed.example.com/dns-query"], vec!["2026-11-20|r2|www.example.com"]);
+        assert_eq!(
+            s.map["cert|https://bad.example.net/dns-query"],
+            vec!["2026-11-14"],
+            "憑證不符的保留"
+        );
+        assert_eq!(s.map["https://new.example.net/dns-query"].len(), 1);
+        assert!(s.dirty);
+        s.save();
+        // 存回去之後再載入：沒有要清的
+        let s = Strikes::load(f.clone(), now);
+        assert_eq!(s.cleared, (0, 0));
+        assert!(!s.dirty);
         let _ = std::fs::remove_dir_all(f.parent().unwrap());
     }
 }
