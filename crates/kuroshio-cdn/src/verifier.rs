@@ -416,7 +416,8 @@ impl Cdn {
         let mut base_pop = String::new();
         let mut http_mode = false;
         let mut base_https: Option<HttpsFail> = None;
-        if let Some(o) = orig.filter(|o| family == 4 || o.is_ipv6()) {
+        // 3.5.1 M2：原本的 IP 要是這個家族的（舊資料的 v4 基準 IP 可能被 v6 驗證蓋成 IPv6，拿它量到的 POP 會判錯 v4）
+        if let Some(o) = orig.filter(|o| o.is_ipv6() == (family == 6)) {
             let mut b = self.probe_site(o, name, false).await;
             if !b.ok && b.error.as_deref() != Some("TIMEOUT") {
                 let b2 = self.net.http_probe(o, name, "/", t).await;
@@ -445,8 +446,12 @@ impl Cdn {
                 }
                 None => det_pop,
             };
+            // 基準只記 v4（3.5.1 M2）：v6 驗證以前也寫同一格，把 v4 的基準 IP 蓋成 IPv6
             self.with_state(|st| {
                 st.db.with_slot(name, provider, |db| {
+                    if family != 4 {
+                        return;
+                    }
                     db.set_base(
                         name,
                         Base {
@@ -492,8 +497,8 @@ impl Cdn {
                 // 這一家那一格看到的 IP（多來源時不能拿別家的 IP 來猜最後一段）
                 let (mut observed, base_ip): (Vec<IpAddr>, Option<IpAddr>) =
                     match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
-                        Some((e, Slot::Main)) => (e.ips4.to_vec(), e.base.as_ref().and_then(|b| b.ip)),
-                        Some((_, Slot::Alt(a))) => (a.ips4.to_vec(), a.base.as_ref().and_then(|b| b.ip)),
+                        Some((e, Slot::Main)) => (e.ips4.to_vec(), e.base_ip4()),
+                        Some((_, Slot::Alt(a))) => (a.ips4.to_vec(), a.base.as_ref().and_then(|b| b.ip).filter(IpAddr::is_ipv4)),
                         _ => (Vec::new(), None),
                     };
                 if let Some(b) = base_ip {

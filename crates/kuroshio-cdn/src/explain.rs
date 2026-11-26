@@ -364,7 +364,10 @@ impl Cdn {
                 }
             }
             // 舊資料沒有最近一次答案的 IP 時，才用存著的基準 POP（那可能是很久以前量的）
-            if answer_tw.is_none() && e.base.as_deref().and_then(|b| b.pop.as_deref()).is_some_and(providers::is_tw_pop) {
+            if answer_tw.is_none()
+                && e.base_ip4().is_some()
+                && e.base.as_deref().and_then(|b| b.pop.as_deref()).is_some_and(providers::is_tw_pop)
+            {
                 return (d::ALREADY_TW, String::new());
             }
             if self.cfg.lite && e.hits < 2 {

@@ -621,13 +621,19 @@ impl Domain {
     pub fn policy(&self) -> Policy {
         self.policy.unwrap_or_default()
     }
-    /// 複驗用的原始 IP：v4 用基準 IP 或第一個 A，v6 用第一個 AAAA
+    /// 複驗用的原始 IP：v4 用基準 IP 或第一個 A，v6 用第一個 AAAA。
+    /// 基準（`base`）只給 v4（3.5.1 M2）：舊版 v6 驗證也寫 `base`、把 `base.ip` 蓋成 IPv6，那種當成沒有
     pub fn orig_ip(&self, family: u8) -> Option<IpAddr> {
         if family == 4 {
-            self.base.as_ref().and_then(|b| b.ip).or_else(|| self.ips4.first().copied())
+            self.base_ip4().or_else(|| self.ips4.first().copied())
         } else {
             self.ips6.first().copied()
         }
+    }
+
+    /// v4 的基準 IP（只接受 IPv4；3.5.1 M2）
+    pub fn base_ip4(&self) -> Option<IpAddr> {
+        self.base.as_ref().and_then(|b| b.ip).filter(IpAddr::is_ipv4)
     }
 
     /// 估計佔用的記憶體（bytes；含雜湊表的一格）。只用來估算記憶體控制釋出多少，不必精確
@@ -2222,7 +2228,11 @@ impl Db {
         }
     }
 
+    /// 寫 v4 的基準連線結果。基準只給 v4（3.5.1 M2）：IPv6 的不寫（v4 的複驗、「原本就在台灣不換」會拿它當 v4 的原本 IP）
     pub fn set_base(&mut self, name: &str, mut base: Base) {
+        if base.ip.is_some_and(|ip| ip.is_ipv6()) {
+            return;
+        }
         let Some(e) = self.domains.get_mut(name) else { return };
         base.at = Some(now_ms());
         e.base = Some(Box::new(base));

@@ -16,6 +16,61 @@ fn cf_ok(colo: &str) -> ProbeResult {
     )
 }
 
+/// 3.5.1 M2：基準（`base`）只給 v4。以前 v6 驗證也寫同一格，把 `base.ip` 蓋成 IPv6，
+/// 之後 v4 的複驗、「原本就在台灣不換」拿 IPv6 量到的 POP 判 v4
+#[tokio::test]
+async fn v6_verify_does_not_overwrite_v4_base() {
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        st.db.touch(
+            "both.test",
+            "cloudflare",
+            "ip",
+            &ips(&["104.21.0.5"]),
+            &ips(&["2606:4700::5"]),
+            None,
+        );
+    });
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "104.21.0.5" => cf_ok("NRT"),
+        "2606:4700::5" => cf_ok("TPE"),
+        "104.16.161.36" | "104.18.20.216" => cf_ok("TPE"),
+        _ => fail("ECONNREFUSED"),
+    });
+    c.verify("both.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await;
+    c.verify("both.test", "cloudflare", 6, Some(ip("2606:4700::5"))).await;
+    let st = c.state();
+    let e = st.db.get("both.test").unwrap();
+    let b = e.base.as_ref().unwrap();
+    assert_eq!(
+        (b.ip, b.pop.as_deref()),
+        (Some(ip("104.21.0.5")), Some("NRT")),
+        "v6 驗證不動 v4 的基準"
+    );
+    assert_eq!(e.orig_ip(4), Some(ip("104.21.0.5")));
+    assert!(e.v4.as_ref().unwrap().is("ok"), "原本在 NRT：照常換");
+    drop(st);
+    // 舊資料：基準 IP 已經被蓋成 IPv6 → v4 當成沒有基準，用最近一次的 A
+    c.with_state(|st| st.db.get_mut("both.test").unwrap().base.as_mut().unwrap().ip = Some(ip("2606:4700::5")));
+    let e = c.state().db.get("both.test").unwrap().clone();
+    assert_eq!(e.orig_ip(4), Some(ip("104.21.0.5")));
+    assert_eq!(e.base_ip4(), None);
+    // 就算有人拿 IPv6 當 v4 的原本 IP 來驗證：不探測它、不拿它的 TPE 判「原本就在台灣」
+    let r = c.verify("both.test", "cloudflare", 4, Some(ip("2606:4700::5"))).await;
+    assert_eq!(r, Some("ok"));
+    assert!(c
+        .state()
+        .db
+        .get("both.test")
+        .unwrap()
+        .v4
+        .as_ref()
+        .unwrap()
+        .extra
+        .get("origTw")
+        .is_none());
+}
+
 #[tokio::test]
 async fn verifier_ok_collects_all_passing_ips() {
     let (c, net) = setup(json!({}));
