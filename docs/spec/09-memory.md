@@ -104,7 +104,7 @@ Windows 3.5.0 前後對照（以前是 max(512 MB, min(10%, 4 GB))）：
 | 2. DNS 快取 | 吃緊 | 縮到目前上限的 1/4，留下熱門的；最少留設定上限的 1/8（256～4,096 筆，`shrink_floor`；3.5.1 以前固定 256 筆） | 上限恢復 |
 | 3. CDN 冷資料 | 吃緊 | 先寫進磁碟，再**從最冷的開始**把網域移出記憶體（磁碟保留，查到時讀回），移到補足缺口就停：沒有學習資料的先、同一組裡最久沒出現的先，2 分鐘內出現的不動。可以一輪一輪做（3.5.1） | 依可用空間一次讀回幾片；只問過一次、沒有學習資料的不讀回（3.5.1） |
 | 4. 過濾清單 | 不足，而且可用 < 保留量的一半 | 依優先順序（廣告 → 遙測 → 惡意、命中少的先、大的先）停用清單：離保留量遠時**一次**取到估計合計 ≥ 還缺的 × 1.3（至少 1 份）、**只重建一次**（3.5.0）；保護清單不在這一步 | 從最後停用的開始，取到合計 × 1.3 ≤ 可用空間（至少 1 份），重建一次；用本機副本或重新下載 |
-| 5. **只轉送** | 同上 | 暫停 CDN 調整（答案照上游原樣）、整個 CDN 資料庫寫進磁碟移出記憶體、快取只留 64 筆（通訊類網域優先留下，3.5.0） | 恢復 CDN 調整與快取上限 |
+| 5. **只轉送** | 同上 | 暫停 CDN 調整（答案照上游原樣）、整個 CDN 資料庫寫進磁碟移出記憶體、快取只留 512 筆、不超過第 2 步的下限（設定上限的 1/8，`floor_cache`；3.5.1 以前 64 筆：幾乎每筆都要問上游，問上游比快取命中更耗記憶體與 CPU）；通訊類網域優先留下（3.5.0） | 恢復 CDN 調整與快取上限 |
 | 6. 保護清單 | 已經只轉送，而且可用 < 保留量的 1/4（一份清單都還沒有時不做，3.4.2） | 暫停全部清單（含惡意 / 反詐騙），只剩自訂規則 | 重新載入全部清單 |
 
 - **底線**：監聽 socket、轉送路徑、上游連線、設定**永遠不釋出**；明文 DNS 一定回答區網的查詢。
@@ -230,7 +230,7 @@ Windows 3.5.0 前後對照（以前是 max(512 MB, min(10%, 4 GB))）：
   沒說缺多少時一次一份（`near_deficit_still_unloads_one`）；保護清單不在裡面、停用後放不進可用的一半就不做（`unload_many_never_includes_protected`）；
   失敗全部撤回（`unload_many_rolls_back_on_failure`）；恢復取到空間為止、重建一次（`restore_many_fits_room_and_rebuilds_once`）；
   恢復後又不足時的退避（`restore_then_pressure_again_backs_off`）；挑選的上下限（`filtering.rs` 的 `pick_shed_and_restore_bounds`）。
-- 使用者明確設定的 `cacheMax` 仍是上限；快取停止長大、1/4、最低限度三者合併（`explicit_user_cache_max_is_still_a_cap`、`cache_cap_combines_growth_shed_and_floor`）。
+- 使用者明確設定的 `cacheMax` 仍是上限；快取停止長大、1/4、最低限度三者合併；只轉送時 512 筆、不超過設定上限的 1/8（3.5.1）（`explicit_user_cache_max_is_still_a_cap`、`cache_cap_combines_growth_shed_and_floor`）。
 - `oom_score_adj` 寫進注入的路徑、限制範圍（`oom_score_adj_written_to_injected_path`）。
 - **最深的狀態仍轉送**：真的啟動程式、載入兩份清單後注入「可用 4 MB、保留 64 MB」，跑到只轉送 + 保護清單暫停，
   UDP / TCP 查詢照樣轉送到上游、回答（連原本被擋的名稱也照上游回答）（`tests/filtering.rs` 的 `deepest_shed_state_still_forwards_plain_dns`）。

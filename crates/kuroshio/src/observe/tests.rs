@@ -398,6 +398,8 @@ fn noisy_inputs() -> FindInputs {
             floor: true,
             protected: false,
             shed: vec!["縮小 DNS 快取", "暫時停用過濾清單"],
+            recovered: false,
+            relax_secs: 180,
         }),
         site_min_clients: crate::site::public_min_clients_note(&public_site_cfg(1)),
         data_leftovers: vec!["seed/upstreams.json".into()],
@@ -500,6 +502,8 @@ fn memory_findings_follow_governor_state() {
         floor: false,
         protected: false,
         shed: vec![],
+        recovered: false,
+        relax_secs: 180,
     };
     assert!(on(base.clone()).is_empty(), "寬裕：沒有");
     let tight = on(crate::memgov::MemSummary {
@@ -526,6 +530,60 @@ fn memory_findings_follow_governor_state() {
     assert_eq!(crit[0].1.matches("只轉送").count(), 1, "不重複：{}", crit[0].1);
     assert_eq!(crit[0].0, "memory-critical");
     assert!(crit[0].1.contains("只剩自訂規則"), "{}", crit[0].1);
+    // 3.5.1：只轉送期間可用記憶體已經回來（259 MB），還沒滿 3 分鐘、還沒放鬆：不再寫「記憶體不足」
+    let floor = crate::memgov::MemSummary {
+        state: crate::memgov::State::Critical,
+        avail: Some(259 << 20),
+        reserve: 17 << 20,
+        floor: true,
+        recovered: true,
+        shed: vec!["縮小 DNS 快取", "最低限度：只轉送（暫停 CDN 調整、快取最小）"],
+        ..base.clone()
+    };
+    let back = on(floor.clone());
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].0, "memory-critical", "還是同一個發現（狀態還沒放鬆）");
+    assert_eq!(
+        back[0].1,
+        "記憶體已經恢復（系統可用 259 MB），離進入只轉送滿 3 分鐘後放鬆：已經讓出：縮小 DNS 快取、最低限度：只轉送（暫停 CDN 調整、快取最小）"
+    );
+    assert!(!back[0].1.contains("不足"), "{}", back[0].1);
+    // 只轉送已經解除、狀態還在等穩定
+    let settling = on(crate::memgov::MemSummary {
+        floor: false,
+        shed: vec!["縮小 DNS 快取"],
+        ..floor.clone()
+    });
+    assert_eq!(
+        settling[0].1,
+        "記憶體已經恢復（系統可用 259 MB），狀態穩定 3 分鐘後放鬆：已經讓出：縮小 DNS 快取"
+    );
+    let tight_back = on(crate::memgov::MemSummary {
+        state: crate::memgov::State::Tight,
+        floor: false,
+        shed: vec!["縮小 DNS 快取"],
+        ..floor.clone()
+    });
+    assert_eq!(
+        (tight_back[0].0, tight_back[0].1.contains("吃緊")),
+        ("memory-tight", false),
+        "{}",
+        tight_back[0].1
+    );
+    assert!(tight_back[0]
+        .1
+        .starts_with("記憶體已經恢復（系統可用 259 MB），狀態穩定 3 分鐘後放鬆"));
+    // 還沒恢復：照舊寫不足與保留量
+    let short = on(crate::memgov::MemSummary {
+        avail: Some(12 << 20),
+        recovered: false,
+        ..floor
+    });
+    assert!(
+        short[0].1.starts_with("記憶體不足（系統可用 12 MB，保留 17 MB）：已經讓出："),
+        "{}",
+        short[0].1
+    );
     let futile = on(crate::memgov::MemSummary {
         state: crate::memgov::State::Critical,
         futile: true,

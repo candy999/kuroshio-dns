@@ -20,7 +20,7 @@
 //!   2. DNS 快取縮到上限的 1/4，留下熱門的
 //!   3. CDN 網域資料庫：先寫進磁碟，再把冷資料移出記憶體（磁碟保留，查到時讀回）
 //!   4. 過濾清單（系統真的不足：可用 < 保留量的一半）：一次停用一份優先順序最低的；自訂規則與保護清單不在這一步
-//!   5. 最低限度（只轉送）：暫停 CDN 調整、整個 CDN 資料庫移到磁碟、快取只留 [`FLOOR_CACHE`] 筆
+//!   5. 最低限度（只轉送）：暫停 CDN 調整、整個 CDN 資料庫移到磁碟、快取只留 [`floor_cache`] 筆（最多 [`FLOOR_CACHE`]）
 //!   6. 保護清單：只有到了最低限度、可用還不到保留量的 1/4（不讓出來連轉送都會失敗）才暫停，狀態頁特別標示
 //!
 //!   **底線**：監聽、轉送路徑、上游連線永遠不釋出；明文 DNS 一定回答區網的查詢。最深的狀態就是「純轉送」。
@@ -45,8 +45,16 @@ use tracing::{debug, info, warn};
 
 pub const MB: u64 = 1 << 20;
 
-/// 最低限度時快取留幾筆（同一個名稱短時間內重複問，例如網頁載入時的多個連線，還是只問上游一次）
-pub const FLOOR_CACHE: usize = 64;
+/// 最低限度（只轉送）時快取最多留幾筆（[`floor_cache`]；同一個名稱短時間內重複問，例如網頁載入時的多個連線，還是只問上游一次）。
+/// 3.5.1 以前是 64 筆：128 MB 的 cgroup 裡快取命中每秒 1,000 筆時只回得了 720 筆、中位 413 ms——64 筆時幾乎
+/// 每筆都要問上游，問上游比快取命中更耗記憶體與 CPU。512 筆每筆約 600 B，約 300 KB
+pub const FLOOR_CACHE: usize = 512;
+
+/// 最低限度（只轉送）時快取的上限（3.5.1）：[`FLOOR_CACHE`]，但不超過縮小時的下限 [`shrink_floor`]（設定上限的 1/8，
+/// 至少 256 筆、不超過設定上限）：設定上限小的機器，只轉送時不會比「縮小 DNS 快取」那一步留得還多
+pub fn floor_cache(configured: usize) -> usize {
+    FLOOR_CACHE.min(shrink_floor(configured))
+}
 
 /// 記憶體狀態
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -846,6 +854,17 @@ pub struct MemSummary {
     pub protected: bool,
     /// 讓出了哪些（步驟名稱，依順序、不重複）
     pub shed: Vec<&'static str>,
+    /// 可用記憶體已經回到保留量 + 遲滯以上（PSI 也平靜），狀態還在等 `relax_secs` 才放鬆（3.5.1，[`recovered`]）：
+    /// 發現清單不再寫「記憶體不足」，改寫「已經恢復、什麼時候放鬆」
+    pub recovered: bool,
+    /// 放鬆要等多久（秒，[`Governor::dwell`]）：狀態要穩定這麼久、離讓出只轉送至少這麼久
+    pub relax_secs: u64,
+}
+
+/// 這一次的讀數已經回到保留量 + 遲滯以上、PSI 也平靜：沒有缺口，狀態只是還在等穩定（`dwell`）才放鬆。
+/// [`Governor::tick`] 這時不再讓出；發現清單的文字也照這個寫（[`MemSummary::recovered`]）
+pub fn recovered(r: &Reading, res: &Reserve) -> bool {
+    r.avail.is_some_and(|a| a >= res.bytes.saturating_add(res.margin())) && r.psi.is_none_or(|p| p.calm())
 }
 
 /// 同一步可以一輪一輪讓出的（CDN 冷資料，3.5.1 G1）：同一步最多留這麼多筆紀錄，再多就併進最舊的那一筆
@@ -1152,10 +1171,10 @@ impl Governor {
 
     /// 發現清單用的摘要（3.5.1 H3）：狀態、可用與保留量、讓出了哪些（依步驟、不重複）、只轉送、保護清單暫停、於事無補
     pub fn finding_summary(&self) -> MemSummary {
-        let (state, avail, futile, mut shed) = {
+        let (state, avail, futile, mut shed, back) = {
             let i = self.inner.lock().unwrap();
             let labels: Vec<&'static str> = i.shed.iter().map(|s| s.label).collect();
-            (i.hyst.state, i.last.avail, i.futile.on, labels)
+            (i.hyst.state, i.last.avail, i.futile.on, labels, recovered(&i.last, &self.reserve))
         };
         // 同一步讓了好幾輪（例如 CDN 冷資料移出、中間夾著別的步驟）只列一次，照第一次讓出的順序（3.5.1 8 號單）
         let mut seen: Vec<&'static str> = Vec::with_capacity(shed.len());
@@ -1174,6 +1193,8 @@ impl Governor {
             floor: self.at_floor(),
             protected: self.steps.iter().any(|s| s.key() == "protected" && s.is_shed()),
             shed,
+            recovered: back && state > State::Comfortable && !futile,
+            relax_secs: self.dwell,
         }
     }
 
@@ -1308,11 +1329,7 @@ impl Governor {
                     mb_round(own)
                 ));
                 None
-            } else if state > State::Comfortable
-                && r.avail
-                    .is_some_and(|a| a >= self.reserve.bytes.saturating_add(self.reserve.margin()))
-                && r.psi.is_none_or(|p| p.calm())
-            {
+            } else if state > State::Comfortable && recovered(&r, &self.reserve) {
                 // 狀態還在等穩定（`dwell`），但這一次的讀數已經回到保留量 + 遲滯以上、PSI 也平靜：沒有缺口，不讓出。
                 // 常見的是別的程式（Windows 上的大模型）一下子放掉記憶體：狀態要穩定 180 秒才降，這段時間照狀態去讓出
                 // 就會在可用記憶體很多的時候移出 CDN 冷資料、縮診斷緩衝（3.5.0 F1，Windows 實測 H1）。
@@ -1675,7 +1692,7 @@ pub struct CacheCap {
     pub frozen: Option<usize>,
     /// 快取步驟：縮到 1/4
     pub quarter: bool,
-    /// 最低限度：只留 [`FLOOR_CACHE`] 筆
+    /// 最低限度：只留 [`floor_cache`] 筆
     pub floor: bool,
 }
 
@@ -1692,7 +1709,7 @@ impl CacheCap {
     /// 現在的上限
     pub fn effective(&self) -> usize {
         if self.floor {
-            return FLOOR_CACHE.min(self.configured);
+            return floor_cache(self.configured);
         }
         let base = self.frozen.unwrap_or(self.configured).min(self.configured);
         if self.quarter {
@@ -1707,7 +1724,7 @@ pub type SharedCap = Arc<Mutex<CacheCap>>;
 
 /// 縮小快取（第 2 步）、停止長大時最少留幾筆（3.5.1）：設定上限的 1/8，夾在 256～4,096 筆（不超過設定上限）。
 /// 以前固定 256 筆：128 MB 的機器（上限約 1.8 萬筆）吃緊時縮到 256 筆，家裡常用的網域通常比這多，
-/// 命中率掉下來、每筆都要問上游；多留到約 2,200 筆只多用約 1.3 MB。只轉送（最低限度）照舊 [`FLOOR_CACHE`]
+/// 命中率掉下來、每筆都要問上游；多留到約 2,200 筆只多用約 1.3 MB。只轉送（最低限度）是 [`floor_cache`]
 pub fn shrink_floor(configured: usize) -> usize {
     (configured / 8).clamp(256, 4096).min(configured)
 }
@@ -2070,7 +2087,7 @@ pub type CdnParts = (
     Vec<crate::app::SnapSource>,
 );
 
-/// 第 5 步：最低限度（只轉送）：暫停 CDN 調整、整個 CDN 資料庫移到磁碟、快取只留 [`FLOOR_CACHE`] 筆。
+/// 第 5 步：最低限度（只轉送）：暫停 CDN 調整、整個 CDN 資料庫移到磁碟、快取只留 [`floor_cache`] 筆。
 /// 監聽、轉送、上游連線不動：區網的明文 DNS 照樣回答（答案照上游原樣，不做 CDN 調整）
 pub struct FloorStep {
     pub resolver: Arc<crate::resolver::Resolver>,
@@ -2634,7 +2651,7 @@ mod tests {
         assert_eq!(c.effective(), 10_000, "比下限多：照舊縮到 1/4");
         c.frozen = Some(3000);
         c.floor = true;
-        assert_eq!(c.effective(), FLOOR_CACHE);
+        assert_eq!(c.effective(), FLOOR_CACHE, "只轉送：512 筆（3.5.1 以前 64）");
         c.floor = false;
         c.quarter = false;
         c.frozen = None;
@@ -2646,6 +2663,14 @@ mod tests {
         assert_eq!(shrink_floor(62_634), 4_096, "最多 4,096");
         assert_eq!(shrink_floor(1_000), 256, "最少 256");
         assert_eq!(shrink_floor(100), 100, "不超過設定上限");
+        // 3.5.1：只轉送時最多 512 筆，不超過縮小時的下限（設定上限的 1/8）
+        assert_eq!(floor_cache(17_895), 512, "128 MB 的機器");
+        assert_eq!(floor_cache(3_000), 375, "設定上限的 1/8");
+        assert_eq!(floor_cache(1_000), 256, "縮小時的下限最少 256");
+        assert_eq!(floor_cache(100), 100, "不超過設定上限");
+        for n in [16, 100, 1_000, 2_048, 4_096, 17_895, 62_634, 1_000_000] {
+            assert!(floor_cache(n) <= shrink_floor(n) && floor_cache(n) <= FLOOR_CACHE, "{n}");
+        }
         let mut c = CacheCap::new(17_895);
         c.frozen = Some(4_000);
         c.quarter = true;
@@ -3606,10 +3631,12 @@ mod tests {
         assert!(r.cache.lock().unwrap().len() <= len.max(256) * 11 / 10 + 1);
         s.set_growth(true);
         assert_eq!(r.cache.lock().unwrap().max, 2000);
-        // 最低限度：只留 FLOOR_CACHE 筆；恢復後回到原本的上限
+        // 最低限度：只留 floor_cache 筆（設定上限 2,000：1/8 是 250 → 縮小時的下限 256）；恢復後回到原本的上限
         let floor = FloorStep::new(r.clone(), s.cap.clone(), None);
         floor.shed(&Reading::default()).await.unwrap();
-        assert!(r.cache.lock().unwrap().len() <= FLOOR_CACHE);
+        assert_eq!(r.cache.lock().unwrap().max, floor_cache(2000));
+        assert_eq!(floor_cache(2000), 256);
+        assert!(r.cache.lock().unwrap().len() <= 256);
         assert!(r.cdn_suspended.load(Ordering::Relaxed), "CDN 調整暫停");
         floor.restore().await.unwrap();
         assert_eq!(r.cache.lock().unwrap().max, 2000);
@@ -3662,12 +3689,19 @@ mod tests {
             now += 5;
         }
         assert!(g.at_floor(), "壓到只轉送");
-        assert_eq!(max(), FLOOR_CACHE, "只轉送時快取上限 64（設計如此）");
+        assert_eq!(max(), FLOOR_CACHE, "只轉送時快取上限 512（3.5.1 以前 64）");
+        let m = g.finding_summary();
+        assert!(m.floor && !m.recovered, "還不足：{m:?}");
         let released = now;
         // 放掉壓力：可用記憶體整個回來
         let mut lifted = None;
         while now < released + 900 {
             g.tick(rd(600), now).await;
+            if lifted.is_none() && g.at_floor() {
+                // 3.5.1：壓力已經解除、還在等時間放鬆：發現清單寫「已經恢復」，不寫「不足」
+                let m = g.finding_summary();
+                assert!(m.recovered && m.state == State::Critical && m.relax_secs == g.dwell, "{m:?}");
+            }
             if lifted.is_none() && !g.at_floor() {
                 lifted = Some((now, g.state()));
             }

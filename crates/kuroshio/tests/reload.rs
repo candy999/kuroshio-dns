@@ -515,3 +515,180 @@ fn reload_with_adopted_cache_skips_warmup() {
     assert_eq!(round(&changed), (false, 6), "快取沒接手：照舊預熱");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------- 重新載入的 RSS（3.5.1 測試版 D3 第二次回報）----------------
+
+/// 一般 DNS 的 TCP 查詢（2 bytes 長度 + 訊息），回傳回應
+fn tcp_query(s: &mut std::net::TcpStream, id: u16, name: &str) -> Vec<u8> {
+    let q = kuroshio_proto::build_query(id, name, 1);
+    s.write_all(&(q.len() as u16).to_be_bytes()).unwrap();
+    s.write_all(&q).unwrap();
+    let mut len = [0u8; 2];
+    s.read_exact(&mut len).unwrap();
+    let mut r = vec![0u8; u16::from_be_bytes(len) as usize];
+    s.read_exact(&mut r).unwrap();
+    r
+}
+
+/// 純 HTTP/1.1 GET（公開頁、DoH 都在 DoH 的埠上），回傳狀態碼
+fn http_get(addr: std::net::SocketAddr, path: &str) -> u16 {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    String::from_utf8_lossy(&out)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// base64url（不補 `=`），DoH GET 用
+fn b64url(b: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut s = String::new();
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for k in 0..=c.len() {
+            s.push(T[(n >> (18 - 6 * k) & 63) as usize] as char);
+        }
+    }
+    s
+}
+
+/// 一輪留下的弱參照，加上監聽與記憶體控制
+struct GenMore {
+    gen: Gen,
+    server: Weak<kuroshio::server::Server>,
+    memgov: Option<Weak<kuroshio::memgov::Governor>>,
+}
+
+impl GenMore {
+    fn alive(&self) -> Vec<&'static str> {
+        let mut v = self.gen.alive();
+        if self.server.upgrade().is_some() {
+            v.push("Server");
+        }
+        if self.memgov.as_ref().is_some_and(|w| w.upgrade().is_some()) {
+            v.push("Governor");
+        }
+        v
+    }
+}
+
+/// 照 D3 的情況跑一輪、照正式的重新載入結束（[`kuroshio::app::Started::shutdown_reload`]，`main.rs` 的 `generation`）：
+/// 一般 DNS 的 UDP、TCP，DoT、DoH 的查詢，公開頁與它的統計（儀表板統計），預熱名單寫出（`hot_prev`）。
+/// 結束的時候用戶端還開著：一條查過的 TCP、剛連上還沒送查詢的 TCP 與 DoH（`Serving::accept` 的登記）、一條查過的 DoT
+/// （連線池）——這些連線的工作要跟著執行環境一起放掉，不能抓著這一輪。回傳弱參照與還開著的用戶端（呼叫端檢查完才關）
+fn generation_with_traffic(cfg: &Value, port: u16) -> (GenMore, Vec<std::net::TcpStream>) {
+    let rt = runtime();
+    let out = rt.block_on(async {
+        let s = kuroshio::app::start(cfg).await.unwrap();
+        let doh = s.encrypted.doh.expect("DoH 有啟動");
+        let dot = s.encrypted.dot.expect("DoT 有啟動");
+        assert!(s.resolver.site.get().is_some(), "公開頁開著");
+        let g = GenMore {
+            gen: Gen {
+                state: Arc::downgrade(&s.state),
+                resolver: Arc::downgrade(&s.resolver),
+                filter: s.state.filter.as_ref().map(Arc::downgrade),
+                cdn: s.resolver.cdn.read().unwrap().as_ref().map(Arc::downgrade),
+                access: s.resolver.access.get().map(Arc::downgrade),
+            },
+            server: Arc::downgrade(&s.server),
+            memgov: s.state.memgov.as_ref().map(Arc::downgrade),
+        };
+        // 用戶端在另一條執行緒（一般的阻塞 socket），跟這一輪的執行環境無關
+        let clients = tokio::task::spawn_blocking(move || {
+            let mut keep = Vec::new();
+            let udp = udp_client(port, Duration::from_secs(3));
+            for round in 0..3u16 {
+                for (k, n) in ["a.example.net", "b.example.net", "c.example.net"].iter().enumerate() {
+                    udp.send(&kuroshio_proto::build_query(round * 10 + k as u16, n, 1)).unwrap();
+                    assert!(recv_answer(&udp).is_some(), "UDP 有回答");
+                }
+            }
+            let mut tcp = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            for id in 0..3 {
+                assert!(!tcp_query(&mut tcp, 100 + id, "a.example.net").is_empty());
+            }
+            keep.push(tcp);
+            for path in [
+                "/".to_string(),
+                "/api/public/info".to_string(),
+                "/api/public/stats?range=today".to_string(),
+                "/api/public/stats?range=7d".to_string(),
+                "/api/public/presence".to_string(),
+                format!("/dns-query?dns={}", b64url(&kuroshio_proto::build_query(0, "b.example.net", 1))),
+            ] {
+                assert_eq!(http_get(doh, &path), 200, "{path}");
+            }
+            // 剛連上、還沒送查詢（交接時算進處理中，最多等一下就放掉）
+            keep.push(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+            keep.push(std::net::TcpStream::connect(doh).unwrap());
+            keep
+        })
+        .await
+        .unwrap();
+        // DoT：用黑潮自己的上游用戶端（連線池會留著這條連線）
+        let u = kuroshio::upstream::Upstream::parse(&format!("tls://{dot}")).unwrap();
+        for i in 0..3u16 {
+            let r = u
+                .exchange(&kuroshio_proto::build_query(i, "c.example.net", 1), Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert!(!r.is_empty());
+        }
+        s.shutdown_reload().await;
+        drop(s);
+        (g, clients)
+    });
+    rt.shutdown_timeout(Duration::from_secs(3));
+    out
+}
+
+/// 3.5.1 測試版 D3 第二次回報（每次重新載入 RSS 約多 1.1 MB）：reloadgap、w5a、viz 之後的重新載入
+/// （停止收查詢、等處理中的做完、剛接受的連線算處理中、預熱名單合併、儀表板統計）沒有讓結束的一輪又被抓住。
+/// 結束時用戶端的連線（查過的 TCP、剛連上的 TCP 與 DoH、DoT）都還開著；連續三輪（接手上一輪的快取、清單層、工作）
+/// 每一輪結束後都要全部放掉
+#[test]
+fn ended_generation_is_dropped_after_traffic() {
+    let _g = serial();
+    let dir = tmp("traffic");
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    std::fs::write(dir.join("cert.pem"), ck.cert.pem()).unwrap();
+    std::fs::write(dir.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
+    kuroshio::tls::add_root(rustls::pki_types::CertificateDer::from(ck.cert.der().to_vec()));
+    let (up, _) = counting_upstream(Duration::ZERO);
+    let port = free_dns_port();
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+    let cfg = config(
+        &dir,
+        json!({
+            "upstream": { "pinned": [format!("udp://{up}")] },
+            "listen": {
+                "plain": { "binds": ["127.0.0.1"], "port": port },
+                "dot": { "enabled": true, "host": "127.0.0.1", "port": 0,
+                         "cert": cert.to_string_lossy(), "key": key.to_string_lossy() },
+            },
+        }),
+    );
+    for round in 1..=3 {
+        let (g, clients) = generation_with_traffic(&cfg, port);
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut left = g.alive();
+        while !left.is_empty() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+            left = g.alive();
+        }
+        assert_eq!(left, Vec::<&str>::new(), "第 {round} 輪結束後還被抓著（用戶端的連線還開著）");
+        drop(clients);
+    }
+    assert!(
+        dir.join("state").join("hot-names.json").exists(),
+        "預熱名單有寫出（hot_prev 有用到）"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

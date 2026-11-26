@@ -673,17 +673,32 @@ pub fn rules(i: &FindInputs, samples: &[Sample]) -> (Vec<Obs>, Sample) {
         } else {
             String::new()
         };
+        // 可用記憶體已經回到保留量以上、狀態在等時間放鬆（3.5.1）：以前照樣寫「記憶體不足（系統可用 259 MB…）」，看的人會困惑
+        let relax = if m.relax_secs >= 60 && m.relax_secs % 60 == 0 {
+            format!("{} 分鐘", m.relax_secs / 60)
+        } else {
+            format!("{} 秒", m.relax_secs)
+        };
+        let back = |wait: &str| format!("記憶體已經恢復（系統可用 {avail}），{wait}：{shed}{tail}");
         out.push(state(
             "memory-tight",
             Sev::Warn,
             !m.futile && m.state == State::Tight,
-            format!("記憶體吃緊（系統可用 {avail}，保留 {} MB）：停止長大，{shed}{tail}", mb(m.reserve)),
+            if m.recovered {
+                back(&format!("狀態穩定 {relax}後放鬆（這段時間先不長大）"))
+            } else {
+                format!("記憶體吃緊（系統可用 {avail}，保留 {} MB）：停止長大，{shed}{tail}", mb(m.reserve))
+            },
         ));
         out.push(state(
             "memory-critical",
             Sev::Warn,
             !m.futile && m.state == State::Critical,
-            format!("記憶體不足（系統可用 {avail}，保留 {} MB）：{shed}{tail}", mb(m.reserve)),
+            match (m.recovered, m.floor) {
+                (true, true) => back(&format!("離進入只轉送滿 {relax}後放鬆")),
+                (true, false) => back(&format!("狀態穩定 {relax}後放鬆")),
+                _ => format!("記憶體不足（系統可用 {avail}，保留 {} MB）：{shed}{tail}", mb(m.reserve)),
+            },
         ));
         out.push(state(
             "memory-futile",
