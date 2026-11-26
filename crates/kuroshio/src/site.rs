@@ -352,7 +352,9 @@ struct FileCache {
 }
 
 pub struct Site {
-    state: Arc<AppState>,
+    /// 這一輪的整體狀態。只留弱參照：`AppState` → `Resolver` → `site` → `Site` 是一個循環，
+    /// 用強參照時每次重新載入設定整輪的結構（過濾清單、CDN 資料庫、快取）都放不掉，RSS 每次長約 10 MB（3.5.1 測試版 D3）
+    state: Weak<AppState>,
     presence: Option<Arc<Presence>>,
     /// `site.hostname`（小寫；可能是空白）
     hostname: String,
@@ -468,7 +470,7 @@ impl Site {
             dot_port: get(cfg, "listen.dot.port").and_then(Value::as_u64).unwrap_or(853) as u16,
             dash_dir: crate::app::share_dir(cfg).join("dashboard"),
             hostname,
-            state,
+            state: Arc::downgrade(&state),
             files: Mutex::new(HashMap::new()),
             ips: RwLock::new((Vec::new(), Vec::new())),
             cache: Mutex::new(HashMap::new()),
@@ -706,7 +708,11 @@ impl Site {
             }
             _ => None,
         };
-        let r = crate::admin::route(&self.state, sub, q).await;
+        // 這一輪已經結束（重新載入設定中）：新的一輪很快接手
+        let Some(state) = self.state.upgrade() else {
+            return json_resp(503, &json!({ "error": "重新載入中，請稍後再試" }), "no-store");
+        };
+        let r = crate::admin::route(&state, sub, q).await;
         if let Some((ctype, name, text)) = r.raw {
             return send(
                 r.code,
@@ -732,7 +738,7 @@ impl Site {
             _ => {}
         }
         // 其他 API（工作狀態、錯誤訊息…）的文字裡也可能帶本機路徑：一律換掉
-        let loc = &self.state.backup;
+        let loc = &state.backup;
         let mut dirs: Vec<String> = [
             Some(loc.state.as_path()),
             Some(loc.data.as_path()),
@@ -801,13 +807,18 @@ impl Site {
     /// `/api/public/info`：連線資訊（`port`：這個請求看到的 DoH 埠號，見 [`Site::port_for`]）
     pub fn info(&self, host: &str, port: u16) -> Value {
         let (v4, v6) = self.ips.read().unwrap().clone();
-        let e = &self.state.encrypted;
+        // 這一輪已經結束（重新載入設定中）時當成都沒有開
+        let on = self.state.upgrade().map(|s| {
+            let e = &s.encrypted;
+            [e.doh.is_some(), e.doh3.is_some(), e.dot.is_some(), e.doq.is_some()]
+        });
+        let [doh, doh3, dot, doq] = on.unwrap_or_default();
         json!({
             "host": host, "doh": self.doh_url(host, port), "dohPort": port, "site": format!("{}/", https_origin(host, port)),
             "dot": host, "dotPort": self.dot_port,
             "ipv4": v4, "ipv6": v6,
             "presence": self.presence.as_ref().map(|p| p.info()),
-            "protocols": { "doh": e.doh.is_some(), "doh3": e.doh3.is_some(), "dot": e.dot.is_some(), "doq": e.doq.is_some() },
+            "protocols": { "doh": doh, "doh3": doh3, "dot": dot, "doq": doq },
             "about": self.about,
         })
     }
@@ -830,7 +841,11 @@ impl Site {
     }
 
     fn build_public_stats(&self, range: &str) -> Value {
-        dashboard_stats(&self.state, range, self.min_clients, PUBLIC_TOP, View::Public)
+        match self.state.upgrade() {
+            Some(st) => dashboard_stats(&st, range, self.min_clients, PUBLIC_TOP, View::Public),
+            // 這一輪已經結束（重新載入設定中）
+            None => json!({}),
+        }
     }
 }
 

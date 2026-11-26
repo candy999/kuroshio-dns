@@ -494,6 +494,27 @@ pub trait ShareSink: Send + Sync {
     fn pressure_ok(&self) -> bool;
 }
 
+/// 兩輪之間（重新載入中）的匯入端：什麼都不匯入，記憶體壓力當成大（同步延後）
+struct Detached;
+
+impl ShareSink for Detached {
+    fn import_upstreams(&self, _json: Vec<u8>) -> Result<()> {
+        bail!("重新載入中，這次不匯入")
+    }
+    fn import_cdn_ranges(&self, _files: BTreeMap<String, String>) -> Result<()> {
+        bail!("重新載入中，這次不匯入")
+    }
+    fn import_cdn_pools(&self, _json: &[u8]) -> Result<()> {
+        bail!("重新載入中，這次不匯入")
+    }
+    fn import_cdn_v6(&self, _json: &[u8]) -> Result<()> {
+        bail!("重新載入中，這次不匯入")
+    }
+    fn pressure_ok(&self) -> bool {
+        false
+    }
+}
+
 /// 下游的時間（`KUROSHIO_CHAIN_TIMING` 的 `shareFirst`、`shareEvery` 可以覆寫，只給整合測試用）
 #[derive(Debug, Clone)]
 pub struct ShareTiming {
@@ -722,6 +743,13 @@ impl Syncer {
     /// 新的一輪（重新載入）換匯入端
     pub fn set_sink(&self, sink: Arc<dyn ShareSink>) {
         *self.sink.write().unwrap() = sink;
+    }
+
+    /// 這一輪結束（重新載入、程式結束）：放掉這一輪的匯入端（它抓著 CDN 資料庫與上游管理）。
+    /// 以前要等下一輪的 [`set_sink`](Self::set_sink) 才換掉：重新載入時舊的 CDN 資料庫跟新的一起留在記憶體裡（3.5.1 測試版 D3）。
+    /// 兩輪之間收到的共用結果不匯入（下一次同步再拿）
+    pub fn detach_sink(&self) {
+        *self.sink.write().unwrap() = Arc::new(Detached);
     }
 
     /// `chain-share.json` 的寫入（快照寫入器的 stage）

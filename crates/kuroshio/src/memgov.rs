@@ -1047,7 +1047,10 @@ impl Governor {
     ///
     /// 以前要等整體回到寬裕才恢復：musl 放掉的記憶體不還給系統，洪水過後可用記憶體回不到保留量以上，
     /// 過濾清單（26 萬條規則只佔約 1.9 MB）就一直停用到重新啟動（3.5.1 測試版 D3）
-    fn partial_restore(&self, i: &Inner, r: &Reading, now: u64) -> Option<(usize, u64)> {
+    ///
+    /// `recovered`：可用記憶體已經回到保留量 + 遲滯以上、狀態還在等穩定（3.5.1 測試版第三版）。這時候的空間照寬裕時的算法
+    /// （可用 − 保留量 − 遲滯，[`restore_room`]），跟狀態降回寬裕之後的恢復一致，不比它寬鬆
+    fn partial_restore(&self, i: &Inner, r: &Reading, now: u64, recovered: bool) -> Option<(usize, u64)> {
         if now < i.next_restore_at || i.futile.on || !r.psi.is_none_or(|p| p.calm()) {
             return None;
         }
@@ -1060,7 +1063,11 @@ impl Governor {
         if now.saturating_sub(last_shed) < self.dwell {
             return None;
         }
-        let room = r.avail?.saturating_sub(self.reserve.bytes / 2);
+        let room = if recovered {
+            restore_room(r, &self.reserve)
+        } else {
+            r.avail?.saturating_sub(self.reserve.bytes / 2)
+        };
         (room as u128 >= s.restore_need() as u128 * 13 / 10).then_some((k, room))
     }
 
@@ -1309,9 +1316,17 @@ impl Governor {
                 // 狀態還在等穩定（`dwell`），但這一次的讀數已經回到保留量 + 遲滯以上、PSI 也平靜：沒有缺口，不讓出。
                 // 常見的是別的程式（Windows 上的大模型）一下子放掉記憶體：狀態要穩定 180 秒才降，這段時間照狀態去讓出
                 // 就會在可用記憶體很多的時候移出 CDN 冷資料、縮診斷緩衝（3.5.0 F1，Windows 實測 H1）。
-                // 下一次讀數掉回去就照舊讓出（路由器上本來就沒有缺口的那一刻讓出也沒有用）
-                i.waiting = Some("可用記憶體已經回到保留量以上，等狀態穩定，不再讓出".to_string());
-                None
+                // 下一次讀數掉回去就照舊讓出（路由器上本來就沒有缺口的那一刻讓出也沒有用）。
+                // 只在真的不足時才做的步驟（只轉送、停用清單、暫停保護清單）照樣可以先恢復（[`partial_restore`]）：
+                // 以前這裡直接等，可用記憶體整個回來時反而要等狀態一級一級降回寬裕、再等 180 秒才解除只轉送，
+                // 快取上限停在 64 筆約 9 分鐘（3.5.1 測試版 D3；可用記憶體回不來的時候 3 分鐘就解除）
+                match self.partial_restore(i, &r, now, true) {
+                    Some((k, room)) => Some(Plan::Restore(k, room)),
+                    None => {
+                        i.waiting = Some("可用記憶體已經回到保留量以上，等狀態穩定，不再讓出".to_string());
+                        None
+                    }
+                }
             } else if state > State::Comfortable {
                 let any = self.pick(i, state, &r, now).is_some();
                 if any {
@@ -1321,7 +1336,7 @@ impl Governor {
                         Plan::Shed { far, deficit }
                     })
                 } else {
-                    self.partial_restore(i, &r, now).map(|(k, room)| Plan::Restore(k, room))
+                    self.partial_restore(i, &r, now, false).map(|(k, room)| Plan::Restore(k, room))
                 }
             } else if held {
                 i.waiting = Some(format!("應要求先讓出記憶體，{} 秒內不恢復", i.hold_until - now));
@@ -3610,5 +3625,71 @@ mod tests {
         s.set_growth(true);
         assert_eq!(r.cache.lock().unwrap().max, 1234);
         assert_eq!(s.cap.lock().unwrap().configured, 1234);
+    }
+
+    /// 3.5.1 測試版 D3：壓到「只轉送」（快取上限 64）之後可用記憶體整個回來（放掉 tmpfs）：只轉送在狀態降回寬裕之前
+    /// 就解除（讓出之後 `dwell` 秒），快取上限回到縮小時的下限（設定上限的 1/8，256～4,096）以上。
+    /// 以前要等狀態不足 → 吃緊 → 寬裕、再等 `dwell`，快取上限停在 64 約 9 分鐘
+    #[tokio::test]
+    async fn floor_lifts_once_memory_is_back_and_cache_cap_returns() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-memgov-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        let cfg = kuroshio_config::with_overrides(&json!({
+            "system": { "persistDir": dir.join("state").to_string_lossy() },
+            "upstream": { "pinned": ["udp://127.0.0.1:9"], "fallback": [] },
+            "resolver": { "lastResort": [], "rankIps": false, "cacheMax": 48_793 },
+            "cdn": { "enabled": false },
+        }));
+        let r = crate::app::build_resolver(&cfg).unwrap();
+        let cache = CacheStep::new(r.clone());
+        let cap = cache.cap.clone();
+        let floor = FloorStep::new(r.clone(), cap.clone(), None);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let steps: Vec<Box<dyn Step>> = vec![
+            Fake::new("diagnostics", State::Tight, 1, 0, &log),
+            Box::new(cache),
+            Fake::new("cdn", State::Tight, 1, 0, &log),
+            Fake::new("filter", State::Critical, 1, 0, &log),
+            Box::new(floor),
+        ];
+        let g = Governor::new(res100(), steps, 0);
+        let max = || r.cache.lock().unwrap().max;
+        let mut now = 1000;
+        // 可用 5 MB：一路讓到只轉送
+        for _ in 0..6 {
+            g.tick(rd(5), now).await;
+            now += 5;
+        }
+        assert!(g.at_floor(), "壓到只轉送");
+        assert_eq!(max(), FLOOR_CACHE, "只轉送時快取上限 64（設計如此）");
+        let released = now;
+        // 放掉壓力：可用記憶體整個回來
+        let mut lifted = None;
+        while now < released + 900 {
+            g.tick(rd(600), now).await;
+            if lifted.is_none() && !g.at_floor() {
+                lifted = Some((now, g.state()));
+            }
+            now += 5;
+        }
+        let (at, state) = lifted.expect("只轉送有解除");
+        assert!(
+            at - released <= g.dwell + 10,
+            "讓出後 {} 秒才解除（應該約 {} 秒）",
+            at - released,
+            g.dwell
+        );
+        assert_ne!(state, State::Comfortable, "不必等狀態降回寬裕");
+        assert!(
+            max() >= shrink_floor(48_793),
+            "解除後快取上限 {} 筆，應該至少 {}",
+            max(),
+            shrink_floor(48_793)
+        );
+        // 最後全部恢復：快取上限回到設定值
+        assert_eq!(g.state(), State::Comfortable);
+        assert_eq!(max(), 48_793, "{:?}", log.lock().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
