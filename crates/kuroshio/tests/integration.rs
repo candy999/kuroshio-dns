@@ -524,8 +524,16 @@ fn memory_restart_reexecs_with_same_pid() {
             .any(|kv| kv.starts_with(kuroshio::memgov::RESTART_ENV.as_bytes()))
     };
     assert!(!has_env(&environ()));
-    // 測試開關要求原地重新啟動（沒有登入：測試設定沒開 auth）
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", admin)).unwrap();
+    // 測試開關要求原地重新啟動（沒有登入：測試設定沒開 auth）。
+    // 管理 API 比 DNS 晚一點開始監聽（CI 機器忙時差得比較多）：等它連得上
+    let t0 = Instant::now();
+    let mut s = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", admin)) {
+            Ok(s) => break s,
+            Err(_) if t0.elapsed() < Duration::from_secs(30) => std::thread::sleep(Duration::from_millis(200)),
+            Err(e) => panic!("管理 API 連不上（{e}）：\n{}", log.lock().unwrap()),
+        }
+    };
     write!(
         s,
         "POST /api/memory/restart HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
