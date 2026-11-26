@@ -1292,7 +1292,8 @@ async fn start_cdn(cfg: &Value, resolver: &Arc<Resolver>, persister: &Arc<Mutex<
     // 啟動 2 分鐘後先複驗一次：種子資料裡過期的驗證結果不用等一小時
     periodic(Duration::from_secs(120), Duration::from_secs(3600), |c| {
         Box::pin(async move {
-            c.recheck();
+            // 3.5.1：分批走過全部網域、批與批之間會停一下：放在 blocking 執行緒上
+            let _ = tokio::task::spawn_blocking(move || c.recheck()).await;
         })
     });
     spawn_wan_subnet(resolver.clone(), 5, false);
@@ -1486,7 +1487,8 @@ fn spawn_maintenance(r: Arc<Resolver>, legacy: bool) {
                 let critical = legacy && pressure() == Pressure::Critical;
                 if critical && !was_critical {
                     if let Some(c) = r.cdn() {
-                        c.shrink(0.7);
+                        // 3.5.1：分批淘汰、批與批之間會停一下讓查詢拿鎖：放在 blocking 執行緒上，不佔查詢的工作執行緒
+                        let _ = tokio::task::spawn_blocking(move || c.shrink(0.7)).await;
                     }
                 }
                 was_critical = critical;

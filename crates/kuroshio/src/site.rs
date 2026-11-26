@@ -597,7 +597,7 @@ impl Site {
                 Some(html) => send(200, "text/html; charset=utf-8", html, &[("cache-control", "no-cache".into())]),
                 None => send(500, "text/plain; charset=utf-8", "error", &[]),
             },
-            "/api/public/stats" => json_resp(200, &self.public_stats(range()), "no-cache"),
+            "/api/public/stats" => json_resp(200, &self.public_stats_bg(range()).await, "no-cache"),
             "/api/public/presence" => {
                 // 用訪客 IP 比對最近的 DNS 查詢（不回傳 IP）
                 let st = match &self.presence {
@@ -665,7 +665,7 @@ impl Site {
             },
             "/api/public" => json_resp(
                 200,
-                &self.public_stats(q.get("range").map(String::as_str).unwrap_or("today")),
+                &self.public_stats_bg(q.get("range").map(String::as_str).unwrap_or("today")).await,
                 "no-store",
             ),
             _ => self.read_only_api(sub, q).await,
@@ -825,29 +825,55 @@ impl Site {
 
     /// `/api/public/stats`：匿名統計（`range`：today / 7d / 30d；10 秒快取）
     pub fn public_stats(&self, range: &str) -> Value {
-        let range: &'static str = match range {
-            "7d" => "7d",
-            "30d" => "30d",
-            _ => "today",
-        };
-        if let Some((at, v)) = self.cache.lock().unwrap().get(range) {
-            if at.elapsed() < STATS_CACHE {
-                return v.clone();
-            }
+        let range = stats_range(range);
+        if let Some(v) = self.cached_stats(range) {
+            return v;
         }
-        let v = self.build_public_stats(range);
+        let v = build_public_stats(&self.state, range, self.min_clients);
         self.cache.lock().unwrap().insert(range, (Instant::now(), v.clone()));
         v
     }
 
-    fn build_public_stats(&self, range: &str) -> Value {
-        match self.state.upgrade() {
-            Some(st) => dashboard_stats(&st, range, self.min_clients, PUBLIC_TOP, View::Public),
-            // 這一輪已經結束（重新載入設定中）
-            None => json!({}),
+    /// 同 [`Site::public_stats`]，但快取過期時在 blocking 執行緒上算（3.5.1：CDN 網域的統計分批拿狀態鎖、
+    /// 批與批之間會停一下，不佔查詢的工作執行緒）。HTTP 處理用這個
+    pub async fn public_stats_bg(&self, range: &str) -> Value {
+        let range = stats_range(range);
+        if let Some(v) = self.cached_stats(range) {
+            return v;
         }
+        let (w, min) = (self.state.clone(), self.min_clients);
+        let v = tokio::task::spawn_blocking(move || build_public_stats(&w, range, min))
+            .await
+            .unwrap_or_else(|_| json!({}));
+        self.cache.lock().unwrap().insert(range, (Instant::now(), v.clone()));
+        v
+    }
+
+    fn cached_stats(&self, range: &'static str) -> Option<Value> {
+        let c = self.cache.lock().unwrap();
+        let (at, v) = c.get(range)?;
+        (at.elapsed() < STATS_CACHE).then(|| v.clone())
     }
 }
+
+/// 統計的期間（不認識的當成今天）
+fn stats_range(range: &str) -> &'static str {
+    match range {
+        "7d" => "7d",
+        "30d" => "30d",
+        _ => "today",
+    }
+}
+
+fn build_public_stats(state: &Weak<AppState>, range: &str, min_clients: u64) -> Value {
+    match state.upgrade() {
+        Some(st) => dashboard_stats(&st, range, min_clients, PUBLIC_TOP, View::Public),
+        // 這一輪已經結束（重新載入設定中）
+        None => json!({}),
+    }
+}
+
+impl Site {}
 
 /// 儀表板給誰看（3.5.0 E8）：公開頁不帶營運狀態
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1069,8 +1095,11 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     let mut paths = PathAcc::default();
     if let Some(c) = r.cdn() {
         use kuroshio_cdn::providers::is_tw_pop;
-        let st = c.state();
-        for e in st.db.domains.values() {
+        // 3.5.1：分批走過全部網域（每批拿一次狀態鎖、批與批之間停一下），查詢不用等整份統計做完；
+        // 順序跟一次走完一樣，結果相同。呼叫端放在 blocking 執行緒上（`/api/dashboard`、公開頁的統計）
+        let mut cross = kuroshio_cdn::db::CrossSummary::default();
+        c.scan_domains(|_, e| {
+            cross.add(e);
             let ok4 = e.v4.as_ref().is_some_and(|v| v.verdict.as_deref() == Some("ok"));
             let ok_ecs = e.ecs.as_ref().is_some_and(|v| v.verdict.as_deref() == Some("ok"));
             if ok4 || ok_ecs {
@@ -1098,12 +1127,13 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
                     *to_pops.entry(tp.chars().take(3).collect()).or_default() += w;
                 }
             }
-        }
+        });
+        let st = c.state();
         for d in st.pools.p.values() {
             v4nodes += d.pool4.iter().filter(|x| !d.bad.contains_key(&x.ip)).count();
             v6nodes += d.pool6.iter().filter(|x| !d.bad.contains_key(&x.ip)).count();
         }
-        cs = st.db.cross_summary();
+        cs = cross.json();
     }
     let median = median(&mut saved);
 

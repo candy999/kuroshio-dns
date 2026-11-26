@@ -350,6 +350,8 @@ pub struct BudgetRound {
     pub forced: usize,
     /// 忘掉幾個一次性網域（3.5.1 H2；不管有沒有預算）
     pub forgot: usize,
+    /// 有忘掉的那一輪看了幾片（日誌用；沒有忘掉是 0）
+    pub forgot_shards: usize,
 }
 
 /// 冷資料移出 / 讀回的結果（記憶體控制，規格 09）
@@ -377,6 +379,15 @@ const SPIN_TRIES: u32 = 200;
 
 /// 寫網域資料庫的快照時，每拿一次鎖寫幾筆（一筆約 0.5 KB、幾微秒）
 const DUMP_CHUNK: usize = 256;
+
+/// 大批處理（冷資料移出、筆數上限與磁碟預算淘汰、一次性網域清理）每拿一次狀態鎖最多看幾筆（3.5.1）。
+/// 一批是幾個完整的分片（一片超過這個數也是一批）。查詢路徑（快取命中的也算）要拿同一把鎖，
+/// 以前整件事一次做完：D3（MT7621）上冷資料移出、淘汰時查詢等了好幾秒，看門狗切到業者 DNS。
+/// x86 實測每筆 0.1～0.3 µs（最重的是移出、刪除），2,048 筆一批約 0.2～0.6 ms；MT7621 慢 15～20 倍，約 3～12 ms
+pub const BATCH_ENTRIES: usize = 1024;
+
+/// 大批處理每批之間停多久（同 `dump_rest`：只 yield 的話，等著的查詢還沒被叫醒，這邊又把鎖拿走了）
+const BATCH_PAUSE: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// 網域資料庫的變動（`snapshots_sharded`）
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1042,20 +1053,152 @@ impl Cdn {
                 .chain(bg.cross.iter().cloned())
                 .collect()
         };
-        let r = {
-            let mut st = self.state();
+        let busy = |name: &str| busy.contains(name);
+        // 3.5.1：分批做（[`db::ColdSweep`]），每批放開一次鎖；規則、目標量跟一次做完一樣
+        let sw = {
+            let st = self.state();
             let n = st.db.shards;
             st.db
-                .evict_coldest(target, protect_ms, now_ms(), &|name| busy.contains(name), &|i| {
-                    persisted(&db::shard_file(n, i))
-                })
+                .cold_sweep(target, protect_ms, now_ms(), &|i| persisted(&db::shard_file(n, i)))
         };
+        let Some(mut sw) = sw else {
+            return ColdReport::default();
+        };
+        self.in_batches(|st, r| {
+            st.db.cold_scan(&mut sw, r, &busy);
+            true
+        });
+        if sw.plan() {
+            self.in_batches(|st, r| {
+                st.db.cold_take(&mut sw, r, &busy);
+                true
+            });
+        }
         self.sync_evicted();
         ColdReport {
-            entries: r.entries,
-            bytes: r.bytes,
+            entries: sw.out.entries,
+            bytes: sw.out.bytes,
             forgotten: 0,
         }
+    }
+
+    /// 把所有分片依筆數切成好幾批（每批大約 [`BATCH_ENTRIES`] 筆、至少一片），每批拿一次狀態鎖呼叫
+    /// `f(狀態, 這一批的分片)`，批與批之間放開鎖、停一下讓查詢先拿到鎖。`f` 回 false 就不做後面的（3.5.1）。
+    /// 會停頓（`sleep`）：只在背景的 blocking 執行緒上用，不在 tokio 的工作執行緒上（那裡用 [`Cdn::in_batches_yield`]）
+    pub(crate) fn in_batches(&self, mut f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
+        self.batches(true, |g, r| f(&mut *g, r))
+    }
+
+    /// 同 [`Cdn::in_batches`]，但批與批之間只讓出執行緒、不停頓：給 tokio 的工作執行緒上的唯讀加總用（狀態頁）
+    pub(crate) fn in_batches_yield(&self, mut f: impl FnMut(&State, std::ops::Range<usize>) -> bool) {
+        self.batches(false, |g, r| f(g, r))
+    }
+
+    /// 唯讀地分批走過全部網域（3.5.1；統計、分享、定時複驗用）：每批約 [`BATCH_ENTRIES`] 筆拿一次狀態鎖，
+    /// 批與批之間放開鎖、停 100 µs。順序跟 `st.db.domains.values()` 一次走完一樣（分片依序、片內依雜湊表的順序），
+    /// 所以結果跟一次拿著鎖做完相同；放開鎖的期間別人改的，走到那一片時看到的是改過的。
+    /// 會停頓：放在 blocking 執行緒上，或只給不常做的事用
+    pub fn scan_domains(&self, mut f: impl FnMut(&State, &db::Domain)) {
+        self.batches(true, |st, r| {
+            for i in r {
+                for d in st.db.domains.shard(i).values() {
+                    f(st, d);
+                }
+            }
+            true
+        })
+    }
+
+    fn batches(&self, pause: bool, mut f: impl FnMut(&mut StateGuard<'_>, std::ops::Range<usize>) -> bool) {
+        let mut i = 0;
+        loop {
+            let (more, done) = {
+                let mut st = self.state();
+                let n = st.db.shards;
+                if i >= n {
+                    return;
+                }
+                let start = i;
+                let mut seen = 0;
+                while i < n {
+                    let len = st.db.domains.shard(i).len();
+                    if i > start && seen + len > BATCH_ENTRIES {
+                        break;
+                    }
+                    seen += len;
+                    i += 1;
+                }
+                (f(&mut st, start..i), i >= n)
+            };
+            if !more || done {
+                return;
+            }
+            if pause {
+                std::thread::sleep(BATCH_PAUSE);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// 依價值淘汰到剩 `keep` 筆（同 [`db::Db::shrink_to`] 的規則），分批做（[`db::CapSweep`]）。回傳各組刪了幾筆
+    fn drop_cheapest_batched(&self, keep: usize) -> [u32; db::PRUNE_GROUPS] {
+        let Some(mut sw) = self.state().db.cap_sweep(keep, now_ms()) else {
+            return [0; db::PRUNE_GROUPS];
+        };
+        self.in_batches(|st, r| {
+            st.db.cap_scan(&mut sw, r);
+            true
+        });
+        let go = {
+            let st = self.state();
+            sw.plan(st.db.domains.len())
+        };
+        if !go {
+            return sw.out;
+        }
+        self.in_batches(|st, r| {
+            st.db.cap_take(&mut sw, r);
+            true
+        });
+        // 最後那一格挑最舊的：不拿鎖
+        sw.pick_edge();
+        while self.state().db.cap_take_edge(&mut sw, BATCH_ENTRIES) {
+            std::thread::sleep(BATCH_PAUSE);
+        }
+        sw.out
+    }
+
+    /// 筆數超過 `cdn.maxEntries`：分批淘汰到上限的 90%（背景的整理每一輪呼叫；查詢路徑只在超過硬上限時才當場做，
+    /// [`db::Db::hard_cap`]）。淘汰的筆數由 [`Cdn::report_cap_pruned`] 合併成一行
+    pub(crate) fn prune_cap(&self) {
+        let keep = {
+            let st = self.state();
+            if !st.db.over_cap() {
+                return;
+            }
+            st.db.prune_keep()
+        };
+        let g = self.drop_cheapest_batched(keep);
+        self.state().db.note_cap_pruned(g);
+    }
+
+    /// 一次性網域清理（[`db::Db::forget_one_shot`]）分批做：（忘掉幾筆，這一輪看了幾片）
+    fn forget_one_shot_batched(&self, now: u64, rotate: bool) -> (usize, usize) {
+        let Some(pick) = self.state().db.forget_pick(rotate) else {
+            return (0, 0);
+        };
+        let looked = pick.iter().filter(|p| **p).count();
+        let mut left = db::FORGET_ONE_SHOT_MAX;
+        let mut forgot = 0;
+        self.in_batches(|st, r| {
+            if !r.clone().any(|i| pick[i]) {
+                return true;
+            }
+            forgot += st.db.forget_in(&pick, r, now, &mut left);
+            left > 0
+        });
+        (forgot, looked)
     }
 
     /// 記憶體控制的「長大」開關（3.5.1 K4）：不能長大時新網域照上游的答案回、不記進資料庫（已經記著的照常）
@@ -1156,7 +1299,7 @@ impl Cdn {
     }
 
     /// 把第 `i` 個分片移出記憶體的冷資料讀回來（讀不到的就從移出名單拿掉）
-    fn restore_shard_cold(&self, n: usize, i: usize) -> ColdReport {
+    pub(crate) fn restore_shard_cold(&self, n: usize, i: usize) -> ColdReport {
         let mut out = ColdReport::default();
         let hashes = self.state().db.evicted_hashes(n, i);
         if hashes.is_empty() {
@@ -1234,20 +1377,23 @@ impl Cdn {
     /// 沒有設定預算（大磁碟、`cdn.dbDiskBudgetKB: 0`）時只量一下實際大小給狀態頁，什麼都不刪
     pub fn budget_round(&self) -> BudgetRound {
         let mut out = BudgetRound::default();
-        // 上一輪以來筆數上限的淘汰（查詢路徑上、寫分片之前發生的）合併成一行
+        // 筆數超過 `cdn.maxEntries`：分批淘汰（3.5.1：以前在查詢路徑上一次做完）
+        self.prune_cap();
+        // 上一輪以來筆數上限的淘汰（這裡的、超過硬上限時查詢路徑上的）合併成一行
         self.report_cap_pruned("執行中（上次整理以來）");
         let disk = self.measure_disk();
         // 3.5.1 H2：一次性網域（只問過一次、沒有學習資料、3 天沒出現）不管有沒有預算都定期忘掉。
         // 有預算的小 Flash 只看本來就要寫的分片；沒有預算時另外輪流看幾片（分批、每輪有上限）
-        let forgot = self.state().db.forget_one_shot(now_ms(), self.cfg.db_disk_budget.is_none());
+        let (forgot, looked) = self.forget_one_shot_batched(now_ms(), self.cfg.db_disk_budget.is_none());
         if forgot > 0 {
             out.forgot = forgot;
+            out.forgot_shards = looked;
             let total = self
                 .forgot_one_shot
                 .load(Ordering::Relaxed)
                 .saturating_add(forgot.min(u32::MAX as usize) as u32);
             self.forgot_one_shot.store(total, Ordering::Relaxed);
-            debug!("CDN 網域資料：忘掉 {forgot} 個 3 天沒出現、只問過一次的網域");
+            info!("CDN：忘掉 {forgot} 筆 3 天沒出現的一次性網域（這一輪看了 {looked} 片）");
         }
         let (Some(limit), Some(budget)) = (self.budget_limit(), self.cfg.db_disk_budget) else {
             self.budget_cap.store(0, Ordering::Relaxed);
@@ -1284,10 +1430,30 @@ impl Cdn {
             }
             self.sync_evicted();
         }
-        let (dropped, left, sweeping) = {
+        // 分批淘汰：一次給幾片（每片各自決定，結果跟一次給全部一樣），批與批之間放開鎖
+        let now = now_ms();
+        let mut dropped = 0;
+        let mut k = 0;
+        while k < plan.shards.len() {
+            if k > 0 {
+                std::thread::sleep(BATCH_PAUSE);
+            }
             let mut st = self.state();
-            let d = st.db.budget_prune(&plan.shards, now_ms());
-            (d, st.db.total_entries(), st.db.budget_sweeping())
+            let start = k;
+            let mut seen = 0;
+            while k < plan.shards.len() {
+                let len = st.db.domains.shard(plan.shards[k].0.min(n - 1)).len();
+                if k > start && seen + len > BATCH_ENTRIES {
+                    break;
+                }
+                seen += len;
+                k += 1;
+            }
+            dropped += st.db.budget_prune(&plan.shards[start..k], now);
+        }
+        let (left, sweeping) = {
+            let st = self.state();
+            (st.db.total_entries(), st.db.budget_sweeping())
         };
         out.dropped = dropped;
         out.shards = plan.shards.len();
@@ -1349,10 +1515,14 @@ impl Cdn {
     }
 
     /// 記憶體不足（規格 05 第 3.2 節的看門狗）：網域資料庫刪到剩 `keep_ratio`（例如 0.5）
+    /// 分批做（3.5.1，同 [`Cdn::prune_cap`]）；刪完把各片的表縮回去，也是一批一批
     pub fn shrink(&self, keep_ratio: f64) {
-        let mut st = self.state();
-        let n = (st.db.domains.len() as f64 * keep_ratio.clamp(0.0, 1.0)) as usize;
-        st.db.shrink_to(n);
+        let keep = (self.state().db.domains.len() as f64 * keep_ratio.clamp(0.0, 1.0)) as usize;
+        self.drop_cheapest_batched(keep);
+        self.in_batches(|st, r| {
+            r.for_each(|i| st.db.domains.shrink_shard(i));
+            true
+        });
     }
 
     /// 每週工作更新了範圍或分類檔之後重新讀取
@@ -1723,10 +1893,17 @@ impl Cdn {
     /// 記憶體裡的網域資料庫大約多大（bytes；狀態頁分項用量用，不必精確）
     pub fn approx_ram_bytes(&self) -> usize {
         // 每筆的估計裡含雜湊表的一格；雜湊表實際配置的格數（容量）比筆數多，空格也佔記憶體（3.4.1 起算進去）
+        // 3.5.1：分批加總（7 萬筆在 MT7621 上一次加完要拿著鎖幾十毫秒）
+        let slot = std::mem::size_of::<(Arc<str>, crate::db::Domain)>();
+        let mut items = 0usize;
+        self.in_batches_yield(|st, r| {
+            items += r
+                .map(|i| st.db.domains.shard(i).values().map(|d| d.approx_bytes()).sum::<usize>())
+                .sum::<usize>();
+            true
+        });
         let st = self.state();
         let m = &st.db.domains;
-        let slot = std::mem::size_of::<(Arc<str>, crate::db::Domain)>();
-        let items: usize = m.values().map(|d| d.approx_bytes()).sum();
         items + m.capacity().saturating_sub(m.len()) * slot + m.capacity() + 16
     }
 
@@ -1774,26 +1951,51 @@ impl Cdn {
     }
 
     /// `/api/cdn/summary`
+    /// 3.5.1：分批走過全部網域（[`Cdn::scan_domains`]），結果跟一次拿著鎖做完一樣（`db::SummaryAcc`）
     pub fn summary(&self) -> Value {
-        serde_json::to_value(self.state().db.summary()).unwrap_or_default()
+        let mut acc = db::SummaryAcc::default();
+        self.scan_domains(|_, e| acc.add(e));
+        serde_json::to_value(acc.finish()).unwrap_or_default()
     }
 
-    /// `/api/cdn/domains`（JSON）
+    /// `/api/cdn/domains` 要列的網域（依排序、分頁之後）：分批走過全部網域只收排序鍵，排序不拿鎖（3.5.1）
+    fn query_keys(&self, q: &db::Query) -> Vec<(u64, Arc<str>)> {
+        let mut keys = Vec::new();
+        self.scan_domains(|_, e| keys.extend(q.key(e)));
+        db::Query::order(&mut keys, q);
+        keys
+    }
+
+    /// 依排好的名稱分批取出內容（每批 [`DUMP_CHUNK`] 筆拿一次鎖；期間被刪掉的略過，同寫快照）
+    fn query_rows(&self, keys: &[(u64, Arc<str>)], mut f: impl FnMut(&[&db::Domain])) {
+        for (k, chunk) in keys.chunks(DUMP_CHUNK).enumerate() {
+            if k > 0 {
+                std::thread::sleep(BATCH_PAUSE);
+            }
+            let st = self.state();
+            let rows: Vec<&db::Domain> = chunk.iter().filter_map(|(_, n)| st.db.get(n)).collect();
+            f(&rows);
+        }
+    }
+
+    /// `/api/cdn/domains`（JSON）。3.5.1：分批拿鎖（7 萬筆整份匯出時，以前一次拿著鎖走完、排序、序列化）。
+    /// 會停頓：放在 blocking 執行緒上
     pub fn query(&self, q: &db::Query) -> Value {
-        let st = self.state();
-        Value::Array(
-            st.db
-                .query(q)
-                .into_iter()
-                .map(|d| serde_json::to_value(d).unwrap_or_default())
-                .collect(),
-        )
+        let keys = self.query_keys(q);
+        let mut out = Vec::with_capacity(keys.len());
+        self.query_rows(&keys, |rows| {
+            out.extend(rows.iter().map(|d| serde_json::to_value(d).unwrap_or_default()))
+        });
+        Value::Array(out)
     }
 
-    /// `/api/cdn/domains?format=csv`
+    /// `/api/cdn/domains?format=csv`（同 [`Cdn::query`]，分批）
     pub fn query_csv(&self, q: &db::Query) -> String {
-        let st = self.state();
-        Db::to_csv(&st.db.query(q))
+        let keys = self.query_keys(q);
+        let mut out = String::new();
+        db::Db::csv_into(&[], true, &mut out);
+        self.query_rows(&keys, |rows| db::Db::csv_into(rows, false, &mut out));
+        out
     }
 
     /// 某個網域的紀錄（`/api/trace` 的 cdnDb）
@@ -1870,7 +2072,13 @@ impl Cdn {
 
     /// 跨 CDN 統計
     pub fn cross_summary(&self) -> Value {
-        self.state().db.cross_summary()
+        // 3.5.1：分批加總（每批拿一次鎖；在 tokio 的工作執行緒上，批與批之間只讓出）
+        let mut acc = db::CrossSummary::default();
+        self.in_batches_yield(|st, r| {
+            r.for_each(|i| st.db.domains.shard(i).values().for_each(|e| acc.add(e)));
+            true
+        });
+        acc.json()
     }
 
     /// 每小時：熱門且即將到期的「驗證通過」網域先重新驗證，避免掉回 10 秒試用；
@@ -1881,67 +2089,9 @@ impl Cdn {
     /// L13：多來源網域另一家的那一格（`src.alt`）用同樣的條件複驗（那一家最後回答在 3 天內）
     pub fn recheck(self: &Arc<Self>) -> usize {
         let now = now_ms();
-        let soon = now + util::HOUR_MS;
-        let recent = now.saturating_sub(3 * util::DAY_MS);
-        let mut tasks = Vec::new();
-        let sampled;
         // 3.5.1 L3：相容性紀錄（ip-zone）的「不服務」7 天沒有新的就消退（每小時一次，跟複驗一起）
         self.with_state(|st| st.pools.decay_zone(now));
-        {
-            let st = self.state();
-            let due = |v: Option<&db::Verdict>| v.is_some_and(|v| v.is("ok") && v.until.unwrap_or(0) < soon);
-            for e in st.db.domains.values() {
-                if e.best != Some(db::Strategy::Alias) && e.hits < 2 {
-                    continue;
-                }
-                if e.last_seen >= recent {
-                    if let Some(p) = e.provider().filter(|p| st.pools.has(p)) {
-                        for fam in [4u8, 6] {
-                            if due(e.verdict(fam)) {
-                                tasks.push(Task::Verify {
-                                    name: e.name.to_string(),
-                                    provider: p.to_string(),
-                                    family: fam,
-                                    orig: e.orig_ip(fam),
-                                });
-                            }
-                        }
-                    }
-                }
-                // L13：另一家的那一格
-                let Some(a) = e.src.as_ref().and_then(|s| s.alt.as_deref()) else {
-                    continue;
-                };
-                if a.last < recent {
-                    continue;
-                }
-                let Some(p) = a.provider.val().filter(|p| st.pools.has(p)) else {
-                    continue;
-                };
-                for (fam, v) in [(4u8, a.v4.as_deref()), (6, a.v6.as_deref())] {
-                    if due(v) {
-                        let orig = if fam == 4 {
-                            a.base
-                                .as_ref()
-                                .and_then(|b| b.ip)
-                                .filter(IpAddr::is_ipv4)
-                                .or_else(|| a.ips4.first().copied())
-                        } else {
-                            a.ips6.first().copied()
-                        };
-                        tasks.push(Task::Verify {
-                            name: e.name.to_string(),
-                            provider: p.to_string(),
-                            family: fam,
-                            orig,
-                        });
-                    }
-                }
-            }
-            let pick = self.reverify_pick(&st, now);
-            sampled = pick.len();
-            tasks.extend(pick);
-        }
+        let (tasks, sampled) = self.recheck_tasks(now);
         let n = tasks.len();
         if n > 0 {
             info!("定時複驗：{n} 個網域（其中輪流抽驗 {sampled} 個）");
@@ -1950,44 +2100,132 @@ impl Cdn {
         n
     }
 
+    /// 定時複驗要排的工作（快到期的在前、輪流抽驗的接在後面）與其中抽驗的個數。
+    /// 3.5.1：分批走過全部網域（每批拿一次鎖），結果跟一次拿著鎖做完一樣
+    pub(crate) fn recheck_tasks(&self, now: u64) -> (Vec<Task>, usize) {
+        let mut tasks = Vec::new();
+        let mut acc = ReverifyAcc::default();
+        self.scan_domains(|st, e| {
+            Self::recheck_one(st, e, now, &mut tasks);
+            self.reverify_one(st, e, now, &mut acc);
+        });
+        let pick = self.reverify_finish(acc);
+        let sampled = pick.len();
+        tasks.extend(pick);
+        (tasks, sampled)
+    }
+
+    /// 定時複驗看一個網域（[`Cdn::recheck`]）：快到期的驗證結果排進 `tasks`
+    pub(crate) fn recheck_one(st: &State, e: &db::Domain, now: u64, tasks: &mut Vec<Task>) {
+        let soon = now + util::HOUR_MS;
+        let recent = now.saturating_sub(3 * util::DAY_MS);
+        let due = |v: Option<&db::Verdict>| v.is_some_and(|v| v.is("ok") && v.until.unwrap_or(0) < soon);
+        if e.best != Some(db::Strategy::Alias) && e.hits < 2 {
+            return;
+        }
+        if e.last_seen >= recent {
+            if let Some(p) = e.provider().filter(|p| st.pools.has(p)) {
+                for fam in [4u8, 6] {
+                    if due(e.verdict(fam)) {
+                        tasks.push(Task::Verify {
+                            name: e.name.to_string(),
+                            provider: p.to_string(),
+                            family: fam,
+                            orig: e.orig_ip(fam),
+                        });
+                    }
+                }
+            }
+        }
+        // L13：另一家的那一格
+        let Some(a) = e.src.as_ref().and_then(|s| s.alt.as_deref()) else {
+            return;
+        };
+        if a.last < recent {
+            return;
+        }
+        let Some(p) = a.provider.val().filter(|p| st.pools.has(p)) else {
+            return;
+        };
+        for (fam, v) in [(4u8, a.v4.as_deref()), (6, a.v6.as_deref())] {
+            if due(v) {
+                let orig = if fam == 4 {
+                    a.base
+                        .as_ref()
+                        .and_then(|b| b.ip)
+                        .filter(IpAddr::is_ipv4)
+                        .or_else(|| a.ips4.first().copied())
+                } else {
+                    a.ips6.first().copied()
+                };
+                tasks.push(Task::Verify {
+                    name: e.name.to_string(),
+                    provider: p.to_string(),
+                    family: fam,
+                    orig,
+                });
+            }
+        }
+    }
+
     /// 輪流抽驗：判定「通過」要 24 小時才到期，期間節點一直健康、但某個網站開始不服務它
     /// （例如 Cloudflare 1034）時，會一路回壞掉的節點到到期為止。
     /// 每小時從「最近一天內有改寫（`best` = 換節點）、判定還有效、上次驗證超過一小時」的網域中，
     /// 抽「改寫中網域數 × `reverifyRatio`」個（限制在 `reverifyMin`～`reverifyMax`）重新驗證：
     /// 熱門程度 × 距上次驗證的時間越大越先（熱門的先驗，冷門的放久了也會輪到）。
-    /// 驗證失敗就跟判定過期一樣，馬上改回原始結果。即將到期的由 `recheck` 處理，這裡不重複
+    /// 驗證失敗就跟判定過期一樣，馬上改回原始結果。即將到期的由 `recheck` 處理，這裡不重複。
+    /// 這裡一次拿著鎖做完（測試比對用）；`recheck` 用同樣的步驟（`reverify_one` → `reverify_finish`）分批做
+    #[cfg(test)]
     pub(crate) fn reverify_pick(&self, st: &State, now: u64) -> Vec<Task> {
+        let mut acc = ReverifyAcc::default();
+        for e in st.db.domains.values() {
+            self.reverify_one(st, e, now, &mut acc);
+        }
+        self.reverify_finish(acc)
+    }
+
+    /// 輪流抽驗看一個網域：還有效的改寫算進 `active`，夠舊的列為候選
+    fn reverify_one(&self, st: &State, e: &db::Domain, now: u64, acc: &mut ReverifyAcc) {
         let c = &self.cfg;
         if c.reverify_ratio <= 0.0 || c.reverify_max == 0 {
-            return vec![];
+            return;
         }
         let active_since = now.saturating_sub(util::DAY_MS);
         let soon = now + util::HOUR_MS;
-        let mut active = 0usize;
-        // （優先度，網域，CDN，家族）
-        let mut cand: Vec<(f64, &db::Domain, &str, u8)> = Vec::new();
-        for e in st.db.domains.values() {
-            if e.last_seen < active_since || e.best != Some(db::Strategy::Alias) || e.policy() != db::Policy::Auto {
-                continue;
-            }
-            let Some(p) = e.provider() else { continue };
-            if !st.pools.has(p) {
-                continue;
-            }
-            for fam in [4u8, 6] {
-                let Some(v) = e.verdict(fam).filter(|v| v.is("ok") && v.valid(now)) else {
-                    continue;
-                };
-                active += 1;
-                let until = v.until.unwrap_or(0);
-                let age = now.saturating_sub(v.at.unwrap_or(0));
-                if until < soon || age < util::HOUR_MS {
-                    continue;
-                }
-                let score = (e.hits as f64 + 1.0) * (age as f64 / util::HOUR_MS as f64);
-                cand.push((score, e, p, fam));
-            }
+        if e.last_seen < active_since || e.best != Some(db::Strategy::Alias) || e.policy() != db::Policy::Auto {
+            return;
         }
+        let Some(p) = e.provider() else { return };
+        if !st.pools.has(p) {
+            return;
+        }
+        for fam in [4u8, 6] {
+            let Some(v) = e.verdict(fam).filter(|v| v.is("ok") && v.valid(now)) else {
+                continue;
+            };
+            acc.active += 1;
+            let until = v.until.unwrap_or(0);
+            let age = now.saturating_sub(v.at.unwrap_or(0));
+            if until < soon || age < util::HOUR_MS {
+                continue;
+            }
+            let score = (e.hits as f64 + 1.0) * (age as f64 / util::HOUR_MS as f64);
+            acc.cand.push((
+                score,
+                Task::Verify {
+                    name: e.name.to_string(),
+                    provider: p.to_string(),
+                    family: fam,
+                    orig: e.orig_ip(fam),
+                },
+            ));
+        }
+    }
+
+    /// 從候選裡抽（不拿鎖）
+    fn reverify_finish(&self, acc: ReverifyAcc) -> Vec<Task> {
+        let c = &self.cfg;
+        let ReverifyAcc { active, mut cand } = acc;
         if cand.is_empty() {
             return vec![];
         }
@@ -2003,15 +2241,15 @@ impl Cdn {
             cand.truncate(want);
         }
         cand.sort_by(|a, b| b.0.total_cmp(&a.0));
-        cand.into_iter()
-            .map(|(_, e, p, fam)| Task::Verify {
-                name: e.name.to_string(),
-                provider: p.to_string(),
-                family: fam,
-                orig: e.orig_ip(fam),
-            })
-            .collect()
+        cand.into_iter().map(|(_, t)| t).collect()
     }
+}
+
+/// 輪流抽驗的累計（[`Cdn::reverify_pick`]）：還有效的改寫數、（優先度，要排的工作）
+#[derive(Default)]
+struct ReverifyAcc {
+    active: usize,
+    cand: Vec<(f64, Task)>,
 }
 
 // ------------------------------------------------------------ 共用結果（串接模式，3.4.0）

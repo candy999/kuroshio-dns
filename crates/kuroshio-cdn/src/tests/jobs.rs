@@ -518,6 +518,47 @@ fn pool_sticky_pick_replaces_worse_nodes() {
     assert!(sticky_pick(&[], &prev, 3).is_empty());
 }
 
+/// 3.5.1：換掉的前一輪節點寫出 IP 與原因（以前日誌只有個數）；每家最多列幾個
+#[test]
+fn pool_replaced_nodes_are_named_with_reason() {
+    use crate::jobs::pool::{replaced_line, replaced_why, sticky_pick};
+    let v4 = |i: u8| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, i));
+    let mut ranked: Vec<pool::PickCand> = (1..=4).map(|i| pick(v4(i), 0.0, 2.0, Some(10.0), false)).collect();
+    ranked.push(pick(v4(10), 0.0, 3.5, Some(10.0), false));
+    ranked.push(pick(v4(11), 0.4, 2.0, Some(10.0), false));
+    ranked.push(pick(v4(12), 0.0, 2.0, Some(4.0), true));
+    ranked.push(pick(v4(13), 0.0, 2.0, Some(7.0), false));
+    ranked.push(pick(v4(14), 1.0, f64::INFINITY, None, false));
+    ranked.push(pick(v4(15), 0.0, 2.9, Some(9.0), false));
+    let prev: Vec<IpAddr> = [10, 11, 12, 13, 14, 15, 200, 201].into_iter().map(v4).collect();
+    let picked = sticky_pick(&ranked, &prev, 4);
+    let gone: HashMap<IpAddr, String> = [(v4(200), "不在台灣（POP HKG）".to_string())].into_iter().collect();
+    let why = replaced_why(&ranked, &prev, &picked, 4, &gone);
+    let got: Vec<(String, String)> = why.iter().map(|(ip, w)| (ip.to_string(), w.clone())).collect();
+    assert_eq!(
+        got,
+        [
+            ("198.51.100.10", "延遲 3.50 ms，超過門檻 3.00 ms"),
+            ("198.51.100.11", "丟包 40%（新的最差 0%）"),
+            ("198.51.100.12", "慢（4 MB/s，比同一家其他節點的一半還低）"),
+            ("198.51.100.13", "速度 7 MB/s，不到新的最慢 10 MB/s 的八成"),
+            ("198.51.100.14", "重新量時連不上"),
+            ("198.51.100.200", "不在台灣（POP HKG）"),
+            ("198.51.100.201", "這一輪沒有量到"),
+        ]
+        .map(|(a, b)| (a.to_string(), b.to_string())),
+        "留下的 v4(15) 不列"
+    );
+    let line = replaced_line(&why, 3);
+    assert_eq!(
+        line,
+        "198.51.100.10：延遲 3.50 ms，超過門檻 3.00 ms；198.51.100.11：丟包 40%（新的最差 0%）；\
+         198.51.100.12：慢（4 MB/s，比同一家其他節點的一半還低）……（另 4 個）"
+    );
+    // 都留下：沒有要列的
+    assert!(replaced_why(&ranked, &[v4(15)], &picked, 4, &gone).is_empty());
+}
+
 /// 3.5.1 M1（D3 R3 重現）：節點池工作連跑兩次，候選每次在同一批 /24 裡隨機抽位址，新抽到的位址延遲只快 0.3 ms；
 /// 前一輪的節點要全部留下。以前：階段 A 的 120 名截斷、每個 /24 只留最快的一個、沒進決選就拿階段 A 的延遲比、
 /// 1/3 的上限照前一輪的總數算，Cloudflare 的 12 個隔 30 分鐘全部換掉

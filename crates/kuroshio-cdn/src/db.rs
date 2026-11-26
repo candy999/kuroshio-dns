@@ -4,6 +4,7 @@
 //! 每筆紀錄保持精簡：常見字串（CDN 名稱、判定）共用、選填的子物件放在 `Box` 裡，沒有就只佔一個指標。
 //! 筆數上限 `cdn.maxEntries`（安全上限，不分機器；記憶體由記憶體控制把冷資料移到磁碟），超過時依價值淘汰：沒有學習資料、只問過一次的先刪，有學習資料的最後才動（手動設定策略的不刪；3.5.1 H1）。
 
+pub use crate::shardmap::ShardMap;
 use crate::util::{
     self, de_arc, de_ips, de_opt_arc, de_opt_bool, de_opt_ip, de_opt_ips, de_opt_string, de_opt_u32, de_opt_u64, de_u32, de_u64, now_ms,
     ser_arc, ser_opt_arc, Extra, Field, Num,
@@ -781,6 +782,115 @@ pub struct Query {
     pub cross: bool,
 }
 
+impl Query {
+    /// 符合條件的網域的排序鍵（不符合是 None）：（依哪個欄位遞減，名稱）
+    pub fn key(&self, e: &Domain) -> Option<(u64, Arc<str>)> {
+        let q = self;
+        let ok = q.provider.as_deref().map(|p| e.provider() == Some(p)).unwrap_or(true)
+            && q.verdict
+                .as_deref()
+                .map(|v| e.v4.as_ref().map(|x| x.is(v)).unwrap_or(false) || e.v6.as_ref().map(|x| x.is(v)).unwrap_or(false))
+                .unwrap_or(true)
+            && q.search.as_deref().map(|t| e.name.contains(t)).unwrap_or(true)
+            && (!q.cross || e.cross4.as_ref().is_some_and(|c| c.verdict.as_deref().is_some_and(|v| v != "none")));
+        if !ok {
+            return None;
+        }
+        let k = match q.sort.as_deref().unwrap_or("hits") {
+            "lastSeen" => e.last_seen,
+            "firstSeen" => e.first_seen,
+            _ => e.hits as u64,
+        };
+        Some((k, e.name.clone()))
+    }
+
+    /// 排序（欄位遞減、同值依名稱）、跳過 `offset`、留 `limit`（預設 1,000）
+    pub fn order(keys: &mut Vec<(u64, Arc<str>)>, q: &Query) {
+        keys.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        keys.drain(..q.offset.min(keys.len()));
+        keys.truncate(q.limit.unwrap_or(1000));
+    }
+}
+
+/// 各家 CDN 統計摘要的累計（[`Db::summary`]）：一筆一筆加、順序不影響結果，分批走過全部網域時也能用（3.5.1）。
+/// 以前先依（第一次出現，名稱）排序整份再累計：業者、POP 的順序是「依這個順序第一次出現」，
+/// 這裡記每個業者、每個 POP 最早的（第一次出現，名稱），最後依它排，結果一樣
+#[derive(Default)]
+pub struct SummaryAcc {
+    by: HashMap<String, SummarySlot>,
+}
+
+/// （第一次出現，名稱）：摘要裡業者、POP 的順序
+type FirstKey = (u64, Arc<str>);
+
+#[derive(Default)]
+struct SummarySlot {
+    first: Option<FirstKey>,
+    s: Summary,
+    pops: HashMap<String, (FirstKey, u32)>,
+}
+
+impl SummaryAcc {
+    pub fn add(&mut self, e: &Domain) {
+        let key = (e.first_seen, e.name.clone());
+        let p = e.provider().unwrap_or("unknown");
+        if !self.by.contains_key(p) {
+            self.by.insert(p.to_string(), SummarySlot::default());
+        }
+        let slot = self.by.get_mut(p).unwrap();
+        if slot.first.as_ref().is_none_or(|f| key < *f) {
+            slot.first = Some(key.clone());
+        }
+        let s = &mut slot.s;
+        s.domains += 1;
+        s.hits += e.hits as u64;
+        if let Some(pop) = e.base.as_ref().and_then(|b| b.pop.as_deref()).filter(|p| !p.is_empty()) {
+            let x = slot.pops.entry(pop.to_string()).or_insert_with(|| (key.clone(), 0));
+            x.1 += 1;
+            if key < x.0 {
+                x.0 = key;
+            }
+            // 2.x 這裡用大小寫有別的比對
+            if ["TPE", "KHH", "TSA", "RMQ", "TXG", "TNN"].iter().any(|t| pop.starts_with(t)) {
+                s.base_pop_tw += 1;
+            } else {
+                s.base_pop_abroad += 1;
+            }
+        }
+        if let Some(v) = &e.v4 {
+            s.v4ok += v.is("ok") as u32;
+            s.v4fail += v.is("fail") as u32;
+        }
+        if let Some(v) = &e.v6 {
+            s.v6ok += v.is("ok") as u32;
+            s.v6fail += v.is("fail") as u32;
+        }
+        if e.ecs.as_ref().map(|x| x.is("ok")).unwrap_or(false) {
+            s.ecs_gain += 1;
+        }
+    }
+
+    pub fn finish(self) -> Vec<Summary> {
+        let mut slots: Vec<(String, SummarySlot)> = self.by.into_iter().collect();
+        slots.sort_by(|a, b| a.1.first.cmp(&b.1.first));
+        let mut v: Vec<Summary> = slots
+            .into_iter()
+            .map(|(p, slot)| {
+                let mut pops: Vec<(String, (FirstKey, u32))> = slot.pops.into_iter().collect();
+                pops.sort_by(|a, b| (a.1).0.cmp(&(b.1).0));
+                Summary {
+                    provider: p,
+                    pops: pops.into_iter().map(|(k, (_, n))| (k, n)).collect(),
+                    ..slot.s
+                }
+            })
+            .collect();
+        // 穩定排序：同樣的查詢次數照第一次出現的順序（同以前）
+        v.sort_by_key(|s| std::cmp::Reverse(s.hits));
+        v
+    }
+}
+
 /// 分段寫快照時要寫的網域：（查詢次數，名稱）
 pub type DumpKeys = Vec<(u32, Arc<str>)>;
 
@@ -979,7 +1089,8 @@ pub struct StoreLoad {
 }
 
 pub struct Db {
-    pub domains: HashMap<Arc<str>, Domain>,
+    /// 網域，記憶體裡也照磁碟分片分開放（[`ShardMap`]，3.5.1）：寫一片、整理幾片都只看那幾片的表
+    pub domains: ShardMap<Domain>,
     pub harvest: IndexMap<String, HarvestSet>,
     pub max_entries: usize,
     saved_at: Option<String>,
@@ -993,9 +1104,12 @@ pub struct Db {
     marks: Vec<Mark>,
     /// 要寫分片清單：寫完之後要刪掉的舊檔（相對路徑）
     pub manifest_pending: Option<Vec<String>>,
-    /// 記憶體控制暫時移出記憶體的冷資料（規格 09）：只留名稱的 32 位元雜湊（排序、可重複），內容還在磁碟的分片裡。
-    /// 查到這些網域時從分片讀回來；寫分片時把它們從舊檔接回去，所以磁碟上不會少
-    evicted: Vec<u32>,
+    /// 記憶體控制暫時移出記憶體的冷資料（規格 09）：只留名稱的 32 位元雜湊（每片一份、排序、可重複），內容還在磁碟的分片裡。
+    /// 查到這些網域時從分片讀回來；寫分片時把它們從舊檔接回去，所以磁碟上不會少。
+    /// 3.5.1：以前全部放在同一份排序的陣列，讀回一筆就要搬動整份（讀回一片是「筆數 × 全部移出筆數」）
+    evicted: Vec<Vec<u32>>,
+    /// 移出記憶體的總筆數
+    evicted_len: usize,
     /// 磁碟預算：正在一輪一輪主動重寫超過額度的分片（超過 110% 開始，回到預算以內結束）
     budget_sweep: bool,
     /// 尊重多來源 CDN、第一層 CNAME 變了就失效（3.5.0 B3，`cdn.multiCdn`）。關掉時同 3.4.x：業者欄位直接改寫
@@ -1114,6 +1228,57 @@ pub fn prune_group(d: &Domain) -> u8 {
     }
 }
 
+/// 跨 CDN 結果的統計（[`Db::cross_summary`]）：一筆一筆加，分批走過全部網域時也能用（`Cdn::scan_domains`，3.5.1）
+#[derive(Debug, Default, Clone)]
+pub struct CrossSummary {
+    explored: u32,
+    ok: u32,
+    fail: u32,
+    none: u32,
+    /// 連線比較近、但握手沒有比較快而沒有採用的（3.5.0 B4、F13）
+    score_rejected: u32,
+    by_to: IndexMap<String, u32>,
+    by_from: IndexMap<String, (u32, u32)>,
+    also: IndexMap<String, u32>,
+}
+
+impl CrossSummary {
+    pub fn add(&mut self, e: &Domain) {
+        let Some(x) = &e.cross4 else { return };
+        let Some(v) = x.verdict.as_deref() else { return };
+        let from = x.from.as_deref().or(e.provider()).unwrap_or("?").to_string();
+        let f = self.by_from.entry(from).or_default();
+        if v == "none" {
+            self.none += 1;
+            return;
+        }
+        self.explored += 1;
+        f.0 += 1;
+        if v == "ok" {
+            self.ok += 1;
+            f.1 += 1;
+            *self.by_to.entry(x.to.as_deref().unwrap_or("?").to_string()).or_default() += 1;
+            for a in x.also.iter().flatten() {
+                *self.also.entry(a.clone()).or_default() += 1;
+            }
+        } else {
+            self.fail += 1;
+            if x.score.get().is_some() && x.orig_score.get().is_some() {
+                self.score_rejected += 1;
+            }
+        }
+    }
+
+    pub fn json(self) -> Value {
+        json!({
+            "explored": self.explored, "ok": self.ok, "fail": self.fail, "none": self.none,
+            "scoreRejected": self.score_rejected, "byTo": self.by_to,
+            "byFrom": self.by_from.into_iter().map(|(k, (e, o))| (k, json!({ "explored": e, "ok": o }))).collect::<serde_json::Map<_, _>>(),
+            "also": self.also,
+        })
+    }
+}
+
 /// 冷資料移出記憶體的結果
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Evicted {
@@ -1122,10 +1287,152 @@ pub struct Evicted {
     pub bytes: usize,
 }
 
+impl Evicted {
+    pub fn add(&mut self, o: Evicted) {
+        self.entries += o.entries;
+        self.bytes += o.bytes;
+    }
+}
+
+/// 筆數上限淘汰的分組數：（[`prune_group`]）×（年齡格）
+const PRUNE_SLOTS: usize = PRUNE_GROUPS * COLD_BUCKETS;
+
+/// 硬上限：筆數上限再加這個分之一（[`Db::hard_cap`]）
+pub const CAP_SLACK_DIV: usize = 16;
+
+/// 一次筆數上限淘汰（[`Db::drop_cheapest`]）的進度（3.5.1），分批的步驟同 [`ColdSweep`]：
+/// [`Db::cap_sweep`] → 每批 [`Db::cap_scan`] → [`CapSweep::plan`] → 每批 [`Db::cap_take`] →
+/// [`CapSweep::pick_edge`]（不拿鎖）→ 每批 [`Db::cap_take_edge`]。
+/// 放開鎖的期間新進來的網域不會讓這一輪多刪（最後那一格之前的最多刪掃描時數到的筆數）
+pub struct CapSweep {
+    keep: usize,
+    now: u64,
+    counts: [usize; PRUNE_SLOTS],
+    /// 刪到哪一格（含）
+    last: usize,
+    /// 最後那一格之前（整格都刪時含那一格）還能刪幾筆
+    before_left: usize,
+    /// 最後那一格要刪幾筆、是不是整格
+    need_last: usize,
+    whole_last: bool,
+    /// 最後那一格的候選（最後出現，名稱）；`pick_edge` 之後是要刪的
+    edge: Vec<(u64, Arc<str>)>,
+    /// 各組刪了幾筆
+    pub out: [u32; PRUNE_GROUPS],
+}
+
+impl CapSweep {
+    fn slot(&self, d: &Domain) -> Option<usize> {
+        if d.policy() != Policy::Auto {
+            return None;
+        }
+        // 同一組裡舊的（年齡格大的）在前
+        Some(usize::from(prune_group(d)) * COLD_BUCKETS + (COLD_BUCKETS - 1 - age_bucket(self.now.saturating_sub(d.last_seen))))
+    }
+
+    /// 第一次掃描做完（`len` = 現在的筆數）：從最不值得留的那格累計到要刪的筆數。回傳有沒有要刪的
+    pub fn plan(&mut self, len: usize) -> bool {
+        let auto: usize = self.counts.iter().sum();
+        let drop = len.saturating_sub(self.keep).min(auto);
+        if drop == 0 {
+            return false;
+        }
+        // 從最不值得留的那格累計到 drop：那一格之前的全部刪，那一格只刪補足的部分
+        let mut sum = 0usize;
+        let mut last = 0usize;
+        for (k, c) in self.counts.iter().enumerate() {
+            if *c == 0 {
+                continue;
+            }
+            last = k;
+            sum += *c;
+            if sum >= drop {
+                break;
+            }
+        }
+        let before = sum - self.counts[last];
+        self.last = last;
+        self.need_last = drop - before;
+        self.whole_last = self.need_last == self.counts[last];
+        self.before_left = if self.whole_last { drop } else { before };
+        if self.whole_last {
+            self.need_last = 0;
+        }
+        true
+    }
+
+    /// 最後那一格挑最舊的（不拿鎖做）：同時間的依名稱
+    pub fn pick_edge(&mut self) {
+        let need = self.need_last;
+        if need == 0 {
+            self.edge.clear();
+            return;
+        }
+        if need < self.edge.len() {
+            self.edge.select_nth_unstable(need - 1);
+            self.edge.truncate(need);
+        }
+    }
+}
+
+/// 冷資料移出的分組數：（有沒有學習資料）×（年齡格）
+const COLD_BUCKETS: usize = COLD_AGE_EDGES_MS.len() + 1;
+const COLD_SLOTS: usize = 2 * COLD_BUCKETS;
+
+/// 一次「從最冷的開始移出」（[`Db::evict_coldest`]）的進度（3.5.1）：分批做的時候，批與批之間記著累計到哪裡。
+/// 步驟：[`Db::cold_sweep`] → 每批 [`Db::cold_scan`] → [`ColdSweep::plan`] → 每批 [`Db::cold_take`]。
+/// 結果跟一次做完一樣（同樣的規則、同樣的目標量）；放開鎖的期間被查詢用到的網域變熱了，第二次掃描時就不移
+pub struct ColdSweep {
+    target: usize,
+    protect_ms: u64,
+    now: u64,
+    /// 開始時可以移出的分片
+    ok: Vec<bool>,
+    bytes: [usize; COLD_SLOTS],
+    /// 移到哪一格（含）、那一格還要移多少（[`ColdSweep::plan`] 之後才有）
+    last: Option<usize>,
+    need_last: usize,
+    /// 到目前為止移出的
+    pub out: Evicted,
+}
+
+impl ColdSweep {
+    /// 這一筆在冷的順序裡的格（小的先移）；不移的是 None
+    fn slot(&self, d: &Domain, busy: &dyn Fn(&str) -> bool) -> Option<usize> {
+        let age = self.now.saturating_sub(d.last_seen);
+        if d.policy() != Policy::Auto || age < self.protect_ms || busy(&d.name) {
+            return None;
+        }
+        // 冷的順序：沒有學習資料的在前（組 0），同一組裡年齡格大的（舊的）在前
+        let group = usize::from(has_learning(d));
+        Some(group * COLD_BUCKETS + (COLD_BUCKETS - 1 - age_bucket(age)))
+    }
+
+    /// 第一次掃描做完：從最冷的那格往熱的累計，到目標量為止。回傳有沒有東西要移
+    pub fn plan(&mut self) -> bool {
+        let mut sum = 0usize;
+        let mut last = None;
+        for (k, b) in self.bytes.iter().enumerate() {
+            if *b == 0 {
+                continue;
+            }
+            last = Some(k);
+            sum = sum.saturating_add(*b);
+            if sum >= self.target {
+                break;
+            }
+        }
+        let Some(last) = last else { return false };
+        self.last = Some(last);
+        self.need_last = self.target.saturating_sub(sum - self.bytes[last]);
+        true
+    }
+}
+
 impl Db {
     pub fn new(max_entries: usize) -> Db {
         Db {
-            domains: HashMap::new(),
+            domains: ShardMap::new(shards_for(max_entries.max(100))),
             harvest: IndexMap::new(),
             max_entries: max_entries.max(100),
             saved_at: None,
@@ -1135,7 +1442,8 @@ impl Db {
             shards: shards_for(max_entries.max(100)),
             marks: vec![Mark::Clean; shards_for(max_entries.max(100))],
             manifest_pending: None,
-            evicted: Vec::new(),
+            evicted: vec![Vec::new(); shards_for(max_entries.max(100))],
+            evicted_len: 0,
             budget_sweep: false,
             multi_cdn: true,
             seen_once: Vec::new(),
@@ -1155,14 +1463,21 @@ impl Db {
         let Some(ok) = self.evictable_shards(persisted) else {
             return Evicted::default();
         };
-        let n = self.shards;
-        let cold: Vec<Arc<str>> = self
-            .domains
-            .values()
-            .filter(|d| d.policy() == Policy::Auto && d.last_seen < cutoff_ms && ok[shard_of(&d.name, n)])
-            .map(|d| d.name.clone())
-            .collect();
-        self.evict_names(cold)
+        let mut out = Evicted::default();
+        for (i, ok) in ok.iter().enumerate() {
+            if !ok {
+                continue;
+            }
+            let cold: Vec<Arc<str>> = self
+                .domains
+                .shard(i)
+                .values()
+                .filter(|d| d.policy() == Policy::Auto && d.last_seen < cutoff_ms)
+                .map(|d| d.name.clone())
+                .collect();
+            out.add(self.evict_names(i, cold));
+        }
+        out
     }
 
     /// 可以移出的分片（已經寫進磁碟、之後沒變動）；整個資料庫要重寫、分片清單還沒寫時是 None
@@ -1173,6 +1488,11 @@ impl Db {
         Some((0..self.shards).map(|i| self.marks[i] == Mark::Clean && persisted(i)).collect())
     }
 
+    /// 第 `i` 片現在還是「磁碟上的就是最新的」（分批移出時每批再看一次：放開鎖的期間查詢可能改過它）
+    fn still_clean(&self, i: usize) -> bool {
+        !self.dirty && self.manifest_pending.is_none() && self.marks.get(i) == Some(&Mark::Clean)
+    }
+
     /// 記憶體吃緊（3.5.1 G1）：**從最冷的開始**移出，估計釋出的量到 `target` bytes 就停（`usize::MAX` = 能移的全部）。
     ///
     /// 順序：先移沒有學習資料的（[`has_learning`]：沒有驗證、ECS、跨 CDN 結果），再移有的；
@@ -1181,7 +1501,8 @@ impl Db {
     /// 有待寫內容的分片（同 [`Db::evict_cold`]）。
     ///
     /// 兩次掃描、不排序：第一次依（組，年齡格）累計估計用量，找出要移到哪一格；第二次只收那些名稱
-    /// （小機器上不為了排序另外配置一份 20 萬筆的陣列）
+    /// （小機器上不為了排序另外配置一份 20 萬筆的陣列）。
+    /// 這裡一次做完；`Cdn::evict_coldest` 用同樣的步驟（[`ColdSweep`]）分批做、每批放開一次鎖（3.5.1）
     pub fn evict_coldest(
         &mut self,
         target: usize,
@@ -1190,121 +1511,151 @@ impl Db {
         busy: &dyn Fn(&str) -> bool,
         persisted: &dyn Fn(usize) -> bool,
     ) -> Evicted {
-        let Some(ok) = self.evictable_shards(persisted) else {
+        let Some(mut sw) = self.cold_sweep(target, protect_ms, now, persisted) else {
             return Evicted::default();
         };
-        let n = self.shards;
-        const B: usize = COLD_AGE_EDGES_MS.len() + 1;
-        let slot = |d: &Domain| -> Option<usize> {
-            let age = now.saturating_sub(d.last_seen);
-            if d.policy() != Policy::Auto || age < protect_ms || !ok[shard_of(&d.name, n)] || busy(&d.name) {
-                return None;
-            }
-            // 冷的順序：沒有學習資料的在前（組 0），同一組裡年齡格大的（舊的）在前
-            let group = usize::from(has_learning(d));
-            Some(group * B + (B - 1 - age_bucket(age)))
-        };
-        let mut bytes = [0usize; 2 * B];
-        for d in self.domains.values() {
-            if let Some(k) = slot(d) {
-                bytes[k] += d.approx_bytes();
-            }
+        let all = 0..self.shards;
+        self.cold_scan(&mut sw, all.clone(), busy);
+        if sw.plan() {
+            self.cold_take(&mut sw, all, busy);
         }
-        // 從最冷的那格往熱的累計，到 target 為止：那一格之前的全部移出，那一格移到補足為止
-        let mut sum = 0usize;
-        let mut last = None;
-        for (k, b) in bytes.iter().enumerate() {
-            if *b == 0 {
-                continue;
-            }
-            last = Some(k);
-            sum = sum.saturating_add(*b);
-            if sum >= target {
-                break;
-            }
-        }
-        let Some(last) = last else {
-            return Evicted::default();
-        };
-        let mut need_last = target.saturating_sub(sum - bytes[last]);
-        let mut names = Vec::new();
-        for d in self.domains.values() {
-            let Some(k) = slot(d) else { continue };
-            if k > last {
-                continue;
-            }
-            if k == last {
-                if need_last == 0 {
-                    continue;
-                }
-                need_last = need_last.saturating_sub(d.approx_bytes());
-            }
-            names.push(d.name.clone());
-        }
-        self.evict_names(names)
+        sw.out
     }
 
-    fn evict_names(&mut self, cold: Vec<Arc<str>>) -> Evicted {
+    /// 開始一次「從最冷的開始移出」（[`Db::evict_coldest`]）；這時候不能移（整個資料庫要重寫、分片清單還沒寫）是 None
+    pub fn cold_sweep(&self, target: usize, protect_ms: u64, now: u64, persisted: &dyn Fn(usize) -> bool) -> Option<ColdSweep> {
+        Some(ColdSweep {
+            target,
+            protect_ms,
+            now,
+            ok: self.evictable_shards(persisted)?,
+            bytes: [0; COLD_SLOTS],
+            last: None,
+            need_last: 0,
+            out: Evicted::default(),
+        })
+    }
+
+    /// 第一次掃描（`shards` 這幾片）：依（組，年齡格）累計估計用量
+    pub fn cold_scan(&self, sw: &mut ColdSweep, shards: std::ops::Range<usize>, busy: &dyn Fn(&str) -> bool) {
+        for i in shards {
+            if !sw.ok.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            for d in self.domains.shard(i).values() {
+                if let Some(k) = sw.slot(d, busy) {
+                    sw.bytes[k] += d.approx_bytes();
+                }
+            }
+        }
+    }
+
+    /// 第二次（`shards` 這幾片，[`ColdSweep::plan`] 之後）：移到定好的那一格為止，那一格移到補足為止
+    pub fn cold_take(&mut self, sw: &mut ColdSweep, shards: std::ops::Range<usize>, busy: &dyn Fn(&str) -> bool) {
+        let Some(last) = sw.last else { return };
+        for i in shards {
+            if !sw.ok.get(i).copied().unwrap_or(false) || !self.still_clean(i) {
+                continue;
+            }
+            let mut names = Vec::new();
+            for d in self.domains.shard(i).values() {
+                let Some(k) = sw.slot(d, busy) else { continue };
+                if k > last {
+                    continue;
+                }
+                if k == last {
+                    if sw.need_last == 0 {
+                        continue;
+                    }
+                    sw.need_last = sw.need_last.saturating_sub(d.approx_bytes());
+                }
+                names.push(d.name.clone());
+            }
+            let r = self.evict_names(i, names);
+            sw.out.add(r);
+        }
+    }
+
+    /// 移出第 `i` 片裡的這些網域（名稱都在這一片）
+    fn evict_names(&mut self, i: usize, cold: Vec<Arc<str>>) -> Evicted {
         let mut out = Evicted::default();
         for name in cold {
             if let Some(d) = self.domains.remove(&name) {
                 out.entries += 1;
                 out.bytes += d.approx_bytes();
-                self.evicted.push(name_hash(&name));
+                self.evicted[i].push(name_hash(&name));
             }
         }
         if out.entries > 0 {
-            self.evicted.sort_unstable();
-            self.evicted.shrink_to_fit();
-            self.domains.shrink_to_fit();
+            self.evicted_len += out.entries;
+            self.evicted[i].sort_unstable();
+            self.evicted[i].shrink_to_fit();
+            self.domains.shrink_shard(i);
         }
         out
     }
 
+    /// 名稱雜湊 `h` 的移出名單在哪一片
+    fn evicted_of(&self, h: u32) -> &Vec<u32> {
+        &self.evicted[(h as usize) & (self.shards - 1)]
+    }
+
     /// 這個名稱可能在磁碟上（被移出記憶體）
     pub fn is_evicted(&self, name: &str) -> bool {
-        !self.evicted.is_empty() && self.evicted.binary_search(&name_hash(name)).is_ok()
+        self.evicted_len != 0 && self.is_evicted_hash(name_hash(name))
     }
 
     /// 名稱雜湊（[`name_hash`]）是 `h` 的網域可能在磁碟上（被移出記憶體）：記著名稱雜湊、不記名稱的呼叫端用
     /// （社群分享記著分享過哪些網域，3.5.1）
     pub fn is_evicted_hash(&self, h: u32) -> bool {
-        !self.evicted.is_empty() && self.evicted.binary_search(&h).is_ok()
+        self.evicted_len != 0 && self.evicted_of(h).binary_search(&h).is_ok()
     }
 
     /// 移出記憶體的筆數
     pub fn evicted_count(&self) -> usize {
-        self.evicted.len()
+        self.evicted_len
     }
 
     /// 有移出記憶體的網域的分片
     pub fn evicted_shards(&self) -> Vec<usize> {
-        let n = self.shards;
-        let mut v: Vec<usize> = self.evicted.iter().map(|h| (*h as usize) & (n - 1)).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
+        if self.evicted_len == 0 {
+            return Vec::new();
+        }
+        (0..self.shards).filter(|i| !self.evicted[*i].is_empty()).collect()
     }
 
-    /// 這個分片裡被移出的雜湊（寫分片時比對磁碟上的網域用；`n` 跟目前的分片數不同時是空的）
+    /// 這個分片裡被移出的雜湊（排序；寫分片時比對磁碟上的網域用；`n` 跟目前的分片數不同時是空的）
     pub fn evicted_hashes(&self, n: usize, i: usize) -> Vec<u32> {
         if n != self.shards {
             return Vec::new();
         }
-        self.evicted.iter().copied().filter(|h| (*h as usize) & (n - 1) == i).collect()
+        self.evicted.get(i).cloned().unwrap_or_default()
+    }
+
+    /// 第 `i` 片有沒有移出記憶體的網域
+    pub fn has_evicted(&self, i: usize) -> bool {
+        self.evicted.get(i).is_some_and(|v| !v.is_empty())
     }
 
     /// 從移出名單拿掉一筆（讀回來了，或磁碟上已經找不到）
     pub fn unevict(&mut self, name: &str) {
-        if let Ok(i) = self.evicted.binary_search(&name_hash(name)) {
-            self.evicted.remove(i);
+        if self.evicted_len == 0 {
+            return;
+        }
+        let h = name_hash(name);
+        let i = (h as usize) & (self.shards - 1);
+        if let Ok(p) = self.evicted[i].binary_search(&h) {
+            self.evicted[i].remove(p);
+            self.evicted_len -= 1;
         }
     }
 
     /// 拿掉這個分片的整個移出名單（全部讀回來了，或分片檔已經不見 / 壞掉）
     pub fn unevict_shard(&mut self, i: usize) {
-        let n = self.shards;
-        self.evicted.retain(|h| (*h as usize) & (n - 1) != i);
+        if let Some(v) = self.evicted.get_mut(i) {
+            self.evicted_len -= v.len();
+            *v = Vec::new();
+        }
     }
 
     /// 從磁碟讀回來的網域：記憶體裡沒有才放進去（記憶體裡的比較新），並從移出名單拿掉。回傳有沒有放進去
@@ -1322,6 +1673,12 @@ impl Db {
     pub fn set_shards(&mut self, n: usize) {
         self.shards = n.clamp(1, MAX_SHARDS).next_power_of_two();
         self.marks = vec![Mark::Clean; self.shards];
+        self.domains.set_shards(self.shards);
+        let old = std::mem::replace(&mut self.evicted, vec![Vec::new(); self.shards]);
+        for h in old.into_iter().flatten() {
+            self.evicted[(h as usize) & (self.shards - 1)].push(h);
+        }
+        self.evicted.iter_mut().for_each(|v| v.sort_unstable());
     }
 
     /// 第 `i` 片只有計數等級的變動（沒有更高等級時才設；3.5.1 G1 讀回時忘掉一次性網域用）
@@ -1411,7 +1768,11 @@ impl Db {
                 Some(Ok(f)) => {
                     if out.legacy {
                         // 這片已經寫過：裡面的內容比舊檔新
-                        self.domains.retain(|k, _| shard_of(k, n) != i);
+                        if n == self.shards {
+                            self.domains.clear_shard(i);
+                        } else {
+                            self.domains.retain(|k, _| shard_of(k, n) != i);
+                        }
                     }
                     for d in f.domains {
                         self.domains.insert(d.name.clone(), d);
@@ -1460,10 +1821,14 @@ impl Db {
         }
     }
 
-    /// 這個分片裡的網域名稱（拿著鎖時呼叫；之後放開鎖排序、分批寫）
+    /// 這個分片裡的網域名稱（拿著鎖時呼叫；之後放開鎖排序、分批寫）。
+    /// 3.5.1：記憶體裡也分片放，只看這一片的表（以前每寫一片就掃過全部網域：寫 256 片 = 掃 256 次）
     pub fn shard_keys(&mut self, n: usize, i: usize) -> Vec<Arc<str>> {
-        if self.domains.len() > self.max_entries {
+        if self.over_hard_cap() {
             self.prune();
+        }
+        if n == self.shards {
+            return self.domains.shard(i).keys().cloned().collect();
         }
         self.domains.keys().filter(|k| shard_of(k, n) == i).cloned().collect()
     }
@@ -1549,7 +1914,7 @@ impl Db {
 
     /// `cdn-domains.json` 內容（依查詢次數多到少）
     pub fn domains_json(&mut self) -> Vec<u8> {
-        if self.domains.len() > self.max_entries {
+        if self.over_hard_cap() {
             self.prune();
         }
         self.saved_at = Some(util::iso(now_ms()));
@@ -1577,7 +1942,7 @@ impl Db {
     /// 回傳（開頭，結尾，（查詢次數，名稱）——還沒排序）。接著放開鎖排序，再分批呼叫 `dump_chunk`。
     /// 內容跟 `domains_json()` 一樣，只是不必整個過程都拿著鎖（20 萬筆要半秒，期間所有 CDN 回應都卡住）
     pub fn dump_begin(&mut self) -> (Vec<u8>, Vec<u8>, DumpKeys) {
-        if self.domains.len() > self.max_entries {
+        if self.over_hard_cap() {
             self.prune();
         }
         self.saved_at = Some(util::iso(now_ms()));
@@ -1652,9 +2017,34 @@ impl Db {
     }
 
     /// 筆數到了上限：依價值淘汰到上限的 90%（手動設定策略的保留；順序見 [`prune_group`]）
-    /// 淘汰的筆數記進 [`Db::take_cap_pruned`]（載入時與執行中的都算）
+    /// 淘汰的筆數記進 [`Db::take_cap_pruned`]（載入時與執行中的都算）。
+    /// 這裡一次做完（載入時、超過硬上限時）；執行中平常由背景的整理分批做（`Cdn::prune_cap`，3.5.1）
     pub fn prune(&mut self) {
-        let g = self.drop_cheapest((self.max_entries as f64 * 0.9) as usize, now_ms());
+        let g = self.drop_cheapest(self.prune_keep(), now_ms());
+        self.note_cap_pruned(g);
+    }
+
+    /// 筆數上限淘汰要刪到剩幾筆（上限的 90%）
+    pub fn prune_keep(&self) -> usize {
+        (self.max_entries as f64 * 0.9) as usize
+    }
+
+    /// 超過筆數上限（`cdn.maxEntries`）了：背景的整理要淘汰
+    pub fn over_cap(&self) -> bool {
+        self.domains.len() > self.max_entries
+    }
+
+    /// 硬上限：筆數上限再加 [`CAP_SLACK_DIV`] 分之一（至少 64 筆）。到了這裡查詢路徑才當場淘汰（3.5.1）
+    pub fn hard_cap(&self) -> usize {
+        self.max_entries.saturating_add((self.max_entries / CAP_SLACK_DIV).max(64))
+    }
+
+    fn over_hard_cap(&self) -> bool {
+        self.domains.len() > self.hard_cap()
+    }
+
+    /// 記下一次筆數上限淘汰（依組的筆數）；一筆都沒刪不算
+    pub fn note_cap_pruned(&mut self, g: [u32; PRUNE_GROUPS]) {
         if g.iter().any(|n| *n > 0) {
             for (a, b) in self.cap_pruned.iter_mut().zip(g) {
                 *a = a.saturating_add(b);
@@ -1677,7 +2067,7 @@ impl Db {
     /// 刪到剩 `keep` 筆（記憶體不足時也用這個）
     pub fn shrink_to(&mut self, keep: usize) {
         self.drop_cheapest(keep, now_ms());
-        // 把空出來的記憶體還回去（要重排整個表：只有記憶體不足時才做，平常的整理不做——反正馬上又會長回來）
+        // 把空出來的記憶體還回去（要重排表：只有記憶體不足時才做，平常的整理不做——反正馬上又會長回來）
         self.domains.shrink_to_fit();
     }
 
@@ -1686,80 +2076,96 @@ impl Db {
     /// （18 萬筆剩下的 99.7% 是只問過一次的網域）。
     ///
     /// 兩次掃描、不排序整份陣列（同 [`Db::evict_coldest`]）：第一次依（組，年齡格）計數，找出刪到哪一格；
-    /// 第二次只收那些名稱，最後那一格不夠分時才在那一格裡挑最舊的。回傳各組刪了幾筆
+    /// 第二次只收那些名稱，最後那一格不夠分時才在那一格裡挑最舊的。回傳各組刪了幾筆。
+    /// 這裡一次做完；`Cdn` 用同樣的步驟（[`CapSweep`]）分批做、每批放開一次鎖（3.5.1）
     fn drop_cheapest(&mut self, keep: usize, now: u64) -> [u32; PRUNE_GROUPS] {
-        let mut out = [0u32; PRUNE_GROUPS];
-        if self.domains.len() <= keep {
-            return out;
-        }
-        const B: usize = COLD_AGE_EDGES_MS.len() + 1;
-        let slot = |d: &Domain| -> Option<usize> {
-            if d.policy() != Policy::Auto {
-                return None;
-            }
-            // 同一組裡舊的（年齡格大的）在前
-            Some(usize::from(prune_group(d)) * B + (B - 1 - age_bucket(now.saturating_sub(d.last_seen))))
+        let Some(mut sw) = self.cap_sweep(keep, now) else {
+            return [0; PRUNE_GROUPS];
         };
-        let mut counts = [0usize; PRUNE_GROUPS * B];
-        for d in self.domains.values() {
-            if let Some(k) = slot(d) {
-                counts[k] += 1;
-            }
+        let all = 0..self.shards;
+        self.cap_scan(&mut sw, all.clone());
+        if sw.plan(self.domains.len()) {
+            self.cap_take(&mut sw, all);
+            sw.pick_edge();
+            self.cap_take_edge(&mut sw, usize::MAX);
         }
-        let auto: usize = counts.iter().sum();
-        let drop = (self.domains.len() - keep).min(auto);
-        if drop == 0 {
-            return out;
-        }
-        // 從最不值得留的那格累計到 drop：那一格之前的全部刪，那一格只刪補足的部分
-        let mut sum = 0usize;
-        let mut last = 0usize;
-        for (k, c) in counts.iter().enumerate() {
-            if *c == 0 {
-                continue;
-            }
-            last = k;
-            sum += *c;
-            if sum >= drop {
-                break;
-            }
-        }
-        let need_last = drop - (sum - counts[last]);
-        let mut names: Vec<Arc<str>> = Vec::with_capacity(drop);
-        let mut edge: Vec<(u64, Arc<str>)> = Vec::new();
-        for d in self.domains.values() {
-            let Some(k) = slot(d) else { continue };
-            if k < last {
-                names.push(d.name.clone());
-            } else if k == last {
-                if need_last == counts[last] {
-                    names.push(d.name.clone());
-                } else {
-                    edge.push((d.last_seen, d.name.clone()));
+        sw.out
+    }
+
+    /// 開始一次筆數上限淘汰（刪到剩 `keep` 筆）；已經不到 `keep` 筆是 None
+    pub fn cap_sweep(&self, keep: usize, now: u64) -> Option<CapSweep> {
+        (self.domains.len() > keep).then(|| CapSweep {
+            keep,
+            now,
+            counts: [0; PRUNE_SLOTS],
+            last: 0,
+            before_left: 0,
+            need_last: 0,
+            whole_last: false,
+            edge: Vec::new(),
+            out: [0; PRUNE_GROUPS],
+        })
+    }
+
+    /// 第一次掃描（`shards` 這幾片）：依（組，年齡格）計數
+    pub fn cap_scan(&self, sw: &mut CapSweep, shards: std::ops::Range<usize>) {
+        for i in shards {
+            for d in self.domains.shard(i).values() {
+                if let Some(k) = sw.slot(d) {
+                    sw.counts[k] += 1;
                 }
             }
         }
-        if !edge.is_empty() && need_last > 0 {
-            if need_last < edge.len() {
-                edge.select_nth_unstable(need_last - 1);
+    }
+
+    /// 第二次（`shards` 這幾片，[`CapSweep::plan`] 之後）：刪掉最後那一格之前的；最後那一格不是整格都刪時先記下來
+    /// （之後 [`CapSweep::pick_edge`] 挑最舊的）
+    pub fn cap_take(&mut self, sw: &mut CapSweep, shards: std::ops::Range<usize>) {
+        for i in shards {
+            let mut names = Vec::new();
+            for d in self.domains.shard(i).values() {
+                let Some(k) = sw.slot(d) else { continue };
+                if k < sw.last || (k == sw.last && sw.whole_last) {
+                    if sw.before_left > 0 {
+                        sw.before_left -= 1;
+                        names.push(d.name.clone());
+                    }
+                } else if k == sw.last && sw.need_last > 0 {
+                    sw.edge.push((d.last_seen, d.name.clone()));
+                }
             }
-            names.extend(edge.into_iter().take(need_last).map(|(_, n)| n));
-        }
-        for n in names {
-            if let Some(d) = self.domains.remove(&n) {
-                let g = &mut out[usize::from(prune_group(&d)).min(PRUNE_GROUPS - 1)];
-                *g = g.saturating_add(1);
+            for n in names {
+                self.cap_remove(sw, i, &n);
             }
-            self.mark(&n);
         }
-        out
+    }
+
+    /// 刪掉最多 `max` 筆最後那一格挑出來的（[`CapSweep::pick_edge`] 之後）。回傳還有沒有剩
+    pub fn cap_take_edge(&mut self, sw: &mut CapSweep, max: usize) -> bool {
+        for _ in 0..max {
+            let Some((_, n)) = sw.edge.pop() else { return false };
+            // 放開鎖的期間被查詢用到、不在那一格了：不刪
+            if self.domains.get(&n).is_some_and(|d| sw.slot(d) == Some(sw.last)) {
+                let i = shard_of(&n, self.shards);
+                self.cap_remove(sw, i, &n);
+            }
+        }
+        !sw.edge.is_empty()
+    }
+
+    fn cap_remove(&mut self, sw: &mut CapSweep, i: usize, name: &str) {
+        if let Some(d) = self.domains.remove(name) {
+            let g = &mut sw.out[usize::from(prune_group(&d)).min(PRUNE_GROUPS - 1)];
+            *g = g.saturating_add(1);
+        }
+        self.marks[i] = Mark::Important;
     }
 
     // ------------------------------------------------------------ 磁碟預算（3.5.0 C5，規格 05 第 5.7 節）
 
     /// 總筆數：記憶體裡的＋移出記憶體（還在磁碟上）的
     pub fn total_entries(&self) -> usize {
-        self.domains.len() + self.evicted.len()
+        self.domains.len() + self.evicted_len
     }
 
     /// 磁碟預算淘汰時的順位（小的先淘汰）；手動設定策略的不在這裡（絕不淘汰）。
@@ -1817,13 +2223,7 @@ impl Db {
         let n = self.shards;
         let quota = (limit / n).max(1);
         let keep = (quota * BUDGET_KEEP_PERCENT / 100).max(1);
-        let mut counts = vec![0usize; n];
-        for k in self.domains.keys() {
-            counts[shard_of(k, n)] += 1;
-        }
-        for h in &self.evicted {
-            counts[(*h as usize) & (n - 1)] += 1;
-        }
+        let counts: Vec<usize> = (0..n).map(|i| self.domains.shard(i).len() + self.evicted[i].len()).collect();
         let cap = if self.dirty { n } else { (n / 8).max(1) };
         let mut over: Vec<(usize, usize)> = (0..n).filter(|i| counts[*i] > quota).map(|i| (counts[i], i)).collect();
         // 超過最多的先
@@ -1863,42 +2263,33 @@ impl Db {
 
     /// 照計畫淘汰：每個分片留 `keep` 筆（手動設定策略的不淘汰、算在筆數裡），依 [`Db::budget_rank`]、
     /// 同一順位最久沒出現的先。有淘汰的分片標成重要變動。回傳淘汰幾筆。
-    /// 分片裡還有移出記憶體的冷資料時這片不動（呼叫端要先把它們讀回來，不然不知道誰比較舊）
+    /// 分片裡還有移出記憶體的冷資料時這片不動（呼叫端要先把它們讀回來，不然不知道誰比較舊）。
+    /// 每片各自決定、互不影響：分批時一次給幾片（`Cdn::budget_round`），結果跟一次給全部一樣
     pub fn budget_prune(&mut self, plan: &[(usize, usize)], now_ms: u64) -> usize {
-        if plan.is_empty() {
-            return 0;
-        }
         let n = self.shards;
-        let mut keep_of: Vec<Option<usize>> = vec![None; n];
-        for (i, keep) in plan {
-            if *i < n && !self.evicted.iter().any(|h| (*h as usize) & (n - 1) == *i) {
-                keep_of[*i] = Some(*keep);
-            }
-        }
-        // （分片，順位，最後出現，名稱）；手動策略的只算筆數
-        let mut counts = vec![0usize; n];
-        let mut cand: Vec<(usize, u8, u64, Arc<str>)> = Vec::new();
-        for d in self.domains.values() {
-            let i = shard_of(&d.name, n);
-            if keep_of[i].is_none() {
-                continue;
-            }
-            counts[i] += 1;
-            if d.policy() == Policy::Auto {
-                cand.push((i, Self::budget_rank(d, now_ms), d.last_seen, d.name.clone()));
-            }
-        }
-        cand.sort_unstable();
         let mut dropped = 0;
-        for (i, _, _, name) in cand {
-            let Some(keep) = keep_of[i] else { continue };
-            if counts[i] <= keep {
+        for (i, keep) in plan {
+            let (i, keep) = (*i, *keep);
+            if i >= n || self.has_evicted(i) {
                 continue;
             }
-            self.domains.remove(&name);
-            self.marks[i] = Mark::Important;
-            counts[i] -= 1;
-            dropped += 1;
+            let m = self.domains.shard(i);
+            let count = m.len();
+            if count <= keep {
+                continue;
+            }
+            // （順位，最後出現，名稱）；手動策略的只算筆數
+            let mut cand: Vec<(u8, u64, Arc<str>)> = m
+                .values()
+                .filter(|d| d.policy() == Policy::Auto)
+                .map(|d| (Self::budget_rank(d, now_ms), d.last_seen, d.name.clone()))
+                .collect();
+            cand.sort_unstable();
+            for (_, _, name) in cand.into_iter().take(count - keep) {
+                self.domains.remove(&name);
+                self.marks[i] = Mark::Important;
+                dropped += 1;
+            }
         }
         dropped
     }
@@ -1910,13 +2301,18 @@ impl Db {
     ///
     /// 分批、有上限：只看本來就有重要變動（反正要寫）的分片，`rotate` 時另外輪流看「分片數 ÷ 16」片
     /// （有磁碟預算的小 Flash 不輪流，不為了忘掉多寫任何檔）；分片裡還有移出記憶體的冷資料時跳過
-    /// （讀回時本來就會忘掉）；每輪最多 [`FORGET_ONE_SHOT_MAX`] 筆。回傳忘掉幾筆
+    /// （讀回時本來就會忘掉）；每輪最多 [`FORGET_ONE_SHOT_MAX`] 筆。回傳忘掉幾筆。
+    /// 這裡一次做完；`Cdn::budget_round` 用同樣的步驟（[`Db::forget_pick`]、[`Db::forget_in`]）分批做
     pub fn forget_one_shot(&mut self, now: u64, rotate: bool) -> usize {
+        let Some(pick) = self.forget_pick(rotate) else { return 0 };
+        let mut left = FORGET_ONE_SHOT_MAX;
+        self.forget_in(&pick, 0..self.shards, now, &mut left)
+    }
+
+    /// 這一輪要看哪些分片（`rotate` 時輪流的那幾片往後移）；一片都沒有是 None
+    pub fn forget_pick(&mut self, rotate: bool) -> Option<Vec<bool>> {
         let n = self.shards;
-        let mut pick = vec![false; n];
-        for (i, m) in self.marks.iter().enumerate() {
-            pick[i] = *m == Mark::Important || self.dirty;
-        }
+        let mut pick: Vec<bool> = self.marks.iter().map(|m| *m == Mark::Important || self.dirty).collect();
         if rotate {
             let k = (n / 16).max(1);
             for j in 0..k {
@@ -1924,25 +2320,44 @@ impl Db {
             }
             self.forget_cursor = (self.forget_cursor + k) % n;
         }
-        for h in &self.evicted {
-            pick[(*h as usize) & (n - 1)] = false;
+        for (i, p) in pick.iter_mut().enumerate() {
+            if self.has_evicted(i) {
+                *p = false;
+            }
         }
-        if !pick.iter().any(|p| *p) {
-            return 0;
-        }
+        pick.iter().any(|p| *p).then_some(pick)
+    }
+
+    /// 忘掉 `shards` 這幾片裡（`pick` 選到的）的一次性網域，最多 `left` 筆（扣掉忘掉的）。回傳忘掉幾筆
+    pub fn forget_in(&mut self, pick: &[bool], shards: std::ops::Range<usize>, now: u64, left: &mut usize) -> usize {
         let cutoff = now.saturating_sub(FORGET_ONE_SHOT_MS);
-        let names: Vec<Arc<str>> = self
-            .domains
-            .values()
-            .filter(|d| d.last_seen < cutoff && forgettable_stale(d, now) && pick[shard_of(&d.name, n)])
-            .take(FORGET_ONE_SHOT_MAX)
-            .map(|d| d.name.clone())
-            .collect();
-        for name in &names {
-            self.domains.remove(name);
-            self.mark(name);
+        let mut forgot = 0;
+        for i in shards {
+            if *left == 0 {
+                break;
+            }
+            if !pick.get(i).copied().unwrap_or(false) || self.has_evicted(i) {
+                continue;
+            }
+            let names: Vec<Arc<str>> = self
+                .domains
+                .shard(i)
+                .values()
+                .filter(|d| d.last_seen < cutoff && forgettable_stale(d, now))
+                .take(*left)
+                .map(|d| d.name.clone())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            for name in &names {
+                self.domains.remove(name);
+            }
+            self.marks[i] = Mark::Important;
+            *left -= names.len();
+            forgot += names.len();
         }
-        names.len()
+        forgot
     }
 
     /// 新網域收不收（3.5.1 H1；呼叫端先確定 `name` 不在資料庫裡）。筆數不到上限的 [`ADMIT_SECOND_PERCENT`]% 一律收；
@@ -2010,7 +2425,9 @@ impl Db {
     ) -> Touch {
         let mut out = Touch::default();
         if !self.domains.contains_key(name) {
-            if self.domains.len() >= self.max_entries {
+            // 3.5.1：到了筆數上限先不當場淘汰（7 萬筆在 MT7621 上要拿著鎖好幾百毫秒），由背景的整理分批做
+            // （`Cdn::prune_cap`，每 5 分鐘）；到了硬上限（上限再多 1/16）才當場做，筆數一樣有上限
+            if self.domains.len() >= self.hard_cap() {
                 self.prune();
             }
             let key: Arc<str> = Arc::from(name);
@@ -2334,7 +2751,7 @@ impl Db {
         let now = now_ms();
         self.mark(name);
         let key: Arc<str> = Arc::from(name);
-        let e = self.domains.entry(key.clone()).or_insert_with(|| Domain {
+        let e = self.domains.get_or_insert_with(key.clone(), || Domain {
             name: key,
             provider: Field::Null,
             via: Field::Val(util::intern("manual")),
@@ -2390,113 +2807,34 @@ impl Db {
 
     /// 跨 CDN 統計：試了幾個、成功幾個、各轉去哪一家
     pub fn cross_summary(&self) -> Value {
-        let (mut explored, mut ok, mut fail, mut none) = (0u32, 0u32, 0u32, 0u32);
-        // 連線比較近、但握手沒有比較快而沒有採用的（3.5.0 B4、F13）
-        let mut score_rejected = 0u32;
-        let mut by_to: IndexMap<String, u32> = IndexMap::new();
-        let mut by_from: IndexMap<String, (u32, u32)> = IndexMap::new();
-        let mut also: IndexMap<String, u32> = IndexMap::new();
-        for e in self.domains.values() {
-            let Some(x) = &e.cross4 else { continue };
-            let Some(v) = x.verdict.as_deref() else { continue };
-            let from = x.from.as_deref().or(e.provider()).unwrap_or("?").to_string();
-            let f = by_from.entry(from).or_default();
-            if v == "none" {
-                none += 1;
-                continue;
-            }
-            explored += 1;
-            f.0 += 1;
-            if v == "ok" {
-                ok += 1;
-                f.1 += 1;
-                *by_to.entry(x.to.as_deref().unwrap_or("?").to_string()).or_default() += 1;
-                for a in x.also.iter().flatten() {
-                    *also.entry(a.clone()).or_default() += 1;
-                }
-            } else {
-                fail += 1;
-                if x.score.get().is_some() && x.orig_score.get().is_some() {
-                    score_rejected += 1;
-                }
-            }
-        }
-        json!({
-            "explored": explored, "ok": ok, "fail": fail, "none": none, "scoreRejected": score_rejected, "byTo": by_to,
-            "byFrom": by_from.into_iter().map(|(k, (e, o))| (k, json!({ "explored": e, "ok": o }))).collect::<serde_json::Map<_, _>>(),
-            "also": also,
-        })
+        let mut acc = CrossSummary::default();
+        self.domains.values().for_each(|e| acc.add(e));
+        acc.json()
     }
 
     /// 分析摘要：各 CDN 有多少網域、多少原本繞國外、置換成功率
     pub fn summary(&self) -> Vec<Summary> {
-        let mut out: IndexMap<String, Summary> = IndexMap::new();
-        let mut names: Vec<&Domain> = self.domains.values().collect();
-        names.sort_by(|a, b| a.first_seen.cmp(&b.first_seen).then_with(|| a.name.cmp(&b.name)));
-        for e in names {
-            let p = e.provider().unwrap_or("unknown").to_string();
-            let s = out.entry(p.clone()).or_insert_with(|| Summary {
-                provider: p,
-                ..Default::default()
-            });
-            s.domains += 1;
-            s.hits += e.hits as u64;
-            if let Some(pop) = e.base.as_ref().and_then(|b| b.pop.as_deref()).filter(|p| !p.is_empty()) {
-                *s.pops.entry(pop.to_string()).or_default() += 1;
-                // 2.x 這裡用大小寫有別的比對
-                if ["TPE", "KHH", "TSA", "RMQ", "TXG", "TNN"].iter().any(|t| pop.starts_with(t)) {
-                    s.base_pop_tw += 1;
-                } else {
-                    s.base_pop_abroad += 1;
-                }
-            }
-            if let Some(v) = &e.v4 {
-                s.v4ok += v.is("ok") as u32;
-                s.v4fail += v.is("fail") as u32;
-            }
-            if let Some(v) = &e.v6 {
-                s.v6ok += v.is("ok") as u32;
-                s.v6fail += v.is("fail") as u32;
-            }
-            if e.ecs.as_ref().map(|x| x.is("ok")).unwrap_or(false) {
-                s.ecs_gain += 1;
-            }
-        }
-        let mut v: Vec<Summary> = out.into_values().collect();
-        v.sort_by_key(|s| std::cmp::Reverse(s.hits));
-        v
+        let mut acc = SummaryAcc::default();
+        self.domains.values().for_each(|e| acc.add(e));
+        acc.finish()
     }
 
     /// 查詢（管理介面 `/api/cdn/domains`）
     pub fn query(&self, q: &Query) -> Vec<&Domain> {
-        let mut arr: Vec<&Domain> = self
-            .domains
-            .values()
-            .filter(|e| q.provider.as_deref().map(|p| e.provider() == Some(p)).unwrap_or(true))
-            .filter(|e| {
-                q.verdict
-                    .as_deref()
-                    .map(|v| e.v4.as_ref().map(|x| x.is(v)).unwrap_or(false) || e.v6.as_ref().map(|x| x.is(v)).unwrap_or(false))
-                    .unwrap_or(true)
-            })
-            .filter(|e| q.search.as_deref().map(|t| e.name.contains(t)).unwrap_or(true))
-            .filter(|e| !q.cross || e.cross4.as_ref().is_some_and(|c| c.verdict.as_deref().is_some_and(|v| v != "none")))
-            .collect();
-        let key = |e: &Domain| -> u64 {
-            match q.sort.as_deref().unwrap_or("hits") {
-                "lastSeen" => e.last_seen,
-                "firstSeen" => e.first_seen,
-                _ => e.hits as u64,
-            }
-        };
-        arr.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.name.cmp(&b.name)));
-        arr.drain(..q.offset.min(arr.len()));
-        arr.truncate(q.limit.unwrap_or(1000));
-        arr
+        let mut keys: Vec<(u64, Arc<str>)> = self.domains.values().filter_map(|e| q.key(e)).collect();
+        Query::order(&mut keys, q);
+        keys.iter().filter_map(|(_, n)| self.domains.get(n)).collect()
     }
 
     /// CSV 匯出（欄位同 2.x）
     pub fn to_csv(rows: &[&Domain]) -> String {
+        let mut out = String::new();
+        Self::csv_into(rows, true, &mut out);
+        out
+    }
+
+    /// CSV 接到 `out` 後面；`header` = 先寫表頭（分批匯出時只有第一批寫，3.5.1）
+    pub fn csv_into(rows: &[&Domain], header: bool, out: &mut String) {
         let cols = [
             "name",
             "provider",
@@ -2537,8 +2875,10 @@ impl Db {
         };
         let ips = |v: &[IpAddr]| v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
         let s = |x: Option<&str>| x.unwrap_or("").to_string();
-        let mut out = cols.join(",");
-        out.push('\n');
+        if header {
+            out.push_str(&cols.join(","));
+            out.push('\n');
+        }
         for e in rows {
             let b = e.base.as_deref();
             let v4 = e.v4.as_deref();
@@ -2573,7 +2913,6 @@ impl Db {
             out.push_str(&row.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
             out.push('\n');
         }
-        out
     }
 }
 
@@ -2732,11 +3071,22 @@ mod tests {
         db.set_policy("d0.test", Policy::Never);
         assert_eq!(db.domains.len(), 100);
         db.touch("new.test", "cloudflare", "ip", &[], &[], None);
+        // 3.5.1：查詢路徑上到了上限先不淘汰（背景的整理分批做），到了硬上限才當場做
+        assert_eq!(db.domains.len(), 101);
+        assert!(db.over_cap());
+        db.prune();
         assert!(db.domains.len() <= 91, "超過上限時降到 90%：{}", db.domains.len());
         assert!(db.get("d0.test").is_some(), "手動策略的保留");
         assert!(db.get("d1.test").is_none(), "最久沒出現的先刪");
         assert!(db.get("d99.test").is_some());
         assert!(db.get("new.test").is_some());
+        // 硬上限：上限再多 1/16（至少 64 筆）；到了就在查詢路徑上當場淘汰，筆數一樣有上限
+        assert_eq!(db.hard_cap(), 164);
+        for i in 0..200 {
+            db.touch(&format!("h{i}.test"), "cloudflare", "ip", &[], &[], None);
+            assert!(db.domains.len() <= db.hard_cap() + 1, "{i}：{}", db.domains.len());
+        }
+        assert!(db.take_cap_pruned().is_some_and(|(_, rounds)| rounds >= 2));
     }
 
     /// 3.5.1 H1：大量一次性網域把筆數推到 `cdn.maxEntries`：學習資料一筆都不能被擠掉

@@ -1829,6 +1829,8 @@ async fn evict_cdn(
 ) -> anyhow::Result<kuroshio_cdn::cdn::ColdReport> {
     let (cdn, p, sources) = (cdn.clone(), persister.clone(), sources.to_vec());
     tokio::task::spawn_blocking(move || -> anyhow::Result<kuroshio_cdn::cdn::ColdReport> {
+        // 3.5.1：同快照寫入（K10），這段期間降低這條執行緒的優先權；寫分片、移出都是分批拿 CDN 狀態鎖
+        let _low = crate::app::LowPriority::enter();
         // 先寫出：移出的只會是已經在磁碟上、之後沒變過的分片（登記與移出期間不會有新的登記）
         let _g = crate::app::STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::app::stage_sources_locked(&p, &sources);
