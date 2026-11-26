@@ -1053,6 +1053,9 @@ impl Manager {
 mod tests {
     use super::*;
 
+    /// 會登記或取走行程層級的 [`NEVER_OK`] 的測試排隊跑：平行跑時另一個測試會先把登記取走（Windows CI 偶發失敗）
+    static NEVER_OK_TESTS: Mutex<()> = Mutex::new(());
+
     fn cfg() -> Value {
         kuroshio_config::with_overrides(&json!({
             "upstream": { "pinned": ["udp://10.0.0.1"], "fallback": ["udp://1.0.0.2"], "autoTypes": ["udp", "doh"], "autoMax": 2 },
@@ -1435,6 +1438,8 @@ mod tests {
 
     #[test]
     fn never_ok_auto_is_benched_after_three_trips() {
+        let _g = NEVER_OK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_never_ok();
         let (dir, m) = manager_with("bench", TWO, json!({}));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c2 = calls.clone();
@@ -1516,6 +1521,7 @@ mod tests {
     /// 從未成功的照 A7 第 3 次暫停時先不用；INFO 只寫一次
     #[test]
     fn never_answering_auto_upstream_reaches_benched() {
+        let _g = NEVER_OK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let (dir, m) = manager_with("late", TWO, json!({}));
         let (bad, good) = (
             auto_by(&m, "tls://never.example.com:853"),
