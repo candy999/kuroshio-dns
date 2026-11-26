@@ -383,9 +383,10 @@ async fn never_ok_excluded_from_selection_for_three_runs() {
         assert!(!spares.is_empty() && spares.len() <= 3, "{spares:?}");
         assert!(spares.iter().all(|s| !sel.contains(s)), "候補是沒選上的");
     }
-    // 第 4 次：忘掉重來（它可能修好了），照常可以選（s1 最快）
-    let (sel, _, logged, n) = &runs[3];
-    assert!(sel.contains(&ids[0]), "{sel:?}");
+    // 第 4 次：忘掉重來（它可能修好了），照常可以選（s1 最快）。3.5.1 起昨天選上的差不多快就留著（M3），
+    // s1 不一定馬上選上，但至少是候補
+    let (sel, spares, logged, n) = &runs[3];
+    assert!(sel.contains(&ids[0]) || spares.contains(&ids[0]), "{sel:?} {spares:?}");
     assert!(!logged);
     assert_eq!(*n, None);
     let l = Learn::load(&learn_file);
