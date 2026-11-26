@@ -330,3 +330,13 @@ async fn unverified_blacklist_entries_are_retested() {
     assert!(!e.prober.asked.lock().unwrap().contains_key(e.id(14)));
     assert!(e.prober.asked.lock().unwrap().contains_key(e.id(13)));
 }
+
+/// A10.5：報表目錄裡的 judge.log 有選出結果（以前在「今日選出的上游」之前就寫檔了）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn judge_log_has_selection() {
+    let e = setup("journal", 4, "").await;
+    let (_, log) = e.run(&cfg()).await;
+    assert!(log.contains("=== 今日選出的上游 ==="), "{log}");
+    assert!(log.contains("總涵蓋率"), "{log}");
+    assert!(log.lines().last().unwrap().starts_with("[dns-benchmark] 結束 "), "{log}");
+}

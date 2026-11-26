@@ -1564,7 +1564,7 @@ impl Benchmark {
                 "[分級] 依歷史要降級的 A 級有 {demoted_now} 個，超過 A 級 {manual_a} 個的三分之一：多半是這條線路的問題，今天不採用降級（照人工分級測）"
             );
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
         }
         let eff: Vec<Tier> = (0..all.len())
             .map(|i| {
@@ -1650,7 +1650,7 @@ impl Benchmark {
             });
         }
         if tier_mode.only_a() {
-            jinfo!(
+            jimp!(
                 journal,
                 "[分級] 只用 A 級（benchmark.tiers = a）：今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）；B 級 {} 個不測、不選（含昨天選上或候補的 {} 個、依歷史升上來的 {} 個）",
                 tier_counts.a,
@@ -1660,14 +1660,14 @@ impl Benchmark {
                 dropped_pulled
             );
             if !tier_plan.fill_reason.is_empty() {
-                jinfo!(
+                jimp!(
                     journal,
                     "[分級] A 級的多樣性不夠（{}）：只用 A 級時不從 B 級補；要補請改成 auto 或 ab",
                     tier_plan.fill_reason
                 );
             }
         } else if tier_mode == tiers::Mode::Small {
-            jinfo!(
+            jimp!(
                 journal,
                 "[分級] 今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）、依歷史拉上來的 B 級 {} 個（試用 {}）、沿用昨天選上或候補的 B 級 {} 個、補位 {} 個{}、探索 {} 個；B 級其餘 {} 個今天不測（不算淘汰、不記紀錄）",
                 tier_counts.a,
@@ -1805,7 +1805,7 @@ impl Benchmark {
         let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
         let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
         if strikes.cleared.0 > 0 {
-            jinfo!(
+            jimp!(
                 journal,
                 "可疑紀錄：清掉舊規則記下的「網站無法驗證」{} 筆（{} 台），用目前的規則重新累積（憑證不符的保留）",
                 strikes.cleared.0,
@@ -2040,6 +2040,7 @@ impl Benchmark {
                     .collect()
             };
             let (mut polluted, mut suspicious, mut rescued, mut lenient) = (0usize, 0usize, 0usize, 0usize);
+            let mut kept = KeptLines::default();
             let mut newly_bl: Vec<String> = Vec::new();
             for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {
                 let s = &mut all[*i];
@@ -2047,11 +2048,15 @@ impl Benchmark {
                     None => s.record(dix, *ms, ips),
                     Some((SiteCheck::Valid, _)) => {
                         rescued += 1;
-                        jinfo!(
-                            journal,
+                        // judge.log 每個業者群組一行（3.5.1）：一個規則沒涵蓋的 CDN 一題就有幾百台，以前一台一行把 judge.log 塞滿
+                        debug!(
                             "   [保留] {} -> {}：業者規則沒涵蓋，但 {domain} 的憑證有效（不是劫持）",
                             s.id,
                             info.label()
+                        );
+                        kept.add(
+                            format!("{}：業者規則沒涵蓋，但 {domain} 的憑證有效（不是劫持）", info.label()),
+                            &s.id,
                         );
                         s.record(dix, *ms, ips);
                     }
@@ -2070,7 +2075,7 @@ impl Benchmark {
                         polluted += 1;
                         s.suspect_today |= s.learns();
                         if s.learns() && strikes.add(&cert_key(&s.id), &today, domain).days >= CERT_DAYS {
-                            jinfo!(
+                            jimp!(
                                 journal,
                                 "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
                                 s.id,
@@ -2098,11 +2103,17 @@ impl Benchmark {
                         } else {
                             format!("這個網域有 {MULTI_CDN_GROUPS} 家以上業者的回答憑證有效（多家 CDN）")
                         };
-                        jinfo!(
-                            journal,
+                        debug!(
                             "   [保留] {} -> {}：{domain} 網站無法驗證（{why}），但{basis}，判為網站或路徑問題，照常計分、不記可疑",
                             s.id,
                             info.label()
+                        );
+                        kept.add(
+                            format!(
+                                "{}：{domain} 網站無法驗證（{why}），但{basis}，判為網站或路徑問題，照常計分、不記可疑",
+                                info.label()
+                            ),
+                            &s.id,
                         );
                         s.record(dix, *ms, ips);
                     }
@@ -2138,7 +2149,7 @@ impl Benchmark {
                         // 同一題天天連不上不累積：要 2 個以上不同的網域，才算進評測歷史的可疑天數、才會定罪
                         s.suspect_today |= c.domains >= SUSPECT_DOMAINS;
                         if c.days >= SUSPECT_DAYS && c.domains >= SUSPECT_DOMAINS && blacklist.insert(s.id.clone()) {
-                            jinfo!(
+                            jimp!(
                                 journal,
                                 "   [淘汰] {} -> 30 天內 {} 天、{} 個網域回答無法驗證的位址（加入永久黑名單）",
                                 s.id,
@@ -2168,7 +2179,11 @@ impl Benchmark {
             if !newly_bl.is_empty() {
                 append_blacklist(&bl_file, &newly_bl);
             }
-            jinfo!(
+            for line in kept.lines() {
+                info!("{line}");
+                journal.push(line);
+            }
+            jimp!(
                 journal,
                 "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、連不上但照用 {lenient}、逾時 {errors}",
                 groups.first().map(|g| g.rep.label()).unwrap_or_else(|| "無法判定".into()),
@@ -2179,6 +2194,8 @@ impl Benchmark {
 
         drop(raw);
         strikes.save();
+        // 之後的都是摘要（分級升降、選出結果）：用 judge.log 預留的尾端空間，不會被前面的判斷過程擠掉
+        journal.enter_tail();
         if learned_bl {
             self.tidy_blacklist(&bl_file, &all, &retest, &known, today_n, &today, &mut journal);
         }
@@ -2299,7 +2316,7 @@ impl Benchmark {
             for id in &regress {
                 let line = format!("[對照組] {id} 以前判得出過濾，今天沒判出：評測可能判不出這一類了");
                 warn!("{line}");
-                journal.push(line);
+                journal.push_important(line);
             }
             if let Some((t, m)) = learned.as_ref().filter(|l| l.control_day == today_n).and_then(|l| {
                 // 不設期望（觀察中）的不算：它們本來就可能今天判出、明天沒判出
@@ -2316,7 +2333,7 @@ impl Benchmark {
                     to_fixed(m * 100.0, 0)
                 );
                 warn!("{line}");
-                journal.push(line);
+                journal.push_important(line);
             }
             for c in control.iter().filter(|c| c["result"] == "passed") {
                 let expect = c["expect"].as_str().unwrap_or("");
@@ -2345,7 +2362,7 @@ impl Benchmark {
             }
             let dead: Vec<&'static str> = kinds.iter().filter(|(_, (n, ok))| *n >= 3 && *ok == 0).map(|(k, _)| *k).collect();
             if !dead.is_empty() {
-                jinfo!(
+                jimp!(
                     journal,
                     "[分級] {} 今天整批過不了資格賽：多半是線路的問題，不記進評測歷史",
                     dead.join("、")
@@ -2372,7 +2389,7 @@ impl Benchmark {
             tier_counts.promoted_today = ch.promoted.len();
             tier_counts.demoted_today = ch.demoted.len();
             if ch.any() {
-                jinfo!(
+                jimp!(
                     journal,
                     "[分級] 依近 30 天的評測歷史：升級 {}、降回 {}、降級 {}、恢復 {}、開始試用 {}、結束試用 {}（只影響測不測，不影響選不選）",
                     ch.promoted.len(),
@@ -2390,7 +2407,7 @@ impl Benchmark {
                 ] {
                     for id in list.iter().take(20) {
                         let h = l.hist.get(id).copied().unwrap_or_default();
-                        jinfo!(
+                        jimp!(
                             journal,
                             "   [{what}] {id}：近 30 天測到 {} 天、倖存 {} 天、可疑 {} 天、延遲 {} ±{} ms",
                             h.tested(),
@@ -2545,7 +2562,6 @@ impl Benchmark {
                 }
                 report(&d.join("protected.csv"), csv.as_bytes());
             }
-            report(&d.join("judge.log"), journal.text().as_bytes());
         }
         jinfo!(journal, "=== 今日選出的上游 ===");
         for x in state["selected"].as_array().into_iter().flatten() {
@@ -2602,6 +2618,10 @@ impl Benchmark {
             cleanup_reports(root, ctx.now_ms(), cfg.keep_days);
         }
         jinfo!(journal, "[{}] 結束 {}", JOB_NAME, fmt_time(ctx.now_ms()));
+        // judge.log 最後才寫（3.5.1）：以前在「今日選出的上游」之前就寫了，報表目錄裡的那份看不到選出結果
+        if let Some(d) = &out_dir {
+            report(&d.join("judge.log"), journal.text().as_bytes());
+        }
         if let (Some(keep), Some(d)) = (&self.keep_last, &out_dir) {
             keep_last_report(d, keep, &journal);
         }
@@ -2903,7 +2923,7 @@ impl Benchmark {
                 if manual_n > 0 { "，請檢查 probe.txt" } else { "" }
             );
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
         } else {
             run.state = "ok";
         }
@@ -2941,14 +2961,14 @@ impl Benchmark {
                 v.probed, v.would_flag
             );
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
             return;
         }
         if run.valid == 0 {
             run.state = "invalid";
             let line = "[惡意網站探測] 全部問完之後沒有有效的探測網域：今天不判斷任何候選".to_string();
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
             return;
         }
         for (c, hit) in ctl_idx.iter().zip(&v.controls) {
@@ -3356,8 +3376,11 @@ fn compute(
     }
 }
 
-/// 判斷過程摘要的上限（評測一次幾千行；只留前面這麼多）
+/// 判斷過程摘要的上限（評測一次幾千行）
 const JOURNAL_MAX: usize = 192 * 1024;
+/// 預留給摘要的尾端空間（3.5.1）：每題的結算、WARN、分級升降、選出結果。一般的判斷過程只能用到
+/// `JOURNAL_MAX - JOURNAL_TAIL`；第一次丟行之後就不再收一般的行（不會再收短的、造成中間跳號）
+const JOURNAL_TAIL: usize = 48 * 1024;
 /// 另存到持久資料區的每個檔案上限（Flash 上每天寫一次，不要太大）
 const KEEP_FILE_MAX: usize = 128 * 1024;
 
@@ -3370,29 +3393,146 @@ macro_rules! jinfo {
 }
 use jinfo;
 
+/// 同 [`jinfo`]，但是摘要：用預留的尾端空間（每題的結算、WARN、加入永久黑名單）
+macro_rules! jimp {
+    ($j:expr, $($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        info!("{s}");
+        $j.push_important(s);
+    }};
+}
+use jimp;
+
 #[derive(Default)]
 struct Journal {
     lines: Vec<String>,
+    /// 每一行是不是摘要（另存的那份要截短時，摘要一定留著）
+    important: Vec<bool>,
     bytes: usize,
+    /// 丟掉的一般行
     dropped: usize,
+    /// 第一次丟一般行的位置（之後不再收一般的行）
+    dropped_at: Option<usize>,
+    /// 連尾端空間也滿了、丟掉的摘要
+    dropped_tail: usize,
+    /// 進入結算之後：每一行都當摘要
+    tail: bool,
 }
 
 impl Journal {
+    /// 一般的判斷過程
     fn push(&mut self, s: String) {
-        if self.bytes + s.len() < JOURNAL_MAX {
+        if self.tail {
+            return self.push_important(s);
+        }
+        if self.dropped_at.is_none() && self.bytes + s.len() < JOURNAL_MAX - JOURNAL_TAIL {
             self.bytes += s.len() + 1;
             self.lines.push(s);
+            self.important.push(false);
         } else {
+            self.dropped_at.get_or_insert(self.lines.len());
             self.dropped += 1;
         }
     }
-    fn text(&self) -> String {
-        let mut t = self.lines.join("\n");
-        if self.dropped > 0 {
-            t.push_str(&format!("\n…（後面還有 {} 行，見系統記錄）", self.dropped));
+    /// 摘要：可以用到預留的尾端空間
+    fn push_important(&mut self, s: String) {
+        if self.bytes + s.len() < JOURNAL_MAX {
+            self.bytes += s.len() + 1;
+            self.lines.push(s);
+            self.important.push(true);
+        } else {
+            self.dropped_tail += 1;
         }
-        t.push('\n');
+    }
+    /// 之後的每一行都當摘要（Phase 1 判斷結束、開始結算）
+    fn enter_tail(&mut self) {
+        self.tail = true;
+    }
+    fn text(&self) -> String {
+        let mut t = String::with_capacity(self.bytes + 128);
+        for (i, l) in self.lines.iter().enumerate() {
+            if self.dropped_at == Some(i) {
+                t.push_str(&format!("…（這裡省略 {} 行判斷過程，見系統記錄；以下只留摘要）\n", self.dropped));
+            }
+            t.push_str(l);
+            t.push('\n');
+        }
+        if self.dropped_at == Some(self.lines.len()) {
+            t.push_str(&format!("…（這裡省略 {} 行判斷過程，見系統記錄）\n", self.dropped));
+        }
+        if self.dropped_tail > 0 {
+            t.push_str(&format!("…（後面還有 {} 行，見系統記錄）\n", self.dropped_tail));
+        }
         t
+    }
+    /// 截到 `max` 位元組左右（另存到持久資料區用）：摘要全部留著，一般的判斷過程從前面留到放不下為止
+    fn text_capped(&self, max: usize) -> String {
+        let t = self.text();
+        if t.len() <= max {
+            return t;
+        }
+        let imp: usize = self
+            .lines
+            .iter()
+            .zip(&self.important)
+            .filter(|(_, i)| **i)
+            .map(|(l, _)| l.len() + 1)
+            .sum();
+        let mut budget = max.saturating_sub(imp + 256);
+        let mut out = String::with_capacity(max + 256);
+        let mut cut = 0usize;
+        for (l, i) in self.lines.iter().zip(&self.important) {
+            if *i {
+                if cut > 0 {
+                    out.push_str(&format!("…（這裡省略 {cut} 行判斷過程）\n"));
+                    cut = 0;
+                }
+                out.push_str(l);
+                out.push('\n');
+            } else if cut == 0 && l.len() < budget {
+                budget -= l.len() + 1;
+                out.push_str(l);
+                out.push('\n');
+            } else {
+                cut += 1;
+            }
+        }
+        if cut > 0 {
+            out.push_str(&format!("…（這裡省略 {cut} 行判斷過程）\n"));
+        }
+        out
+    }
+}
+
+/// 一題裡「[保留]」的候選，依業者群組（同一句說明）合成一行（3.5.1）
+#[derive(Default)]
+struct KeptLines {
+    groups: Vec<(String, Vec<String>)>,
+}
+
+/// 一行最多列幾台的 id（其他寫「等 N 台」）
+const KEPT_IDS: usize = 5;
+
+impl KeptLines {
+    fn add(&mut self, what: String, id: &str) {
+        match self.groups.iter_mut().find(|(w, _)| *w == what) {
+            Some((_, ids)) => ids.push(id.to_string()),
+            None => self.groups.push((what, vec![id.to_string()])),
+        }
+    }
+    fn lines(self) -> Vec<String> {
+        self.groups
+            .into_iter()
+            .map(|(what, ids)| {
+                let shown: Vec<&str> = ids.iter().take(KEPT_IDS).map(String::as_str).collect();
+                let more = if ids.len() > KEPT_IDS {
+                    format!(" 等 {} 台", ids.len())
+                } else {
+                    String::new()
+                };
+                format!("   [保留] {} 台 -> {what}：{}{more}", ids.len(), shown.join("、"))
+            })
+            .collect()
     }
 }
 
@@ -3414,7 +3554,8 @@ fn keep_last_report(out_dir: &Path, keep: &Path, journal: &Journal) {
         warn!("最近一次評測報表另存失敗（{}）：{e}", keep.display());
         return;
     }
-    report(&keep.join("judge.log"), &cut(journal.text().into_bytes()));
+    // judge.log：摘要（每題結算、WARN、分級升降、選出結果）一定留著，截掉的是中間的判斷過程
+    report(&keep.join("judge.log"), &cut(journal.text_capped(KEEP_FILE_MAX).into_bytes()));
     for name in ["eliminated.csv", "upstreams.json", "protected.csv"] {
         if let Ok(b) = std::fs::read(out_dir.join(name)) {
             report(&keep.join(name), &cut(b));
@@ -3885,5 +4026,73 @@ mod strike_tests {
         assert_eq!(s.cleared, (0, 0));
         assert!(!s.dirty);
         let _ = std::fs::remove_dir_all(f.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    /// 3.5.1（M1）：一般的判斷過程只能用到尾端預留空間之前；第一次丟行之後不再收一般的行（不收短的、不跳號）；
+    /// 摘要（每題結算、WARN、結算之後的每一行）用預留的尾端空間
+    #[test]
+    fn journal_reserves_tail_for_summary() {
+        let mut j = Journal::default();
+        let long = "判".repeat(1000); // 3,000 bytes
+        let mut n = 0;
+        while j.dropped == 0 {
+            j.push(format!("{n} {long}"));
+            n += 1;
+        }
+        let kept = j.lines.len();
+        assert!(j.bytes <= JOURNAL_MAX - JOURNAL_TAIL);
+        j.push("短".into());
+        assert_eq!(j.lines.len(), kept, "第一次丟行之後短的也不收");
+        assert_eq!(j.dropped, 2);
+        j.push_important("   -> 第一名 [X]".into());
+        j.enter_tail();
+        j.push("=== 今日選出的上游 ===".into());
+        j.push("  https://dns.example.com/dns-query".into());
+        let t = j.text();
+        assert!(
+            t.contains("…（這裡省略 2 行判斷過程，見系統記錄；以下只留摘要）\n   -> 第一名 [X]\n=== 今日選出的上游 ===\n"),
+            "{}",
+            &t[t.len() - 300..]
+        );
+        assert!(t.ends_with("  https://dns.example.com/dns-query\n"));
+        assert!(t.len() <= JOURNAL_MAX + 200);
+        // 尾端空間也滿了：最後寫一行還有幾行
+        for _ in 0..100 {
+            j.push(long.clone());
+        }
+        assert!(j.bytes <= JOURNAL_MAX);
+        assert!(j.text().ends_with(&format!("…（後面還有 {} 行，見系統記錄）\n", j.dropped_tail)));
+        // 另存的那份（128 KiB）：摘要全部留著
+        let c = j.text_capped(KEEP_FILE_MAX);
+        assert!(c.len() <= KEEP_FILE_MAX, "{}", c.len());
+        assert!(c.contains("   -> 第一名 [X]\n=== 今日選出的上游 ===\n  https://dns.example.com/dns-query\n"));
+        assert!(c.contains("…（這裡省略 "));
+    }
+
+    #[test]
+    fn kept_lines_are_grouped() {
+        let mut k = KeptLines::default();
+        for i in 0..7 {
+            k.add(
+                "X__AS64500_X：業者規則沒涵蓋，但 www.example.com 的憑證有效（不是劫持）".into(),
+                &format!("192.0.2.{i}"),
+            );
+        }
+        k.add(
+            "Y__AS64501_Y：業者規則沒涵蓋，但 www.example.com 的憑證有效（不是劫持）".into(),
+            "198.51.100.1",
+        );
+        let l = k.lines();
+        assert_eq!(l.len(), 2);
+        assert_eq!(
+            l[0],
+            "   [保留] 7 台 -> X__AS64500_X：業者規則沒涵蓋，但 www.example.com 的憑證有效（不是劫持）：192.0.2.0、192.0.2.1、192.0.2.2、192.0.2.3、192.0.2.4 等 7 台"
+        );
+        assert!(l[1].ends_with("：198.51.100.1"));
     }
 }
