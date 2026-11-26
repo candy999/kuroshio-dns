@@ -176,15 +176,19 @@ async fn setup(name: &str) -> (PathBuf, BenchPaths, [String; 5]) {
     let ids: Vec<String> = s.iter().map(|a| a.to_string()).collect();
     std::fs::write(p.list_dir.join("iplist.txt"), ids.join("\n")).unwrap();
     std::fs::write(p.list_dir.join("web.txt"), "www.example.com\ncdn.example.net\n").unwrap();
-    // 答案的 /16 先放進快取（汙染判斷不用問 ip-api）；舊格式，沒有 cc
+    // 答案的 /24 先放進快取（汙染判斷不用問 ip-api）；3.5.1 的格式（代表 IP、查到的日數），沒有 cc
     let out_root = p.out_root.clone().unwrap();
     std::fs::create_dir_all(&out_root).unwrap();
-    std::fs::write(
-        out_root.join("cidr_cache.json"),
-        r#"{"93.1":{"raw":"Example_Web__AS64496_Example","keywords":["example","web","as64496"]},
-            "94.2":{"raw":"Example_Web__AS64496_Example","keywords":["example","web","as64496"]}}"#,
-    )
-    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let t = kuroshio_jobs::benchmark::learn::day_of(now);
+    let web = json!({ "raw": "Example_Web__AS64496_Example", "keywords": ["example", "web", "as64496"], "t": t });
+    let mut cache = json!({ "93.1.0": web.clone(), "94.2.0": web });
+    cache["93.1.0"]["ip"] = json!("93.1.0.1");
+    cache["94.2.0"]["ip"] = json!("94.2.0.1");
+    std::fs::write(out_root.join("cidr_cache.json"), serde_json::to_vec(&cache).unwrap()).unwrap();
     (root, p, ids.try_into().unwrap())
 }
 
@@ -274,10 +278,10 @@ async fn upstreams_json_has_region() {
     }
     let log = std::fs::read_to_string(out.join("judge.log")).unwrap();
     assert!(log.contains("覆蓋：鄰近 2 台、其他 2 台"), "{log}");
-    // 快取：新查到的有 cc，答案的 /16（只在汙染判斷用到）不補查
+    // 快取：新查到的有 cc，答案的 /24（只在汙染判斷用到）不補查
     let cache = read(&p.out_root.clone().unwrap().join("cidr_cache.json"));
-    assert_eq!(cache["127.3"]["cc"], "JP");
-    assert!(cache["93.1"].get("cc").is_none());
+    assert_eq!(cache["127.3.0"]["cc"], "JP");
+    assert!(cache["93.1.0"].get("cc").is_none());
 
     // coverageRegion = any：跟 3.3.7 一樣不分遠近（s3 最慢，最後才選）
     let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(cfg("any")));
@@ -301,12 +305,15 @@ async fn upstreams_json_has_region() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ip_api_offline_still_selects() {
     let (root, p, ids) = setup("offline").await;
-    // 上游位址的業者在 3.3.7 的快取裡（沒有 cc）：補查國別失敗，業者照用、國別是空的
+    // 上游位址的業者在快取裡、沒有 cc：補查國別失敗，業者照用、國別是空的
     let cache_file = p.out_root.clone().unwrap().join("cidr_cache.json");
     let mut cache = read(&cache_file);
+    let t = cache["93.1.0"]["t"].clone();
     for n in 1..=5 {
-        cache[format!("127.{n}")] =
-            json!({ "raw": format!("Owner{n}_Ltd__AS6450{n}_Owner{n}"), "keywords": [format!("owner{n}"), format!("as6450{n}")] });
+        cache[format!("127.{n}.0")] = json!({
+            "raw": format!("Owner{n}_Ltd__AS6450{n}_Owner{n}"), "keywords": [format!("owner{n}"), format!("as6450{n}")],
+            "ip": format!("127.{n}.0.1"), "t": t
+        });
     }
     std::fs::write(&cache_file, serde_json::to_vec(&cache).unwrap()).unwrap();
     // 沒有人在聽的埠：ip-api 連不上
@@ -376,9 +383,10 @@ async fn never_ok_excluded_from_selection_for_three_runs() {
         assert!(!spares.is_empty() && spares.len() <= 3, "{spares:?}");
         assert!(spares.iter().all(|s| !sel.contains(s)), "候補是沒選上的");
     }
-    // 第 4 次：忘掉重來（它可能修好了），照常可以選（s1 最快）
-    let (sel, _, logged, n) = &runs[3];
-    assert!(sel.contains(&ids[0]), "{sel:?}");
+    // 第 4 次：忘掉重來（它可能修好了），照常可以選（s1 最快）。3.5.1 起昨天選上的差不多快就留著（M3），
+    // s1 不一定馬上選上，但至少是候補
+    let (sel, spares, logged, n) = &runs[3];
+    assert!(sel.contains(&ids[0]) || spares.contains(&ids[0]), "{sel:?} {spares:?}");
     assert!(!logged);
     assert_eq!(*n, None);
     let l = Learn::load(&learn_file);

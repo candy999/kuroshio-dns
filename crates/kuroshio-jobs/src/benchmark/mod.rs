@@ -29,6 +29,7 @@
 //! 3.4.0 的差異（上游多樣性，規格 10 第 6 節）：Phase 2 判斷每台上游的所在地（台灣網段、ip-api 的國別、
 //! 量到的最低延遲），`benchmark.coverageRegion = near`（預設）時「覆蓋」階段先挑鄰近的（台灣、日本、香港、新加坡）。
 
+pub mod blacklist;
 pub mod learn;
 pub mod malware;
 pub mod probe;
@@ -304,6 +305,10 @@ impl Benchmark {
             finished: false,
         };
         let r = self.run_inner(ctx, &mut g.cache).await;
+        // 清理舊報表（3.5.1 L2）：評測失敗也清（以前只有成功才清，一直失敗時報表目錄只會變多）
+        if let Some(root) = &self.paths.out_root {
+            cleanup_reports(root, ctx.now_ms(), BenchCfg::from(&ctx.cfg).keep_days);
+        }
         g.finished = true;
         r
     }
@@ -538,14 +543,40 @@ pub fn select_opts(cfg: &Value) -> SelectOpts {
     }
 }
 
-// ---------------- ASN 快取（以 /16 為鍵，同 2.x 的 cidr_cache.json） ----------------
+// ---------------- ASN 快取（3.5.1 起以 /24 為鍵，`cidr_cache.json`） ----------------
+
+/// ASN 快取一筆的有效天數：超過就用同一個代表 IP 重問一次（業者換了網段、ip-api 的資料更新了都會跟上）
+pub const ASN_TTL_DAYS: u32 = 30;
+/// ASN 快取最多幾筆（超過時先丟最舊的；一筆約 200 bytes，評測一天大約幾千個 /24）
+pub const ASN_CACHE_MAX: usize = 16_384;
+
+/// 快取的鍵：IPv4 的 /24（`a.b.c`）。3.5.0 以前用 /16（同 2.x），同一個 /16 裡不同業者的位址會互相蓋掉
+/// （例如某家社群網站的 /16 被另一家的候選蓋成別的業者，之後每天的回答都被當成規則外、白做幾百次網站驗證）
+pub fn asn_key(ip: Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("{}.{}.{}", o[0], o[1], o[2])
+}
+
+/// 是不是 3.5.1 的鍵（三段數字）；/16 的舊鍵不是
+fn is_asn_key(k: &str) -> bool {
+    let parts: Vec<&str> = k.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+/// 快取的一筆：業者資料、當初問的代表 IP、查到的日數（台北）
+#[derive(Debug, Clone, PartialEq)]
+struct AsnEntry {
+    info: AsnInfo,
+    ip: Ipv4Addr,
+    day: u32,
+}
 
 struct AsnCache {
-    map: HashMap<String, AsnInfo>,
-    /// 這次執行查不到的 /16（不重複查；2.x 每個網域都會重查，ip-api 連不上時每題都要等）
+    map: HashMap<String, AsnEntry>,
+    /// 這次執行查不到的 /24（不重複查；2.x 每個網域都會重查，ip-api 連不上時每題都要等）
     failed: HashSet<String>,
-    /// 這次執行已經向 ip-api 問過的 /16（含補問國別的）：快取裡沒有國別的舊資料只補問一次，查不到也不重問
-    cc_tried: HashSet<String>,
+    /// 這次執行已經向 ip-api 問過的 /24（含補問國別、到期重問的）：查不到也不重問
+    tried: HashSet<String>,
     dirty: bool,
 }
 
@@ -556,56 +587,106 @@ impl AsnCache {
             .as_ref()
             .and_then(|r| read_json(&r.join("cidr_cache.json")))
             .or_else(|| read_json(&paths.list_dir.join("cidr_cache.json")));
-        let map: HashMap<String, AsnInfo> = v
-            .as_ref()
-            .and_then(Value::as_object)
-            .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), AsnInfo::from_json(v)?))).collect())
-            .unwrap_or_default();
-        info!("[Cache] 已載入 {} 筆 /16 ASN 資料", map.len());
-        AsnCache {
+        let mut dropped = 0usize;
+        let mut map: HashMap<String, AsnEntry> = HashMap::new();
+        for (k, v) in v.as_ref().and_then(Value::as_object).into_iter().flatten() {
+            // 3.5.0 以前的紀錄（/16 鍵；2.x 留下的沒有國別）、沒有代表 IP 或日數的：不知道是哪一個位址、哪一天查的，丟掉重查。
+            // 3.5.1 的紀錄 ip-api 沒給國別時照留（到期才重問，補國別只在決選時）
+            let entry = (|| {
+                if !is_asn_key(k) {
+                    return None;
+                }
+                let info = AsnInfo::from_json(v)?;
+                let ip: Ipv4Addr = v.get("ip")?.as_str()?.parse().ok()?;
+                let day = v.get("t")?.as_u64()?.min(u32::MAX as u64) as u32;
+                (asn_key(ip) == *k).then_some(AsnEntry { info, ip, day })
+            })();
+            match entry {
+                Some(e) => {
+                    map.insert(k.clone(), e);
+                }
+                None => dropped += 1,
+            }
+        }
+        let mut c = AsnCache {
             map,
             failed: HashSet::new(),
-            cc_tried: HashSet::new(),
-            dirty: false,
+            tried: HashSet::new(),
+            dirty: dropped > 0,
+        };
+        c.cap();
+        if dropped > 0 {
+            info!(
+                "[Cache] 已載入 {} 筆 /24 ASN 資料（3.5.0 以前的 {dropped} 筆丟掉重查）",
+                c.map.len()
+            );
+        } else {
+            info!("[Cache] 已載入 {} 筆 /24 ASN 資料", c.map.len());
         }
+        c
     }
 
-    /// 查業者。`want_cc`：快取裡有這個 /16 但沒有國別（3.4.0 以前的快取）時當成沒查過、補問一次
-    /// （只用在 Phase 2 決選的上游位址；汙染判斷的查詢量很大，不補問，也不整批重查 cidr_cache.json）
-    async fn lookup(&mut self, src: &dyn AsnSource, ips: &[IpAddr], want_cc: bool) -> HashMap<IpAddr, AsnInfo> {
-        // 每個 /16 只查一個代表
+    /// 超過上限時先丟最舊的
+    fn cap(&mut self) {
+        let over = self.map.len().saturating_sub(ASN_CACHE_MAX);
+        if over == 0 {
+            return;
+        }
+        let mut by_age: Vec<(u32, String)> = self.map.iter().map(|(k, e)| (e.day, k.clone())).collect();
+        by_age.sort();
+        for (_, k) in by_age.into_iter().take(over) {
+            self.map.remove(&k);
+        }
+        self.dirty = true;
+    }
+
+    /// 查業者。每個 /24 只問一個代表：快取裡有的用當初那個代表 IP 重問（到期、或 `want_cc` 時沒有國別），
+    /// 回來的資料是同一個位址的，整筆換掉；沒有的用這次看到的第一個位址。查不到的留著舊資料。
+    /// `want_cc` 只用在 Phase 2 決選的上游位址；`today` 是台北的日數（到期判斷）。
+    /// 回傳的業者沒有 AS 編號時，[`AsnInfo::is_unknown`] 是真的：汙染判斷當成查不到
+    async fn lookup(&mut self, src: &dyn AsnSource, ips: &[IpAddr], want_cc: bool, today: u32) -> HashMap<IpAddr, AsnInfo> {
         let mut reps: Vec<Ipv4Addr> = Vec::new();
         let mut seen = HashSet::new();
         for ip in ips {
             if let IpAddr::V4(v4) = ip {
-                let k = sub_key(*v4);
-                let need = match self.map.get(&k) {
-                    None => !self.failed.contains(&k),
-                    Some(i) => want_cc && i.cc.is_empty() && !self.cc_tried.contains(&k),
+                let k = asn_key(*v4);
+                let rep = match self.map.get(&k) {
+                    None => (!self.failed.contains(&k)).then_some(*v4),
+                    Some(e) => {
+                        // 到期；系統時間倒退一點點（還沒對時）不算，日數比今天晚超過有效天數（時間曾經跳到很遠的未來）算到期
+                        let stale = today >= e.day.saturating_add(ASN_TTL_DAYS) || e.day > today.saturating_add(ASN_TTL_DAYS);
+                        ((stale || (want_cc && e.info.cc.is_empty())) && !self.tried.contains(&k)).then_some(e.ip)
+                    }
                 };
-                if need && seen.insert(k) {
-                    reps.push(*v4);
+                if let Some(rep) = rep {
+                    if seen.insert(k) {
+                        reps.push(rep);
+                    }
                 }
             }
         }
         if !reps.is_empty() {
             let got = src.lookup(reps.clone()).await;
+            let asked: HashSet<Ipv4Addr> = reps.iter().copied().collect();
             for (ip, info) in got {
-                self.map.insert(sub_key(ip), info);
-                self.dirty = true;
+                // 只收問過的位址（來源回了別的就不理，不能用別的位址的資料蓋掉這個 /24）
+                if asked.contains(&ip) {
+                    self.map.insert(asn_key(ip), AsnEntry { info, ip, day: today });
+                    self.dirty = true;
+                }
             }
             for ip in reps {
-                let k = sub_key(ip);
+                let k = asn_key(ip);
                 if !self.map.contains_key(&k) {
                     self.failed.insert(k.clone());
                 }
-                self.cc_tried.insert(k);
+                self.tried.insert(k);
             }
         }
         let mut out = HashMap::new();
         for ip in ips {
             let info = match ip {
-                IpAddr::V4(v4) => self.map.get(&sub_key(*v4)).cloned(),
+                IpAddr::V4(v4) => self.map.get(&asn_key(*v4)).map(|e| e.info.clone()),
                 IpAddr::V6(_) => None,
             };
             out.insert(*ip, info.unwrap_or_else(AsnInfo::unknown));
@@ -613,8 +694,18 @@ impl AsnCache {
         out
     }
 
-    fn save(&self, path: &Path) -> std::io::Result<()> {
-        let o: Map<String, Value> = self.map.iter().map(|(k, v)| (k.clone(), v.to_json())).collect();
+    fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        self.cap();
+        let o: Map<String, Value> = self
+            .map
+            .iter()
+            .map(|(k, e)| {
+                let mut v = e.info.to_json();
+                v["ip"] = json!(e.ip.to_string());
+                v["t"] = json!(e.day);
+                (k.clone(), v)
+            })
+            .collect();
         write_json(path, &Value::Object(o))
     }
 }
@@ -639,6 +730,10 @@ struct Srv {
     malware_filter: bool,
     /// 惡意網站探測的結果（對照組用）：Some(true)＝有擋、Some(false)＝沒擋、None＝今天判不出來
     probe: Option<bool>,
+    /// 永久黑名單裡「網站無法驗證」列入 30～60 天、今天重測的（3.5.1 A10.4）
+    retest: bool,
+    /// 今天的汙染判斷記進評測歷史的可疑天數（3.5.1）：憑證不符，或「無法驗證」已經在 2 個以上網域發生
+    suspect_today: bool,
     alive: bool,
     fail_reason: String,
     timeouts: u32,
@@ -663,6 +758,8 @@ impl Srv {
             preflight: None,
             malware_filter: false,
             probe: None,
+            retest: false,
+            suspect_today: false,
             alive: true,
             fail_reason: String::new(),
             timeouts: 0,
@@ -773,6 +870,10 @@ impl Srv {
             // compute() 裡用台灣網段算（3.5.0 B5）
             tw_rate: None,
             ecs: self.tag.ecs,
+            // Phase 2 跟昨天的結果比過之後才填
+            incumbent: 0,
+            // 選上游與候補時同一個經營者各最多 1 台（3.5.1 M4）
+            op_key: self.op_key(),
         }
     }
 }
@@ -953,6 +1054,30 @@ fn incumbent_ids(file: &Path) -> HashSet<String> {
         .collect()
 }
 
+/// 昨天選上的上游（`upstreams.json` 的 `selected[]`，3.5.1 M3）：（正規化後的 id, 經營者）。
+/// 經營者：今天名單裡有同一台的用它的 [`Srv::op_key`]，沒有就用昨天寫下的 `op`、再沒有就用主機名稱。讀不到是空的
+fn yesterday_selected(file: &Path, all: &[Srv]) -> (HashSet<String>, HashSet<String>) {
+    let (mut ids, mut ops) = (HashSet::new(), HashSet::new());
+    let Some(v) = read_json(file) else {
+        return (ids, ops);
+    };
+    for x in v["selected"].as_array().into_iter().flatten() {
+        let Some(up) = x["id"].as_str().and_then(|id| Upstream::parse(id).ok()) else {
+            continue;
+        };
+        let op = match all.iter().find(|s| s.up.id == up.id) {
+            Some(s) => s.op_key(),
+            None => match x["op"].as_str().filter(|o| !o.is_empty()) {
+                Some(o) => o.to_ascii_lowercase(),
+                None => operator_of(&up.host),
+            },
+        };
+        ops.insert(op);
+        ids.insert(up.id);
+    }
+    (ids, ops)
+}
+
 /// 分級評測的統計（`upstreams.json` 的 `tiers`）
 #[derive(Debug, Clone, Copy)]
 struct TierCounts {
@@ -1009,8 +1134,8 @@ pub struct Cand {
 /// 回傳（候選、社群好友提供的個數）
 pub fn candidate_ids(paths: &BenchPaths) -> (Vec<Cand>, usize) {
     let cand = |(id, tag): (String, Tag)| Cand { id, tag };
-    let mut udp: Vec<Cand> = paths.read_lists_tagged("iplist.txt").into_iter().map(cand).collect();
-    let mut doh: Vec<Cand> = paths
+    let udp: Vec<Cand> = paths.read_lists_tagged("iplist.txt").into_iter().map(cand).collect();
+    let doh: Vec<Cand> = paths
         .read_lists_tagged("dohlist.txt")
         .into_iter()
         .map(|(l, t)| cand((pick_token(&l, "http"), t)))
@@ -1053,28 +1178,6 @@ pub fn candidate_ids(paths: &BenchPaths) -> (Vec<Cand>, usize) {
         .filter_map(|x| x.as_str().map(str::to_string))
         .take(MAX_SHARED)
         .collect();
-    let shared_tag = || Tag {
-        tier: Tier::B,
-        ..Default::default()
-    };
-    for id in &shared {
-        if id.starts_with("https://") || id.starts_with("tls://") {
-            if !doh.iter().any(|c| c.id == *id) {
-                doh.push(Cand {
-                    id: id.clone(),
-                    tag: shared_tag(),
-                });
-            }
-        } else {
-            let ip = id.strip_prefix("udp://").unwrap_or(id);
-            if ip.parse::<IpAddr>().is_ok() && !udp.iter().any(|u| u.id == ip) {
-                udp.push(Cand {
-                    id: ip.to_string(),
-                    tag: shared_tag(),
-                });
-            }
-        }
-    }
     if !shared.is_empty() {
         info!("社群好友提供的上游候選 {} 個", shared.len());
     }
@@ -1103,6 +1206,35 @@ pub fn candidate_ids(paths: &BenchPaths) -> (Vec<Cand>, usize) {
     all.extend(dot);
     all.extend(h3);
     all.extend(stamps);
+    // 社群好友提供的放在所有名單之後，用正規化後的 id 跟全部名單比（3.5.1 M2）：以前只跟 DoH 名單比、又排在 DoT 名單前面，
+    // 好友給的 `tls://x:853` 先到先得，蓋掉名單裡 A 級的 `tls://x`（分級變 B、經營者標記沒了、評測歷史斷掉）
+    let norm = |id: &str| Upstream::parse(id).map(|u| u.id).ok();
+    let mut seen: HashSet<String> = all.iter().filter_map(|c| norm(&c.id)).collect();
+    let shared_tag = || Tag {
+        tier: Tier::B,
+        ..Default::default()
+    };
+    let mut push = |all: &mut Vec<Cand>, id: String| {
+        if let Some(k) = norm(&id) {
+            if seen.insert(k) {
+                all.push(Cand { id, tag: shared_tag() });
+            }
+        }
+    };
+    for id in &shared {
+        if id.starts_with("https://") || id.starts_with("tls://") {
+            push(&mut all, id.clone());
+            // DoH 也用 HTTP/3 測（同名單裡的 DoH）
+            if let Some(r) = id.strip_prefix("https://") {
+                push(&mut all, format!("h3://{r}"));
+            }
+        } else {
+            let ip = id.strip_prefix("udp://").unwrap_or(id);
+            if ip.parse::<IpAddr>().is_ok() {
+                push(&mut all, ip.to_string());
+            }
+        }
+    }
     (all, n)
 }
 
@@ -1140,7 +1272,25 @@ fn reason_of(r: &QueryResult) -> String {
     }
 }
 
-/// 永久黑名單：曾被判定「汙染」的 DNS 不再測試（可手動編輯，# 後為註解）
+/// 今天名單裡有的上游（原始寫法與正規化後的 id 都放）：候選（含好友提供的）、對照組、固定上游
+fn known_ids(ids: &[Cand], protected: &[(String, String, Tag)], pinned: &[String]) -> HashSet<String> {
+    let mut known: HashSet<String> = HashSet::new();
+    for spec in ids
+        .iter()
+        .map(|c| c.id.as_str())
+        .chain(protected.iter().map(|(p, _, _)| p.as_str()))
+        .chain(pinned.iter().map(String::as_str))
+    {
+        known.insert(spec.to_string());
+        if let Ok(u) = Upstream::parse(spec) {
+            known.insert(u.id);
+        }
+    }
+    known
+}
+
+/// 永久黑名單：曾被判定「汙染」的 DNS 不再測試（可手動編輯，# 後為註解）。
+/// 學到的那份（`state/blacklist.txt`）3.5.1 起會整理：「網站無法驗證」的 30～60 天後重測（見 [`blacklist`]）
 fn read_blacklist(file: &Path) -> HashSet<String> {
     read_list(file)
         .iter()
@@ -1150,11 +1300,7 @@ fn read_blacklist(file: &Path) -> HashSet<String> {
 }
 
 fn append_blacklist(file: &Path, lines: &[String]) {
-    let head = if file.exists() {
-        ""
-    } else {
-        "# 永久黑名單：每日評測判定「汙染」（解析到錯誤業者）的 DNS，之後不再測試\n# 要恢復某台就刪掉那一行\n"
-    };
+    let head = if file.exists() { "" } else { blacklist::HEADER };
     let r = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1165,8 +1311,16 @@ fn append_blacklist(file: &Path, lines: &[String]) {
     }
 }
 
-/// 網站「無法驗證」幾天（不同日期）才列入永久黑名單
+/// 網站「無法驗證」幾天（30 天內不同日期）才列入永久黑名單
 const SUSPECT_DAYS: usize = 3;
+/// 網站「無法驗證」還要在幾個以上不同的網域（題目）發生才算（3.5.1）：同一題天天連不上，
+/// 多半是那個網站從這條線路連不上，不是那台 DNS 竄改（正式環境 44 台只因為同一個網站 TIMEOUT 3 天就被永久封殺）
+const SUSPECT_DOMAINS: usize = 2;
+/// 可疑紀錄的判斷規則版本（3.5.1 是 2；沒寫的是 3.5.0 以前的）。判斷規則改了就加一：
+/// 舊規則記下的「無法驗證」紀錄載入時清掉（憑證不符的保留）
+const STRIKE_RULES: u32 = 2;
+/// 一台 DNS 在可疑紀錄檔裡最多留幾筆（日期 × 網域；超過先丟最舊的）
+const STRIKE_MAX_ENTRIES: usize = 64;
 /// 同一個業者群組有幾家互相獨立（不同經營者）的加密 DNS 都「網站無法驗證」時，照常計分、不記可疑天數
 const INDEPENDENT_OPERATORS: usize = 3;
 /// 規則外但憑證有效的回答來自幾個以上不同業者時，這個網域算「多家 CDN」：連不上照常計分、不記可疑天數
@@ -1184,33 +1338,101 @@ const VERIFY_IPS: usize = 2;
 const VERIFY_CONC: usize = 16;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 每台 DNS 被判「網站無法驗證」的日期（`state/blacklist-suspects.json`）；30 天沒再發生就忘掉
+/// 可疑紀錄的一筆：`YYYY-MM-DD|r<規則版本>|<網域>`（3.5.1）；3.5.0 以前只有日期（規則版本當成 0、網域不知道）。
+/// 舊版讀到新格式也還能用（字串開頭照樣是日期，30 天的比較不受影響）
+fn strike_entry(day: &str, domain: &str) -> String {
+    format!("{day}|r{STRIKE_RULES}|{domain}")
+}
+
+/// 拆開一筆：（日期, 規則版本, 網域）
+fn parse_strike(e: &str) -> (&str, u32, &str) {
+    let mut it = e.splitn(3, '|');
+    let day = it.next().unwrap_or("");
+    let rules = it
+        .next()
+        .and_then(|r| r.strip_prefix('r'))
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(0);
+    (day, rules, it.next().unwrap_or(""))
+}
+
+/// 每台 DNS 被判「網站無法驗證」、「憑證不符」（鍵是 `cert|<id>`）的日期與網域（`state/blacklist-suspects.json`）；
+/// 30 天沒再發生就忘掉
 struct Strikes {
     file: PathBuf,
     map: BTreeMap<String, Vec<String>>,
     dirty: bool,
+    /// 載入時清掉的舊規則「無法驗證」紀錄（筆數, 台數）：寫進 judge.log
+    cleared: (usize, usize),
+}
+
+/// 累計：不同日期幾天、不同網域幾個
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrikeCount {
+    days: usize,
+    domains: usize,
 }
 
 impl Strikes {
     fn load(file: PathBuf, now_ms: u64) -> Strikes {
         let mut map: BTreeMap<String, Vec<String>> = read_json(&file).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
         let cutoff = local_date_str(now_ms.saturating_sub(30 * DAY_MS));
-        let before = map.len();
-        map.retain(|_, days| {
-            days.retain(|d| *d >= cutoff);
+        let mut dirty = false;
+        let mut cleared = (0usize, 0usize);
+        map.retain(|k, days| {
+            let before = days.len();
+            days.retain(|d| parse_strike(d).0 >= cutoff.as_str());
+            // 舊規則（沒寫版本的是 3.5.0 以前）記下的「無法驗證」：那時候的判斷比較容易誤判
+            // （還沒有「多家 CDN」「不同經營者也回同一個位址」「要 2 個網域」），升級時清掉重新累積。憑證不符的保留
+            if !k.starts_with("cert|") {
+                let n = days.len();
+                days.retain(|d| parse_strike(d).1 >= STRIKE_RULES);
+                if days.len() != n {
+                    cleared.0 += n - days.len();
+                    cleared.1 += 1;
+                }
+            }
+            dirty |= days.len() != before;
             !days.is_empty()
         });
-        let dirty = map.len() != before;
-        Strikes { file, map, dirty }
+        Strikes { file, map, dirty, cleared }
     }
-    /// 記一天，回傳累計的不同日期數
-    fn add(&mut self, id: &str, day: &str) -> usize {
-        let days = self.map.entry(id.to_string()).or_default();
-        if !days.iter().any(|d| d == day) {
-            days.push(day.to_string());
+    /// 記一筆（同一天同一個網域只記一次），回傳累計
+    fn add(&mut self, id: &str, day: &str, domain: &str) -> StrikeCount {
+        let list = self.map.entry(id.to_string()).or_default();
+        let e = strike_entry(day, domain);
+        if !list.contains(&e) {
+            list.push(e);
+            if list.len() > STRIKE_MAX_ENTRIES {
+                list.sort();
+                let over = list.len() - STRIKE_MAX_ENTRIES;
+                list.drain(..over);
+            }
             self.dirty = true;
         }
-        days.len()
+        self.count(id)
+    }
+    /// 累計（3.5.0 以前的紀錄沒有網域：每一筆各算一個不知道的網域，不會因為沒寫網域就被當成同一題）
+    fn count(&self, id: &str) -> StrikeCount {
+        let Some(list) = self.map.get(id) else {
+            return StrikeCount { days: 0, domains: 0 };
+        };
+        let mut days: HashSet<&str> = HashSet::new();
+        let mut domains: HashSet<&str> = HashSet::new();
+        let mut unknown = 0usize;
+        for e in list {
+            let (d, _, dom) = parse_strike(e);
+            days.insert(d);
+            if dom.is_empty() {
+                unknown += 1;
+            } else {
+                domains.insert(dom);
+            }
+        }
+        StrikeCount {
+            days: days.len(),
+            domains: domains.len() + unknown,
+        }
     }
     /// 有變動才寫（同步寫檔）；寫過（不論成敗）就不再重寫，`Drop` 不會重複記錄失敗
     fn save(&mut self) {
@@ -1249,12 +1471,24 @@ impl Benchmark {
         if let Some(d) = &self.paths.default_list_dir {
             blacklist.extend(read_blacklist(&d.join("blacklist.txt")));
         }
+        // 程式附帶的唯讀名單（重測也拿不掉）；學到的那份跟它是同一個檔時不整理（3.5.1 A10.4）
+        let fixed_bl = blacklist.clone();
+        let learned_bl = bl_file != base_bl
+            && self
+                .paths
+                .default_list_dir
+                .as_ref()
+                .map_or(true, |d| d.join("blacklist.txt") != bl_file);
         blacklist.extend(read_blacklist(&bl_file));
         let (ids, _) = candidate_ids(&self.paths);
         let protected = protected_ids(&self.paths);
         // 學習資料（3.5.0）：執行時上線以來從未成功的（主程式登記的）今天照測、不選；排除 3 次之後忘掉重來
         let mut learned = self.paths.learn_file.as_ref().map(|p| learn::Learn::load(p));
         let (never_ok, mut learn_dirty) = learned.as_mut().map(|l| l.take_never_ok_round()).unwrap_or_default();
+        // 評測歷史的鍵用正規化後的 id（3.5.1 M2）：同一台不同寫法（`tls://x`／`tls://x:853`）是同一份歷史；舊的鍵合併
+        if let Some(l) = learned.as_mut() {
+            learn_dirty |= l.hist_rekey(|k| Upstream::parse(k).ok().map(|u| u.id)) > 0;
+        }
         let never_ok: HashSet<String> = never_ok.into_iter().collect();
         let today_n = learn::day_of(now);
         // 不支援 HTTP/3 的 DoH（3.5.0 A6）：它的 https:// 已經不在名單的刪掉
@@ -1262,7 +1496,23 @@ impl Benchmark {
             let h3_ids: HashSet<&str> = ids.iter().filter(|c| c.id.starts_with("h3://")).map(|c| c.id.as_str()).collect();
             learn_dirty |= l.h3_prune(|k| h3_ids.contains(k)) > 0;
         }
+        // 永久黑名單裡「網站無法驗證」列入 30～60 天的：今天重測（從黑名單的集合拿掉、分級評測一定測），結果在 Phase 1 之後整理
+        // 今天名單裡有的（原始寫法與正規化後的都算）：好友提供的候選、對照組、固定上游也算
+        let known = known_ids(&ids, &protected, &cfg.pinned);
+        let retest: HashSet<String> = if learned_bl {
+            let text = std::fs::read_to_string(&bl_file).unwrap_or_default();
+            let entries: Vec<blacklist::Entry> = text.lines().filter_map(blacklist::parse_line).collect();
+            blacklist::due(&entries, today_n, |id| fixed_bl.contains(id) || !known.contains(id))
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        for id in &retest {
+            blacklist.remove(id);
+        }
         let mut h3_skipped = 0usize;
+        let mut rl_skipped = 0usize;
         // 判斷過程的摘要（judge.log）：報表目錄在記憶體裡（重開機就沒了），最近一次另存一份到持久資料區
         let mut journal = Journal::default();
         // 路徑檢查：一般 DNS 被接走、IPv6 不能用、協定被擋時，那些候選今天不測（測了也只會冤枉它們）
@@ -1331,9 +1581,15 @@ impl Benchmark {
                 h3_skipped += 1;
                 continue;
             }
+            // 連續好幾天回 HTTP 429（限流）的：跳過期間不測（3.5.1 L1）；重測的永久黑名單不受影響（它們本來就不在這裡）
+            if !pinned_or_control && learned.as_ref().is_some_and(|l| l.rl_skipping(&up.id, today_n)) {
+                rl_skipped += 1;
+                continue;
+            }
             let mut s = Srv::new(spec.clone(), up, pinned, tag.clone());
             s.protected = expect.cloned();
             s.never_ok = !pinned && expect.is_none() && never_ok.contains(&s.up.id);
+            s.retest = !pinned_or_control && (retest.contains(spec.as_str()) || retest.contains(&s.up.id));
             all.push(s);
         }
         // 分級評測（3.5.0 A3）：`a` 只用 A 級（B 級一個都不測、不選）；小機器的 `auto` 測 A 級、使用者的、
@@ -1345,7 +1601,7 @@ impl Benchmark {
             if s.pinned || s.protected.is_some() {
                 return None;
             }
-            learned.as_ref().filter(|l| today_n >= l.day).and_then(|l| l.hist.get(&s.id))
+            learned.as_ref().filter(|l| today_n >= l.day).and_then(|l| l.hist.get(&s.up.id))
         };
         let eff: Vec<Tier> = all.iter().map(|s| tiers::effective_tier(s.tag.tier, hist_of(s), today_n)).collect();
         let manual_a = all.iter().filter(|s| s.selectable() && s.tag.tier == Tier::A).count();
@@ -1357,7 +1613,7 @@ impl Benchmark {
                 "[分級] 依歷史要降級的 A 級有 {demoted_now} 個，超過 A 級 {manual_a} 個的三分之一：多半是這條線路的問題，今天不採用降級（照人工分級測）"
             );
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
         }
         let eff: Vec<Tier> = (0..all.len())
             .map(|i| {
@@ -1384,7 +1640,7 @@ impl Benchmark {
                         tier: eff[i],
                         op: s.op_key(),
                         ms: s.tag.ms,
-                        always: s.pinned || s.protected.is_some() || s.never_ok,
+                        always: s.pinned || s.protected.is_some() || s.never_ok || s.retest,
                         fixed: s.pinned || s.protected.is_some(),
                         incumbent: incumbents.contains(s.id.as_str()),
                         score: aged.as_ref().and_then(learn::Hist::score),
@@ -1443,7 +1699,7 @@ impl Benchmark {
             });
         }
         if tier_mode.only_a() {
-            jinfo!(
+            jimp!(
                 journal,
                 "[分級] 只用 A 級（benchmark.tiers = a）：今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）；B 級 {} 個不測、不選（含昨天選上或候補的 {} 個、依歷史升上來的 {} 個）",
                 tier_counts.a,
@@ -1453,14 +1709,14 @@ impl Benchmark {
                 dropped_pulled
             );
             if !tier_plan.fill_reason.is_empty() {
-                jinfo!(
+                jimp!(
                     journal,
                     "[分級] A 級的多樣性不夠（{}）：只用 A 級時不從 B 級補；要補請改成 auto 或 ab",
                     tier_plan.fill_reason
                 );
             }
         } else if tier_mode == tiers::Mode::Small {
-            jinfo!(
+            jimp!(
                 journal,
                 "[分級] 今天測 A 級 {} 個（另外依歷史降級、今天不測 {} 個）、依歷史拉上來的 B 級 {} 個（試用 {}）、沿用昨天選上或候補的 B 級 {} 個、補位 {} 個{}、探索 {} 個；B 級其餘 {} 個今天不測（不算淘汰、不記紀錄）",
                 tier_counts.a,
@@ -1499,6 +1755,13 @@ impl Benchmark {
             jinfo!(
                 journal,
                 "HTTP/3 先不測 {h3_skipped} 個：連續 {} 天以上 QUIC 連不上、HTTPS 正常（跳過 7～30 天，到期再試）",
+                learn::H3_FAIL_DAYS
+            );
+        }
+        if rl_skipped > 0 {
+            jinfo!(
+                journal,
+                "限流（HTTP 429）先不測 {rl_skipped} 個：連續 {} 天以上回 429（跳過 7～30 天，到期再試）",
                 learn::H3_FAIL_DAYS
             );
         }
@@ -1597,6 +1860,14 @@ impl Benchmark {
         // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
         let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
         let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
+        if strikes.cleared.0 > 0 {
+            jimp!(
+                journal,
+                "可疑紀錄：清掉舊規則記下的「網站無法驗證」{} 筆（{} 台），用目前的規則重新累積（憑證不符的保留）",
+                strikes.cleared.0,
+                strikes.cleared.1
+            );
+        }
         let mut universe: HashSet<u64> = HashSet::new();
         let mut blocked_report: Vec<Value> = Vec::new();
         let mut scored = 0usize;
@@ -1669,7 +1940,7 @@ impl Benchmark {
 
             // 污染判斷（v16.1 邏輯）
             let all_ips: Vec<IpAddr> = ok.iter().flat_map(|(_, ips, _)| ips.iter().map(|i| IpAddr::V4(*i))).collect();
-            let ip_info = cache.lookup(&*self.asn, &all_ips, false).await;
+            let ip_info = cache.lookup(&*self.asn, &all_ips, false, today_n).await;
             for (_, ips, _) in ok.iter().filter(|(i, _, _)| !all[*i].control_like()) {
                 universe.extend(ips.iter().map(|ip| select::item(dix, u32::from(*ip))));
             }
@@ -1681,7 +1952,7 @@ impl Benchmark {
             if unknown > 0 {
                 jinfo!(
                     journal,
-                    "   ⚠ {unknown} 筆結果查不到 ASN（ip-api 無法連線或受限），這些結果不做污染判斷"
+                    "   ⚠ {unknown} 筆結果查不到 ASN（ip-api 無法連線、受限，或查到的沒有 AS 編號），這些結果不做污染判斷"
                 );
             }
             let mut groups: Vec<Group> = Vec::new();
@@ -1797,7 +2068,35 @@ impl Benchmark {
                 }
                 seen.len() >= MULTI_CDN_GROUPS
             };
+            // 「網站無法驗證」的回答裡，別的經營者的加密 DNS 也回了同一個位址的（3.5.1）：那個位址多半是真的節點、
+            // 只是從這條線路連不上，不是這台 DNS 編出來的 → 今天照樣不用，但不記可疑天數。
+            // 只看加密 DNS：一般 DNS 可能被路上的設備竄改，好幾台被塞同一批假位址的不能互相作證
+            let shared: HashSet<usize> = {
+                let mut by_ip: HashMap<Ipv4Addr, Vec<String>> = HashMap::new();
+                for (i, ips, _) in ok.iter().filter(|(i, _, _)| !all[*i].control_like() && !is_plain(all[*i].kind)) {
+                    let op = all[*i].op_key();
+                    for ip in ips {
+                        let v = by_ip.entry(*ip).or_default();
+                        if !v.contains(&op) {
+                            v.push(op.clone());
+                        }
+                    }
+                }
+                verdict
+                    .iter()
+                    .filter(|(_, (c, _))| *c == SiteCheck::Unverified)
+                    .map(|(k, _)| *k)
+                    .filter(|k| {
+                        let own = all[ok[*k].0].op_key();
+                        ok[*k]
+                            .1
+                            .iter()
+                            .any(|ip| by_ip.get(ip).is_some_and(|ops| ops.iter().any(|o| *o != own)))
+                    })
+                    .collect()
+            };
             let (mut polluted, mut suspicious, mut rescued, mut lenient) = (0usize, 0usize, 0usize, 0usize);
+            let mut kept = KeptLines::default();
             let mut newly_bl: Vec<String> = Vec::new();
             for (k, ((i, ips, ms), info)) in ok.iter().zip(&infos).enumerate() {
                 let s = &mut all[*i];
@@ -1805,11 +2104,15 @@ impl Benchmark {
                     None => s.record(dix, *ms, ips),
                     Some((SiteCheck::Valid, _)) => {
                         rescued += 1;
-                        jinfo!(
-                            journal,
+                        // judge.log 每個業者群組一行（3.5.1）：一個規則沒涵蓋的 CDN 一題就有幾百台，以前一台一行把 judge.log 塞滿
+                        debug!(
                             "   [保留] {} -> {}：業者規則沒涵蓋，但 {domain} 的憑證有效（不是劫持）",
                             s.id,
                             info.label()
+                        );
+                        kept.add(
+                            format!("{}：業者規則沒涵蓋，但 {domain} 的憑證有效（不是劫持）", info.label()),
+                            &s.id,
                         );
                         s.record(dix, *ms, ips);
                     }
@@ -1826,8 +2129,9 @@ impl Benchmark {
                             continue;
                         }
                         polluted += 1;
-                        if s.learns() && strikes.add(&cert_key(&s.id), &today) >= CERT_DAYS {
-                            jinfo!(
+                        s.suspect_today |= s.learns();
+                        if s.learns() && strikes.add(&cert_key(&s.id), &today, domain).days >= CERT_DAYS {
+                            jimp!(
                                 journal,
                                 "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
                                 s.id,
@@ -1855,11 +2159,17 @@ impl Benchmark {
                         } else {
                             format!("這個網域有 {MULTI_CDN_GROUPS} 家以上業者的回答憑證有效（多家 CDN）")
                         };
-                        jinfo!(
-                            journal,
+                        debug!(
                             "   [保留] {} -> {}：{domain} 網站無法驗證（{why}），但{basis}，判為網站或路徑問題，照常計分、不記可疑",
                             s.id,
                             info.label()
+                        );
+                        kept.add(
+                            format!(
+                                "{}：{domain} 網站無法驗證（{why}），但{basis}，判為網站或路徑問題，照常計分、不記可疑",
+                                info.label()
+                            ),
+                            &s.id,
                         );
                         s.record(dix, *ms, ips);
                     }
@@ -1876,23 +2186,47 @@ impl Benchmark {
                             continue;
                         }
                         suspicious += 1;
-                        if s.learns() && strikes.add(&s.id, &today) >= SUSPECT_DAYS && blacklist.insert(s.id.clone()) {
-                            jinfo!(
+                        if shared.contains(&k) {
+                            if !s.pinned {
+                                jinfo!(
+                                    journal,
+                                    "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但別的經營者的 DNS 也回了同樣的位址，不記可疑",
+                                    s.id,
+                                    info.label()
+                                );
+                            }
+                            continue;
+                        }
+                        let c = if s.learns() {
+                            strikes.add(&s.id, &today, domain)
+                        } else {
+                            StrikeCount { days: 0, domains: 0 }
+                        };
+                        // 同一題天天連不上不累積：要 2 個以上不同的網域，才算進評測歷史的可疑天數、才會定罪
+                        s.suspect_today |= c.domains >= SUSPECT_DOMAINS;
+                        if c.days >= SUSPECT_DAYS && c.domains >= SUSPECT_DOMAINS && blacklist.insert(s.id.clone()) {
+                            jimp!(
                                 journal,
-                                "   [淘汰] {} -> 連續 {SUSPECT_DAYS} 天回答無法驗證的位址（加入永久黑名單）",
-                                s.id
+                                "   [淘汰] {} -> 30 天內 {} 天、{} 個網域回答無法驗證的位址（加入永久黑名單）",
+                                s.id,
+                                c.days,
+                                c.domains
                             );
                             newly_bl.push(format!(
-                                "{}  # {today} 汙染：{domain} → {}（連續 {SUSPECT_DAYS} 天網站無法驗證）",
+                                "{}  # {today} 汙染：{domain} → {}（30 天內 {} 天、{} 個網域網站無法驗證）",
                                 s.id,
-                                info.label()
+                                info.label(),
+                                c.days,
+                                c.domains
                             ));
                         } else if !s.pinned {
                             jinfo!(
                                 journal,
-                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}）",
+                                "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}；可疑 {} 天、{} 個網域）",
                                 s.id,
-                                info.label()
+                                info.label(),
+                                c.days,
+                                c.domains
                             );
                         }
                     }
@@ -1901,7 +2235,11 @@ impl Benchmark {
             if !newly_bl.is_empty() {
                 append_blacklist(&bl_file, &newly_bl);
             }
-            jinfo!(
+            for line in kept.lines() {
+                info!("{line}");
+                journal.push(line);
+            }
+            jimp!(
                 journal,
                 "   -> 第一名 [{}]，有效 {}、封殺 {}、汙染 {polluted}、可疑 {suspicious}、規則外但驗證通過 {rescued}、連不上但照用 {lenient}、逾時 {errors}",
                 groups.first().map(|g| g.rep.label()).unwrap_or_else(|| "無法判定".into()),
@@ -1912,6 +2250,25 @@ impl Benchmark {
 
         drop(raw);
         strikes.save();
+        // 之後的都是摘要（分級升降、選出結果）：用 judge.log 預留的尾端空間，不會被前面的判斷過程擠掉
+        journal.enter_tail();
+        if learned_bl {
+            self.tidy_blacklist(&bl_file, &all, &retest, &known, today_n, &today, &mut journal);
+        }
+        if let Some(l) = learned.as_mut() {
+            let c = record_rl429(l, &all, &pf, &known, today_n, &mut journal);
+            learn_dirty |= c.any();
+            if c.any() || l.rl_skipping_count(today_n) > 0 {
+                jimp!(
+                    journal,
+                    "限流（HTTP 429）：多記一天 {}、開始跳過 {}、恢復 {}（目前跳過 {} 個）",
+                    c.counted,
+                    c.skipped,
+                    c.cleared,
+                    l.rl_skipping_count(today_n)
+                );
+            }
+        }
         let finals: Vec<usize> = verified
             .iter()
             .copied()
@@ -1933,8 +2290,10 @@ impl Benchmark {
             host_ip.push(ip);
         }
         let owner_info = cache
-            .lookup(&*self.asn, &host_ip.iter().flatten().copied().collect::<Vec<_>>(), true)
+            .lookup(&*self.asn, &host_ip.iter().flatten().copied().collect::<Vec<_>>(), true, today_n)
             .await;
+        // 昨天選上的（3.5.1 M3）：正規化後的 id 與經營者。今天差不多好就留昨天那台，不要天天換
+        let (yday_ids, yday_ops) = yesterday_selected(&self.paths.upstreams_file, &all);
         // 所在地（規格 10 的 6.1）：台灣網段 → ip-api 的國別 → 都沒有；鄰近再看量到的最低延遲
         let tw_nets = self.tw.as_ref().map(|t| t.all());
         let scored_list: Vec<Scored> = finals
@@ -1948,6 +2307,13 @@ impl Benchmark {
                 let cc = info.map(|x| x.cc.as_str()).unwrap_or("");
                 (s.region, s.near) = select::classify_region(in_tw, cc, s.min, cfg.near_max_ms);
                 s.region_source = select::region_source(in_tw);
+                s.incumbent = if yday_ids.contains(&all[i].up.id) {
+                    2
+                } else if yday_ops.contains(&all[i].op_key()) {
+                    1
+                } else {
+                    0
+                };
                 s
             })
             .collect();
@@ -2029,7 +2395,7 @@ impl Benchmark {
             for id in &regress {
                 let line = format!("[對照組] {id} 以前判得出過濾，今天沒判出：評測可能判不出這一類了");
                 warn!("{line}");
-                journal.push(line);
+                journal.push_important(line);
             }
             if let Some((t, m)) = learned.as_ref().filter(|l| l.control_day == today_n).and_then(|l| {
                 // 不設期望（觀察中）的不算：它們本來就可能今天判出、明天沒判出
@@ -2046,7 +2412,7 @@ impl Benchmark {
                     to_fixed(m * 100.0, 0)
                 );
                 warn!("{line}");
-                journal.push(line);
+                journal.push_important(line);
             }
             for c in control.iter().filter(|c| c["result"] == "passed") {
                 let expect = c["expect"].as_str().unwrap_or("");
@@ -2075,7 +2441,7 @@ impl Benchmark {
             }
             let dead: Vec<&'static str> = kinds.iter().filter(|(_, (n, ok))| *n >= 3 && *ok == 0).map(|(k, _)| *k).collect();
             if !dead.is_empty() {
-                jinfo!(
+                jimp!(
                     journal,
                     "[分級] {} 今天整批過不了資格賽：多半是線路的問題，不記進評測歷史",
                     dead.join("、")
@@ -2085,23 +2451,24 @@ impl Benchmark {
                 .iter()
                 .filter(|s| general(s) && s.tag.tier != Tier::User && !dead.contains(&s.kind))
                 .map(|s| tiers::Tested {
-                    id: s.id.clone(),
+                    id: s.up.id.clone(),
                     manual: s.tag.tier,
                     // 惡意網站探測判出有擋的：今天不選，算沒倖存
                     survived: s.alive && !s.malware_filter,
-                    suspect: !s.alive && ["汙染", "可疑"].iter().any(|p| s.fail_reason.starts_with(p)),
+                    // 3.5.1：憑證不符、或「無法驗證」已經在 2 個以上網域發生的才算（同一題天天連不上不算）
+                    suspect: s.suspect_today,
                     ms: (s.alive && !s.malware_filter && s.lat_count > 0).then(|| s.avg() as f32),
                     trial_ok: !s.never_ok && cfg.select.auto_types.iter().any(|t| t == s.kind),
                 })
                 .collect();
-            let listed: HashSet<&str> = ids.iter().map(|c| c.id.as_str()).collect();
+            let listed: HashSet<String> = ids.iter().filter_map(|c| Upstream::parse(&c.id).ok().map(|u| u.id)).collect();
             let ch = tiers::update_history(&mut l.hist, &tested, today_n, |k| listed.contains(k));
             l.hist_cap(|k| listed.contains(k));
             learn_dirty = true;
             tier_counts.promoted_today = ch.promoted.len();
             tier_counts.demoted_today = ch.demoted.len();
             if ch.any() {
-                jinfo!(
+                jimp!(
                     journal,
                     "[分級] 依近 30 天的評測歷史：升級 {}、降回 {}、降級 {}、恢復 {}、開始試用 {}、結束試用 {}（只影響測不測，不影響選不選）",
                     ch.promoted.len(),
@@ -2119,9 +2486,11 @@ impl Benchmark {
                 ] {
                     for id in list.iter().take(20) {
                         let h = l.hist.get(id).copied().unwrap_or_default();
-                        jinfo!(
+                        // 鍵是正規化後的 id；記錄裡寫名單的寫法
+                        let shown = all.iter().find(|s| s.up.id == *id).map(|s| s.id.as_str()).unwrap_or(id);
+                        jimp!(
                             journal,
-                            "   [{what}] {id}：近 30 天測到 {} 天、倖存 {} 天、可疑 {} 天、延遲 {} ±{} ms",
+                            "   [{what}] {shown}：近 30 天測到 {} 天、倖存 {} 天、可疑 {} 天、延遲 {} ±{} ms",
                             h.tested(),
                             h.survived(),
                             h.suspect(),
@@ -2274,18 +2643,20 @@ impl Benchmark {
                 }
                 report(&d.join("protected.csv"), csv.as_bytes());
             }
-            report(&d.join("judge.log"), journal.text().as_bytes());
         }
         jinfo!(journal, "=== 今日選出的上游 ===");
+        let kept: HashSet<&str> = calc.selection.kept.iter().map(|&i| calc.finals[i].id.as_str()).collect();
         for x in state["selected"].as_array().into_iter().flatten() {
+            let id = x["id"].as_str().unwrap_or("");
             jinfo!(
                 journal,
-                "  {:<48} {:<4} {:>7}ms  +{}  ({}) {}",
-                x["id"].as_str().unwrap_or(""),
+                "  {:<48} {:<4} {:>7}ms  +{}  ({}{}) {}",
+                id,
                 x["type"].as_str().unwrap_or(""),
                 x["avgMs"].to_string(),
                 x["newItems"],
                 x["reason"].as_str().unwrap_or(""),
+                if kept.contains(id) { "，沿用昨天的" } else { "" },
                 x["owner"].as_str().unwrap_or("")
             );
         }
@@ -2326,15 +2697,59 @@ impl Benchmark {
             calc.selection.covered
         );
 
-        // 清理舊報表
-        if let Some(root) = &self.paths.out_root {
-            cleanup_reports(root, ctx.now_ms(), cfg.keep_days);
-        }
         jinfo!(journal, "[{}] 結束 {}", JOB_NAME, fmt_time(ctx.now_ms()));
+        // judge.log 最後才寫（3.5.1）：以前在「今日選出的上游」之前就寫了，報表目錄裡的那份看不到選出結果
+        if let Some(d) = &out_dir {
+            report(&d.join("judge.log"), journal.text().as_bytes());
+        }
         if let (Some(keep), Some(d)) = (&self.keep_last, &out_dir) {
             keep_last_report(d, keep, &journal);
         }
         Ok(state)
+    }
+
+    /// 整理學到的永久黑名單（3.5.1 A10.4）：今天重測的「網站無法驗證」通過就移除、沒通過從今天重新算；
+    /// 名單裡已經沒有的（列入 30 天以上）、重複的、超過上限的移除。有變動才寫（暫存檔＋改名）
+    #[allow(clippy::too_many_arguments)]
+    fn tidy_blacklist(
+        &self,
+        file: &Path,
+        all: &[Srv],
+        retest: &HashSet<String>,
+        known: &HashSet<String>,
+        today_n: u32,
+        today: &str,
+        journal: &mut Journal,
+    ) {
+        let Ok(text) = std::fs::read_to_string(file) else { return };
+        let mut results: HashMap<String, blacklist::Retest> = HashMap::new();
+        for id in retest {
+            let r = match all.iter().find(|s| s.id == *id || s.up.id == *id) {
+                None => blacklist::Retest::Untested,
+                Some(s) if s.alive || s.fail_reason.starts_with("封殺") => blacklist::Retest::Passed,
+                Some(s) => blacklist::Retest::Failed(s.fail_reason.clone()),
+            };
+            results.insert(id.clone(), r);
+        }
+        let (out, st) = blacklist::tidy(&text, &results, |id| known.contains(id), today_n, today);
+        if st.any() || st.untested > 0 {
+            jinfo!(
+                journal,
+                "[永久黑名單] 重測「網站無法驗證」{} 台：通過移除 {}、沒通過 {}（從今天重新算 30～60 天）、今天沒測到 {}；名單裡已經沒有的移除 {}、超過上限 {} 筆移除 {}",
+                retest.len(),
+                st.passed,
+                st.failed,
+                st.untested,
+                st.pruned,
+                blacklist::BLACKLIST_MAX,
+                st.capped
+            );
+        }
+        if out != text {
+            if let Err(e) = write_atomic(file, out.as_bytes()) {
+                warn!("永久黑名單整理後寫入失敗（{}）：{e}", file.display());
+            }
+        }
     }
 
     /// 惡意網站探測的自我檢查（3.5.0 A5；探測網域的來源 F10）：`probe.txt`（排前面）加上主程式抽樣、先確認還解析得到的，
@@ -2588,7 +3003,7 @@ impl Benchmark {
                 if manual_n > 0 { "，請檢查 probe.txt" } else { "" }
             );
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
         } else {
             run.state = "ok";
         }
@@ -2626,14 +3041,14 @@ impl Benchmark {
                 v.probed, v.would_flag
             );
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
             return;
         }
         if run.valid == 0 {
             run.state = "invalid";
             let line = "[惡意網站探測] 全部問完之後沒有有效的探測網域：今天不判斷任何候選".to_string();
             warn!("{line}");
-            journal.push(line);
+            journal.push_important(line);
             return;
         }
         for (c, hit) in ctl_idx.iter().zip(&v.controls) {
@@ -2897,6 +3312,47 @@ fn record_h3(l: &mut learn::Learn, all: &[Srv], pf: &[Option<Preflight>], today:
     change
 }
 
+/// 一次評測裡回 HTTP 429 的超過這麼多台：多半是這台送得太快（或共用出口被限流），不是那些伺服器的問題，今天不記
+const RL_FUSE: usize = 32;
+
+/// 一直回 HTTP 429（限流）的上游（3.5.1 L1）：今天測到的一般候選各記一筆（鍵是正規化後的 id）。
+/// 資格賽或之後的查詢回 429＝失敗；過了資格賽、沒有 429＝恢復（整筆刪掉）；資格賽是別的錯誤、今天沒測到＝不動。
+/// 名單裡已經沒有的刪掉。回 429 的超過 [`RL_FUSE`] 台時今天不記（寫進 judge.log）
+fn record_rl429(
+    l: &mut learn::Learn,
+    all: &[Srv],
+    pf: &[Option<Preflight>],
+    known: &HashSet<String>,
+    today: u32,
+    journal: &mut Journal,
+) -> learn::H3Change {
+    use learn::H3Seen;
+    let mut change = learn::H3Change::default();
+    // 名單裡已經沒有的刪掉（評測成功時學習檔一定會寫，見評測歷史）
+    l.rl429.retain(|k, _| known.contains(k));
+    let general = |s: &Srv| s.selectable() && !s.never_ok;
+    let limited = |s: &Srv| s.fail_reason.contains("HTTP 429");
+    let n = all.iter().filter(|s| general(s) && limited(s)).count();
+    if n > RL_FUSE {
+        jimp!(
+            journal,
+            "限流（HTTP 429）：今天有 {n} 台回 429，超過 {RL_FUSE} 台，多半是這台送得太快或共用的出口被限流，今天不記"
+        );
+        return change;
+    }
+    for (i, s) in all.iter().enumerate().filter(|(_, s)| general(s)) {
+        let seen = if limited(s) {
+            H3Seen::Fail
+        } else if pf[i] == Some(Preflight::Pass) {
+            H3Seen::Ok
+        } else {
+            H3Seen::Neutral
+        };
+        l.rl_record(&s.up.id, today, seen, &mut change);
+    }
+    change
+}
+
 /// 收集到的原始答案大約佔多少記憶體（每筆：結果本身 + 幾個 IP；估計值，誤差約 ±30%）。
 /// 只算原始答案，不含每台上游的歷史、ASN 快取、連線緩衝。放在 `/api/status` 的 `memory.jobs.rawBytes`
 fn raw_bytes(entries: usize) -> usize {
@@ -3041,8 +3497,11 @@ fn compute(
     }
 }
 
-/// 判斷過程摘要的上限（評測一次幾千行；只留前面這麼多）
+/// 判斷過程摘要的上限（評測一次幾千行）
 const JOURNAL_MAX: usize = 192 * 1024;
+/// 預留給摘要的尾端空間（3.5.1）：每題的結算、WARN、分級升降、選出結果。一般的判斷過程只能用到
+/// `JOURNAL_MAX - JOURNAL_TAIL`；第一次丟行之後就不再收一般的行（不會再收短的、造成中間跳號）
+const JOURNAL_TAIL: usize = 48 * 1024;
 /// 另存到持久資料區的每個檔案上限（Flash 上每天寫一次，不要太大）
 const KEEP_FILE_MAX: usize = 128 * 1024;
 
@@ -3055,29 +3514,146 @@ macro_rules! jinfo {
 }
 use jinfo;
 
+/// 同 [`jinfo`]，但是摘要：用預留的尾端空間（每題的結算、WARN、加入永久黑名單）
+macro_rules! jimp {
+    ($j:expr, $($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        info!("{s}");
+        $j.push_important(s);
+    }};
+}
+use jimp;
+
 #[derive(Default)]
 struct Journal {
     lines: Vec<String>,
+    /// 每一行是不是摘要（另存的那份要截短時，摘要一定留著）
+    important: Vec<bool>,
     bytes: usize,
+    /// 丟掉的一般行
     dropped: usize,
+    /// 第一次丟一般行的位置（之後不再收一般的行）
+    dropped_at: Option<usize>,
+    /// 連尾端空間也滿了、丟掉的摘要
+    dropped_tail: usize,
+    /// 進入結算之後：每一行都當摘要
+    tail: bool,
 }
 
 impl Journal {
+    /// 一般的判斷過程
     fn push(&mut self, s: String) {
-        if self.bytes + s.len() < JOURNAL_MAX {
+        if self.tail {
+            return self.push_important(s);
+        }
+        if self.dropped_at.is_none() && self.bytes + s.len() < JOURNAL_MAX - JOURNAL_TAIL {
             self.bytes += s.len() + 1;
             self.lines.push(s);
+            self.important.push(false);
         } else {
+            self.dropped_at.get_or_insert(self.lines.len());
             self.dropped += 1;
         }
     }
-    fn text(&self) -> String {
-        let mut t = self.lines.join("\n");
-        if self.dropped > 0 {
-            t.push_str(&format!("\n…（後面還有 {} 行，見系統記錄）", self.dropped));
+    /// 摘要：可以用到預留的尾端空間
+    fn push_important(&mut self, s: String) {
+        if self.bytes + s.len() < JOURNAL_MAX {
+            self.bytes += s.len() + 1;
+            self.lines.push(s);
+            self.important.push(true);
+        } else {
+            self.dropped_tail += 1;
         }
-        t.push('\n');
+    }
+    /// 之後的每一行都當摘要（Phase 1 判斷結束、開始結算）
+    fn enter_tail(&mut self) {
+        self.tail = true;
+    }
+    fn text(&self) -> String {
+        let mut t = String::with_capacity(self.bytes + 128);
+        for (i, l) in self.lines.iter().enumerate() {
+            if self.dropped_at == Some(i) {
+                t.push_str(&format!("…（這裡省略 {} 行判斷過程，見系統記錄；以下只留摘要）\n", self.dropped));
+            }
+            t.push_str(l);
+            t.push('\n');
+        }
+        if self.dropped_at == Some(self.lines.len()) {
+            t.push_str(&format!("…（這裡省略 {} 行判斷過程，見系統記錄）\n", self.dropped));
+        }
+        if self.dropped_tail > 0 {
+            t.push_str(&format!("…（後面還有 {} 行，見系統記錄）\n", self.dropped_tail));
+        }
         t
+    }
+    /// 截到 `max` 位元組左右（另存到持久資料區用）：摘要全部留著，一般的判斷過程從前面留到放不下為止
+    fn text_capped(&self, max: usize) -> String {
+        let t = self.text();
+        if t.len() <= max {
+            return t;
+        }
+        let imp: usize = self
+            .lines
+            .iter()
+            .zip(&self.important)
+            .filter(|(_, i)| **i)
+            .map(|(l, _)| l.len() + 1)
+            .sum();
+        let mut budget = max.saturating_sub(imp + 256);
+        let mut out = String::with_capacity(max + 256);
+        let mut cut = 0usize;
+        for (l, i) in self.lines.iter().zip(&self.important) {
+            if *i {
+                if cut > 0 {
+                    out.push_str(&format!("…（這裡省略 {cut} 行判斷過程）\n"));
+                    cut = 0;
+                }
+                out.push_str(l);
+                out.push('\n');
+            } else if cut == 0 && l.len() < budget {
+                budget -= l.len() + 1;
+                out.push_str(l);
+                out.push('\n');
+            } else {
+                cut += 1;
+            }
+        }
+        if cut > 0 {
+            out.push_str(&format!("…（這裡省略 {cut} 行判斷過程）\n"));
+        }
+        out
+    }
+}
+
+/// 一題裡「[保留]」的候選，依業者群組（同一句說明）合成一行（3.5.1）
+#[derive(Default)]
+struct KeptLines {
+    groups: Vec<(String, Vec<String>)>,
+}
+
+/// 一行最多列幾台的 id（其他寫「等 N 台」）
+const KEPT_IDS: usize = 5;
+
+impl KeptLines {
+    fn add(&mut self, what: String, id: &str) {
+        match self.groups.iter_mut().find(|(w, _)| *w == what) {
+            Some((_, ids)) => ids.push(id.to_string()),
+            None => self.groups.push((what, vec![id.to_string()])),
+        }
+    }
+    fn lines(self) -> Vec<String> {
+        self.groups
+            .into_iter()
+            .map(|(what, ids)| {
+                let shown: Vec<&str> = ids.iter().take(KEPT_IDS).map(String::as_str).collect();
+                let more = if ids.len() > KEPT_IDS {
+                    format!(" 等 {} 台", ids.len())
+                } else {
+                    String::new()
+                };
+                format!("   [保留] {} 台 -> {what}：{}{more}", ids.len(), shown.join("、"))
+            })
+            .collect()
     }
 }
 
@@ -3099,7 +3675,8 @@ fn keep_last_report(out_dir: &Path, keep: &Path, journal: &Journal) {
         warn!("最近一次評測報表另存失敗（{}）：{e}", keep.display());
         return;
     }
-    report(&keep.join("judge.log"), &cut(journal.text().into_bytes()));
+    // judge.log：摘要（每題結算、WARN、分級升降、選出結果）一定留著，截掉的是中間的判斷過程
+    report(&keep.join("judge.log"), &cut(journal.text_capped(KEEP_FILE_MAX).into_bytes()));
     for name in ["eliminated.csv", "upstreams.json", "protected.csv"] {
         if let Ok(b) = std::fs::read(out_dir.join(name)) {
             report(&keep.join(name), &cut(b));
@@ -3113,16 +3690,45 @@ fn report(path: &Path, data: &[u8]) {
     }
 }
 
-/// 刪掉超過 `keep_days` 天的報表目錄（YYYY-MM-DD）
+/// 刪掉超過 `keep_days` 天的報表目錄（YYYY-MM-DD，台北日期）：留今天在內的最近 `keep_days` 個日期。
+/// 3.5.1（L2）以前把目錄名稱當成 UTC 午夜、跟現在的時間比，台北清晨評測時實際留了 15 天
 fn cleanup_reports(root: &Path, now: u64, keep_days: u64) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
+    let today = learn::day_of(now) as u64;
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
+        // 目錄名稱的日數（`parse_date_utc` 給的是那天的 UTC 午夜，除以一天就是日數，跟台北的日數同一套算法）
         if let Some(t) = parse_date_utc(&name) {
-            if now.saturating_sub(t) > keep_days * DAY_MS {
+            if today >= t / DAY_MS + keep_days.max(1) && e.path().is_dir() {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    /// 3.5.1（L2）：目錄名稱是台北日期；留今天在內的最近 14 個日期（台北清晨評測也一樣）
+    #[test]
+    fn reports_kept_by_taipei_date() {
+        let root = std::env::temp_dir().join(format!("kuroshio-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["2026-11-12", "2026-11-13", "2026-11-26", "not-a-date"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("2026-11-01"), b"x").unwrap();
+        // 台北 2026-11-26 00:30（UTC 是 11-25 16:30）
+        let now = crate::time::days_from_civil(2026, 11, 26) as u64 * DAY_MS + 30 * crate::time::MIN_MS - crate::time::TPE_OFFSET_MS;
+        cleanup_reports(&root, now, 14);
+        assert!(!root.join("2026-11-12").exists(), "第 15 個日期");
+        assert!(root.join("2026-11-13").exists() && root.join("2026-11-26").exists());
+        assert!(
+            root.join("not-a-date").exists() && root.join("2026-11-01").exists(),
+            "不是報表目錄的不動"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -3276,6 +3882,41 @@ mod list_merge_tests {
         assert_eq!(tier("192.0.2.53"), Some(Tier::B));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// 3.5.1（M2）：好友候選放在所有名單之後、用正規化後的 id 跟全部名單比：
+    /// 好友給的 `tls://x:853` 不會蓋掉名單裡 A 級的 `tls://x`，`udp://` 寫法也比得出重複
+    #[test]
+    fn shared_candidates_never_shadow_listed_ones() {
+        let (root, mut p) = two_lists("shadow");
+        p.default_list_dir = None;
+        std::fs::write(p.list_dir.join("dotlist.txt"), "tls://dot.example.com  # tier=A op=Example_Dot\n").unwrap();
+        std::fs::write(p.list_dir.join("iplist.txt"), "192.0.2.53\n").unwrap();
+        let f = p.community_candidates.clone().unwrap();
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        let ids = [
+            "tls://dot.example.com:853",
+            "udp://192.0.2.53:53",
+            "tls://friend.example.net",
+            "https://friend.example.net/dns-query",
+        ];
+        std::fs::write(&f, serde_json::to_vec(&json!({ "ids": ids })).unwrap()).unwrap();
+        let (c, _) = candidate_ids(&p);
+        let got: Vec<&str> = c.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "192.0.2.53",
+                "tls://dot.example.com",
+                "tls://friend.example.net",
+                "https://friend.example.net/dns-query",
+                "h3://friend.example.net/dns-query"
+            ],
+            "好友的排在最後、重複的不收"
+        );
+        assert_eq!(c[1].tag.tier, Tier::A);
+        assert_eq!(c[1].tag.op, "Example_Dot");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]
@@ -3306,66 +3947,161 @@ mod asn_cache_tests {
         s.parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn asn_cache_reads_old_format_and_backfills_cc() {
-        let root = std::env::temp_dir().join(format!("kuroshio-asncc-{}", std::process::id()));
+    fn cache_root(name: &str) -> (PathBuf, BenchPaths) {
+        let root = std::env::temp_dir().join(format!("kuroshio-asn-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut p = BenchPaths::from_config(&json!({}), &root.join("state"), &root);
         p.out_root = Some(root.join("out"));
         std::fs::create_dir_all(root.join("out")).unwrap();
-        // 3.3.7 的快取：沒有 cc
+        (root, p)
+    }
+
+    fn calls(src: &Counting) -> Vec<Vec<Ipv4Addr>> {
+        src.calls.lock().unwrap().clone()
+    }
+
+    fn ip4(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    /// 3.5.0 以前的快取（/16 鍵、沒有國別、沒有代表 IP）整份丟掉重查；新的鍵是 /24，存代表 IP 與日數
+    #[tokio::test]
+    async fn asn_cache_drops_old_format_and_keys_by_24() {
+        let (root, p) = cache_root("old");
         std::fs::write(
             root.join("out/cidr_cache.json"),
-            r#"{"198.51":{"raw":"Old_Net__AS64501_Old","keywords":["old","as64501"]},"203.0":{"raw":"Other__AS64502","keywords":["other"]}}"#,
+            r#"{"198.51":{"raw":"Old_Net__AS64501_Old","keywords":["old","as64501"]},"203.0":{"raw":"Other__AS64502","keywords":["other"],"cc":"JP"},"198.51.100":{"raw":"X__AS64503_X","keywords":["x"],"cc":"JP"}}"#,
         )
         .unwrap();
+        let mut c = AsnCache::load(&p);
+        assert!(c.map.is_empty(), "/16 的舊鍵、沒有代表 IP 的都丟掉：{:?}", c.map);
+        assert!(c.dirty, "丟掉的要寫回去");
+        let src = Counting {
+            calls: Mutex::new(Vec::new()),
+            offline: false,
+        };
+        // 同一個 /16、不同 /24：各問一次（以前同一個 /16 只問一個，後問的蓋掉先問的）
+        let r = c
+            .lookup(&src, &[v4("198.51.100.1"), v4("198.51.100.2"), v4("198.51.7.1")], false, 100)
+            .await;
+        assert_eq!(calls(&src), vec![vec![ip4("198.51.100.1"), ip4("198.51.7.1")]]);
+        assert_eq!(r[&v4("198.51.100.2")].cc, "JP");
+        // 存檔：/24 鍵，多 ip 與 t；2.x 的兩個鍵不動
+        let f = root.join("out/cidr_cache.json");
+        c.save(&f).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert_eq!(v["198.51.100"]["ip"], "198.51.100.1");
+        assert_eq!(v["198.51.100"]["t"], 100);
+        assert!(v["198.51.100"]["raw"].is_string() && v["198.51.100"]["keywords"].is_array());
+        // 讀回來照用，不重問
+        let mut c = AsnCache::load(&p);
+        assert_eq!(c.map.len(), 2);
+        assert!(!c.dirty);
+        c.lookup(&src, &[v4("198.51.100.9")], true, 101).await;
+        assert_eq!(calls(&src).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 到期（30 天）或沒有國別時，用當初的代表 IP 重問；查不到留著舊資料，同一次執行不重問
+    #[tokio::test]
+    async fn asn_cache_refreshes_with_same_rep_ip() {
+        let (_root, p) = cache_root("ttl");
         for offline in [false, true] {
             let mut c = AsnCache::load(&p);
-            assert_eq!(c.map.len(), 2, "舊格式讀得進來");
-            assert_eq!(c.map["198.51"].cc, "");
+            c.map.insert(
+                "198.51.100".into(),
+                AsnEntry {
+                    info: AsnInfo::from_ip_api("Old Net", "", "AS64501 Old", "JP"),
+                    ip: ip4("198.51.100.7"),
+                    day: 100,
+                },
+            );
+            c.map.insert(
+                "203.0.113".into(),
+                AsnEntry {
+                    info: AsnInfo::from_ip_api("No CC", "", "AS64502 Nocc", ""),
+                    ip: ip4("203.0.113.5"),
+                    day: 100,
+                },
+            );
             let src = Counting {
                 calls: Mutex::new(Vec::new()),
                 offline,
             };
-            // 汙染判斷那邊（want_cc = false）不補查
-            let r = c.lookup(&src, &[v4("198.51.100.1"), v4("203.0.113.1")], false).await;
-            assert_eq!(r[&v4("198.51.100.1")].raw, "Old_Net__AS64501_Old");
-            assert!(src.calls.lock().unwrap().is_empty());
-            // 決選的上游位址（want_cc）：沒有國別的 /16 補查一次（同一個 /16 只送一個代表）
-            let r = c.lookup(&src, &[v4("198.51.100.1"), v4("198.51.100.2")], true).await;
-            assert_eq!(*src.calls.lock().unwrap(), vec![vec!["198.51.100.1".parse::<Ipv4Addr>().unwrap()]]);
-            let got = &r[&v4("198.51.100.1")];
+            // 還沒到期：不問
+            c.lookup(&src, &[v4("198.51.100.1")], false, 100 + ASN_TTL_DAYS - 1).await;
+            assert!(calls(&src).is_empty());
+            // 汙染判斷那邊（want_cc = false）沒有國別也不補問
+            c.lookup(&src, &[v4("203.0.113.1")], false, 101).await;
+            assert!(calls(&src).is_empty());
+            // 決選（want_cc）：用當初的代表 IP 補問，不是這次看到的位址
+            c.lookup(&src, &[v4("203.0.113.1")], true, 101).await;
+            assert_eq!(calls(&src), vec![vec![ip4("203.0.113.5")]]);
+            // 到期：同樣用代表 IP 重問
+            let r = c.lookup(&src, &[v4("198.51.100.1")], false, 100 + ASN_TTL_DAYS).await;
+            assert_eq!(calls(&src)[1], vec![ip4("198.51.100.7")]);
             if offline {
-                // 查不到：留著舊資料、國別是空的，不算失敗
-                assert_eq!(got.raw, "Old_Net__AS64501_Old");
-                assert_eq!(got.cc, "");
+                assert_eq!(r[&v4("198.51.100.1")].raw, "Old_Net__AS64501_Old", "查不到留著舊資料");
                 assert!(!c.dirty);
             } else {
-                assert_eq!(got.cc, "JP");
-                assert!(c.dirty);
+                assert_eq!(r[&v4("198.51.100.1")].raw, "Example_Net__AS64500_Example");
+                assert_eq!(c.map["198.51.100"].day, 100 + ASN_TTL_DAYS);
+                assert_eq!(c.map["203.0.113"].info.cc, "JP");
             }
-            // 同一次執行不重複補查
-            c.lookup(&src, &[v4("198.51.100.3")], true).await;
-            assert_eq!(src.calls.lock().unwrap().len(), 1);
-            // 還沒補查過的另一個 /16 照樣補一次
-            c.lookup(&src, &[v4("203.0.113.9")], true).await;
-            assert_eq!(src.calls.lock().unwrap().len(), 2);
-            // 存檔：有國別的才多 "cc"，2.x 的兩個鍵不動
-            let f = root.join(format!("saved-{offline}.json"));
-            c.save(&f).unwrap();
-            let v: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
-            assert_eq!(v["198.51"].get("cc").is_some(), !offline);
-            assert!(v["198.51"]["raw"].is_string() && v["198.51"]["keywords"].is_array());
+            // 同一次執行不重問
+            c.lookup(&src, &[v4("198.51.100.2"), v4("203.0.113.2")], true, 100 + ASN_TTL_DAYS)
+                .await;
+            assert_eq!(calls(&src).len(), 2);
         }
-        // 這次執行查不到的 /16：want_cc 時也不重問
+        // 這次執行查不到的 /24：want_cc 時也不重問
         let mut c = AsnCache::load(&p);
         let src = Counting {
             calls: Mutex::new(Vec::new()),
             offline: true,
         };
-        c.lookup(&src, &[v4("192.0.2.1")], false).await;
-        c.lookup(&src, &[v4("192.0.2.1")], true).await;
-        assert_eq!(src.calls.lock().unwrap().len(), 1);
+        c.lookup(&src, &[v4("192.0.2.1")], false, 1).await;
+        c.lookup(&src, &[v4("192.0.2.1")], true, 1).await;
+        assert_eq!(calls(&src).len(), 1);
+    }
+
+    /// 來源回了沒問過的位址不收；沒有 AS 編號的業者當成查不到；超過上限先丟最舊的
+    #[tokio::test]
+    async fn asn_cache_ignores_foreign_answers_and_caps() {
+        struct Wrong;
+        impl AsnSource for Wrong {
+            fn lookup(&self, _ips: Vec<Ipv4Addr>) -> BoxFuture<Vec<(Ipv4Addr, AsnInfo)>> {
+                Box::pin(async move {
+                    vec![
+                        (ip4("198.51.100.9"), AsnInfo::from_ip_api("Other", "", "AS64509 Other", "BG")),
+                        (ip4("192.0.2.1"), AsnInfo::from_ip_api("NOASN", "", "", "CN")),
+                    ]
+                })
+            }
+        }
+        let (root, p) = cache_root("cap");
+        let mut c = AsnCache::load(&p);
+        let r = c.lookup(&Wrong, &[v4("192.0.2.1"), v4("198.51.7.1")], false, 5).await;
+        assert!(!c.map.contains_key("198.51.100"), "沒問過的不收");
+        assert!(r[&v4("192.0.2.1")].is_unknown(), "沒有 AS 編號的當成查不到");
+        assert_eq!(r[&v4("192.0.2.1")].label(), "NOASN（查不到 AS 編號）");
+        assert!(r[&v4("198.51.7.1")].is_unknown());
+        for i in 0..(ASN_CACHE_MAX + 3) as u32 {
+            let ip = Ipv4Addr::from(0x0a00_0000 + (i << 8));
+            c.map.insert(
+                asn_key(ip),
+                AsnEntry {
+                    info: AsnInfo::from_ip_api("N", "", "AS1 N", "JP"),
+                    ip,
+                    day: 1000 + i,
+                },
+            );
+        }
+        c.save(&root.join("x.json")).unwrap();
+        assert_eq!(c.map.len(), ASN_CACHE_MAX);
+        assert!(!c.map.contains_key("10.0.0"), "最舊的先丟");
+        assert!(c
+            .map
+            .contains_key(&asn_key(Ipv4Addr::from(0x0a00_0000 + ((ASN_CACHE_MAX as u32 + 2) << 8)))));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -3394,5 +4130,154 @@ mod shared_tests {
         let (_, n) = candidate_ids(&paths);
         assert_eq!(n, MAX_SHARED, "好友的上游候選最多 100 個");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod strike_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("kuroshio-strikes-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("blacklist-suspects.json")
+    }
+
+    /// 3.5.1：每一筆記日期、規則版本、網域；同一天同一個網域只記一次；累計分開算日期與網域
+    #[test]
+    fn strikes_count_days_and_domains() {
+        let f = tmp("count");
+        let now = crate::time::days_from_civil(2026, 11, 20) as u64 * DAY_MS;
+        let mut s = Strikes::load(f.clone(), now);
+        assert_eq!(s.add("a", "2026-11-18", "www.example.com"), StrikeCount { days: 1, domains: 1 });
+        assert_eq!(s.add("a", "2026-11-18", "www.example.com"), StrikeCount { days: 1, domains: 1 });
+        assert_eq!(s.add("a", "2026-11-19", "www.example.com"), StrikeCount { days: 2, domains: 1 });
+        assert_eq!(
+            s.add("a", "2026-11-20", "www.example.com"),
+            StrikeCount { days: 3, domains: 1 },
+            "同一題天天連不上：網域只有 1 個"
+        );
+        assert_eq!(s.add("a", "2026-11-20", "cdn.example.net"), StrikeCount { days: 3, domains: 2 });
+        s.save();
+        let v: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert_eq!(v["a"][0], "2026-11-18|r2|www.example.com");
+        assert_eq!(parse_strike("2026-11-18|r2|www.example.com"), ("2026-11-18", 2, "www.example.com"));
+        assert_eq!(parse_strike("2026-11-18"), ("2026-11-18", 0, ""), "3.5.0 以前只有日期");
+        // 超過 30 天的忘掉（新舊格式都一樣用開頭的日期比）
+        let s = Strikes::load(f.clone(), now + 31 * DAY_MS);
+        assert!(s.map.is_empty(), "{:?}", s.map);
+        // 一台最多留 64 筆，先丟最舊的
+        let mut s = Strikes::load(f.clone(), now);
+        for i in 0..70 {
+            s.add("b", "2026-11-20", &format!("d{i:02}.example.com"));
+        }
+        assert_eq!(s.map["b"].len(), STRIKE_MAX_ENTRIES);
+        assert!(!s.map["b"].iter().any(|e| e.ends_with("|d00.example.com")));
+        let _ = std::fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    /// 3.5.1（H2）：舊規則（沒寫版本＝3.5.0 以前）記下的「無法驗證」載入時清掉；憑證不符的保留
+    #[test]
+    fn old_rule_unverified_strikes_are_cleared() {
+        let f = tmp("rules");
+        let now = crate::time::days_from_civil(2026, 11, 26) as u64 * DAY_MS;
+        std::fs::write(
+            &f,
+            serde_json::to_vec(&json!({
+                // 3.0.x 時期記的兩天（只差一天就永久封殺）
+                "https://dns.example.com/dns-query": ["2026-11-13", "2026-11-15"],
+                "https://mixed.example.com/dns-query": ["2026-11-13", "2026-11-20|r2|www.example.com", "2026-11-21|r1|www.example.com"],
+                "cert|https://bad.example.net/dns-query": ["2026-11-14"],
+                "https://new.example.net/dns-query": ["2026-11-25|r2|cdn.example.net"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut s = Strikes::load(f.clone(), now);
+        assert_eq!(s.cleared, (4, 2));
+        assert!(!s.map.contains_key("https://dns.example.com/dns-query"));
+        assert_eq!(s.map["https://mixed.example.com/dns-query"], vec!["2026-11-20|r2|www.example.com"]);
+        assert_eq!(
+            s.map["cert|https://bad.example.net/dns-query"],
+            vec!["2026-11-14"],
+            "憑證不符的保留"
+        );
+        assert_eq!(s.map["https://new.example.net/dns-query"].len(), 1);
+        assert!(s.dirty);
+        s.save();
+        // 存回去之後再載入：沒有要清的
+        let s = Strikes::load(f.clone(), now);
+        assert_eq!(s.cleared, (0, 0));
+        assert!(!s.dirty);
+        let _ = std::fs::remove_dir_all(f.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    /// 3.5.1（M1）：一般的判斷過程只能用到尾端預留空間之前；第一次丟行之後不再收一般的行（不收短的、不跳號）；
+    /// 摘要（每題結算、WARN、結算之後的每一行）用預留的尾端空間
+    #[test]
+    fn journal_reserves_tail_for_summary() {
+        let mut j = Journal::default();
+        let long = "判".repeat(1000); // 3,000 bytes
+        let mut n = 0;
+        while j.dropped == 0 {
+            j.push(format!("{n} {long}"));
+            n += 1;
+        }
+        let kept = j.lines.len();
+        assert!(j.bytes <= JOURNAL_MAX - JOURNAL_TAIL);
+        j.push("短".into());
+        assert_eq!(j.lines.len(), kept, "第一次丟行之後短的也不收");
+        assert_eq!(j.dropped, 2);
+        j.push_important("   -> 第一名 [X]".into());
+        j.enter_tail();
+        j.push("=== 今日選出的上游 ===".into());
+        j.push("  https://dns.example.com/dns-query".into());
+        let t = j.text();
+        assert!(
+            t.contains("…（這裡省略 2 行判斷過程，見系統記錄；以下只留摘要）\n   -> 第一名 [X]\n=== 今日選出的上游 ===\n"),
+            "{}",
+            &t[t.len() - 300..]
+        );
+        assert!(t.ends_with("  https://dns.example.com/dns-query\n"));
+        assert!(t.len() <= JOURNAL_MAX + 200);
+        // 尾端空間也滿了：最後寫一行還有幾行
+        for _ in 0..100 {
+            j.push(long.clone());
+        }
+        assert!(j.bytes <= JOURNAL_MAX);
+        assert!(j.text().ends_with(&format!("…（後面還有 {} 行，見系統記錄）\n", j.dropped_tail)));
+        // 另存的那份（128 KiB）：摘要全部留著
+        let c = j.text_capped(KEEP_FILE_MAX);
+        assert!(c.len() <= KEEP_FILE_MAX, "{}", c.len());
+        assert!(c.contains("   -> 第一名 [X]\n=== 今日選出的上游 ===\n  https://dns.example.com/dns-query\n"));
+        assert!(c.contains("…（這裡省略 "));
+    }
+
+    #[test]
+    fn kept_lines_are_grouped() {
+        let mut k = KeptLines::default();
+        for i in 0..7 {
+            k.add(
+                "X__AS64500_X：業者規則沒涵蓋，但 www.example.com 的憑證有效（不是劫持）".into(),
+                &format!("192.0.2.{i}"),
+            );
+        }
+        k.add(
+            "Y__AS64501_Y：業者規則沒涵蓋，但 www.example.com 的憑證有效（不是劫持）".into(),
+            "198.51.100.1",
+        );
+        let l = k.lines();
+        assert_eq!(l.len(), 2);
+        assert_eq!(
+            l[0],
+            "   [保留] 7 台 -> X__AS64500_X：業者規則沒涵蓋，但 www.example.com 的憑證有效（不是劫持）：192.0.2.0、192.0.2.1、192.0.2.2、192.0.2.3、192.0.2.4 等 7 台"
+        );
+        assert!(l[1].ends_with("：198.51.100.1"));
     }
 }

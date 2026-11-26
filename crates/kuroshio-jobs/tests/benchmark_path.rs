@@ -324,7 +324,11 @@ async fn multi_cdn_domain_timeouts_are_not_suspects() {
     let suspects = std::fs::read_to_string(root.join("state/blacklist-suspects.json")).unwrap_or_default();
     assert!(!suspects.contains("same-op"), "多家 CDN 的網域連不上不記可疑：{suspects}");
     let log = std::fs::read_to_string(root.join("persist/benchmark-last/judge.log")).unwrap();
-    assert!(log.contains("多家 CDN") && log.contains("[保留] https://sea01.same-op"), "{log}");
+    assert!(
+        log.lines()
+            .any(|l| l.starts_with("   [保留] ") && l.contains("多家 CDN") && l.contains("https://sea01.same-op")),
+        "3.5.1 起每個業者群組一行：{log}"
+    );
     assert!(!log.contains("[今天不用] https://sea01.same-op"), "{log}");
 }
 

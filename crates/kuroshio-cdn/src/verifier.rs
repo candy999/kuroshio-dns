@@ -108,6 +108,24 @@ struct Hinted {
     ip: IpAddr,
     from: String,
     result: Option<bool>,
+    /// 失敗的原因是連線（不是憑證不符、回應不對）：本機忙、本機的網路有問題時不算好友的（3.5.1 L6）
+    conn_fail: Option<String>,
+}
+
+/// 本機這邊的連線錯誤（3.5.1 L6）：通訊端用完、本機位址不能用、本機的網路不通。好友給的節點連不上是這種原因時不算好友的
+pub(crate) fn local_conn_error(err: &str) -> bool {
+    const LOCAL: [&str; 9] = [
+        "EADDRNOTAVAIL",
+        "ENETUNREACH",
+        "ENOBUFS",
+        "EMFILE",
+        "ENFILE",
+        "Too many open files",
+        "No buffer space",
+        "os error 10055", // Windows：WSAENOBUFS
+        "os error 10024", // Windows：WSAEMFILE
+    ];
+    LOCAL.iter().any(|k| err.contains(k))
 }
 
 /// 好友提示最多試幾個（每個都要連一次）
@@ -386,11 +404,17 @@ impl Cdn {
                 }
             });
         }
-        // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗（沒輪到試的不算）
+        // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗（沒輪到試的不算）。
+        // 3.5.1（L6）：連不上的失敗，本機忙（驗證減量中、記憶體不能長大）、原本的 IP 也連不上（本機的網路）、
+        // 本機的通訊端錯誤時不算好友的（壓測時本機驗證失敗會拉低好友的品質分數）；憑證不符、回應不對照算
         if !hinted.is_empty() {
             if let Some(h) = self.hints() {
+                let strained = self.locally_strained() || !conn.base_ok;
                 for x in &hinted {
                     if let Some(ok) = x.result {
+                        if !ok && x.conn_fail.as_deref().is_some_and(|e| strained || local_conn_error(e)) {
+                            continue;
+                        }
                         h.hint_result(&x.from, crate::cdn::HintKind::Site, ok);
                     }
                 }
@@ -570,6 +594,7 @@ impl Cdn {
                     ip: x.ip,
                     from: x.from,
                     result: if in_range { None } else { Some(false) },
+                    conn_fail: None,
                 });
                 if !take {
                     seen.remove(&x.ip);
@@ -599,6 +624,10 @@ impl Cdn {
             if !r.ok {
                 let err = r.error.clone().unwrap_or_default();
                 if kuroshio_net::probe::is_local_error(&err) {
+                    // 好友給的節點也一樣：本機的問題不算好友的（3.5.1 L6；結果照記「沒通過」，算分時看 conn_fail 略過）
+                    if let Some(h) = hinted_out.iter_mut().find(|h| h.ip == ip) {
+                        h.conn_fail = Some(err.clone());
+                    }
                     local_err.get_or_insert(err);
                     continue;
                 }
@@ -616,6 +645,9 @@ impl Cdn {
                     continue;
                 }
                 last_reason = format!("連線失敗 {err}");
+                if let Some(h) = hinted_out.iter_mut().find(|h| h.ip == ip) {
+                    h.conn_fail = Some(err.clone());
+                }
                 // 3.5.1 K2：不馬上暫停節點，驗證結束後再看是網站還是節點的問題（`verify_with_speed()`）
                 conn_out.list.push((ip, err));
                 continue;

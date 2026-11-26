@@ -788,9 +788,12 @@ impl PeerStore {
         }
     }
 
+    /// 同步成功：失敗的退避（與「對方版本較舊」的 6 小時重試）一起清掉（3.5.1 L4：以前 `next_try` 沒清，
+    /// 成功之後還要等到上一次失敗排的時間才會再同步）
     pub fn note_success(&mut self, domain: &str, now: u64) {
         if let Some(p) = self.get_mut(domain) {
             p.fail_count = 0;
+            p.next_try = 0;
             p.last_error = None;
             p.last_contact = now;
             p.last_sync_ok = now;
@@ -945,6 +948,23 @@ mod tests {
         s.on_request("late.flood.test", "r", vec![], PeerInfo::default(), now, |_, _| Action::Manual);
         assert_eq!(s.peers.len(), MAX_STRANGERS + 3);
         assert_eq!(s.get("late.flood.test").unwrap().rel, Rel::In);
+    }
+
+    /// 3.5.1（L4）：同步成功之後清掉失敗的退避（以前 `nextTry` 沒清，成功之後還要等上一次失敗排的時間）
+    #[test]
+    fn success_clears_next_try() {
+        let mut s = store();
+        let now = 1_000 * DAY;
+        s.on_request("f.test", "r", vec![], PeerInfo::default(), now, |_, _| Action::Accept);
+        s.note_failure("f.test", "逾時", now);
+        s.note_failure("f.test", "逾時", now);
+        assert_eq!(s.get("f.test").unwrap().next_try, now + 2 * HOUR);
+        s.note_success("f.test", now + 10);
+        let p = s.get("f.test").unwrap();
+        assert_eq!((p.next_try, p.fail_count, p.last_error.is_none()), (0, 0, true));
+        // 再失敗：退避從 1 小時重新算
+        s.note_failure("f.test", "逾時", now + 20);
+        assert_eq!(s.get("f.test").unwrap().next_try, now + 20 + HOUR);
     }
 
     #[test]

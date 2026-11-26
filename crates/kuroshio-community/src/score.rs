@@ -53,7 +53,7 @@ pub enum Outcome {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KindScore {
-    /// 每天一筆：[日（Unix 天數）, ok, fail, invalid]
+    /// 每天一筆：[日（台北的 Unix 天數；3.5.0 以前是 UTC）, ok, fail, invalid]
     #[serde(default)]
     pub days: Vec<[u32; 4]>,
     #[serde(default)]
@@ -64,9 +64,14 @@ pub struct KindScore {
     pub last_retry: u64,
 }
 
+/// 台北的日數（3.5.1 L5：跟評測學習檔一樣用台北的日期換日；以前用 UTC，台北早上 8 點才換日）。
+/// 舊資料是 UTC 的日數：台北的日數只會一樣或多 1，不會倒退
 fn day_of(ms: u64) -> u32 {
-    (ms / DAY) as u32
+    ((ms + TPE_OFFSET) / DAY) as u32
 }
+
+/// 台北比 UTC 快 8 小時
+const TPE_OFFSET: u64 = 8 * crate::util::HOUR;
 
 impl KindScore {
     pub fn add(&mut self, o: Outcome, n: u32, now: u64) {
@@ -170,6 +175,26 @@ mod tests {
         assert!((s.score(t0) - 9.0 / 15.0).abs() < 1e-9);
         // 15 天後全部過期
         assert_eq!(s.totals(t0 + 15 * DAY), (0, 0, 0));
+    }
+
+    /// 3.5.1（L5）：用台北的日期換日（跟評測學習檔一樣）：台北 00:30 已經是新的一天
+    #[test]
+    fn days_follow_taipei_date() {
+        let mut s = KindScore::default();
+        // UTC 某天 15:00（台北 23:00）與 16:30（台北隔天 00:30）
+        let t0 = 300 * DAY + 15 * crate::util::HOUR;
+        s.add(Outcome::Ok, 1, t0);
+        s.add(Outcome::Ok, 1, t0 + 90 * crate::util::MINUTE);
+        assert_eq!(s.days.len(), 2, "{:?}", s.days);
+        assert_eq!(s.days[0][0] + 1, s.days[1][0]);
+        // 舊資料（UTC 的日數）：照樣在 14 天的窗裡，不會倒退
+        let mut old = KindScore {
+            days: vec![[300, 5, 0, 0]],
+            ..Default::default()
+        };
+        old.add(Outcome::Ok, 1, 300 * DAY + 20 * crate::util::HOUR);
+        assert_eq!(old.days.len(), 2);
+        assert_eq!(old.totals(300 * DAY + 20 * crate::util::HOUR).0, 6);
     }
 
     #[test]

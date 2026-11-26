@@ -70,13 +70,13 @@ impl Prober for NetProber {
     }
 }
 
-/// 查一批 IPv4 的業者（每個 /16 只會送一個代表進來）
+/// 查一批 IPv4 的業者（每個 /24 只會送一個代表進來，3.5.1 以前是 /16）
 pub trait AsnSource: Send + Sync + 'static {
     /// 回傳查得到的（查不到的不用回）
     fn lookup(&self, ips: Vec<Ipv4Addr>) -> BoxFuture<Vec<(Ipv4Addr, AsnInfo)>>;
 }
 
-/// 固定資料（測試、或完全離線）：以 /16（"a.b"）為鍵
+/// 固定資料（測試、或完全離線）：以 /24（"a.b.c"）或 /16（"a.b"）為鍵，/24 優先
 #[derive(Debug, Default)]
 pub struct StaticAsn(pub HashMap<String, AsnInfo>);
 
@@ -84,13 +84,19 @@ impl AsnSource for StaticAsn {
     fn lookup(&self, ips: Vec<Ipv4Addr>) -> BoxFuture<Vec<(Ipv4Addr, AsnInfo)>> {
         let out = ips
             .into_iter()
-            .filter_map(|ip| self.0.get(&sub_key(ip)).map(|i| (ip, i.clone())))
+            .filter_map(|ip| {
+                let o = ip.octets();
+                self.0
+                    .get(&format!("{}.{}.{}", o[0], o[1], o[2]))
+                    .or_else(|| self.0.get(&sub_key(ip)))
+                    .map(|i| (ip, i.clone()))
+            })
             .collect();
         Box::pin(async move { out })
     }
 }
 
-/// /16 鍵（同 2.x 的 `subKey`）
+/// /16 鍵（同 2.x 的 `subKey`）：3.5.1 起只用在「經營者」（IP 寫法的候選）與測試的固定資料，ASN 快取改用 /24
 pub fn sub_key(ip: Ipv4Addr) -> String {
     let o = ip.octets();
     format!("{}.{}", o[0], o[1])

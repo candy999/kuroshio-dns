@@ -42,7 +42,16 @@ pub struct Scored {
     pub tw_rate: Option<f32>,
     /// 名單標記的 `ecs=1`（3.5.0 B5）：會帶 ECS。只輸出
     pub ecs: bool,
+    /// 昨天選上的（3.5.1 M3）：2＝同一台（正規化後的 id 相同）、1＝同一個經營者的別的寫法、0＝不是。
+    /// 跟今天最好的差在 [`STICKY_RATIO`] 以內就留昨天那台（不要天天換）
+    pub incumbent: u8,
+    /// 經營者（3.5.1 M4；名單的 `op=`，沒有就用主機的可註冊網域或 /16，小寫）：選上游時同一個經營者最多 1 台、
+    /// 候補也最多 1 台。空的＝不限（2.x 對照、測試）
+    pub op_key: String,
 }
+
+/// 昨天選上的上游，延遲或新增覆蓋跟今天最好的差在這個比例以內就留昨天那台（3.5.1 M3：15%）
+pub const STICKY_RATIO: f64 = 0.15;
 
 /// 台灣率的分母（至少有一台倖存者回過台灣 IP 的網域）少於這個數就不算（樣本太少）
 pub const TW_RATE_MIN_DOMAINS: usize = 10;
@@ -184,15 +193,26 @@ fn stable_sort_by_avg(list: &mut [usize], servers: &[&Scored]) {
 
 /// 貪婪選擇（同 2.x `greedy`）：回傳（選擇順序, 剩下的依延遲排序）
 pub fn greedy(servers: &[&Scored], total: usize, strategy: Strategy, pre: &HashSet<u64>) -> (Vec<Step>, Vec<usize>) {
-    greedy_inner(servers, total, strategy, pre, false)
+    greedy_inner(servers, total, strategy, pre, false).0
 }
 
 /// `tw_tie`（3.5.0 B5，只用在選上游的「覆蓋」階段）：每一步新增覆蓋差在 10% 以內的候選裡，
 /// 台灣率比原本選到的高就改選它（台灣率高的有好幾台時，照原本的規則：新增多的、再快的）。
 /// 台灣率是 None（沒有台灣網段資料、樣本太少）時跟原本一模一樣；報表（`greedy_csv`）不用
-fn greedy_inner(servers: &[&Scored], total: usize, strategy: Strategy, pre: &HashSet<u64>, tw_tie: bool) -> (Vec<Step>, Vec<usize>) {
+///
+/// `tw_tie` 也同時打開「留昨天選上的」（3.5.1 M3）：台灣率決定之後，選到的不是昨天選上的，而新增覆蓋差在
+/// [`STICKY_RATIO`] 以內、台灣率不比它低的候選裡有昨天選上的，就改選昨天那台（同一台優先、再來同一個經營者、再來新增多的、再快的）。
+/// 第二個回傳值是因為這樣改選的步驟（`result` 的位置）
+fn greedy_inner(
+    servers: &[&Scored],
+    total: usize,
+    strategy: Strategy,
+    pre: &HashSet<u64>,
+    tw_tie: bool,
+) -> ((Vec<Step>, Vec<usize>), Vec<usize>) {
     let mut covered = pre.clone();
     let mut result = Vec::new();
+    let mut kept_steps = Vec::new();
     let mut cands: Vec<usize> = (0..servers.len()).collect();
     let mut news: Vec<(usize, usize)> = Vec::new(); // (cands 位置, 新增數)
     while covered.len() < total {
@@ -249,6 +269,37 @@ fn greedy_inner(servers: &[&Scored], total: usize, strategy: Strategy, pre: &Has
                     }
                 }
             }
+            // 留昨天選上的（M3）
+            if servers[cands[bp]].incumbent == 0 {
+                let chosen_tw = servers[cands[bp]].tw_rate;
+                let close = |nw: usize| nw as f64 >= bn as f64 * (1.0 - STICKY_RATIO);
+                let mut pick: Option<(usize, usize)> = None;
+                // 台灣率不比選到的低（任一邊沒有台灣率就不比）：台灣節點是黑潮的本質，穩定不能拿它來換
+                let tw_ok = |s: &Scored| match (s.tw_rate, chosen_tw) {
+                    (Some(a), Some(b)) => a >= b,
+                    _ => true,
+                };
+                for &(pos, nw) in news.iter().filter(|(pos, nw)| {
+                    let s = servers[cands[*pos]];
+                    s.incumbent > 0 && close(*nw) && tw_ok(s)
+                }) {
+                    let s = servers[cands[pos]];
+                    let better = match pick {
+                        None => true,
+                        Some((pp, pn)) => {
+                            let p = servers[cands[pp]];
+                            (s.incumbent, nw) > (p.incumbent, pn) || ((s.incumbent, nw) == (p.incumbent, pn) && s.avg < p.avg)
+                        }
+                    };
+                    if better {
+                        pick = Some((pos, nw));
+                    }
+                }
+                if let Some(p) = pick {
+                    (bp, bn) = p;
+                    kept_steps.push(result.len());
+                }
+            }
         }
         let idx = cands.remove(bp);
         covered.extend(servers[idx].items());
@@ -257,9 +308,14 @@ fn greedy_inner(servers: &[&Scored], total: usize, strategy: Strategy, pre: &Has
             newly: bn,
             total: covered.len(),
         });
+        // 選上游時同一個經營者最多 1 台（M4）：同一個經營者的其他寫法、其他節點不再考慮
+        if tw_tie && !servers[idx].op_key.is_empty() {
+            let op = &servers[idx].op_key;
+            cands.retain(|&c| servers[c].op_key != *op);
+        }
     }
     stable_sort_by_avg(&mut cands, servers);
-    (result, cands)
+    ((result, cands), kept_steps)
 }
 
 /// 每個 ASN（沒有 AS 號碼就用整個 owner 字串）留最快的一台，依第一次出現的順序
@@ -321,6 +377,8 @@ pub struct Pick {
 pub struct Selection {
     pub selected: Vec<Pick>,
     pub covered: usize,
+    /// 因為「昨天選上的」而留下的（3.5.1 M3；`finals` 的位置）：寫進 judge.log
+    pub kept: Vec<usize>,
 }
 
 /// 能不能被選來用（固定上游另外算；3.5.0 起「今天不選」的也不行）
@@ -333,6 +391,8 @@ pub const SPARES: usize = 3;
 
 /// 候補（3.5.0 A7）：跟 [`select`] 一樣合格（每個 ASN 最快的一台、類型、延遲、成功率）、但沒選上的，依速度取前 `n` 台。
 /// 執行時可用的自動上游不夠時依序補上
+/// 3.5.1（M4）：同一個經營者最多 1 台候補（主要的那台另外算：同一個經營者最多 1 台主要＋1 台候補）。
+/// 以前每個 ASN 取一台：同一個服務的節點放在不同機房（AS 不同）時，候補 3 台裡 2 台是同一家
 pub fn spares(finals: &[&Scored], asn_best: &[usize], sel: &Selection, o: &SelectOpts, n: usize) -> Vec<usize> {
     let mut v: Vec<usize> = asn_best
         .iter()
@@ -340,8 +400,15 @@ pub fn spares(finals: &[&Scored], asn_best: &[usize], sel: &Selection, o: &Selec
         .filter(|&i| eligible(finals[i], o) && !sel.selected.iter().any(|p| p.idx == i))
         .collect();
     v.sort_by(|a, b| finals[*a].avg.partial_cmp(&finals[*b].avg).unwrap_or(std::cmp::Ordering::Equal));
+    let mut ops: HashSet<&str> = HashSet::new();
+    v.retain(|&i| finals[i].op_key.is_empty() || ops.insert(finals[i].op_key.as_str()));
     v.truncate(n);
     v
+}
+
+/// 同一個經營者（`op_key` 一樣、不是空的）
+fn same_op(a: &Scored, b: &Scored) -> bool {
+    !a.op_key.is_empty() && a.op_key == b.op_key
 }
 
 /// Phase 3：選出執行期上游。`finals` 依延遲排序，`asn_best` 是 `best_per_asn(finals)`。
@@ -352,7 +419,23 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
     let mut by_speed = eligible.clone();
     by_speed.sort_by(|a, b| finals[*a].avg.partial_cmp(&finals[*b].avg).unwrap_or(std::cmp::Ordering::Equal));
     let mut selected = Vec::new();
-    if let Some(&fastest) = by_speed.first() {
+    let mut kept = Vec::new();
+    if let Some(&best) = by_speed.first() {
+        // 留昨天選上的（M3）：延遲在今天最快的 15% 以內（同一台優先、再來同一個經營者的別的寫法、再快的）
+        let fastest = by_speed
+            .iter()
+            .copied()
+            .filter(|&i| finals[i].incumbent > 0 && finals[i].avg <= finals[best].avg * (1.0 + STICKY_RATIO))
+            .min_by(|&a, &b| {
+                finals[b]
+                    .incumbent
+                    .cmp(&finals[a].incumbent)
+                    .then(finals[a].avg.partial_cmp(&finals[b].avg).unwrap_or(std::cmp::Ordering::Equal))
+            })
+            .unwrap_or(best);
+        if fastest != best {
+            kept.push(fastest);
+        }
         let nw: Vec<u64> = finals[fastest].items().filter(|k| !covered.contains(k)).collect();
         let newly = nw.len();
         covered.extend(nw);
@@ -361,7 +444,12 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
             newly,
             why: "最快",
         });
-        let rest: Vec<usize> = eligible.iter().copied().filter(|&i| i != fastest).collect();
+        // 同一個經營者最多 1 台（M4）：「最快」那台的經營者的其他寫法、其他節點不再選
+        let rest: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&i| i != fastest && !same_op(finals[i], finals[fastest]))
+            .collect();
         // 覆蓋：`near_first` 時分兩輪（先鄰近的、再其餘的），第二輪從第一輪結束時的覆蓋接著算；
         // 兩輪共用台數上限與覆蓋率的停止條件。否則一輪、不分遠近（3.3.7）
         let rounds: Vec<Vec<usize>> = if o.near_first {
@@ -375,13 +463,21 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
             if done(selected.len(), covered.len()) {
                 break;
             }
+            // 前一輪選過的經營者不再選（M4）
+            let round: Vec<usize> = round
+                .into_iter()
+                .filter(|&i| !selected.iter().any(|p: &Pick| same_op(finals[i], finals[p.idx])))
+                .collect();
             let refs: Vec<&Scored> = round.iter().map(|&i| finals[i]).collect();
-            let (steps, _) = greedy_inner(&refs, total, Strategy::Coverage, &covered, true);
-            for st in steps {
+            let ((steps, _), kept_steps) = greedy_inner(&refs, total, Strategy::Coverage, &covered, true);
+            for (n, st) in steps.into_iter().enumerate() {
                 if done(selected.len(), covered.len()) {
                     break 'rounds;
                 }
                 let idx = round[st.idx];
+                if kept_steps.contains(&n) {
+                    kept.push(idx);
+                }
                 covered.extend(finals[idx].items());
                 selected.push(Pick {
                     idx,
@@ -391,11 +487,18 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
             }
         }
     }
-    for &i in &by_speed {
-        if selected.len() >= o.min_auto.min(o.max_n) {
-            break;
-        }
-        if !selected.iter().any(|p| p.idx == i) {
+    // 不足 minAuto 台時依速度補備援：先補別的經營者（M4）；都是同一家的時候才補同一家（最壞情況跟以前一樣，台數照樣補足）
+    for distinct in [true, false] {
+        for &i in &by_speed {
+            if selected.len() >= o.min_auto.min(o.max_n) {
+                break;
+            }
+            if selected.iter().any(|p| p.idx == i) {
+                continue;
+            }
+            if distinct && selected.iter().any(|p| same_op(finals[i], finals[p.idx])) {
+                continue;
+            }
             selected.push(Pick {
                 idx: i,
                 newly: 0,
@@ -406,6 +509,7 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
     Selection {
         selected,
         covered: covered.len(),
+        kept,
     }
 }
 
@@ -712,6 +816,7 @@ mod tests {
         Selection {
             selected,
             covered: covered.len(),
+            kept: Vec::new(),
         }
     }
 
@@ -889,5 +994,141 @@ mod tests {
             let refs2: Vec<&Scored> = same.iter().collect();
             assert_eq!(select(&refs2, &asn, 60, &o), want, "第 {round} 組（一樣的台灣率）");
         }
+    }
+}
+
+#[cfg(test)]
+mod sticky_tests {
+    use super::*;
+
+    fn srv(id: &str, asn: u32, avg: f64, items: std::ops::Range<u32>, incumbent: u8) -> Scored {
+        Scored {
+            id: id.into(),
+            kind: "doh".into(),
+            owner: format!("X{asn}__AS{asn}_X"),
+            avg,
+            count: 10,
+            history: vec![(0, items.collect())],
+            incumbent,
+            ..Default::default()
+        }
+    }
+
+    fn opts(max_n: usize) -> SelectOpts {
+        SelectOpts {
+            auto_types: vec!["doh".into()],
+            max_n,
+            min_auto: 1,
+            coverage_target: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn run(v: &mut [Scored], max_n: usize) -> (Vec<String>, Vec<String>) {
+        extended_metrics(v, 1);
+        v.sort_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap());
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        let s = select(&refs, &asn, 1000, &opts(max_n));
+        (
+            s.selected.iter().map(|p| refs[p.idx].id.clone()).collect(),
+            s.kept.iter().map(|&i| refs[i].id.clone()).collect(),
+        )
+    }
+
+    /// 3.5.1（M3）：「最快」昨天選上的延遲在今天最快的 15% 以內就留昨天那台；同一台優先於同一個經營者的別的寫法
+    #[test]
+    fn fastest_keeps_yesterday_within_15_percent() {
+        let mut v = vec![srv("new", 1, 3.2, 0..5, 0), srv("old", 2, 3.6, 5..10, 2)];
+        assert_eq!(run(&mut v, 1), (vec!["old".to_string()], vec!["old".to_string()]));
+        let mut v = vec![srv("new", 1, 3.2, 0..5, 0), srv("old", 2, 3.8, 5..10, 2)];
+        assert_eq!(run(&mut v, 1).0, vec!["new"], "差超過 15%：換");
+        let mut v = vec![
+            srv("new", 1, 3.2, 0..5, 0),
+            srv("same-op", 2, 3.3, 5..10, 1),
+            srv("old", 3, 3.5, 10..15, 2),
+        ];
+        assert_eq!(run(&mut v, 1).0, vec!["old"], "同一台優先");
+        // 沒有昨天的資料：跟以前一樣
+        let mut v = vec![srv("new", 1, 3.2, 0..5, 0), srv("old", 2, 3.6, 5..10, 0)];
+        assert_eq!(run(&mut v, 1), (vec!["new".to_string()], vec![]));
+    }
+
+    /// 「覆蓋」：新增覆蓋在今天最多的 85% 以上的昨天選上的就留它；差太多、台灣率比較低的照換
+    #[test]
+    fn coverage_keeps_yesterday_within_15_percent() {
+        let base = || srv("fast", 9, 1.0, 0..1, 0);
+        let mut v = vec![base(), srv("more", 1, 50.0, 100..200, 0), srv("old", 2, 60.0, 300..390, 2)];
+        let (sel, kept) = run(&mut v, 2);
+        assert_eq!(sel, vec!["fast", "old"]);
+        assert_eq!(kept, vec!["old"]);
+        let mut v = vec![base(), srv("more", 1, 50.0, 100..200, 0), srv("old", 2, 60.0, 300..380, 2)];
+        assert_eq!(run(&mut v, 2).0, vec!["fast", "more"], "新增覆蓋少超過 15%：換");
+        let mut v = vec![base(), srv("more", 1, 50.0, 100..200, 0), srv("old", 2, 60.0, 300..390, 2)];
+        v[1].tw_rate = Some(0.5);
+        v[2].tw_rate = Some(0.4);
+        assert_eq!(run(&mut v, 2).0, vec!["fast", "more"], "台灣率比較低的不留");
+    }
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    fn srv(id: &str, asn: u32, op: &str, avg: f64, items: std::ops::Range<u32>) -> Scored {
+        Scored {
+            id: id.into(),
+            kind: "doh".into(),
+            owner: format!("X{asn}__AS{asn}_X"),
+            avg,
+            count: 10,
+            history: vec![(0, items.collect())],
+            op_key: op.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 3.5.1（M4）：同一個經營者（同一個服務放在不同機房、AS 不同）最多 1 台主要＋1 台候補
+    #[test]
+    fn one_main_and_one_spare_per_operator() {
+        let mut v = vec![
+            srv("nd1", 1, "nextdns", 3.2, 0..10),
+            srv("nd2", 2, "nextdns", 3.3, 10..30),
+            srv("nd3", 3, "nextdns", 3.4, 30..40),
+            srv("cf", 4, "cloudflare", 3.8, 40..45),
+            srv("far", 5, "other", 60.0, 50..60),
+            srv("g", 6, "google", 9.0, 60..61),
+        ];
+        extended_metrics(&mut v, 1);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        assert_eq!(asn.len(), 6, "AS 都不同：以前每個 AS 一台");
+        let o = SelectOpts {
+            auto_types: vec!["doh".into()],
+            max_n: 3,
+            min_auto: 3,
+            coverage_target: 1.0,
+            ..Default::default()
+        };
+        let s = select(&refs, &asn, 1000, &o);
+        let ids: Vec<&str> = s.selected.iter().map(|p| refs[p.idx].id.as_str()).collect();
+        assert_eq!(ids, vec!["nd1", "far", "cf"], "nd2 新增最多，但跟最快的同一家");
+        let sp: Vec<&str> = spares(&refs, &asn, &s, &o, SPARES).iter().map(|&i| refs[i].id.as_str()).collect();
+        assert_eq!(sp, vec!["nd2", "g"], "候補同一家也只一台");
+        // 經營者都一樣、台數不夠：照樣補足（最壞情況跟以前一樣）
+        let mut v = vec![srv("a", 1, "same", 3.0, 0..5), srv("b", 2, "same", 4.0, 5..10)];
+        extended_metrics(&mut v, 1);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        let o = SelectOpts {
+            auto_types: vec!["doh".into()],
+            max_n: 2,
+            min_auto: 2,
+            coverage_target: 1.0,
+            ..Default::default()
+        };
+        let s = select(&refs, &asn, 1000, &o);
+        assert_eq!(s.selected.len(), 2);
+        assert_eq!(s.selected[1].why, "備援");
     }
 }

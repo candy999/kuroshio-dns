@@ -1525,6 +1525,12 @@ impl Cdn {
         self.cfg.verify_pacing && (self.cfg.lite || self.paced.load(Ordering::Relaxed))
     }
 
+    /// 本機忙（3.5.1 L6）：驗證減量中（新網域很多或 CPU 很忙；`cdn.lite` 固定的減量不算）、記憶體不能再長大。
+    /// 這時好友給的節點連不上，不算到好友的品質分數上
+    pub(crate) fn locally_strained(&self) -> bool {
+        self.paced.load(Ordering::Relaxed) || !self.admit_new.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn note_pace_waited(&self) {
         self.pace_waited.fetch_add(1, Ordering::Relaxed);
     }
