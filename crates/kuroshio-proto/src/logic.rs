@@ -180,13 +180,16 @@ pub fn add_ede(resp: &mut Message, code: u16, text: &str) {
     }
 }
 
-/// 被封鎖的回應（同 2.x）：A → 0.0.0.0、AAAA → ::、其他 → 空回應；TTL 10 秒
-pub fn blocked_response(query: &Message, ede_code: u16, why: &str) -> Message {
+/// 被封鎖的答案預設的 TTL（秒，`filter.blockedTtl`；3.5.0 以前固定 10 秒）
+pub const BLOCKED_TTL: u32 = 60;
+
+/// 被封鎖的回應（同 2.x）：A → 0.0.0.0、AAAA → ::、其他 → 空回應；TTL `ttl` 秒（`filter.blockedTtl`，預設 [`BLOCKED_TTL`]）
+pub fn blocked_response(query: &Message, ttl: u32, ede_code: u16, why: &str) -> Message {
     let mut r = Message::response_to(query, 0);
     if let Some(q) = query.question() {
         match q.qtype {
-            rtype::A => r.answers.push(Record::a(&q.name, 10, Ipv4Addr::UNSPECIFIED)),
-            rtype::AAAA => r.answers.push(Record::aaaa(&q.name, 10, Ipv6Addr::UNSPECIFIED)),
+            rtype::A => r.answers.push(Record::a(&q.name, ttl, Ipv4Addr::UNSPECIFIED)),
+            rtype::AAAA => r.answers.push(Record::aaaa(&q.name, ttl, Ipv6Addr::UNSPECIFIED)),
             _ => {}
         }
     }
@@ -275,15 +278,17 @@ mod tests {
             udp_size: 4096,
             ..Default::default()
         });
-        let r = Message::parse(&blocked_response(&q, ede::FILTERED, "廣告").encode()).unwrap();
+        let r = Message::parse(&blocked_response(&q, BLOCKED_TTL, ede::FILTERED, "廣告").encode()).unwrap();
         assert_eq!(r.answers[0].data, RData::Aaaa(Ipv6Addr::UNSPECIFIED));
-        assert_eq!(r.answers[0].ttl, 10);
+        assert_eq!(r.answers[0].ttl, 60);
+        let r = Message::parse(&blocked_response(&q, 300, ede::FILTERED, "廣告").encode()).unwrap();
+        assert_eq!(r.answers[0].ttl, 300);
         let ede = &r.opt.as_ref().unwrap().options[0];
         assert_eq!(ede.0, opt_code::EDE);
         assert_eq!(&ede.1[..2], &17u16.to_be_bytes());
         // 沒有 EDNS 的查詢不加 OPT
         let q2 = Message::parse(&build_query(5, "ads.test", 1)).unwrap();
-        assert!(blocked_response(&q2, ede::FILTERED, "x").opt.is_none());
+        assert!(blocked_response(&q2, BLOCKED_TTL, ede::FILTERED, "x").opt.is_none());
     }
 
     #[test]

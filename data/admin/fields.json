@@ -278,6 +278,7 @@
             { "key": "filter.enabled", "type": "bool", "label": "啟用過濾" },
             { "key": "filter.protectComm", "type": "bool", "label": "內建服務與通訊類網域不被清單誤擋", "help": "內建的六類服務就算被訂閱清單擋到也放行（自訂規則照樣優先：自己明確要擋的照擋）：推播（Apple 推播、Firebase 雲端訊息，照常換台灣節點）、時間同步（NTP）、連線偵測（手機判斷「有沒有網路」）、憑證撤銷（OCSP／CRL）、地震速報（政府的資料來源）這四類也不改寫 CDN 答案（換節點沒有好處、換錯代價很大）；系統與安全更新照常換台灣節點，只保證不被誤擋。自己加的通訊類網域（resolver.keepNames）不擋、快取優先。關掉＝新的五類照清單擋、照常改寫，推播回到 3.5.0 之前的規則。" },
             { "key": "filter.updateIntervalHours", "type": "int", "label": "清單更新間隔（小時）", "pro": true, "min": 1 },
+            { "key": "filter.blockedTtl", "type": "int", "label": "被擋網域的 TTL（秒）", "help": "裝置收到「被擋」的答案後記多久（0～3600，預設 60）。越長裝置重複查被擋網域的次數越少；解除封鎖後，裝置最多要等這麼久才會重新查詢（黑潮這邊立刻生效）。", "pro": true, "min": 0, "max": 3600 },
             { "key": "filter.relaxedModifiers", "type": "bool", "label": "寬鬆套用瀏覽器規則", "help": "EasyList 這類瀏覽器清單有很多帶 $third-party、$script 修飾詞的規則。關閉（預設，同 AdGuard Home）= 略過這些規則；打開 = 整個網域封鎖，擋得更多但可能誤殺。", "pro": true },
             { "key": "filter.customRules", "type": "list", "label": "自訂規則檔", "help": "一行一個檔案（相對路徑以設定資料夾為準）。用記事本編輯即可，例：||ads.example.com^ 封鎖、@@||good.example.com^ 白名單、! 或 # 開頭是註解。存檔後 3 秒內生效，不用重啟。", "pro": true }
           ]

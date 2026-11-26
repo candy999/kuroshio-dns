@@ -69,6 +69,8 @@ return view.extend({
 		o.rmempty = false;
 		if (pro) {
 			common.num(s, null, 'update_interval_hours', _('清單更新間隔（小時）'), 'filter.updateIntervalHours');
+			common.num(s, null, 'blocked_ttl', _('被擋網域的 TTL（秒）'), 'filter.blockedTtl',
+				_('裝置收到「被擋」的答案後記多久（0～3600，預設 60）。越長裝置重複查被擋網域的次數越少；解除封鎖後，裝置最多要等這麼久才會重新查詢（黑潮這邊立刻生效）。'));
 			o = common.flag(s, null, 'relaxed_modifiers', _('寬鬆套用瀏覽器規則'), 'filter.relaxedModifiers',
 				_('EasyList 這類瀏覽器清單有很多帶 $third-party、$script 修飾詞的規則。關閉（預設，同 AdGuard Home）= 略過這些規則；打開 = 整個網域封鎖，擋得更多但可能誤殺。'));
 			// 內建一定通過的服務（3.5.0 F11）

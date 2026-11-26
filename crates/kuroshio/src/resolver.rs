@@ -74,6 +74,8 @@ pub struct Params {
     /// 特殊用途網域（RFC 6761：`.invalid`、`.test`、`.localhost`、`.onion`、`.example`）在本機回答
     /// （`resolver.specialUse`，預設開，3.5.1）。關掉＝3.5.0 的行為：照一般網域問上游
     pub special_use: bool,
+    /// 被封鎖的答案的 TTL（秒，`filter.blockedTtl`，預設 60、最多 3600；3.5.0 以前固定 10 秒）
+    pub blocked_ttl: u32,
 }
 
 impl Params {
@@ -111,6 +113,10 @@ impl Params {
             backfill_max: if kuroshio_config::Host::detect().cores <= 2 { 2 } else { 4 },
             round_aware_failures: kuroshio_config::chain::flex_bool(kuroshio_config::get(cfg, "upstream.roundAwareFailures"), true).0,
             special_use: b("specialUse", true),
+            blocked_ttl: kuroshio_config::get(cfg, "filter.blockedTtl")
+                .and_then(Value::as_u64)
+                .unwrap_or(logic::BLOCKED_TTL as u64)
+                .min(3600) as u32,
         }
     }
 }
@@ -575,7 +581,7 @@ impl Resolver {
                 self.stats.blocked_name(&qname, ctx.client, v.category);
                 let code = if v.category == "malware" { ede::BLOCKED } else { ede::FILTERED };
                 debug!("{} {qname} 攔截（{}）{}", ctx.proto, v.category, v.rule);
-                let out = logic::blocked_response(&query, code, &format!("{}：{}", v.category, v.rule));
+                let out = logic::blocked_response(&query, self.params.blocked_ttl, code, &format!("{}：{}", v.category, v.rule));
                 self.qlog(&qname, qtype, ctx, crate::querylog::Kind::Blocked, &out, t0, v.category);
                 return msg(out);
             }
@@ -678,7 +684,7 @@ impl Resolver {
     fn serve(&self, query: &Message, e: &Entry, force_ttl: Option<u32>, client: Option<IpAddr>) -> Message {
         if let Some(cat) = self.entry_blocked(e, client) {
             let code = if cat == "malware" { ede::BLOCKED } else { ede::FILTERED };
-            return logic::blocked_response(query, code, &format!("{cat}：CNAME"));
+            return logic::blocked_response(query, self.params.blocked_ttl, code, &format!("{cat}：CNAME"));
         }
         if e.class == Class::ServFail {
             return logic::servfail(query);

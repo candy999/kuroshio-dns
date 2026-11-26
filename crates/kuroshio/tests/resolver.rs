@@ -164,7 +164,17 @@ async fn filter_and_cname_chain() {
     // 快取命中也維持封鎖
     let m = Message::parse(&r.handle(&q(3, "ad-cname.test", 1), &CTX).await.unwrap()).unwrap();
     assert_eq!(m.answers[0].data, RData::A(Ipv4Addr::UNSPECIFIED));
+    assert_eq!(m.answers[0].ttl, 60, "被擋的答案預設 TTL 60 秒（3.5.1，以前 10 秒）");
     assert_eq!(r.stats.summary()["today"]["blocked"], 3);
+    // `filter.blockedTtl`：查詢名稱被擋、CNAME 被擋都用同一個 TTL；上限 3600
+    for (set, want) in [(300u64, 300u32), (0, 0), (99_999, 3600)] {
+        let r = kuroshio::app::build_resolver(&cfg(&[up], json!({ "filter": { "blockedTtl": set } }))).unwrap();
+        r.set_filter(Some(Arc::new(Block)));
+        for (i, name) in ["ads.test", "ad-cname.test"].iter().enumerate() {
+            let m = Message::parse(&r.handle(&q(10 + i as u16, name, 1), &CTX).await.unwrap()).unwrap();
+            assert_eq!(m.answers[0].ttl, want, "{name} blockedTtl={set}");
+        }
+    }
 }
 
 fn loop_a(name: &str, _t: u16) -> (u16, Vec<Record>, u32) {

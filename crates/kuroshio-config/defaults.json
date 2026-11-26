@@ -194,6 +194,7 @@
   "filter": {
     "enabled": true,
     "protectComm": true,
+    "blockedTtl": 60,
     "customRules": [
       "./custom-rules.txt"
     ],
