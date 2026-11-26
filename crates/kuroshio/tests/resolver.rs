@@ -1666,3 +1666,28 @@ async fn only_push_quake_and_user_names_use_prefetch_slots() {
     let want: usize = cases.iter().map(|c| c.1).sum();
     assert_eq!(n.load(Ordering::SeqCst) - before, want, "只有推播、地震速報有預取");
 }
+
+/// 3.5.1：快取交給下一輪之後（重新載入、這一輪正在結束），問上游失敗的查詢不回 SERVFAIL（沒有回應，
+/// 用戶端重送給新的一輪）；快取命中的照常回答
+#[tokio::test]
+async fn retired_round_does_not_answer_servfail() {
+    let (up, down, _) = switchable(300).await;
+    let c = cfg(
+        &[up],
+        json!({ "resolver": { "timeoutMs": 200, "serveStaleSec": 0, "staleIfErrorSec": 0 } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    r.handle(&q(1, "kept.test", 1), &CTX).await.unwrap();
+    down.store(true, Ordering::SeqCst);
+    // 平常：上游全掛回 SERVFAIL
+    let m = Message::parse(&r.handle(&q(2, "gone.test", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 2);
+    r.serving.retire();
+    assert!(r.handle(&q(3, "gone2.test", 1), &CTX).await.is_none(), "交出快取之後不回 SERVFAIL");
+    let m = Message::parse(&r.handle(&q(4, "kept.test", 1), &CTX).await.unwrap()).unwrap();
+    assert_eq!(
+        (m.rcode, m.answers[0].data.clone()),
+        (0, RData::A(Ipv4Addr::new(9, 9, 9, 9))),
+        "快取命中照常回答"
+    );
+}

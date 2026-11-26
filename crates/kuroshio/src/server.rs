@@ -8,8 +8,9 @@ use crate::resolver::{Ctx, Resolver};
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info};
@@ -17,6 +18,95 @@ use tracing::{debug, info};
 pub struct Server {
     pub resolver: Arc<Resolver>,
     pub acl: Arc<Acl>,
+}
+
+/// 重新載入時交出 DNS 快取之前，先等處理中的查詢做完最多這麼久（規格 10 第 7.3 節）。
+/// 這段時間監聽已經停下來，新的封包留在核心的接收緩衝區、TCP 連線留在 accept 佇列，給新的一輪
+pub const QUIESCE_MAX: Duration = Duration::from_secs(1);
+
+/// 這一輪的監聽迴圈與處理中的查詢（3.5.1）。
+///
+/// 重新載入時舊的一輪要先**停止收新的查詢**、等處理中的做完，才把快取交給下一輪
+/// （[`Serving::quiesce`]）。以前快取交出去之後舊的一輪還在讀同一個（`listenbank` 共用的）監聽 socket：
+/// 查詢一律沒命中、改問上游；剛好碰上舊的執行環境關閉時，問上游的工作開不起來，回了 SERVFAIL；
+/// 或是查詢讀進來了卻跟著執行環境一起被丟掉，用戶端要等逾時重送。
+///
+/// 每筆查詢多兩個 32 位元原子操作（MT7621 沒有 64 位元原子操作），不加鎖；監聽迴圈的登記只在啟動時。
+#[derive(Default)]
+pub struct Serving {
+    /// 收查詢的迴圈（一般 DNS 的 UDP、TCP accept，DoT、DoH 的 accept）：停止時 abort
+    loops: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// 處理中的查詢（一般 DNS：讀進來到送出回應）
+    pending: AtomicU32,
+    /// 快取已經交給下一輪：這一輪不再回 SERVFAIL（見 `Resolver::handle_inner`）
+    retired: AtomicBool,
+}
+
+/// 一筆處理中的查詢；結束（含被取消）時減回去
+pub struct Pending<'a>(&'a Serving);
+
+/// 收的迴圈已經算進「處理中」、還沒交給處理的工作（[`Serving::track`] 接手）
+#[must_use]
+pub struct Entered(());
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Serving {
+    /// 登記一個收查詢的迴圈（重新載入時 [`Serving::quiesce`] 停掉它）
+    pub fn add_loop(&self, h: tokio::task::AbortHandle) {
+        self.loops.lock().unwrap_or_else(|e| e.into_inner()).push(h);
+    }
+
+    /// 開始處理一筆查詢（同一個工作裡處理完）
+    pub fn begin(&self) -> Pending<'_> {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        Pending(self)
+    }
+
+    /// 收的迴圈讀到一筆查詢、交給另一個工作之前先算進處理中（不然工作還沒開始跑時 [`Serving::quiesce`] 看不到它）
+    pub fn enter(&self) -> Entered {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        Entered(())
+    }
+
+    /// 處理的工作接手 [`Serving::enter`] 算進去的那一筆
+    pub fn track(&self, _e: Entered) -> Pending<'_> {
+        Pending(self)
+    }
+
+    /// 處理中的查詢數
+    pub fn pending(&self) -> u32 {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// 快取已經交給下一輪
+    pub fn retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
+    }
+
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Relaxed);
+    }
+
+    /// 停止收新的查詢（停在等封包、等連線的地方，不會丟掉已經讀進來的），再等處理中的查詢做完，最多 `max`。
+    /// 回傳（停掉幾個迴圈, 時間到還沒做完的查詢數）。已經建立的 TCP／TLS 連線不在這裡斷，跟以前一樣隨執行環境結束
+    pub async fn quiesce(&self, max: Duration) -> (usize, u32) {
+        let loops = std::mem::take(&mut *self.loops.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in &loops {
+            h.abort();
+        }
+        // 先等迴圈真的停下來（abort 只在下一個等待點生效：正在別的執行緒上把剛讀到的查詢交出去的，交完才停），
+        // 再等處理中的查詢做完
+        let end = Instant::now() + max;
+        while (loops.iter().any(|h| !h.is_finished()) || self.pending() > 0) && Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (loops.len(), self.pending())
+    }
 }
 
 fn bind_socket(addr: SocketAddr, ty: Type, proto: Protocol) -> std::io::Result<Socket> {
@@ -42,8 +132,9 @@ impl Server {
         let tcp = TcpListener::from_std(tcp)?;
         let bound = vec![udp.local_addr()?, tcp.local_addr()?];
         info!("監聽 {} (UDP/TCP)", bound[0]);
-        tokio::spawn(self.clone().serve_udp(Arc::new(udp), open));
-        tokio::spawn(self.clone().serve_tcp(tcp, open));
+        let serving = &self.resolver.serving;
+        serving.add_loop(tokio::spawn(self.clone().serve_udp(Arc::new(udp), open)).abort_handle());
+        serving.add_loop(tokio::spawn(self.clone().serve_tcp(tcp, open)).abort_handle());
         Ok(bound)
     }
 
@@ -121,7 +212,10 @@ impl Server {
             }
             let q = buf[..n].to_vec();
             let (me, sock) = (self.clone(), sock.clone());
+            // 讀進來到送出回應都算「處理中」：重新載入時交出快取之前等它送完
+            let entered = self.resolver.serving.enter();
             tokio::spawn(async move {
+                let _pending = me.resolver.serving.track(entered);
                 let ctx = Ctx {
                     proto: "udp",
                     client: peer.ip(),
@@ -162,6 +256,7 @@ impl Server {
             };
             let mut q = vec![0u8; len];
             s.read_exact(&mut q).await?;
+            let _pending = self.resolver.serving.begin();
             let Some(resp) = self.resolver.handle(&q, &ctx).await else {
                 return Ok(());
             };

@@ -893,6 +893,15 @@ mod reload {
 
     /// 查 example.com 的 A：回答案裡的位址（`None` = 等不到）；拒絕連線回 `Err(ConnectionRefused)`
     fn query_a(sock: &std::net::UdpSocket, id: u16, wait: std::time::Duration) -> std::io::Result<Option<Vec<std::net::IpAddr>>> {
+        Ok(query_a_rcode(sock, id, wait)?.map(|(_, ips)| ips))
+    }
+
+    /// 同 [`query_a`]，另外回 rcode（答案不對時印出來：SERVFAIL、REFUSED 還是空的 NOERROR）
+    fn query_a_rcode(
+        sock: &std::net::UdpSocket,
+        id: u16,
+        wait: std::time::Duration,
+    ) -> std::io::Result<Option<(u16, Vec<std::net::IpAddr>)>> {
         use kuroshio_proto::message::{Message, RData};
         let t0 = std::time::Instant::now();
         sock.send(&kuroshio_proto::build_query(id, "example.com", 1))?;
@@ -913,7 +922,7 @@ mod reload {
                             _ => None,
                         })
                         .collect();
-                    return Ok(Some(ips));
+                    return Ok(Some((m.rcode, ips)));
                 }
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
                 Err(e) => return Err(e),
@@ -948,6 +957,16 @@ mod reload {
         Ok(s.into())
     }
 
+    fn rcode_name(rcode: u16) -> &'static str {
+        match rcode {
+            0 => "NOERROR",
+            2 => "SERVFAIL",
+            3 => "NXDOMAIN",
+            5 => "REFUSED",
+            _ => "其他",
+        }
+    }
+
     fn answer_ip() -> std::net::IpAddr {
         "198.51.100.10".parse().unwrap()
     }
@@ -976,9 +995,9 @@ mod reload {
                         // 第一次等 2 秒，沒回應重送一次再等 2 秒
                         let mut got = None;
                         for _ in 0..2 {
-                            match query_a(&sock, id, Duration::from_secs(2)) {
-                                Ok(Some(ips)) => {
-                                    got = Some(ips);
+                            match query_a_rcode(&sock, id, Duration::from_secs(2)) {
+                                Ok(Some(r)) => {
+                                    got = Some(r);
                                     break;
                                 }
                                 Ok(None) => {}
@@ -989,8 +1008,11 @@ mod reload {
                             }
                         }
                         match got {
-                            Some(ips) if ips == [answer_ip()] => ok += 1,
-                            Some(ips) => errors.lock().unwrap().push(format!("UDP 查詢 #{id}：答案不對 {ips:?}")),
+                            Some((0, ips)) if ips == [answer_ip()] => ok += 1,
+                            Some((rcode, ips)) => errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("UDP 查詢 #{id}：答案不對 rcode {rcode}（{}）{ips:?}", rcode_name(rcode))),
                             None => errors.lock().unwrap().push(format!("UDP 查詢 #{id}：重送一次之後還是沒有回應")),
                         }
                         std::thread::sleep(Duration::from_millis(5));
