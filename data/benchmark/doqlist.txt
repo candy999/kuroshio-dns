@@ -4,7 +4,7 @@
 #   3 輪都通過、答案正確、「不存在」沒被改寫、不擋廣告／成人／惡意網站的才收。
 #   tier=A：經營者明確（知名的公共 DNS、國家級電信商自己的伺服器，carrier=1）；tier=B：品質都過，但經營者看不出來（個人、小型主機）。
 #   連不上的、有改寫的不在這裡；有過濾的大型 DNS 是對照組，另外列在 protected.txt（照常評測、永遠不選）。
-#   op＝AS 名稱（租機房的經營者會是機房的名字）；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
+#   op＝經營者：AS 名稱（租機房的經營者會是機房的名字）；3.5.1 起同一個服務放在好幾家機房的（同一個網域，例如 NextDNS、dnscry.pt、DNS.SB）用服務的名稱，選上游與候補時同一個經營者各最多 1 台；ms＝從台灣量到的延遲中位數；ecs=1＝會帶 ECS（比較容易導到台灣節點）。
 # 共 32 筆：A 8、B 24
 
 # ---- A 級 ----
@@ -23,7 +23,7 @@ quic://doh.tiar.app  # tier=B op=DigitalOcean ms=64.8 src=kuroshio-default check
 quic://dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=68.9 src=hagezi checked=2026-11-22
 quic://dns.caliph.dev  # tier=B op=PT_Trisula_Media_Data ms=69.1 src=kuroshio-default checked=2026-11-22
 quic://admin-dns.unpak.ac.id  # tier=B op=Universitas_Pakuan ms=69.6 src=hagezi checked=2026-11-22
-quic://dns-idx2.itsec.my.id  # tier=B op=PT_Biznet_Gio_Nusantara ms=77.7 src=hagezi checked=2026-11-22
+quic://dns-idx2.itsec.my.id  # tier=B op=itsec.my.id ms=77.7 src=hagezi checked=2026-11-22
 quic://dns-telkominfra.disacloud.com  # tier=B op=PT_Deneva ms=82.9 src=hagezi checked=2026-11-22
 quic://us.aab.im  # tier=B op=HostPapa ms=148.7 ecs=1 src=hagezi checked=2026-11-22
 quic://dns.yuzia.cc  # tier=B op=Zont_LLC ms=152.6 ecs=1 src=hagezi checked=2026-11-22

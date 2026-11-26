@@ -45,6 +45,9 @@ pub struct Scored {
     /// 昨天選上的（3.5.1 M3）：2＝同一台（正規化後的 id 相同）、1＝同一個經營者的別的寫法、0＝不是。
     /// 跟今天最好的差在 [`STICKY_RATIO`] 以內就留昨天那台（不要天天換）
     pub incumbent: u8,
+    /// 經營者（3.5.1 M4；名單的 `op=`，沒有就用主機的可註冊網域或 /16，小寫）：選上游時同一個經營者最多 1 台、
+    /// 候補也最多 1 台。空的＝不限（2.x 對照、測試）
+    pub op_key: String,
 }
 
 /// 昨天選上的上游，延遲或新增覆蓋跟今天最好的差在這個比例以內就留昨天那台（3.5.1 M3：15%）
@@ -305,6 +308,11 @@ fn greedy_inner(
             newly: bn,
             total: covered.len(),
         });
+        // 選上游時同一個經營者最多 1 台（M4）：同一個經營者的其他寫法、其他節點不再考慮
+        if tw_tie && !servers[idx].op_key.is_empty() {
+            let op = &servers[idx].op_key;
+            cands.retain(|&c| servers[c].op_key != *op);
+        }
     }
     stable_sort_by_avg(&mut cands, servers);
     ((result, cands), kept_steps)
@@ -383,6 +391,8 @@ pub const SPARES: usize = 3;
 
 /// 候補（3.5.0 A7）：跟 [`select`] 一樣合格（每個 ASN 最快的一台、類型、延遲、成功率）、但沒選上的，依速度取前 `n` 台。
 /// 執行時可用的自動上游不夠時依序補上
+/// 3.5.1（M4）：同一個經營者最多 1 台候補（主要的那台另外算：同一個經營者最多 1 台主要＋1 台候補）。
+/// 以前每個 ASN 取一台：同一個服務的節點放在不同機房（AS 不同）時，候補 3 台裡 2 台是同一家
 pub fn spares(finals: &[&Scored], asn_best: &[usize], sel: &Selection, o: &SelectOpts, n: usize) -> Vec<usize> {
     let mut v: Vec<usize> = asn_best
         .iter()
@@ -390,8 +400,15 @@ pub fn spares(finals: &[&Scored], asn_best: &[usize], sel: &Selection, o: &Selec
         .filter(|&i| eligible(finals[i], o) && !sel.selected.iter().any(|p| p.idx == i))
         .collect();
     v.sort_by(|a, b| finals[*a].avg.partial_cmp(&finals[*b].avg).unwrap_or(std::cmp::Ordering::Equal));
+    let mut ops: HashSet<&str> = HashSet::new();
+    v.retain(|&i| finals[i].op_key.is_empty() || ops.insert(finals[i].op_key.as_str()));
     v.truncate(n);
     v
+}
+
+/// 同一個經營者（`op_key` 一樣、不是空的）
+fn same_op(a: &Scored, b: &Scored) -> bool {
+    !a.op_key.is_empty() && a.op_key == b.op_key
 }
 
 /// Phase 3：選出執行期上游。`finals` 依延遲排序，`asn_best` 是 `best_per_asn(finals)`。
@@ -427,7 +444,12 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
             newly,
             why: "最快",
         });
-        let rest: Vec<usize> = eligible.iter().copied().filter(|&i| i != fastest).collect();
+        // 同一個經營者最多 1 台（M4）：「最快」那台的經營者的其他寫法、其他節點不再選
+        let rest: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&i| i != fastest && !same_op(finals[i], finals[fastest]))
+            .collect();
         // 覆蓋：`near_first` 時分兩輪（先鄰近的、再其餘的），第二輪從第一輪結束時的覆蓋接著算；
         // 兩輪共用台數上限與覆蓋率的停止條件。否則一輪、不分遠近（3.3.7）
         let rounds: Vec<Vec<usize>> = if o.near_first {
@@ -441,6 +463,11 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
             if done(selected.len(), covered.len()) {
                 break;
             }
+            // 前一輪選過的經營者不再選（M4）
+            let round: Vec<usize> = round
+                .into_iter()
+                .filter(|&i| !selected.iter().any(|p: &Pick| same_op(finals[i], finals[p.idx])))
+                .collect();
             let refs: Vec<&Scored> = round.iter().map(|&i| finals[i]).collect();
             let ((steps, _), kept_steps) = greedy_inner(&refs, total, Strategy::Coverage, &covered, true);
             for (n, st) in steps.into_iter().enumerate() {
@@ -460,11 +487,18 @@ pub fn select(finals: &[&Scored], asn_best: &[usize], total: usize, o: &SelectOp
             }
         }
     }
-    for &i in &by_speed {
-        if selected.len() >= o.min_auto.min(o.max_n) {
-            break;
-        }
-        if !selected.iter().any(|p| p.idx == i) {
+    // 不足 minAuto 台時依速度補備援：先補別的經營者（M4）；都是同一家的時候才補同一家（最壞情況跟以前一樣，台數照樣補足）
+    for distinct in [true, false] {
+        for &i in &by_speed {
+            if selected.len() >= o.min_auto.min(o.max_n) {
+                break;
+            }
+            if selected.iter().any(|p| p.idx == i) {
+                continue;
+            }
+            if distinct && selected.iter().any(|p| same_op(finals[i], finals[p.idx])) {
+                continue;
+            }
             selected.push(Pick {
                 idx: i,
                 newly: 0,
@@ -1034,5 +1068,67 @@ mod sticky_tests {
         v[1].tw_rate = Some(0.5);
         v[2].tw_rate = Some(0.4);
         assert_eq!(run(&mut v, 2).0, vec!["fast", "more"], "台灣率比較低的不留");
+    }
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    fn srv(id: &str, asn: u32, op: &str, avg: f64, items: std::ops::Range<u32>) -> Scored {
+        Scored {
+            id: id.into(),
+            kind: "doh".into(),
+            owner: format!("X{asn}__AS{asn}_X"),
+            avg,
+            count: 10,
+            history: vec![(0, items.collect())],
+            op_key: op.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 3.5.1（M4）：同一個經營者（同一個服務放在不同機房、AS 不同）最多 1 台主要＋1 台候補
+    #[test]
+    fn one_main_and_one_spare_per_operator() {
+        let mut v = vec![
+            srv("nd1", 1, "nextdns", 3.2, 0..10),
+            srv("nd2", 2, "nextdns", 3.3, 10..30),
+            srv("nd3", 3, "nextdns", 3.4, 30..40),
+            srv("cf", 4, "cloudflare", 3.8, 40..45),
+            srv("far", 5, "other", 60.0, 50..60),
+            srv("g", 6, "google", 9.0, 60..61),
+        ];
+        extended_metrics(&mut v, 1);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        assert_eq!(asn.len(), 6, "AS 都不同：以前每個 AS 一台");
+        let o = SelectOpts {
+            auto_types: vec!["doh".into()],
+            max_n: 3,
+            min_auto: 3,
+            coverage_target: 1.0,
+            ..Default::default()
+        };
+        let s = select(&refs, &asn, 1000, &o);
+        let ids: Vec<&str> = s.selected.iter().map(|p| refs[p.idx].id.as_str()).collect();
+        assert_eq!(ids, vec!["nd1", "far", "cf"], "nd2 新增最多，但跟最快的同一家");
+        let sp: Vec<&str> = spares(&refs, &asn, &s, &o, SPARES).iter().map(|&i| refs[i].id.as_str()).collect();
+        assert_eq!(sp, vec!["nd2", "g"], "候補同一家也只一台");
+        // 經營者都一樣、台數不夠：照樣補足（最壞情況跟以前一樣）
+        let mut v = vec![srv("a", 1, "same", 3.0, 0..5), srv("b", 2, "same", 4.0, 5..10)];
+        extended_metrics(&mut v, 1);
+        let refs: Vec<&Scored> = v.iter().collect();
+        let asn = best_per_asn(&refs);
+        let o = SelectOpts {
+            auto_types: vec!["doh".into()],
+            max_n: 2,
+            min_auto: 2,
+            coverage_target: 1.0,
+            ..Default::default()
+        };
+        let s = select(&refs, &asn, 1000, &o);
+        assert_eq!(s.selected.len(), 2);
+        assert_eq!(s.selected[1].why, "備援");
     }
 }

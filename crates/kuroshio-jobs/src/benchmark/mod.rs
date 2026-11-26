@@ -868,6 +868,8 @@ impl Srv {
             ecs: self.tag.ecs,
             // Phase 2 跟昨天的結果比過之後才填
             incumbent: 0,
+            // 選上游與候補時同一個經營者各最多 1 台（3.5.1 M4）
+            op_key: self.op_key(),
         }
     }
 }

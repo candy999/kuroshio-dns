@@ -9,7 +9,7 @@
 #   B：品質都過、經營者看不出來，每個 ASN 最多 2 台（不對同一家打幾百台）。
 #   舊名單照同一個標準分級（品質不夠的淘汰）；不在 public-dns.info 的 43 台同一天補測 1 輪、照同一個標準分級，
 #   另外收經營者明確、官方寫明不過濾的 5 台（TWNIC、Cloudflare 1.0.0.1、DNS4EU 不過濾版）。
-# 共 839 筆：A 77、B 762
+# 共 839 筆：A 81、B 758（3.5.1 依一台正式環境 14 天的評測紀錄，4 台一直很穩、經營者明確的 B 升 A：AliDNS 2 台、NTT 2 台）
 
 # ---- A 級 ----
 # A TWNIC（台灣網路資訊中心）TW 101.101.101.101（不在 public-dns.info；D3 直連評測倖存）
@@ -98,7 +98,7 @@
 2001:b000:168::1
 # A Korea_Telecom（AS4766）KR kns2.kornet.net 36.0 ms 電信商官方 DNS：KT（韓國電信）
 168.126.63.2
-# A HKBN_Enterprise_Solutions_HK_Limited（AS9381）HK dns2.hkbnes.net.hk 25.6 ms 電信商官方 DNS：HKBN（香港寬頻）
+# A HKBN（AS9381）HK dns2.hkbnes.net.hk 25.6 ms 電信商官方 DNS：HKBN（香港寬頻）
 202.130.97.66
 # A Quad9（AS19281）US dns10.quad9.net 48.3 ms
 149.112.112.10
@@ -174,19 +174,19 @@
 8.20.247.20
 # B Akamai_Connected_Cloud（AS63949）SG li1637-181.members.linode.com 44.5 ms ECS
 172.104.57.181
-# B HKBN_Enterprise_Solutions_Limited（AS17444）HK 059188010029.static.ctinets.com 30.0 ms ECS
+# B HKBN（AS17444）HK 059188010029.static.ctinets.com 30.0 ms ECS
 59.188.10.29
-# B Alibaba_(US)_Technology_Co.（AS45102）CN public2.alidns.com 26.2 ms ECS
+# A Alibaba_(US)_Technology_Co.（AS45102）CN public2.alidns.com 26.2 ms ECS
 223.6.6.6
 # B Companhia_de_Telecomunicacoes_de_Macau_S（AS4609）MO n18293z25l100.static.ctmip.net 37.7 ms ECS
 182.93.25.100
-# B Alibaba_(US)_Technology_Co.（AS45102）CN public1.alidns.com 27.9 ms ECS
+# A Alibaba_(US)_Technology_Co.（AS45102）CN public1.alidns.com 27.9 ms ECS
 223.5.5.5
 # B CONTROLD_INC.（AS398962）CA p5.freedns.controld.com 57.3 ms
 2606:1a40::5
 # B KDDI_CORPORATION（AS2516）JP zz20204023607195FE61.userreverse.dion.ne.jp 57.2 ms
 113.149.254.97
-# B Hong_Kong_Broadband_Network_Ltd.（AS9269）HK 183178058215.ctinets.com 36.1 ms
+# B HKBN（AS9269）HK 183178058215.ctinets.com 36.1 ms
 183.178.58.215
 # B NTT_DOCOMO_BUSINESS（AS4713）JP ns.hc-ufo.co.jp 46.2 ms ECS
 219.163.11.226
@@ -198,7 +198,7 @@
 118.163.7.54
 # B VTC-VN（AS38248）VN hn.vtc.vn 62.6 ms ECS
 117.103.228.101
-# B HK_Broadband_Network_Ltd.（AS10103）HK 061244186189.ctinets.com 28.4 ms ECS
+# B HKBN（AS10103）HK 061244186189.ctinets.com 28.4 ms ECS
 61.244.186.189
 # B Fortinet_Inc.（AS40934）CA fortinet-public-dns-52.fortinet.com 5.2 ms ECS
 208.91.112.52
@@ -220,7 +220,7 @@
 99.83.147.72
 # B Taiwan_Fixed_Network（AS9924）TW dns.ssf-steel.com.tw 9.9 ms
 219.87.164.152
-# B NTT_America（AS2914）US y.ns.gin.ntt.net 32.1 ms
+# A NTT_America（AS2914）US y.ns.gin.ntt.net 32.1 ms
 129.250.35.251
 # B Amazon.com（AS16509）US a58798f21a0ff9d38.awsglobalaccelerator.com 22.0 ms
 75.2.53.153
@@ -232,9 +232,9 @@
 45.90.28.167
 # B Skylink_Fibernet_Private_Limited（AS135139）IN ns1.skylinkfibernet.com 105.9 ms
 103.99.150.10
-# B NTT_America（AS2914）US x.ns.gin.ntt.net 32.9 ms
+# A NTT_America（AS2914）US x.ns.gin.ntt.net 32.9 ms
 129.250.35.250
-# B HKBN_Enterprise_Solutions_Limited（AS17444）HK 059188010022.static.ctinets.com 28.9 ms ECS
+# B HKBN（AS17444）HK 059188010022.static.ctinets.com 28.9 ms ECS
 59.188.10.22
 # B Sony_Network_Communications_Inc.（AS2527）JP ipa0566d21.ap.nuro.jp 54.8 ms
 160.86.109.33
@@ -300,7 +300,7 @@
 218.44.234.170
 # B SB_Professional_Services（AS24013）DE public-dns-a.dns.sb 44.0 ms
 185.222.222.222
-# B HKBN_Enterprise_Solutions_HK_Limited（AS9381）HK ns2.diversity.hk 25.0 ms
+# B HKBN（AS9381）HK ns2.diversity.hk 25.0 ms
 175.45.16.253
 # B Philippine_Long_Distance_Telephone_Compa（AS9299）PH host.4.static.com.ph 58.9 ms
 122.52.251.163
@@ -314,7 +314,7 @@
 103.48.78.157
 # B LG_DACOM_Corporation（AS3786）KR mail.neungyule.com 72.2 ms
 61.32.254.2
-# B Charter_Communications_LLC（AS20115）US ns1.ci.victorville.ca.us 168.0 ms
+# B Charter_Communications（AS20115）US ns1.ci.victorville.ca.us 168.0 ms
 24.182.14.205
 # B XMission（AS6315）US rns1.xmission.com 166.2 ms
 198.60.22.2
@@ -328,7 +328,7 @@
 45.125.208.8
 # B Cisco_OpenDNS（AS36692）US dns.umbrella.com 57.8 ms ECS
 208.67.222.222
-# B HKBN_Enterprise_Solutions_HK_Limited（AS9381）HK dns1.ibn-ipv6.info 28.5 ms
+# B HKBN（AS9381）HK dns1.ibn-ipv6.info 28.5 ms
 202.130.97.65
 # B HGC_Global_Communications_Limited（AS9304）HK ns251.on-nets.com 33.6 ms
 210.0.128.251
@@ -362,7 +362,7 @@
 180.193.179.138
 # B Internet_Service_Provider（AS23932）TH ns1.worldinternetworkcorporation.com 120.3 ms
 202.44.52.1
-# B Charter_Communications_Inc（AS20001）US syn-098-154-040-078.biz.spectrum.com 182.8 ms
+# B Charter_Communications（AS20001）US syn-098-154-040-078.biz.spectrum.com 182.8 ms
 98.154.40.78
 # B Operbes（AS18734）MX dns4.bestel.com.mx 200.1 ms
 201.140.114.161
@@ -374,7 +374,7 @@
 103.12.31.83
 # B Com_Net（AS7106）US primary.dns.bright.net 202.5 ms
 209.143.0.10
-# B Charter_Communications_LLC（AS22516）US syn-144-129-045-042.biz.spectrum.com 194.0 ms ECS
+# B Charter_Communications（AS22516）US syn-144-129-045-042.biz.spectrum.com 194.0 ms ECS
 144.129.45.42
 # B Cogent_Communications（AS174）US na-res1.dns.cogentco.com 146.0 ms
 2001:550:1:1::d
@@ -406,7 +406,7 @@
 103.90.75.9
 # B Quad9（AS19281）US dns11.quad9.net 60.7 ms ECS
 2620:fe::11
-# B Charter_Communications_Inc（AS20001）US syn-076-080-221-014.biz.spectrum.com 210.2 ms
+# B Charter_Communications（AS20001）US syn-076-080-221-014.biz.spectrum.com 210.2 ms
 76.80.221.14
 # B VISTEON_CORPORATION（AS33627）US ns8.visteon.com 194.7 ms
 74.112.164.55
@@ -426,7 +426,7 @@
 8.43.56.34
 # B IBM_Cloud（AS36351）US f6.66.37a9.ip4.static.sl-reverse.com 249.1 ms
 169.55.102.246
-# B Charter_Communications_LLC（AS20115）US syn-071-086-003-190.biz.spectrum.com 228.1 ms ECS
+# B Charter_Communications（AS20115）US syn-071-086-003-190.biz.spectrum.com 228.1 ms ECS
 71.86.3.190
 # B Lightning_Wire_Labs_GmbH（AS204867）DE recursor01.haj.ipfire.org 246.7 ms
 2001:678:b28::54
@@ -452,7 +452,7 @@
 64.31.5.1
 # B nemox.net_Informationstechnologie_OG（AS31394）AT dns2.nemox.net 251.2 ms
 83.137.41.9
-# B Charter_Communications_Inc（AS11426）US syn-096-010-126-038.biz.spectrum.com 228.0 ms ECS
+# B Charter_Communications（AS11426）US syn-096-010-126-038.biz.spectrum.com 228.0 ms ECS
 96.10.126.38
 # B CenturyLink_Communications（AS3561）US rdns01.stng01.exodus.net 212.1 ms 補測 1 輪
 216.33.116.102
@@ -492,13 +492,13 @@
 207.17.190.5
 # B nemox.net_Informationstechnologie_OG（AS31394）AT dns1.nemox.net 267.9 ms
 83.137.41.8
-# B Charter_Communications_Inc（AS10796）US smtp.officecomputinginc.com 231.5 ms 補測 1 輪
+# B Charter_Communications（AS10796）US smtp.officecomputinginc.com 231.5 ms 補測 1 輪
 74.142.64.226
 # B Vivacom_Bulgaria_EAD（AS8866）BG hq.natdist.com 251.9 ms
 95.43.241.218
 # B HostRocket.com（AS23535）US node41.dbnoc.net 249.6 ms ECS
 199.101.48.17
-# B Charter_Communications_Inc（AS11427）US syn-074-087-171-129.biz.spectrum.com 244.2 ms ECS
+# B Charter_Communications（AS11427）US syn-074-087-171-129.biz.spectrum.com 244.2 ms ECS
 74.87.171.129
 # B Midcontinent_Communications（AS11232）US cdromsrv.cscnt.com 218.8 ms
 24.124.66.35
@@ -576,7 +576,7 @@
 85.234.143.167
 # B Netsys_JV_LLC（AS21104）AM mail.aybeng.com 320.6 ms
 80.86.230.58
-# B Charter_Communications_Inc（AS11351）US syn-072-045-131-066.biz.spectrum.com 255.2 ms
+# B Charter_Communications（AS11351）US syn-072-045-131-066.biz.spectrum.com 255.2 ms
 72.45.131.66
 # B netcup_GmbH（AS197540）DE mail.morbitzer.de 310.3 ms
 2a03:4000:4d:c92:88c0:96ff:fec6:b9d
@@ -598,11 +598,11 @@
 85.209.185.50
 # B OVH_SAS（AS16276）FR mbm91.fr 288.4 ms
 87.98.128.51
-# B Charter_Communications_Inc（AS11426）US syn-096-010-218-162.biz.spectrum.com 250.8 ms ECS
+# B Charter_Communications（AS11426）US syn-096-010-218-162.biz.spectrum.com 250.8 ms ECS
 96.10.218.162
 # B University_Of_Ioannina（AS8581）GR wwwserver.ioa.teiep.gr 311.8 ms ECS
 194.177.199.1
-# B Charter_Communications_Inc（AS11427）US syn-070-117-056-250.biz.spectrum.com 224.4 ms ECS
+# B Charter_Communications（AS11427）US syn-070-117-056-250.biz.spectrum.com 224.4 ms ECS
 70.117.56.250
 # B mnemonic_AS（AS60848）NO host-63-6.mnemonic.no 288.8 ms
 94.127.63.6
@@ -712,7 +712,7 @@
 85.217.207.230
 # B FlokiNET_ehf（AS200651）RO ro.resolv.flokinet.net 247.2 ms
 185.247.225.17
-# B Charter_Communications_Inc（AS10796）US syn-071-067-154-107.biz.spectrum.com 244.3 ms ECS
+# B Charter_Communications（AS10796）US syn-071-067-154-107.biz.spectrum.com 244.3 ms ECS
 71.67.154.107
 # B ALPHA_TELECOMMUNICATION_MALI-ATEL-S.A（AS328253）ML segou_bkp.telecelmali.com 338.9 ms ECS
 196.251.156.82
@@ -844,7 +844,7 @@
 82.151.90.1
 # B GlobalConnect_A/S（AS31027）DK ns.sni.dk 253.7 ms ECS
 91.230.68.158
-# B Charter_Communications_Inc（AS12271）US syn-024-039-107-174.biz.spectrum.com 273.2 ms ECS
+# B Charter_Communications（AS12271）US syn-024-039-107-174.biz.spectrum.com 273.2 ms ECS
 24.39.107.174
 # B HOSTING.CL（AS265839）CL vps10770.intelcam.cl 336.6 ms ECS
 201.148.107.70
