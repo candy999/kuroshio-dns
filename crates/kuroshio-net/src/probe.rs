@@ -193,7 +193,11 @@ fn classify_error(e: &anyhow::Error) -> (String, bool) {
             std::io::ErrorKind::NetworkUnreachable => "ENETUNREACH",
             std::io::ErrorKind::HostUnreachable => "EHOSTUNREACH",
             std::io::ErrorKind::AddrNotAvailable => "EADDRNOTAVAIL",
-            _ => return (io.to_string(), false),
+            std::io::ErrorKind::AddrInUse => "EADDRINUSE",
+            _ => match local_os_code(io.raw_os_error()) {
+                Some(c) => c,
+                None => return (io.to_string(), false),
+            },
         };
         return (code.to_string(), false);
     }
@@ -205,6 +209,71 @@ fn classify_error(e: &anyhow::Error) -> (String, bool) {
         return ("TIMEOUT".into(), false);
     }
     (s, false)
+}
+
+/// 本機通訊端的錯誤碼（3.5.1 L4）：連接埠用完、緩衝不足、檔案描述元用完。`ErrorKind` 分不出來的照作業系統的錯誤號碼對應
+fn local_os_code(code: Option<i32>) -> Option<&'static str> {
+    let c = code?;
+    if cfg!(windows) {
+        return match c {
+            10048 => Some("EADDRINUSE"),
+            10049 => Some("EADDRNOTAVAIL"),
+            10055 => Some("ENOBUFS"),
+            10024 => Some("EMFILE"),
+            _ => None,
+        };
+    }
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )) {
+        return match c {
+            48 => Some("EADDRINUSE"),
+            49 => Some("EADDRNOTAVAIL"),
+            55 => Some("ENOBUFS"),
+            24 => Some("EMFILE"),
+            23 => Some("ENFILE"),
+            _ => None,
+        };
+    }
+    // Linux：MIPS 的 errno 號碼跟其他架構不同（arch/mips/include/uapi/asm/errno.h）
+    if cfg!(any(target_arch = "mips", target_arch = "mips64")) {
+        return match c {
+            125 => Some("EADDRINUSE"),
+            126 => Some("EADDRNOTAVAIL"),
+            132 => Some("ENOBUFS"),
+            24 => Some("EMFILE"),
+            23 => Some("ENFILE"),
+            _ => None,
+        };
+    }
+    match c {
+        98 => Some("EADDRINUSE"),
+        99 => Some("EADDRNOTAVAIL"),
+        105 => Some("ENOBUFS"),
+        24 => Some("EMFILE"),
+        23 => Some("ENFILE"),
+        _ => None,
+    }
+}
+
+/// 這個錯誤是本機的通訊端問題（連接埠用完、緩衝不足、檔案描述元用完），不是對方的問題（3.5.1 L4）。
+/// 驗證、跨 CDN 探索看到它時不能當成網站或節點的結論。也認得舊版寫下來的原始文字（Windows 的 `os error 10048` 之類）
+pub fn is_local_error(err: &str) -> bool {
+    matches!(err, "EADDRINUSE" | "EADDRNOTAVAIL" | "ENOBUFS" | "EMFILE" | "ENFILE")
+        || [
+            "os error 10048",
+            "os error 10049",
+            "os error 10055",
+            "os error 10024",
+            "Too many open files",
+            "No buffer space",
+        ]
+        .iter()
+        .any(|s| err.contains(s))
 }
 
 fn tls_code(e: &rustls::Error) -> String {
@@ -545,6 +614,34 @@ fn speed_mbs(bytes: u64, sec: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3.5.1 L4：本機通訊端的錯誤（連接埠用完、緩衝不足、檔案描述元用完）有固定的代碼，CDN 驗證不當成網站或節點的結論
+    #[test]
+    fn local_socket_errors_have_codes() {
+        let code = |n: i32| classify_error(&anyhow::Error::from(std::io::Error::from_raw_os_error(n))).0;
+        if cfg!(all(target_os = "linux", not(any(target_arch = "mips", target_arch = "mips64")))) {
+            assert_eq!(code(98), "EADDRINUSE");
+            assert_eq!(code(105), "ENOBUFS");
+            assert_eq!(code(24), "EMFILE");
+        }
+        if cfg!(windows) {
+            assert_eq!(code(10048), "EADDRINUSE");
+            assert_eq!(code(10055), "ENOBUFS");
+        }
+        for e in [
+            "EADDRINUSE",
+            "EADDRNOTAVAIL",
+            "ENOBUFS",
+            "EMFILE",
+            "ENFILE",
+            "connect failed (os error 10048)",
+        ] {
+            assert!(is_local_error(e), "{e}");
+        }
+        for e in ["ECONNRESET", "ECONNREFUSED", "TIMEOUT", "ERR_TLS_CERT_ALTNAME_INVALID"] {
+            assert!(!is_local_error(e), "{e}");
+        }
+    }
 
     #[test]
     fn heads_and_chunks() {

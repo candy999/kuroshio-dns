@@ -136,6 +136,9 @@ pub struct Stats {
 /// 但不能無限長；淘汰追上之後自己恢復
 pub const ADMIT_BUDGET_FACTOR: usize = 2;
 
+/// 載入時清掉到期超過這麼久的 ECS、跨 CDN 結果（3.5.1 L2）：早就不用了，留著只會讓它看起來像有學習資料
+pub const STALE_LEARNING_MS: u64 = 7 * 24 * 3600 * 1000;
+
 /// 背景工作
 #[derive(Debug, Clone, PartialEq)]
 pub enum Task {
@@ -327,6 +330,8 @@ pub struct Cdn {
     budget_pruned: AtomicU32,
     /// 有淘汰的磁碟預算整理輪數（發現清單的次數用；3.5.1：以前用筆數，一下子就到 9999 的上限）
     budget_rounds: AtomicU32,
+    /// 定期忘掉的一次性網域累計筆數（3.5.1 H2）
+    forgot_one_shot: AtomicU32,
     disk_kb: AtomicU32,
     /// 分片目錄裡檔案長度的合計（KB；3.5.0 F8 之前的 `dbDiskKB`）、整個 `cdn/` 目錄實際佔用（KB，只顯示）。`u32::MAX` = 還沒量
     file_kb: AtomicU32,
@@ -341,6 +346,8 @@ pub struct BudgetRound {
     /// 整理了幾個分片，其中幾個是為了淘汰主動重寫的
     pub shards: usize,
     pub forced: usize,
+    /// 忘掉幾個一次性網域（3.5.1 H2；不管有沒有預算）
+    pub forgot: usize,
 }
 
 /// 冷資料移出 / 讀回的結果（記憶體控制，規格 09）
@@ -534,17 +541,115 @@ impl Cdn {
             budget_cap: AtomicU32::new(0),
             budget_pruned: AtomicU32::new(0),
             budget_rounds: AtomicU32::new(0),
+            forgot_one_shot: AtomicU32::new(0),
             disk_kb: AtomicU32::new(u32::MAX),
             file_kb: AtomicU32::new(u32::MAX),
             cdn_dir_kb: AtomicU32::new(u32::MAX),
         };
         me.reset_octet_verdicts();
+        me.clean_stale_learning();
         // 啟動時先量一次實際的磁碟用量（3.5.0 D3 回報：重新啟動後到第一輪預算之前 dbDiskKB 是 null，
         // 預算換算的筆數也沒辦法用實測校正）。只有設了預算（小 Flash）才量：讀分片目錄裡每個檔的大小
         if me.cfg.db_disk_budget.is_some() {
             me.measure_disk();
         }
         Arc::new(me)
+    }
+
+    /// 載入時清掉舊資料裡不成立的學習資料（3.5.1 L1、L2；啟動時一次，記一行 info）。這些會讓 `has_learning()` 誤判
+    /// （淘汰、讀回時當成有學習資料），也會讓複驗、explain 用錯的資料：
+    ///
+    /// - App 層（只辨識、不改寫）的那一格：v4／v6／基準（3.5.0 B3 以前驗證過的；手動「一定換」、`cdn.appLayer: false` 的不動）。
+    /// - 基準 IP 家族不對（IPv6，見 M2）或不在這一格業者的官方範圍裡（有範圍檔時才比）。
+    /// - 到期超過 [`STALE_LEARNING_MS`] 的 ECS、跨 CDN 結果。
+    /// - `best` 指向已經不成立的策略：`ecs`／`cross` 但那個結果沒有或不是 ok；`alias` 但 v4、v6 都沒有驗證結果。
+    ///
+    /// 回傳（App 層，基準，ECS，跨 CDN，最佳策略）各清掉幾筆
+    pub(crate) fn clean_stale_learning(&self) -> [usize; 5] {
+        let mut st = self.state();
+        let st = &mut *st;
+        let now = now_ms();
+        let app_layer = self.cfg.app_layer;
+        let mut n = [0usize; 5];
+        let mut touched: Vec<Arc<str>> = Vec::new();
+        // 一格（業者、v4、v6、基準）的清理：回傳有沒有改
+        let pools = &st.pools;
+        let clean_slot = |provider: Option<&str>,
+                          always: bool,
+                          v4: &mut Option<Box<db::Verdict>>,
+                          v6: &mut Option<Box<db::Verdict>>,
+                          base: &mut Option<Box<db::Base>>,
+                          n: &mut [usize; 5]|
+         -> bool {
+            let Some(p) = provider else { return false };
+            if app_layer && !always && crate::providers::get(p).is_some_and(|x| x.app_layer) {
+                if v4.is_some() || v6.is_some() || base.is_some() {
+                    *v4 = None;
+                    *v6 = None;
+                    *base = None;
+                    n[0] += 1;
+                    return true;
+                }
+                return false;
+            }
+            let Some(ip) = base.as_ref().and_then(|b| b.ip) else { return false };
+            let has_range = pools.p.get(p).is_some_and(|d| d.range4.v4_len() > 0);
+            if ip.is_ipv6() || (has_range && !pools.in_ranges(p, ip)) {
+                *base = None;
+                n[1] += 1;
+                return true;
+            }
+            false
+        };
+        for e in st.db.domains.values_mut() {
+            let always = e.policy() == db::Policy::Always;
+            let p = e.provider.val().cloned();
+            let mut changed = clean_slot(p.as_deref(), always, &mut e.v4, &mut e.v6, &mut e.base, &mut n);
+            if let Some(a) = e.src.as_mut().and_then(|s| s.alt.as_deref_mut()) {
+                let p = a.provider.val().map(|x| x.to_string());
+                changed |= clean_slot(p.as_deref(), always, &mut a.v4, &mut a.v6, &mut a.base, &mut n);
+            }
+            let stale = |until: Option<u64>| until.unwrap_or(0).saturating_add(STALE_LEARNING_MS) < now;
+            if e.ecs.as_ref().is_some_and(|x| stale(x.until)) {
+                e.ecs = None;
+                n[2] += 1;
+                changed = true;
+            }
+            if e.cross4.as_ref().is_some_and(|x| stale(x.until)) {
+                e.cross4 = None;
+                n[3] += 1;
+                changed = true;
+            }
+            let holds = match e.best {
+                Some(db::Strategy::Ecs) => e.ecs.as_ref().is_some_and(|x| x.is("ok")),
+                Some(db::Strategy::Cross) => e.cross4.as_ref().is_some_and(|x| x.is("ok")),
+                Some(db::Strategy::Alias) => e.v4.is_some() || e.v6.is_some(),
+                None => true,
+            };
+            if !holds {
+                e.best = None;
+                n[4] += 1;
+                changed = true;
+            }
+            if changed {
+                touched.push(e.name.clone());
+            }
+        }
+        for name in &touched {
+            st.db.mark(name);
+        }
+        if !touched.is_empty() {
+            info!(
+                "CDN 網域資料整理（舊資料）：{} 個網域，清掉 App 層的驗證結果 {} 筆、不對的基準 {} 筆、過期很久的 ECS {} 筆、跨 CDN {} 筆、不成立的最佳策略 {} 筆",
+                touched.len(),
+                n[0],
+                n[1],
+                n[2],
+                n[3],
+                n[4]
+            );
+        }
+        n
     }
 
     /// 舊版用隨機 IP 驗證 Fastly 必然憑證不符；最後一段跟原始不同的失敗紀錄作廢，重新驗證
@@ -924,16 +1029,24 @@ impl Cdn {
     }
 
     /// 這個網域收不收（3.5.1 K4）：已經在資料庫（含移出記憶體的）一定收；新網域要記憶體能長大、
-    /// 而且總筆數沒超過磁碟預算的 [`ADMIT_BUDGET_FACTOR`] 倍
-    pub(crate) fn admits(&self, st: &State, name: &str) -> bool {
+    /// 而且總筆數沒超過磁碟預算的 [`ADMIT_BUDGET_FACTOR`] 倍。不收的時候回傳原因（標籤用）。
+    /// 3.5.1 H1：筆數到了 `cdn.maxEntries` 的 90% 以上，新網域問第二次才記（[`db::Db::admit_new`]；
+    /// 沒有磁碟預算的大機器上 K4 不會擋，靠這個）
+    pub(crate) fn admits(&self, st: &mut State, name: &str) -> Result<(), &'static str> {
         if st.db.get(name).is_some() || st.db.is_evicted(name) {
-            return true;
+            return Ok(());
         }
         if !self.admit_new.load(Ordering::Relaxed) {
-            return false;
+            return Err("新網域先不記:記憶體或磁碟預算");
         }
         let cap = self.budget_cap.load(Ordering::Relaxed) as usize;
-        cap == 0 || st.db.total_entries() < cap.saturating_mul(ADMIT_BUDGET_FACTOR)
+        if cap != 0 && st.db.total_entries() >= cap.saturating_mul(ADMIT_BUDGET_FACTOR) {
+            return Err("新網域先不記:記憶體或磁碟預算");
+        }
+        if !st.db.admit_new(name) {
+            return Err("新網域先不記:筆數接近上限，問第二次才記");
+        }
+        Ok(())
     }
 
     /// 移出記憶體的冷資料分佈在幾個分片（記憶體恢復時估計一次讀回一片要多少用）
@@ -1087,6 +1200,18 @@ impl Cdn {
     pub fn budget_round(&self) -> BudgetRound {
         let mut out = BudgetRound::default();
         let disk = self.measure_disk();
+        // 3.5.1 H2：一次性網域（只問過一次、沒有學習資料、3 天沒出現）不管有沒有預算都定期忘掉。
+        // 有預算的小 Flash 只看本來就要寫的分片；沒有預算時另外輪流看幾片（分批、每輪有上限）
+        let forgot = self.state().db.forget_one_shot(now_ms(), self.cfg.db_disk_budget.is_none());
+        if forgot > 0 {
+            out.forgot = forgot;
+            let total = self
+                .forgot_one_shot
+                .load(Ordering::Relaxed)
+                .saturating_add(forgot.min(u32::MAX as usize) as u32);
+            self.forgot_one_shot.store(total, Ordering::Relaxed);
+            debug!("CDN 網域資料：忘掉 {forgot} 個 3 天沒出現、只問過一次的網域");
+        }
         let (Some(limit), Some(budget)) = (self.budget_limit(), self.cfg.db_disk_budget) else {
             self.budget_cap.store(0, Ordering::Relaxed);
             return out;
@@ -1173,6 +1298,7 @@ impl Cdn {
         v["dbDiskEstKB"] = json!(db::budget_disk_estimate(total, shards).div_ceil(1024));
         v["prunedForBudget"] = json!(self.budget_pruned.load(Ordering::Relaxed));
         v["prunedRounds"] = json!(self.budget_rounds.load(Ordering::Relaxed));
+        v["forgotOneShot"] = json!(self.forgot_one_shot.load(Ordering::Relaxed));
     }
 
     /// 把網域資料庫（`cdn-domains.json`，內容同 `snapshots`）邊序列化邊寫出：分批拿鎖，
@@ -1700,31 +1826,66 @@ impl Cdn {
     }
 
     /// 每小時：熱門且即將到期的「驗證通過」網域先重新驗證，避免掉回 10 秒試用；
-    /// 另外輪流抽一小批還在有效期內、最近真的有在改寫的網域複驗（見 `reverify_pick`）。回傳排入幾個
+    /// 另外輪流抽一小批還在有效期內、最近真的有在改寫的網域複驗（見 `reverify_pick`）。回傳排入幾個。
+    ///
+    /// 3.5.1 M3：只複驗真的有在用的——`best` 是換節點（`Alias`，真的有在改寫），或問過 2 次以上的；
+    /// 只問過一次的網域到期就讓它到期（以前「3 天內出現過＋通過＋1 小時內到期」全部重驗，大量一次性網域每天被重驗）。
+    /// L13：多來源網域另一家的那一格（`src.alt`）用同樣的條件複驗（那一家最後回答在 3 天內）
     pub fn recheck(self: &Arc<Self>) -> usize {
         let now = now_ms();
         let soon = now + util::HOUR_MS;
         let recent = now.saturating_sub(3 * util::DAY_MS);
         let mut tasks = Vec::new();
         let sampled;
+        // 3.5.1 L3：相容性紀錄（ip-zone）的「不服務」7 天沒有新的就消退（每小時一次，跟複驗一起）
+        self.with_state(|st| st.pools.decay_zone(now));
         {
             let st = self.state();
+            let due = |v: Option<&db::Verdict>| v.is_some_and(|v| v.is("ok") && v.until.unwrap_or(0) < soon);
             for e in st.db.domains.values() {
-                if e.last_seen < recent {
+                if e.best != Some(db::Strategy::Alias) && e.hits < 2 {
                     continue;
                 }
-                let Some(p) = e.provider() else { continue };
-                if !st.pools.has(p) {
+                if e.last_seen >= recent {
+                    if let Some(p) = e.provider().filter(|p| st.pools.has(p)) {
+                        for fam in [4u8, 6] {
+                            if due(e.verdict(fam)) {
+                                tasks.push(Task::Verify {
+                                    name: e.name.to_string(),
+                                    provider: p.to_string(),
+                                    family: fam,
+                                    orig: e.orig_ip(fam),
+                                });
+                            }
+                        }
+                    }
+                }
+                // L13：另一家的那一格
+                let Some(a) = e.src.as_ref().and_then(|s| s.alt.as_deref()) else {
+                    continue;
+                };
+                if a.last < recent {
                     continue;
                 }
-                for fam in [4u8, 6] {
-                    let Some(v) = e.verdict(fam) else { continue };
-                    if v.is("ok") && v.until.unwrap_or(0) < soon {
+                let Some(p) = a.provider.val().filter(|p| st.pools.has(p)) else {
+                    continue;
+                };
+                for (fam, v) in [(4u8, a.v4.as_deref()), (6, a.v6.as_deref())] {
+                    if due(v) {
+                        let orig = if fam == 4 {
+                            a.base
+                                .as_ref()
+                                .and_then(|b| b.ip)
+                                .filter(IpAddr::is_ipv4)
+                                .or_else(|| a.ips4.first().copied())
+                        } else {
+                            a.ips6.first().copied()
+                        };
                         tasks.push(Task::Verify {
                             name: e.name.to_string(),
                             provider: p.to_string(),
                             family: fam,
-                            orig: e.orig_ip(fam),
+                            orig,
                         });
                     }
                 }

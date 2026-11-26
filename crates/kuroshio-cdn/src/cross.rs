@@ -21,7 +21,7 @@ use kuroshio_proto::message::rtype;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 pub const TARGETS: [&str; 4] = ["cloudflare", "cloudfront", "azure", "akamai"];
 
@@ -292,6 +292,11 @@ impl Cdn {
         };
         self.with_state(|st| st.cross_explored += 1);
         let base = self.net.https_probe(orig, name, "/", opts.clone()).await;
+        // 3.5.1 L4：本機通訊端出錯（Windows 10048／10055、Linux EADDRNOTAVAIL／EMFILE…）不是網站的結論：短時間後重試
+        if let Some(err) = base.error.as_deref().filter(|e| !base.ok && kuroshio_net::probe::is_local_error(e)) {
+            self.note_cross_local(name, from, err, now);
+            return "none";
+        }
         if !base.ok {
             self.with_state(|st| {
                 st.db.set_cross(
@@ -322,6 +327,8 @@ impl Cdn {
         }
         // 每個提示 IP 的處理結果（輪到提示的那一家時才填）
         let mut hint_uses: Vec<HintUse> = Vec::new();
+        // 候選連線時本機通訊端出錯（3.5.1 L4）
+        let mut local_err: Option<String> = None;
         for to in order {
             if to == from {
                 continue;
@@ -378,6 +385,9 @@ impl Cdn {
             for ip in ips {
                 let r = self.net.https_probe(ip, name, "/", opts.clone()).await;
                 if !r.ok {
+                    if let Some(e) = r.error.as_deref().filter(|e| kuroshio_net::probe::is_local_error(e)) {
+                        local_err.get_or_insert_with(|| e.to_string());
+                    }
                     why = Some(if r.tls_error {
                         "憑證不符（這家沒有放這個網站）".into()
                     } else {
@@ -437,6 +447,13 @@ impl Cdn {
                 ms: q.ms,
                 score,
             });
+        }
+        // 一家都沒通過、而且有本機通訊端的錯誤：不下「其他 CDN 都沒有這個網站」的結論（那會記好幾天），短時間後重試
+        if ok_list.is_empty() {
+            if let Some(err) = &local_err {
+                self.note_cross_local(name, from, err, now);
+                return "none";
+            }
         }
         ok_list.sort_by(|a, b| a.ms.partial_cmp(&b.ms).unwrap_or(std::cmp::Ordering::Equal));
         // 好友提示的命中率：試過的照結果算，一定錯的（家族不符、範圍外）算沒命中，本機沒辦法確認的不算
@@ -550,6 +567,26 @@ impl Cdn {
             )
         });
         "fail"
+    }
+}
+
+impl Cdn {
+    /// 跨 CDN 探索遇到本機通訊端的錯誤（3.5.1 L4）：記成 `unknown`，[`crate::verifier::UNSURE_RETRY_MS`] 後有人查再探索
+    /// （跨 CDN 的狀態是 `wait`，這段期間查詢路徑不排探索；不寫成 `none`／`fail`，那兩個會記 6 小時到好幾天）
+    fn note_cross_local(&self, name: &str, from: &str, err: &str, now: u64) {
+        self.with_state(|st| {
+            st.db.set_cross(
+                name,
+                Cross {
+                    verdict: Some(intern("unknown")),
+                    from: Some(intern(from)),
+                    reason: Some(format!("本機通訊端錯誤 {err}（不是網站的問題，稍後重試）")),
+                    until: Some(now + crate::verifier::UNSURE_RETRY_MS),
+                    ..Default::default()
+                },
+            )
+        });
+        warn!("{name} 跨 CDN 探索暫停：本機通訊端錯誤 {err}，稍後重試");
     }
 }
 

@@ -126,7 +126,17 @@ struct ConnOut {
     site_level: bool,
     /// 原本的 IP 連得上（連不上的時候多半是本機的網路，不記）
     base_ok: bool,
+    /// 回「不服務這個網站」（HTTP 421、Cloudflare 錯誤 1xxx）的節點（3.5.1 M4；保留最後一段的 CDN 不算，那是網段的憑證組）
+    zone: Vec<(IpAddr, String)>,
+    /// 候選都回「不服務這個網站」、而且有 3 個以上：網站的問題，不記到節點上
+    zone_site_level: bool,
 }
+
+/// 驗證結果暫時無法判定（`unknown`）的重試間隔：10 分鐘起，連續幾次就加倍（3.5.1 M4、L4），最多 [`UNSURE_MAX_SHIFT`] 次
+pub const UNSURE_RETRY_MS: u64 = 10 * 60_000;
+pub const UNSURE_MAX_SHIFT: u32 = 4;
+/// 驗證結果 `extra` 裡連續「暫時無法判定」的次數
+pub const UNSURE: &str = "unsure";
 
 /// 原始節點 HTTPS 失敗的樣子（只用 HTTP 驗證時，候選節點要跟它一致）
 struct HttpsFail {
@@ -246,14 +256,26 @@ pub(crate) fn slow1_at(v: &crate::db::Verdict) -> Option<u64> {
 /// 驗證結果 `extra` 裡「原本的答案已經在台灣機房」的 POP（3.5.1）：有這個欄位的 `fail` 不是驗證失敗，是「不用換」
 pub const ORIG_TW: &str = "origTw";
 
+/// 驗證結果 `extra` 裡「最近節點型換到同一個 POP 不算改善」的 POP（3.5.1 L11）：有這個欄位的 `fail` 是「不用換」
+pub const SAME_POP: &str = "samePop";
+
+/// 「最近節點型換到同一個 POP」的 POP（沒有回 None）
+pub fn same_pop_of(v: &crate::db::Verdict) -> Option<&str> {
+    v.extra.get(SAME_POP).and_then(serde_json::Value::as_str)
+}
+
 /// 「原本的答案已經在台灣機房」的 POP（沒有回 None）
 pub fn orig_tw_pop(v: &crate::db::Verdict) -> Option<&str> {
     v.extra.get(ORIG_TW).and_then(serde_json::Value::as_str)
 }
 
 fn clear_orig_tw(extra: &mut util::Extra) {
+    clear_key(extra, ORIG_TW);
+}
+
+fn clear_key(extra: &mut util::Extra, key: &str) {
     if let Some(m) = extra.0.as_mut() {
-        m.remove(ORIG_TW);
+        m.remove(key);
         if m.is_empty() {
             extra.0 = None;
         }
@@ -355,6 +377,15 @@ impl Cdn {
                 }
             });
         }
+        // 回「不服務這個網站」的節點（3.5.1 M4）：同一個節點 1 小時內對第 2 個不同的網站也這樣才暫停（同 K2，反覆的逐次加倍）。
+        // 一台 Windows 上 CloudFront 102 筆失敗都是同一個 IP 回 421、Cloudflare 66 筆是同一批節點回錯誤 1xxx，以前全部記在網站上
+        if !conn.zone_site_level && !conn.zone.is_empty() {
+            self.with_state(|st| {
+                for (ip, why) in &conn.zone {
+                    st.pools.note_conn_fail(provider, *ip, name, &format!("驗證 {name} 時 {why}"));
+                }
+            });
+        }
         // 社群提示的命中率：好友給的 IP 在我這邊驗證成功 / 失敗（沒輪到試的不算）
         if !hinted.is_empty() {
             if let Some(h) = self.hints() {
@@ -416,7 +447,8 @@ impl Cdn {
         let mut base_pop = String::new();
         let mut http_mode = false;
         let mut base_https: Option<HttpsFail> = None;
-        if let Some(o) = orig.filter(|o| family == 4 || o.is_ipv6()) {
+        // 3.5.1 M2：原本的 IP 要是這個家族的（舊資料的 v4 基準 IP 可能被 v6 驗證蓋成 IPv6，拿它量到的 POP 會判錯 v4）
+        if let Some(o) = orig.filter(|o| o.is_ipv6() == (family == 6)) {
             let mut b = self.probe_site(o, name, false).await;
             if !b.ok && b.error.as_deref() != Some("TIMEOUT") {
                 let b2 = self.net.http_probe(o, name, "/", t).await;
@@ -445,8 +477,12 @@ impl Cdn {
                 }
                 None => det_pop,
             };
+            // 基準只記 v4（3.5.1 M2）：v6 驗證以前也寫同一格，把 v4 的基準 IP 蓋成 IPv6
             self.with_state(|st| {
                 st.db.with_slot(name, provider, |db| {
+                    if family != 4 {
+                        return;
+                    }
                     db.set_base(
                         name,
                         Base {
@@ -464,6 +500,14 @@ impl Cdn {
             base_pop = pop;
             base = Some(b);
         }
+        // 3.5.1 L4：連原本的 IP 都是本機通訊端出錯（Windows 10048／10055 這類）：這一輪什麼都判斷不了，短時間後重試
+        if let Some(err) = base
+            .as_ref()
+            .and_then(|b| b.error.as_deref())
+            .filter(|e| kuroshio_net::probe::is_local_error(e))
+        {
+            return Some(self.unsure(name, provider, family, &format!("本機通訊端錯誤 {err}（不是網站或節點的問題）")));
+        }
         let base_ok = base.as_ref().filter(|b| b.ok);
         conn_out.base_ok = base_ok.is_some();
         // 3.5.1（Azure「台北換台北」）：原本的答案這條線連過去已經落在台灣機房 → 當成已是台灣、不換。
@@ -479,7 +523,7 @@ impl Cdn {
                 && b.status < 500
                 && looks_broken_r(provider, b).is_none()
             {
-                return Some(self.done_orig_tw(name, provider, family, prev_fails, o, &base_pop, b));
+                return Some(self.done_orig_tw(name, provider, family, prev_fails, o, &base_pop, b, false));
             }
         }
 
@@ -492,8 +536,8 @@ impl Cdn {
                 // 這一家那一格看到的 IP（多來源時不能拿別家的 IP 來猜最後一段）
                 let (mut observed, base_ip): (Vec<IpAddr>, Option<IpAddr>) =
                     match st.db.get(name).map(|e| (e, slot_of(e, provider, st.db.multi_cdn))) {
-                        Some((e, Slot::Main)) => (e.ips4.to_vec(), e.base.as_ref().and_then(|b| b.ip)),
-                        Some((_, Slot::Alt(a))) => (a.ips4.to_vec(), a.base.as_ref().and_then(|b| b.ip)),
+                        Some((e, Slot::Main)) => (e.ips4.to_vec(), e.base_ip4()),
+                        Some((_, Slot::Alt(a))) => (a.ips4.to_vec(), a.base.as_ref().and_then(|b| b.ip).filter(IpAddr::is_ipv4)),
                         _ => (Vec::new(), None),
                     };
                 if let Some(b) = base_ip {
@@ -547,16 +591,22 @@ impl Cdn {
         let mut zone_fail: Option<ZoneFail> = None;
         // 這一次連不上或憑證不符的不同節點數（3.5.1 K2）
         let mut failed_nodes: Vec<IpAddr> = Vec::new();
+        // 本機通訊端的錯誤（3.5.1 L4：連接埠用完、緩衝不足…）：不是網站也不是節點的結論
+        let mut local_err: Option<String> = None;
         for (idx, &ip) in candidates.iter().enumerate() {
             note(hinted_out, ip, false);
             let r = self.probe_site(ip, name, http_mode).await;
             if !r.ok {
                 let err = r.error.clone().unwrap_or_default();
+                if kuroshio_net::probe::is_local_error(&err) {
+                    local_err.get_or_insert(err);
+                    continue;
+                }
                 if !failed_nodes.contains(&ip) {
                     failed_nodes.push(ip);
                 }
                 if r.tls_error {
-                    self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                    self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
                     zone_fail.get_or_insert(ZoneFail {
                         reason: format!("TLS 失敗 ({err})"),
                         pop: None,
@@ -621,7 +671,10 @@ impl Cdn {
                     }
                 }
                 if zone_kind(&broken) {
-                    self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                    self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
+                    if !octet && !conn_out.zone.iter().any(|(x, _)| *x == ip) {
+                        conn_out.zone.push((ip, broken.clone()));
+                    }
                     zone_fail.get_or_insert(ZoneFail {
                         reason: broken,
                         pop: Some(pop),
@@ -690,7 +743,14 @@ impl Cdn {
                 last_reason = "只有不在節點池裡的 IP 可用".into();
                 continue;
             }
-            self.with_state(|st| st.pools.zone_note(provider, ip, true));
+            self.with_state(|st| st.pools.zone_note_site(provider, ip, true, name));
+            // 3.5.1 L11：最近節點型（Fastly）換到跟原本同一個 POP 不算改善（比照「原本就在台灣不換」）：
+            // 同一個城市的另一台機器，連線的路一樣，量到的延遲差多半是雜訊。不加失敗次數、不標壞節點
+            if let (Some(b), Some(o)) = (base_ok, orig) {
+                if family == 4 && Cdn::is_nearest(provider) && !always && !base_pop.is_empty() && pop == base_pop {
+                    return Some(self.done_orig_tw(name, provider, family, prev_fails, o, &base_pop, b, true));
+                }
+            }
             // 3.5.0 F9（E7 第二版）：台灣節點能用，但握手連續兩次（相隔 10 分鐘以上）比原本慢 → 暫時用原本的答案
             // （既有的「驗證失敗 → 原始」），15 分鐘後有人查再重驗。節點沒有壞：不標壞、不增加失敗次數；好友的提示照樣算命中
             let chk = self.slower_check(provider, family, orig, http_mode, base_ok, &r, prev_slow, always);
@@ -775,6 +835,25 @@ impl Cdn {
         // 一個都沒通過，而且連不上（或憑證不符）的不同節點有 3 個以上：這個網站的問題（例如只接受業者專用的 IP），
         // 不是那些節點的問題（3.5.1 K2：D3 壓測裡 Fastly 節點被暫停的大多是這種）
         conn_out.site_level = base_ok.is_some() && failed_nodes.len() >= SITE_FAIL_NODES;
+        // 3.5.1 L4：本機通訊端出錯、一個都沒通過：不下結論（不記在網站上、不記到節點上），短時間後重試
+        if let Some(err) = &local_err {
+            if zone_fail.is_none() && !conn_out.site_level {
+                conn_out.list.clear();
+                return Some(self.unsure(name, provider, family, &format!("本機通訊端錯誤 {err}（不是網站或節點的問題）")));
+            }
+        }
+        // 3.5.1 M4：候選不到 3 個、都回「不服務這個網站」：分不出是網站還是那一兩個節點的問題 → 不記在網站上，
+        // 暫時無法判定、短時間後重試（連續幾次就拉長）；節點那邊照上面記（多個網站都這樣才暫停）
+        if zone_fail.is_some() && !octet && candidates.len() < SITE_FAIL_NODES {
+            let z = zone_fail.as_ref().map(|z| z.reason.clone()).unwrap_or_default();
+            return Some(self.unsure(
+                name,
+                provider,
+                family,
+                &format!("{z}（只有 {} 個候選節點，先不記在網站上）", candidates.len()),
+            ));
+        }
+        conn_out.zone_site_level = zone_fail.is_some() && !octet;
         // 每個候選 IP 都明確表示「不服務這個網站」→ 判定失敗
         if let Some(z) = zone_fail {
             // Fastly 這類：可能只是還沒掃到放了這組憑證的網段，1 小時後再找一次；
@@ -834,17 +913,34 @@ impl Cdn {
             ));
         }
         // 全部因網路或漂移失敗 → 暫不判定，10 分鐘後再試
+        Some(self.unsure(name, provider, family, &last_reason))
+    }
+
+    /// 暫時無法判定（`unknown`）：不算網站的失敗、不加失敗次數；[`UNSURE_RETRY_MS`] 後有人查再驗證，
+    /// 連續幾次就加倍（最多 2^[`UNSURE_MAX_SHIFT`] 倍，160 分鐘），驗證有結論（通過或失敗）時歸零
+    fn unsure(&self, name: &str, provider: &str, family: u8, reason: &str) -> &'static str {
+        let now = now_ms();
         self.with_state(|st| {
             st.db.with_slot(name, provider, |db| {
                 db.set_verdict(name, family, |v| {
+                    let n = v
+                        .extra
+                        .get(UNSURE)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        .min(u64::from(UNSURE_MAX_SHIFT)) as u32;
                     v.verdict = Some(intern("unknown"));
-                    v.reason = Some(last_reason.clone());
-                    v.until = Some(now_ms() + 600_000);
+                    v.reason = Some(reason.to_string());
+                    v.until = Some(now + (UNSURE_RETRY_MS << n));
+                    v.extra
+                        .0
+                        .get_or_insert_with(Default::default)
+                        .insert(UNSURE.into(), serde_json::json!((n + 1).min(UNSURE_MAX_SHIFT)));
                 })
             })
         });
-        warn!("{name} IPv{family} 暫無法判定：{last_reason}");
-        Some("unknown")
+        warn!("{name} IPv{family} 暫無法判定：{reason}");
+        "unknown"
     }
 
     /// 原本的答案已經在台灣機房（3.5.1）：記成 `fail`＋`origTw`（查詢路徑走既有的「驗證失敗 → 原始」），
@@ -860,11 +956,14 @@ impl Cdn {
         orig: IpAddr,
         pop: &str,
         b: &ProbeResult,
+        same_pop: bool,
     ) -> &'static str {
         let now = now_ms();
         let until = now + (self.cfg.verify_fail_hours * HOUR_MS as f64) as u64;
         self.with_state(|st| {
-            st.stats.orig_tw = st.stats.orig_tw.saturating_add(1);
+            if !same_pop {
+                st.stats.orig_tw = st.stats.orig_tw.saturating_add(1);
+            }
             st.db.with_slot(name, provider, |db| {
                 db.set_verdict(name, family, |v| {
                     v.verdict = Some(intern("fail"));
@@ -875,19 +974,32 @@ impl Cdn {
                     v.ms = if b.ms > 0.0 { Num::V(util::round(b.ms, 1)) } else { Num::Null };
                     v.status = Num::V(b.status as f64);
                     v.ip = Some(orig);
-                    v.reason = Some(format!("原本的答案已經在台灣機房（{pop}），不換"));
+                    v.reason = Some(if same_pop {
+                        format!("原本的答案已經在 {pop}，最近的節點也在 {pop}：換到同一個 POP 不會比較近，不換")
+                    } else {
+                        format!("原本的答案已經在台灣機房（{pop}），不換")
+                    });
                     apply_slow(&mut v.extra, SlowMark::Clear, now);
+                    clear_key(&mut v.extra, UNSURE);
+                    clear_key(&mut v.extra, if same_pop { ORIG_TW } else { SAME_POP });
                     v.extra
                         .0
                         .get_or_insert_with(Default::default)
-                        .insert(ORIG_TW.into(), serde_json::json!(pop));
+                        .insert((if same_pop { SAME_POP } else { ORIG_TW }).into(), serde_json::json!(pop));
                 })
             })
         });
-        info!(
-            "◎ {name} IPv{family} 原本的答案已經在台灣機房（{pop}），不換；{} 小時後有人查再看一次",
-            self.cfg.verify_fail_hours
-        );
+        if same_pop {
+            info!(
+                "◎ {name} IPv{family} 原本的答案已經在 {pop}，最近的節點也在 {pop}：不換；{} 小時後有人查再看一次",
+                self.cfg.verify_fail_hours
+            );
+        } else {
+            info!(
+                "◎ {name} IPv{family} 原本的答案已經在台灣機房（{pop}），不換；{} 小時後有人查再看一次",
+                self.cfg.verify_fail_hours
+            );
+        }
         "fail"
     }
 
@@ -989,7 +1101,7 @@ impl Cdn {
         let r = self.probe_site(ip, name, http_mode).await;
         if !r.ok {
             if r.tls_error {
-                self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
             }
             return false;
         }
@@ -1007,7 +1119,7 @@ impl Cdn {
         }
         if let Some(broken) = looks_broken_r(provider, &r) {
             if zone_kind(&broken) {
-                self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
             }
             return false;
         }
@@ -1021,7 +1133,7 @@ impl Cdn {
                 return false;
             }
         }
-        self.with_state(|st| st.pools.zone_note(provider, ip, true));
+        self.with_state(|st| st.pools.zone_note_site(provider, ip, true, name));
         true
     }
 
@@ -1085,6 +1197,8 @@ impl Cdn {
                     }
                     apply_slow(&mut v.extra, d.slow, now);
                     clear_orig_tw(&mut v.extra);
+                    clear_key(&mut v.extra, UNSURE);
+                    clear_key(&mut v.extra, SAME_POP);
                 })
             })
         });

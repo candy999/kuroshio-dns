@@ -315,3 +315,30 @@ async fn cross_no_taiwan_weight() {
     let (c, _) = setup(100.0, (4.0, 95.0), (60.0, 10.0), Value::Null);
     assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "ok");
 }
+
+/// 3.5.1 L4：本機通訊端出錯（Windows 10048 位址用完、10055 緩衝不足；Linux EADDRNOTAVAIL、EMFILE…）不是網站的結論：
+/// 記 `unknown`、短時間後重試，不記「原站無法用 HTTPS 連線」（6 小時）或「其他 CDN 都沒有這個網站」（好幾天）
+#[tokio::test]
+async fn cross_local_socket_errors_are_not_conclusions() {
+    let (c, net) = setup(100.0, (4.0, 60.0), (6.0, 30.0), Value::Null);
+    net.on_https(|i, _| match i.to_string().as_str() {
+        ORIG => ProbeResult::failed(
+            "Only one usage of each socket address is normally permitted. (os error 10048)",
+            false,
+        ),
+        _ => page(&[("cf-ray", "abc-TPE")], 30.0),
+    });
+    let t0 = now_ms();
+    assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "none");
+    let r = rec(&c);
+    assert_eq!(r.verdict.as_deref(), Some("unknown"));
+    assert!(r.until.unwrap() <= t0 + crate::verifier::UNSURE_RETRY_MS + 1000, "短時間後重試");
+    assert!(r.reason.unwrap().contains("本機通訊端錯誤"));
+    // 原站正常、候選全部是本機的錯誤
+    net.on_https(|i, _| match i.to_string().as_str() {
+        ORIG => page(&[], 100.0),
+        _ => ProbeResult::failed("EADDRINUSE", false),
+    });
+    assert_eq!(c.cross_explore("x.com", "fastly", ip(ORIG)).await, "none");
+    assert_eq!(rec(&c).verdict.as_deref(), Some("unknown"));
+}

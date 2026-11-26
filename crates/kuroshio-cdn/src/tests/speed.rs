@@ -443,11 +443,11 @@ async fn pool_job_marks_relatively_slow_node() {
 
 // ------------------------------------------------------------ 離線重播
 
-/// 種子裡的節點池（`data/seed/cdn-pools.json`，實機量到的延遲與速度）當成一次節點池工作的量測結果：
-/// 完整測（收滿 8 MiB，時間由速度回推）
+/// 2026-11-11 種子裡的節點池（實機量到的延遲與速度）當成一次節點池工作的量測結果：
+/// 完整測（收滿 8 MiB，時間由速度回推）。3.5.1 起種子更新了，重播用的這一份另外存在 `tests/replay-pools.json`，結果才固定
 fn seed_pool(provider: &str) -> Vec<PoolNode> {
-    let text = std::fs::read_to_string(repo().join("data/seed/cdn-pools.json")).unwrap();
-    let f: PoolsFile = serde_json::from_str(&text).unwrap();
+    let text = include_str!("replay-pools.json");
+    let f: PoolsFile = serde_json::from_str(text).unwrap();
     f.providers[provider].v4.clone().unwrap()
 }
 

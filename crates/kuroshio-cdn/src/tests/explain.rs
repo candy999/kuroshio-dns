@@ -42,6 +42,7 @@ fn explain_rewritten_and_failed() {
             v.until = Some(until);
             v.pop = Some("TPE".into());
             v.ms = crate::util::Num::of(12.0);
+            v.ip = Some(ip("104.16.161.36"));
         });
         st.db.set_verdict("bad.test", 4, |v| {
             v.verdict = Some("fail".into());
@@ -55,6 +56,25 @@ fn explain_rewritten_and_failed() {
     let v = c.explain("bad.test", Context::default());
     assert_eq!(v["decision"], "verify-failed");
     assert!(v["text"].as_str().unwrap().contains("試了 3 個節點"), "{v}");
+    // 3.5.1 M1：驗證過的節點不在節點池了（節點池換過）：跟查詢路徑一樣先回原本的答案、下次查詢重新驗證
+    c.with_state(|st| {
+        st.pools
+            .p
+            .get_mut("cloudflare")
+            .unwrap()
+            .pool4
+            .retain(|n| n.ip != ip("104.16.161.36"))
+    });
+    let v = c.explain("ok.test", Context::default());
+    assert_eq!(v["decision"], "pool-changed", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("下次查詢重新驗證"), "{v}");
+    let mut m = msg("ok.test", 1, &["104.21.0.5"], vec![]);
+    let r = c.apply(&mut m, "ok.test", 1);
+    assert!(r.rewritten.is_none() && r.ttl_cap.is_some(), "查詢路徑同樣不換：{:?}", r.tags);
+    assert!(
+        c.take_tasks().iter().any(|t| matches!(t, crate::cdn::Task::Verify { .. })),
+        "排重新驗證"
+    );
     // 過期的「通過」不算：回到驗證中
     c.with_state(|st| st.db.set_verdict("ok.test", 4, |v| v.until = Some(1)));
     assert_eq!(decision(&c, "ok.test"), "trial");
@@ -168,4 +188,84 @@ fn tw_native_cdn_is_already_taiwan() {
     let v = c.explain("www.example.com", Context::default());
     assert_eq!(v["decision"], "already-tw", "{v}");
     assert!(v["text"].as_str().unwrap().contains("HiNet"), "{v}");
+}
+
+/// 3.5.1 M5（a）：最近節點型（Fastly）驗證通過、查詢路徑有在換：explain 以前一律說 `no-tw-node`
+#[test]
+fn explain_nearest_rewritten_matches_query_path() {
+    let (c, net) = setup(json!({}));
+    super::selftest::fastly_setup(&c);
+    let name = "fx.example.com";
+    net.set_cached("151.101.65.140", 120.0);
+    c.with_state(|st| st.pools.zone_note("fastly", ip("151.101.77.140"), true));
+    let mut m = msg(name, 1, &["151.101.65.140"], vec![]);
+    c.apply(&mut m, name, 1);
+    c.take_tasks();
+    c.with_state(|st| {
+        st.db.set_verdict(name, 4, |v| {
+            v.verdict = Some("ok".into());
+            v.until = Some(now_ms() + 3_600_000);
+            v.ip = Some(ip("151.101.77.140"));
+            v.pop = Some("HKG".into());
+        })
+    });
+    let mut m = msg(name, 1, &["151.101.65.140"], vec![]);
+    let r = c.apply(&mut m, name, 1);
+    assert_eq!(r.rewritten, Some(crate::Rewrite::Alias), "{:?}", r.tags);
+    let v = c.explain(name, Context::default());
+    assert_eq!(v["decision"], "nearest", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("HKG"), "{v}");
+    // 原本的答案已經夠近：查詢路徑不換，explain 也不說換
+    net.set_cached("151.101.65.140", 26.5);
+    let mut m = msg(name, 1, &["151.101.65.140"], vec![]);
+    assert_eq!(c.apply(&mut m, name, 1).rewritten, None);
+    let v = c.explain(name, Context::default());
+    assert_eq!(v["decision"], "no-tw-node", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("最近的節點"), "{v}");
+}
+
+/// 3.5.1 M5（b）：節點池建過、但一個節點都沒有（Gcore 這樣）：查詢路徑直接回原本的答案（不縮短 TTL），
+/// explain 以前說「驗證中，TTL 10 秒」
+#[test]
+fn explain_empty_pool_is_no_pool() {
+    let (c, _) = setup(json!({}));
+    seen(&c, "e.example.com");
+    c.with_state(|st| st.pools.p.get_mut("cloudflare").unwrap().pool4.clear());
+    let mut m = msg("e.example.com", 1, &["104.21.0.5"], vec![]);
+    let r = c.apply(&mut m, "e.example.com", 1);
+    assert!(r.rewritten.is_none() && r.ttl_cap.is_none(), "{:?}", r.tags);
+    let v = c.explain("e.example.com", Context::default());
+    assert_eq!(v["decision"], "no-pool", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("沒有可用的節點"), "{v}");
+}
+
+/// 3.5.1 M5（c）：多來源，這一格是只辨識的業者、另一格是驗證過的 Cloudflare：explain 兩家都說，
+/// 回答來自 Cloudflare 時查詢路徑照樣換
+#[test]
+fn explain_multi_source_describes_other_slot() {
+    let (c, _) = setup(json!({}));
+    let name = "mix.example.com";
+    seen(&c, name);
+    c.with_state(|st| {
+        st.db.set_verdict(name, 4, |v| {
+            v.verdict = Some("ok".into());
+            v.until = Some(now_ms() + 3_600_000);
+            v.ip = Some(ip("104.16.161.36"));
+            v.pop = Some("TPE".into());
+        });
+        let t = st
+            .db
+            .touch_at(name, "google", "cname", &ips(&["192.0.2.30"]), &[], None, "", now_ms());
+        assert!(t.new_slot);
+    });
+    let v = c.explain(name, Context::default());
+    assert_eq!(v["decision"], "app-layer", "{v}");
+    assert_eq!(v["alt"]["provider"], "cloudflare", "{v}");
+    assert_eq!(v["alt"]["decision"], "rewritten", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("回答來自 Cloudflare 時"), "{v}");
+    // 回答換回 Cloudflare：查詢路徑換成驗證過的節點
+    let mut m = msg(name, 1, &["104.21.0.5"], vec![]);
+    let r = c.apply(&mut m, name, 1);
+    assert_eq!(r.rewritten, Some(crate::Rewrite::Alias), "{:?}", r.tags);
+    assert_eq!(c.explain(name, Context::default())["decision"], "rewritten");
 }

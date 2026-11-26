@@ -160,6 +160,7 @@ impl Cdn {
                             !v.reason.as_deref().unwrap_or("").contains("試了")
                                 && v.extra.get(crate::verifier::SLOWER).is_none()
                                 && v.extra.get(crate::verifier::ORIG_TW).is_none()
+                                && v.extra.get(crate::verifier::SAME_POP).is_none()
                                 && pools.is_restricted(p, ip)
                         }
                         _ => false,
@@ -281,11 +282,12 @@ impl Cdn {
             let mut st = self.state();
             let st = &mut *st;
             // 3.5.1 K4：先不收新網域（記憶體不能長大、或筆數超過磁碟預算的 2 倍）：照上游的答案回、不記、不排驗證。
-            // 已經記著的網域照常；記憶體回來、淘汰追上之後自己恢復
-            if !self.admits(st, &name) {
+            // 已經記著的網域照常；記憶體回來、淘汰追上之後自己恢復。
+            // 3.5.1 H1：筆數接近 `cdn.maxEntries`（90%）時，新網域問第二次才記
+            if let Err(why) = self.admits(st, &name) {
                 st.stats.new_held = st.stats.new_held.saturating_add(1);
                 res.provider = Some(provider);
-                res.tags.push("新網域先不記:記憶體或磁碟預算".into());
+                res.tags.push(why.into());
                 return res;
             }
             self.apply_locked(st, msg, &name, qtype, provider, via, &cname, c1, &mut res, &mut tasks);
@@ -715,18 +717,9 @@ impl Cdn {
         }
         // 沒有台灣節點的 CDN（例如 Fastly）：只有在「最近節點」明顯比原本快時才換
         if nearest {
-            let orig_ms = self.served_ms_in(&st.pools, provider, &needs);
-            let pop = match pool.first() {
-                Some(ip) => st.pools.pop_of_ip(provider, *ip),
-                None => st.pools.pop_view(provider).pops.first().map(|x| x.0.clone()),
-            };
-            let pool_ms = pop
-                .and_then(|p| st.pools.pop_score(provider, &p))
-                .filter(|s| *s != 0.0 && !s.is_nan())
-                .or_else(|| st.pools.best_ms(provider, family));
-            let enough = matches!((orig_ms, pool_ms), (Some(o), Some(p)) if o - p >= pc_min_gain);
+            let (enough, orig_known) = self.nearest_gain(&st.pools, provider, family, &needs, &pool);
             if !enough {
-                if orig_ms.is_none() {
+                if !orig_known {
                     tasks.push(Task::Latency(needs[0]));
                 }
                 res.tags.push(format!("{label}:已是最近節點"));
@@ -813,6 +806,44 @@ impl Cdn {
         res.rewritten = Some(Rewrite::Alias);
     }
 
+    /// 最近節點型（Fastly）：最近的節點有沒有明顯比原本的答案快（`cdn.nearestMinGainMs`）。回傳（夠不夠，原本的延遲量過沒有）。
+    /// 查詢路徑（`alias_family`）與 `explain` 共用（3.5.1 M5）；只讀測速快取與節點池的紀錄，不發請求
+    pub(crate) fn nearest_gain(&self, pools: &Pools, provider: &str, family: u8, needs: &[IpAddr], pool: &[IpAddr]) -> (bool, bool) {
+        let orig_ms = self.served_ms_in(pools, provider, needs);
+        let pop = match pool.first() {
+            Some(ip) => pools.pop_of_ip(provider, *ip),
+            None => pools.pop_view(provider).pops.first().map(|x| x.0.clone()),
+        };
+        let pool_ms = pop
+            .and_then(|p| pools.pop_score(provider, &p))
+            .filter(|s| *s != 0.0 && !s.is_nan())
+            .or_else(|| pools.best_ms(provider, family));
+        let enough = matches!((orig_ms, pool_ms), (Some(o), Some(p)) if o - p >= self.cfg.nearest_min_gain_ms);
+        (enough, orig_ms.is_some())
+    }
+
+    /// 「針對這個網站驗證過」、而且現在還能用（[`Pools::usable`]：仍在節點池、沒被暫停）的 IP，驗證時用的那個排第一。
+    /// 查詢路徑（`serve_pool`）與 `explain` 共用同一個判斷（3.5.1 M1）。
+    ///
+    /// - 保留最後一段的 CDN（v4）：最後一段要跟這次答案（`orig`）一樣才能用（網站換了憑證組就不能用舊的）。
+    ///   以前驗證用的 IP 不能用（POP 變差、網站換了憑證組）時會改回節點池裡「別的網站驗證過」的 IP，
+    ///   那些沒有針對這個網站驗證過憑證；現在回空的，讓呼叫端先回原始結果並重新驗證。
+    /// - 任播型（Cloudflare 等）：池內其他 IP 不一定能服務這個網站（Error 1034 Edge IP Restricted），不能當備援塞進去
+    pub(crate) fn verified_ips(pools: &Pools, provider: &str, family: u8, v: &crate::db::Verdict, orig: Option<&[IpAddr]>) -> Vec<IpAddr> {
+        let octet = pools.octet_mode(provider) && family == 4;
+        let mut out: Vec<IpAddr> = Vec::new();
+        for ip in v.ip.iter().chain(v.ips.iter().flatten()) {
+            let same_octet = !octet
+                || orig
+                    .map(|o| o.iter().any(|x| util::last_octet(*x) == util::last_octet(*ip)))
+                    .unwrap_or(true);
+            if same_octet && !out.contains(ip) && pools.usable(provider, *ip) {
+                out.push(*ip);
+            }
+        }
+        out
+    }
+
     /// 驗證通過時用的那個 IP 排第一（確定能服務這個網站），其餘接在後面當備援
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn serve_pool(
@@ -827,32 +858,11 @@ impl Cdn {
     ) -> Vec<IpAddr> {
         let entry = st.db.get(name);
         let v = entry.and_then(|e| e.verdict(family));
-        if st.pools.octet_mode(provider) && family == 4 {
-            let Some(v) = v.filter(|v| v.is("ok")) else { return pool.to_vec() };
-            // 只回「針對這個網站驗證過」的 IP：驗證時用的那個排第一，其餘驗證通過的當備援。
-            // 以前驗證用的 IP 不能用（POP 變差、網站換了憑證組）時會改回節點池裡「別的網站驗證過」的 IP，
-            // 那些沒有針對這個網站驗證過憑證；現在回空的，讓呼叫端先回原始結果並重新驗證
-            let mut out: Vec<IpAddr> = Vec::new();
-            for ip in v.ip.iter().chain(v.ips.iter().flatten()) {
-                // 最後一段要跟這次答案一樣才能用（網站換了憑證組就不能用舊的）
-                let same_octet = orig
-                    .map(|o| o.iter().any(|x| util::last_octet(*x) == util::last_octet(*ip)))
-                    .unwrap_or(true);
-                if same_octet && !out.contains(ip) && st.pools.usable(provider, *ip) {
-                    out.push(*ip);
-                }
-            }
-            out.truncate(pool.len().max(1));
-            return out;
-        }
-        // 任播型（Cloudflare 等）：只回「針對這個網站驗證過」的 IP。
-        // 池內其他 IP 不一定能服務這個網站（Error 1034 Edge IP Restricted），不能當備援塞進去
         let Some(v) = v.filter(|v| v.is("ok")) else { return pool.to_vec() };
-        let mut verified: Vec<IpAddr> = Vec::new();
-        for ip in v.ip.iter().chain(v.ips.iter().flatten()) {
-            if !verified.contains(ip) && st.pools.usable(provider, *ip) {
-                verified.push(*ip);
-            }
+        let mut verified = Self::verified_ips(&st.pools, provider, family, v, orig);
+        if st.pools.octet_mode(provider) && family == 4 {
+            verified.truncate(pool.len().max(1));
+            return verified;
         }
         if verified.is_empty() {
             if v.ip.is_some() {

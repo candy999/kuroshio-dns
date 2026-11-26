@@ -341,9 +341,25 @@ pub struct Zone {
     pub miss: u32,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_u64")]
     pub at: Option<u64>,
+    /// 最後一次「不服務」的時間（3.5.1 L3）：[`ZONE_MISS_KEEP_MS`] 沒有新的就把 `miss` 清掉
+    #[serde(
+        rename = "missAt",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_opt_u64"
+    )]
+    pub miss_at: Option<u64>,
+    /// 「不服務」的網站（名稱的雜湊，最多 [`ZONE_SITES_MAX`] 個）：同一個網站重複失敗只算一次（3.5.1 L3）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<u32>,
     #[serde(flatten)]
     pub extra: Extra,
 }
+
+/// 「不服務」的紀錄多久沒有新的就清掉（3.5.1 L3）
+pub const ZONE_MISS_KEEP_MS: u64 = 7 * 24 * 3600 * 1000;
+/// 每個節點記幾個「不服務」的網站
+pub const ZONE_SITES_MAX: usize = 8;
 
 fn de_nodes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<PoolNode>>, D::Error> {
     Ok(match Value::deserialize(d)? {
@@ -769,6 +785,8 @@ impl Pools {
             .into_iter()
             .filter_map(|(k, v)| Some((k, serde_json::from_value(v).ok()?)))
             .collect();
+        // 3.5.1 L3：很久沒有新的「不服務」的紀錄載入時就消退（之後每小時一次）
+        self.decay_zone(now_ms());
         Ok(())
     }
 
@@ -861,6 +879,12 @@ impl Pools {
 
     /// 記錄某個池內 IP 能不能服務某個網站
     pub fn zone_note(&mut self, provider: &str, ip: IpAddr, ok: bool) {
+        self.zone_note_site(provider, ip, ok, "");
+    }
+
+    /// 相容性紀錄（3.5.1 L3）：「不服務」算**不同的網站**（`site` 是網站名稱；空的 = 不分網站，舊的算法）。
+    /// 以前同一個網站每驗證一次就多算一次，幾次重驗就把節點當成「特定產品專用」，而且永遠不會消退
+    pub fn zone_note_site(&mut self, provider: &str, ip: IpAddr, ok: bool, site: &str) {
         let k = format!("{provider}|{ip}");
         if !self.zone.contains_key(&k) && self.zone.len() >= self.cfg.zone_max.max(16) {
             // 上限：丟掉最久沒更新的
@@ -868,14 +892,30 @@ impl Pools {
                 self.zone.shift_remove_index(i);
             }
         }
+        let now = now_ms();
         let z = self.zone.entry(k).or_default();
+        let mut warn_now = false;
         if ok {
-            z.hit += 1;
+            z.hit = z.hit.saturating_add(1);
         } else {
-            z.miss += 1;
+            z.miss_at = Some(now);
+            let h = (!site.is_empty()).then(|| site_hash(site));
+            let new_site = match h {
+                Some(h) => !z.sites.contains(&h),
+                None => true,
+            };
+            if new_site {
+                z.miss = z.miss.saturating_add(1);
+                warn_now = z.miss == 2;
+                if let Some(h) = h {
+                    if z.sites.len() >= ZONE_SITES_MAX {
+                        z.sites.remove(0);
+                    }
+                    z.sites.push(h);
+                }
+            }
         }
-        z.at = Some(now_ms());
-        let warn_now = !ok && z.miss == 2;
+        z.at = Some(now);
         self.zone_dirty = true;
         if warn_now && self.is_restricted(provider, ip) {
             warn!("{provider} 節點 {ip} 多個網站無法使用（可能是特定產品專用 IP），之後排到最後");
@@ -902,6 +942,30 @@ impl Pools {
             Ok(()) => self.zone.get(std::str::from_utf8(&k.b[..k.n]).ok()?),
             Err(_) => self.zone.get(&format!("{provider}|{ip}")),
         }
+    }
+
+    /// 「不服務」的紀錄消退（3.5.1 L3；背景每小時一次、載入時一次，不在查詢路徑上）：[`ZONE_MISS_KEEP_MS`] 沒有新的「不服務」
+    /// 就把 `miss` 清掉（舊資料沒有 `missAt` 時看 `at`）；同時也沒有「服務」的整筆拿掉。回傳動了幾筆
+    pub fn decay_zone(&mut self, now: u64) -> usize {
+        let mut n = 0;
+        self.zone.retain(|_, z| {
+            if z.miss == 0 {
+                return true;
+            }
+            let last = z.miss_at.or(z.at).unwrap_or(0);
+            if now.saturating_sub(last) < ZONE_MISS_KEEP_MS {
+                return true;
+            }
+            n += 1;
+            z.miss = 0;
+            z.miss_at = None;
+            z.sites.clear();
+            z.hit > 0
+        });
+        if n > 0 {
+            self.zone_dirty = true;
+        }
+        n
     }
 
     pub fn is_restricted(&self, provider: &str, ip: IpAddr) -> bool {

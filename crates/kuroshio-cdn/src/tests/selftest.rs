@@ -294,7 +294,7 @@ fn restricted_ips_and_verified_only() {
     assert_eq!(serve(&opt), (vec![], 1));
 }
 
-fn fastly_setup(opt: &Cdn) {
+pub(super) fn fastly_setup(opt: &Cdn) {
     opt.with_state(|st| {
         st.pools.zone.clear();
         let d = st.pools.p.get_mut("fastly").unwrap();
