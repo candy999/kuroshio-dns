@@ -735,7 +735,7 @@ impl Resolver {
             // 每一次 A 回應 ≈ 一次連線：記錄是否把「原本會出國」的連線拉回台灣
             if qtype == rtype::A {
                 if let Some(rt) = cdn.route(e.baseline.as_ref(), &res, &r) {
-                    self.stats.route(&rt.provider, rt.abroad, rt.tw, rt.saved_ms);
+                    self.stats.route(&rt.provider, rt.abroad, rt.tw, rt.saved_ms, rt.cross);
                 }
             }
         }

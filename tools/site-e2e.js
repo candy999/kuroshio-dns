@@ -17,6 +17,7 @@ const ROOT = path.resolve(__dirname, '..');
 const BIN = process.env.KUROSHIO_BIN ? path.resolve(process.env.KUROSHIO_BIN) : path.join(ROOT, 'target', 'debug', process.platform === 'win32' ? 'kuroshio.exe' : 'kuroshio');
 const SHOTS = path.resolve(process.env.SHOTS || 'screenshots-site');
 const HOST = 'dns.example';
+const { checkFlow, checkFlowEmpty, checkOtherParts } = require('./flow-check.js');
 
 let pass = 0, fail = 0;
 const ok = m => { pass++; console.log(`  ✔ ${m}`); };
@@ -102,6 +103,15 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
         const dj = await fetchSite(port, '/assets/dashboard.js');
         check(dj.status === 200 && /javascript/.test(dj.headers['content-type']), '共用儀表板 /assets/dashboard.js');
 
+        // 3.5.1：連線去向圖的數字要跟公開 API 一致（公開頁只有彙總數字）
+        const pub = JSON.parse((await fetchSite(port, '/api/public/stats?range=today')).body);
+        check(Array.isArray(pub.routing) && pub.routing.length === 7 && pub.routing.every(r => r.alreadyTw + r.accelerated + r.stillAbroad === r.connections),
+            '/api/public/stats 的 routing：7 家 CDN，三塊加起來等於連線數', JSON.stringify(pub.routing).slice(0, 300));
+        check(pub.cdnOther && pub.cdnOther.providers === 2 && pub.crossCdn.pairsOther && pub.crossCdn.pairsOther.pairs === 2 && pub.flowsOther,
+            '/api/public/stats：前幾名以外合併的 cdnOther、pairsOther、flowsOther', JSON.stringify([pub.cdnOther, pub.crossCdn.pairsOther, pub.flowsOther]));
+        check(typeof pub.opportunity.savedSamples === 'number' && typeof pub.acceleration.samples === 'number', '/api/public/stats：估計值帶樣本數');
+        const pubText = JSON.stringify({ routing: pub.routing, cdnOther: pub.cdnOther, opportunity: pub.opportunity });
+        check(!/\.(com|net|tw|me|cc)\b|192\.0\.2|127\.0\.0/.test(pubText), '連線去向用到的公開資料只有彙總數字（沒有網域、IP）', pubText.slice(0, 200));
         const errors = [];
         for (const [scheme, w] of [['light', 1280], ['dark', 1280], ['light', 390], ['dark', 390]]) {
             const tag = `${scheme === 'dark' ? '深色' : '淺色'} ${w} px`;
@@ -125,6 +135,22 @@ const fetchSite = (port, p) => new Promise((resolve, reject) => {
             check(await page.locator('[data-panel=android] .dot-off').evaluate(n => !n.hidden), 'DoT 沒開：說明 Android 私人 DNS 不能用');
             check(await page.locator('#rt svg').count() === 1 && await page.locator('#trend svg').count() === 1 && await page.locator('#map svg').count() >= 1, '圖表：最近 60 分鐘、近 30 天、路由地圖');
             check(await page.locator('#gauges .gauge').count() >= 3 && await page.locator('#cdnRank .rank-row').count() >= 3, '圖表：各 CDN 環形儀表、CDN 排行');
+            // 3.5.1：連線去向（桌機流向圖、手機堆疊橫條）；其他圖的「其他」與「沒辨識出來」分開、估計值標樣本數
+            const fr = JSON.parse((await fetchSite(port, '/api/public/stats?range=today')).body);
+            for (const c of await checkFlow(page, '#flow', '#flowTable', fr.routing, w, `公開頁 ${tag}`)) check(...c);
+            if (scheme === 'light' && w === 1280) for (const c of [...await checkFlowEmpty(page, '公開頁'), ...await checkOtherParts(page, '公開頁')]) check(...c);
+            check(await page.locator('#gauges .gauge').count() === 6 && await page.locator('#gauges .gauge.other').count() === 1, '環形儀表：前 5 家＋「其他」一張');
+            check(/其他 2 家/.test(await page.textContent('#cdnRank .rank-row.other')), 'CDN 排行：前 8 家以外合併成「其他 2 家」、排在最後');
+            // 跨 CDN 卡片要等資料庫裡有測過的網站才畫（種子資料的跨 CDN 紀錄在啟動整理時清掉了）：沒有時只看說明
+            if (fr.crossCdn.explored) check(await page.locator('#cross .pair.unknown').count() === 1 && /其他 2 組/.test(await page.textContent('#cross .pair.other')), '跨 CDN：改走的 CDN 沒記到的標「未辨識」，跟「其他 2 組」分開');
+            else check(/資料累積中/.test(await page.textContent('#cross')), '跨 CDN：還沒有測過的網站時顯示說明');
+            const oppSub = await page.textContent('#oppSub');
+            check(/次量測/.test(await page.textContent('#o-ms-l')) && /個網站/.test(oppSub) || !fr.acceleration.samples, '平均縮短、網站中位數旁邊標樣本數', await page.textContent('#o-ms-l'));
+            // 3.5.1：網站中位數可以是負的（台灣比較慢的網站也算）：負的寫「反而慢」、不寫「省」
+            const fm = fr.acceleration.medianSavedMs;
+            check(typeof fm !== 'number' || !fr.acceleration.samples || (fm < 0 ? /反而慢/.test(oppSub) && !/中位數省/.test(oppSub) : fm > 0 ? /台灣節點快/.test(oppSub) : /兩邊一樣/.test(oppSub)), '網站中位數的說明跟正負一致', `${fm} / ${oppSub}`);
+            check(/\d+ 次/.test(await page.textContent('#stackLegend')), '查詢去向的比例旁邊附次數');
+            await page.locator('.card:has(> #flow)').screenshot({ path: path.join(SHOTS, `flow-site-${scheme}-${w}.png`) });
             const sites = await page.locator('#siteRank').textContent();
             check(/youtube\.com/.test(sites) && /大家最常造訪的網站/.test(await page.textContent('#sitesCap')), '熱門網站（site.minClients = 1）', sites.slice(0, 120));
             const sw = await page.evaluate(() => document.documentElement.scrollWidth);

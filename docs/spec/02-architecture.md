@@ -188,6 +188,7 @@ kuroshio check-config <file>                     檢查設定檔
 - 網站排行（`topSites`、`topBlocked`）只列出至少 `site.minClients` 位不同使用者造訪過的網站，預設 `auto`（對外開放時 2、其他 1）。
 - **排除異常日（3.5.1）**：`/api/stats/exclude?date=YYYY-MM-DD`（POST）把壓測那種日子標成異常，7 天、30 天的統計跳過它（見第 6 節的管理 API 表）。以前一天的壓測就把 7 天、30 天的命中率從 49.6% 拉到 8.6%，要等 30 天才恢復。
 - **最少人數預設自動（3.5.1）**：公開頁開著、DoH 開著、有設定網域（`site.hostname`，`domain` 會自動帶入）——也就是公開頁對外開放——時用 2：公開伺服器用 1 會列出只有一台裝置去過的網站、每日排行保存 31 天。其他情況（大部分是家裡的路由器，只有一兩台裝置）用 1，改成 2 排行就空了。自己填了數字的照填的；對外開放又自己填 1 時，啟動時記一行 WARN、發現清單有一筆 info（`site-min-clients-1`）。
+- **CDN 連線去向（3.5.1）**：首頁「加速成效」多一張圖，資料是 `/api/public/stats` 的 `routing[]`（每家 CDN 的彙總數字，沒有網域、用戶端），畫法見 7.3。
 - 排行的資料（3.5.1）：今天的網站與被擋網站各最多 20,000 個（`stats.rs` 的 `Limits.anon_sites`），過去每一天各留前 300 名。收滿時一次淘汰次數最少的一半（同樣次數時最久沒被查到的先，`evict_half()`），再收新的網站；以前收滿就不再加，壓測那天被單一來源的一次性網域佔滿，之後真正使用者的新網站都記不到。每收一萬個新網站才整理一次（攤銷 O(1)），在既有的統計鎖裡做、只比次數與順序兩個數字、不複製網站名稱。
 
 ### 7.2 設定頁
@@ -212,6 +213,14 @@ Windows 設定頁用原生 JS（不用前端框架、不需要編譯步驟），
 - 管理介面是完整資料：統計用 `/api/dashboard?range=today|7d|30d`（跟 `/api/public/stats` 同一份，但排行不受 `site.minClients` 限制、各列 30 筆），上游完整網址、用戶端不打馬賽克。
 - 圖表在瀏覽器畫，路由器只給 JSON。CDN 網域資料庫可能有 20 萬筆：管理介面用 `/api/cdn/domains?limit=300&offset=…&q=…&provider=…` 分頁搜尋，跨 CDN 用 `cross=1`；詳細頁維持一次載入 2 萬筆在瀏覽器篩選。
 - 安全：不組 HTML 字串、不寫 `style` 屬性（只用 CSSOM），在設定頁的嚴格 CSP 下可用。淺色 / 深色跟著系統（LuCI 跟著 `data-darkmode`），手機寬度下寬表格在框裡捲動。
+- **CDN 連線去向（3.5.1，`cdnFlow()`）**：「機會成本（各 CDN）」與公開頁的「加速成效」各一張。左邊是各家 CDN，寬度是 `routing[].connections`；右邊三塊是「原本就在台灣」（`alreadyTw`）、「拉回台灣」（`accelerated`）、「仍在國外」（`stillAbroad`）。
+  - 資料核對：`Stats::route()` 每次 A 回應 `n` 加 1，一般 DNS 的答案在國外（`abroad`）的再分成拉回（`acc`）或仍在國外（`miss`），所以每一天、每一家 `n = (n − abroad) + acc + miss`，三塊加起來就是連線數。`alreadyTw` 在讀統計時算（`n − acc − miss`，不小於 0；跟 `connections − wouldGoAbroad` 同一個數），查詢路徑不變；舊版核心沒有這個欄位時畫面自己算。
+  - 跨 CDN 不重複算：在台灣沒有節點的 CDN（`nearest`，例如 Fastly）沒有「原本」可以比，不進 `routing[]`，改走別家的次數只在 `crossCdn`；三塊的「拉回台灣」合計是 `opportunity.routedAccelerated`。
+  - 加速次數只算一次（3.5.1）：在台灣有節點的 CDN 也可能走跨 CDN，這種連線 `Stats::cdn()` 記一次跨 CDN（`crossRewrite`、這一分鐘的拉回），`Stats::route()` 又記成那家 CDN 的拉回（`acc`），以前 `opportunity.accelerated`、`totals.accelerated`、每分鐘的拉回都算兩次。現在 `Route` 帶 `cross`（`res.rewritten == Cross` 的一次比較），`route()` 在既有的鎖裡多記一筆 `route.<cdn>.cross`、這一分鐘的拉回不再加；合計用 `acc + max(0, crossRewrite − cross)`。`acc` 照舊包含它（連線去向的三塊要加得起來）。3.5.1 之前存下來的日子沒有 `cross`（0），照舊相加，不回頭修。
+  - 上限：前 5 家，其餘合併成「其他 N 家」；provider 空白（看得出是 CDN 但沒辨識出是哪一家）另外一塊「未辨識的 CDN」。最多 7 個節點。
+  - 桌機（容器 600 px 以上）是兩段式流向圖：節點是 `rect`，流線是三次貝茲曲線圍成的帶狀 `path`，滑過顯示數字；手機改成每家 CDN 一條 100% 堆疊橫條，下面一行三塊的比例。兩種都附數據表（含合計）。顏色以外加圖樣（拉回 = 斜線、國外 = 點點）與文字。連線數 0 顯示「資料累積中」，少於 10 次只說明累積中、數據表照列，不畫圖。
+- **其他與沒辨識出來（3.5.1）**：環形儀表前 5 家＋「其他」；「最常用到的 CDN」前 8 家（後端 `cdnOther`）、跨 CDN 配對前 8 組（`crossCdn.pairsOther`）、路由地圖前 12 個機房（`flowsOther`），其餘合併成「其他」、排最後（以前直接丟掉，比例加起來不到 100%）。沒辨識出來的另外標：改走的 CDN 沒記到（`?`）的配對標「未辨識的 CDN」；機房代碼沒有座標的不上地圖、在數據表標「沒辨識出位置」。
+- **估計值標樣本數（3.5.1）**：`routing[].savedSamples`、`opportunity.savedSamples` 是平均縮短用了幾次連線的量測；`acceleration.samples` 是網站中位數（`medianSavedMs`）用了幾個網站。網站中位數 3.5.1 起跟「兩條路」（`paths.medianSavedMs`）同一個定義（`site::saved_ms`）：原本的答案與台灣節點兩邊都量到延遲的網站，原本 − 台灣，台灣比較慢的是負的也算（以前只收原本出國、驗證成功、台灣比較快的，再加 ECS 的增益，偏高）；畫面上正的寫「台灣節點快」、負的寫「台灣節點慢」，不寫「縮短」。總覽、環形儀表、機會成本表、公開頁的「平均每次縮短」旁邊標樣本數，少於 10 加註「樣本少」。查詢去向的比例旁邊附次數。
 
 ## 8. 平台層
 

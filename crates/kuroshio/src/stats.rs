@@ -134,6 +134,9 @@ struct RouteStat {
     miss: u64,
     saved: f64,
     saved_n: u64,
+    /// 拉回台灣的連線裡，是跨 CDN 備援改寫的（3.5.1）：這些也算在 `Day::cross_rewrite`，
+    /// 加速次數合計時扣掉，不重複算。3.5.1 之前存下來的日子沒有這個欄位（0），照舊
+    cross: u64,
 }
 
 /// 一分鐘的即時計數
@@ -748,7 +751,7 @@ impl Day {
                 .map(|(k, r)| {
                     (
                         k.clone(),
-                        json!({ "n": r.n, "abroad": r.abroad, "acc": r.acc, "miss": r.miss, "saved": r.saved.round(), "savedN": r.saved_n }),
+                        json!({ "n": r.n, "abroad": r.abroad, "acc": r.acc, "miss": r.miss, "saved": r.saved.round(), "savedN": r.saved_n, "cross": r.cross }),
                     )
                 })
                 .collect::<Map<_, _>>(),
@@ -796,6 +799,7 @@ impl Day {
                                 miss: g("miss"),
                                 saved: r.get("saved").and_then(Value::as_f64).unwrap_or(0.0),
                                 saved_n: g("savedN"),
+                                cross: g("cross"),
                             },
                         )
                     })
@@ -876,6 +880,7 @@ impl Day {
             e.miss += r.miss;
             e.saved += r.saved;
             e.saved_n += r.saved_n;
+            e.cross += r.cross;
         }
     }
 }
@@ -1167,8 +1172,12 @@ impl Stats {
         })
     }
 
-    /// 一次 A 回應 ≈ 一次連線：原本會不會出國（`abroad`）、有沒有拉回台灣（`tw`）、省下幾毫秒
-    pub fn route(&self, provider: &str, abroad: bool, tw: bool, saved_ms: Option<f64>) {
+    /// 一次 A 回應 ≈ 一次連線：原本會不會出國（`abroad`）、有沒有拉回台灣（`tw`）、省下幾毫秒。
+    ///
+    /// `cross`（3.5.1）：這次是跨 CDN 備援改寫的。`cdn()` 已經把它算進跨 CDN 次數與這一分鐘的拉回，
+    /// 這裡照樣記成這家 CDN 的「拉回」（連線去向的三塊要加得起來），另外記一筆 `cross`，
+    /// 加速次數合計時扣掉；這一分鐘的拉回不再加（以前同一次連線算兩次）。在既有的鎖裡多一次比較、一個計數
+    pub fn route(&self, provider: &str, abroad: bool, tw: bool, saved_ms: Option<f64>, cross: bool) {
         self.with(|i| {
             let r = i.day.route.entry(provider.to_string()).or_default();
             r.n += 1;
@@ -1182,7 +1191,11 @@ impl Stats {
                     r.saved += ms;
                     r.saved_n += 1;
                 }
-                i.minute(Self::now_min()).acc += 1;
+                if cross {
+                    r.cross += 1;
+                } else {
+                    i.minute(Self::now_min()).acc += 1;
+                }
             } else {
                 r.miss += 1;
             }
@@ -1530,11 +1543,68 @@ mod tests {
         );
     }
 
+    /// 連線去向圖（3.5.1）的三塊：原本就在台灣 + 拉回台灣 + 仍在國外 = 連線數（`n = (n − abroad) + acc + miss`）
+    #[test]
+    fn route_splits_every_connection_into_three() {
+        let s = Stats::default();
+        s.route("cloudflare", false, false, None, false); // 一般 DNS 給的已經是台灣節點
+        s.route("cloudflare", false, true, None, false); // 一樣算原本就在台灣（沒有出國可以拉回）
+        s.route("cloudflare", true, true, Some(30.0), false); // 拉回台灣
+        s.route("cloudflare", true, false, None, false); // 仍在國外
+        s.route("cloudflare", true, true, Some(5000.0), false); // 拉回台灣；省下的時間不合理，不算樣本
+        let daily = s.daily();
+        let day = &daily.last().unwrap().1["route"]["cloudflare"];
+        let g = |k: &str| day[k].as_u64().unwrap();
+        assert_eq!((g("n"), g("abroad"), g("acc"), g("miss"), g("savedN")), (5, 3, 2, 1, 1));
+        assert_eq!(g("n") - g("abroad") + g("acc") + g("miss"), g("n"));
+        assert_eq!(g("abroad"), g("acc") + g("miss"));
+    }
+
+    /// 3.5.1：同一次連線同時是跨 CDN 又是拉回台灣（在台灣有節點的 CDN 走跨 CDN）：跨 CDN 次數、
+    /// 這家 CDN 的拉回、這一分鐘的拉回各只加 1；另外記一筆 `cross`，加速次數合計時扣掉
+    #[test]
+    fn cross_and_route_count_once() {
+        let s = Stats::default();
+        s.cdn("cloudflare", Some("cross"), Some("cloudfront"));
+        s.route("cloudflare", true, true, Some(20.0), true);
+        let daily = s.daily();
+        let d = &daily.last().unwrap().1;
+        assert_eq!(d["crossRewrite"], 1);
+        assert_eq!(d["cross"]["cloudflare>cloudfront"], 1);
+        let r = &d["route"]["cloudflare"];
+        assert_eq!(
+            (r["n"].as_u64(), r["acc"].as_u64(), r["cross"].as_u64()),
+            (Some(1), Some(1), Some(1))
+        );
+        let acc: u64 = s
+            .realtime()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["accelerated"].as_u64().unwrap())
+            .sum();
+        assert_eq!(acc, 1, "這一分鐘的拉回只算一次");
+        // 一般的拉回（不是跨 CDN）照舊
+        s.route("cloudflare", true, true, None, false);
+        let acc: u64 = s
+            .realtime()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["accelerated"].as_u64().unwrap())
+            .sum();
+        assert_eq!(acc, 2);
+        // 存下來再讀回：cross 保留；3.5.1 之前的日子沒有這個欄位當 0
+        let t = Stats::default();
+        assert!(t.restore(&s.snapshot()));
+        assert_eq!(t.daily().last().unwrap().1["route"]["cloudflare"]["cross"], 1);
+    }
+
     #[test]
     fn snapshot_restore_and_history() {
         let s = Stats::default();
         s.count(Kind::Query);
-        s.route("cloudflare", true, true, Some(30.0));
+        s.route("cloudflare", true, true, Some(30.0), false);
         let today = taipei_date(now_unix());
         let snap: Value = serde_json::from_slice(&s.snapshot()).unwrap();
         assert_eq!(snap["days"][0]["date"], today);

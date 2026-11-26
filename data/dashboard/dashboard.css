@@ -131,7 +131,7 @@
 .kd .gauge .name { font-weight: 700; display: flex; align-items: center; gap: 8px; }
 .kd .gauge .name i { width: 10px; height: 10px; border-radius: 3px; }
 .kd .gauge dl { margin: 6px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
-.kd .gauge dt { color: var(--text-3); }
+.kd .gauge dt { color: var(--text-3); white-space: nowrap; }
 .kd .gauge dd { margin: 0; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text); }
 .kd .cross { padding: 18px; display: grid; grid-template-columns: 120px 1fr; gap: 22px; align-items: center; }
 .kd .cross svg.ring { width: 120px; height: 120px; }
@@ -181,3 +181,28 @@
 .kd .kd-find-row { padding: 4px 0; font-size: 13.5px; }
 .kd .kd-dim { opacity: .55; }
 .kd .kd-warn { color: var(--warn); font-size: 13px; }
+
+/* CDN 連線去向（3.5.1）：桌機兩段式流向圖、手機每家 CDN 一條堆疊橫條；顏色以外再加圖樣（拉回 = 斜線、國外 = 點點） */
+.kd .flowchart svg { overflow: visible; }
+.kd .flowchart text.flow-lbl { font: 600 13px var(--font); fill: var(--text); }
+.kd .flowchart text.flow-lbl.dim { fill: var(--text-2); font-weight: 500; font-style: italic; }
+.kd .flowchart text.flow-num { font: 12px var(--mono); fill: var(--text-3); }
+.kd .flowchart .band { cursor: default; transition: fill-opacity .15s; }
+.kd .flow-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--text-2); margin-bottom: 10px; }
+.kd .flow-legend i, .kd .flow-nums i { display: inline-block; width: 14px; height: 10px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.kd .fpat-acc { background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.55) 0 2px, transparent 2px 5px); }
+.kd .fpat-still { background-image: radial-gradient(circle, rgba(255,255,255,.8) 1.1px, transparent 1.7px); background-size: 5px 5px; }
+.kd .flow-bars { display: grid; gap: 14px; }
+.kd .flow-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 14px; margin-bottom: 4px; min-width: 0; }
+.kd .flow-head b { font-weight: 650; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kd .flow-head span { font: 12.5px var(--mono); color: var(--text-3); white-space: nowrap; }
+.kd .flow-row.other .flow-head b, .kd .flow-row.unknown .flow-head b { color: var(--text-2); font-weight: 500; font-style: italic; }
+.kd .flow-stack { display: flex; gap: 2px; height: 16px; border-radius: 6px; overflow: hidden; background: var(--track); }
+.kd .flow-stack > div { height: 100%; min-width: 2px; }
+.kd .flow-nums { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12.5px; color: var(--text-2); margin-top: 5px; font-variant-numeric: tabular-nums; }
+.kd .flow-note { font-size: 12.5px; color: var(--text-3); margin: 10px 0 0; }
+.kd details.table tr.sum td { font-weight: 650; color: var(--text); }
+.kd details.table tr.other td:first-child, .kd details.table tr.unknown td:first-child { font-style: italic; }
+/* 「其他」（量太小合併）與「沒辨識出來」：灰色、斜體，跟一般的 CDN 分開 */
+.kd .rank-row.other .name, .kd .cross .pair.other .lbl, .kd .cross .pair.unknown .lbl, .kd .gauge.other .name, .kd .gauge.unknown .name { color: var(--text-2); font-style: italic; font-weight: 500; }
+.kd .stack-legend small { display: block; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }

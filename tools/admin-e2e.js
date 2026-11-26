@@ -20,6 +20,7 @@ const ROOT = path.resolve(__dirname, '..');
 const BIN = process.env.KUROSHIO_BIN ? path.resolve(process.env.KUROSHIO_BIN) : path.join(ROOT, 'target', 'debug', process.platform === 'win32' ? 'kuroshio.exe' : 'kuroshio');
 const SHOTS = path.resolve(process.env.SHOTS || 'screenshots-admin');
 const WEB = path.join(ROOT, 'data', 'admin');
+const { checkFlow, checkFlowEmpty, checkOtherParts } = require('./flow-check.js');
 
 let pass = 0, fail = 0;
 const ok = m => { pass++; console.log(`  ✔ ${m}`); };
@@ -1002,6 +1003,26 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             const routing = await sp.textContent('#kd-routing');
             check(/Cloudflare/.test(routing) && /CloudFront/.test(routing) && await sp.locator('#kd-routing .gauge').count() >= 3, '儀表板：機會成本（表格與環形儀表）', routing.slice(0, 200));
             check(await sp.locator('#kd-map svg').count() >= 1, '儀表板：路由地圖');
+            // 3.5.1：CDN 連線去向（數字跟 /api/dashboard 一致）；其他圖的「其他」與「沒辨識出來」分開、估計值標樣本數
+            const dashApi = async range => JSON.parse((await raw(adminPort, 'GET', `/api/dashboard?range=${range}`, { Authorization: `Bearer ${token}` })).body);
+            const flowShot = name => sp.locator('#kd-routing .kd-flowcard').screenshot({ path: path.join(SHOTS, `${name}.png`) });
+            const today = await dashApi('today');
+            check(today.routing.length === 7 && today.routing.every(r => r.alreadyTw + r.accelerated + r.stillAbroad === r.connections && typeof r.savedSamples === 'number'),
+                '/api/dashboard 的 routing：三塊加起來等於連線數、平均縮短帶樣本數', JSON.stringify(today.routing).slice(0, 300));
+            for (const c of await checkFlow(sp, '#kd-routing .flowchart', '#kd-routing .kd-flowcard table', today.routing, 1280, '管理頁 淺色 1280 px')) check(...c);
+            for (const c of [...await checkFlowEmpty(sp, '管理頁'), ...await checkOtherParts(sp, '管理頁')]) check(...c);
+            check(await sp.locator('#kd-routing .gauge').count() === 6 && await sp.locator('#kd-routing .gauge.other').count() === 1, '儀表板：環形儀表前 5 家＋「其他」一張');
+            check(/其他 2 家/.test(await sp.textContent('#kd-live .rank-row.other')), '儀表板：CDN 排行前 8 家以外合併成「其他」');
+            const tilesText = await sp.textContent('#kd-overview .tiles');
+            check(/次量測/.test(tilesText) && /網站中位數差距/.test(tilesText) && /個網站兩邊都量到/.test(tilesText), '儀表板：平均縮短、網站中位數旁邊標樣本數', tilesText.slice(0, 300));
+            // 3.5.1：網站中位數含台灣比較慢的網站，可以是負的：負的寫「慢」、不寫「縮短」，跟 API 的正負一致
+            const med = today.acceleration.medianSavedMs;
+            check(typeof med !== 'number' || (med < 0 ? /台灣節點慢/.test(tilesText) : med > 0 ? /台灣節點快/.test(tilesText) : /兩邊一樣/.test(tilesText)), '儀表板：網站中位數的說明跟正負一致', `${med} / ${tilesText.slice(0, 200)}`);
+            const mt = await sp.evaluate(() => [-5, 12.5, 0, null].map(v => window.KuroshioDashboard.medianText(v)));
+            check(JSON.stringify(mt) === JSON.stringify(['台灣節點慢 5 ms', '台灣節點快 12.5 ms', '兩邊一樣', '—']) && !mt.some(t => /縮短/.test(t)), '儀表板：中位數是負的時寫「慢」、不寫「縮短」', JSON.stringify(mt));
+            const rtHead = await sp.textContent('#kd-routing .tbl table tr');
+            check(/原本就在台灣/.test(rtHead) && /量測樣本/.test(rtHead), '儀表板：機會成本表多「原本就在台灣」「量測樣本」', rtHead);
+            await flowShot('flow-admin-light-1280');
             // 每張折線圖的 y 軸刻度（text-anchor = end 的 axis 標籤）不能重複；剛啟動的服務流量幾乎為 0，涵蓋最大值 0～1 的情況
             const dupAxes = await sp.evaluate(() => [...document.querySelectorAll('#tab-dashboard .chart svg')].map((s, i) => {
                 const ends = [...s.querySelectorAll('text.axis[text-anchor="end"]')];
@@ -1030,6 +1051,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             await sp.waitForTimeout(800);
             const dw = await sp.evaluate(() => document.documentElement.scrollWidth);
             check(dw <= 391, '儀表板：390 px 寬沒有水平捲動（寬表格在框裡捲動）', `scrollWidth = ${dw}`);
+            const week = await dashApi('7d');
+            for (const c of await checkFlow(sp, '#kd-routing .flowchart', '#kd-routing .kd-flowcard table', week.routing, 390, '管理頁 淺色 390 px（7 天）')) check(...c);
+            await flowShot('flow-admin-light-390');
             await sp.screenshot({ path: path.join(SHOTS, '14-dashboard-mobile.png'), fullPage: true });
             await sp.emulateMedia({ colorScheme: 'dark' });
             await sp.setViewportSize({ width: 1280, height: 900 });
@@ -1038,8 +1062,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             const crgb = (cardBg.match(/\d+/g) || []).slice(0, 3).map(Number);
             check(crgb.length === 3 && crgb[0] + crgb[1] + crgb[2] < 150, '儀表板：深色模式', cardBg);
             await sp.screenshot({ path: path.join(SHOTS, '15-dashboard-dark.png'), fullPage: true });
+            for (const c of await checkFlow(sp, '#kd-routing .flowchart', '#kd-routing .kd-flowcard table', week.routing, 1280, '管理頁 深色 1280 px')) check(...c);
+            await flowShot('flow-admin-dark-1280');
             await sp.setViewportSize({ width: 390, height: 844 });
             await sp.waitForTimeout(500);
+            for (const c of await checkFlow(sp, '#kd-routing .flowchart', '#kd-routing .kd-flowcard table', week.routing, 390, '管理頁 深色 390 px')) check(...c);
+            await flowShot('flow-admin-dark-390');
             await sp.screenshot({ path: path.join(SHOTS, '16-dashboard-dark-mobile.png'), fullPage: true });
             check(csp.length === 0, '儀表板：沒有 JavaScript 錯誤、沒有違反 CSP', csp.join('\n     '));
             await strict.close();
