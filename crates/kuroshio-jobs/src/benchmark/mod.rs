@@ -1102,8 +1102,8 @@ pub struct Cand {
 /// 回傳（候選、社群好友提供的個數）
 pub fn candidate_ids(paths: &BenchPaths) -> (Vec<Cand>, usize) {
     let cand = |(id, tag): (String, Tag)| Cand { id, tag };
-    let mut udp: Vec<Cand> = paths.read_lists_tagged("iplist.txt").into_iter().map(cand).collect();
-    let mut doh: Vec<Cand> = paths
+    let udp: Vec<Cand> = paths.read_lists_tagged("iplist.txt").into_iter().map(cand).collect();
+    let doh: Vec<Cand> = paths
         .read_lists_tagged("dohlist.txt")
         .into_iter()
         .map(|(l, t)| cand((pick_token(&l, "http"), t)))
@@ -1146,28 +1146,6 @@ pub fn candidate_ids(paths: &BenchPaths) -> (Vec<Cand>, usize) {
         .filter_map(|x| x.as_str().map(str::to_string))
         .take(MAX_SHARED)
         .collect();
-    let shared_tag = || Tag {
-        tier: Tier::B,
-        ..Default::default()
-    };
-    for id in &shared {
-        if id.starts_with("https://") || id.starts_with("tls://") {
-            if !doh.iter().any(|c| c.id == *id) {
-                doh.push(Cand {
-                    id: id.clone(),
-                    tag: shared_tag(),
-                });
-            }
-        } else {
-            let ip = id.strip_prefix("udp://").unwrap_or(id);
-            if ip.parse::<IpAddr>().is_ok() && !udp.iter().any(|u| u.id == ip) {
-                udp.push(Cand {
-                    id: ip.to_string(),
-                    tag: shared_tag(),
-                });
-            }
-        }
-    }
     if !shared.is_empty() {
         info!("社群好友提供的上游候選 {} 個", shared.len());
     }
@@ -1196,6 +1174,35 @@ pub fn candidate_ids(paths: &BenchPaths) -> (Vec<Cand>, usize) {
     all.extend(dot);
     all.extend(h3);
     all.extend(stamps);
+    // 社群好友提供的放在所有名單之後，用正規化後的 id 跟全部名單比（3.5.1 M2）：以前只跟 DoH 名單比、又排在 DoT 名單前面，
+    // 好友給的 `tls://x:853` 先到先得，蓋掉名單裡 A 級的 `tls://x`（分級變 B、經營者標記沒了、評測歷史斷掉）
+    let norm = |id: &str| Upstream::parse(id).map(|u| u.id).ok();
+    let mut seen: HashSet<String> = all.iter().filter_map(|c| norm(&c.id)).collect();
+    let shared_tag = || Tag {
+        tier: Tier::B,
+        ..Default::default()
+    };
+    let mut push = |all: &mut Vec<Cand>, id: String| {
+        if let Some(k) = norm(&id) {
+            if seen.insert(k) {
+                all.push(Cand { id, tag: shared_tag() });
+            }
+        }
+    };
+    for id in &shared {
+        if id.starts_with("https://") || id.starts_with("tls://") {
+            push(&mut all, id.clone());
+            // DoH 也用 HTTP/3 測（同名單裡的 DoH）
+            if let Some(r) = id.strip_prefix("https://") {
+                push(&mut all, format!("h3://{r}"));
+            }
+        } else {
+            let ip = id.strip_prefix("udp://").unwrap_or(id);
+            if ip.parse::<IpAddr>().is_ok() {
+                push(&mut all, ip.to_string());
+            }
+        }
+    }
     (all, n)
 }
 
@@ -1446,6 +1453,10 @@ impl Benchmark {
         // 學習資料（3.5.0）：執行時上線以來從未成功的（主程式登記的）今天照測、不選；排除 3 次之後忘掉重來
         let mut learned = self.paths.learn_file.as_ref().map(|p| learn::Learn::load(p));
         let (never_ok, mut learn_dirty) = learned.as_mut().map(|l| l.take_never_ok_round()).unwrap_or_default();
+        // 評測歷史的鍵用正規化後的 id（3.5.1 M2）：同一台不同寫法（`tls://x`／`tls://x:853`）是同一份歷史；舊的鍵合併
+        if let Some(l) = learned.as_mut() {
+            learn_dirty |= l.hist_rekey(|k| Upstream::parse(k).ok().map(|u| u.id)) > 0;
+        }
         let never_ok: HashSet<String> = never_ok.into_iter().collect();
         let today_n = learn::day_of(now);
         // 不支援 HTTP/3 的 DoH（3.5.0 A6）：它的 https:// 已經不在名單的刪掉
@@ -1552,7 +1563,7 @@ impl Benchmark {
             if s.pinned || s.protected.is_some() {
                 return None;
             }
-            learned.as_ref().filter(|l| today_n >= l.day).and_then(|l| l.hist.get(&s.id))
+            learned.as_ref().filter(|l| today_n >= l.day).and_then(|l| l.hist.get(&s.up.id))
         };
         let eff: Vec<Tier> = all.iter().map(|s| tiers::effective_tier(s.tag.tier, hist_of(s), today_n)).collect();
         let manual_a = all.iter().filter(|s| s.selectable() && s.tag.tier == Tier::A).count();
@@ -2372,7 +2383,7 @@ impl Benchmark {
                 .iter()
                 .filter(|s| general(s) && s.tag.tier != Tier::User && !dead.contains(&s.kind))
                 .map(|s| tiers::Tested {
-                    id: s.id.clone(),
+                    id: s.up.id.clone(),
                     manual: s.tag.tier,
                     // 惡意網站探測判出有擋的：今天不選，算沒倖存
                     survived: s.alive && !s.malware_filter,
@@ -2382,7 +2393,7 @@ impl Benchmark {
                     trial_ok: !s.never_ok && cfg.select.auto_types.iter().any(|t| t == s.kind),
                 })
                 .collect();
-            let listed: HashSet<&str> = ids.iter().map(|c| c.id.as_str()).collect();
+            let listed: HashSet<String> = ids.iter().filter_map(|c| Upstream::parse(&c.id).ok().map(|u| u.id)).collect();
             let ch = tiers::update_history(&mut l.hist, &tested, today_n, |k| listed.contains(k));
             l.hist_cap(|k| listed.contains(k));
             learn_dirty = true;
@@ -2407,9 +2418,11 @@ impl Benchmark {
                 ] {
                     for id in list.iter().take(20) {
                         let h = l.hist.get(id).copied().unwrap_or_default();
+                        // 鍵是正規化後的 id；記錄裡寫名單的寫法
+                        let shown = all.iter().find(|s| s.up.id == *id).map(|s| s.id.as_str()).unwrap_or(id);
                         jimp!(
                             journal,
-                            "   [{what}] {id}：近 30 天測到 {} 天、倖存 {} 天、可疑 {} 天、延遲 {} ±{} ms",
+                            "   [{what}] {shown}：近 30 天測到 {} 天、倖存 {} 天、可疑 {} 天、延遲 {} ±{} ms",
                             h.tested(),
                             h.survived(),
                             h.suspect(),
@@ -3730,6 +3743,41 @@ mod list_merge_tests {
         assert_eq!(tier("https://friend.example.net/dns-query"), Some(Tier::B));
         assert_eq!(tier("h3://friend.example.net/dns-query"), Some(Tier::B));
         assert_eq!(tier("192.0.2.53"), Some(Tier::B));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 3.5.1（M2）：好友候選放在所有名單之後、用正規化後的 id 跟全部名單比：
+    /// 好友給的 `tls://x:853` 不會蓋掉名單裡 A 級的 `tls://x`，`udp://` 寫法也比得出重複
+    #[test]
+    fn shared_candidates_never_shadow_listed_ones() {
+        let (root, mut p) = two_lists("shadow");
+        p.default_list_dir = None;
+        std::fs::write(p.list_dir.join("dotlist.txt"), "tls://dot.example.com  # tier=A op=Example_Dot\n").unwrap();
+        std::fs::write(p.list_dir.join("iplist.txt"), "192.0.2.53\n").unwrap();
+        let f = p.community_candidates.clone().unwrap();
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        let ids = [
+            "tls://dot.example.com:853",
+            "udp://192.0.2.53:53",
+            "tls://friend.example.net",
+            "https://friend.example.net/dns-query",
+        ];
+        std::fs::write(&f, serde_json::to_vec(&json!({ "ids": ids })).unwrap()).unwrap();
+        let (c, _) = candidate_ids(&p);
+        let got: Vec<&str> = c.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "192.0.2.53",
+                "tls://dot.example.com",
+                "tls://friend.example.net",
+                "https://friend.example.net/dns-query",
+                "h3://friend.example.net/dns-query"
+            ],
+            "好友的排在最後、重複的不收"
+        );
+        assert_eq!(c[1].tag.tier, Tier::A);
+        assert_eq!(c[1].tag.op, "Example_Dot");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

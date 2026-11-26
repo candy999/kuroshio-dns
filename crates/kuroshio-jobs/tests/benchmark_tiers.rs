@@ -27,6 +27,8 @@ use tokio::net::UdpSocket;
 /// 一台假 DNS：正常回答；`up` 關掉時不回應；`hits` 是收到的查詢數
 struct Mock {
     id: String,
+    /// 評測歷史的鍵（3.5.1 起是正規化後的 id：`udp://位址`）
+    key: String,
     hits: Arc<AtomicUsize>,
     up: Arc<AtomicBool>,
 }
@@ -65,7 +67,8 @@ async fn mock(n: u8, delay_ms: u64) -> Mock {
             });
         }
     });
-    Mock { id, hits, up }
+    let key = format!("udp://{id}");
+    Mock { id, key, hits, up }
 }
 
 struct LocalOnly;
@@ -358,10 +361,10 @@ async fn failed_run_does_not_touch_history() {
     run(&p, "ab", &clock).await;
     let h = learn(&p).hist;
     assert_eq!(h.len(), 53, "A 級 3、B 級 50；使用者自己加的不記");
-    assert!(!h.contains_key(&l.user.id));
-    let dead = h[&l.a[0].id];
+    assert!(!h.contains_key(&l.user.key));
+    let dead = h[&l.a[0].key];
     assert_eq!((dead.tested(), dead.survived(), dead.suspect()), (1, 0, 0));
-    let ok = h[&l.a[1].id];
+    let ok = h[&l.a[1].key];
     assert_eq!((ok.tested(), ok.survived()), (1, 1));
     assert!(ok.ms > 0.0);
     // 第 2 天：整台斷網（全部連不上）→ 評測失敗，歷史不動：不能把本機的問題記到候選頭上
@@ -378,7 +381,7 @@ async fn failed_run_does_not_touch_history() {
         m.up.store(true, Ordering::Relaxed);
     }
     run(&p, "ab", &clock).await;
-    let ok = learn(&p).hist[&l.a[1].id];
+    let ok = learn(&p).hist[&l.a[1].key];
     assert_eq!((ok.tested(), ok.survived(), ok.t), (2, 2, 0b101));
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -412,14 +415,14 @@ async fn history_demotes_a_and_pulls_up_b() {
             up["tiers"]
         );
         for id in &trial {
-            let m = l.b.iter().find(|m| m.id == *id).unwrap();
+            let m = l.b.iter().find(|m| m.key == *id).unwrap();
             assert!(m.hits.load(Ordering::Relaxed) > 0, "第 {day} 天沒測試用中的 {id}");
         }
         assert_eq!(up["tiers"]["a"], 3, "第 {day} 天：還沒降級");
     }
     // 第 7 天：連續 7 天沒倖存 → 降級（只影響測不測）
     assert_eq!(up["tiers"]["demotedToday"], 1, "{}", up["tiers"]);
-    assert_eq!(learn(&p).hist[&l.a[0].id].e, HistState::Demoted);
+    assert_eq!(learn(&p).hist[&l.a[0].key].e, HistState::Demoted);
     let log = report(&p, &up, "judge.log");
     assert!(
         log.contains(&format!("[降級] {}：近 30 天測到 7 天、倖存 0 天", l.a[0].id)),
@@ -464,7 +467,7 @@ async fn demotion_fuse_and_unreadable_learn_file_fall_back_to_manual_tiers() {
     // 3 台 A 級裡 1 台降級：照降（今天不測）
     let mut lf = Learn::default();
     lf.day = today - 1;
-    lf.hist.insert(l.a[0].id.clone(), demoted);
+    lf.hist.insert(l.a[0].key.clone(), demoted);
     lf.save(&p.learn_file.clone().unwrap()).unwrap();
     let up = run(&p, "a", &clock).await;
     assert_eq!((up["tiers"]["a"].as_u64(), up["tiers"]["demoted"].as_u64()), (Some(2), Some(1)));
@@ -472,8 +475,8 @@ async fn demotion_fuse_and_unreadable_learn_file_fall_back_to_manual_tiers() {
     // 3 台裡 2 台降級（超過三分之一）：多半是線路的問題 → 今天不採用降級，全部照人工分級測
     let mut lf = Learn::default();
     lf.day = today - 1;
-    lf.hist.insert(l.a[0].id.clone(), demoted);
-    lf.hist.insert(l.a[1].id.clone(), demoted);
+    lf.hist.insert(l.a[0].key.clone(), demoted);
+    lf.hist.insert(l.a[1].key.clone(), demoted);
     lf.save(&p.learn_file.clone().unwrap()).unwrap();
     l.reset();
     let up = run(&p, "a", &clock).await;
@@ -493,6 +496,6 @@ async fn demotion_fuse_and_unreadable_learn_file_fall_back_to_manual_tiers() {
     assert_eq!((up["tiers"]["a"].as_u64(), up["tiers"]["demoted"].as_u64()), (Some(3), Some(0)));
     assert_eq!(up["tiers"]["promoted"], 0);
     // 評測完重新寫出一份好的
-    assert_eq!(learn(&p).hist[&l.a[0].id].tested(), 1);
+    assert_eq!(learn(&p).hist[&l.a[0].key].tested(), 1);
     let _ = std::fs::remove_dir_all(&root);
 }

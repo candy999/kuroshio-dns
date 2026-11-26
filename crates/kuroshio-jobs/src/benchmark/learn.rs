@@ -643,6 +643,27 @@ impl Learn {
         over
     }
 
+    /// `hist` 的鍵換成正規化後的 id（3.5.1 M2）：`norm` 回傳正規化後的 id（解析不了的回 None，鍵不動）。
+    /// 同一台有好幾個寫法的（例如 `tls://x` 與 `tls://x:853`）合成一筆：留最後記錄比較新的（一樣新就留測到天數多的）。
+    /// 回傳改了幾筆
+    pub fn hist_rekey(&mut self, norm: impl Fn(&str) -> Option<String>) -> usize {
+        let moved: Vec<(String, String)> = self
+            .hist
+            .keys()
+            .filter_map(|k| norm(k).filter(|n| n != k).map(|n| (k.clone(), n)))
+            .collect();
+        for (old, new) in &moved {
+            let Some(h) = self.hist.remove(old) else { continue };
+            match self.hist.get(new) {
+                Some(cur) if (cur.last, cur.tested()) >= (h.last, h.tested()) => {}
+                _ => {
+                    self.hist.insert(new.clone(), h);
+                }
+            }
+        }
+        moved.len()
+    }
+
     /// 今天在跳過期間的筆數
     pub fn h3_skipping_count(&self, today: u32) -> usize {
         self.h3skip.keys().filter(|k| self.h3_skipping(k, today)).count()
@@ -692,6 +713,37 @@ mod tests {
         assert_eq!(l.day, 5);
         assert_eq!(l.never_ok.len(), 1);
         assert_eq!(l.never_ok["a"], NeverOk { since: 1, n: 2 });
+    }
+
+    /// 3.5.1（M2）：`hist` 的鍵換成正規化後的 id；同一台好幾個寫法的合成一筆（留比較新的）
+    #[test]
+    fn hist_rekey_merges_spellings() {
+        let mut l = Learn::default();
+        let h = |last: u32, t: u32| Hist {
+            t,
+            s: t,
+            last,
+            ..Default::default()
+        };
+        l.hist.insert("tls://dot.example.com".into(), h(100, 0b111));
+        l.hist.insert("tls://dot.example.com:853".into(), h(98, 0b1));
+        l.hist.insert("192.0.2.1".into(), h(100, 1));
+        l.hist.insert("https://dns.example.com/dns-query".into(), h(100, 1));
+        let norm = |k: &str| -> Option<String> {
+            if let Some(h) = k.strip_prefix("tls://") {
+                Some(if h.contains(':') { k.to_string() } else { format!("tls://{h}:853") })
+            } else if k.parse::<std::net::IpAddr>().is_ok() {
+                Some(format!("udp://{k}:53"))
+            } else {
+                Some(k.to_string())
+            }
+        };
+        assert_eq!(l.hist_rekey(norm), 2);
+        assert_eq!(l.hist.len(), 3);
+        assert_eq!(l.hist["tls://dot.example.com:853"].last, 100, "留比較新的");
+        assert_eq!(l.hist["tls://dot.example.com:853"].tested(), 3);
+        assert!(l.hist.contains_key("udp://192.0.2.1:53"));
+        assert_eq!(l.hist_rekey(norm), 0, "換過之後不再動");
     }
 
     #[test]
