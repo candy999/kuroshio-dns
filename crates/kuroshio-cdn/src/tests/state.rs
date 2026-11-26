@@ -701,7 +701,10 @@ fn one_shot_domains_forgotten_without_budget() {
         }
         st.db.touch("kept.example.com", "cloudflare", "ip", &[], &[], None);
         st.db.get_mut("kept.example.com").unwrap().last_seen = old;
-        st.db.set_verdict("kept.example.com", 4, |v| v.verdict = Some("ok".into()));
+        st.db.set_verdict("kept.example.com", 4, |v| {
+            v.verdict = Some("ok".into());
+            v.until = Some(crate::util::now_ms() + 86_400_000);
+        });
         st.db.take_marks(false);
     });
     let shards = c.state().db.shards;
@@ -710,8 +713,88 @@ fn one_shot_domains_forgotten_without_budget() {
         total += c.budget_round().forgot;
     }
     assert_eq!(total, 2000, "{shards} 片、每輪 1/16，一圈之內忘光");
-    assert!(c.state().db.get("kept.example.com").is_some(), "有學習資料的不動");
+    assert!(c.state().db.get("kept.example.com").is_some(), "還有效的學習資料不動");
     assert_eq!(c.status_lite()["forgotOneShot"], json!(2000));
+}
+
+/// 3.5.0 寫的分片（D3 R1）：不是 `cdn.lite` 的機器第一次查詢就驗證，一次性網域都帶著到期的驗證結果與 `best`。
+/// 升級後照樣忘得掉；還有效的、問過兩次的、最近出現的留著。`budget_round` 的累計記在 `forgotOneShot`
+#[test]
+fn one_shot_domains_from_3_5_0_data_are_forgotten() {
+    let paths = paths_no_seed("forget-3.5.0");
+    let dir = paths.state_dir.clone();
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = now_ms();
+    let day = 86_400_000u64;
+    let old = now - 5 * day;
+    let mut domains = Vec::new();
+    for i in 0..600u32 {
+        let name = format!("o{:08x}.example.net", crate::db::name_hash(&i.to_string()));
+        let failed = i % 3 == 0;
+        let verdict = if failed { "fail" } else { "ok" };
+        let best = if failed { Value::Null } else { json!("alias") };
+        domains.push(
+            json!({ "name": name, "provider": "cloudflare", "via": "ip", "firstSeen": old, "lastSeen": old,
+            "hits": 1, "ips4": ["104.21.0.5"], "policy": "auto",
+            "v4": { "verdict": verdict, "fails": u32::from(failed),
+                    "until": old + day, "algo": 2, "pop": "TPE", "ms": 12.5, "status": 200, "ip": "104.16.0.1", "at": old },
+            "best": best }),
+        );
+    }
+    let keep = [
+        (
+            "live.example.com",
+            1,
+            old,
+            json!({ "verdict": "ok", "until": now + day, "algo": 2 }),
+        ),
+        (
+            "twice.example.com",
+            2,
+            old,
+            json!({ "verdict": "ok", "until": old + day, "algo": 2 }),
+        ),
+        (
+            "recent.example.com",
+            1,
+            now - day,
+            json!({ "verdict": "ok", "until": now, "algo": 2 }),
+        ),
+    ];
+    for (name, hits, seen, v4) in &keep {
+        domains.push(
+            json!({ "name": name, "provider": "cloudflare", "via": "ip", "firstSeen": old, "lastSeen": seen,
+            "hits": hits, "ips4": ["104.21.0.5"], "policy": "auto", "v4": v4, "best": "alias" }),
+        );
+    }
+    std::fs::write(
+        dir.join(crate::db::FILE),
+        serde_json::to_vec(&json!({ "savedAt": "2026-11-11T00:00:00.000Z", "domains": domains })).unwrap(),
+    )
+    .unwrap();
+    // 先照 3.5.0 的樣子寫成分片（搬家那一次整份重寫），再從分片重新啟動：之後就跟升級後的 D3 一樣
+    let c = Cdn::load(&budget_cfg(0), paths.clone(), MockNet::new());
+    let (_, ch) = c.snapshots_sharded(false);
+    write_changes(&c, &dir, &ch);
+    drop(c);
+    let c = Cdn::load(&budget_cfg(0), paths, MockNet::new());
+    assert_eq!(c.state().db.domains.len(), 603);
+    assert!(!c.state().db.changed(), "從分片讀回來，沒有要寫的");
+    let shards = c.state().db.shards;
+    let mut total = 0;
+    for _ in 0..(shards / 16 + 1) {
+        let r = c.budget_round();
+        assert_eq!(r.dropped, 0, "沒有預算：不是預算淘汰");
+        total += r.forgot;
+    }
+    assert_eq!(total, 600, "輪完一圈，3.5.0 資料裡的一次性網域全部忘掉");
+    for (name, ..) in &keep {
+        assert!(c.state().db.get(name).is_some(), "{name} 要留著");
+    }
+    let st = c.status_lite();
+    assert_eq!(st["forgotOneShot"], json!(600));
+    assert_eq!(st["prunedForBudget"], json!(0));
+    assert_eq!(st["prunedRounds"], json!(0));
 }
 
 #[test]
@@ -732,6 +815,7 @@ fn budget_round_sweeps_in_rounds_and_survives_restart() {
     let mut rewritten = vec![0u32; shards];
     let mut rounds = 0;
     let mut dropped = 0;
+    let mut pruned_rounds = 0u64;
     loop {
         let r = c.budget_round();
         if r.shards == 0 {
@@ -740,6 +824,11 @@ fn budget_round_sweeps_in_rounds_and_survives_restart() {
         rounds += 1;
         assert!(r.forced <= 16 && r.shards <= 32, "每輪上限：{r:?}");
         dropped += r.dropped;
+        pruned_rounds += u64::from(r.dropped > 0);
+        // 每一輪結束時狀態頁就跟上（D3 R1：升級後第一次套用預算、主動重寫的這條路徑也要記到）
+        let st = c.status_lite();
+        assert_eq!(st["prunedForBudget"], json!(dropped), "第 {rounds} 輪");
+        assert_eq!(st["prunedRounds"], json!(pruned_rounds), "第 {rounds} 輪");
         let (_, ch) = c.snapshots_sharded(false);
         assert!(ch.manifest.is_none(), "不動分片清單");
         assert!(ch.changed.len() <= 32, "一輪最多重寫 32 片：{}", ch.changed.len());
@@ -764,6 +853,7 @@ fn budget_round_sweeps_in_rounds_and_survives_restart() {
     assert_eq!(st["dbBudgetKB"], json!(512));
     assert_eq!(st["dbBudgetEntries"], json!(limit));
     assert_eq!(st["prunedForBudget"], json!(dropped));
+    assert!(pruned_rounds >= 8, "{pruned_rounds}");
     assert_eq!(st["dbEntries"], json!(left));
     // 重新啟動：內容一樣，在預算以內，不再淘汰
     let c2 = Cdn::load(&budget_cfg(512), paths, MockNet::new());

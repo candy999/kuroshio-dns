@@ -463,6 +463,7 @@ fn now_unix() -> u64 {
 }
 
 /// 常見的多層公共尾碼（不需要完整 Public Suffix List 也能處理大部分台灣 / 亞洲網站，同 2.x）
+#[rustfmt::skip]
 const MULTI_SUFFIX: &[&str] = &[
     "com.tw",
     "net.tw",
@@ -510,6 +511,12 @@ const MULTI_SUFFIX: &[&str] = &[
     "com.mx",
     "co.nz",
     "com.tr",
+];
+
+/// 託管平台的尾碼（Public Suffix List 的 private 段）：底下每一個名稱是不同使用者的網站，所以跟 [`MULTI_SUFFIX`] 一樣
+/// 多算一段當主網域。開機預熱名單另外限制同一個平台底下的總筆數（`cache::WARM_PER_PLATFORM`，3.5.1）：
+/// 這些平台大多對任何子網域都回答，隨機名稱查幾次就是「正常有答案、命中 2 次以上」
+pub const PLATFORM_SUFFIX: &[&str] = &[
     "github.io",
     "herokuapp.com",
     "blogspot.com",
@@ -555,10 +562,17 @@ fn site_slice(n: &str) -> Option<&str> {
     // 從右邊數第 k 個點之後的部分（沒有那麼多層就是整個名稱）
     let tail = |k: usize| n.rmatch_indices('.').nth(k - 1).map_or(n, |(i, _)| &n[i + 1..]);
     let last2 = tail(2);
-    if MULTI_SUFFIX.contains(&last2) {
+    if MULTI_SUFFIX.contains(&last2) || PLATFORM_SUFFIX.contains(&last2) {
         return Some(tail(3));
     }
     Some(last2)
+}
+
+/// 主網域（[`site_key`] 的結果）在哪一個託管平台底下（[`PLATFORM_SUFFIX`] 的位置）；平台本身、一般網域回 None。
+/// 開機預熱名單分組用（背景），不在查詢路徑上
+pub fn platform_of(site: &str) -> Option<usize> {
+    let (_, rest) = site.split_once('.')?;
+    PLATFORM_SUFFIX.iter().position(|p| *p == rest)
 }
 
 #[derive(Debug, Clone, Copy)]

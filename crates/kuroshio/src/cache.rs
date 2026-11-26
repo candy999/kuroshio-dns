@@ -50,13 +50,18 @@ const HOT_BONUS_DS: u64 = 3000;
 pub const WARM_PER_SITE: usize = 8;
 /// 開機預熱名單：至少命中幾次才收（第一次查是寫入、之後才算命中）
 pub const WARM_MIN_HITS: u32 = 2;
+/// 開機預熱名單：同一個託管平台（[`crate::stats::PLATFORM_SUFFIX`]，Public Suffix List 的 private 段）底下全部加起來最多幾筆（3.5.1）。
+/// 平台底下每個名稱是不同的網站，各自照 [`WARM_PER_SITE`]；但這些平台大多對任何子網域都回答，外部探測用平台底下的隨機名稱、
+/// 每個查幾次，就能塞滿 2,000 筆的名單。32 筆 ≈ 16 個網站的 A 與 AAAA，家裡常用的平台網站通常比這少；超過的只是開機時不預熱
+pub const WARM_PER_PLATFORM: usize = 32;
 
-/// 開機預熱名單的共同過濾（寫出名單、讀進舊名單都用）：依原本的順序，同一個主網域最多 [`WARM_PER_SITE`] 筆，
-/// 重複的、格式不對的略過；`skip_special` 時特殊用途網域（RFC 6761，本機直接回答、不必預熱）也略過，最多 `n` 筆。
+/// 開機預熱名單的共同過濾（寫出名單、讀進舊名單都用）：依原本的順序，同一個主網域最多 [`WARM_PER_SITE`] 筆、
+/// 同一個託管平台底下最多 [`WARM_PER_PLATFORM`] 筆，重複的、格式不對的略過；`skip_special` 時特殊用途網域（RFC 6761，本機直接回答、不必預熱）也略過，最多 `n` 筆。
 /// 3.5.0 以前的名單只要查過一次就收，外部探測每 10 秒查一個隨機子網域就塞滿整份名單，重新啟動時逐一重問上游
 pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize, skip_special: bool) -> Vec<String> {
     let mut per: HashMap<String, usize> = HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut platform = [0usize; crate::stats::PLATFORM_SUFFIX.len()];
     let mut out = Vec::new();
     for k in keys {
         if out.len() >= n {
@@ -67,11 +72,18 @@ pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize, skip_speci
             continue;
         }
         let site = crate::stats::site_key(name).unwrap_or(name);
+        let p = crate::stats::platform_of(site);
+        if p.is_some_and(|p| platform[p] >= WARM_PER_PLATFORM) {
+            continue;
+        }
         let c = per.entry(site.to_string()).or_insert(0);
         if *c >= WARM_PER_SITE || !seen.insert(k.clone()) {
             continue;
         }
         *c += 1;
+        if let Some(p) = p {
+            platform[p] += 1;
+        }
         out.push(k);
     }
     out
@@ -306,7 +318,7 @@ impl Cache {
     /// - 只收正常有答案的（[`Class::Ok`]、不是 CNAME 被擋）：不存在、沒有這個類型、被擋、失敗、拒絕的重問也沒用
     /// - 至少命中 [`WARM_MIN_HITS`] 次：只查過一次的一次性網域（外部探測每次換一個隨機子網域）不收
     /// - 依「命中次數 ÷（1 + 上次使用距今幾小時）」排：常用、最近還在用的在前
-    /// - 同一個主網域最多 [`WARM_PER_SITE`] 筆（[`cap_per_site`]）
+    /// - 同一個主網域最多 [`WARM_PER_SITE`] 筆、同一個託管平台底下最多 [`WARM_PER_PLATFORM`] 筆（[`cap_per_site`]）
     ///
     /// 每 10 分鐘與關機時各算一次（背景），不在查詢路徑上
     pub fn hot_keys(&self, n: usize) -> Vec<String> {
@@ -639,6 +651,42 @@ mod tests {
         ];
         assert_eq!(cap_per_site(special.clone(), 10, true), vec!["1|a.example.com"]);
         assert_eq!(cap_per_site(special, 10, false).len(), 4);
+    }
+
+    /// 3.5.1（D3 R4）：託管平台（PSL 的 private 段）底下每個名稱是不同的網站，各自照「同一個主網域最多 8 筆」；
+    /// 但同一個平台底下全部加起來最多 [`WARM_PER_PLATFORM`] 筆，隨機名稱塞不滿名單。別的平台、一般網域不受影響
+    #[test]
+    fn cap_per_site_limits_each_platform() {
+        let plat = crate::stats::PLATFORM_SUFFIX;
+        let (a, b) = (plat[0], plat[1]);
+        // 平台底下的網站各自是主網域：同一個網站最多 8 筆，平台本身也是一般的主網域
+        let one = (0..12).map(|i| format!("1|s{i}.site.{a}")).collect::<Vec<_>>();
+        assert_eq!(cap_per_site(one, usize::MAX, true).len(), WARM_PER_SITE);
+        assert_eq!(crate::stats::platform_of(&format!("site.{a}")), Some(0));
+        assert_eq!(crate::stats::platform_of(a), None, "平台本身不算在平台底下");
+        assert_eq!(crate::stats::platform_of("example.com"), None);
+        assert_eq!(crate::stats::platform_of("example.com.tw"), None, "常見二級網域不是託管平台");
+        // 家裡常用的：平台底下 10 個網站、各有 A 與 AAAA，全部留著
+        let mut keys: Vec<String> = Vec::new();
+        for i in 0..10 {
+            keys.push(format!("1|home{i}.{a}"));
+            keys.push(format!("28|home{i}.{a}"));
+        }
+        // 外部探測：同一個平台底下 2,000 個隨機名稱（每個都命中好幾次，排在後面）
+        keys.extend((0..2000).map(|i| format!("1|r{i:04}qwxz.{a}")));
+        // 另一個平台、很多個一般網站（保留的 .example 頂級網域）、同一個網站很多名稱照常
+        keys.extend((0..5).map(|i| format!("1|other{i}.{b}")));
+        keys.extend((0..40).map(|i| format!("1|www.s{i}.example")));
+        keys.extend((0..40).map(|i| format!("1|s{i}.example.net")));
+        // `.example` 是特殊用途網域：這裡照一般網域算（skip_special = false）
+        let kept = cap_per_site(keys, 2000, false);
+        let under = |p: &str| kept.iter().filter(|k| k.ends_with(&format!(".{p}"))).count();
+        assert_eq!(under(a), WARM_PER_PLATFORM, "同一個平台底下最多 {WARM_PER_PLATFORM} 筆");
+        assert_eq!(kept.iter().filter(|k| k.contains("|home")).count(), 20, "常用的在前、全部留著");
+        assert_eq!(under(b), 5, "別的平台不受影響");
+        assert_eq!(kept.iter().filter(|k| k.ends_with(".example")).count(), 40, "一般網站不受影響");
+        assert_eq!(kept.iter().filter(|k| k.ends_with(".example.net")).count(), WARM_PER_SITE);
+        assert_eq!(kept.len(), WARM_PER_PLATFORM + 5 + 40 + WARM_PER_SITE);
     }
 
     #[test]
