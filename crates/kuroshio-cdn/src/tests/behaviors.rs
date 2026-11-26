@@ -97,9 +97,19 @@ async fn verifier_ok_collects_all_passing_ips() {
     assert!(st.pools.zone_hit("cloudflare", ip("104.18.20.216")));
 }
 
+/// 節點池加到 3 個節點（3.5.1 M4：候選 3 個以上都回「不服務這個網站」才算網站的問題）
+fn third_node(c: &Cdn) {
+    c.with_state(|st| {
+        let mut n = PoolNode::new(ip("104.16.162.7"));
+        n.ms = Num::V(5.0);
+        st.pools.p.get_mut("cloudflare").unwrap().pool4.push(n);
+    });
+}
+
 #[tokio::test]
 async fn verifier_error_1034_then_fail_and_backoff() {
     let (c, net) = setup(json!({ "verifyFailHours": 6 }));
+    third_node(&c);
     c.with_state(|st| {
         st.db.touch("b.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
     });
@@ -111,7 +121,7 @@ async fn verifier_error_1034_then_fail_and_backoff() {
     assert_eq!(c.verify("b.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("fail"));
     let v = c.state().db.get("b.test").unwrap().v4.clone().unwrap();
     assert!(
-        v.reason.as_deref().unwrap().contains("Cloudflare 錯誤 1034（試了 2 個網段）"),
+        v.reason.as_deref().unwrap().contains("Cloudflare 錯誤 1034（試了 3 個網段）"),
         "{:?}",
         v.reason
     );
@@ -125,6 +135,54 @@ async fn verifier_error_1034_then_fail_and_backoff() {
     assert!(v.until.unwrap() > now_ms() + 11 * 3_600_000);
     // 兩個節點各失敗兩次 → 特定產品專用 IP
     assert!(c.state().pools.is_restricted("cloudflare", ip("104.16.161.36")));
+    // 3 個候選都這樣：網站的問題，節點不暫停
+    assert!(c.state().pools.usable("cloudflare", ip("104.16.161.36")));
+}
+
+/// 3.5.1 M4：候選不到 3 個、都回「不服務這個網站」（421、錯誤 1xxx）：分不出是網站還是節點的問題 →
+/// 不記在網站上（暫時無法判定、短時間後重試、連續幾次就拉長）；同一個節點 1 小時內對 2 個不同的網站都這樣才暫停節點
+#[tokio::test]
+async fn single_node_misdirected_is_not_recorded_on_site() {
+    let (c, net) = setup(json!({}));
+    c.with_state(|st| {
+        for n in ["a.example.com", "b.example.com"] {
+            st.db.touch(n, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+        }
+    });
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "104.21.0.5" => cf_ok("NRT"),
+        _ => resp(403, &[("cf-ray", "x-TPE")], "error code: 1034"),
+    });
+    assert_eq!(
+        c.verify("a.example.com", "cloudflare", 4, Some(ip("104.21.0.5"))).await,
+        Some("unknown")
+    );
+    let v = c.state().db.get("a.example.com").unwrap().v4.clone().unwrap();
+    assert_eq!(v.fails, None, "不算網站的失敗");
+    assert!(v.reason.as_deref().unwrap().contains("先不記在網站上"), "{:?}", v.reason);
+    let u1 = v.until.unwrap() - v.at.unwrap();
+    assert!((9 * 60_000..=10 * 60_000 + 1000).contains(&u1), "{u1}");
+    assert!(c.state().pools.usable("cloudflare", ip("104.16.161.36")), "一個網站：節點不暫停");
+    // 同一個網站又一次：重試間隔加倍（不會每 10 分鐘一直重驗）
+    c.verify("a.example.com", "cloudflare", 4, Some(ip("104.21.0.5"))).await;
+    let v = c.state().db.get("a.example.com").unwrap().v4.clone().unwrap();
+    assert!(v.until.unwrap() - v.at.unwrap() >= 19 * 60_000);
+    assert!(c.state().pools.usable("cloudflare", ip("104.16.161.36")), "同一個網站不算兩個");
+    // 第二個網站也一樣 → 節點暫停（同 K2）
+    assert_eq!(
+        c.verify("b.example.com", "cloudflare", 4, Some(ip("104.21.0.5"))).await,
+        Some("unknown")
+    );
+    assert!(!c.state().pools.usable("cloudflare", ip("104.16.161.36")), "兩個網站：暫停節點");
+    // 換了好的節點、驗證通過：連續的次數歸零
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "104.21.0.5" => cf_ok("NRT"),
+        _ => cf_ok("TPE"),
+    });
+    c.with_state(|st| st.pools.p.get_mut("cloudflare").unwrap().bad.clear());
+    assert_eq!(c.verify("a.example.com", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("ok"));
+    let v = c.state().db.get("a.example.com").unwrap().v4.clone().unwrap();
+    assert!(v.extra.get(crate::verifier::UNSURE).is_none());
 }
 
 /// 3.5.1（Azure「台北換台北」）：驗證時原本的答案已經落在台灣機房 → 當成已是台灣、不換，也不再試候選節點。
@@ -1122,6 +1180,7 @@ async fn reverify_failure_drops_rewrite_immediately() {
     // 節點本身健康，但這個網站開始不讓它服務（Cloudflare 1034）：抽驗失敗後下一次查詢就回原始結果，
     // 不必等 24 小時的判定過期
     let (c, net) = setup(json!({}));
+    third_node(&c);
     c.with_state(|st| rewritten_ok(st, "s.test", 50, 5, 20));
     let q = || msg("s.test", 1, &["104.21.0.5"], vec![]);
     let a = |m: &Message| {

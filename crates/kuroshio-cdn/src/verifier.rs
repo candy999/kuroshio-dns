@@ -126,7 +126,17 @@ struct ConnOut {
     site_level: bool,
     /// 原本的 IP 連得上（連不上的時候多半是本機的網路，不記）
     base_ok: bool,
+    /// 回「不服務這個網站」（HTTP 421、Cloudflare 錯誤 1xxx）的節點（3.5.1 M4；保留最後一段的 CDN 不算，那是網段的憑證組）
+    zone: Vec<(IpAddr, String)>,
+    /// 候選都回「不服務這個網站」、而且有 3 個以上：網站的問題，不記到節點上
+    zone_site_level: bool,
 }
+
+/// 驗證結果暫時無法判定（`unknown`）的重試間隔：10 分鐘起，連續幾次就加倍（3.5.1 M4、L4），最多 [`UNSURE_MAX_SHIFT`] 次
+pub const UNSURE_RETRY_MS: u64 = 10 * 60_000;
+pub const UNSURE_MAX_SHIFT: u32 = 4;
+/// 驗證結果 `extra` 裡連續「暫時無法判定」的次數
+pub const UNSURE: &str = "unsure";
 
 /// 原始節點 HTTPS 失敗的樣子（只用 HTTP 驗證時，候選節點要跟它一致）
 struct HttpsFail {
@@ -252,8 +262,12 @@ pub fn orig_tw_pop(v: &crate::db::Verdict) -> Option<&str> {
 }
 
 fn clear_orig_tw(extra: &mut util::Extra) {
+    clear_key(extra, ORIG_TW);
+}
+
+fn clear_key(extra: &mut util::Extra, key: &str) {
     if let Some(m) = extra.0.as_mut() {
-        m.remove(ORIG_TW);
+        m.remove(key);
         if m.is_empty() {
             extra.0 = None;
         }
@@ -352,6 +366,15 @@ impl Cdn {
             self.with_state(|st| {
                 for (ip, err) in &conn.list {
                     st.pools.note_conn_fail(provider, *ip, name, &format!("驗證 {name} 時 {err}"));
+                }
+            });
+        }
+        // 回「不服務這個網站」的節點（3.5.1 M4）：同一個節點 1 小時內對第 2 個不同的網站也這樣才暫停（同 K2，反覆的逐次加倍）。
+        // 一台 Windows 上 CloudFront 102 筆失敗都是同一個 IP 回 421、Cloudflare 66 筆是同一批節點回錯誤 1xxx，以前全部記在網站上
+        if !conn.zone_site_level && !conn.zone.is_empty() {
+            self.with_state(|st| {
+                for (ip, why) in &conn.zone {
+                    st.pools.note_conn_fail(provider, *ip, name, &format!("驗證 {name} 時 {why}"));
                 }
             });
         }
@@ -627,6 +650,9 @@ impl Cdn {
                 }
                 if zone_kind(&broken) {
                     self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                    if !octet && !conn_out.zone.iter().any(|(x, _)| *x == ip) {
+                        conn_out.zone.push((ip, broken.clone()));
+                    }
                     zone_fail.get_or_insert(ZoneFail {
                         reason: broken,
                         pop: Some(pop),
@@ -780,6 +806,18 @@ impl Cdn {
         // 一個都沒通過，而且連不上（或憑證不符）的不同節點有 3 個以上：這個網站的問題（例如只接受業者專用的 IP），
         // 不是那些節點的問題（3.5.1 K2：D3 壓測裡 Fastly 節點被暫停的大多是這種）
         conn_out.site_level = base_ok.is_some() && failed_nodes.len() >= SITE_FAIL_NODES;
+        // 3.5.1 M4：候選不到 3 個、都回「不服務這個網站」：分不出是網站還是那一兩個節點的問題 → 不記在網站上，
+        // 暫時無法判定、短時間後重試（連續幾次就拉長）；節點那邊照上面記（多個網站都這樣才暫停）
+        if zone_fail.is_some() && !octet && candidates.len() < SITE_FAIL_NODES {
+            let z = zone_fail.as_ref().map(|z| z.reason.clone()).unwrap_or_default();
+            return Some(self.unsure(
+                name,
+                provider,
+                family,
+                &format!("{z}（只有 {} 個候選節點，先不記在網站上）", candidates.len()),
+            ));
+        }
+        conn_out.zone_site_level = zone_fail.is_some() && !octet;
         // 每個候選 IP 都明確表示「不服務這個網站」→ 判定失敗
         if let Some(z) = zone_fail {
             // Fastly 這類：可能只是還沒掃到放了這組憑證的網段，1 小時後再找一次；
@@ -839,17 +877,34 @@ impl Cdn {
             ));
         }
         // 全部因網路或漂移失敗 → 暫不判定，10 分鐘後再試
+        Some(self.unsure(name, provider, family, &last_reason))
+    }
+
+    /// 暫時無法判定（`unknown`）：不算網站的失敗、不加失敗次數；[`UNSURE_RETRY_MS`] 後有人查再驗證，
+    /// 連續幾次就加倍（最多 2^[`UNSURE_MAX_SHIFT`] 倍，160 分鐘），驗證有結論（通過或失敗）時歸零
+    fn unsure(&self, name: &str, provider: &str, family: u8, reason: &str) -> &'static str {
+        let now = now_ms();
         self.with_state(|st| {
             st.db.with_slot(name, provider, |db| {
                 db.set_verdict(name, family, |v| {
+                    let n = v
+                        .extra
+                        .get(UNSURE)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        .min(u64::from(UNSURE_MAX_SHIFT)) as u32;
                     v.verdict = Some(intern("unknown"));
-                    v.reason = Some(last_reason.clone());
-                    v.until = Some(now_ms() + 600_000);
+                    v.reason = Some(reason.to_string());
+                    v.until = Some(now + (UNSURE_RETRY_MS << n));
+                    v.extra
+                        .0
+                        .get_or_insert_with(Default::default)
+                        .insert(UNSURE.into(), serde_json::json!((n + 1).min(UNSURE_MAX_SHIFT)));
                 })
             })
         });
-        warn!("{name} IPv{family} 暫無法判定：{last_reason}");
-        Some("unknown")
+        warn!("{name} IPv{family} 暫無法判定：{reason}");
+        "unknown"
     }
 
     /// 原本的答案已經在台灣機房（3.5.1）：記成 `fail`＋`origTw`（查詢路徑走既有的「驗證失敗 → 原始」），
@@ -1090,6 +1145,7 @@ impl Cdn {
                     }
                     apply_slow(&mut v.extra, d.slow, now);
                     clear_orig_tw(&mut v.extra);
+                    clear_key(&mut v.extra, UNSURE);
                 })
             })
         });
