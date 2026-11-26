@@ -587,6 +587,8 @@ struct AsnCache {
     /// 這次執行已經向 ip-api 問過的 /24（含補問國別、到期重問的）：查不到也不重問
     tried: HashSet<String>,
     dirty: bool,
+    /// 載入時丟掉的 3.5.0 以前的紀錄筆數（升級後第一次重查；寫進 judge.log 的花費時間）
+    dropped: usize,
 }
 
 impl AsnCache {
@@ -622,6 +624,7 @@ impl AsnCache {
             failed: HashSet::new(),
             tried: HashSet::new(),
             dirty: dropped > 0,
+            dropped,
         };
         c.cap();
         if dropped > 0 {
@@ -1093,10 +1096,10 @@ fn incumbent_ids(file: &Path) -> HashSet<String> {
         .collect()
 }
 
-/// 昨天選上的上游（`upstreams.json` 的 `selected[]`，3.5.1 M3）：（正規化後的 id, 經營者）。
+/// 昨天選上的上游（`upstreams.json` 的 `selected[]`，3.5.1 M3）：（正規化後的 id, 經營者 → 昨天選上的那一個寫法）。
 /// 經營者：今天名單裡有同一台的用它的 [`Srv::op_key`]，沒有就用昨天寫下的 `op`、再沒有就用主機名稱。讀不到是空的
-fn yesterday_selected(file: &Path, all: &[Srv]) -> (HashSet<String>, HashSet<String>) {
-    let (mut ids, mut ops) = (HashSet::new(), HashSet::new());
+fn yesterday_selected(file: &Path, all: &[Srv]) -> (HashSet<String>, HashMap<String, String>) {
+    let (mut ids, mut ops) = (HashSet::new(), HashMap::new());
     let Some(v) = read_json(file) else {
         return (ids, ops);
     };
@@ -1111,10 +1114,23 @@ fn yesterday_selected(file: &Path, all: &[Srv]) -> (HashSet<String>, HashSet<Str
                 None => operator_of(&up.host),
             },
         };
-        ops.insert(op);
+        ops.entry(op).or_insert_with(|| x["id"].as_str().unwrap_or("").to_string());
         ids.insert(up.id);
     }
     (ids, ops)
+}
+
+/// 因為「昨天選上的」而留下的上游在 judge.log 的標籤（3.5.1 M3；第二版之後分開寫）：同一台是「沿用昨天的」，
+/// 同一個經營者的別的寫法（DoT 換成同一家的 DoQ、同一家的另一個節點）是「沿用昨天的經營者（昨天是 …）」。
+/// `yday_ops`：[`yesterday_selected`] 的經營者 → 昨天選上的寫法
+fn sticky_label(s: &Scored, yday_ops: &HashMap<String, String>) -> String {
+    if s.incumbent >= 2 {
+        return "，沿用昨天的".into();
+    }
+    match yday_ops.get(&s.op_key).filter(|y| !y.is_empty()) {
+        Some(y) => format!("，沿用昨天的經營者（昨天是 {y}）"),
+        None => "，沿用昨天的經營者".into(),
+    }
 }
 
 /// 分級評測的統計（`upstreams.json` 的 `tiers`）
@@ -1338,6 +1354,27 @@ fn read_blacklist(file: &Path) -> HashSet<String> {
         .collect()
 }
 
+/// judge.log「永久黑名單略過」的寫法（3.5.1 第二版之後）：台數（正規化後的 id）與來源；
+/// 同一台有好幾種寫法時另外寫候選數。`hits`：正規化後的 id → 是不是程式附帶的唯讀名單裡的
+fn blacklist_skip_text(hits: &HashMap<String, bool>, rows: usize) -> String {
+    if hits.is_empty() {
+        return "0".into();
+    }
+    let fixed = hits.values().filter(|f| **f).count();
+    let mut parts = Vec::new();
+    if hits.len() > fixed {
+        parts.push(format!("學到的 {}", hits.len() - fixed));
+    }
+    if fixed > 0 {
+        parts.push(format!("程式附帶的 {fixed}"));
+    }
+    let mut t = format!("{} 台：{}", hits.len(), parts.join("、"));
+    if rows > hits.len() {
+        t.push_str(&format!("，同一台的不同寫法共 {rows} 個候選"));
+    }
+    t
+}
+
 fn append_blacklist(file: &Path, lines: &[String]) {
     let head = if file.exists() { "" } else { blacklist::HEADER };
     let r = std::fs::OpenOptions::new()
@@ -1355,6 +1392,27 @@ const SUSPECT_DAYS: usize = 3;
 /// 網站「無法驗證」還要在幾個以上不同的網域（題目）發生才算（3.5.1）：同一題天天連不上，
 /// 多半是那個網站從這條線路連不上，不是那台 DNS 竄改（正式環境 44 台只因為同一個網站 TIMEOUT 3 天就被永久封殺）
 const SUSPECT_DOMAINS: usize = 2;
+
+/// 「網站無法驗證」的可疑紀錄夠不夠格列入永久黑名單（30 天內 [`SUSPECT_DAYS`] 天、[`SUSPECT_DOMAINS`] 個以上網域）。
+/// 重測沒通過時也用同一個標準（3.5.1 第二版之後）
+fn suspect_qualifies(c: StrikeCount) -> bool {
+    c.days >= SUSPECT_DAYS && c.domains >= SUSPECT_DOMAINS
+}
+
+/// 重測的結果（3.5.1 A10.4；第二版之後沒通過時照列入的標準判斷）。`c`：這台今天記完之後的「網站無法驗證」可疑紀錄
+/// - 倖存、或只是封殺（有過濾、不是竄改）：通過
+/// - 憑證不符：照舊留著、改成永久
+/// - 「網站無法驗證」而且可疑紀錄夠格：留著、從今天重新算 30～60 天
+/// - 其他（可疑紀錄不夠格、別的經營者也回同一個位址、資格賽或連線失敗）：移出，之後照一般規則累積
+fn retest_result(s: &Srv, c: StrikeCount) -> blacklist::Retest {
+    if s.alive || s.fail_reason.starts_with("封殺") {
+        blacklist::Retest::Passed
+    } else if s.fail_reason.contains("憑證不符") || (s.fail_reason.starts_with("可疑") && suspect_qualifies(c)) {
+        blacklist::Retest::Failed(s.fail_reason.clone())
+    } else {
+        blacklist::Retest::Released(s.fail_reason.clone())
+    }
+}
 /// 可疑紀錄的判斷規則版本（3.5.1 是 2；沒寫的是 3.5.0 以前的）。判斷規則改了就加一：
 /// 舊規則記下的「無法驗證」紀錄載入時清掉（憑證不符的保留）
 const STRIKE_RULES: u32 = 2;
@@ -1500,6 +1558,9 @@ struct Group {
 
 impl Benchmark {
     async fn run_inner(&self, ctx: &JobCtx, cache: &mut AsnCache) -> Result<Value> {
+        // 各大階段花的時間（3.5.1 第二版之後）：每個階段結束時 judge.log 寫一行，最後再寫一行合計
+        let run_start = Instant::now();
+        let mut stages: Vec<(&'static str, Duration)> = Vec::new();
         let cfg = BenchCfg::from(&ctx.cfg);
         let now = ctx.now_ms();
         let today = local_date_str(now);
@@ -1569,6 +1630,20 @@ impl Benchmark {
         let mut seen: HashSet<String> = HashSet::new();
         let mut all: Vec<Srv> = Vec::new();
         let mut skipped: BTreeMap<&'static str, usize> = BTreeMap::new();
+        // 永久黑名單略過的（3.5.1 第二版之後）：（正規化後的 id → 是不是程式附帶的唯讀名單裡的）與候選數。
+        // 以前只寫候選數：同一台的不同寫法（`tls://x`／`tls://x:853`）各算一次、程式附帶的名單也算在裡面，
+        // 對不上 `state/blacklist.txt` 的筆數
+        let mut bl_hits: HashMap<String, bool> = HashMap::new();
+        let mut bl_rows = 0usize;
+        let mut bl_hit = |spec: &str, id: Option<&str>| {
+            bl_rows += 1;
+            let key = id
+                .map(str::to_string)
+                .or_else(|| Upstream::parse(spec).ok().map(|u| u.id))
+                .unwrap_or_else(|| spec.to_string());
+            let fixed = fixed_bl.contains(spec) || fixed_bl.contains(&key);
+            *bl_hits.entry(key).or_insert(false) |= fixed;
+        };
         // 順序：固定上游、對照組、一般候選（同一個上游出現在兩邊時，以前面的為準）
         // 固定上游是使用者指定的：標記當成 user
         let user_tag = Tag {
@@ -1585,7 +1660,7 @@ impl Benchmark {
             // 對照組不看永久黑名單：用來確認判斷正常，不能被永久封殺
             let pinned_or_control = pinned || expect.is_some();
             if !pinned_or_control && blacklist.contains(spec.as_str()) {
-                *skipped.entry("blacklist").or_default() += 1;
+                bl_hit(spec, None);
                 continue;
             }
             let up = match Upstream::parse(spec) {
@@ -1596,7 +1671,7 @@ impl Benchmark {
                 }
             };
             if !pinned_or_control && blacklist.contains(&up.id) {
-                *skipped.entry("blacklist").or_default() += 1;
+                bl_hit(spec, Some(&up.id));
                 continue;
             }
             if !seen.insert(up.id.clone()) {
@@ -1782,11 +1857,7 @@ impl Benchmark {
                 parts.join("、")
             );
         }
-        let unsupported: Vec<String> = skipped
-            .iter()
-            .filter(|(k, _)| **k != "blacklist")
-            .map(|(k, n)| format!("{k} {n}"))
-            .collect();
+        let unsupported: Vec<String> = skipped.iter().map(|(k, n)| format!("{k} {n}")).collect();
         if !unsupported.is_empty() {
             jinfo!(journal, "這個版本還不支援的類型先略過（之後版本加入）：{}", unsupported.join("、"));
         }
@@ -1813,12 +1884,13 @@ impl Benchmark {
             all.len(),
             all.iter().filter(|s| s.pinned).count(),
             all.iter().filter(|s| s.protected.is_some()).count(),
-            skipped.get("blacklist").copied().unwrap_or(0)
+            blacklist_skip_text(&bl_hits, bl_rows)
         );
 
         // Phase 0：資格賽
         let (pf_domain, pf_expected) = self.preflight.clone();
         jinfo!(journal, "[Phase 0] 資格賽 ({pf_domain})");
+        let mut t_stage = Instant::now();
         let results = self.query_all(&all, (0..all.len()).collect(), &pf_domain, &cfg).await;
         // 每個候選的資格賽結果（A6 用：h3:// 與它的 https://）
         let mut pf: Vec<Option<Preflight>> = vec![None; all.len()];
@@ -1866,6 +1938,8 @@ impl Benchmark {
         }
         let verified: Vec<usize> = (0..all.len()).filter(|i| all[*i].alive).collect();
         jinfo!(journal, "資格賽結束：通過 {} / 淘汰 {}", verified.len(), all.len() - verified.len());
+        let d = lap(&mut t_stage, &mut stages, "資格賽");
+        jimp!(journal, "[花費時間] 資格賽 {}", took_text(d));
         if !verified.iter().any(|i| all[*i].selectable()) {
             bail!("沒有任何 DNS 通過資格賽（本機網路可能異常），保留昨天的結果");
         }
@@ -1882,9 +1956,36 @@ impl Benchmark {
         let mut probe = self
             .probe_precheck(ctx, &all, &verified, &pf, &domains, &pf_domain, &cfg, &mut journal)
             .await;
+        if probe.queries > 0 {
+            let d = lap(&mut t_stage, &mut stages, "惡意網站探測的自我檢查");
+            jimp!(journal, "[花費時間] 惡意網站探測的自我檢查 {}", took_text(d));
+        }
         let mut ask = domains.clone();
         ask.extend(probe.used.iter().cloned());
-        let mut raw = self.collect(ctx, &all, &verified, &ask, &cfg).await;
+        t_stage = Instant::now();
+        let (mut raw, cstats) = self.collect(ctx, &all, &verified, &ask, &cfg).await;
+        let d = lap(&mut t_stage, &mut stages, "收集");
+        {
+            // 下限：每個候選照順序問完全部網域、每筆至少隔 `paceMs`，同時測 `conc` 個
+            let floor =
+                Duration::from_secs_f64(cfg.pace.as_secs_f64() * ask.len() as f64 * verified.len() as f64 / cstats.conc.max(1) as f64);
+            let slow: Vec<String> = cstats
+                .slowest
+                .iter()
+                .map(|(i, t)| format!("{} {}", all[*i].id, took_text(*t)))
+                .collect();
+            jimp!(
+                journal,
+                "[花費時間] 收集 {}（{} 個網域 × {} 個候選、同時測 {} 個；照查詢間隔 {} ms 算至少約 {}；最慢的候選：{}）",
+                took_text(d),
+                ask.len(),
+                verified.len(),
+                cstats.conc,
+                cfg.pace.as_millis(),
+                took_text(floor),
+                if slow.is_empty() { "無".to_string() } else { slow.join("、") }
+            );
+        }
         drop(ask);
         if !probe.used.is_empty() {
             // 探測的答案拿出來（只留分類），原始答案只留評測網域的
@@ -1936,6 +2037,17 @@ impl Benchmark {
                     "[ASN] 合併查完：查到 {}、查不到 {failed}（查不到的這次不重問）",
                     reps.len() - failed
                 );
+                let d = lap(&mut t_stage, &mut stages, "ASN 合併查");
+                jimp!(
+                    journal,
+                    "[花費時間] ASN 合併查 {}{}",
+                    took_text(d),
+                    if cache.dropped > 0 {
+                        format!("（升級後第一次：3.5.0 以前的業者資料 {} 筆丟掉重查）", cache.dropped)
+                    } else {
+                        String::new()
+                    }
+                );
             }
         }
         // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
@@ -1951,6 +2063,9 @@ impl Benchmark {
         }
         let mut blocked_report: Vec<Value> = Vec::new();
         let mut scored = 0usize;
+        // 逐網域判斷裡查業者、驗證網站憑證各花了多少（寫進花費時間）
+        let (mut t_asn, mut t_verify) = (Duration::ZERO, Duration::ZERO);
+        t_stage = Instant::now();
         for (di, domain) in domains.iter().enumerate() {
             ctx.checkpoint().await;
             // 已經淘汰的候選：剩下的原始答案用不到了
@@ -2020,7 +2135,9 @@ impl Benchmark {
 
             // 污染判斷（v16.1 邏輯）
             let all_ips: Vec<IpAddr> = ok.iter().flat_map(|(_, ips, _)| ips.iter().map(|i| IpAddr::V4(*i))).collect();
+            let t0 = Instant::now();
             let ip_info = cache.lookup(&*self.asn, &all_ips, false, today_n).await;
+            t_asn += t0.elapsed();
             let infos: Vec<AsnInfo> = ok
                 .iter()
                 .map(|(_, ips, _)| ip_info.get(&IpAddr::V4(ips[0])).cloned().unwrap_or_else(AsnInfo::unknown))
@@ -2095,6 +2212,7 @@ impl Benchmark {
                         }
                         v
                     });
+                let t0 = Instant::now();
                 let baseline = self.verify_answers(domain, vec![base], &mut site_cache).await.remove(0);
                 if baseline.0 == SiteCheck::Valid {
                     let checks = self
@@ -2109,6 +2227,7 @@ impl Benchmark {
                         suspects.len()
                     );
                 }
+                t_verify += t0.elapsed();
             }
             // 「網站無法驗證」的可疑回答：同一個業者群組有好幾家互相獨立的加密 DNS 都這樣回答，
             // 比較可能是網站或這條路連不上那些位址，不是這些 DNS 一起竄改 → 照常計分，不記可疑天數
@@ -2207,7 +2326,21 @@ impl Benchmark {
                         }
                         polluted += 1;
                         s.suspect_today |= s.learns();
-                        if s.learns() && strikes.add(&cert_key(&s.id), &today, domain).days >= CERT_DAYS {
+                        let cert_days = if s.learns() {
+                            strikes.add(&cert_key(&s.id), &today, domain).days
+                        } else {
+                            0
+                        };
+                        if s.retest {
+                            // 今天重測的（已經在永久黑名單裡）：重測時憑證不符照舊留著、改成永久（整理時改寫那一行，這裡不再附加）。
+                            // 以前照一般候選寫「再發生一天就列入永久黑名單」，跟實際狀態對不上
+                            jimp!(
+                                journal,
+                                "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（重測：已經在永久黑名單裡，留著、改成永久的那一種）",
+                                s.id,
+                                info.label()
+                            );
+                        } else if cert_days >= CERT_DAYS {
                             jimp!(
                                 journal,
                                 "   [淘汰] {} -> 汙染 {}：憑證不符 {why}（第 {CERT_DAYS} 天，加入永久黑名單）",
@@ -2267,9 +2400,10 @@ impl Benchmark {
                             if !s.pinned {
                                 jinfo!(
                                     journal,
-                                    "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但別的經營者的 DNS 也回了同樣的位址，不記可疑",
+                                    "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}），但別的經營者的 DNS 也回了同樣的位址，不記可疑{}",
                                     s.id,
-                                    info.label()
+                                    info.label(),
+                                    if s.retest { "（重測：不到列入的標準，移出永久黑名單）" } else { "" }
                                 );
                             }
                             continue;
@@ -2281,7 +2415,29 @@ impl Benchmark {
                         };
                         // 同一題天天連不上不累積：要 2 個以上不同的網域，才算進評測歷史的可疑天數、才會定罪
                         s.suspect_today |= c.domains >= SUSPECT_DOMAINS;
-                        if c.days >= SUSPECT_DAYS && c.domains >= SUSPECT_DOMAINS && blacklist.insert(s.id.clone()) {
+                        if s.retest {
+                            // 今天重測的：照列入的標準判斷（3.5.1 第二版之後）。夠格才留在永久黑名單，不夠格就移出、
+                            // 今天這一筆照一般規則留在可疑紀錄（上面已經記了）。整理時改寫或刪掉那一行，這裡不再附加
+                            if suspect_qualifies(c) {
+                                jimp!(
+                                    journal,
+                                    "   [淘汰] {} -> {}：{domain} 網站無法驗證（{why}；30 天內 {} 天、{} 個網域）：重測沒通過，留在永久黑名單，從今天重新算 30～60 天",
+                                    s.id,
+                                    info.label(),
+                                    c.days,
+                                    c.domains
+                                );
+                            } else {
+                                jimp!(
+                                    journal,
+                                    "   [今天不用] {} -> {}：{domain} 網站無法驗證（{why}；可疑 {} 天、{} 個網域）：重測沒通過，但不到列入的標準（30 天內 {SUSPECT_DAYS} 天、{SUSPECT_DOMAINS} 個網域），移出永久黑名單、照一般規則累積",
+                                    s.id,
+                                    info.label(),
+                                    c.days,
+                                    c.domains
+                                );
+                            }
+                        } else if suspect_qualifies(c) && blacklist.insert(s.id.clone()) {
                             jimp!(
                                 journal,
                                 "   [淘汰] {} -> 30 天內 {} 天、{} 個網域回答無法驗證的位址（加入永久黑名單）",
@@ -2329,8 +2485,17 @@ impl Benchmark {
         strikes.save();
         // 之後的都是摘要（分級升降、選出結果）：用 judge.log 預留的尾端空間，不會被前面的判斷過程擠掉
         journal.enter_tail();
+        let d = lap(&mut t_stage, &mut stages, "逐網域判斷");
+        jimp!(
+            journal,
+            "[花費時間] 逐網域判斷 {}（{} 個網域；其中查業者 {}、驗證網站憑證 {}）",
+            took_text(d),
+            domains.len(),
+            took_text(t_asn),
+            took_text(t_verify)
+        );
         if learned_bl {
-            self.tidy_blacklist(&bl_file, &all, &retest, &known, today_n, &today, &mut journal);
+            self.tidy_blacklist(&bl_file, &all, &retest, &known, &strikes, today_n, &today, &mut journal);
         }
         if let Some(l) = learned.as_mut() {
             let c = record_rl429(l, &all, &pf, &known, today_n, &mut journal);
@@ -2386,7 +2551,7 @@ impl Benchmark {
                 s.region_source = select::region_source(in_tw);
                 s.incumbent = if yday_ids.contains(&all[i].up.id) {
                     2
-                } else if yday_ops.contains(&all[i].op_key()) {
+                } else if yday_ops.contains_key(&all[i].op_key()) {
                     1
                 } else {
                     0
@@ -2646,7 +2811,7 @@ impl Benchmark {
             "protected": control,
             "tiers": tier_counts.to_json(),
             "probe": probe.to_json(),
-            "skippedTypes": skipped.iter().filter(|(k, _)| **k != "blacklist").map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
+            "skippedTypes": skipped.iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "pathSkipped": path_skipped.iter().map(|(k, n)| (k.to_string(), json!(n))).collect::<Map<String, Value>>(),
             "path": path.as_ref().map(|r| { let mut j = r.to_json(); j["policy"] = json!(policy); j }),
             "reportDir": out_dir.as_ref().map(|d| d.display().to_string()),
@@ -2720,8 +2885,21 @@ impl Benchmark {
                 report(&d.join("protected.csv"), csv.as_bytes());
             }
         }
+        let d = lap(&mut t_stage, &mut stages, "選出");
+        jimp!(
+            journal,
+            "[花費時間] 選出 {}（永久黑名單整理、查選出的 DNS 的業者、選擇與報表）",
+            took_text(d)
+        );
         jinfo!(journal, "=== 今日選出的上游 ===");
-        let kept: HashSet<&str> = calc.selection.kept.iter().map(|&i| calc.finals[i].id.as_str()).collect();
+        // 因為「昨天選上的」而留下的（M3）：同一台寫「沿用昨天的」；同一個經營者的別的寫法（DoT 換成同一家的 DoQ 等）
+        // 寫「沿用昨天的經營者（昨天是 …）」（3.5.1 第二版之後；以前也寫「沿用昨天的」，看不出換了寫法）
+        let kept: HashMap<&str, String> = calc
+            .selection
+            .kept
+            .iter()
+            .map(|&i| (calc.finals[i].id.as_str(), sticky_label(&calc.finals[i], &yday_ops)))
+            .collect();
         for x in state["selected"].as_array().into_iter().flatten() {
             let id = x["id"].as_str().unwrap_or("");
             jinfo!(
@@ -2732,7 +2910,7 @@ impl Benchmark {
                 x["avgMs"].to_string(),
                 x["newItems"],
                 x["reason"].as_str().unwrap_or(""),
-                if kept.contains(id) { "，沿用昨天的" } else { "" },
+                kept.get(id).map(String::as_str).unwrap_or(""),
                 x["owner"].as_str().unwrap_or("")
             );
         }
@@ -2782,6 +2960,13 @@ impl Benchmark {
             calc.domains_answered
         );
 
+        let parts: Vec<String> = stages.iter().map(|(n, d)| format!("{n} {}", took_text(*d))).collect();
+        jinfo!(
+            journal,
+            "[花費時間] {}；整次評測 {}",
+            parts.join("、"),
+            took_text(run_start.elapsed())
+        );
         jinfo!(journal, "[{}] 結束 {}", JOB_NAME, fmt_time(ctx.now_ms()));
         // judge.log 最後才寫（3.5.1）：以前在「今日選出的上游」之前就寫了，報表目錄裡的那份看不到選出結果
         if let Some(d) = &out_dir {
@@ -2793,7 +2978,8 @@ impl Benchmark {
         Ok(state)
     }
 
-    /// 整理學到的永久黑名單（3.5.1 A10.4）：今天重測的「網站無法驗證」通過就移除、沒通過從今天重新算；
+    /// 整理學到的永久黑名單（3.5.1 A10.4）：今天重測的「網站無法驗證」通過就移除；沒通過照列入的標準判斷
+    /// （[`retest_result`]：憑證不符改成永久、可疑紀錄夠格的從今天重新算、不夠格的移出）；
     /// 名單裡已經沒有的（列入 30 天以上）、重複的、超過上限的移除。有變動才寫（暫存檔＋改名）
     #[allow(clippy::too_many_arguments)]
     fn tidy_blacklist(
@@ -2802,6 +2988,7 @@ impl Benchmark {
         all: &[Srv],
         retest: &HashSet<String>,
         known: &HashSet<String>,
+        strikes: &Strikes,
         today_n: u32,
         today: &str,
         journal: &mut Journal,
@@ -2811,8 +2998,7 @@ impl Benchmark {
         for id in retest {
             let r = match all.iter().find(|s| s.id == *id || s.up.id == *id) {
                 None => blacklist::Retest::Untested,
-                Some(s) if s.alive || s.fail_reason.starts_with("封殺") => blacklist::Retest::Passed,
-                Some(s) => blacklist::Retest::Failed(s.fail_reason.clone()),
+                Some(s) => retest_result(s, strikes.count(&s.id)),
             };
             results.insert(id.clone(), r);
         }
@@ -2820,10 +3006,12 @@ impl Benchmark {
         if st.any() || st.untested > 0 {
             jinfo!(
                 journal,
-                "[永久黑名單] 重測「網站無法驗證」{} 台：通過移除 {}、沒通過 {}（從今天重新算 30～60 天）、今天沒測到 {}；名單裡已經沒有的移除 {}、超過上限 {} 筆移除 {}",
+                "[永久黑名單] 重測「網站無法驗證」{} 台：通過移除 {}；沒通過的照列入的標準判斷：不夠格移出 {}（今天的失敗照一般規則記進可疑紀錄）、夠格留著 {}（從今天重新算 30～60 天）、憑證不符改成永久 {}；今天沒測到 {}；名單裡已經沒有的移除 {}、超過上限 {} 筆移除 {}",
                 retest.len(),
                 st.passed,
+                st.released,
                 st.failed,
+                st.failed_cert,
                 st.untested,
                 st.pruned,
                 blacklist::BLACKLIST_MAX,
@@ -3177,7 +3365,7 @@ impl Benchmark {
         verified: &[usize],
         domains: &[String],
         cfg: &BenchCfg,
-    ) -> Vec<Vec<Option<QueryResult>>> {
+    ) -> (Vec<Vec<Option<QueryResult>>>, CollectStats) {
         let (conc, room) = self.effective_conc(cfg);
         info!(
             "[Phase 1] {} 個網域 × {} 個候選，同時測 {conc} 個{}（每個候選測完就關閉連線）",
@@ -3200,7 +3388,7 @@ impl Benchmark {
         }));
         let mut it = verified.iter().copied();
         let mut set = JoinSet::new();
-        let spawn = |set: &mut JoinSet<(usize, Vec<Option<QueryResult>>)>, i: usize| {
+        let spawn = |set: &mut JoinSet<(usize, Vec<Option<QueryResult>>, Duration)>, i: usize| {
             let s = &all[i];
             let job = CollectJob {
                 prober: self.prober.clone(),
@@ -3213,16 +3401,22 @@ impl Benchmark {
                 stop_after: if s.pinned { None } else { Some(cfg.max_timeouts) },
                 pause: pause.clone(),
             };
-            set.spawn(async move { (i, job.run().await) });
+            set.spawn(async move {
+                let t = Instant::now();
+                let v = job.run().await;
+                (i, v, t.elapsed())
+            });
         };
         for i in it.by_ref().take(conc) {
             spawn(&mut set, i);
         }
         let mut kept = 0usize;
+        let mut stats = CollectStats { conc, slowest: Vec::new() };
         while let Some(r) = set.join_next().await {
-            if let Ok((i, v)) = r {
+            if let Ok((i, v, took)) = r {
                 kept += v.len();
                 out[i] = v;
+                stats.note(i, took);
             }
             done += 1;
             if let Some(i) = it.next() {
@@ -3240,7 +3434,7 @@ impl Benchmark {
             }
         }
         info!("   收集完成：{total} 個候選，開始逐網域判斷");
-        out
+        (out, stats)
     }
 
     /// 對 `idx` 這些候選並行查同一個網域；回傳（候選位置, 結果），依輸入順序
@@ -3453,6 +3647,44 @@ struct PauseState {
 }
 
 /// 一個候選的收集工作
+/// 收集的統計（3.5.1 第二版之後，寫進 judge.log 的花費時間）：同時測幾個、最慢的幾個候選
+struct CollectStats {
+    conc: usize,
+    /// （`all` 的位置, 花的時間），最慢的在前，最多 [`SLOWEST_SHOWN`] 個
+    slowest: Vec<(usize, Duration)>,
+}
+
+/// judge.log 列出收集最慢的幾個候選
+const SLOWEST_SHOWN: usize = 3;
+
+impl CollectStats {
+    fn note(&mut self, i: usize, took: Duration) {
+        if self.slowest.len() < SLOWEST_SHOWN || self.slowest.last().is_some_and(|(_, d)| took > *d) {
+            self.slowest.push((i, took));
+            self.slowest.sort_by_key(|a| std::cmp::Reverse(a.1));
+            self.slowest.truncate(SLOWEST_SHOWN);
+        }
+    }
+}
+
+/// 花費時間的寫法：「16.3 秒」「11 分 07 秒」
+fn took_text(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{:.1} 秒", d.as_secs_f64())
+    } else {
+        format!("{} 分 {:02} 秒", s / 60, s % 60)
+    }
+}
+
+/// 一個階段結束：記下花的時間、從現在開始算下一個階段
+fn lap(t: &mut Instant, stages: &mut Vec<(&'static str, Duration)>, name: &'static str) -> Duration {
+    let d = t.elapsed();
+    *t = Instant::now();
+    stages.push((name, d));
+    d
+}
+
 struct CollectJob {
     prober: Arc<dyn Prober>,
     up: Upstream,
@@ -4081,6 +4313,7 @@ mod asn_cache_tests {
         let mut c = AsnCache::load(&p);
         assert!(c.map.is_empty(), "/16 的舊鍵、沒有代表 IP 的都丟掉：{:?}", c.map);
         assert!(c.dirty, "丟掉的要寫回去");
+        assert_eq!(c.dropped, 3, "丟掉幾筆（升級後第一次重查，judge.log 的花費時間寫出來）");
         let src = Counting {
             calls: Mutex::new(Vec::new()),
             offline: false,
@@ -4445,5 +4678,129 @@ mod journal_tests {
             "   [保留] 7 台 -> X__AS64500_X：業者規則沒涵蓋，但 www.example.com 的憑證有效（不是劫持）：192.0.2.0、192.0.2.1、192.0.2.2、192.0.2.3、192.0.2.4 等 7 台"
         );
         assert!(l[1].ends_with("：198.51.100.1"));
+    }
+}
+
+/// 3.5.1 第二版（Windows 第二階段）的回報：重測的門檻、永久黑名單略過的算法、黏著的標籤、各階段的花費時間
+#[cfg(test)]
+mod benchw_tests {
+    use super::*;
+
+    fn srv(id: &str) -> Srv {
+        Srv::new(id.to_string(), Upstream::parse(id).unwrap(), false, Tag::default())
+    }
+
+    /// 重測沒通過時照列入的標準判斷：憑證不符留著；「網站無法驗證」可疑紀錄夠格才留著，不夠格（含資格賽、連線失敗）移出
+    #[test]
+    fn retest_failure_uses_listing_threshold() {
+        let none = StrikeCount { days: 0, domains: 0 };
+        let mut s = srv("https://dns.example.com/dns-query");
+        assert_eq!(retest_result(&s, none), blacklist::Retest::Passed);
+        s.kill("封殺 www.example.com (導向 0.0.0.0)".into());
+        assert_eq!(retest_result(&s, none), blacklist::Retest::Passed, "只是封殺：通過");
+        let mut s = srv("https://dns.example.com/dns-query");
+        s.kill("可疑 www.example.com (判定為 X，網站無法驗證 TIMEOUT)".into());
+        // 正式環境的 3 台：一天、一個網站逾時
+        let r = retest_result(&s, StrikeCount { days: 1, domains: 1 });
+        assert!(matches!(r, blacklist::Retest::Released(_)), "{r:?}");
+        for c in [StrikeCount { days: 3, domains: 1 }, StrikeCount { days: 2, domains: 2 }] {
+            assert!(matches!(retest_result(&s, c), blacklist::Retest::Released(_)), "{c:?}");
+        }
+        let r = retest_result(&s, StrikeCount { days: 3, domains: 2 });
+        assert!(matches!(r, blacklist::Retest::Failed(_)), "夠格：留著 {r:?}");
+        let mut s = srv("https://dns.example.com/dns-query");
+        s.kill("汙染 www.example.com (判定為 X，憑證不符 ERR_TLS_CERT_ALTNAME_INVALID)".into());
+        assert!(matches!(retest_result(&s, none), blacklist::Retest::Failed(_)), "憑證不符照舊留著");
+        for why in ["資格賽失敗 (逾時)", "連線失敗 (逾時)"] {
+            let mut s = srv("https://dns.example.com/dns-query");
+            s.kill(why.into());
+            assert!(matches!(retest_result(&s, none), blacklist::Retest::Released(_)), "{why}");
+        }
+    }
+
+    /// 「永久黑名單略過」寫台數（正規化後的 id）與來源；同一台的不同寫法另外寫候選數
+    #[test]
+    fn blacklist_skip_text_counts_servers() {
+        let mut h = HashMap::new();
+        assert_eq!(blacklist_skip_text(&h, 0), "0");
+        for i in 0..9 {
+            h.insert(format!("https://dns{i}.example.com/dns-query"), false);
+        }
+        assert_eq!(blacklist_skip_text(&h, 9), "9 台：學到的 9");
+        h.insert("quic://dns.example.net:853".into(), true);
+        assert_eq!(blacklist_skip_text(&h, 10), "10 台：學到的 9、程式附帶的 1");
+        assert_eq!(
+            blacklist_skip_text(&h, 11),
+            "10 台：學到的 9、程式附帶的 1，同一台的不同寫法共 11 個候選"
+        );
+    }
+
+    /// 黏著的標籤：同一台「沿用昨天的」，同一個經營者的別的寫法「沿用昨天的經營者（昨天是 …）」
+    #[test]
+    fn sticky_label_tells_operator_from_same_server() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-benchw-sticky-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("upstreams.json");
+        std::fs::write(
+            &f,
+            json!({ "selected": [
+                { "id": "tls://dns.example.com", "op": "Example" },
+                { "id": "tls://dns10.example.net" },
+            ] })
+            .to_string(),
+        )
+        .unwrap();
+        let all = vec![srv("quic://dns.example.com"), srv("tls://dns-nosec.example.net")];
+        let (ids, ops) = yesterday_selected(&f, &all);
+        assert!(ids.contains("tls://dns.example.com:853"));
+        assert_eq!(ops["example"], "tls://dns.example.com");
+        let same = Scored {
+            incumbent: 2,
+            op_key: "example".into(),
+            ..Default::default()
+        };
+        assert_eq!(sticky_label(&same, &ops), "，沿用昨天的");
+        let other = Scored {
+            incumbent: 1,
+            op_key: "example".into(),
+            ..Default::default()
+        };
+        assert_eq!(sticky_label(&other, &ops), "，沿用昨天的經營者（昨天是 tls://dns.example.com）");
+        // 經營者用主機的可註冊網域：同一家的另一台
+        let nosec = Scored {
+            incumbent: 1,
+            op_key: all[1].op_key(),
+            ..Default::default()
+        };
+        assert_eq!(sticky_label(&nosec, &ops), "，沿用昨天的經營者（昨天是 tls://dns10.example.net）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 花費時間的寫法與收集最慢的候選（最多 3 個、最慢的在前）
+    #[test]
+    fn stage_times_and_slowest() {
+        assert_eq!(took_text(Duration::from_millis(16_340)), "16.3 秒");
+        assert_eq!(took_text(Duration::from_secs(667)), "11 分 07 秒");
+        let mut c = CollectStats {
+            conc: 50,
+            slowest: Vec::new(),
+        };
+        for (i, s) in [(0usize, 40u64), (1, 220), (2, 45), (3, 41), (4, 300), (5, 39)] {
+            c.note(i, Duration::from_secs(s));
+        }
+        assert_eq!(
+            c.slowest,
+            vec![
+                (4, Duration::from_secs(300)),
+                (1, Duration::from_secs(220)),
+                (2, Duration::from_secs(45))
+            ]
+        );
+        let mut t = Instant::now();
+        let mut st = Vec::new();
+        lap(&mut t, &mut st, "資格賽");
+        lap(&mut t, &mut st, "收集");
+        assert_eq!(st.iter().map(|(n, _)| *n).collect::<Vec<_>>(), ["資格賽", "收集"]);
     }
 }

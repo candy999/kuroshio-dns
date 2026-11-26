@@ -261,11 +261,13 @@ async fn unverified_needs_two_domains_and_unshared_answer() {
     assert_eq!(l.hist[e.id(multi)].suspect(), 2, "{:?}", l.hist[e.id(multi)]);
 }
 
-/// A10.4：永久黑名單裡「網站無法驗證」的 30～60 天後重測一次：通過就移除、沒通過從今天重新算；
+/// A10.4：永久黑名單裡「網站無法驗證」的 30～60 天後重測一次：通過就移除；沒通過照列入的標準判斷
+/// （3.5.1 第二版之後：可疑紀錄夠格才留著、從今天重新算，不夠格就移出、照一般規則累積；重測時憑證不符的改成永久）；
 /// 憑證不符的永久（不重測）；名單裡已經沒有的移除；檔頭換成新的說明
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unverified_blacklist_entries_are_retested() {
-    let e = setup("retest", 15, "").await;
+    // 多數業者要夠多：規則外的群組才不會因為分數超過第一名的 20% 被當成有效
+    let e = setup("retest", 20, "").await;
     let q = "Quiet_Hosting__AS64498_Quiet_Hosting";
     let lines = [
         "# 永久黑名單：每日評測判定「汙染」（解析到錯誤業者）的 DNS，之後不再測試".to_string(),
@@ -286,19 +288,29 @@ async fn unverified_blacklist_entries_are_retested() {
             e.id(12),
             WEB[0]
         ),
+        format!("{}  # 2026-11-15 汙染：{} → {q}（連續 3 天網站無法驗證）", e.id(11), WEB[0]),
+        format!("{}  # 2026-11-15 汙染：{} → {q}（連續 3 天網站無法驗證）", e.id(10), WEB[0]),
         format!(
             "https://gone.example.net/dns-query  # 2026-09-15 汙染：{} → X（30 天內 3 天、2 個網域網站無法驗證）",
             WEB[0]
         ),
     ];
     std::fs::write(e.root.join("state/blacklist.txt"), lines.join("\n") + "\n").unwrap();
-    // 第 14 台重測時還是連不上
+    // 第 11 台：前兩天另一個網域已經有可疑紀錄（今天再一筆就是 30 天內 3 天、2 個網域）
+    std::fs::write(
+        e.root.join("state/blacklist-suspects.json"),
+        json!({ e.id(11): [format!("2026-11-18|r2|{}", WEB[1]), format!("2026-11-19|r2|{}", WEB[1])] }).to_string(),
+    )
+    .unwrap();
+    // 第 14 台重測時還是連不上（一天、一個網域）；第 11 台也連不上；第 10 台這次憑證不符
     e.answer(14, WEB[0], "98.6.0.14");
+    e.answer(11, WEB[0], "98.6.0.11");
+    e.answer(10, WEB[0], "96.4.0.10");
     let (state, log) = e.run(&cfg()).await;
     let out = e.blacklist();
     assert!(
         log.contains(
-            "[永久黑名單] 重測「網站無法驗證」2 台：通過移除 1、沒通過 1（從今天重新算 30～60 天）、今天沒測到 0；名單裡已經沒有的移除 1"
+            "[永久黑名單] 重測「網站無法驗證」4 台：通過移除 1；沒通過的照列入的標準判斷：不夠格移出 1（今天的失敗照一般規則記進可疑紀錄）、夠格留著 1（從今天重新算 30～60 天）、憑證不符改成永久 1；今天沒測到 0；名單裡已經沒有的移除 1"
         ),
         "{log}"
     );
@@ -307,28 +319,75 @@ async fn unverified_blacklist_entries_are_retested() {
         !out.contains(&format!("{}  #", e.id(13))),
         "3.5.0 以前的規則列入的：重測通過就移除 {out}"
     );
-    assert!(
-        out.contains(&format!("{}  # 2026-11-20 重測：網站無法驗證（可疑 {}", e.id(14), WEB[0])),
-        "沒通過：從今天重新算 {out}"
+    // 第 14 台：一天、一個網域，不到列入的標準（30 天內 3 天、2 個網域）→ 移出，今天這筆照一般規則記下
+    assert!(!out.contains(&format!("{}  #", e.id(14))), "不夠格：移出 {out}");
+    assert_eq!(
+        e.suspects()[e.id(14)],
+        json!([format!("2026-11-20|r2|{}", WEB[0])]),
+        "今天的失敗照一般規則記進可疑紀錄"
     );
-    assert!(out.contains("第一次列入 2026-09-15）"), "{out}");
+    assert!(
+        log.contains(&format!(
+            "{} -> {q}：{} 網站無法驗證（TIMEOUT；可疑 1 天、1 個網域）：重測沒通過，但不到列入的標準（30 天內 3 天、2 個網域），移出永久黑名單、照一般規則累積",
+            e.id(14),
+            WEB[0]
+        )),
+        "{log}"
+    );
+    // 第 11 台：夠格 → 留著、從今天重新算
+    assert!(
+        out.contains(&format!("{}  # 2026-11-20 重測：網站無法驗證（可疑 {}", e.id(11), WEB[0])),
+        "夠格：從今天重新算 {out}"
+    );
+    assert!(out.contains("第一次列入 2026-11-15）"), "{out}");
+    assert!(
+        log.contains(&format!(
+            "{} -> {q}：{} 網站無法驗證（TIMEOUT；30 天內 3 天、2 個網域）：重測沒通過，留在永久黑名單",
+            e.id(11),
+            WEB[0]
+        )),
+        "{log}"
+    );
+    // 第 10 台：重測時憑證不符 → 留著、改成永久；文字照實際狀態寫（不是「再發生一天就列入」）
+    assert!(out.contains(&format!("{}  # 2026-11-20 重測：憑證不符（", e.id(10))), "{out}");
+    assert!(
+        log.contains(&format!(
+            "[淘汰] {} -> 汙染 Evil_Corp__AS64497_Evil_Corp：憑證不符 ERR_TLS_CERT_ALTNAME_INVALID（重測：已經在永久黑名單裡，留著、改成永久的那一種）",
+            e.id(10)
+        )),
+        "{log}"
+    );
+    assert!(
+        !log.contains(&format!(
+            "{} -> 汙染 Evil_Corp__AS64497_Evil_Corp：憑證不符 ERR_TLS_CERT_ALTNAME_INVALID（再發生一天",
+            e.id(10)
+        )),
+        "{log}"
+    );
+    // 重測的不再附加一行（整理時改寫）：每台只有一行
+    for n in [10u8, 11] {
+        assert_eq!(out.matches(&format!("{}  #", e.id(n))).count(), 1, "{out}");
+    }
     assert!(out.contains(&format!("{}  # 2026-09-15", e.id(15))), "憑證不符的永久：{out}");
     assert!(out.contains(&format!("{}  # 2026-11-19", e.id(12))), "還沒到重測的不動：{out}");
     assert!(!out.contains("gone.example.net"), "名單裡已經沒有的移除：{out}");
+    assert!(log.contains("永久黑名單略過 2 台：學到的 2）"), "{log}");
     let asked = e.prober.asked.lock().unwrap().clone();
     assert!(asked.contains_key(e.id(13)) && asked.contains_key(e.id(14)));
     assert!(
         !asked.contains_key(e.id(15)) && !asked.contains_key(e.id(12)),
         "還在黑名單的不測：{asked:?}"
     );
-    assert_eq!(state["counts"]["eliminated"], 2, "第 14 台的 https 與 h3：{state}");
-    // 隔天：第 14 台剛重測過，不會再測；移除的第 13 台照常每天測
+    assert_eq!(state["counts"]["eliminated"], 6, "第 10、11、14 台的 https 與 h3：{state}");
+    // 隔天：剛重測過、留著的不會再測；移除的第 13 台、移出的第 14 台照常每天測
     e.next_day();
+    e.reset_answers();
     e.prober.asked.lock().unwrap().clear();
     let (_, log) = e.run(&cfg()).await;
     assert!(!log.contains("[永久黑名單] 重測"), "{log}");
-    assert!(!e.prober.asked.lock().unwrap().contains_key(e.id(14)));
-    assert!(e.prober.asked.lock().unwrap().contains_key(e.id(13)));
+    let asked = e.prober.asked.lock().unwrap().clone();
+    assert!(!asked.contains_key(e.id(11)) && !asked.contains_key(e.id(10)), "{asked:?}");
+    assert!(asked.contains_key(e.id(13)) && asked.contains_key(e.id(14)), "{asked:?}");
 }
 
 /// A10.5：報表目錄裡的 judge.log 有選出結果（以前在「今日選出的上游」之前就寫檔了）
@@ -347,6 +406,51 @@ async fn judge_log_has_selection() {
     // 選出幾台看本機的延遲（這個測試不比），網域數一定寫出來
     assert!(log.contains("  網域覆蓋：計分的 3 個網域，選出的上游答得出 "), "{log}");
     assert!(log.lines().last().unwrap().starts_with("[dns-benchmark] 結束 "), "{log}");
+    // 3.5.1 第二版之後：各大階段結束時寫花了多久，最後一行合計（測試者比不出「收集」變慢在哪裡）
+    for stage in ["資格賽 ", "收集 ", "ASN 合併查 ", "逐網域判斷 ", "選出 "] {
+        assert!(log.contains(&format!("[花費時間] {stage}")), "{stage}：{log}");
+    }
+    assert!(
+        log.contains("個網域 × 8 個候選、同時測 8 個；照查詢間隔 0 ms 算至少約 0.0 秒；最慢的候選："),
+        "{log}"
+    );
+    assert!(log.contains("（3 個網域；其中查業者 "), "{log}");
+    let total = log.lines().rev().nth(1).unwrap();
+    assert!(
+        total.starts_with("[花費時間] 資格賽 ") && total.contains("、收集 ") && total.contains("；整次評測 "),
+        "{log}"
+    );
+}
+
+/// 3.5.1 第二版之後：「永久黑名單略過」寫台數（同一台的不同寫法算一台）與來源（學到的、程式附帶的），
+/// 才對得上 `state/blacklist.txt` 的筆數（以前寫候選數：Windows 第二階段 9 筆的名單寫「略過 10」）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blacklist_skip_counts_servers_not_spellings() {
+    let e = setup("blskip", 6, "").await;
+    std::fs::write(e.p.list_dir.join("dotlist.txt"), "tls://h3.example.com\ntls://h3.example.com:853\n").unwrap();
+    std::fs::write(
+        e.root.join("state/blacklist.txt"),
+        format!(
+            "tls://h3.example.com:853  # 2026-10-01 汙染：{} → Evil（憑證不符 X）\n{}  # 2026-10-01 汙染：{} → Evil（憑證不符 X）\n",
+            WEB[0],
+            e.id(4),
+            WEB[0]
+        ),
+    )
+    .unwrap();
+    // 程式附帶的唯讀名單
+    std::fs::write(
+        e.p.list_dir.join("blacklist.txt"),
+        format!("{}  # 2026-10-01 汙染：{} → Evil（憑證不符 X）\n", e.id(2), WEB[0]),
+    )
+    .unwrap();
+    let (_, log) = e.run(&cfg()).await;
+    assert!(
+        log.contains("永久黑名單略過 3 台：學到的 2、程式附帶的 1，同一台的不同寫法共 4 個候選）"),
+        "{log}"
+    );
+    let asked = e.prober.asked.lock().unwrap().clone();
+    assert!(!asked.keys().any(|k| k.starts_with("tls://h3.")), "{asked:?}");
 }
 
 /// 3.5.1：ASN 在逐網域判斷之前合併查：全部網域裡快取沒有的 /24 一起查、每個 /24 只問一次
