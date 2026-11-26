@@ -387,6 +387,9 @@ pub struct ProbeSample {
     pub lists: usize,
     /// 主程式這次沒抽（或抽不到）的原因：寫進 judge.log
     pub skipped: Option<String>,
+    /// 抽樣的來源說明（3.5.1：沒有本機副本的清單用下載時順便抽的樣本，「「…」用 3 天前下載時順便抽的 120 個」）：
+    /// 有抽到時寫進 judge.log
+    pub note: Option<String>,
 }
 
 impl ProbeSample {
@@ -407,10 +410,11 @@ impl ProbeSample {
                 .unwrap_or_default(),
             lists: v["lists"].as_u64().unwrap_or(0) as usize,
             skipped: v["skipped"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+            note: v["note"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         }
     }
     pub fn to_json(&self) -> Value {
-        json!({ "names": self.names, "lists": self.lists, "skipped": self.skipped })
+        json!({ "names": self.names, "lists": self.lists, "skipped": self.skipped, "note": self.note })
     }
 }
 
@@ -549,6 +553,11 @@ pub fn select_opts(cfg: &Value) -> SelectOpts {
 pub const ASN_TTL_DAYS: u32 = 30;
 /// ASN 快取最多幾筆（超過時先丟最舊的；一筆約 200 bytes，評測一天大約幾千個 /24）
 pub const ASN_CACHE_MAX: usize = 16_384;
+/// 逐網域判斷之前合併查 ASN 最多幾個 /24（3.5.1；ip-api 每批 100 個、間隔 4.2 秒，8,000 個約 80 批、5.6 分鐘）。
+/// 超過的照舊在逐網域判斷時查
+pub const ASN_PREFETCH_MAX: usize = 8_000;
+/// 合併查時每查這麼多個 /24 讓評測暫停點檢查一次（記憶體吃緊、還沒對時時暫停）
+const ASN_PREFETCH_STEP: usize = 500;
 
 /// 快取的鍵：IPv4 的 /24（`a.b.c`）。3.5.0 以前用 /16（同 2.x），同一個 /16 裡不同業者的位址會互相蓋掉
 /// （例如某家社群網站的 /16 被另一家的候選蓋成別的業者，之後每天的回答都被當成規則外、白做幾百次網站驗證）
@@ -650,39 +659,14 @@ impl AsnCache {
         for ip in ips {
             if let IpAddr::V4(v4) = ip {
                 let k = asn_key(*v4);
-                let rep = match self.map.get(&k) {
-                    None => (!self.failed.contains(&k)).then_some(*v4),
-                    Some(e) => {
-                        // 到期；系統時間倒退一點點（還沒對時）不算，日數比今天晚超過有效天數（時間曾經跳到很遠的未來）算到期
-                        let stale = today >= e.day.saturating_add(ASN_TTL_DAYS) || e.day > today.saturating_add(ASN_TTL_DAYS);
-                        ((stale || (want_cc && e.info.cc.is_empty())) && !self.tried.contains(&k)).then_some(e.ip)
-                    }
-                };
-                if let Some(rep) = rep {
+                if let Some(rep) = self.rep_for(&k, *v4, want_cc, today) {
                     if seen.insert(k) {
                         reps.push(rep);
                     }
                 }
             }
         }
-        if !reps.is_empty() {
-            let got = src.lookup(reps.clone()).await;
-            let asked: HashSet<Ipv4Addr> = reps.iter().copied().collect();
-            for (ip, info) in got {
-                // 只收問過的位址（來源回了別的就不理，不能用別的位址的資料蓋掉這個 /24）
-                if asked.contains(&ip) {
-                    self.map.insert(asn_key(ip), AsnEntry { info, ip, day: today });
-                    self.dirty = true;
-                }
-            }
-            for ip in reps {
-                let k = asn_key(ip);
-                if !self.map.contains_key(&k) {
-                    self.failed.insert(k.clone());
-                }
-                self.tried.insert(k);
-            }
-        }
+        self.fetch(src, reps, today).await;
         let mut out = HashMap::new();
         for ip in ips {
             let info = match ip {
@@ -692,6 +676,61 @@ impl AsnCache {
             out.insert(*ip, info.unwrap_or_else(AsnInfo::unknown));
         }
         out
+    }
+
+    /// 這個 /24 要不要向來源問、用哪個代表 IP 問（`k` 是 `asn_key(v4)`）：沒有資料（這次執行還沒查不到過）用 `v4`；
+    /// 到期、或 `want_cc` 時沒有國別，用當初的代表 IP（這次執行還沒問過）；其他不問
+    fn rep_for(&self, k: &str, v4: Ipv4Addr, want_cc: bool, today: u32) -> Option<Ipv4Addr> {
+        match self.map.get(k) {
+            None => (!self.failed.contains(k)).then_some(v4),
+            Some(e) => {
+                // 到期；系統時間倒退一點點（還沒對時）不算，日數比今天晚超過有效天數（時間曾經跳到很遠的未來）算到期
+                let stale = today >= e.day.saturating_add(ASN_TTL_DAYS) || e.day > today.saturating_add(ASN_TTL_DAYS);
+                ((stale || (want_cc && e.info.cc.is_empty())) && !self.tried.contains(k)).then_some(e.ip)
+            }
+        }
+    }
+
+    /// 向來源問這些代表 IP（每個 /24 一個）；查不到的記下來，這次執行不重問
+    async fn fetch(&mut self, src: &dyn AsnSource, reps: Vec<Ipv4Addr>, today: u32) {
+        if reps.is_empty() {
+            return;
+        }
+        let got = src.lookup(reps.clone()).await;
+        let asked: HashSet<Ipv4Addr> = reps.iter().copied().collect();
+        for (ip, info) in got {
+            // 只收問過的位址（來源回了別的就不理，不能用別的位址的資料蓋掉這個 /24）
+            if asked.contains(&ip) {
+                self.map.insert(asn_key(ip), AsnEntry { info, ip, day: today });
+                self.dirty = true;
+            }
+        }
+        for ip in reps {
+            let k = asn_key(ip);
+            if !self.map.contains_key(&k) {
+                self.failed.insert(k.clone());
+            }
+            self.tried.insert(k);
+        }
+    }
+
+    /// 逐網域判斷之前先把全部網域要查的 /24 挑出來（3.5.1）：`ips` 依網域順序給，每個 /24 只取第一次看到的，
+    /// 快取裡有、還沒到期的不要；最多 `max` 個（超過的照舊逐網域查）。回傳要問的代表 IP
+    fn prefetch_reps(&self, ips: impl Iterator<Item = Ipv4Addr>, today: u32, max: usize) -> Vec<Ipv4Addr> {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut reps = Vec::new();
+        for v4 in ips {
+            if reps.len() >= max {
+                break;
+            }
+            if !seen.insert(u32::from(v4) >> 8) {
+                continue;
+            }
+            if let Some(rep) = self.rep_for(&asn_key(v4), v4, false, today) {
+                reps.push(rep);
+            }
+        }
+        reps
     }
 
     fn save(&mut self, path: &Path) -> std::io::Result<()> {
@@ -1857,6 +1896,48 @@ impl Benchmark {
             }
             self.probe_judge(&mut all, &verified, answers, &mut probe, &mut journal);
         }
+        // ASN 先合併查（3.5.1）：以前逐網域判斷時每個網域各查一次，新的 /24 只有幾十個也要等 ip-api 的 4.2 秒間隔，
+        // ASN 快取整份重查時（3.5.0 → 3.5.1 換成 /24 鍵、30 天到期）D3 的逐網域判斷從 4.1 分變 11.5 分。
+        // 原始答案都已經在手上，先把全部網域、倖存候選答案裡快取沒有的 /24 挑出來，一批 100 個一起查（每個 /24 只問一次，
+        // 間隔照舊）；之後逐網域判斷時大多直接用快取
+        {
+            let (raw_ref, all_ref) = (&raw, &all);
+            let today_ips = (0..domains.len()).flat_map(|di| {
+                verified
+                    .iter()
+                    .filter(|&&i| all_ref[i].alive)
+                    .flat_map(move |&i| match raw_ref[i].get(di) {
+                        Some(Some(QueryResult {
+                            outcome: Outcome::Ok(ips), ..
+                        })) => ips.as_slice(),
+                        _ => &[],
+                    })
+            });
+            let reps = cache.prefetch_reps(today_ips.copied(), today_n, ASN_PREFETCH_MAX);
+            if !reps.is_empty() {
+                let batches = reps.len().div_ceil(100);
+                jinfo!(
+                    journal,
+                    "[ASN] 逐網域判斷之前先合併查：{} 個 /24（快取沒有或到期），每批 100 個、共 {batches} 批，間隔照 ip-api 的限制",
+                    reps.len()
+                );
+                let before = cache.failed.len();
+                for (k, chunk) in reps.chunks(ASN_PREFETCH_STEP).enumerate() {
+                    ctx.checkpoint().await;
+                    self.set_progress(json!({
+                        "phase": "asn", "done": k * ASN_PREFETCH_STEP, "total": reps.len(),
+                        "text": format!("執行中：查 ASN（{} / {} 個 /24）", k * ASN_PREFETCH_STEP, reps.len()),
+                    }));
+                    cache.fetch(&*self.asn, chunk.to_vec(), today_n).await;
+                }
+                let failed = cache.failed.len() - before;
+                jinfo!(
+                    journal,
+                    "[ASN] 合併查完：查到 {}、查不到 {failed}（查不到的這次不重問）",
+                    reps.len() - failed
+                );
+            }
+        }
         // 網站驗證結果（同一次評測內同一個 網域 + IP 只連一次）與「無法驗證」的天數紀錄
         let mut site_cache: HashMap<(String, Ipv4Addr), (SiteCheck, String)> = HashMap::new();
         let mut strikes = Strikes::load(bl_file.with_file_name("blacklist-suspects.json"), now);
@@ -1868,7 +1949,6 @@ impl Benchmark {
                 strikes.cleared.1
             );
         }
-        let mut universe: HashSet<u64> = HashSet::new();
         let mut blocked_report: Vec<Value> = Vec::new();
         let mut scored = 0usize;
         for (di, domain) in domains.iter().enumerate() {
@@ -1941,9 +2021,6 @@ impl Benchmark {
             // 污染判斷（v16.1 邏輯）
             let all_ips: Vec<IpAddr> = ok.iter().flat_map(|(_, ips, _)| ips.iter().map(|i| IpAddr::V4(*i))).collect();
             let ip_info = cache.lookup(&*self.asn, &all_ips, false, today_n).await;
-            for (_, ips, _) in ok.iter().filter(|(i, _, _)| !all[*i].control_like()) {
-                universe.extend(ips.iter().map(|ip| select::item(dix, u32::from(*ip))));
-            }
             let infos: Vec<AsnInfo> = ok
                 .iter()
                 .map(|(_, ips, _)| ip_info.get(&IpAddr::V4(ips[0])).cloned().unwrap_or_else(AsnInfo::unknown))
@@ -2517,13 +2594,12 @@ impl Benchmark {
         ctx.checkpoint().await;
 
         // Phase 2 / 3 的計算可能要幾秒（候選多時），放到 blocking 執行緒
-        let total = universe.len();
-        drop(universe);
         let opts = cfg.select.clone();
         let want_reports = out_dir.is_some();
         let tw = self.tw.clone();
-        let calc = tokio::task::spawn_blocking(move || compute(scored_list, scored, total, &opts, want_reports, eliminated, tw.as_deref()))
-            .await?;
+        let calc =
+            tokio::task::spawn_blocking(move || compute(scored_list, scored, &opts, want_reports, eliminated, tw.as_deref())).await?;
+        let total = calc.total;
         match calc.tw_domains {
             Some(n) if n >= select::TW_RATE_MIN_DOMAINS => jinfo!(
                 journal,
@@ -2683,9 +2759,12 @@ impl Benchmark {
                 pinned_line.join("、")
             }
         );
+        // 覆蓋（3.5.1 改寫）：以前只寫「總涵蓋率 4.2%（981/23161）」，看起來像「只查得到 4%」。
+        // 其實是「選出的上游回過的不同位址」占「倖存候選合起來回過的不同位址」的比例：候選遍布各地，CDN 依地區給不同的位址，
+        // 本來就低，只是挑「新增位址多」的上游用的。查不到的比例看第二行（計分的網域選出的上游答得出幾個）
         jinfo!(
             journal,
-            "  總涵蓋率 {}%（{}/{total}）",
+            "  位址覆蓋 {}%：選出的上游合起來回過 {} 個不同的（網域, 位址），倖存的 {} 台合起來是 {total} 個（候選遍布各地、CDN 依地區給不同的位址，這個比例本來就低，只用來挑新增位址多的上游）",
             to_fixed(
                 if total > 0 {
                     calc.selection.covered as f64 / total as f64 * 100.0
@@ -2694,7 +2773,13 @@ impl Benchmark {
                 },
                 1
             ),
-            calc.selection.covered
+            calc.selection.covered,
+            calc.finals.len()
+        );
+        jinfo!(
+            journal,
+            "  網域覆蓋：計分的 {scored} 個網域，選出的上游答得出 {} 個",
+            calc.domains_answered
         );
 
         jinfo!(journal, "[{}] 結束 {}", JOB_NAME, fmt_time(ctx.now_ms()));
@@ -2796,8 +2881,9 @@ impl Benchmark {
                 manual.len(),
                 run.lists,
                 sampled.len(),
-                match (&cfg.sample.skipped, sampled.is_empty()) {
-                    (Some(why), true) => format!("（這次沒抽：{why}）"),
+                match (&cfg.sample.skipped, &cfg.sample.note, sampled.is_empty()) {
+                    (Some(why), _, true) => format!("（這次沒抽：{why}）"),
+                    (_, Some(note), false) => format!("（{note}）"),
                     _ => String::new(),
                 }
             );
@@ -3442,18 +3528,27 @@ struct Calc {
     /// 候補（`finals` 的位置）
     spares: Vec<usize>,
     reports: Vec<(&'static str, String)>,
+    /// 覆蓋的分母：倖存的候選（含固定上游）合起來回過幾個不同的（網域, 位址）（3.5.1；以前連淘汰的、汙染的答案也算）
+    total: usize,
+    /// 計分的網域裡，選出的上游（含固定上游）至少一台回答得出位址的有幾個
+    domains_answered: usize,
 }
 
 fn compute(
     mut finals: Vec<Scored>,
     scored_domains: usize,
-    total: usize,
     opts: &SelectOpts,
     want_reports: bool,
     eliminated: Vec<(String, &'static str, String)>,
     tw: Option<&crate::geo::TwIp>,
 ) -> Calc {
     select::extended_metrics(&mut finals, scored_domains);
+    // 覆蓋的分母（3.5.1）：倖存的候選回過的（網域, 位址）。以前是逐網域判斷時所有有回答的候選（之後被淘汰、汙染的也算），
+    // 那些答案沒有一台選得到，算進來只會讓比例更低、更難懂
+    let total = {
+        let all: HashSet<u64> = finals.iter().flat_map(|s| s.items()).collect();
+        all.len()
+    };
     // 台灣率（3.5.0 B5）：台灣網段讀不到時不算，選擇跟 3.4.4 一樣
     let tw_domains = tw.map(|t| {
         let nets = t.all();
@@ -3465,6 +3560,14 @@ fn compute(
     info!("ASN 過濾：{} → {}", finals.len(), asn_best.len());
     let selection = select::select(&refs, &asn_best, total, opts);
     let spares = select::spares(&refs, &asn_best, &selection, opts, select::SPARES);
+    let domains_answered = {
+        let used = refs
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| s.pinned || selection.selected.iter().any(|p| p.idx == *i))
+            .flat_map(|(_, s)| s.history.iter().filter(|(_, ips)| !ips.is_empty()).map(|(d, _)| *d));
+        used.collect::<HashSet<u32>>().len()
+    };
     let mut reports = Vec::new();
     if want_reports {
         let asn_refs: Vec<&Scored> = asn_best.iter().map(|i| refs[*i]).collect();
@@ -3494,6 +3597,8 @@ fn compute(
         selection,
         spares,
         reports,
+        total,
+        domains_answered,
     }
 }
 
@@ -4061,6 +4166,67 @@ mod asn_cache_tests {
         };
         c.lookup(&src, &[v4("192.0.2.1")], false, 1).await;
         c.lookup(&src, &[v4("192.0.2.1")], true, 1).await;
+        assert_eq!(calls(&src).len(), 1);
+    }
+
+    /// 3.5.1：逐網域判斷之前合併查。每個 /24 只取第一次看到的；快取裡沒到期的不要、到期的用當初的代表 IP；
+    /// 有上限；查過（含查不到）的之後逐網域判斷時不再問
+    #[tokio::test]
+    async fn asn_prefetch_merges_by_24_and_is_capped() {
+        let (_root, p) = cache_root("prefetch");
+        let mut c = AsnCache::load(&p);
+        c.map.insert(
+            "198.51.100".into(),
+            AsnEntry {
+                info: AsnInfo::from_ip_api("Fresh", "", "AS64501 Fresh", "JP"),
+                ip: ip4("198.51.100.7"),
+                day: 100,
+            },
+        );
+        c.map.insert(
+            "198.51.101".into(),
+            AsnEntry {
+                info: AsnInfo::from_ip_api("Old", "", "AS64502 Old", "JP"),
+                ip: ip4("198.51.101.9"),
+                day: 100 - ASN_TTL_DAYS,
+            },
+        );
+        // 三個網域的答案（依網域順序）：同一個 /24 在不同網域、不同位址重複出現
+        let ips = [
+            "192.0.2.1",
+            "198.51.100.1",
+            "192.0.2.77",
+            "203.0.113.5",
+            "198.51.101.1",
+            "203.0.113.6",
+            "192.0.2.1",
+        ]
+        .map(ip4);
+        let reps = c.prefetch_reps(ips.iter().copied(), 100, 100);
+        assert_eq!(reps, [ip4("192.0.2.1"), ip4("203.0.113.5"), ip4("198.51.101.9")]);
+        assert_eq!(c.prefetch_reps(ips.iter().copied(), 100, 2).len(), 2, "上限");
+        let src = Counting {
+            calls: Mutex::new(Vec::new()),
+            offline: false,
+        };
+        c.fetch(&src, reps, 100).await;
+        assert_eq!(calls(&src).len(), 1, "一次問完");
+        // 逐網域判斷時：全部在快取裡，不再問
+        let all: Vec<IpAddr> = ips.iter().map(|ip| IpAddr::V4(*ip)).collect();
+        let r = c.lookup(&src, &all, false, 100).await;
+        assert_eq!(calls(&src).len(), 1);
+        assert_eq!(r[&v4("203.0.113.6")].cc, "JP");
+        assert!(c.prefetch_reps(ips.iter().copied(), 100, 100).is_empty(), "查過的不再挑");
+        // 查不到的：這次執行不再挑、逐網域判斷時也不再問
+        let src = Counting {
+            calls: Mutex::new(Vec::new()),
+            offline: true,
+        };
+        let reps = c.prefetch_reps([ip4("192.0.2.200"), ip4("192.0.3.1")].into_iter(), 100, 100);
+        assert_eq!(reps.len(), 1, "192.0.2 已經在快取裡");
+        c.fetch(&src, reps, 100).await;
+        c.lookup(&src, &[v4("192.0.3.2")], false, 100).await;
+        assert!(c.prefetch_reps([ip4("192.0.3.3")].into_iter(), 100, 100).is_empty());
         assert_eq!(calls(&src).len(), 1);
     }
 

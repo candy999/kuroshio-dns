@@ -44,7 +44,7 @@ pub fn tier_of(rel: &str) -> Tier {
     if base.starts_with("filter-lists/") {
         return Tier::Optional;
     }
-    const REBUILDABLE: [&str; 6] = [
+    const REBUILDABLE: [&str; 7] = [
         "cdn/harvest.json",
         "cdn/ip-zone.json",
         "stats.json",
@@ -52,6 +52,8 @@ pub fn tier_of(rel: &str) -> Tier {
         "import-last.json",
         // 評測學習資料（3.5.0）：丟了只是重新學
         "benchmark-learn.json",
+        // 惡意網站探測的樣本（3.5.1，幾 KB）：丟了下次下載清單時重抽
+        "probe-sample.json",
     ];
     const REBUILDABLE_DIRS: [&str; 3] = ["benchmark/", "cdn/ranges/", "cdn/scan/"];
     if REBUILDABLE.contains(&base) || REBUILDABLE_DIRS.iter().any(|d| base.starts_with(d)) {
@@ -268,6 +270,7 @@ mod tests {
         assert_eq!(tier_of("benchmark/2026-11-11/report.json"), Tier::Rebuildable);
         assert_eq!(tier_of("benchmark-learn.json.zst"), Tier::Rebuildable);
         assert_eq!(tier_of("benchmark-learn.json"), Tier::Rebuildable);
+        assert_eq!(tier_of("probe-sample.json"), Tier::Rebuildable, "探測樣本丟了下次下載清單時重抽");
         for core in [
             "cdn-domains.json",
             "cdn/domains/16-003.json.zst",

@@ -1035,3 +1035,103 @@ async fn custom_allow_still_wins() {
     assert!(f.check("www.essential.example.com", 1).unwrap().block);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 3.5.1：小 Flash 存不下威脅情資清單的副本時，惡意網站探測的網域在**過濾服務本來就要下載的那一次**順便抽
+/// （串流、水塘 120 個），存成快照目錄的小檔；7 天內不重抽、不為了抽樣多下載；重新啟動後讀得回來；
+/// 下載失敗時留著舊的樣本。存得下副本的機器照舊讀副本、不寫樣本檔
+#[tokio::test]
+async fn probe_sample_taken_while_downloading_list_without_copy() {
+    use kuroshio::probesample::{sample, SNAP_FILE, SNAP_MAX};
+    use kuroshio_jobs::benchmark::malware::SAMPLE_MAX;
+    use std::sync::{Arc, Mutex};
+    let st = Arc::new(Mutex::new(EtagLists::default()));
+    let tif: String = (0..3000).map(|i| format!("||t{i}.example.com^\n")).collect::<String>() + "@@||ok.example.net^\n";
+    {
+        let mut g = st.lock().unwrap();
+        g.lists.insert("tif.txt".into(), ("\"t1\"".into(), tif));
+        g.lists.insert("ads.txt".into(), ("\"a1\"".into(), many("ad", 100)));
+    }
+    let srv = etag_server(st.clone()).await;
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "TIF", "url": format!("http://{srv}/tif.txt"), "category": "malware" },
+        { "name": "廣告", "url": format!("http://{srv}/ads.txt"), "category": "ads" },
+    ] } }));
+    // `big`：空間很大（副本存得下）；不是的話可用空間只比保留線多 200 KB（小檔寫得下、清單副本存不下）
+    let persister = |dir: &std::path::Path, big: bool| {
+        let mut p = kuroshio::persist::Persister::new(
+            dir.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Flash, 0, 4096),
+        );
+        let line = p.reserve().keep_line();
+        let free = if big { 10 << 30 } else { line + 200 * 1024 };
+        p.set_free_probe(move |_| Some(free));
+        Arc::new(Mutex::new(p))
+    };
+    let full = |st: &Arc<Mutex<EtagLists>>| st.lock().unwrap().full.get("tif.txt").copied().unwrap_or(0);
+    let reqs = |st: &Arc<Mutex<EtagLists>>| st.lock().unwrap().reqs.get("tif.txt").copied().unwrap_or(0);
+
+    let dir = std::env::temp_dir().join(format!("kuroshio-probesnap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = persister(&dir, false);
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(p.clone());
+    assert!(f.probe_sources()[0].snap.is_none(), "還沒下載過");
+    assert!(f.update_lists(true).await.unwrap());
+    assert_eq!((full(&st), reqs(&st)), (1, 1), "只有載入清單那一次下載");
+    let ps = f.probe_sources();
+    assert_eq!(ps.len(), 1);
+    assert!(ps[0].copy.is_none(), "存不下副本");
+    let snap = ps[0].snap.clone().expect("下載時順便抽了");
+    assert_eq!(snap.names.len(), SNAP_MAX);
+    assert!(
+        snap.names.iter().all(|d| d.starts_with('t') && d.ends_with(".example.com")),
+        "例外規則不收"
+    );
+    p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    let file = dir.join("state").join(SNAP_FILE);
+    let size = std::fs::metadata(&file).expect("樣本檔寫在快照目錄").len();
+    assert!(size < 8 * 1024, "幾 KB：{size}");
+
+    // 評測用它抽：60 個、算 1 份清單，沒有「沒有本機副本」
+    let s = sample(&ps, true, &|_: &str| false, 1, kuroshio::persist::now_secs());
+    assert_eq!((s.names.len(), s.lists), (SAMPLE_MAX, 1));
+    assert!(s.skipped.is_none() && s.note.as_deref().unwrap().contains("下載時順便抽"), "{s:?}");
+
+    // 7 天內再下載（清單有更新、重建）：照常下載一次，不重抽（樣本不變、不重寫 Flash）
+    assert!(f.update_lists(true).await.unwrap());
+    assert_eq!((full(&st), reqs(&st)), (2, 2), "不為了抽樣多下載");
+    assert_eq!(f.probe_sources()[0].snap.as_ref(), Some(&snap));
+
+    // 下載失敗：留著舊的樣本
+    st.lock().unwrap().down.insert("tif.txt".into());
+    assert!(f.update_lists(true).await.is_err());
+    assert_eq!(f.probe_sources()[0].snap.as_ref(), Some(&snap));
+    st.lock().unwrap().down.clear();
+
+    // 重新啟動：從快照目錄讀回來
+    let f2 = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f2.set_copies(persister(&dir, false));
+    assert_eq!(f2.probe_sources()[0].snap.as_ref(), Some(&snap));
+    // 設定裡拿掉這份清單：讀回來時不留
+    let cfg_no = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "廣告", "url": format!("http://{srv}/ads.txt"), "category": "ads" },
+    ] } }));
+    let f3 = kuroshio::filtering::FilterService::from_cfg(&cfg_no, &dir).unwrap();
+    f3.set_copies(persister(&dir, false));
+    assert!(f3.probe_sources().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 存得下副本：照舊讀副本，不另外抽、不寫樣本檔
+    let dir = std::env::temp_dir().join(format!("kuroshio-probesnap-big-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = persister(&dir, true);
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &dir).unwrap();
+    f.set_copies(p.clone());
+    assert!(f.update_lists(true).await.unwrap());
+    p.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    let ps = f.probe_sources();
+    assert!(ps[0].copy.is_some(), "存得下副本");
+    assert!(ps[0].snap.is_none());
+    assert!(!dir.join("state").join(SNAP_FILE).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

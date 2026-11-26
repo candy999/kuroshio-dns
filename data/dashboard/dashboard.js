@@ -999,7 +999,7 @@
         const box = sec.bench; box.textContent = '';
         if (!b || !b.selected) { box.textContent = '尚無評測結果'; return; }
         box.className = '';
-        box.appendChild(el('div', 'muted', `${fmtTime(b.generatedAt)} · 測試 ${b.counts.total} 台 · 存活 ${b.counts.survivors} · 淘汰 ${b.counts.eliminated} · 涵蓋率 ${pct1(b.coverage)}`));
+        box.appendChild(el('div', 'muted', `${fmtTime(b.generatedAt)} · 測試 ${b.counts.total} 台 · 存活 ${b.counts.survivors} · 淘汰 ${b.counts.eliminated} · 位址覆蓋 ${pct1(b.coverage)}`));
         const t = el('table'); const w = el('div', 'tbl kd-mt8'); w.appendChild(t); box.appendChild(w);
         table(t, [...b.selected.map(x => ({ ...x, role: '自動' })), ...b.pinned.map(x => ({ ...x, role: '固定', type: '', newItems: x.coverageItems, reason: x.issues.length ? x.issues.length + ' 個問題' : '' }))], [
           { h: '上游', v: r => r.id, cls: 'mono' }, { h: '', v: r => tag(r.role) }, { h: '平均 ms', v: r => r.avgMs, num: 1 }, { h: '新增覆蓋', v: r => r.newItems, num: 1 },
