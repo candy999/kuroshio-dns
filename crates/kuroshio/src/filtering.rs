@@ -4,6 +4,7 @@
 //! - 自訂規則檔存檔後 3 秒內生效，不必重新下載清單
 //! - 清單邊下載邊解析；任何一份下載失敗就保留舊的過濾器（第一次載入除外），30 分鐘後重試
 //! - 清單都沒變（全部 304）就不重建；有變就整個重建，建好才替換（尖峰 = 新舊兩份並存）
+//! - 重新載入設定時清單與建置選項都沒變：沿用上一輪建好的清單層，不重建、不下載（3.5.1，規格 09 第 14 節）
 //! - 記憶體控制（規格 09）：記憶體不足時可以暫時停用優先順序最低的清單（重建一份不含它的過濾器），
 //!   恢復時重新下載。自訂規則與標成「保護」（`protect`，惡意 / 反詐騙預設是）的清單絕不停用。
 //!   停用中的清單在狀態裡列得清清楚楚（`unloaded`、`notice`）。
@@ -680,6 +681,41 @@ pub struct FilterService {
     held: Mutex<HashMap<String, Held>>,
     /// 惡意網站探測：沒有本機副本的清單下載時順便抽的樣本（3.5.1，快照目錄的 `probe-sample.json`，幾 KB）
     probe_snaps: Mutex<crate::probesample::Snaps>,
+    /// 清單層是上一輪交下來的（[`FilterService::adopt_lists`]）：開機排程不重建，照上次檢查的時間等下一次更新
+    adopted: AtomicBool,
+}
+
+/// 重新載入設定時交給下一輪的清單層（3.5.1）：清單與建置選項都沒變就沿用已經建好的過濾器，
+/// 不重新讀副本、不重新解析、不重新下載。以前每次重新載入（例如只改 `filter.blockedTtl`）都把 34 萬條規則
+/// 整份重建一次，D3 上每次要 25 秒，建置時的大量小配置也讓 musl 的 RSS 一路往上（3.5.1 測試版 D3）
+struct ListsHandoff {
+    /// 清單與建置選項（[`FilterService::layer_key`]）
+    key: String,
+    /// 快照目錄（另一個實例不接手）
+    dir: PathBuf,
+    at: std::time::Instant,
+    lists: Arc<Filter>,
+    validators: Vec<Validators>,
+    sizes: Vec<(u64, u64)>,
+    status: Value,
+    missing: Vec<usize>,
+    held: HashMap<String, Held>,
+}
+
+static LISTS_HANDOFF: Mutex<Option<ListsHandoff>> = Mutex::new(None);
+
+/// 交出的清單層多久沒人接手就丟掉（同快取、背景工作的交接）
+const LISTS_HANDOFF_TTL: Duration = Duration::from_secs(60);
+
+/// 新的一輪沒有開過濾（或沒有走到接手）：上一輪交出的清單層直接丟掉，不留在記憶體裡
+pub fn drop_lists_handoff() {
+    LISTS_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
+/// 有沒有等下一輪接手的清單層（測試用）
+#[doc(hidden)]
+pub fn lists_handoff_pending() -> bool {
+    LISTS_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 /// 錯誤是不是「工作被取消」（runtime 結束時 `spawn_blocking` 的工作）
@@ -826,7 +862,68 @@ impl FilterService {
             rebuilds: AtomicU32::new(0),
             held: Mutex::new(HashMap::new()),
             probe_snaps: Mutex::new(Default::default()),
+            adopted: AtomicBool::new(false),
         }))
+    }
+
+    /// 決定清單層內容的設定：啟用中的清單（網址、名稱、分類、保護、繞過防護、探測）與建置選項。
+    /// 這些都沒變，重新載入時就沿用上一輪建好的清單層（[`FilterService::adopt_lists`]）；
+    /// `blockedTtl`、`protectComm`、更新間隔、自訂規則這些不影響清單層（自訂規則每一輪照樣重新讀）
+    fn layer_key(&self) -> String {
+        format!("{:?}|{:?}", self.sources, self.opts)
+    }
+
+    /// 這一輪結束（重新載入設定）：把建好的清單層交給下一輪（[`FilterService::adopt_lists`]）。
+    /// 正在重建、有清單被記憶體控制停用或暫停中、還沒有任何清單時不交：下一輪照舊從副本或下載重建
+    pub fn hand_over_lists(&self, dir: &Path) {
+        let Ok(_g) = self.rebuild_lock.try_lock() else { return };
+        if self.all_suspended() || !self.unloaded.lock().unwrap().is_empty() {
+            return;
+        }
+        let lists = self.lists.read().unwrap().clone();
+        if lists.stats().lists == 0 {
+            return;
+        }
+        let h = ListsHandoff {
+            key: self.layer_key(),
+            dir: dir.to_path_buf(),
+            at: std::time::Instant::now(),
+            lists,
+            validators: self.validators.lock().unwrap().clone(),
+            sizes: self.sizes.lock().unwrap().clone(),
+            status: self.status.lock().unwrap().clone(),
+            missing: self.missing.lock().unwrap().clone(),
+            held: self.held.lock().unwrap().clone(),
+        };
+        *LISTS_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+
+    /// 新的一輪（在 [`spawn`](Self::spawn) 之前）：上一輪交出的清單層，清單與建置選項都相同就直接接手
+    /// （同一份 `Arc<Filter>`，不重建）。不同、過期、別的快照目錄就丟掉（舊的先放掉，再照舊重建，尖峰不會變成兩份）。
+    /// 回傳有沒有接手
+    pub fn adopt_lists(&self, dir: &Path) -> bool {
+        let Some(h) = LISTS_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return false;
+        };
+        if h.at.elapsed() > LISTS_HANDOFF_TTL || h.dir != dir || h.key != self.layer_key() {
+            return false;
+        }
+        let rules = h.lists.stats().lists;
+        *self.lists.write().unwrap() = h.lists;
+        *self.validators.lock().unwrap() = h.validators;
+        *self.sizes.lock().unwrap() = h.sizes;
+        *self.status.lock().unwrap() = h.status;
+        *self.missing.lock().unwrap() = h.missing;
+        *self.held.lock().unwrap() = h.held;
+        self.adopted.store(true, Ordering::Relaxed);
+        info!("重新載入：過濾清單沒有變，沿用上一輪建好的清單（{rules} 條，不重新解析）");
+        true
+    }
+
+    /// 目前的清單層（測試用：重新載入前後是不是同一份）
+    #[doc(hidden)]
+    pub fn lists_layer(&self) -> Arc<Filter> {
+        self.lists.read().unwrap().clone()
     }
 
     pub fn sources(&self) -> &[ListSource] {
@@ -1381,6 +1478,9 @@ impl FilterService {
     ///
     /// 回傳定時更新迴圈的重試次數起點（補缺的清單下載失敗時已經照退避等過第一次）
     pub async fn boot(&self, h: &BootHooks) -> usize {
+        if self.adopted.swap(false, Ordering::Relaxed) {
+            return self.boot_adopted(h).await;
+        }
         let built = self.build_from_copies().await;
         let mut fresh: Vec<usize> = Vec::new();
         if built {
@@ -1428,6 +1528,27 @@ impl FilterService {
                     w.as_secs() / 60
                 );
                 (h.sleep)(w).await;
+            }
+        }
+        0
+    }
+
+    /// 清單層是上一輪交下來的（重新載入、清單沒變）：不重建，照上一輪最後一次成功（重建或檢查過都沒變）的時間
+    /// 等到該檢查的時候；上一輪有清單失敗、或有清單還沒載入，照退避的第一步（1 分鐘）後重試。
+    /// 不在重新載入時把每份清單都問一次（以前每次重新載入都整份重建，沒有副本的清單整份重新下載）
+    async fn boot_adopted(&self, h: &BootHooks) -> usize {
+        if self.failing() {
+            let w = Duration::from_secs(RETRY_BACKOFF[0]);
+            info!("過濾清單：上一輪有清單還沒載入，{} 秒後重試", w.as_secs());
+            (h.sleep)(w).await;
+            return 1;
+        }
+        let (last, _, interval) = self.freshness();
+        let now = crate::persist::now_secs() * 1000;
+        if let Some(t) = last.filter(|t| *t <= now) {
+            let left = (t + interval).saturating_sub(now);
+            if left > 0 {
+                (h.sleep)(Duration::from_millis(left)).await;
             }
         }
         0

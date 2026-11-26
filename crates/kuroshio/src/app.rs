@@ -927,12 +927,17 @@ fn register_twip_job(
     runtime: PathBuf,
 ) {
     use kuroshio_jobs::twip::{system_load, Hooks, Sources, TwIpJob};
-    let (a1, a2, p2) = (access.clone(), access.clone(), persister.clone());
+    // 工作只留存取控制的弱參照：存取控制的 `update_status` 抓著這個工作，兩邊都用強參照就是一個循環，
+    // 每次重新載入設定整份存取控制（台灣 IP 規則）都放不掉（3.5.1 測試版 D3 的重新載入 RSS）
+    let (a1, a2, p2) = (Arc::downgrade(access), Arc::downgrade(access), persister.clone());
     let hooks = Hooks {
-        current: Arc::new(move || a1.data_and_origin()),
+        current: Arc::new(move || a1.upgrade().map_or((None, false), |a| a.data_and_origin())),
         memory_short: Arc::new(job_memory_short),
         load: Arc::new(system_load),
         install: Arc::new(move |t, bytes: Vec<u8>| {
+            let Some(a2) = a2.upgrade() else {
+                anyhow::bail!("這一輪已經結束（重新載入設定），新的清單由下一輪重新產生");
+            };
             a2.set_data(t, crate::ipfilter::LOCAL_SOURCE);
             crate::observe::set_isp_tw_ip(a2.data());
             p2.lock().unwrap().stage(crate::ipfilter::STATE_FILE, bytes.clone());
@@ -1655,6 +1660,10 @@ impl Started {
     pub fn shutdown(&self) {
         self.hand_over_jobs();
         self.hand_over_upstreams();
+        // 3.5.1：建好的過濾清單層交給下一輪（清單沒變就不重建）
+        if let Some(f) = &self.state.filter {
+            f.hand_over_lists(&persist_dir(&self.state.cfg));
+        }
         self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
     }
 
@@ -1707,6 +1716,10 @@ impl Started {
             Ok((n, bytes)) if ms >= 5000 => warn!("關機前寫出 {n} 份快照，{} KB，花了 {ms} ms", bytes.div_ceil(1024)),
             Ok((n, bytes)) => info!("關機前寫出 {n} 份快照，{} KB，{ms} ms", bytes.div_ceil(1024)),
             Err(e) => warn!("關機前寫出快照有失敗的：{e}（{ms} ms）"),
+        }
+        // 行程層級的共用結果同步抓著這一輪的 CDN 資料庫：這一輪結束就放掉，不留到下一輪換上新的（3.5.1 測試版 D3）
+        if let Some(s) = crate::chain::syncer() {
+            s.detach_sink();
         }
     }
 }
@@ -2270,11 +2283,17 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| persist_dir(cfg));
     let filter = crate::filtering::FilterService::from_cfg(cfg, &base_dir);
+    if filter.is_none() {
+        // 這一輪沒開過濾：上一輪交出的清單層不留著
+        crate::filtering::drop_lists_handoff();
+    }
     if let Some(f) = &filter {
         if let Some(b) = persister.lock().unwrap().load(crate::filtering::HITS_FILE) {
             f.restore_hits(&b);
         }
         f.set_copies(persister.clone());
+        // 重新載入：清單沒變就沿用上一輪建好的清單層（不重建；3.5.1 測試版 D3）
+        f.adopt_lists(&persist_dir(cfg));
         f.spawn();
         resolver.set_filter(Some(f.clone()));
     }

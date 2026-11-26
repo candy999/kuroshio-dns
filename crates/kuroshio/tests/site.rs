@@ -60,6 +60,7 @@ fn state(cfg: &Value) -> Arc<AppState> {
     })
 }
 
+/// 回傳的 `AppState` 要留著：`Site` 只抓弱參照（正式執行時由這一輪的 `Started` 抓著），丟掉的話公開頁的 API 回「重新載入中」
 fn site(cfg: &Value) -> (Arc<Site>, Arc<AppState>, Option<Arc<Presence>>) {
     let st = state(cfg);
     let p = Presence::from_cfg(cfg);
@@ -86,7 +87,7 @@ fn json_of(r: &SiteResponse) -> Value {
 #[tokio::test]
 async fn routing_and_headers() {
     let dir = tmp("routing");
-    let (s, _, _) = site(&config(&dir, json!({})));
+    let (s, _st, _) = site(&config(&dir, json!({})));
 
     let r = get(&s, "/").await.unwrap();
     assert_eq!(r.status, 200);
@@ -158,19 +159,19 @@ async fn custom_paths() {
         &dir,
         json!({ "site": { "detailPath": "/api" }, "listen": { "doh": { "path": "/q" } } }),
     );
-    let (s, _, _) = site(&cfg);
+    let (s, _st, _) = site(&cfg);
     assert_eq!(s.detail_path(), "/detail");
     assert!(get(&s, "/q").await.is_none());
     assert!(get(&s, "/dns-query").await.is_none());
     assert!(text(&get(&s, "/").await.unwrap()).contains("https://dns.example/q"));
     let cfg = config(&dir, json!({ "site": { "detailPath": "secret/" } }));
-    let (s, _, _) = site(&cfg);
+    let (s, _st, _) = site(&cfg);
     assert_eq!(get(&s, "/secret").await.unwrap().header("location"), Some("/secret/"));
     assert_eq!(get(&s, "/detail/").await.unwrap().status, 404);
     // 自己的網頁檔
     std::fs::write(dir.join("mine.html"), "<p>{{HOST}}{{DOH_PATH}}</p>").unwrap();
     let cfg = config(&dir, json!({ "site": { "htmlFile": dir.join("mine.html").to_string_lossy() } }));
-    let (s, _, _) = site(&cfg);
+    let (s, _st, _) = site(&cfg);
     assert_eq!(text(&get(&s, "/").await.unwrap()), "<p>dns.example/dns-query</p>");
     // 檔案改了就重新讀
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -181,7 +182,7 @@ async fn custom_paths() {
     assert_eq!(text(&get(&s, "/").await.unwrap()), "<p>改過了 dns.example</p>");
     // 網頁檔讀不到 → 500
     let cfg = config(&dir, json!({ "system": { "dataDir": dir.join("none").to_string_lossy() } }));
-    let (s, _, _) = site(&cfg);
+    let (s, _st, _) = site(&cfg);
     assert_eq!(get(&s, "/").await.unwrap().status, 500);
     assert_eq!(get(&s, "/robots.txt").await.unwrap().status, 200);
     // 關掉
@@ -193,7 +194,7 @@ async fn custom_paths() {
 #[tokio::test]
 async fn empty_hostname_uses_host_header() {
     let dir = tmp("nohost");
-    let (s, _, p) = site(&config(&dir, json!({ "site": { "hostname": "" } })));
+    let (s, _st, p) = site(&config(&dir, json!({ "site": { "hostname": "" } })));
     let c = ip("192.0.2.10");
     let html = text(&s.handle("GET", "/", "", c, Some("Router.Example:8443")).await.unwrap());
     assert!(
@@ -229,7 +230,7 @@ async fn empty_hostname_uses_host_header() {
 #[tokio::test]
 async fn presence_and_info() {
     let dir = tmp("presence");
-    let (s, _, p) = site(&config(&dir, json!({})));
+    let (s, _st, p) = site(&config(&dir, json!({})));
     let p = p.unwrap();
     let me = ip("2001:db8:aa:bb::1");
     let presence = |client: IpAddr| {
@@ -264,7 +265,7 @@ async fn presence_and_info() {
 
     // 偵測關掉：公開頁回 unknown
     let cfg = config(&dir, json!({ "check": { "enabled": false } }));
-    let (s, _, p) = site(&cfg);
+    let (s, _st, p) = site(&cfg);
     assert!(p.is_none());
     assert_eq!(
         json_of(&get(&s, "/api/public/presence").await.unwrap()),
@@ -277,7 +278,7 @@ async fn presence_and_info() {
 #[tokio::test]
 async fn mobileconfig() {
     let dir = tmp("apple");
-    let (s, _, _) = site(&config(&dir, json!({})));
+    let (s, _st, _) = site(&config(&dir, json!({})));
     let doh = get(&s, "/apple/doh.mobileconfig").await.unwrap();
     assert_eq!(doh.status, 200);
     assert_eq!(doh.header("content-type"), Some("application/x-apple-aspen-config"));
@@ -494,7 +495,7 @@ async fn public_stats_ranges() {
 #[tokio::test]
 async fn doh_on_other_port() {
     let dir = tmp("port");
-    let (s, _, _) = site(&config(
+    let (s, _st, _) = site(&config(
         &dir,
         json!({ "listen": { "doh": { "enabled": true, "host": "0.0.0.0", "port": 8443, "tls": true } } }),
     ));
@@ -539,7 +540,7 @@ async fn doh_on_other_port() {
     let info = json_of(&at("127.0.0.1:8053", "/api/public/info").await);
     assert_eq!(info["doh"], "https://dns.example:8443/dns-query");
     // 設定了對外埠號
-    let (s2, _, _) = site(&config(
+    let (s2, _st, _) = site(&config(
         &dir,
         json!({ "listen": { "doh": { "enabled": true, "host": "0.0.0.0", "port": 8443, "tls": true, "publicPort": 443 } } }),
     ));
@@ -730,7 +731,7 @@ async fn csv_download_with_cdn() {
 #[tokio::test]
 async fn share_qr_codes() {
     let dir = tmp("qr");
-    let (s, _, _) = site(&config(
+    let (s, _st, _) = site(&config(
         &dir,
         json!({ "about": { "sourceUrl": "https://git.example.org/me/kuroshio" } }),
     ));
@@ -834,4 +835,20 @@ fn no_hardcoded_domain() {
         let t = std::fs::read_to_string(root().join(f)).unwrap().to_lowercase();
         assert!(!t.contains("candy"), "{f}");
     }
+}
+
+/// 3.5.1：公開頁只抓這一輪整體狀態的弱參照（以前的強參照讓每次重新載入整輪都放不掉）。
+/// 這一輪已經結束（重新載入中）時詳細頁的 API 回 503、公開統計是空的，不會出錯
+#[tokio::test]
+async fn ended_round_answers_reloading() {
+    let dir = tmp("ended");
+    let (s, st, _) = site(&config(&dir, json!({})));
+    let r = get(&s, "/detail/api/status").await.unwrap();
+    assert_eq!(r.status, 200, "這一輪還在");
+    drop(st);
+    let r = get(&s, "/detail/api/status").await.unwrap();
+    assert_eq!(r.status, 503);
+    let r = get(&s, "/detail/api/public?range=30d").await.unwrap();
+    assert_eq!(json_of(&r), json!({}));
+    std::fs::remove_dir_all(&dir).unwrap();
 }
