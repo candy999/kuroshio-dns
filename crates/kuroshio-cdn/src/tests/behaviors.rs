@@ -71,6 +71,33 @@ async fn v6_verify_does_not_overwrite_v4_base() {
         .is_none());
 }
 
+/// 3.5.1 L3：「特定產品專用」算不同的網站，7 天沒有新的「不服務」就消退
+#[test]
+fn zone_restricted_counts_sites_and_decays() {
+    let (c, _) = setup(json!({}));
+    let x = ip("104.16.161.36");
+    c.with_state(|st| {
+        let p = &mut st.pools;
+        for _ in 0..5 {
+            p.zone_note_site("cloudflare", x, false, "a.example.com");
+        }
+        assert!(!p.is_restricted("cloudflare", x), "同一個網站重驗 5 次只算一次");
+        p.zone_note_site("cloudflare", x, false, "b.example.com");
+        assert!(p.is_restricted("cloudflare", x), "兩個不同的網站");
+        let now = now_ms();
+        assert_eq!(p.decay_zone(now + 6 * 86_400_000), 0, "6 天：還在");
+        assert_eq!(p.decay_zone(now + 8 * 86_400_000), 1, "7 天沒有新的就清掉");
+        assert!(!p.is_restricted("cloudflare", x));
+        assert!(!p.zone.contains_key("cloudflare|104.16.161.36"), "也沒有「服務」的整筆拿掉");
+        // 有「服務」紀錄的留著，只清「不服務」
+        p.zone_note_site("cloudflare", x, true, "c.example.com");
+        p.zone_note_site("cloudflare", x, false, "a.example.com");
+        assert_eq!(p.decay_zone(now + 8 * 86_400_000), 1);
+        let z = &p.zone["cloudflare|104.16.161.36"];
+        assert_eq!((z.hit, z.miss, z.sites.len()), (1, 0, 0));
+    });
+}
+
 /// 3.5.1 L1／L2：載入時清掉舊資料裡不成立的學習資料（會讓 `has_learning()` 誤判）
 #[test]
 fn stale_learning_cleaned_on_load() {
@@ -206,7 +233,12 @@ async fn verifier_error_1034_then_fail_and_backoff() {
     let v = c.state().db.get("b.test").unwrap().v4.clone().unwrap();
     assert_eq!(v.fails, Some(2));
     assert!(v.until.unwrap() > now_ms() + 11 * 3_600_000);
-    // 兩個節點各失敗兩次 → 特定產品專用 IP
+    // 同一個網站失敗兩次只算一個網站（3.5.1 L3）；第二個網站也這樣 → 特定產品專用 IP
+    assert!(!c.state().pools.is_restricted("cloudflare", ip("104.16.161.36")));
+    c.with_state(|st| {
+        st.db.touch("b2.test", "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+    });
+    assert_eq!(c.verify("b2.test", "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("fail"));
     assert!(c.state().pools.is_restricted("cloudflare", ip("104.16.161.36")));
     // 3 個候選都這樣：網站的問題，節點不暫停
     assert!(c.state().pools.usable("cloudflare", ip("104.16.161.36")));

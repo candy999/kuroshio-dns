@@ -584,7 +584,7 @@ impl Cdn {
                     failed_nodes.push(ip);
                 }
                 if r.tls_error {
-                    self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                    self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
                     zone_fail.get_or_insert(ZoneFail {
                         reason: format!("TLS 失敗 ({err})"),
                         pop: None,
@@ -649,7 +649,7 @@ impl Cdn {
                     }
                 }
                 if zone_kind(&broken) {
-                    self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                    self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
                     if !octet && !conn_out.zone.iter().any(|(x, _)| *x == ip) {
                         conn_out.zone.push((ip, broken.clone()));
                     }
@@ -721,7 +721,7 @@ impl Cdn {
                 last_reason = "只有不在節點池裡的 IP 可用".into();
                 continue;
             }
-            self.with_state(|st| st.pools.zone_note(provider, ip, true));
+            self.with_state(|st| st.pools.zone_note_site(provider, ip, true, name));
             // 3.5.0 F9（E7 第二版）：台灣節點能用，但握手連續兩次（相隔 10 分鐘以上）比原本慢 → 暫時用原本的答案
             // （既有的「驗證失敗 → 原始」），15 分鐘後有人查再重驗。節點沒有壞：不標壞、不增加失敗次數；好友的提示照樣算命中
             let chk = self.slower_check(provider, family, orig, http_mode, base_ok, &r, prev_slow, always);
@@ -1049,7 +1049,7 @@ impl Cdn {
         let r = self.probe_site(ip, name, http_mode).await;
         if !r.ok {
             if r.tls_error {
-                self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
             }
             return false;
         }
@@ -1067,7 +1067,7 @@ impl Cdn {
         }
         if let Some(broken) = looks_broken_r(provider, &r) {
             if zone_kind(&broken) {
-                self.with_state(|st| st.pools.zone_note(provider, ip, false));
+                self.with_state(|st| st.pools.zone_note_site(provider, ip, false, name));
             }
             return false;
         }
@@ -1081,7 +1081,7 @@ impl Cdn {
                 return false;
             }
         }
-        self.with_state(|st| st.pools.zone_note(provider, ip, true));
+        self.with_state(|st| st.pools.zone_note_site(provider, ip, true, name));
         true
     }
 

@@ -44,7 +44,7 @@ fn seed_state_with_unknowns(state: &std::path::Path) -> HashMap<&'static str, Va
         .unwrap();
     dom["domains"][j]["cross4"]["tried"][0]["futureTried"] = json!(null);
     let harvest = json!({ "cloudflare": { "v4": { "104.16.1.1": 1793085962496u64, "104.16.0.9": 2 }, "v6": {}, "futureH": 1 } });
-    let zone = json!({ "cloudflare|104.16.1.1": { "hit": 3, "miss": 1, "at": 1793085962496u64, "futureZ": "z" } });
+    let zone = json!({ "cloudflare|104.16.1.1": { "hit": 3, "miss": 1, "at": now_ms(), "futureZ": "z" } });
     let out: HashMap<&'static str, Value> = [
         ("cdn/pools.json", pools),
         ("cdn/v6-nodes.json", v6),

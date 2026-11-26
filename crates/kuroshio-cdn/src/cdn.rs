@@ -1837,6 +1837,8 @@ impl Cdn {
         let recent = now.saturating_sub(3 * util::DAY_MS);
         let mut tasks = Vec::new();
         let sampled;
+        // 3.5.1 L3：相容性紀錄（ip-zone）的「不服務」7 天沒有新的就消退（每小時一次，跟複驗一起）
+        self.with_state(|st| st.pools.decay_zone(now));
         {
             let st = self.state();
             let due = |v: Option<&db::Verdict>| v.is_some_and(|v| v.is("ok") && v.until.unwrap_or(0) < soon);
