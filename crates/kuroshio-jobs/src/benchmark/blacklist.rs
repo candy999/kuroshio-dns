@@ -1,8 +1,12 @@
 //! 學到的永久黑名單（`state/blacklist.txt`）的整理（3.5.1，規格 11 的 A10.4）。
 //!
 //! 一行一台：`<id>  # <YYYY-MM-DD> <原因>`。原因裡有「憑證不符」的、手動加的、沒有日期的：永久（要手動刪）。
-//! 原因裡有「網站無法驗證」的：列入之後 30～60 天（依 id 雜湊分散）自動重測一次，通過就移除，
-//! 沒通過就從那天重新算。3.5.0 以前的規則列入的（文字是「連續 N 天網站無法驗證」）那時候比較容易誤判，升級後就排重測。
+//! 原因裡有「網站無法驗證」的：列入之後 30～60 天（依 id 雜湊分散）自動重測一次，通過就移除。
+//! 沒通過時照列入的標準判斷（3.5.1 第二版之後）：憑證不符的改成永久；「網站無法驗證」的可疑紀錄夠格列入
+//! （30 天內不同的 3 天、2 個以上網域）才留著、從那天重新算，不夠格就移出、這次的失敗照一般規則記進可疑紀錄
+//! （以前一天、一個網站逾時就又留 30～60 天，重測的門檻比列入的還低）。資格賽或連線失敗（什麼都沒看到）算今天沒測到：
+//! 留著，30～60 天後再試（不移出：移出等於每天白測一台可能已經不在的伺服器）。
+//! 3.5.0 以前的規則列入的（文字是「連續 N 天網站無法驗證」）那時候比較容易誤判，升級後就排重測。
 //! 每次評測最多重測 [`RETEST_PER_RUN`] 台；名單裡已經沒有的、超過 [`BLACKLIST_MAX`] 筆的移除。
 //!
 //! 程式附帶的唯讀名單（`data/benchmark/blacklist.txt`）不動。
@@ -126,25 +130,38 @@ pub fn due(entries: &[Entry], today: u32, skip: impl Fn(&str) -> bool) -> Vec<St
 pub enum Retest {
     /// 通過（沒有汙染、可疑）：移除
     Passed,
-    /// 又被判汙染／可疑、或連資格賽都沒過：從今天重新算（`reason` 寫進那一行）
+    /// 沒通過、而且照列入的標準夠格（憑證不符；或可疑紀錄 30 天內 3 天、2 個網域）：留著、從今天重新算（`reason` 寫進那一行）
     Failed(String),
+    /// 沒通過，但照列入的標準不夠格（可疑紀錄不夠、別的經營者也回同一個位址）：移出永久黑名單，
+    /// 這次的失敗照一般規則記進可疑紀錄（之後夠格再列入）
+    Released(String),
     /// 今天沒測到（路徑檢查略過、不支援）：不動，下次再試
     Untested,
+    /// 資格賽或連線失敗（沒有「網站無法驗證」或憑證的證據）：也算今天沒測到，留著；
+    /// 那一行的日期改成今天，30～60 天後再試（不然每次評測都會再排一次，天天白測一台可能已經不在的伺服器）
+    Unreachable(String),
 }
 
 /// 整理的結果（寫進 judge.log）
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tidy {
     pub passed: usize,
+    /// 沒通過、「網站無法驗證」夠格：留著、從今天重新算
     pub failed: usize,
+    /// 沒通過、憑證不符：改成永久
+    pub failed_cert: usize,
+    /// 沒通過但不夠格：移出
+    pub released: usize,
     pub untested: usize,
+    /// 今天沒測到裡面，資格賽或連線失敗的（留著、30～60 天後再試）
+    pub unreachable: usize,
     pub pruned: usize,
     pub capped: usize,
 }
 
 impl Tidy {
     pub fn any(&self) -> bool {
-        self.passed + self.failed + self.pruned + self.capped > 0
+        self.passed + self.failed + self.failed_cert + self.released + self.pruned + self.capped > 0
     }
 }
 
@@ -172,8 +189,11 @@ pub fn tidy(text: &str, results: &HashMap<String, Retest>, known: impl Fn(&str) 
                 st.passed += 1;
                 continue;
             }
+            Some(Retest::Released(_)) => {
+                st.released += 1;
+                continue;
+            }
             Some(Retest::Failed(why)) => {
-                st.failed += 1;
                 let first = first_listed(&e.line).unwrap_or_else(|| e.line_date().unwrap_or_default());
                 // 重測時憑證不符：改成永久的那一種
                 let what = if why.contains("憑證不符") {
@@ -190,9 +210,25 @@ pub fn tidy(text: &str, results: &HashMap<String, Retest>, known: impl Fn(&str) 
                 e.old_rule = false;
                 if what == "憑證不符" {
                     e.kind = Kind::Permanent;
+                    st.failed_cert += 1;
+                } else {
+                    st.failed += 1;
                 }
             }
             Some(Retest::Untested) => st.untested += 1,
+            Some(Retest::Unreachable(why)) => {
+                st.untested += 1;
+                st.unreachable += 1;
+                let first = first_listed(&e.line).unwrap_or_else(|| e.line_date().unwrap_or_default());
+                // 照樣是「網站無法驗證」的那一種（`parse_line()` 看這幾個字）：30～60 天後再重測
+                e.line = format!(
+                    "{}  # {today_str} 重測：連不上（{}），網站無法驗證的判斷下次再試（第一次列入 {first}）",
+                    e.id,
+                    why.replace(['\n', '#'], " ")
+                );
+                e.day = Some(today);
+                e.old_rule = false;
+            }
             None => {}
         }
         // 名單裡已經沒有的：列入夠久（或沒有日期）才移除
@@ -318,12 +354,20 @@ mod tests {
 192.0.2.4  # 2026-11-20 重複的\n\
 192.0.2.5  # 2026-11-14 汙染：a → b（憑證不符 X）\n\
 192.0.2.6  # 2026-12-25 汙染：a → b（憑證不符 X）\n\
+192.0.2.7  # 2026-11-15 汙染：a → b（連續 3 天網站無法驗證）\n\
+192.0.2.8  # 2026-11-15 汙染：a → b（連續 3 天網站無法驗證）\n\
+192.0.2.9  # 2026-11-15 汙染：a → b（連續 3 天網站無法驗證）\n\
 # 使用者自己的註解\n\
 198.51.100.9\n";
         let mut r = HashMap::new();
         r.insert("192.0.2.1".to_string(), Retest::Passed);
         r.insert("192.0.2.2".to_string(), Retest::Failed("可疑 a".into()));
         r.insert("192.0.2.3".to_string(), Retest::Untested);
+        // 連不上：留著、日期改成今天（30～60 天後再試）
+        r.insert("192.0.2.9".to_string(), Retest::Unreachable("資格賽失敗 (逾時)".into()));
+        // 沒通過但不夠列入的標準：移出（3.5.1 第二版之後）；重測時憑證不符：改成永久
+        r.insert("192.0.2.7".to_string(), Retest::Released("可疑 a".into()));
+        r.insert("192.0.2.8".to_string(), Retest::Failed("汙染 a (判定為 b，憑證不符 X)".into()));
         // 192.0.2.5 不在名單、列入超過 30 天 → 移除；192.0.2.6 不在名單但才 5 天 → 留著；手動加的 198.51.100.9 在名單裡
         let known = |id: &str| id != "192.0.2.5" && id != "192.0.2.6";
         let (out, st) = tidy(text, &r, known, today, "2026-12-30");
@@ -332,7 +376,10 @@ mod tests {
             Tidy {
                 passed: 1,
                 failed: 1,
-                untested: 1,
+                failed_cert: 1,
+                released: 1,
+                untested: 2,
+                unreachable: 1,
                 pruned: 1,
                 capped: 0
             }
@@ -345,6 +392,22 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("192.0.2.3  # 2026-11-15"), "沒測到的不動：{out}");
+        assert!(!out.contains("192.0.2.7 "), "不夠格的移出：{out}");
+        assert!(
+            out.contains("192.0.2.9  # 2026-12-30 重測：連不上（資格賽失敗 (逾時)），網站無法驗證的判斷下次再試（第一次列入 2026-11-15）"),
+            "{out}"
+        );
+        let e9 = parse_line(out.lines().find(|l| l.starts_with("192.0.2.9 ")).unwrap()).unwrap();
+        assert_eq!((e9.kind, e9.old_rule, e9.day), (Kind::Unverified, false, Some(today)));
+        assert!(due(&[e9], today + 1, |_| false).is_empty(), "隔天不再排");
+        assert!(
+            out.contains("192.0.2.8  # 2026-12-30 重測：憑證不符（汙染 a (判定為 b，憑證不符 X)；第一次列入 2026-11-15）"),
+            "{out}"
+        );
+        assert_eq!(
+            parse_line(out.lines().find(|l| l.starts_with("192.0.2.8 ")).unwrap()).unwrap().kind,
+            Kind::Permanent
+        );
         assert_eq!(out.matches("192.0.2.4 ").count(), 1, "重複的只留第一筆：{out}");
         assert!(!out.contains("192.0.2.5") && out.contains("192.0.2.6"), "{out}");
         assert!(out.contains("# 使用者自己的註解\n") && out.contains("198.51.100.9\n"));
