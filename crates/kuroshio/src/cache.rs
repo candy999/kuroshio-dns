@@ -52,9 +52,9 @@ pub const WARM_PER_SITE: usize = 8;
 pub const WARM_MIN_HITS: u32 = 2;
 
 /// 開機預熱名單的共同過濾（寫出名單、讀進舊名單都用）：依原本的順序，同一個主網域最多 [`WARM_PER_SITE`] 筆，
-/// 重複的、格式不對的略過，最多 `n` 筆。
+/// 重複的、格式不對的略過；`skip_special` 時特殊用途網域（RFC 6761，本機直接回答、不必預熱）也略過，最多 `n` 筆。
 /// 3.5.0 以前的名單只要查過一次就收，外部探測每 10 秒查一個隨機子網域就塞滿整份名單，重新啟動時逐一重問上游
-pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize) -> Vec<String> {
+pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize, skip_special: bool) -> Vec<String> {
     let mut per: HashMap<String, usize> = HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -63,7 +63,7 @@ pub fn cap_per_site(keys: impl IntoIterator<Item = String>, n: usize) -> Vec<Str
             break;
         }
         let Some((t, name)) = k.split_once('|') else { continue };
-        if t.parse::<u16>().is_err() || name.is_empty() {
+        if t.parse::<u16>().is_err() || name.is_empty() || (skip_special && crate::resolver::special_use(name).is_some()) {
             continue;
         }
         let site = crate::stats::site_key(name).unwrap_or(name);
@@ -331,7 +331,8 @@ impl Cache {
             })
             .collect();
         v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
-        cap_per_site(v.into_iter().map(|x| x.0.clone()), n)
+        // 特殊用途網域在本機回答時根本不會進快取；關掉時照一般網域
+        cap_per_site(v.into_iter().map(|x| x.0.clone()), n, false)
     }
 
     pub fn approx_bytes(&self) -> usize {
@@ -530,12 +531,12 @@ mod tests {
         // 預熱名單只列一般查詢
         let mut c = Cache::new(100);
         let now = Instant::now();
-        for k in ["1|a.test", "1+1d|a.test", "16+3|a.test"] {
+        for k in ["1|a.example.com", "1+1d|a.example.com", "16+3|a.example.com"] {
             c.insert(k.into(), entry(60, false), now);
             c.get(k, now);
             c.get(k, now);
         }
-        assert_eq!(c.hot_keys(10), vec!["1|a.test"]);
+        assert_eq!(c.hot_keys(10), vec!["1|a.example.com"]);
     }
 
     fn with_class(class: Class) -> Entry {
@@ -617,7 +618,7 @@ mod tests {
             .map(String::from),
         );
         old.extend((0..10).map(|i| format!("1|s{i}.shop.example.com.tw")));
-        let kept = cap_per_site(old, usize::MAX);
+        let kept = cap_per_site(old, usize::MAX, true);
         assert_eq!(kept.iter().filter(|k| k.ends_with(".example.com")).count(), WARM_PER_SITE);
         assert_eq!(
             kept.iter().filter(|k| k.ends_with(".example.com.tw")).count(),
@@ -626,7 +627,16 @@ mod tests {
         );
         assert_eq!(kept.iter().filter(|k| k.contains("www.example.net")).count(), 2, "重複的只留一筆");
         assert!(!kept.iter().any(|k| k.contains("bad") || k == "nopipe"));
-        assert_eq!(cap_per_site(kept.clone(), 3).len(), 3);
+        assert_eq!(cap_per_site(kept.clone(), 3, true).len(), 3);
+        // 特殊用途網域：本機回答時不預熱，關掉時照一般網域
+        let special = vec![
+            "1|a.test".to_string(),
+            "1|b.invalid".into(),
+            "28|localhost".into(),
+            "1|a.example.com".into(),
+        ];
+        assert_eq!(cap_per_site(special.clone(), 10, true), vec!["1|a.example.com"]);
+        assert_eq!(cap_per_site(special, 10, false).len(), 4);
     }
 
     #[test]

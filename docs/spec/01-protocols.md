@@ -138,6 +138,7 @@ DDR 注意事項：
 | DNS Cookies | 7873 | ⚙️ | 對外開放 UDP 53 時建議開啟 |
 | TCP keepalive | 7828 | 🆕 | 伺服器端 TCP / DoT 支援 |
 | DNSSEC 驗證 | 4033–4035 | ⚙️ | 本機驗證上游回應。被 CDN 置換或過濾改寫的回應一律不標 AD；DO 位元照 2.x 規則傳遞 |
+| 特殊用途網域 | 6761、7686 | ✅ | 3.5.1，`resolver.specialUse`（預設開）：`.invalid`、`.test`、`.onion`、`.example`（含頂級網域本身）在本機回 NXDOMAIN；`localhost` 與底下的名稱 A 回 `127.0.0.1`、AAAA 回 `::1`（TTL 1 小時）、其他類型空答案。不問上游、不過濾、不快取、不算進熱門網域與公開頁的網站排行（計在「本機回答」），開機預熱名單也不收。順序：`version.kuroshio`、串接、DDR 之後，**本地網域轉發（`resolver.localForward`）之後**——區網真的有這些網域時照轉；Windows 等沒有本地轉發的環境可以關掉這個選項。只看最後一段，查詢路徑上只多一次字串比較。`example.com`、`example.net` 是一般網域，照常解析。以前這些名稱都送去問上游（結果一樣是不存在），外部探測的 `.invalid`、`.test` 名稱也進了排行 |
 
 ## 4. 攔截回應格式（不變）
 

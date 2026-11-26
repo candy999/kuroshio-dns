@@ -229,6 +229,8 @@ return view.extend({
 		num('cache_max', _('快取筆數上限'), 'resolver.cacheMax');
 		common.flag(s, null, 'send_ecs', _('對上游附帶 ECS（本機對外 IP 的 /24）'), 'resolver.sendEcs');
 		common.flag(s, null, 'android_probe_fast', _('Android 私人 DNS 驗證查詢立即回覆'), 'resolver.androidProbeFast');
+		common.flag(s, null, 'special_use', _('特殊用途網域在本機回答'), 'resolver.specialUse',
+			_('RFC 6761：.invalid、.test、.onion、.example 直接回「不存在」，localhost 回本機位址，不問上游、不算進排行。區網網域轉給 dnsmasq 的照樣優先。'));
 		// 背景補問（3.4.0）
 		o = s.option(form.ListValue, 'backfill', _('背景補問'),
 			_('只同時問最快幾台上游時（同時問幾個上游有限制），CDN 相關的查詢與抽樣的查詢在回答之後，於背景再問這次沒問到的上游，合併節點與比對汙染。不增加回答的等待。'));

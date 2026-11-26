@@ -71,6 +71,9 @@ pub struct Params {
     /// 上游成敗的記法（3.5.0 F4，`upstream.roundAwareFailures`，預設開）：來不及回答（被取消）的上游記得到、
     /// 大家都答不出來的那一輪不算個別上游失敗。關掉＝3.4.x 的記法。規格 11 第 6.2 節骨架，乙批接上
     pub round_aware_failures: bool,
+    /// 特殊用途網域（RFC 6761：`.invalid`、`.test`、`.localhost`、`.onion`、`.example`）在本機回答
+    /// （`resolver.specialUse`，預設開，3.5.1）。關掉＝3.5.0 的行為：照一般網域問上游
+    pub special_use: bool,
 }
 
 impl Params {
@@ -107,6 +110,44 @@ impl Params {
             backfill_sample,
             backfill_max: if kuroshio_config::Host::detect().cores <= 2 { 2 } else { 4 },
             round_aware_failures: kuroshio_config::chain::flex_bool(kuroshio_config::get(cfg, "upstream.roundAwareFailures"), true).0,
+            special_use: b("specialUse", true),
+        }
+    }
+}
+
+/// 特殊用途網域（RFC 6761、RFC 7686）在本機怎麼回答
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialUse {
+    /// `localhost` 與底下的名稱：A 回 127.0.0.1、AAAA 回 ::1、其他類型空答案（RFC 6761 6.3）
+    Localhost,
+    /// `.invalid`、`.test`、`.onion`、`.example`：一律 NXDOMAIN（根區沒有這些頂級網域，問上游的結果也是不存在）
+    NxDomain,
+}
+
+/// 名稱（小寫、結尾沒有點）是不是特殊用途網域。只看最後一段：查詢路徑上只多一次字串比較、不配置。
+/// `example.com`、`example.net` 是一般網域（IANA 的範例網站），照常解析
+pub fn special_use(name: &str) -> Option<SpecialUse> {
+    match name.rsplit('.').next()? {
+        "localhost" => Some(SpecialUse::Localhost),
+        "invalid" | "test" | "onion" | "example" => Some(SpecialUse::NxDomain),
+        _ => None,
+    }
+}
+
+/// 特殊用途網域的回答（不問上游、不快取、不算進排行）
+fn special_use_response(query: &Message, kind: SpecialUse) -> Message {
+    match kind {
+        SpecialUse::NxDomain => Message::response_to(query, 3),
+        SpecialUse::Localhost => {
+            let mut r = Message::response_to(query, 0);
+            if let Some(q) = query.question() {
+                match q.qtype {
+                    rtype::A => r.answers.push(Record::a(&q.name, 3600, std::net::Ipv4Addr::LOCALHOST)),
+                    rtype::AAAA => r.answers.push(Record::aaaa(&q.name, 3600, std::net::Ipv6Addr::LOCALHOST)),
+                    _ => {}
+                }
+            }
+            r
         }
     }
 }
@@ -511,6 +552,14 @@ impl Resolver {
                     Ok(r) => Some((Out::Raw(r), false)),
                     Err(_) => msg(logic::servfail(&query)),
                 };
+            }
+        }
+        // 特殊用途網域（RFC 6761，3.5.1）：本機直接回答，不問上游、不過濾、不快取、不算進熱門與網站排行。
+        // 放在本地轉發之後：使用者把這些網域轉給區網的 DNS 時照轉
+        if qclass == 1 && self.params.special_use {
+            if let Some(kind) = special_use(&qname) {
+                self.stats.count(StatKind::Local);
+                return msg(special_use_response(&query, kind));
             }
         }
         self.stats.query(&qname, ctx.client);

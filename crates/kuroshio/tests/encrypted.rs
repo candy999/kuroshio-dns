@@ -62,7 +62,7 @@ async fn dot_and_doh_serve_queries() {
         "site": { "hostname": "dns.example.test" },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
         // 關掉快速回應：第一個回應就是正式結果（快速回應的 TTL 最多 10 秒）
-        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false }
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false, "fastPath": false }
     }));
     let started = kuroshio::app::start(&cfg).await.unwrap();
     let dot = started.encrypted.dot.expect("DoT 有啟動");
@@ -225,7 +225,7 @@ async fn plain_http_doh_behind_proxy() {
         "admin": { "port": 0, "auth": false }, "filter": { "enabled": false },
         "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 }, "doh": { "enabled": true, "host": "127.0.0.1", "port": 0, "cert": "", "key": "", "trustProxy": true } },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false },
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false },
         // 測試環境沒有台灣 IP 資料：資料讀不到時公網來源（X-Forwarded-For 203.0.113.9）會被擋，這裡測的是轉發
         "access": { "mode": "open" }
     }));
@@ -261,7 +261,7 @@ async fn doq_retry_when_many_unvalidated_handshakes() {
     let cfg = kuroshio_config::with_overrides(&json!({
         "system": { "persistDir": dir.join("state").to_string_lossy() },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false }
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false, "fastPath": false }
     }));
     let r = kuroshio::app::build_resolver(&cfg).unwrap();
     let certs = kuroshio::encrypted::CertStore::new(dir.join("cert.pem"), dir.join("key.pem"));
@@ -292,7 +292,7 @@ async fn quic_open_gauge_follows_connections() {
     let cfg = kuroshio_config::with_overrides(&json!({
         "system": { "persistDir": dir.join("state").to_string_lossy() },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false }
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false, "fastPath": false }
     }));
     let r = kuroshio::app::build_resolver(&cfg).unwrap();
     let certs = kuroshio::encrypted::CertStore::new(dir.join("cert.pem"), dir.join("key.pem"));
@@ -384,7 +384,7 @@ fn stuck_resolver(dir: &std::path::Path, up: SocketAddr) -> std::sync::Arc<kuros
     let cfg = kuroshio_config::with_overrides(&json!({
         "system": { "persistDir": dir.join("state").to_string_lossy() },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false, "timeoutMs": 8000 }
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false, "fastPath": false, "timeoutMs": 8000 }
     }));
     kuroshio::app::build_resolver(&cfg).unwrap()
 }

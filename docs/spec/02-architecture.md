@@ -73,6 +73,7 @@ kuroshio check-config <file>                     檢查設定檔
   | `resolver.stripEch` | `false` | 移除 HTTPS 記錄的 ECH |
   | `resolver.dnssec` | `false` | 本機 DNSSEC 驗證 |
   | `resolver.cookies` | `false` | DNS Cookies |
+  | `resolver.specialUse` | `true` | 特殊用途網域（RFC 6761：`.invalid`、`.test`、`.localhost`、`.onion`、`.example`）在本機回答，不問上游（3.5.1，見 01 第 3 節） |
   | `upstream.autoTypes` | `['udp','doh','doh3','dot','doq']` | 評測類型 |
   | `acme` | `{ enabled:false, provider:'cloudflare', … }` | Windows 內建 ACME；OpenWrt 預設仍用 acme.sh |
   | `domain` | `''` | 綁定網域（固定網域或 DDNS 名稱）。`site.hostname`、`community.domain`、`acme.domains` 空白時自動帶入；`ddns.records` 只有 `ddns.enabled` 而且沒寫記錄時才帶入（固定網域不需要 DDNS） |

@@ -28,7 +28,7 @@ fn user_cfg(dir: &Path, dns_port: u16, admin_port: u16, auth: bool) -> Value {
         "filter": { "enabled": false }, "cdn": { "enabled": false },
         "listen": { "plain": { "binds": ["127.0.0.1"], "port": dns_port } },
         "upstream": { "pinned": ["udp://127.0.0.1:9"], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false },
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false },
         "jobs": { "dns-benchmark": { "enabled": false }, "cdn-pool": { "enabled": false }, "cdn-ranges": { "enabled": false },
                   "cdn-scan": { "enabled": false }, "tw-ip": { "enabled": false } },
     })

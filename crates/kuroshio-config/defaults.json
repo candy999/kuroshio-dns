@@ -176,6 +176,7 @@
     "stripEch": false,
     "dnssec": false,
     "cookies": false,
+    "specialUse": true,
     "parallel": "auto",
     "staleIfErrorSec": 86400,
     "warmNames": 2000,

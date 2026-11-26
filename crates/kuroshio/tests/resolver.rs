@@ -84,7 +84,7 @@ fn cfg(ups: &[SocketAddr], extra: serde_json::Value) -> serde_json::Value {
         "filter": { "enabled": false },
         "system": { "persistDir": std::env::temp_dir().join("kuroshio-rtest").to_string_lossy() },
         "upstream": { "pinned": ups.iter().map(|u| format!("udp://{u}")).collect::<Vec<_>>(), "fallback": [] },
-        "resolver": { "timeoutMs": 800, "collectWindowMs": 100, "lastResort": [], "rankIps": false }
+        "resolver": { "specialUse": false, "timeoutMs": 800, "collectWindowMs": 100, "lastResort": [], "rankIps": false }
     }));
     kuroshio_config::merge(&mut c, &extra);
     c
@@ -426,6 +426,70 @@ async fn warmup_from_hot_names() {
     let saved: Vec<String> = serde_json::from_slice(&std::fs::read(dir.join("hot-names.json")).unwrap()).unwrap();
     assert_eq!(saved[0], "1|hot-a.test", "{saved:?}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 3.5.1：特殊用途網域（RFC 6761）在本機回答，不問上游、不算進熱門與網站排行；example.com 照常解析；
+/// 使用者設定的本地網域轉發優先；關掉 `resolver.specialUse` 時照一般網域問上游
+#[tokio::test]
+async fn special_use_names_answered_locally() {
+    let (up, n) = upstream(0, answer).await;
+    let r = kuroshio::app::build_resolver(&cfg(&[up], json!({ "resolver": { "specialUse": true } }))).unwrap();
+    for (i, name) in ["x.invalid", "a.b.test", "test", "abc.onion", "www.example", "EXAMPLE."]
+        .iter()
+        .enumerate()
+    {
+        for t in [rtype::A, rtype::AAAA, rtype::TXT] {
+            let m = Message::parse(&r.handle(&q(i as u16, name, t), &CTX).await.unwrap()).unwrap();
+            assert_eq!(m.rcode, 3, "{name} 類型 {t}");
+            assert!(m.answers.is_empty());
+        }
+    }
+    let m = Message::parse(&r.handle(&q(20, "app.localhost", rtype::A), &CTX).await.unwrap()).unwrap();
+    assert_eq!((m.rcode, m.answers.len()), (0, 1));
+    assert!(
+        matches!(m.answers[0].data, RData::A(ip) if ip == Ipv4Addr::LOCALHOST),
+        "{:?}",
+        m.answers
+    );
+    let m = Message::parse(&r.handle(&q(21, "localhost", rtype::AAAA), &CTX).await.unwrap()).unwrap();
+    assert!(
+        matches!(m.answers[0].data, RData::Aaaa(ip) if ip == std::net::Ipv6Addr::LOCALHOST),
+        "{:?}",
+        m.answers
+    );
+    let m = Message::parse(&r.handle(&q(22, "localhost", rtype::TXT), &CTX).await.unwrap()).unwrap();
+    assert_eq!((m.rcode, m.answers.len()), (0, 0), "其他類型空答案");
+    assert_eq!(n.load(Ordering::SeqCst), 0, "一次都沒問上游");
+    let st = r.stats.summary();
+    assert_eq!(st["topDomains"], json!([]), "不算進熱門網域");
+    assert_eq!(st["today"]["query"], 0);
+    assert!(st["today"]["local"].as_u64().unwrap() >= 21);
+    assert_eq!(r.stats.anon_ranking(1, false, 1, 10), json!([]), "不算進網站排行");
+    // example.com、example.net 是一般網域
+    let m = Message::parse(&r.handle(&q(23, "www.example.com", rtype::A), &CTX).await.unwrap()).unwrap();
+    assert_eq!((m.rcode, m.answers.len()), (0, 1));
+    assert_eq!(n.load(Ordering::SeqCst), 1);
+    assert_eq!(r.stats.anon_ranking(1, false, 1, 10)[0]["site"], "example.com");
+
+    // 本地網域轉發優先：使用者把 test 轉給區網的 DNS 時照轉
+    let (lan, ln) = upstream(0, answer).await;
+    let c = cfg(
+        &[up],
+        json!({ "resolver": { "specialUse": true, "localForward": { "server": format!("udp://{lan}"), "domains": ["test"] } } }),
+    );
+    let r = kuroshio::app::build_resolver(&c).unwrap();
+    let m = Message::parse(&r.handle(&q(30, "nas.test", rtype::A), &CTX).await.unwrap()).unwrap();
+    assert_eq!((m.rcode, m.answers.len()), (0, 1));
+    assert_eq!(ln.load(Ordering::SeqCst), 1, "交給本地轉發");
+    let m = Message::parse(&r.handle(&q(31, "x.invalid", rtype::A), &CTX).await.unwrap()).unwrap();
+    assert_eq!(m.rcode, 3, "沒有轉發的照樣本機回答");
+
+    // 關掉：照一般網域問上游（3.5.0 的行為）
+    let before = n.load(Ordering::SeqCst);
+    let r = kuroshio::app::build_resolver(&cfg(&[up], json!({ "resolver": { "specialUse": false } }))).unwrap();
+    let m = Message::parse(&r.handle(&q(40, "a.b.test", rtype::A), &CTX).await.unwrap()).unwrap();
+    assert_eq!((m.rcode, m.answers.len()), (0, 1));
+    assert_eq!(n.load(Ordering::SeqCst), before + 1);
 }
 
 /// 3.5.1 升級遷移：舊版寫的預熱名單塞滿同一個網域底下的一次性子網域時，讀進來只重查前 8 筆，不逐一問上游
@@ -1148,7 +1212,7 @@ async fn chain_timeout_still_falls_back() {
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap(); // 收了不回
     let chain = dead.local_addr().unwrap();
     let (own, n_own) = upstream(0, answer_ok_ip).await;
-    let mut c = cfg(&[], json!({ "resolver": { "timeoutMs": 200 } }));
+    let mut c = cfg(&[], json!({ "resolver": { "specialUse": false, "timeoutMs": 200 } }));
     kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{own}")] } }));
     let r = kuroshio::app::build_resolver(&c).unwrap();
     r.upstreams
@@ -1172,7 +1236,7 @@ async fn chain_servfail_retry_does_not_count_silent_own() {
     let (chain, _) = upstream(0, servfail).await;
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap(); // 收了不回
     let silent = dead.local_addr().unwrap();
-    let mut c = cfg(&[], json!({ "resolver": { "timeoutMs": 200 } }));
+    let mut c = cfg(&[], json!({ "resolver": { "specialUse": false, "timeoutMs": 200 } }));
     kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": [format!("udp://{silent}")] } }));
     let r = kuroshio::app::build_resolver(&c).unwrap();
     r.upstreams
@@ -1186,7 +1250,7 @@ async fn chain_servfail_retry_does_not_count_silent_own() {
     let (ok, _) = upstream(0, answer_ok_ip).await;
     let mut c = cfg(
         &[],
-        json!({ "resolver": { "timeoutMs": 200, "parallel": 0, "collectWindowMs": 600 } }),
+        json!({ "resolver": { "specialUse": false, "timeoutMs": 200, "parallel": 0, "collectWindowMs": 600 } }),
     );
     kuroshio_config::merge(
         &mut c,
@@ -1218,7 +1282,7 @@ async fn chain_servfail_retry_needs_two_negatives() {
     let build = |own: Vec<String>| {
         let mut c = cfg(
             &[],
-            json!({ "resolver": { "timeoutMs": 200, "parallel": 0, "collectWindowMs": 300 } }),
+            json!({ "resolver": { "specialUse": false, "timeoutMs": 200, "parallel": 0, "collectWindowMs": 300 } }),
         );
         kuroshio_config::merge(&mut c, &json!({ "upstream": { "fallback": own } }));
         let r = kuroshio::app::build_resolver(&c).unwrap();

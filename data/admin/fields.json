@@ -245,6 +245,7 @@
             { "key": "resolver.stripEch", "type": "bool", "label": "移除 HTTPS 記錄的 ECH", "help": "某些網路環境下 ECH 會讓網站連不上時再打開。" },
             { "key": "resolver.dnssec", "type": "bool", "label": "本機 DNSSEC 驗證" },
             { "key": "resolver.cookies", "type": "bool", "label": "DNS Cookies" },
+            { "key": "resolver.specialUse", "type": "bool", "label": "特殊用途網域在本機回答", "help": "RFC 6761：.invalid、.test、.onion、.example 直接回「不存在」，localhost 回本機位址，不問上游、不算進排行。example.com、example.net 是一般網域，照常解析。區網真的有用這些網域時關掉（OpenWrt 的區網網域轉發照樣優先）。" },
             { "key": "resolver.backfill", "type": "select", "label": "背景補問", "fallbackDefault": "cdn", "help": "只同時問最快幾台上游時（同時問幾個上游有限制），CDN 相關的查詢與抽樣的查詢在回答之後，於背景再問這次沒問到的上游，合併節點與比對汙染。不增加回答的等待。", "options": [
               { "value": "cdn", "label": "CDN 相關與抽樣（建議）" },
               { "value": "off", "label": "不補問（3.3.7 的行為）" }

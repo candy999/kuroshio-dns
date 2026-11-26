@@ -70,7 +70,7 @@ async fn lists_custom_priority_and_reload() {
         "admin": { "port": 0, "auth": false },
         "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false, "cacheMax": 1000 },
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false, "cacheMax": 1000 },
         "filter": {
             "customRules": ["./custom-rules.txt"],
             "maxUnindexed": 1,
@@ -362,7 +362,7 @@ async fn plain_dns_answers_before_lists_load() {
         "admin": { "port": 0, "auth": false },
         "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false },
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false },
         "filter": { "customRules": ["./custom-rules.txt"], "lists": [{ "name": "慢", "url": format!("http://{lists}/a.txt"), "category": "ads" }] }
     }));
     let started = kuroshio::app::start(&cfg).await.unwrap();
@@ -392,7 +392,7 @@ async fn deepest_shed_state_still_forwards_plain_dns() {
         "admin": { "port": 0, "auth": false },
         "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false },
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false },
         "filter": { "lists": [
             { "name": "廣告", "url": format!("http://{lists}/ads.txt"), "category": "ads" },
             { "name": "惡意", "url": format!("http://{lists}/mal.txt"), "category": "malware" }

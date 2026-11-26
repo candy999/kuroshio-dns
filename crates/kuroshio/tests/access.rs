@@ -68,7 +68,7 @@ async fn start(tag: &str, up: SocketAddr, access: Value, doh_tls: bool) -> (kuro
         "admin": { "port": 0, "auth": false }, "filter": { "enabled": false }, "cdn": { "enabled": false },
         "listen": listen,
         "upstream": { "pinned": [format!("udp://{up}")], "fallback": [] },
-        "resolver": { "lastResort": [], "rankIps": false, "fastPath": false },
+        "resolver": { "specialUse": false, "lastResort": [], "rankIps": false, "fastPath": false },
         "access": a,
     }));
     (kuroshio::app::start(&cfg).await.unwrap(), dir)

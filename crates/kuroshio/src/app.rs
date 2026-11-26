@@ -1364,7 +1364,7 @@ fn spawn_warmup(r: Arc<Resolver>, p: Arc<Mutex<Persister>>, rate: u64) {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
     let before = raw.len();
-    let keys = crate::cache::cap_per_site(raw, usize::MAX);
+    let keys = crate::cache::cap_per_site(raw, usize::MAX, r.params.special_use);
     if keys.is_empty() || rate == 0 {
         return;
     }

@@ -38,7 +38,7 @@ fn cfg(upstreams: Vec<String>) -> serde_json::Value {
         "system": { "persistDir": state.to_string_lossy() },
         "listen": { "plain": { "binds": ["127.0.0.1"], "port": 0 } },
         "upstream": { "pinned": upstreams, "fallback": [] },
-        "resolver": { "timeoutMs": 800, "lastResort": [], "rankIps": false }
+        "resolver": { "specialUse": false, "timeoutMs": 800, "lastResort": [], "rankIps": false }
     }))
 }
 
