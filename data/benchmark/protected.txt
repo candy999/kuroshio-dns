@@ -49,3 +49,6 @@ quic://doh-mullvad.quad9.net  # 觀察中（不設期望）：3.5.0 D3 實測 9 
 76.76.2.1  # filter=malware 依據：ControlD p1（擋惡意網站的那一組，依名稱推定） checked=2026-11-22
 2606:1a40::1  # filter=malware 依據：ControlD p1 checked=2026-11-22
 2606:1a40:1::1  # filter=malware 依據：ControlD s1（p1 的第二組） checked=2026-11-22
+2620:fe::11  # filter=malware 依據：dns11.quad9.net（9.9.9.11 的 IPv6）；Quad9 官方：擋惡意網站、帶 ECS checked=2026-11-26
+2a0d:2a00:1::2  # filter=malware 依據：CleanBrowsing 官方：Security 過濾 checked=2026-11-26
+2a0d:2a00:2::2  # filter=malware 依據：CleanBrowsing 官方：Security 過濾 checked=2026-11-26

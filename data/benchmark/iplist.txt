@@ -13,12 +13,15 @@
 #   （包括依一台正式環境 14 天的評測紀錄先升的 AliDNS 2 台、NTT 2 台），例如 Comodo Secure DNS、114DNS、DNSPod、
 #   Hurricane Electric、CZ.NIC、DNS.SB、Bharat Public DNS、Level 3，以及 Swisscom、Deutsche Telekom、BT、Virgin Media、
 #   Cogent 這些電信商的官方 DNS；每一筆的註解寫「3.5.1 改 A：理由」。看不出經營者的、家用、主機商的照舊是 B；
-#   同一家已經到 A 級上限的（NextDNS、Cisco OpenDNS、Vercara 各 8 台）多出來的也照舊是 B。
+#   同一家已經到 A 級上限的（NextDNS、Cisco OpenDNS 各 8 台）多出來的也照舊是 B。
+#   Vercara 沒有反解名稱、也不是官方公布的位址的 3 台不算經營者明確：1 台改 B、2 台刪掉（同一家 B 級最多 2 台；
+#   UltraDNS 有幾組過濾版的位址，看不出是哪一種）。有過濾的 3 台移到 protected.txt：2620:fe::11（dns11.quad9.net）、
+#   2a0d:2a00:1::2、2a0d:2a00:2::2（CleanBrowsing Security 過濾版）。
 # 2026-11-26 補候選（3.5.1）：A 級經營者在 public-dns.info（同一天下載）裡、這份名單還沒有的位址補到上限為止，共 40 筆：
 #   reliability ≥ 0.95、7 天內檢查過、反解名稱在經營者自己的網域；不收對照組、黑名單、有過濾的名稱（例如 dns9.quad9.net、
 #   p1.freedns.controld.com、protected.canadianshield.cira.ca）與 DNS64。放在 A 級區塊最後、註解寫「3.5.1 補的候選」：
 #   還沒經過台灣線路直連三輪測試、沒有延遲資料，跟其他候選一樣走每日評測的所有檢查。
-# 共 879 筆：A 176（其中 3.5.1 補的候選 40）、B 703
+# 共 874 筆：A 173（其中 3.5.1 補的候選 40）、B 701
 
 # ---- A 級 ----
 # A TWNIC（台灣網路資訊中心）TW 101.101.101.101（不在 public-dns.info；D3 直連評測倖存）
@@ -169,12 +172,6 @@
 2a10:50c0::1:ff
 # A NTT_America（AS2914）GB dnsres02.amstnl07.nl.to.gin.ntt.net 281.8 ms 電信商官方 DNS：NTT
 185.84.19.115
-# A Vercara（AS12008）US 32.3 ms
-156.154.70.60
-# A Vercara（AS12008）US 63.3 ms
-156.154.71.46
-# A Vercara（AS12008）US 68.7 ms
-156.154.71.5
 # A NuCDN_LLC（AS23393）US ns2.recursive.dnsbycomodo.com 34.5 ms 3.5.1 改 A：Comodo Secure DNS
 8.20.247.20
 # A Alibaba_(US)_Technology_Co.（AS45102）CN public2.alidns.com 26.2 ms ECS
@@ -564,8 +561,6 @@
 216.80.113.2
 # B Clodo_Cloud_Service_Co._L.L.C（AS216154）NL davidbudz228.fvds.ru 207.9 ms
 103.90.75.9
-# B Quad9（AS19281）US dns11.quad9.net 60.7 ms ECS
-2620:fe::11
 # B Charter_Communications（AS20001）US syn-076-080-221-014.biz.spectrum.com 210.2 ms
 76.80.221.14
 # B VISTEON_CORPORATION（AS33627）US ns8.visteon.com 194.7 ms
@@ -1004,8 +999,6 @@
 2606:1a40::33
 # B Akari_Networks（AS38136）SG 58.8 ms
 103.190.178.190
-# B Daniel_Cid（AS205157）US 59.2 ms
-2a0d:2a00:2::2
 # B SingNet（AS3758）SG 55.1 ms ECS
 118.201.56.26
 # B PT_Acces_Prima_Nusantara（AS140448）ID 66.8 ms
@@ -1052,8 +1045,6 @@
 58.180.176.3
 # B Daewoo_Information_Systems（AS4961）KR 72.4 ms
 152.149.135.10
-# B Daniel_Cid（AS205157）US 60.3 ms
-2a0d:2a00:1::2
 # B Microsoft_Corporation（AS8075）SG 50.0 ms
 20.212.94.189
 # B Macau_University_of_Science_and_Technolo（AS138164）CN 34.9 ms ECS
@@ -1094,6 +1085,8 @@
 203.231.233.131
 # B Vercara（AS12008）US 64.0 ms
 156.154.71.26
+# B Vercara（AS12008）US 32.3 ms 3.5.1 改 B：沒有反解名稱、也不是官方公布的位址（看不出是不是過濾版）
+156.154.70.60
 # B PCCW_IMS_Ltd_(PCCW_Business_Internet_Acc（AS4515）HK 30.3 ms
 220.241.227.4
 # B TIME_dotCom_Berhad_No._14（AS9930）MY 75.2 ms ECS
