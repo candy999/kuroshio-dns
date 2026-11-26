@@ -716,18 +716,9 @@ impl Cdn {
         }
         // 沒有台灣節點的 CDN（例如 Fastly）：只有在「最近節點」明顯比原本快時才換
         if nearest {
-            let orig_ms = self.served_ms_in(&st.pools, provider, &needs);
-            let pop = match pool.first() {
-                Some(ip) => st.pools.pop_of_ip(provider, *ip),
-                None => st.pools.pop_view(provider).pops.first().map(|x| x.0.clone()),
-            };
-            let pool_ms = pop
-                .and_then(|p| st.pools.pop_score(provider, &p))
-                .filter(|s| *s != 0.0 && !s.is_nan())
-                .or_else(|| st.pools.best_ms(provider, family));
-            let enough = matches!((orig_ms, pool_ms), (Some(o), Some(p)) if o - p >= pc_min_gain);
+            let (enough, orig_known) = self.nearest_gain(&st.pools, provider, family, &needs, &pool);
             if !enough {
-                if orig_ms.is_none() {
+                if !orig_known {
                     tasks.push(Task::Latency(needs[0]));
                 }
                 res.tags.push(format!("{label}:已是最近節點"));
@@ -812,6 +803,22 @@ impl Cdn {
         });
         st.stats.rewrites += 1;
         res.rewritten = Some(Rewrite::Alias);
+    }
+
+    /// 最近節點型（Fastly）：最近的節點有沒有明顯比原本的答案快（`cdn.nearestMinGainMs`）。回傳（夠不夠，原本的延遲量過沒有）。
+    /// 查詢路徑（`alias_family`）與 `explain` 共用（3.5.1 M5）；只讀測速快取與節點池的紀錄，不發請求
+    pub(crate) fn nearest_gain(&self, pools: &Pools, provider: &str, family: u8, needs: &[IpAddr], pool: &[IpAddr]) -> (bool, bool) {
+        let orig_ms = self.served_ms_in(pools, provider, needs);
+        let pop = match pool.first() {
+            Some(ip) => pools.pop_of_ip(provider, *ip),
+            None => pools.pop_view(provider).pops.first().map(|x| x.0.clone()),
+        };
+        let pool_ms = pop
+            .and_then(|p| pools.pop_score(provider, &p))
+            .filter(|s| *s != 0.0 && !s.is_nan())
+            .or_else(|| pools.best_ms(provider, family));
+        let enough = matches!((orig_ms, pool_ms), (Some(o), Some(p)) if o - p >= self.cfg.nearest_min_gain_ms);
+        (enough, orig_ms.is_some())
     }
 
     /// 「針對這個網站驗證過」、而且現在還能用（[`Pools::usable`]：仍在節點池、沒被暫停）的 IP，驗證時用的那個排第一。

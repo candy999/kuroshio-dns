@@ -683,6 +683,16 @@ impl Domain {
         out
     }
 
+    /// 另一家的那一格換到前面的副本（`last_seen` 是那一家最後回答的時間；`explain` 用，3.5.1 M5）。沒有另一格是 None
+    pub fn alt_view(&self) -> Option<Domain> {
+        let a = self.src.as_ref()?.alt.as_deref()?;
+        a.provider.val()?;
+        let mut d = self.clone();
+        d.swap_slot();
+        d.last_seen = a.last;
+        Some(d)
+    }
+
     /// 對調目前這一格與另一格（只換「跟業者有關」的欄位；`last` 由呼叫端處理）
     fn swap_slot(&mut self) {
         let Some(a) = self.src.as_mut().and_then(|s| s.alt.as_deref_mut()) else {

@@ -24,6 +24,8 @@ pub mod decision {
     pub const SLOWER: &str = "slower";
     pub const NO_TW_NODE: &str = "no-tw-node";
     pub const NO_POOL: &str = "no-pool";
+    /// 最近節點型（Fastly，在台灣沒有節點）：已經換成驗證過、比原本快的最近節點（3.5.1 M5）
+    pub const NEAREST: &str = "nearest";
     pub const CROSS: &str = "cross";
     pub const ECS: &str = "ecs";
     pub const POLICY_NEVER: &str = "policy-never";
@@ -70,7 +72,9 @@ pub fn text_of(decision: &str, label: &str, detail: &str) -> String {
         d::VERIFY_FAILED => format!("這個網域用 {label}，台灣節點驗證沒通過，暫時用原本的答案{detail}；到期後會重新驗證。"),
         d::SLOWER => slower_text(label, &detail, crate::reach::SLOWER_RETEST_MS / 60_000),
         d::NO_TW_NODE => format!("這個網域用 {label}，找不到可用的台灣節點，跨 CDN 也沒有可用的替代{detail}。"),
+        d::NO_POOL if !detail.is_empty() => format!("這個網域用 {label}，但這台的 {label} 台灣節點池{detail}，先用原本的答案。"),
         d::NO_POOL => format!("這個網域用 {label}，但這台還沒有 {label} 的台灣節點池（節點池工作還沒跑完），先用原本的答案。"),
+        d::NEAREST => format!("這個網域用 {label}（在台灣沒有節點），已經換成驗證過、比原本快的最近節點{detail}。"),
         d::CROSS => format!("這個網域用 {label}，同一個網站也放在別家 CDN 上，已經換成那家的台灣節點{detail}。"),
         d::ECS => format!("這個網域用 {label}（依查詢來源分流），已經帶台灣網段問到台灣節點{detail}。"),
         d::POLICY_NEVER => "這個網域被手動設成「不換」，照原本的答案。".into(),
@@ -260,6 +264,24 @@ impl Cdn {
             );
         }
         v["steps"] = Value::Array(steps);
+        // 多來源（3.5.1 M5）：另一家的那一格也說明——查詢路徑依這次回答的業者用那一家的驗證結果
+        // （以前只看目前這一格，例如這一格是只辨識的業者，就說「只辨識不改寫」，回答換成另一家時其實會換）
+        if !ctx.chained && !ctx.suspended {
+            if let Some(alt) = e.alt_view().filter(|a| now.saturating_sub(a.last_seen) < crate::db::MULTI_KEEP_MS) {
+                if let Some(ap) = alt.provider().map(str::to_string) {
+                    let alabel = providers::get(&ap).map(|p| p.label.to_string()).unwrap_or_else(|| ap.clone());
+                    let (ad, adetail) = self.decide(&st.pools, &alt, &ap, now);
+                    let atext = text_of(ad, &alabel, &adetail);
+                    if ad != decision {
+                        v["text"] = json!(format!("{}回答來自 {alabel} 時：{atext}", v["text"].as_str().unwrap_or("")));
+                    }
+                    v["alt"] = json!({
+                        "provider": ap, "providerLabel": alabel, "decision": ad, "text": atext, "lastSeen": alt.last_seen,
+                        "steps": [verdict_step("v4", alt.v4.as_deref(), now), verdict_step("v6", alt.v6.as_deref(), now)],
+                    });
+                }
+            }
+        }
         v
     }
 
@@ -318,23 +340,37 @@ impl Cdn {
             if !has_pool {
                 return (d::NO_POOL, String::new());
             }
-            if Cdn::is_nearest(provider) {
-                return if no_cross {
-                    (d::MULTI_CDN, multi_detail())
-                } else {
-                    (d::NO_TW_NODE, String::new())
-                };
-            }
+            let nearest = Cdn::is_nearest(provider);
             // 最近一次答案的 IP 在節點池裡已經是台灣節點（3.5.1）：查詢路徑（`alias_family()`）在看驗證結果之前
             // 就照原本的答案回（「已是台灣」），不換、不試用、不排驗證，這裡也一樣先判斷
             if answer_tw == Some(true) {
                 return (d::ALREADY_TW, String::new());
             }
+            // 以下跟 `alias_family()` 的順序一樣（3.5.1 M5）
+            let needs = needs_of(pools, e, provider);
+            let pool = pools.map_ips(provider, 4, &needs);
+            let octet = pools.octet_mode(provider) && !pools.pop_view(provider).pops.is_empty();
+            // 節點池建過了，但裡面沒有可用的 v4 節點（例如 Gcore 一個都沒找到）：查詢路徑直接回原本的答案，
+            // 不縮短 TTL、不排驗證（以前這裡說「驗證中，TTL 10 秒」）
+            if pool.is_empty() && !octet {
+                // 最近節點型要回台灣只能靠跨 CDN：多來源時是因為多來源才沒有換
+                if nearest && no_cross {
+                    return (d::MULTI_CDN, multi_detail());
+                }
+                return (d::NO_POOL, "目前沒有可用的節點".into());
+            }
+            // 最近節點型（Fastly）：最近的節點要明顯比原本快才換（以前這裡一律說「找不到台灣節點」，實際有在換）
+            if nearest && !needs.is_empty() && !self.nearest_gain(pools, provider, 4, &needs, &pool).0 {
+                return if no_cross {
+                    (d::MULTI_CDN, multi_detail())
+                } else {
+                    (d::NO_TW_NODE, "原本的答案已經是最近的節點".into())
+                };
+            }
             if let Some(v) = e.v4.as_deref().filter(|v| v.valid(now)) {
                 if v.is("ok") {
                     // 3.5.1 M1：跟查詢路徑（`serve_pool`）一樣，驗證過的 IP 要現在還能用（仍在節點池、沒被暫停）；
                     // 都不能用時查詢路徑先回原本的答案（TTL 10 秒）、重新驗證
-                    let needs = needs_of(pools, e, provider);
                     if Cdn::verified_ips(pools, provider, 4, v, Some(&needs)).is_empty() {
                         return (d::POOL_CHANGED, String::new());
                     }
@@ -343,7 +379,7 @@ impl Cdn {
                         (Some(p), None) => p.to_string(),
                         _ => String::new(),
                     };
-                    return (d::REWRITTEN, detail);
+                    return (if nearest { d::NEAREST } else { d::REWRITTEN }, detail);
                 }
                 if v.is("fail") && is_slower(v) {
                     let n = |k: &str| {

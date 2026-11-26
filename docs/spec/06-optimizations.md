@@ -287,6 +287,18 @@ Cloudflare 66 筆「錯誤 1xxx（試了 1 個網段）」。「不服務這個�
   `UNSURE_RETRY_MS`、`UNSURE_MAX_SHIFT`；次數記在驗證結果的 `extra.unsure`），驗證有結論（通過或失敗）時歸零。
   以前固定 10 分鐘：一直分不出來的網站每 10 分鐘重驗一次。
 
+**M5：explain 跟查詢路徑一致**（`explain.rs` 的 `decide` 照 `alias_family()` 的順序判斷，共用 `Cdn::nearest_gain`、`Cdn::verified_ips`）：
+
+- **最近節點型（Fastly）**：v4 通過、`best` 是換節點、查詢路徑有在換，explain 以前一律回 `no-tw-node`。現在照查詢路徑：最近的節點
+  明顯比原本快（`cdn.nearestMinGainMs`，用測速快取與節點池的紀錄，不發請求）而且驗證過的節點還能用 → 新代碼 `nearest`
+  「已經換成驗證過、比原本快的最近節點」；原本的答案已經夠近 → `no-tw-node`（「原本的答案已經是最近的節點」）。
+- **節點池建過、但一個節點都沒有**（Gcore v4／v6 都是 0 個、`Pools::has()` 是 true）：查詢路徑直接回原本的答案、不縮短 TTL、不排驗證，
+  explain 以前說「驗證中，TTL 10 秒」。現在是 `no-pool`（「這台的 X 台灣節點池目前沒有可用的節點，先用原本的答案」）；
+  最近節點型而且是多來源時是 `multi-cdn`（它回台灣只能靠跨 CDN）。
+- **多來源**：另一家的那一格（`src.alt`，7 天內回答過）也算一次決定，放在 `alt`（`provider`、`providerLabel`、`decision`、`text`、
+  `lastSeen`、`steps`）；兩格的決定不同時，`text` 後面接「回答來自 B 時：…」。以前只看目前這一格，例如這一格是只辨識的業者
+  就說「只辨識不改寫」，回答換成另一家時查詢路徑其實會換。
+
 ## 4. 實作順序
 
 1. ✅ 這一批：1.1、1.2、1.3、2.1、2.4（不改變外部行為，只讓命中率與速度變好，而且都能量測）

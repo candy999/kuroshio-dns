@@ -992,7 +992,8 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
   | `verify-failed` | 台灣節點驗證沒通過（到期後重新驗證） |
   | `pool-changed` | 3.5.1：驗證通過過，但驗證過的節點已經不在節點池（或被暫停）；跟查詢路徑一樣先回原本的答案（TTL 10 秒），下次查詢重新驗證 |
   | `no-tw-node` | 找不到可用的台灣節點，跨 CDN 也沒有 |
-  | `no-pool` | 這家 CDN 的台灣節點池還沒建好 |
+  | `no-pool` | 這家 CDN 的台灣節點池還沒建好；3.5.1 起也包括「建過了，但裡面沒有可用的節點」（查詢路徑直接回原本的答案，不縮短 TTL） |
+  | `nearest` | 3.5.1：最近節點型（Fastly，在台灣沒有節點）已經換成驗證過、比原本快的最近節點 |
   | `cross` | 換成同一個網站在別家 CDN 的台灣節點 |
   | `ecs` | 帶台灣網段問到台灣節點（依查詢來源分流的 CDN） |
   | `policy-never`／`policy-always` | 手動設成不換／一定換 |
@@ -1010,6 +1011,7 @@ DoH 的 `503` 回應是 `Content-Type: text/plain`、內容 `busy`、帶 `Retry-
 - **多來源 CDN 的欄位**（3.5.0）：`/api/cdn/domain` 與 `/api/cdn/explain` 多回：
   - `c1`：第一層 CNAME 的鍵（查詢名稱的第一個 CNAME 目標取最後三段，例如 `a1b2.node7.edge.example.net` → `edge.example.net`；最長 64 位元組；沒有 CNAME 就沒有這個欄位）。
   - `multi`：7 天內看過兩家 CDN 輪流回答。
+  - `alt`（只有 `/api/cdn/explain`，3.5.1）：另一家那一格的決定 `{ provider, providerLabel, decision, text, lastSeen, steps }`；跟目前這一格不同時，`text` 後面多一句「回答來自 B 時：…」。
   - `provs`：最近看到的業者，最多 3 個：`[{ "provider": "cloudfront", "lastSeen": 毫秒, "verified": true }]`。`verified: true` 是有自己一格驗證結果的（最多兩家），`false` 是沒有格子、照原始答案回的。
   - `/api/cdn/domain` 的 `src`：原始的來源紀錄（`alt` 是另一家的那一格：`provider`、`v4`、`v6`、`base`、`last`；`seen`、`pend` 是第一層 CNAME 的防抖動狀態；`multiAt`、`invalAt`、`slotAt` 是毫秒時間）。這些欄位 3.4.x 讀到會原樣保留。
   - `/api/status` 的 `cdn.stats`：`srcInvalidated`（來源變了而清掉跨 CDN／ECS 的次數）、`multiHeld`（多來源沒有格子、照原始答案回的次數）、`appLayer`（App 層不改寫的次數）。
