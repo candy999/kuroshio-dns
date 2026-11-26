@@ -1530,6 +1530,23 @@ mod tests {
         );
     }
 
+    /// 連線去向圖（3.5.1）的三塊：原本就在台灣 + 拉回台灣 + 仍在國外 = 連線數（`n = (n − abroad) + acc + miss`）
+    #[test]
+    fn route_splits_every_connection_into_three() {
+        let s = Stats::default();
+        s.route("cloudflare", false, false, None); // 一般 DNS 給的已經是台灣節點
+        s.route("cloudflare", false, true, None); // 一樣算原本就在台灣（沒有出國可以拉回）
+        s.route("cloudflare", true, true, Some(30.0)); // 拉回台灣
+        s.route("cloudflare", true, false, None); // 仍在國外
+        s.route("cloudflare", true, true, Some(5000.0)); // 拉回台灣；省下的時間不合理，不算樣本
+        let daily = s.daily();
+        let day = &daily.last().unwrap().1["route"]["cloudflare"];
+        let g = |k: &str| day[k].as_u64().unwrap();
+        assert_eq!((g("n"), g("abroad"), g("acc"), g("miss"), g("savedN")), (5, 3, 2, 1, 1));
+        assert_eq!(g("n") - g("abroad") + g("acc") + g("miss"), g("n"));
+        assert_eq!(g("abroad"), g("acc") + g("miss"));
+    }
+
     #[test]
     fn snapshot_restore_and_history() {
         let s = Stats::default();

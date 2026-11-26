@@ -941,6 +941,33 @@ pub const PUBLIC_TOP: (usize, usize) = (15, 10);
 /// 管理介面儀表板的排行筆數（不受 `site.minClients` 限制）
 pub const ADMIN_TOP: (usize, usize) = (30, 30);
 
+/// 「最常用到的 CDN」列幾家、跨 CDN 的配對列幾組、原本的機房列幾個；其餘合併成「其他」（3.5.1：以前直接丟掉）
+const CDN_TOP: usize = 8;
+const PAIRS_TOP: usize = 8;
+const FLOWS_TOP: usize = 12;
+
+/// 原本就在台灣的連線：`a` = [連線, 一般 DNS 出國, 拉回台灣, 仍在國外, …]。
+///
+/// `Stats::route()` 每次連線 `n` 加 1，原本出國的再分成拉回（`acc`）或仍在國外（`miss`），所以
+/// `n = 原本就在台灣 + acc + miss`，也就是 `n − abroad`。這裡用 `n − acc − miss`：三塊加起來一定等於連線數
+/// （匯入的舊資料不一致時也不會畫出加總不對的圖）；不會小於 0
+fn already_tw(a: &[f64; 6]) -> f64 {
+    (a[0] - a[2] - a[3]).max(0.0)
+}
+
+/// `routing[]` 的一列（`a` = [n, abroad, acc, miss, saved, savedN]，期間內每一天的合計）。
+/// 3.5.1 多 `alreadyTw`（連線去向圖的第三塊）與 `savedSamples`（平均縮短是幾次連線量到的）；都在讀統計時算，查詢路徑不變
+fn routing_row(p: &str, label: &str, a: &[f64; 6]) -> Value {
+    json!({
+        "provider": p, "label": label,
+        "connections": a[0], "wouldGoAbroad": a[1], "accelerated": a[2], "stillAbroad": a[3], "alreadyTw": already_tw(a),
+        "abroadShare": if a[0] > 0.0 { r4(a[1] / a[0]) } else { 0.0 },
+        "successRate": if a[1] > 0.0 { json!(r4(a[2] / a[1])) } else { Value::Null },
+        "avgSavedMs": if a[5] > 0.0 { json!(r1(a[4] / a[5])) } else { Value::Null },
+        "savedSamples": a[5],
+    })
+}
+
 /// 儀表板的統計（公開頁 `/api/public/stats` 與管理 API `/api/dashboard` 共用）。
 /// `range`：today / 7d / 30d（其他當成 today）；`min_clients`：網站排行最少要有幾位不同使用者；
 /// `top`：（熱門網站, 被擋網站）各列幾筆。內容只有彙總數字與網站名稱，不含任何 IP
@@ -1015,13 +1042,16 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
     let cdn_total: u64 = cdn_agg.values().sum();
     let mut cdn_list: Vec<(String, u64)> = cdn_agg.into_iter().collect();
     cdn_list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let share = |c: u64| if cdn_total > 0 { r4(c as f64 / cdn_total as f64) } else { 0.0 };
     let cdn: Vec<Value> = cdn_list
         .iter()
-        .take(8)
-        .map(|(p, c)| {
-            json!({ "provider": p, "label": label(p), "count": c, "share": if cdn_total > 0 { r4(*c as f64 / cdn_total as f64) } else { 0.0 } })
-        })
+        .take(CDN_TOP)
+        .map(|(p, c)| json!({ "provider": p, "label": label(p), "count": c, "share": share(*c) }))
         .collect();
+    // 前幾名以外的合併成「其他」（3.5.1）：畫面上跟「沒辨識出來」分開標示，比例加起來才是 100%
+    let cdn_rest = cdn_list.get(CDN_TOP..).unwrap_or(&[]);
+    let cdn_rest_n: u64 = cdn_rest.iter().map(|(_, c)| c).sum();
+    let cdn_other = json!({ "providers": cdn_rest.len(), "count": cdn_rest_n, "share": share(cdn_rest_n) });
 
     // CDN 加速成效（只有統計數字，不列網域）；原本被導去哪個 POP → 改到哪個台灣 POP（依查詢次數加權）
     let (mut verified, mut was_abroad, mut v4nodes, mut v6nodes) = (0u64, 0u64, 0usize, 0usize);
@@ -1094,18 +1124,7 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
             rt[i] += a[i];
         }
     }
-    let routing: Vec<Value> = routing_rows
-        .iter()
-        .map(|(p, a)| {
-            json!({
-                "provider": p, "label": label(p),
-                "connections": a[0], "wouldGoAbroad": a[1], "accelerated": a[2], "stillAbroad": a[3],
-                "abroadShare": if a[0] > 0.0 { r4(a[1] / a[0]) } else { 0.0 },
-                "successRate": if a[1] > 0.0 { json!(r4(a[2] / a[1])) } else { Value::Null },
-                "avgSavedMs": if a[5] > 0.0 { json!(r1(a[4] / a[5])) } else { Value::Null },
-            })
-        })
-        .collect();
+    let routing: Vec<Value> = routing_rows.iter().map(|(p, a)| routing_row(p, &label(p), a)).collect();
 
     // 跨 CDN 備援：原本的 CDN 沒有台灣節點時，同一個網站能不能改走別家的台灣節點
     let cross_serves = s("crossRewrite");
@@ -1127,15 +1146,22 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
         "byTo": by_to.iter().map(|(p, c)| json!({ "provider": p, "label": label(p), "sites": c })).collect::<Vec<_>>(),
         "byFrom": by_from.iter().map(|(p, e, o)| json!({ "provider": p, "label": label(p), "explored": e, "ok": o })).collect::<Vec<_>>(),
         "serves": cross_serves,
-        "pairs": pairs.iter().take(8).map(|(k, c)| {
+        "pairs": pairs.iter().take(PAIRS_TOP).map(|(k, c)| {
             let (f, t) = k.split_once('>').unwrap_or((k.as_str(), ""));
             json!({ "from": f, "fromLabel": label(f), "to": t, "toLabel": label(t), "count": c })
         }).collect::<Vec<_>>(),
+        // 前幾組以外的合併（3.5.1）；改走的 CDN 沒記到（`?`）的那一組照樣在 pairs 裡，不併進這裡
+        "pairsOther": {
+            "pairs": pairs.len().saturating_sub(PAIRS_TOP),
+            "count": pairs.iter().skip(PAIRS_TOP).map(|(_, c)| c).sum::<u64>(),
+        },
     });
 
     // 跨 CDN 的連線也是「原本出國、改走台灣」：算進加速次數
     let opportunity = json!({
         "connections": rt[0], "wouldGoAbroad": rt[1], "accelerated": rt[2] + cross_serves as f64, "stillAbroad": rt[3],
+        // 3.5.1：連線去向圖的三塊（`routing[]` 的合計；跨 CDN 另外算，不在這三塊裡）
+        "alreadyTw": already_tw(&rt), "routedAccelerated": rt[2], "savedSamples": rt[5],
         "otherDnsAbroadShare": if rt[0] > 0.0 { r4(rt[1] / rt[0]) } else { 0.0 },
         "oursAbroadShare": if rt[0] > 0.0 { r4(rt[3] / rt[0]) } else { 0.0 },
         "avgSavedMs": if rt[5] > 0.0 { json!(r1(rt[4] / rt[5])) } else { Value::Null },
@@ -1145,9 +1171,16 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
 
     let mut flows: Vec<(String, (u64, u64))> = from_pops.into_iter().collect();
     flows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+    // 前 12 個機房以外的合併成「其他」（3.5.1；以前直接丟掉）
+    let flows_rest = flows.get(FLOWS_TOP..).unwrap_or(&[]);
+    let flows_other = json!({
+        "pops": flows_rest.len(),
+        "count": flows_rest.iter().map(|(_, (c, _))| c).sum::<u64>(),
+        "fixed": flows_rest.iter().map(|(_, (_, fx))| fx).sum::<u64>(),
+    });
     let flows: Vec<Value> = flows
         .into_iter()
-        .take(12)
+        .take(FLOWS_TOP)
         .map(|(pop, (c, fx))| json!({ "pop": pop, "count": c, "fixed": fx }))
         .collect();
 
@@ -1174,7 +1207,8 @@ pub fn dashboard_stats(state: &AppState, range: &str, min_clients: u64, top: (us
             "verifiedSites": verified, "sitesRoutedAbroad": was_abroad, "medianSavedMs": median.map(r1), "samples": saved.len(),
             "twNodesV4": v4nodes, "twNodesV6": v6nodes,
         },
-        "trend": trend, "cdn": cdn, "routing": routing, "opportunity": opportunity, "flows": flows,
+        "trend": trend, "cdn": cdn, "cdnOther": cdn_other, "routing": routing, "opportunity": opportunity,
+        "flows": flows, "flowsOther": flows_other,
         "toPops": Value::Object(to_pops.into_iter().map(|(k, v)| (k, json!(v))).collect::<Map<_, _>>()),
         "crossCdn": cross_cdn,
         "realtime": stats.realtime(),
@@ -1402,6 +1436,26 @@ mod tests {
             mobileconfig("doh", "dns.example.net", "/dns-query", 8443).contains("<string>https://dns.example.net:8443/dns-query</string>")
         );
         assert_eq!(detail_path("/assets", "/dns-query"), "/detail", "儀表板檔案的路徑保留給 /assets");
+    }
+
+    /// 連線去向圖（3.5.1）：三塊加起來等於連線數；舊資料不一致時「原本就在台灣」不會是負的；平均縮短帶樣本數
+    #[test]
+    fn routing_row_three_parts() {
+        let v = routing_row("cloudflare", "Cloudflare", &[820.0, 330.0, 296.0, 34.0, 8436.0, 296.0]);
+        assert_eq!(v["alreadyTw"], 490.0);
+        let sum = v["alreadyTw"].as_f64().unwrap() + v["accelerated"].as_f64().unwrap() + v["stillAbroad"].as_f64().unwrap();
+        assert_eq!(sum, v["connections"].as_f64().unwrap());
+        assert_eq!(
+            v["alreadyTw"].as_f64().unwrap(),
+            820.0 - 330.0,
+            "跟 connections − wouldGoAbroad 一樣"
+        );
+        assert_eq!(v["avgSavedMs"], 28.5);
+        assert_eq!(v["savedSamples"], 296.0);
+        let broken = routing_row("cloudflare", "Cloudflare", &[3.0, 5.0, 4.0, 1.0, 0.0, 0.0]);
+        assert_eq!(broken["alreadyTw"], 0.0);
+        assert_eq!(broken["avgSavedMs"], Value::Null);
+        assert_eq!(broken["savedSamples"], 0.0);
     }
 
     #[test]

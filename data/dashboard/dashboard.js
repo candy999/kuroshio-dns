@@ -188,9 +188,12 @@
   // 縮放狀態：每 15 秒重畫時保留，手勢進行中不重畫（一頁只有一張地圖）
   const MAPZ = { k: 1, tx: 0, ty: 0, W: 0 };
   let mapBusy = false, mapPending = null, mapUsed = false;
-  /** 畫地圖。`note`：顯示「資料累積中」說明的元素（可省略） */
-  function routeMap(container, table, flows, toPops, note) {
-    if (mapBusy) { mapPending = [container, table, flows, toPops, note]; return; }
+  /**
+   * 畫地圖。`note`：顯示「資料累積中」說明的元素（可省略）；`other`：前 12 個機房以外合併的合計（3.5.1，後端的 flowsOther）。
+   * 機房代碼不在 POPS（沒有座標）的不上地圖、在數據表標「沒辨識出位置」；跟「其他」分開
+   */
+  function routeMap(container, table, flows, toPops, note, other) {
+    if (mapBusy) { mapPending = [container, table, flows, toPops, note, other]; return; }
     const coarse = matchMedia('(pointer: coarse)').matches;
     container.textContent = ''; table.textContent = '';
     const W = Math.max(320, Math.round(container.clientWidth || 900));
@@ -420,22 +423,242 @@
     // iOS Safari 的手勢事件：避免雙指觸發整頁縮放
     ['gesturestart', 'gesturechange'].forEach(t => svg.addEventListener(t, e => e.preventDefault()));
     constrain(); apply();
-    if (note) note.textContent = known.length ? '' : '資料累積中：驗證過的網站越多，這張圖越完整';
+    const unk = flows.filter(f => !POPS[f.pop]);
+    const unkN = unk.reduce((a, f) => a + f.count, 0);
+    const oth = other && other.count > 0 ? other : null;
+    if (note) {
+      const parts = [];
+      if (!known.length) parts.push('資料累積中：驗證過的網站越多，這張圖越完整');
+      if (unkN) parts.push(`${unk.length} 個機房代碼沒辨識出位置（${compact(unkN)} 次查詢），不在地圖上、列在數據表`);
+      if (oth) parts.push(`前 ${flows.length} 個機房以外的 ${oth.pops} 個合併成「其他」（${compact(oth.count)} 次查詢）`);
+      note.textContent = parts.join('；');
+    }
     if (flows.length) {
       const hr = el('tr'); ['原本機房', '查詢次數', '已改走台灣'].forEach(h => hr.appendChild(el('th', '', h))); table.appendChild(hr);
-      flows.forEach(f => { const tr = el('tr'); [(POPS[f.pop] ? POPS[f.pop][0] + ' ' : '') + f.pop, nf.format(f.count), nf.format(f.fixed)].forEach(v => tr.appendChild(el('td', '', v))); table.appendChild(tr); });
+      const row = (cls, name, c, fx) => { const tr = el('tr', cls); [name, nf.format(c), nf.format(fx)].forEach(v => tr.appendChild(el('td', '', v))); table.appendChild(tr); };
+      flows.forEach(f => row(POPS[f.pop] ? '' : 'unknown', POPS[f.pop] ? POPS[f.pop][0] + ' ' + f.pop : f.pop + '（沒辨識出位置，不在地圖上）', f.count, f.fixed));
+      if (oth) row('other', `其他 ${oth.pops} 個機房`, oth.count, oth.fixed);
     }
+  }
+
+  // ---------- CDN 連線去向（3.5.1：兩段式流向圖；手機寬度改成每家 CDN 一條 100% 堆疊橫條） ----------
+  /**
+   * 左邊是各家 CDN（`routing[]` 的 `connections`），右邊三塊：原本就在台灣、拉回台灣、仍在國外。
+   * 後端的 `Stats::route()` 每次連線 n 加 1，原本出國的再分成拉回（acc）或仍在國外（miss），所以三塊加起來就是連線數；
+   * 「原本就在台灣」用後端給的 `alreadyTw`（3.5.1），舊版核心沒有這個欄位時用 連線 − 拉回 − 仍在國外 算（同一個數）。
+   * 跨 CDN 備援（Fastly 這類在台灣沒有節點的 CDN 改走別家）沒有「原本」可以比，不在這張圖裡，另外在「跨 CDN 備援」。
+   * 上限：前 FLOW_TOP 家，其餘合併成「其他」；沒辨識出來的 CDN（provider 空白）另外一塊，不跟「其他」混在一起。
+   */
+  const FLOW_TOP = 5, FLOW_MIN = 10;
+  const FLOW_PARTS = [
+    { key: 'tw', name: '原本就在台灣', short: '原本在台灣', color: 'var(--s3)', pat: '' },
+    { key: 'acc', name: '拉回台灣', short: '拉回', color: 'var(--s1)', pat: 'acc' },
+    { key: 'still', name: '仍在國外', short: '國外', color: 'var(--s2)', pat: 'still' }
+  ];
+  const unknownCdn = p => !p || p === '?';
+  const cdnName = r => SHORT[r.provider] || String(r.label || r.provider || '').split(' / ')[0];
+  /** 樣本數的說明：「296 次量測」；少於 10 次加註樣本少 */
+  const samplesText = (n, unit = '次量測') => nf.format(n) + ' ' + unit + (n > 0 && n < 10 ? '（樣本少）' : '');
+  /**
+   * 每家 CDN 的連線分成三塊，取前 `top` 家，其餘合併成「其他」、沒辨識出來的另外合併。
+   * 回傳 { nodes: [{ key, name, kind: 'cdn'|'other'|'unknown', members, n, tw, acc, still, abroad, savedN, avgSavedMs }], total }
+   */
+  function flowRows(routing, top = FLOW_TOP) {
+    const one = r => {
+      const n = Math.max(0, +r.connections || 0), acc = Math.max(0, +r.accelerated || 0), still = Math.max(0, +r.stillAbroad || 0);
+      const tw = r.alreadyTw !== undefined && r.alreadyTw !== null ? Math.max(0, +r.alreadyTw) : Math.max(0, n - acc - still);
+      const savedN = +r.savedSamples || 0, unk = unknownCdn(r.provider);
+      return {
+        key: r.provider || '', name: unk ? '未辨識的 CDN' : cdnName(r), provider: r.provider, kind: unk ? 'unknown' : 'cdn', members: [],
+        n, tw, acc, still, abroad: Math.max(0, +r.wouldGoAbroad || 0), savedN, avgSavedMs: r.avgSavedMs === undefined ? null : r.avgSavedMs,
+        saved: typeof r.avgSavedMs === 'number' ? r.avgSavedMs * savedN : 0
+      };
+    };
+    const rows = (routing || []).map(one).filter(r => r.n > 0).sort((a, b) => b.n - a.n || (a.key < b.key ? -1 : 1));
+    const named = rows.filter(r => r.kind === 'cdn'), unk = rows.filter(r => r.kind === 'unknown');
+    const merge = (list, key, name, kind) => {
+      const m = { key, name, kind, members: list.map(r => r.name), n: 0, tw: 0, acc: 0, still: 0, abroad: 0, saved: 0, savedN: 0 };
+      list.forEach(r => ['n', 'tw', 'acc', 'still', 'abroad', 'saved', 'savedN'].forEach(k => { m[k] += r[k]; }));
+      m.avgSavedMs = m.savedN > 0 ? Math.round(m.saved / m.savedN * 10) / 10 : null;
+      return m;
+    };
+    const nodes = named.slice(0, top);
+    if (named.length > top) nodes.push(merge(named.slice(top), '_other', `其他 ${named.length - top} 家`, 'other'));
+    if (unk.length) nodes.push(merge(unk, '_unknown', '未辨識的 CDN', 'unknown'));
+    return { nodes, total: merge(rows, '_total', '合計', 'total') };
+  }
+
+  let flowSeq = 0;
+  /** 圖例：顏色＋圖樣（色盲也分得出來）＋文字 */
+  function flowSwatch(p) { const i = el('i', p.pat ? 'fpat-' + p.pat : ''); i.style.backgroundColor = p.color; return i; }
+  function flowLegend(parent) {
+    const lg = el('div', 'flow-legend');
+    FLOW_PARTS.forEach(p => { const s = el('span'); s.appendChild(flowSwatch(p)); s.appendChild(document.createTextNode(p.name)); lg.appendChild(s); });
+    parent.appendChild(lg);
+  }
+  const nodeTitle = m => m.kind === 'other' ? `${m.name}（${m.members.join('、')}）` : m.name;
+
+  /**
+   * 畫「CDN 連線去向」。`container` 是 .chart（提示框的定位用），`table` 是數據表（可省略）。
+   * 連線數是 0 或少於 FLOW_MIN 時只顯示說明、不畫圖（有數字時數據表照樣列）。
+   * 容器比 600 px 窄（手機）改成每家 CDN 一條堆疊橫條。回傳 { nodes, total, mode }（測試用）
+   */
+  function cdnFlow(container, table, routing) {
+    container.textContent = '';
+    const d = flowRows(routing);
+    const T = d.total;
+    if (table) {
+      table.textContent = '';
+      if (d.nodes.length) {
+        const hr = el('tr'); ['CDN', '連線', ...FLOW_PARTS.map(p => p.name)].forEach(h => hr.appendChild(el('th', '', h))); table.appendChild(hr);
+        [...d.nodes, T].forEach(m => {
+          const tr = el('tr', m.kind === 'total' ? 'sum' : m.kind);
+          tr.dataset.key = m.key;
+          tr.appendChild(el('td', '', nodeTitle(m)));
+          tr.appendChild(el('td', '', nf.format(m.n)));
+          FLOW_PARTS.forEach(p => tr.appendChild(el('td', '', `${nf.format(m[p.key])}（${m.n ? pct(m[p.key] / m.n, 1) : '—'}）`)));
+          table.appendChild(tr);
+        });
+      }
+    }
+    const cw = container.clientWidth || (typeof innerWidth === 'number' ? innerWidth : 900);
+    const mode = !T.n ? 'empty' : T.n < FLOW_MIN ? 'few' : cw < 600 ? 'bars' : 'svg';
+    container.dataset.mode = mode;
+    if (mode === 'empty') { container.appendChild(el('div', 'empty', '資料累積中：有人瀏覽 Cloudflare、CloudFront 等 CDN 網站後就會出現')); return Object.assign(d, { mode }); }
+    if (mode === 'few') { container.appendChild(el('div', 'empty', `目前只比對了 ${nf.format(T.n)} 次 CDN 連線，累積到 ${FLOW_MIN} 次以上再畫圖（數字見數據表）`)); return Object.assign(d, { mode }); }
+    flowLegend(container);
+    if (mode === 'bars') flowBars(container, d); else flowSvg(container, d);
+    const notes = [];
+    const o = d.nodes.find(m => m.kind === 'other'), u = d.nodes.find(m => m.kind === 'unknown');
+    if (o) notes.push(`「${o.name}」是量比較小、合併起來的：${o.members.join('、')}`);
+    if (u) notes.push('「未辨識的 CDN」是看得出是 CDN、但沒辨識出是哪一家的連線，跟「其他」分開算');
+    if (notes.length) container.appendChild(el('p', 'flow-note', notes.join('；')));
+    return Object.assign(d, { mode });
+  }
+
+  /** 手機：每家 CDN 一條 100% 堆疊橫條，下面一行三塊的比例 */
+  function flowBars(container, d) {
+    const box = el('div', 'flow-bars');
+    d.nodes.forEach(m => {
+      const row = el('div', 'flow-row ' + m.kind); row.dataset.key = m.key;
+      const head = el('div', 'flow-head'); head.appendChild(el('b', '', m.name)); head.appendChild(el('span', '', nf.format(m.n) + ' 次'));
+      if (m.kind === 'other') head.title = nodeTitle(m);
+      row.appendChild(head);
+      const st = el('div', 'flow-stack'); st.setAttribute('role', 'img');
+      st.setAttribute('aria-label', `${m.name}：` + FLOW_PARTS.map(p => `${p.name} ${pct(m[p.key] / m.n)}`).join('、'));
+      FLOW_PARTS.forEach(p => {
+        if (!m[p.key]) return;
+        const s = el('div', 'fseg ' + p.key + (p.pat ? ' fpat-' + p.pat : '')); s.style.backgroundColor = p.color; s.style.width = (m[p.key] / m.n * 100) + '%';
+        s.title = `${p.name}：${nf.format(m[p.key])} 次（${pct(m[p.key] / m.n, 1)}）`; st.appendChild(s);
+      });
+      row.appendChild(st);
+      const nums = el('div', 'flow-nums');
+      FLOW_PARTS.forEach(p => { const s = el('span'); s.appendChild(flowSwatch(p)); s.appendChild(document.createTextNode(`${p.short} ${pct(m[p.key] / m.n)}`)); nums.appendChild(s); });
+      row.appendChild(nums);
+      box.appendChild(row);
+    });
+    container.appendChild(box);
+  }
+
+  /** 桌機：兩段式流向圖。節點是 rect，流線是三次貝茲曲線圍成的帶狀 path，寬度 = 連線數 */
+  function flowSvg(container, d) {
+    const T = d.total, L = d.nodes, id = 'kdf' + (++flowSeq);
+    const W = Math.max(600, Math.round(container.clientWidth || 900));
+    const nwL = 12, nwR = 18, xL = Math.min(170, Math.round(W * .2)), xR = W - 190 - nwR;
+    const gapL = 10, gapR = 22, padT = 8, padB = 8;
+    let H = Math.max(230, L.length * 50 + 24);
+    const k = Math.min((H - padT - padB - gapL * (L.length - 1)) / T.n, (H - padT - padB - gapR * 2) / T.n);
+    const svg = sv('svg', { role: 'img', 'aria-label': 'CDN 連線去向：' + FLOW_PARTS.map(p => `${p.name} ${pct(T[p.key] / T.n)}`).join('、') + '（數字見數據表）' });
+    const defs = sv('defs', {}, svg);
+    const ps = sv('pattern', { id: id + '-acc', width: 6, height: 6, patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' }, defs);
+    sv('rect', { width: 2.2, height: 6, fill: '#fff', 'fill-opacity': .55 }, ps);
+    const pd = sv('pattern', { id: id + '-still', width: 6, height: 6, patternUnits: 'userSpaceOnUse' }, defs);
+    sv('circle', { cx: 3, cy: 3, r: 1.3, fill: '#fff', 'fill-opacity': .75 }, pd);
+    // 位置：兩邊各自垂直置中
+    let y = padT + (H - padT - padB - (T.n * k + gapL * (L.length - 1))) / 2;
+    const left = L.map(m => { const h = m.n * k; const o = { m, y, h }; y += h + gapL; return o; });
+    y = padT + (H - padT - padB - (T.n * k + gapR * 2)) / 2;
+    const right = FLOW_PARTS.map(p => { const h = T[p.key] * k; const o = { p, y, h }; y += h + gapR; return o; });
+    const gBand = sv('g', {}, svg), gNode = sv('g', {}, svg), gText = sv('g', {}, svg);
+    const tip = tooltip(container);
+    const show = (e, title, rows) => {
+      const b = container.getBoundingClientRect();
+      tipRows(tip, title, rows);
+      placeTip(tip, container, e.clientX - b.left, e.clientY - b.top);
+    };
+    const hide = () => { tip.style.opacity = 0; };
+    // 流線：左邊每家 CDN 依三塊的順序往下排，右邊每一塊依 CDN 的順序往下排（不交叉）
+    const tOff = right.map(r => r.y);
+    const x0 = xL + nwL, x1 = xR, xm = (x0 + x1) / 2, f = n => n.toFixed(1);
+    const bands = [];
+    left.forEach(l => {
+      let sOff = l.y;
+      FLOW_PARTS.forEach((p, j) => {
+        const v = l.m[p.key];
+        if (!(v > 0)) return;
+        const h = v * k, ya = sOff, yb = tOff[j];
+        const path = sv('path', {
+          d: `M${f(x0)},${f(ya)}C${f(xm)},${f(ya)} ${f(xm)},${f(yb)} ${f(x1)},${f(yb)}L${f(x1)},${f(yb + h)}C${f(xm)},${f(yb + h)} ${f(xm)},${f(ya + h)} ${f(x0)},${f(ya + h)}Z`,
+          fill: p.color, 'fill-opacity': .4, class: 'band'
+        }, gBand);
+        path.dataset.from = l.m.key; path.dataset.to = p.key; path.dataset.n = v;
+        bands.push(path);
+        path.addEventListener('pointermove', e => {
+          path.setAttribute('fill-opacity', .7);
+          show(e, `${l.m.name} → ${p.name}`, [[nf.format(v) + ' 次', `占 ${l.m.name} 的 ${pct(v / l.m.n, 1)}`, p.color]]);
+        });
+        path.addEventListener('pointerleave', () => { path.setAttribute('fill-opacity', .4); hide(); });
+        sOff += h; tOff[j] += h;
+      });
+    });
+    const hl = (pred, on) => bands.forEach(b => b.setAttribute('fill-opacity', on && pred(b) ? .7 : .4));
+    // 標籤：兩行字（名稱、次數）；節點很小、太擠時往下推，不疊在一起
+    const place = items => { let last = -Infinity; items.forEach(it => { it.ty = Math.max(it.y + it.h / 2 - 15, last + 3); last = it.ty + 30; }); return last; };
+    H = Math.max(H, Math.ceil(Math.max(place(left), place(right)) + 4));
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const hover = (nodes, title, rows, pred) => nodes.forEach(n => {
+      n.addEventListener('pointermove', e => { hl(pred, true); show(e, title, rows); });
+      n.addEventListener('pointerleave', () => { hl(null, false); hide(); });
+    });
+    left.forEach(l => {
+      const m = l.m;
+      const r = sv('rect', { x: xL, y: f(l.y), width: nwL, height: f(Math.max(1, l.h)), rx: 2, fill: m.kind === 'cdn' ? 'var(--text-2)' : 'var(--text-3)', 'fill-opacity': m.kind === 'cdn' ? .8 : .5, class: 'node ' + m.kind }, gNode);
+      if (m.kind === 'unknown') { r.setAttribute('stroke', 'var(--text-3)'); r.setAttribute('stroke-dasharray', '2 2'); }
+      r.dataset.key = m.key; r.dataset.n = m.n;
+      const t1 = sv('text', { x: xL - 8, y: f(l.ty + 12), 'text-anchor': 'end', class: 'flow-lbl' + (m.kind === 'cdn' ? '' : ' dim') }, gText);
+      t1.textContent = m.name.length > 16 ? m.name.slice(0, 15) + '…' : m.name;
+      const t2 = sv('text', { x: xL - 8, y: f(l.ty + 27), 'text-anchor': 'end', class: 'flow-num' }, gText);
+      t2.textContent = `${compact(m.n)} 次 · ${pct(m.n / T.n)}`;
+      hover([r, t1, t2], `${nodeTitle(m)} · ${nf.format(m.n)} 次連線`, FLOW_PARTS.map(p => [nf.format(m[p.key]) + ' 次', `${p.name}（${pct(m[p.key] / m.n, 1)}）`, p.color]), b => b.dataset.from === m.key);
+    });
+    right.forEach(rt => {
+      const p = rt.p, v = T[p.key];
+      const a = { x: xR, y: f(rt.y), width: nwR, height: f(Math.max(1, rt.h)), rx: 2 };
+      const r = sv('rect', Object.assign({ fill: p.color, class: 'node part' }, a), gNode);
+      r.dataset.key = p.key; r.dataset.n = v;
+      if (p.pat) sv('rect', Object.assign({ fill: `url(#${id}-${p.pat})`, 'pointer-events': 'none' }, a), gNode);
+      const t1 = sv('text', { x: xR + nwR + 8, y: f(rt.ty + 12), class: 'flow-lbl' }, gText); t1.textContent = p.name;
+      const t2 = sv('text', { x: xR + nwR + 8, y: f(rt.ty + 27), class: 'flow-num' }, gText); t2.textContent = `${compact(v)} 次 · ${pct(v / T.n, 1)}`;
+      hover([r, t1, t2], `${p.name} · ${nf.format(v)} 次（${pct(v / T.n, 1)}）`, L.filter(m => m[p.key] > 0).map(m => [nf.format(m[p.key]) + ' 次', m.name, p.color]), b => b.dataset.to === p.key);
+    });
+    container.insertBefore(svg, tip);
   }
 
   // ---------- CDN 環形儀表 ----------
   /** `emptyClass`：沒有資料時那張卡片的 class（公開頁是 card glass empty） */
+  /** 3.5.1：跟連線去向圖一樣，前 5 家各一張，其餘合併成「其他」一張、沒辨識出來的另外一張；縮短的毫秒數旁邊標樣本數 */
   function gauges(container, rows, emptyClass = 'card glass empty') {
     container.textContent = '';
-    const useful = rows.filter(r => r.connections > 0);
+    const useful = flowRows(rows).nodes.map(m => Object.assign(m, {
+      label: m.name, connections: m.n, accelerated: m.acc,
+      successRate: m.abroad > 0 ? m.acc / m.abroad : null, abroadShare: m.n > 0 ? m.abroad / m.n : 0
+    }));
     if (!useful.length) { const e = el('div', emptyClass, '資料累積中：有人瀏覽 Cloudflare、CloudFront 等網站後就會出現'); container.appendChild(e); return; }
     useful.forEach(r => {
-      const color = CDN_COLOR[r.provider] || 'var(--s7)';
-      const card = el('div', 'gauge glass');
+      const color = r.kind === 'cdn' ? CDN_COLOR[r.provider] || 'var(--s7)' : 'var(--text-3)';
+      const card = el('div', 'gauge glass ' + r.kind);
+      card.dataset.key = r.key;
+      if (r.kind === 'other') card.title = nodeTitle(r);
       const svg = sv('svg', { viewBox: '0 0 92 92', role: 'img', 'aria-label': `${r.label} 成功拉回 ${r.successRate === null ? '—' : pct(r.successRate)}` });
       const C = 2 * Math.PI * 38;
       sv('circle', { cx: 46, cy: 46, r: 38, fill: 'none', stroke: 'var(--track)', 'stroke-width': 8 }, svg);
@@ -445,9 +668,11 @@
       sv('text', { x: 46, y: 64, 'text-anchor': 'middle', class: 'ring-sub' }, svg).textContent = r.successRate === null ? '原本就在台灣' : '拉回台灣';
       card.appendChild(svg);
       const info = el('div');
-      const nm = el('div', 'name'); const sw = el('i'); sw.style.background = color; nm.appendChild(sw); nm.appendChild(document.createTextNode(SHORT[r.provider] || r.label)); info.appendChild(nm);
+      const nm = el('div', 'name'); const sw = el('i'); sw.style.background = color; nm.appendChild(sw); nm.appendChild(document.createTextNode(r.label)); info.appendChild(nm);
       const dl = el('dl');
-      [['原本出國', pct(r.abroadShare)], ['拉回', compact(r.accelerated) + ' 次'], ['縮短', r.avgSavedMs !== null ? r.avgSavedMs + ' ms' : '—'], ['連線', compact(r.connections)]].forEach(([k, v]) => { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v)); });
+      [['連線', compact(r.connections)], ['原本出國', pct(r.abroadShare)], ['拉回', compact(r.accelerated) + ' 次'],
+        ['平均縮短', r.avgSavedMs !== null ? r.avgSavedMs + ' ms' : '—'], ['樣本', r.savedN ? compact(r.savedN) + ' 次' + (r.savedN < 10 ? '（少）' : '') : '—']]
+        .forEach(([k, v]) => { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v)); });
       info.appendChild(dl); card.appendChild(info);
       container.appendChild(card);
       requestAnimationFrame(() => requestAnimationFrame(() => arc.setAttribute('stroke-dasharray', `${(r.successRate || 0) * C} ${C}`)));
@@ -476,45 +701,61 @@
     lead.appendChild(document.createTextNode(' 次連線因此改走台灣'));
     info.appendChild(lead);
     const pairs = el('div', 'pairs');
-    const max = Math.max(1, ...c.pairs.map(p => p.count));
-    c.pairs.forEach(p => {
-      const row = el('div', 'pair'); row.title = `${p.fromLabel} → ${p.toLabel}：${nf.format(p.count)} 次`;
-      const l = el('div', 'lbl');
-      const i1 = el('i'); i1.style.background = CDN_COLOR[p.from] || 'var(--s7)'; l.appendChild(i1); l.appendChild(document.createTextNode(SHORT[p.from] || p.fromLabel));
-      l.appendChild(el('span', 'arrow', ' → '));
-      const i2 = el('i'); i2.style.background = CDN_COLOR[p.to] || 'var(--s7)'; l.appendChild(i2); l.appendChild(document.createTextNode(SHORT[p.to] || p.toLabel));
-      row.appendChild(l);
+    // 3.5.1：前 8 組以外的合併成「其他」（後端的 pairsOther）；改走的 CDN 沒記到（?）的那一組標「未辨識」，不跟「其他」混在一起
+    const other = c.pairsOther && c.pairsOther.count > 0 ? c.pairsOther : null;
+    const max = Math.max(1, ...c.pairs.map(p => p.count), other ? other.count : 0);
+    const pname = (id, label) => unknownCdn(id) ? '未辨識的 CDN' : SHORT[id] || String(label || id).split(' / ')[0];
+    const pcolor = id => unknownCdn(id) ? 'var(--text-3)' : CDN_COLOR[id] || 'var(--s7)';
+    const pairRow = (cls, title, lbl, count, color) => {
+      const row = el('div', 'pair' + cls); row.title = title;
+      row.appendChild(lbl);
       const bw = el('div', 'bar-wrap'); bw.style.display = 'flex'; bw.style.alignItems = 'center'; bw.style.gap = '8px';
       const bar = el('div', 'bar');
-      Object.assign(bar.style, { height: '10px', borderRadius: '0 4px 4px 0', minWidth: '3px', background: CDN_COLOR[p.to] || 'var(--s7)', width: Math.max(2, p.count / max * 74) + '%' });
-      const val = el('span', 'val', compact(p.count) + ' 次');
+      Object.assign(bar.style, { height: '10px', borderRadius: '0 4px 4px 0', minWidth: '3px', background: color, width: Math.max(2, count / max * 74) + '%' });
+      const val = el('span', 'val', compact(count) + ' 次');
       Object.assign(val.style, { font: '12.5px var(--mono)', color: 'var(--text-2)' });
       bw.appendChild(bar); bw.appendChild(val);
       row.appendChild(bw); pairs.appendChild(row);
+    };
+    c.pairs.forEach(p => {
+      const l = el('div', 'lbl');
+      const i1 = el('i'); i1.style.background = pcolor(p.from); l.appendChild(i1); l.appendChild(document.createTextNode(pname(p.from, p.fromLabel)));
+      l.appendChild(el('span', 'arrow', ' → '));
+      const i2 = el('i'); i2.style.background = pcolor(p.to); l.appendChild(i2); l.appendChild(document.createTextNode(pname(p.to, p.toLabel)));
+      pairRow(unknownCdn(p.to) || unknownCdn(p.from) ? ' unknown' : '', `${pname(p.from, p.fromLabel)} → ${pname(p.to, p.toLabel)}：${nf.format(p.count)} 次`, l, p.count, pcolor(p.to));
     });
+    if (other) pairRow(' other', `前 ${c.pairs.length} 組以外的 ${other.pairs} 組合計：${nf.format(other.count)} 次`, el('div', 'lbl', `其他 ${other.pairs} 組`), other.count, 'var(--text-3)');
     if (!c.pairs.length) pairs.appendChild(el('div', 'cap', '已找到可用的網站，等有人連線後就會出現轉換次數'));
     info.appendChild(pairs);
     const chips = el('div', 'chips');
-    c.byFrom.forEach(f => { const ch = el('span', 'chip'); ch.appendChild(document.createTextNode(`${SHORT[f.provider] || f.label} 網站 `)); ch.appendChild(el('b', '', `${f.ok}/${f.explored}`)); chips.appendChild(ch); });
-    c.byTo.forEach(t => { const ch = el('span', 'chip'); ch.appendChild(document.createTextNode(`可改走 ${SHORT[t.provider] || t.label} `)); ch.appendChild(el('b', '', String(t.sites))); chips.appendChild(ch); });
+    c.byFrom.forEach(f => { const ch = el('span', 'chip'); ch.appendChild(document.createTextNode(`${pname(f.provider, f.label)} 網站 `)); ch.appendChild(el('b', '', `${f.ok}/${f.explored}`)); chips.appendChild(ch); });
+    c.byTo.forEach(t => { const ch = el('span', 'chip'); ch.appendChild(document.createTextNode(`可改走 ${pname(t.provider, t.label)} `)); ch.appendChild(el('b', '', String(t.sites))); chips.appendChild(ch); });
     info.appendChild(chips);
     container.appendChild(info);
   }
 
   // ---------- 排行 ----------
-  function rank(container, rows, { label, value, valueText, color = 'var(--s1)' }) {
+  /**
+   * 排行（依數值由大到小，跟後端給的順序一樣）。`other`（3.5.1，可省略）：前幾名以外合併的那一列
+   * { name, value, text }，一律排在最後、灰色、不編號，跟「沒辨識出來」分開
+   */
+  function rank(container, rows, { label, value, valueText, color = 'var(--s1)', other = null }) {
     container.textContent = '';
     if (!rows.length) { container.appendChild(el('div', 'empty', '資料累積中')); return; }
-    const max = Math.max(...rows.map(value), 1);
-    rows.forEach((r, i) => {
-      const row = el('div', 'rank-row'); row.title = `${label(r)}：${valueText(r)}`;
-      row.appendChild(el('span', 'n', String(i + 1).padStart(2, '0')));
-      row.appendChild(el('span', 'name', label(r)));
-      const bw = el('div', 'bar-wrap'); const bar = el('div', 'bar'); bar.style.background = typeof color === 'function' ? color(r) : color; bar.style.width = Math.max(2, value(r) / max * 74) + '%';
-      bw.appendChild(bar); bw.appendChild(el('span', 'val', valueText(r))); row.appendChild(bw);
+    const max = Math.max(...rows.map(value), other ? other.value : 0, 1);
+    const add = (cls, n, name, v, text, c) => {
+      const row = el('div', 'rank-row' + cls); row.title = `${name}：${text}`;
+      row.appendChild(el('span', 'n', n));
+      row.appendChild(el('span', 'name', name));
+      const bw = el('div', 'bar-wrap'); const bar = el('div', 'bar'); bar.style.background = c; bar.style.width = Math.max(2, v / max * 74) + '%';
+      bw.appendChild(bar); bw.appendChild(el('span', 'val', text)); row.appendChild(bw);
       container.appendChild(row);
-    });
+    };
+    rows.forEach((r, i) => add('', String(i + 1).padStart(2, '0'), label(r), value(r), valueText(r), typeof color === 'function' ? color(r) : color));
+    if (other && other.value > 0) add(' other', '··', other.name, other.value, other.text, 'var(--text-3)');
   }
+  /** 「最常用到的 CDN」：前 8 家以外合併的那一列（3.5.1，後端的 cdnOther） */
+  const cdnOtherRow = o => o && o.count > 0 ? { name: `其他 ${o.providers} 家`, value: o.count, text: pct(o.share, 1) } : null;
 
   // ---------- 查詢去向（100% 長條） ----------
   /** 回傳查詢總數 */
@@ -523,7 +764,8 @@
     const parts = [['快取直接回應', oc.cache, 'var(--s1)'], ['問上游解析', oc.upstream, 'var(--s7)'], ['擋下廣告追蹤', oc.ads, 'var(--s2)'], ['擋下惡意詐騙', oc.malware, 'var(--s8)']];
     stack.textContent = ''; legend.textContent = '';
     if (tot) parts.forEach(([n, v, c]) => { if (!v) return; const d = el('div'); d.style.background = c; d.style.flexGrow = v; d.title = `${n}：${nf.format(v)}（${pct(v / tot, 1)}）`; stack.appendChild(d); });
-    parts.forEach(([n, v, c]) => { const d = el('div'); const i = el('i'); i.style.background = c; d.appendChild(i); d.appendChild(document.createTextNode(n)); d.appendChild(el('b', '', tot ? pct(v / tot, 1) : '—')); legend.appendChild(d); });
+    // 3.5.1：比例旁邊附次數
+    parts.forEach(([n, v, c]) => { const d = el('div'); const i = el('i'); i.style.background = c; d.appendChild(i); d.appendChild(document.createTextNode(n)); d.appendChild(el('b', '', tot ? pct(v / tot, 1) : '—')); d.appendChild(el('small', 'cnt', nf.format(v) + ' 次')); legend.appendChild(d); });
     return tot;
   }
 
@@ -547,7 +789,7 @@
   /** 最近 60 分鐘（公開頁的樣式） */
   function realtime(container, rows) { lineChart(container, rows, RT_SERIES, { xLabel: (d) => fmtHM(d.t), height: 200 }); }
 
-  Object.assign(KD, { niceTicks, tooltip, tipRows, placeTip, lineChart, lineChartCompact, routeMap, gauges, crossCard, rank, outcomes, trend, realtime, POPS });
+  Object.assign(KD, { niceTicks, tooltip, tipRows, placeTip, lineChart, lineChartCompact, routeMap, gauges, crossCard, rank, cdnOtherRow, outcomes, trend, realtime, POPS, flowRows, cdnFlow, samplesText, FLOW_TOP, FLOW_MIN });
 
   // =====================================================================================
   // 表格類（詳細頁、管理介面）
@@ -746,7 +988,13 @@
     }
     // ---- 機會成本 ----
     if (on('routing')) {
-      const c = card(sec.routing);
+      // 3.5.1：CDN 連線去向（兩段式流向圖；手機寬度是堆疊橫條）
+      const fc = card(sec.routing, 'kd-flowcard');
+      fc.appendChild(el('h3', '', 'CDN 連線去向'));
+      fc.appendChild(el('p', 'cap', '每次回應算一次連線：左邊是各家 CDN（前 5 家，其餘合併成「其他」），右邊是連線最後到哪裡。跨 CDN 備援改走的連線不在這張圖裡（見「跨 CDN 備援」）'));
+      sec.flowBox = el('div', 'chart flowchart'); fc.appendChild(sec.flowBox);
+      const fd = el('details', 'table'); fd.appendChild(el('summary', '', '數據表')); sec.flowTable = el('table'); fd.appendChild(sec.flowTable); fc.appendChild(fd);
+      const c = card(sec.routing, 'kd-mt12');
       c.appendChild(el('p', 'muted kd-mt0', '「一般 DNS 出國」= 固定上游以外的其他上游給的答案在國外節點；「拉回」= 這裡回給用戶的是台灣節點。每次回應算一次連線。'));
       sec.routeTable = tblBox(c);
       if (o.rich) {
@@ -823,7 +1071,9 @@
           ['攔截', nf.format(t.blocked), `廣告 ${nf.format(t.blockedAds)} · 惡意 ${nf.format(t.blockedMalware)} · 自訂 ${nf.format(t.blockedCustom)}`],
           ['CDN 連線比對', nf.format(o2.connections), `一般 DNS 出國 ${pct1(o2.otherDnsAbroadShare)}`],
           ['拉回台灣', nf.format(o2.accelerated), `仍在國外 ${nf.format(o2.stillAbroad)}（${pct1(o2.oursAbroadShare)}）`],
-          ['平均縮短', o2.avgSavedMs !== null ? o2.avgSavedMs + ' ms' : '—', `合計 ${o2.totalSavedSec} 秒`],
+          // 估計值都標樣本數（3.5.1）：平均縮短是幾次連線量到的、網站中位數是幾個網站量到的
+          ['平均縮短', o2.avgSavedMs !== null ? o2.avgSavedMs + ' ms' : '—', (typeof o2.savedSamples === 'number' ? samplesText(o2.savedSamples) + ' · ' : '') + `合計 ${o2.totalSavedSec} 秒`],
+          ['網站中位數縮短', typeof p.acceleration.medianSavedMs === 'number' ? p.acceleration.medianSavedMs + ' ms' : '—', samplesText(p.acceleration.samples || 0, '個網站量到')],
           ['已驗證可加速網站', nf.format(p.acceleration.verifiedSites), `台灣節點 v4 ${p.acceleration.twNodesV4} · v6 ${p.acceleration.twNodesV6}`]
         ];
         sec.tiles.textContent = '';
@@ -835,22 +1085,25 @@
         const tot = outcomes(sec.stack, sec.stackLegend, p.outcomes);
         sec.outCap.textContent = `${rangeName}共 ${nf.format(tot)} 次查詢`;
         trend(sec.trend, sec.trendTable, p.trend);
-        rank(sec.cdnRank, p.cdn, { label: r => r.label, value: r => r.count, valueText: r => pct(r.share, 1), color: r => CDN_COLOR[r.provider] || 'var(--s7)' });
+        rank(sec.cdnRank, p.cdn, { label: r => r.label, value: r => r.count, valueText: r => pct(r.share, 1), color: r => CDN_COLOR[r.provider] || 'var(--s7)', other: cdnOtherRow(p.cdnOther) });
         rank(sec.siteRank, p.topSites, { label: r => r.site, value: r => r.count, valueText: r => compact(r.count) });
         rank(sec.blockRank, p.topBlocked, { label: r => r.site, value: r => r.count, valueText: r => compact(r.count), color: 'var(--s2)' });
       }
       if (sec.routeTable) table(sec.routeTable, p.routing, [
-        { h: 'CDN', v: r => r.label },
+        { h: 'CDN', v: r => unknownCdn(r.provider) ? '未辨識的 CDN' : r.label },
         { h: '連線', v: r => nf.format(r.connections), num: 1 },
+        { h: '原本就在台灣', v: r => nf.format(flowRows([r]).total.tw), num: 1 },
         { h: '一般 DNS 出國', v: r => nf.format(r.wouldGoAbroad), num: 1 },
         { h: '出國比例', v: r => pct1(r.abroadShare), num: 1 },
         { h: '拉回台灣', v: r => nf.format(r.accelerated), num: 1 },
         { h: '仍在國外', v: r => nf.format(r.stillAbroad), num: 1 },
         { h: '成功率', v: r => { const w = el('div', 'bar'); const f = el('div'); f.style.width = ((r.successRate || 0) * 100) + '%'; f.style.background = 'var(--s1)'; w.appendChild(f); const box = el('div'); box.style.display = 'flex'; box.style.gap = '8px'; box.style.alignItems = 'center'; box.appendChild(w); box.appendChild(el('span', '', pct1(r.successRate))); return box; } },
-        { h: '平均縮短', v: r => r.avgSavedMs !== null ? r.avgSavedMs + ' ms' : '—', num: 1 }
+        { h: '平均縮短', v: r => r.avgSavedMs !== null ? r.avgSavedMs + ' ms' : '—', num: 1 },
+        { h: '量測樣本', v: r => typeof r.savedSamples === 'number' ? nf.format(r.savedSamples) : '—', num: 1 }
       ], '資料累積中');
+      if (sec.flowBox) cdnFlow(sec.flowBox, sec.flowTable, p.routing || []);
       if (sec.gauges) gauges(sec.gauges, p.routing || [], 'card glass empty');
-      if (sec.mapBox) routeMap(sec.mapBox, sec.mapTable, p.flows || [], p.toPops || {}, sec.mapNote);
+      if (sec.mapBox) routeMap(sec.mapBox, sec.mapTable, p.flows || [], p.toPops || {}, sec.mapNote, p.flowsOther);
       if (sec.crossCard) crossCard(sec.crossCard, p.crossCdn);
       if (sec.crossSum && o.domainsMode === 'server') {
         const c = p.crossCdn || {};

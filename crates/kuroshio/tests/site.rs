@@ -491,6 +491,88 @@ async fn public_stats_ranges() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// 3.5.1：連線去向圖的三塊加起來等於連線數；排行、跨 CDN 配對前幾名以外的合併成「其他」（以前直接丟掉）
+#[tokio::test]
+async fn dashboard_flow_parts_and_other() {
+    let dir = tmp("stats-other");
+    let (_s, st, _) = site(&config(&dir, json!({})));
+    let today = kuroshio::stats::taipei_date(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    // 10 家 CDN（排行列 8 家）、10 組跨 CDN 配對（列 8 組，其中一組改走的 CDN 沒記到）
+    let names = [
+        "cloudflare",
+        "cloudfront",
+        "akamai",
+        "gcore",
+        "azure",
+        "apple",
+        "line",
+        "bunny",
+        "cdn77",
+        "keycdn",
+    ];
+    let cdn: serde_json::Map<String, Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.to_string(), json!(100 - i * 10)))
+        .collect();
+    let cross: serde_json::Map<String, Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (format!("fastly>{p}"), json!(20 - i)))
+        .collect();
+    let mut cross = cross;
+    cross.insert("fastly>?".into(), json!(15));
+    let day = json!({ "date": today, "query": 1,
+        "route": {
+            "cloudflare": { "n": 820, "abroad": 330, "acc": 296, "miss": 34, "saved": 8436, "savedN": 296 },
+            "cloudfront": { "n": 410, "abroad": 250, "acc": 201, "miss": 49, "saved": 0, "savedN": 0 },
+            "akamai": { "n": 260, "abroad": 18, "acc": 0, "miss": 18 },
+        },
+        "cdn": cdn, "cross": cross, "crossRewrite": 7 });
+    assert!(st
+        .resolver
+        .stats
+        .restore(&serde_json::to_vec(&json!({ "version": 1, "days": [day] })).unwrap()));
+    let q = kuroshio::admin::parse_query("range=today");
+    let a = kuroshio::admin::route(&st, "/api/dashboard", &q).await.body;
+    let f = |v: &Value| v.as_f64().unwrap();
+    for r in a["routing"].as_array().unwrap() {
+        assert_eq!(
+            f(&r["alreadyTw"]) + f(&r["accelerated"]) + f(&r["stillAbroad"]),
+            f(&r["connections"]),
+            "{r}"
+        );
+        assert_eq!(f(&r["alreadyTw"]), f(&r["connections"]) - f(&r["wouldGoAbroad"]), "{r}");
+    }
+    assert_eq!(a["routing"][0]["alreadyTw"], 490.0);
+    assert_eq!(a["routing"][0]["savedSamples"], 296.0);
+    let o = &a["opportunity"];
+    assert_eq!(o["alreadyTw"], 490.0 + 160.0 + 242.0);
+    assert_eq!(
+        f(&o["alreadyTw"]) + f(&o["routedAccelerated"]) + f(&o["stillAbroad"]),
+        f(&o["connections"])
+    );
+    assert_eq!(o["accelerated"], 497.0 + 7.0, "跨 CDN 照舊算進加速次數，但不在三塊裡");
+    assert_eq!(o["savedSamples"], 296.0);
+    // 最常用到的 CDN：前 8 家，其餘 2 家（20 + 10）合併；比例加起來是 100%
+    assert_eq!(a["cdn"].as_array().unwrap().len(), 8);
+    assert_eq!(a["cdnOther"], json!({ "providers": 2, "count": 30, "share": 0.0545 }));
+    let shares: f64 = a["cdn"].as_array().unwrap().iter().map(|c| f(&c["share"])).sum::<f64>() + f(&a["cdnOther"]["share"]);
+    assert!((shares - 1.0).abs() < 0.001, "{shares}");
+    // 跨 CDN 配對：前 8 組；改走的 CDN 沒記到的那組（15 次）照樣排在裡面，沒有被併進「其他」
+    let pairs = a["crossCdn"]["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 8);
+    assert!(pairs.iter().any(|p| p["to"] == "?" && p["count"] == 15), "{pairs:?}");
+    assert_eq!(a["crossCdn"]["pairsOther"], json!({ "pairs": 3, "count": 13 + 12 + 11 }));
+    assert_eq!(a["flowsOther"], json!({ "pops": 0, "count": 0, "fixed": 0 }), "CDN 沒開：沒有機房");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// DoH 用 443 以外的埠號（例如 443 被占用改用 8443）：公開頁、描述檔、QR 碼、連線資訊都要帶埠號
 #[tokio::test]
 async fn doh_on_other_port() {

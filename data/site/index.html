@@ -304,9 +304,32 @@ section { padding: 56px 0 8px; }
 .gauge .name { font-weight: 700; display: flex; align-items: center; gap: 8px; }
 .gauge .name i { width: 10px; height: 10px; border-radius: 3px; }
 .gauge dl { margin: 6px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
-.gauge dt { color: var(--text-3); }
+.gauge dt { color: var(--text-3); white-space: nowrap; }
 .gauge dd { margin: 0; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text); }
 
+/* CDN 連線去向（3.5.1，dashboard.js 的 cdnFlow）：桌機兩段式流向圖、手機每家 CDN 一條堆疊橫條；顏色以外再加圖樣（拉回 = 斜線、國外 = 點點） */
+.flowchart text.flow-lbl { font: 600 13px var(--font); fill: var(--text); }
+.flowchart text.flow-lbl.dim { fill: var(--text-2); font-weight: 500; font-style: italic; }
+.flowchart text.flow-num { font: 12px var(--mono); fill: var(--text-3); }
+.flowchart .band { cursor: default; transition: fill-opacity .15s; }
+.flow-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--text-2); margin-bottom: 10px; }
+.flow-legend i, .flow-nums i { display: inline-block; width: 14px; height: 10px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.fpat-acc { background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.55) 0 2px, transparent 2px 5px); }
+.fpat-still { background-image: radial-gradient(circle, rgba(255,255,255,.8) 1.1px, transparent 1.7px); background-size: 5px 5px; }
+.flow-bars { display: grid; gap: 14px; }
+.flow-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 14px; margin-bottom: 4px; min-width: 0; }
+.flow-head b { font-weight: 650; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-head span { font: 12.5px var(--mono); color: var(--text-3); white-space: nowrap; }
+.flow-row.other .flow-head b, .flow-row.unknown .flow-head b { color: var(--text-2); font-weight: 500; font-style: italic; }
+.flow-stack { display: flex; gap: 2px; height: 16px; border-radius: 6px; overflow: hidden; background: var(--track); }
+.flow-stack > div { height: 100%; min-width: 2px; }
+.flow-nums { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12.5px; color: var(--text-2); margin-top: 5px; font-variant-numeric: tabular-nums; }
+.flow-note { font-size: 12.5px; color: var(--text-3); margin: 10px 0 0; }
+details.table tr.sum td { font-weight: 650; color: var(--text); }
+details.table tr.other td:first-child, details.table tr.unknown td:first-child { font-style: italic; }
+/* 「其他」（量太小合併）與「沒辨識出來」：灰色、斜體，跟一般的 CDN 分開 */
+.rank-row.other .name, .cross .pair.other .lbl, .cross .pair.unknown .lbl, .gauge.other .name, .gauge.unknown .name { color: var(--text-2); font-style: italic; font-weight: 500; }
+.stack-legend small { display: block; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 /* 圖表通用 */
 .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--text-2); margin-bottom: 8px; }
 .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
@@ -511,7 +534,7 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
           <p class="sub" id="oppSub">每一次 CDN 網站的連線，都會和其他 DNS 的答案比對。</p>
           <div class="kpis">
             <div class="kpi"><div class="v" id="o-acc">—</div><div class="l">次連線拉回台灣</div></div>
-            <div class="kpi"><div class="v" id="o-ms">—</div><div class="l">平均每次縮短</div></div>
+            <div class="kpi"><div class="v" id="o-ms">—</div><div class="l" id="o-ms-l">平均每次縮短</div></div>
             <div class="kpi"><div class="v" id="o-sec">—</div><div class="l">合計省下等待</div></div>
           </div>
         </div>
@@ -522,6 +545,12 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
         </div>
       </div>
 
+      <div class="card glass" style="margin-top:14px">
+        <h3>CDN 連線去向</h3>
+        <p class="cap">每次回應算一次連線：左邊是各家 CDN（前 5 家，其餘合併成「其他」），右邊是連線最後到哪裡。只有彙總數字，不含任何網站或裝置</p>
+        <div class="chart flowchart" id="flow"></div>
+        <details class="table"><summary>數據表</summary><table id="flowTable"></table></details>
+      </div>
       <div class="grid g2" style="margin-top:14px">
         <div class="card glass" style="grid-column:1/-1">
           <h3>原本會被送去哪裡</h3>
@@ -979,13 +1008,17 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
       h.appendChild(el('em', '', pct(o.otherDnsAbroadShare)));
       h.appendChild(document.createTextNode(' 的 CDN 連線送出國；這裡只剩 '));
       h.appendChild(el('strong', '', pct(o.oursAbroadShare)));
-      $('#oppSub').textContent = `共比對 ${nf.format(o.connections)} 次 CDN 連線，其中 ${nf.format(o.wouldGoAbroad)} 次原本會出國，${nf.format(o.accelerated)} 次成功改走台灣節點。`;
+      // 估計值標樣本數（3.5.1）：網站中位數是幾個已驗證的網站量到的
+      const ac = s.acceleration || {};
+      const med = typeof ac.medianSavedMs === 'number' && ac.samples > 0 ? `已驗證的網站中，${KD.samplesText(ac.samples, '個網站')}量到改走台灣節點的差距，中位數省 ${ac.medianSavedMs} ms。` : '';
+      $('#oppSub').textContent = `共比對 ${nf.format(o.connections)} 次 CDN 連線，其中 ${nf.format(o.wouldGoAbroad)} 次原本會出國，${nf.format(o.accelerated)} 次成功改走台灣節點。` + med;
     } else {
       $('#oppHead').textContent = '資料累積中…';
       $('#oppSub').textContent = '有人瀏覽 Cloudflare、CloudFront 等 CDN 網站後，這裡就會開始比對。';
     }
     countTo($('#o-acc'), o.accelerated);
     $('#o-ms').textContent = o.avgSavedMs !== null ? o.avgSavedMs + ' ms' : '—';
+    $('#o-ms-l').textContent = typeof o.savedSamples === 'number' && o.savedSamples > 0 ? `平均每次縮短（${KD.samplesText(o.savedSamples)}）` : '平均每次縮短';
     $('#o-sec').textContent = o.totalSavedSec ? (o.totalSavedSec >= 120 ? (o.totalSavedSec / 60).toFixed(1) + ' 分鐘' : o.totalSavedSec + ' 秒') : '—';
     $('#vs-other').textContent = o.connections ? pct(o.otherDnsAbroadShare) + ' 出國' : '—';
     $('#vs-ours').textContent = o.connections ? pct(o.oursAbroadShare) + ' 出國' : '—';
@@ -994,7 +1027,8 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
       $('#vs-ours-bar').style.width = (o.connections ? Math.max(1, o.oursAbroadShare * 100) : 0) + '%';
     });
 
-    KD.routeMap($('#map'), $('#mapTable'), s.flows || [], s.toPops || {}, $('#mapNote'));
+    KD.cdnFlow($('#flow'), $('#flowTable'), s.routing || []);
+    KD.routeMap($('#map'), $('#mapTable'), s.flows || [], s.toPops || {}, $('#mapNote'), s.flowsOther);
     KD.gauges($('#gauges'), s.routing || []);
     KD.crossCard($('#cross'), s.crossCdn);
 
@@ -1006,7 +1040,7 @@ footer { padding: 56px 0 48px; color: var(--text-3); font-size: 14px; }
     $('#outCap').textContent = `${rangeName}共 ${nf.format(tot)} 次查詢`;
 
     KD.trend($('#trend'), $('#trendTable'), s.trend);
-    KD.rank($('#cdnRank'), s.cdn, { label: r => r.label, value: r => r.count, valueText: r => pct(r.share, 1), color: r => KD.CDN_COLOR[r.provider] || 'var(--s7)' });
+    KD.rank($('#cdnRank'), s.cdn, { label: r => r.label, value: r => r.count, valueText: r => pct(r.share, 1), color: r => KD.CDN_COLOR[r.provider] || 'var(--s7)', other: KD.cdnOtherRow(s.cdnOther) });
     KD.rank($('#siteRank'), s.topSites, { label: r => r.site, value: r => r.count, valueText: r => compact(r.count) });
     KD.rank($('#blockRank'), s.topBlocked, { label: r => r.site, value: r => r.count, valueText: r => compact(r.count), color: 'var(--s2)' });
     $('#sitesCap').textContent = s.privacy.minClients > 1 ? `至少 ${s.privacy.minClients} 位不同使用者造訪過` : '大家最常造訪的網站';
