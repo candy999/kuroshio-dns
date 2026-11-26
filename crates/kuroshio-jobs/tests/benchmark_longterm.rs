@@ -337,8 +337,64 @@ async fn judge_log_has_selection() {
     let e = setup("journal", 4, "").await;
     let (_, log) = e.run(&cfg()).await;
     assert!(log.contains("=== 今日選出的上游 ==="), "{log}");
-    assert!(log.contains("總涵蓋率"), "{log}");
+    // 3.5.1：以前是「總涵蓋率 4.2%（981/23161）」，看起來像「只查得到 4%」。改成寫明在算什麼，另外一行寫網域查不查得到
+    assert!(!log.contains("總涵蓋率"), "{log}");
+    assert!(
+        log.contains("  位址覆蓋 ") && log.contains("個不同的（網域, 位址），倖存的 8 台合起來是 "),
+        "{log}"
+    );
+    assert!(log.contains("這個比例本來就低，只用來挑新增位址多的上游"), "{log}");
+    // 選出幾台看本機的延遲（這個測試不比），網域數一定寫出來
+    assert!(log.contains("  網域覆蓋：計分的 3 個網域，選出的上游答得出 "), "{log}");
     assert!(log.lines().last().unwrap().starts_with("[dns-benchmark] 結束 "), "{log}");
+}
+
+/// 3.5.1：ASN 在逐網域判斷之前合併查：全部網域裡快取沒有的 /24 一起查、每個 /24 只問一次
+/// （以前每個網域各查一批，新的 /24 只有幾個也要等 ip-api 的 4.2 秒間隔：D3 換成 /24 鍵那天逐網域判斷多 7.4 分鐘）。
+/// 快取裡有的隔天不再問
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asn_lookups_merged_before_judging() {
+    struct Counting {
+        inner: Arc<dyn AsnSource>,
+        calls: Mutex<Vec<Vec<Ipv4Addr>>>,
+    }
+    impl AsnSource for Counting {
+        fn lookup(&self, ips: Vec<Ipv4Addr>) -> BoxFuture<Vec<(Ipv4Addr, AsnInfo)>> {
+            self.calls.lock().unwrap().push(ips.clone());
+            self.inner.lookup(ips)
+        }
+    }
+    let e = setup("asn-merge", 6, "").await;
+    // 第 6 台在第 2 個網域回另一個 /24（同一家業者）：一樣在同一批裡
+    e.answer(6, WEB[1], "93.1.9.6");
+    let src = Arc::new(Counting {
+        inner: asn(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let run = || async {
+        let ctx = JobCtx::new("dns-benchmark", "測試", Arc::new(cfg())).with_clock(e.clock.clone());
+        let b = Benchmark::with(e.p.clone(), e.prober.clone(), src.clone());
+        let state = b.run(&ctx).await.unwrap();
+        let day = state["date"].as_str().unwrap().to_string();
+        std::fs::read_to_string(e.p.out_root.clone().unwrap().join(day).join("judge.log")).unwrap()
+    };
+    let log = run().await;
+    let calls = src.calls.lock().unwrap().clone();
+    // 3 個網域、6 台候選：93.1.0／93.1.1／93.1.2／93.1.9 四個 /24，一次問完（每個 /24 一個代表）
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let mut keys: Vec<[u8; 3]> = calls[0].iter().map(|ip| [ip.octets()[0], ip.octets()[1], ip.octets()[2]]).collect();
+    keys.sort();
+    assert_eq!(keys, [[93, 1, 0], [93, 1, 1], [93, 1, 2], [93, 1, 9]]);
+    assert!(
+        log.contains("[ASN] 逐網域判斷之前先合併查：4 個 /24（快取沒有或到期），每批 100 個、共 1 批"),
+        "{log}"
+    );
+    assert!(log.contains("[ASN] 合併查完：查到 4、查不到 0"), "{log}");
+    // 隔天：都在快取裡，不再問、不寫合併查那一行
+    e.next_day();
+    let log = run().await;
+    assert_eq!(src.calls.lock().unwrap().len(), 1);
+    assert!(!log.contains("[ASN] 逐網域判斷之前先合併查"), "{log}");
 }
 
 /// A10.9：每天回 HTTP 429 的（https 與 h3 都算）連續 3 天之後跳過 7～30 天；到期再測沒有 429 就恢復

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 安裝時附帶的預設自訂規則（設定的自訂規則檔不存在時寫出這份）
 pub const DEFAULT_CUSTOM_RULES: &str = include_str!("../../../rules/default-custom-rules.txt");
@@ -125,8 +125,10 @@ pub struct ProbeSource {
     pub name: String,
     /// 本機副本在磁碟上的位置（沒有副本、或還在等寫出時是 None：不為了抽樣多下載）
     pub copy: Option<PathBuf>,
-    /// 被記憶體控制停用中（停用中不抽）
+    /// 被記憶體控制停用中（停用中不讀副本）
     pub unloaded: bool,
+    /// 沒有本機副本時：下載這份清單時順便抽的樣本（3.5.1，[`crate::probesample::LineSampler`]）
+    pub snap: Option<crate::probesample::SnapList>,
 }
 
 /// 暫時停用的清單
@@ -676,6 +678,8 @@ pub struct FilterService {
     rebuilds: AtomicU32,
     /// 下載到、但這台這時候存不了副本的清單（網址 → 內容），見 [`Held`]
     held: Mutex<HashMap<String, Held>>,
+    /// 惡意網站探測：沒有本機副本的清單下載時順便抽的樣本（3.5.1，快照目錄的 `probe-sample.json`，幾 KB）
+    probe_snaps: Mutex<crate::probesample::Snaps>,
 }
 
 /// 錯誤是不是「工作被取消」（runtime 結束時 `spawn_blocking` 的工作）
@@ -821,6 +825,7 @@ impl FilterService {
             update_done: tokio::sync::watch::channel(0).0,
             rebuilds: AtomicU32::new(0),
             held: Mutex::new(HashMap::new()),
+            probe_snaps: Mutex::new(Default::default()),
         }))
     }
 
@@ -855,8 +860,45 @@ impl FilterService {
                     Some(p.file_path(&m.file)).filter(|f| f.is_file())
                 }),
                 unloaded: all || ex.get(i).copied().unwrap_or(false),
+                snap: self.probe_snaps.lock().unwrap().0.get(&s.url).cloned(),
             })
             .collect()
+    }
+
+    /// 這份清單這次下載要不要順便抽樣（3.5.1）：可以抽、這次存不了本機副本、有快照寫入器、時間已經對過，
+    /// 而且沒有樣本或樣本滿 7 天
+    fn probe_snap_due(&self, s: &ListSource, persist: bool) -> bool {
+        s.probe
+            && !persist
+            && self.copies.get().is_some()
+            && crate::clock::synced()
+            && self.probe_snaps.lock().unwrap().due(&s.url, crate::persist::now_secs())
+    }
+
+    /// 存下載時順便抽的樣本（登記給快照寫入器，照它的時程寫出；內容沒變不寫）
+    fn save_probe_snap(&self, url: &str, names: Vec<String>) {
+        let Some(c) = self.copies.get() else { return };
+        let n = names.len();
+        if n == 0 {
+            // 清單裡沒有單純的網域規則：留著舊的樣本（下次下載再試，只多花一點 CPU）
+            debug!("惡意網站探測：清單下載時順便抽樣，沒有單純的網域規則");
+            return;
+        }
+        let keep: Vec<&str> = self.sources.iter().filter(|s| s.probe).map(|s| s.url.as_str()).collect();
+        let json = {
+            let mut snaps = self.probe_snaps.lock().unwrap();
+            snaps.put(
+                url,
+                crate::probesample::SnapList {
+                    at: crate::persist::now_secs(),
+                    names,
+                },
+                &keep,
+            );
+            snaps.to_json()
+        };
+        c.persister.lock().unwrap().stage(crate::probesample::SNAP_FILE, json);
+        info!("惡意網站探測：清單下載時順便抽了 {n} 個網域存起來（沒有本機副本時評測用，7 天後下載時重抽）");
     }
 
     /// 開始一次手動更新（重新讀自訂規則、強制檢查每份清單），在背景執行。
@@ -922,6 +964,12 @@ impl FilterService {
 
     /// 本機副本存在快照目錄的 `filter-lists/`（只能設定一次）
     pub fn set_copies(&self, p: Arc<Mutex<crate::persist::Persister>>) {
+        // 下載時順便抽的探測樣本（3.5.1）：只留目前設定裡可以抽的清單
+        if let Some(b) = p.lock().unwrap().load(crate::probesample::SNAP_FILE) {
+            let mut snaps = crate::probesample::Snaps::parse(&b);
+            snaps.0.retain(|u, _| self.sources.iter().any(|s| s.probe && s.url == *u));
+            *self.probe_snaps.lock().unwrap() = snaps;
+        }
         let _ = self.copies.set(ListCopies::new(p));
         // 副本記著上次的規則數：開機那次就能估記憶體（沒量過的清單本來只受 maxDomains 限制）
         if let Some(c) = self.copies.get() {
@@ -1538,9 +1586,16 @@ impl FilterService {
             let persist = copies.is_some_and(|c| c.wanted(estimate));
             let hold = copies.is_some() && !persist && self.held_room(&s.url, estimate);
             let mut sink = CopySink::new(persist || hold);
+            // 惡意網站探測（3.5.1）：存不了副本的可以抽樣清單，下載時順便抽（7 天一次，不另外下載）
+            let mut samp = self
+                .probe_snap_due(s, persist)
+                .then(|| crate::probesample::LineSampler::new(crate::probesample::seed_now()));
             let r = fetch::get(&s.url, &Validators::default(), self.max_bytes, timeout, |c| {
                 w.feed(c);
                 sink.feed(c);
+                if let Some(p) = samp.as_mut() {
+                    p.feed(c);
+                }
                 Ok(())
             })
             .await;
@@ -1560,6 +1615,9 @@ impl FilterService {
                 Ok(Outcome::Done { validators: v, .. }) => {
                     let rules = w.rules();
                     w.end();
+                    if let Some(p) = samp.take() {
+                        self.save_probe_snap(&s.url, p.finish());
+                    }
                     if let Some(c) = copies {
                         let (h, z) = sink.finish();
                         if persist {

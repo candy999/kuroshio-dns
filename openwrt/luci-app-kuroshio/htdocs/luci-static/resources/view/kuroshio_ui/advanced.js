@@ -283,7 +283,7 @@ return view.extend({
 		num('concurrency', _('同時測試數'), 'benchmark.concurrency');
 		num('timeout_ms', _('逾時（毫秒）'), 'benchmark.timeoutMs');
 		num('max_timeouts', _('容許逾時次數'), 'benchmark.maxTimeouts');
-		num('coverage_target', _('涵蓋率目標'), 'benchmark.coverageTarget', _('0.97 = 97%'), 'ufloat');
+		num('coverage_target', _('涵蓋率目標'), 'benchmark.coverageTarget', _('0.97 = 97%。選出的上游合起來回過的（網域, 位址）占倖存候選合起來的比例到這個值就不再加；候選遍布各地、CDN 依地區給不同位址，通常先到台數上限'), 'ufloat');
 		// 上游多樣性（3.4.0）
 		o = s.option(form.ListValue, 'coverage_region', _('覆蓋上游的範圍'),
 			_('鄰近優先：選「覆蓋」上游時先選鄰近的（台灣、日本、香港、新加坡，或延遲低的任播上游），CDN 才比較會回亞洲的節點；還有名額才選其他的。'));
@@ -304,7 +304,7 @@ return view.extend({
 		o.rmempty = false;
 		// 探測網域從已下載的清單抽樣（3.5.0 F10）
 		o = common.flag(s, null, 'probe_sample', _('探測網域從已下載的清單抽樣'), 'benchmark.probeSample',
-			_('每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 60 個網域，先確認還解析得到（留最多 30 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。TW165、TWNIC-RPZ、新註冊網域不抽。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）。關掉＝只用 probe.txt。'));
+			_('每次評測前從這台已經下載的惡意類過濾清單（本機副本）抽 60 個網域，先確認還解析得到（留最多 30 個），再跟 probe.txt 合併；有回答的至少 6 個、擋了一半以上才算有擋。TW165、TWNIC-RPZ、新註冊網域不抽。記憶體吃緊、清單停用中、沒有本機副本時這次不抽（不為了抽樣多下載）；小 Flash 存不下副本時，清單下載時順便抽 120 個存成幾 KB 的小檔（7 天重抽一次），評測用這份。關掉＝只用 probe.txt。'));
 		o.depends('malware_probe', '1');
 		num('near_max_ms', _('鄰近的延遲上限（毫秒）'), 'benchmark.nearMaxMs', _('最低延遲在這以內就算鄰近（不管國別）；台灣、日本、香港、新加坡的上游放寬到兩倍。'));
 		num('min_auto', _('至少選幾台'), 'benchmark.minAuto');

@@ -257,8 +257,10 @@ async fn end_to_end_with_mock_servers() {
     }
     assert_eq!(up["selected"][0]["owner"], "Owner1_Ltd__AS901_Owner1");
     assert_eq!(up["date"], "2026-11-10");
-    assert_eq!(up["universe"], 7);
-    assert_eq!(up["coverage"], json!(0.8571));
+    // 3.5.1：覆蓋的分母只算倖存的候選回過的（網域, 位址）。2.x 連汙染的 s3 回的位址也算（7 個、0.8571），
+    // 那些答案沒有一台選得到
+    assert_eq!(up["universe"], 6);
+    assert_eq!(up["coverage"], json!(1));
     assert_eq!(
         up["counts"],
         json!({ "total": 9, "verified": 7, "survivors": 4, "eliminated": 5, "protected": 0, "byTier": { "A": 1, "B": 7 }, "malwareFilter": 0 })
