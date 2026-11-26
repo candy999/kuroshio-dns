@@ -1403,10 +1403,13 @@ fn suspect_qualifies(c: StrikeCount) -> bool {
 /// - 倖存、或只是封殺（有過濾、不是竄改）：通過
 /// - 憑證不符：照舊留著、改成永久
 /// - 「網站無法驗證」而且可疑紀錄夠格：留著、從今天重新算 30～60 天
-/// - 其他（可疑紀錄不夠格、別的經營者也回同一個位址、資格賽或連線失敗）：移出，之後照一般規則累積
+/// - 資格賽或連線失敗（沒有「網站無法驗證」或憑證的證據）：今天沒測到，留著、30～60 天後再試
+/// - 其他（可疑紀錄不夠格、別的經營者也回同一個位址）：移出，之後照一般規則累積
 fn retest_result(s: &Srv, c: StrikeCount) -> blacklist::Retest {
     if s.alive || s.fail_reason.starts_with("封殺") {
         blacklist::Retest::Passed
+    } else if s.fail_reason.starts_with("資格賽失敗") || s.fail_reason.starts_with("連線失敗") {
+        blacklist::Retest::Unreachable(s.fail_reason.clone())
     } else if s.fail_reason.contains("憑證不符") || (s.fail_reason.starts_with("可疑") && suspect_qualifies(c)) {
         blacklist::Retest::Failed(s.fail_reason.clone())
     } else {
@@ -3006,13 +3009,14 @@ impl Benchmark {
         if st.any() || st.untested > 0 {
             jinfo!(
                 journal,
-                "[永久黑名單] 重測「網站無法驗證」{} 台：通過移除 {}；沒通過的照列入的標準判斷：不夠格移出 {}（今天的失敗照一般規則記進可疑紀錄）、夠格留著 {}（從今天重新算 30～60 天）、憑證不符改成永久 {}；今天沒測到 {}；名單裡已經沒有的移除 {}、超過上限 {} 筆移除 {}",
+                "[永久黑名單] 重測「網站無法驗證」{} 台：通過移除 {}；沒通過的照列入的標準判斷：不夠格移出 {}（今天的失敗照一般規則記進可疑紀錄）、夠格留著 {}（從今天重新算 30～60 天）、憑證不符改成永久 {}；今天沒測到 {}（其中資格賽或連線失敗 {}：留著，30～60 天後再試）；名單裡已經沒有的移除 {}、超過上限 {} 筆移除 {}",
                 retest.len(),
                 st.passed,
                 st.released,
                 st.failed,
                 st.failed_cert,
                 st.untested,
+                st.unreachable,
                 st.pruned,
                 blacklist::BLACKLIST_MAX,
                 st.capped
@@ -4690,7 +4694,7 @@ mod benchw_tests {
         Srv::new(id.to_string(), Upstream::parse(id).unwrap(), false, Tag::default())
     }
 
-    /// 重測沒通過時照列入的標準判斷：憑證不符留著；「網站無法驗證」可疑紀錄夠格才留著，不夠格（含資格賽、連線失敗）移出
+    /// 重測沒通過時照列入的標準判斷：憑證不符留著；「網站無法驗證」可疑紀錄夠格才留著，不夠格移出；資格賽、連線失敗算沒測到
     #[test]
     fn retest_failure_uses_listing_threshold() {
         let none = StrikeCount { days: 0, domains: 0 };
@@ -4711,10 +4715,11 @@ mod benchw_tests {
         let mut s = srv("https://dns.example.com/dns-query");
         s.kill("汙染 www.example.com (判定為 X，憑證不符 ERR_TLS_CERT_ALTNAME_INVALID)".into());
         assert!(matches!(retest_result(&s, none), blacklist::Retest::Failed(_)), "憑證不符照舊留著");
+        // 資格賽或連線失敗：什麼都沒看到，算今天沒測到（留著、30～60 天後再試），不移出
         for why in ["資格賽失敗 (逾時)", "連線失敗 (逾時)"] {
             let mut s = srv("https://dns.example.com/dns-query");
             s.kill(why.into());
-            assert!(matches!(retest_result(&s, none), blacklist::Retest::Released(_)), "{why}");
+            assert!(matches!(retest_result(&s, none), blacklist::Retest::Unreachable(_)), "{why}");
         }
     }
 

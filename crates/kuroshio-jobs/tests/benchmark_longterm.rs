@@ -262,7 +262,8 @@ async fn unverified_needs_two_domains_and_unshared_answer() {
 }
 
 /// A10.4：永久黑名單裡「網站無法驗證」的 30～60 天後重測一次：通過就移除；沒通過照列入的標準判斷
-/// （3.5.1 第二版之後：可疑紀錄夠格才留著、從今天重新算，不夠格就移出、照一般規則累積；重測時憑證不符的改成永久）；
+/// （3.5.1 第二版之後：可疑紀錄夠格才留著、從今天重新算，不夠格就移出、照一般規則累積；重測時憑證不符的改成永久；
+/// 資格賽或連線失敗算今天沒測到，留著、30～60 天後再試）；
 /// 憑證不符的永久（不重測）；名單裡已經沒有的移除；檔頭換成新的說明
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unverified_blacklist_entries_are_retested() {
@@ -290,6 +291,7 @@ async fn unverified_blacklist_entries_are_retested() {
         ),
         format!("{}  # 2026-11-15 汙染：{} → {q}（連續 3 天網站無法驗證）", e.id(11), WEB[0]),
         format!("{}  # 2026-11-15 汙染：{} → {q}（連續 3 天網站無法驗證）", e.id(10), WEB[0]),
+        format!("{}  # 2026-11-15 汙染：{} → {q}（連續 3 天網站無法驗證）", e.id(9), WEB[0]),
         format!(
             "https://gone.example.net/dns-query  # 2026-09-15 汙染：{} → X（30 天內 3 天、2 個網域網站無法驗證）",
             WEB[0]
@@ -306,11 +308,13 @@ async fn unverified_blacklist_entries_are_retested() {
     e.answer(14, WEB[0], "98.6.0.14");
     e.answer(11, WEB[0], "98.6.0.11");
     e.answer(10, WEB[0], "96.4.0.10");
+    // 第 9 台連資格賽都沒過（什麼都沒看到）：算今天沒測到，留著、30～60 天後再試
+    e.prober.limited.lock().unwrap().insert("h9.example.com".into());
     let (state, log) = e.run(&cfg()).await;
     let out = e.blacklist();
     assert!(
         log.contains(
-            "[永久黑名單] 重測「網站無法驗證」4 台：通過移除 1；沒通過的照列入的標準判斷：不夠格移出 1（今天的失敗照一般規則記進可疑紀錄）、夠格留著 1（從今天重新算 30～60 天）、憑證不符改成永久 1；今天沒測到 0；名單裡已經沒有的移除 1"
+            "[永久黑名單] 重測「網站無法驗證」5 台：通過移除 1；沒通過的照列入的標準判斷：不夠格移出 1（今天的失敗照一般規則記進可疑紀錄）、夠格留著 1（從今天重新算 30～60 天）、憑證不符改成永久 1；今天沒測到 1（其中資格賽或連線失敗 1：留著，30～60 天後再試）；名單裡已經沒有的移除 1"
         ),
         "{log}"
     );
@@ -364,8 +368,14 @@ async fn unverified_blacklist_entries_are_retested() {
         )),
         "{log}"
     );
+    // 第 9 台：留著，日期改成今天（30～60 天後再試）
+    assert!(
+        out.contains(&format!("{}  # 2026-11-20 重測：連不上（資格賽失敗 (", e.id(9))),
+        "{out}"
+    );
+    assert!(out.contains("網站無法驗證的判斷下次再試（第一次列入 2026-11-15）"), "{out}");
     // 重測的不再附加一行（整理時改寫）：每台只有一行
-    for n in [10u8, 11] {
+    for n in [9u8, 10, 11] {
         assert_eq!(out.matches(&format!("{}  #", e.id(n))).count(), 1, "{out}");
     }
     assert!(out.contains(&format!("{}  # 2026-09-15", e.id(15))), "憑證不符的永久：{out}");
@@ -378,15 +388,19 @@ async fn unverified_blacklist_entries_are_retested() {
         !asked.contains_key(e.id(15)) && !asked.contains_key(e.id(12)),
         "還在黑名單的不測：{asked:?}"
     );
-    assert_eq!(state["counts"]["eliminated"], 6, "第 10、11、14 台的 https 與 h3：{state}");
+    assert_eq!(state["counts"]["eliminated"], 8, "第 9、10、11、14 台的 https 與 h3：{state}");
     // 隔天：剛重測過、留著的不會再測；移除的第 13 台、移出的第 14 台照常每天測
     e.next_day();
     e.reset_answers();
+    e.prober.limited.lock().unwrap().clear();
     e.prober.asked.lock().unwrap().clear();
     let (_, log) = e.run(&cfg()).await;
-    assert!(!log.contains("[永久黑名單] 重測"), "{log}");
+    assert!(!log.contains("[永久黑名單] 重測"), "連不上的也不會天天排：{log}");
     let asked = e.prober.asked.lock().unwrap().clone();
-    assert!(!asked.contains_key(e.id(11)) && !asked.contains_key(e.id(10)), "{asked:?}");
+    assert!(
+        !asked.contains_key(e.id(11)) && !asked.contains_key(e.id(10)) && !asked.contains_key(e.id(9)),
+        "{asked:?}"
+    );
     assert!(asked.contains_key(e.id(13)) && asked.contains_key(e.id(14)), "{asked:?}");
 }
 
