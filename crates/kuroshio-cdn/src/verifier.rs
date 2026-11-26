@@ -492,6 +492,14 @@ impl Cdn {
             base_pop = pop;
             base = Some(b);
         }
+        // 3.5.1 L4：連原本的 IP 都是本機通訊端出錯（Windows 10048／10055 這類）：這一輪什麼都判斷不了，短時間後重試
+        if let Some(err) = base
+            .as_ref()
+            .and_then(|b| b.error.as_deref())
+            .filter(|e| kuroshio_net::probe::is_local_error(e))
+        {
+            return Some(self.unsure(name, provider, family, &format!("本機通訊端錯誤 {err}（不是網站或節點的問題）")));
+        }
         let base_ok = base.as_ref().filter(|b| b.ok);
         conn_out.base_ok = base_ok.is_some();
         // 3.5.1（Azure「台北換台北」）：原本的答案這條線連過去已經落在台灣機房 → 當成已是台灣、不換。
@@ -575,11 +583,17 @@ impl Cdn {
         let mut zone_fail: Option<ZoneFail> = None;
         // 這一次連不上或憑證不符的不同節點數（3.5.1 K2）
         let mut failed_nodes: Vec<IpAddr> = Vec::new();
+        // 本機通訊端的錯誤（3.5.1 L4：連接埠用完、緩衝不足…）：不是網站也不是節點的結論
+        let mut local_err: Option<String> = None;
         for (idx, &ip) in candidates.iter().enumerate() {
             note(hinted_out, ip, false);
             let r = self.probe_site(ip, name, http_mode).await;
             if !r.ok {
                 let err = r.error.clone().unwrap_or_default();
+                if kuroshio_net::probe::is_local_error(&err) {
+                    local_err.get_or_insert(err);
+                    continue;
+                }
                 if !failed_nodes.contains(&ip) {
                     failed_nodes.push(ip);
                 }
@@ -806,6 +820,13 @@ impl Cdn {
         // 一個都沒通過，而且連不上（或憑證不符）的不同節點有 3 個以上：這個網站的問題（例如只接受業者專用的 IP），
         // 不是那些節點的問題（3.5.1 K2：D3 壓測裡 Fastly 節點被暫停的大多是這種）
         conn_out.site_level = base_ok.is_some() && failed_nodes.len() >= SITE_FAIL_NODES;
+        // 3.5.1 L4：本機通訊端出錯、一個都沒通過：不下結論（不記在網站上、不記到節點上），短時間後重試
+        if let Some(err) = &local_err {
+            if zone_fail.is_none() && !conn_out.site_level {
+                conn_out.list.clear();
+                return Some(self.unsure(name, provider, family, &format!("本機通訊端錯誤 {err}（不是網站或節點的問題）")));
+            }
+        }
         // 3.5.1 M4：候選不到 3 個、都回「不服務這個網站」：分不出是網站還是那一兩個節點的問題 → 不記在網站上，
         // 暫時無法判定、短時間後重試（連續幾次就拉長）；節點那邊照上面記（多個網站都這樣才暫停）
         if zone_fail.is_some() && !octet && candidates.len() < SITE_FAIL_NODES {

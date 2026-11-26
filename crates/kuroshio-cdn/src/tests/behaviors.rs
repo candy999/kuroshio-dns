@@ -71,6 +71,42 @@ async fn v6_verify_does_not_overwrite_v4_base() {
         .is_none());
 }
 
+/// 3.5.1 L4：驗證時本機通訊端出錯（連接埠用完、緩衝不足、檔案描述元用完）不當成網站或節點的結論
+#[tokio::test]
+async fn verifier_local_socket_errors_are_unsure() {
+    let (c, net) = setup(json!({}));
+    third_node(&c);
+    c.with_state(|st| {
+        for n in ["l1.example.com", "l2.example.com"] {
+            st.db.touch(n, "cloudflare", "ip", &ips(&["104.21.0.5"]), &[], None);
+        }
+    });
+    // 原站正常、候選全部是本機的錯誤：不算 3 個節點都連不上（那會記成網站的失敗），也不記到節點上
+    net.on_https(|i, _| match i.to_string().as_str() {
+        "104.21.0.5" => cf_ok("NRT"),
+        _ => fail("EADDRINUSE"),
+    });
+    for n in ["l1.example.com", "l2.example.com"] {
+        assert_eq!(c.verify(n, "cloudflare", 4, Some(ip("104.21.0.5"))).await, Some("unknown"));
+        let v = c.state().db.get(n).unwrap().v4.clone().unwrap();
+        assert_eq!(v.fails, None);
+        assert!(v.reason.unwrap().contains("本機通訊端錯誤"));
+    }
+    assert!(
+        c.state().pools.usable("cloudflare", ip("104.16.161.36")),
+        "兩個網站都這樣也不暫停節點"
+    );
+    // 連原站都是本機的錯誤（Windows 的原始文字）
+    net.on_https(|_, _| {
+        fail("An operation on a socket could not be performed because the system lacked sufficient buffer space (os error 10055)")
+    });
+    assert_eq!(
+        c.verify("l1.example.com", "cloudflare", 4, Some(ip("104.21.0.5"))).await,
+        Some("unknown")
+    );
+    assert!(kuroshio_net::probe::is_local_error("EMFILE") && !kuroshio_net::probe::is_local_error("ECONNRESET"));
+}
+
 /// 3.5.1 L3：「特定產品專用」算不同的網站，7 天沒有新的「不服務」就消退
 #[test]
 fn zone_restricted_counts_sites_and_decays() {
