@@ -590,70 +590,93 @@ async fn build_nearest(
     (nodes, prefixes, speed_ref)
 }
 
-/// 前一輪的節點這一輪還合格時，延遲在新的前幾名最慢的那個的這個比例以內就不換（3.5.1 M1）
-pub(crate) const KEEP_MS_TOLERANCE: f64 = 1.15;
-/// 每一輪最多換掉前一輪節點的幾分之一（還活著、只是排名掉下去的；本輪不合格的照換）
-pub(crate) const REPLACE_DIVISOR: usize = 3;
+/// 前一輪的節點留下的延遲門檻（3.5.1 M1）：比新的最好那批最慢的多 max(這個比例, [`KEEP_MS_ABS`]) 以內就不換。
+///
+/// 為什麼是 max(20%, 1 ms)：D3（MT7621、HiNet）連跑兩次節點池，同一輪重新量的 12 個台灣節點彼此差 0.5 ms
+/// （2.76～3.25 ms），每一輪整批的中位數也會飄 0.3～0.5 ms（2.63 → 2.95 → 3.13 ms），階段 A 與重新量之間差得更多；
+/// 以前的 115% 在 3 ms 只有 0.45 ms，比量測的抖動還小，換不換等於看運氣。1 ms 約是觀察到的抖動的兩倍；
+/// 遠的節點（20 ms 以上）排隊造成的抖動跟延遲成比例，用 20%
+pub(crate) const KEEP_MS_RATIO: f64 = 0.2;
+/// 延遲門檻的下限（毫秒），見 [`KEEP_MS_RATIO`]
+pub(crate) const KEEP_MS_ABS: f64 = 1.0;
+/// 丟包的寬限：重新量 5 次裡掉 1 次（0.2）還算連得上（Windows 剛量完大量候選時本機連接埠還沒釋放，偶爾就會掉一次）
+pub(crate) const KEEP_LOSS_SLACK: f64 = 0.2;
+/// 速度的寬限：量到的速度不低於新的最好那批最慢的這個比例（速度的誤差範圍最多 18%，見 `speed::TOL_MAX`）
+pub(crate) const KEEP_SPEED_RATIO: f64 = 0.8;
+/// 階段 A（4 次、高並行）前一輪的節點最多可以掉幾成（新的候選要 0%）；之後一定會用低並行重新量，由那次決定
+pub(crate) const PREV_STAGE_A_LOSS: f64 = 0.25;
 
-/// 決定這一輪的節點池（3.5.1 M1）：`ranked` 是這一輪排好的候選（丟包 → 速度 → 延遲，決選的在前），
-/// 回傳選中的索引（照 `ranked` 的順序）。
+/// 選節點池用的一個候選（3.5.1 M1）：排好的順序由呼叫端決定（丟包 → 速度 → 延遲，決選的在前）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PickCand {
+    pub ip: IpAddr,
+    pub loss: f64,
+    pub ms: f64,
+    /// 量到的速度（MB/s）；None = 這一輪沒測（沒有證據，不拿速度判斷）
+    pub mbps: Option<f64>,
+    pub slow: bool,
+}
+
+/// 延遲的門檻：`worst + max(worst × 20%, 1 ms)`
+pub(crate) fn keep_ms_limit(worst: f64) -> f64 {
+    worst + (worst * KEEP_MS_RATIO).max(KEEP_MS_ABS)
+}
+
+/// 決定這一輪的節點池（3.5.1 M1）：`ranked` 是這一輪排好的候選，回傳選中的索引（照 `ranked` 的順序）。
 ///
 /// 以前每天直接取前 `pool_size` 名，Cloudflare、CloudFront 各 12 個、Azure 4 個節點每天整批換掉；
-/// 網站的驗證結果只認節點池裡的 IP（`Pools::usable`），一換池子就全部失效（一台機器 996 筆 v4 通過只剩 1 筆的 IP 還在池裡），
-/// 查詢路徑退回原本的答案、TTL 10 秒，再排重新驗證。現在：
+/// 網站的驗證結果只認節點池裡的 IP（`Pools::usable`），一換池子就全部失效，查詢路徑退回原本的答案、TTL 10 秒，再排重新驗證。
+/// 現在：
 ///
-/// 1. 前一輪的節點這一輪也合格（通過延遲、POP 檢查，不算慢）、丟包不比新的前幾名差，
-///    延遲在新的前幾名最慢的那個的 [`KEEP_MS_TOLERANCE`] 以內 → 留著。
-/// 2. 前一輪的節點還合格、但排名掉出容忍範圍的：每輪最多換掉前一輪節點數的 1/[`REPLACE_DIVISOR`]（排名最後的先換），
-///    其他這一輪先留著，幾輪之內換完（會自己收斂，不會一直卡著）。
-/// 3. 本輪不合格的（連不上、不在台灣、不在候選裡）照換。
-/// 4. 剩下的位置由這一輪排名最前的新節點補上。
-pub(crate) fn sticky_pick(ranked: &[(IpAddr, f64, f64, bool)], prev: &[IpAddr], pool_size: usize) -> Vec<usize> {
+/// 1. 「新的最好那批」＝排名前 `pool_size` 個不算慢、連得上的。
+/// 2. 前一輪的節點這一輪還連得上（丟包不比那批最差的多 [`KEEP_LOSS_SLACK`]）、不算慢、量到速度時不低於那批最慢的
+///    [`KEEP_SPEED_RATIO`]、延遲不超過 [`keep_ms_limit`]（那批最慢的 + max(20%, 1 ms)）→ 留著。
+/// 3. 剩下的位置照排名補（新的最前面的先補）；比門檻差的前一輪節點、這一輪不見的（連不上、不在台灣）就這樣換掉。
+///
+/// 門檻是跟同一輪、同一種量法的新節點比，舊節點變差會在下一輪換掉，不會一直卡著；
+/// 新節點要好過門檻才換得進來，量測的抖動不會讓池子來回換
+pub(crate) fn sticky_pick(ranked: &[PickCand], prev: &[IpAddr], pool_size: usize) -> Vec<usize> {
     let pool_size = pool_size.max(1);
-    let top = &ranked[..ranked.len().min(pool_size)];
-    if top.is_empty() {
-        return Vec::new();
-    }
-    // 新的前幾名裡最差的丟包與延遲
-    let worst_loss = top.iter().map(|x| x.1).fold(0.0, f64::max);
-    let worst_ms = top.iter().map(|x| x.2).fold(0.0, f64::max);
-    let mut keep = vec![false; ranked.len()];
-    // （索引）前一輪的節點、這一輪還合格、但不在容忍範圍內
-    let mut weaker: Vec<usize> = Vec::new();
-    let mut alive_prev = 0usize;
-    for (i, (ip, loss, ms, slow)) in ranked.iter().enumerate() {
-        if !prev.contains(ip) || *slow {
-            continue;
-        }
-        alive_prev += 1;
-        if i < pool_size || (*loss <= worst_loss && *ms <= worst_ms * KEEP_MS_TOLERANCE) {
-            keep[i] = true;
-        } else {
-            weaker.push(i);
-        }
-    }
-    // 排名掉下去的：最多換掉 1/3，排名比較前面的先留
-    let max_replace = prev.len().max(alive_prev).div_ceil(REPLACE_DIVISOR).max(1);
-    let stay = weaker.len().saturating_sub(max_replace);
-    for i in weaker.iter().take(stay) {
-        keep[*i] = true;
-    }
-    let mut out: Vec<usize> = (0..ranked.len()).filter(|i| keep[*i]).take(pool_size).collect();
-    for i in 0..ranked.len() {
-        if out.len() >= pool_size {
-            break;
-        }
-        if !keep[i] && !prev.contains(&ranked[i].0) {
-            out.push(i);
+    let top: Vec<&PickCand> = ranked
+        .iter()
+        .filter(|x| !x.slow && x.loss < 1.0 && x.ms.is_finite())
+        .take(pool_size)
+        .collect();
+    let mut out: Vec<usize> = Vec::with_capacity(pool_size);
+    if !top.is_empty() {
+        let worst_loss = top.iter().map(|x| x.loss).fold(0.0, f64::max);
+        let worst_ms = top.iter().map(|x| x.ms).filter(|m| m.is_finite()).fold(0.0, f64::max);
+        let min_speed = top.iter().filter_map(|x| x.mbps.filter(|s| *s > 0.0)).reduce(f64::min);
+        let ms_limit = keep_ms_limit(worst_ms);
+        for (i, x) in ranked.iter().enumerate() {
+            if out.len() >= pool_size {
+                break;
+            }
+            let speed_ok = match (x.mbps.filter(|s| *s > 0.0), min_speed) {
+                (Some(s), Some(m)) => s >= m * KEEP_SPEED_RATIO,
+                _ => true,
+            };
+            if prev.contains(&x.ip)
+                && !x.slow
+                && x.loss < 1.0
+                && x.loss <= worst_loss + KEEP_LOSS_SLACK + 1e-9
+                && x.ms.is_finite()
+                && x.ms <= ms_limit
+                && speed_ok
+            {
+                out.push(i);
+            }
         }
     }
-    // 新節點不夠時，掉下去的舊節點也可以補回來
-    for i in 0..ranked.len() {
-        if out.len() >= pool_size {
-            break;
-        }
-        if !out.contains(&i) {
-            out.push(i);
+    // 照排名補（不算慢的先）；重新量時一次都連不上的（前一輪的節點這一輪已經壞了）不放
+    for allow_slow in [false, true] {
+        for (i, x) in ranked.iter().enumerate() {
+            if out.len() >= pool_size {
+                break;
+            }
+            if (allow_slow || !x.slow) && !out.contains(&i) && x.loss < 1.0 && x.ms.is_finite() {
+                out.push(i);
+            }
         }
     }
     out.sort_unstable();
@@ -797,6 +820,9 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             harvest4.len()
         );
 
+        // 前一輪的節點（3.5.1 M1）：每一關都給它留位子，最後跟同一輪重新量過的新節點比（`sticky_pick`）
+        let prev_set: Arc<std::collections::HashSet<IpAddr>> = Arc::new(prev.v4.iter().map(|x| x.ip).collect());
+
         // ---------- 階段 A：延遲 / 丟包 ----------
         ctx.checkpoint().await;
         let c = cdn.clone();
@@ -805,10 +831,14 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             async move { (ip, measure(&c, ip, 4).await) }
         })
         .await;
+        // 3.5.1 M1：前一輪的節點 4 次裡掉 1 次也先留著（高並行下偶爾會掉；決選時用低並行重新量，由那次決定）
         let mut good: Vec<(IpAddr, f64)> = lat
             .into_iter()
             .flatten()
-            .filter(|(_, (l, m))| *l == 0.0 && *m <= max_lat)
+            .filter(|(ip, (l, m))| {
+                let max_loss = if prev_set.contains(ip) { PREV_STAGE_A_LOSS } else { 0.0 };
+                *l <= max_loss && *m <= max_lat
+            })
             .map(|(ip, (_, m))| (ip, m))
             .collect();
         good.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -817,23 +847,43 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         // ---------- 階段 B：確認是台灣 POP ----------
         ctx.checkpoint().await;
         let (host, path) = prov.probe.unwrap_or(("", "/"));
-        good.truncate(120);
+        // 只確認延遲最低的 120 個；3.5.1 M1：前一輪的節點排在 120 名以外也確認（台灣節點的延遲幾乎一樣，
+        // 階段 A 高並行量到的名次大半是抖動：以前 Cloudflare 幾百個 3 ms 左右的候選裡，前一輪的節點常常就在這裡被切掉）
+        let mut n_top = 0usize;
+        good.retain(|(ip, _)| {
+            n_top += 1;
+            n_top <= 120 || prev_set.contains(ip)
+        });
         let c = cdn.clone();
+        let ps = prev_set.clone();
         let checked = map_limit(good, jc.probe_concurrency, move |(ip, ms): (IpAddr, f64)| {
             let c = c.clone();
+            let is_prev = ps.contains(&ip);
             async move {
-                let r = c.net().http_probe(ip, host, path, Duration::from_millis(3000)).await;
+                let mut r = c.net().http_probe(ip, host, path, Duration::from_millis(3000)).await;
+                // 前一輪的節點探測失敗時再試一次（一次逾時就整批換掉不值得；最多多 12 次探測）
+                if !r.ok && is_prev {
+                    r = c.net().http_probe(ip, host, path, Duration::from_millis(3000)).await;
+                }
                 (ip, ms, if r.ok { prov.pop(&r.headers, &r.body) } else { String::new() })
             }
         })
         .await;
+        let checked: Vec<(IpAddr, f64, String)> = checked.into_iter().flatten().filter(|x| is_tw_pop(&x.2)).collect();
+        // 每個 /24 只留最快的一個，提高多樣性。3.5.1 M1：前一輪的節點優先（候選每次在網段裡隨機抽位址，
+        // 同一個 /24 的新位址常常在階段 A 剛好快一點，就把前一輪的節點擠掉；同一個 /24 是同一批機器，換了沒有好處）
+        let prev24: std::collections::HashSet<Option<u32>> = checked.iter().filter(|x| prev_set.contains(&x.0)).map(|x| p24(x.0)).collect();
         let mut seen24 = std::collections::HashSet::new();
-        // 每個 /24 只留最快的一個，提高多樣性
         let mut good: Vec<Scored> = checked
             .into_iter()
-            .flatten()
-            .filter(|x| is_tw_pop(&x.2))
-            .filter(|x| seen24.insert(p24(x.0)))
+            .filter(|x| {
+                if prev_set.contains(&x.0) {
+                    seen24.insert(p24(x.0));
+                    true
+                } else {
+                    !prev24.contains(&p24(x.0)) && seen24.insert(p24(x.0))
+                }
+            })
             .map(|(ip, ms, pop)| Scored {
                 ip,
                 pop,
@@ -856,6 +906,10 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
             }
         }
         info!("階段 B POP：{} 個確認在台灣（{}）", good.len(), pops_seen.join(", "));
+        // 3.5.1 M1：前一輪的節點排最前面（其餘照階段 A 的延遲）：測速的名額先給它們（要確認它們這一輪不慢）、
+        // 一定進決選（用低並行重新量延遲與丟包，跟新的節點用同一種量法比）。測速的總數不變（`speedTop`）
+        good.sort_by_key(|x| !prev_set.contains(&x.ip));
+        let prev_alive = good.iter().filter(|x| prev_set.contains(&x.ip)).count();
 
         // ---------- 階段 C：下載測速 ----------
         // 3.5.0 F15：被對方限流的狀態碼（這一輪對這一家停止測速）；F16：快測的參考速度（前 1 MiB）
@@ -967,10 +1021,11 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         })
         .await;
         for (ip, q) in rq.into_iter().flatten() {
-            if q.ms.is_finite() {
+            // 前一輪的節點重新量時一次都連不上：這一輪就是壞了（3.5.1 M1，階段 A 放寬過，這裡要記實際的結果）
+            if q.ms.is_finite() || prev_set.contains(&ip) {
                 if let Some(x) = good.iter_mut().find(|x| x.ip == ip) {
                     x.ms = q.ms;
-                    x.loss = q.loss;
+                    x.loss = if q.ms.is_finite() { q.loss } else { 1.0 };
                 }
             }
         }
@@ -1010,11 +1065,25 @@ pub async fn run(ctx: &JobCtx) -> Result<Report> {
         let good: Vec<Scored> = fin.into_iter().chain(rest).map(|i| good[i].clone()).collect();
         // 3.5.1 M1：前一輪還合格的節點優先留下（不必每天整批換掉，網站的驗證結果才不會一起失效）
         let prev_ips: Vec<IpAddr> = prev.v4.iter().map(|x| x.ip).collect();
-        let cand: Vec<(IpAddr, f64, f64, bool)> = good.iter().map(|x| (x.ip, x.loss, x.ms, x.slow == Some(true))).collect();
+        let cand: Vec<PickCand> = good
+            .iter()
+            .map(|x| PickCand {
+                ip: x.ip,
+                loss: x.loss,
+                ms: x.ms,
+                mbps: x.speed,
+                slow: x.slow == Some(true),
+            })
+            .collect();
         let picked = sticky_pick(&cand, &prev_ips, pool_size);
         let stayed = picked.iter().filter(|i| prev_ips.contains(&good[**i].ip)).count();
         if !prev_ips.is_empty() && !picked.is_empty() {
-            info!("  前一輪的 {} 個節點留下 {stayed} 個", prev_ips.len());
+            info!(
+                "  前一輪的 {} 個節點留下 {stayed} 個（{} 個這一輪連不上或不在台灣；{} 個比新的明顯差：慢、丟包，或延遲超過新的最好那批最慢的 + max(20%, 1 ms)）",
+                prev_ips.len(),
+                prev_ips.len().saturating_sub(prev_alive),
+                prev_alive.saturating_sub(stayed)
+            );
         }
         let mut pool4: Vec<PoolNode> = picked
             .iter()

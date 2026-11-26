@@ -508,14 +508,20 @@ pub async fn https_probe(addr: SocketAddr, hostname: &str, path: &str, opts: &Ht
 pub const SPEED_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 下載測速：連到 `ip`（`port` 沒給就用網址的埠），Host / SNI 用網址的主機，回傳 MB/s（兩位小數）。
-/// 跟 2.x 一樣：收到標頭後開始計時，`max_ms + 3` 秒或收到 `max_bytes` 就停；狀態碼 ≥ 300 回 0。
+/// 收到標頭後開始計時；收到 `max_bytes`、或收內容滿 `max_ms` 而且至少收到 [`HEAD_BYTES`]（3.5.1：前 1 MiB 的時間
+/// 要量得到），或從連線開始超過 `max_ms + 3` 秒（2.x 的上限）就停；狀態碼 ≥ 300 回 0。
 /// 沒收滿 `max_bytes` 又不到 0.2 秒（檔案太小、連線被關）回 0；收滿了就照實際時間算（網路很快時不到 0.2 秒）
 pub async fn download_speed(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u64, max_bytes: u64) -> f64 {
     download_sample(ip, port, url, max_ms, max_bytes).await.mbps
 }
 
 /// 同 [`download_speed`]，回整個量測樣本（3.5.0）：速度之外還有位元組數、傳輸時間、連線與 TTFB。
-/// 同一條連線、同樣的上限，流量跟 `download_speed` 完全一樣
+/// 同一條連線、同樣的上限，流量跟 `download_speed` 完全一樣。
+///
+/// 每收一次就讓出一次執行緒（3.5.1，`tokio::task::yield_now`）：沒有 AES 的小機器（MT7621）上 HTTPS 解密（ChaCha20）
+/// 每次約 16 KB、幾毫秒，資料一直到、讀取一直成功，tokio 只在用完一輪的額度（128 次）才強制讓出，
+/// 同一條工作執行緒上的 DNS 查詢要等 0.5～0.8 秒。讓出只是排到後面，收的資料、計時都不變（計時包含讓出等待的時間，
+/// 機器忙的時候量到的速度略低，同一輪的節點條件一樣，比較不受影響）
 pub async fn download_sample(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u64, max_bytes: u64) -> SpeedSample {
     let Ok(u) = crate::fetch::parse_url(url) else {
         return SpeedSample::default();
@@ -576,6 +582,7 @@ pub async fn download_sample(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u
         let mut bytes = (buf.len() - end) as u64;
         // 前 1 MiB 的時間（同一條連線順便記；標頭那一包已經超過 1 MiB 的話量不到）
         let mut head: Option<f64> = None;
+        let body_max = Duration::from_millis(max_ms);
         while bytes < max_bytes {
             match tokio::time::timeout(left(), s.read(&mut tmp)).await {
                 Ok(Ok(n)) if n > 0 => {
@@ -586,6 +593,11 @@ pub async fn download_sample(ip: IpAddr, port: Option<u16>, url: &str, max_ms: u
                 }
                 _ => break,
             }
+            // 收內容滿 `max_ms`：夠算速度了（前 1 MiB 也要收到，快測的參考才量得到）
+            if head.is_some() && start.elapsed() >= body_max {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
         let secs = start.elapsed().as_secs_f64();
         let mbps = if secs > 0.2 || (bytes >= max_bytes && secs > 0.0) {
@@ -751,6 +763,53 @@ mod tests {
         let url = format!("http://speed.example.com:{}/file", addr.port());
         let s = download_sample(addr.ip(), Some(addr.port()), &url, 2000, 2 << 20).await;
         assert_eq!(s.head_secs, 0.0);
+    }
+
+    /// 3.5.1：慢的線路（或小機器上 HTTPS 解密跟不上）收內容滿 `max_ms` 就停，不再收到 `max_bytes` 或 `max_ms + 3` 秒；
+    /// 前 1 MiB 還沒收到時多等它（快測的參考要量得到）
+    #[tokio::test]
+    async fn speed_sample_stops_after_body_time() {
+        // 先送 1 MiB + 64 KiB，之後每 50 ms 送 64 KiB（約 1.25 MB/s），總共 64 MiB
+        async fn serve(first: usize) -> SocketAddr {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let total = 64usize << 20;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+                s.write_all(head.as_bytes()).await.unwrap();
+                if s.write_all(&vec![0u8; first]).await.is_err() {
+                    return;
+                }
+                let chunk = vec![0u8; 65536];
+                for _ in 0..1000 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if s.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            addr
+        }
+        let addr = serve((1 << 20) + 65536).await;
+        let url = format!("http://speed.example.com:{}/file", addr.port());
+        let t0 = Instant::now();
+        let s = download_sample(addr.ip(), Some(addr.port()), &url, 400, SPEED_MAX_BYTES).await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(2000),
+            "收內容滿 0.4 秒就停：{:?}",
+            t0.elapsed()
+        );
+        assert!(s.mbps > 0.0 && s.head_secs > 0.0, "{s:?}");
+        assert!(s.bytes < SPEED_MAX_BYTES / 2, "{s:?}");
+        // 前 1 MiB 還沒到：等到收到第 1 MiB 才停（量得到 `head_secs`）
+        let addr = serve(512 << 10).await;
+        let url = format!("http://speed.example.com:{}/file", addr.port());
+        let s = download_sample(addr.ip(), Some(addr.port()), &url, 100, SPEED_MAX_BYTES).await;
+        assert!(s.head_secs > 0.0 && s.bytes >= HEAD_BYTES, "{s:?}");
+        assert!(s.secs < 1.5, "{s:?}");
     }
 
     /// 3.4.2：探測用的連線接收緩衝區小（只讀前段就關，對方先送進來的資料也算流量）

@@ -80,6 +80,10 @@ DoH / DoT / DoQ / DoH3、社群共享、大型清單都可以開：記憶體夠�
   - 憑證預設 ECDSA P-256（acme `ec-256`），握手比 RSA 快。
   - TLS session resumption 與長時間保持連線，減少完整握手的次數。
 - **背景工作不搶 DNS**：一次只跑一個工作，切成小段、每段之間讓出 CPU；清單解析也一樣。目標：任何背景工作期間，DNS 回應延遲增加 < 50 ms。
+  - 節點池的下載測速（3.5.1）：每收一次就讓出一次（`tokio::task::yield_now`）。MT7621 沒有 AES，HTTPS 解密（ChaCha20）只跟得上約 2 MB/s，
+    資料一直到、讀取一直成功，tokio 只在用完一輪的額度（128 次讀取，約 0.5～1 秒）才強制讓出；D3 實測 CloudFront 12 個節點逐一測速的
+    50 秒裡，快取查詢 95% 480～590 ms、99% 680～830 ms（平常 3～5 ms）。每個節點收內容最多 `pool.speedSeconds`（預設從 5 秒改成 2 秒，
+    至少收到 1 MiB）：D3 上每個節點從約 8 MiB／4 秒減成約 4 MiB／2 秒；快的線路 8 MiB 本來就在 2 秒內收完，不變。
   手動觸發的工作排在佇列最前面（3.5.0，`Scheduler::request_priority`）；網段掃描在一家 CDN 掃完時讓給它（最多 3 次，續跑跳過 6 小時內掃完的），仍然不並行。
 - **重的工作排在半夜**：網段掃描（`cdn-scan`）每週一次；記憶體接近保留量時延後（不再依等級停用）。
 
@@ -453,7 +457,7 @@ D9 實測（D3 單獨運作、每秒 20 個不重複的新網域）：中位 409
 | `cdn.maxEntries` | 200,000 | 1 萬 / 2.5 萬 / 15 萬 | 09：冷資料移到磁碟 |
 | `cdn.zoneMax` / `v6NodesMax` | 8,000 / 2,000 | 2,000 / 4,000、300 / 800 | 安全上限（資料量由 CDN 官方範圍決定，幾百 KB） |
 | `cdn.qualityIntervalMin` / `healthIntervalMin` | 5 / 30 | 15 / 10、60 | 背景工作接近保留量時延後 |
-| `scan.samplesPerSubnet`、`pool.candidatesPerProvider` / `speedTop` / `speedSeconds` / `nearestProbeTop` | 6、1,500 / 16 / 5 / 1,500 | 依等級調低 | 工作規模；接近保留量時整個工作延後 |
+| `scan.samplesPerSubnet`、`pool.candidatesPerProvider` / `speedTop` / `speedSeconds` / `nearestProbeTop` | 6、1,500 / 16 / 2（3.5.1；以前 5） / 1,500 | 依等級調低 | 工作規模；接近保留量時整個工作延後 |
 | `jobs.cdn-scan.enabled` | true | tiny 停用 | 接近保留量時延後 |
 | `filter.maxDomains` / `maxComplex` | 1,000 萬 / 2 萬 | 40 萬… / 2,000… | 09：載入前依空間估計 |
 | `system.queryLogRing` | 20,000 | 實體記憶體 160 MB 以下最多 1,000、512 MB 以下最多 5,000（3.5.0） | 查詢紀錄的筆數上限；每筆固定約 160 bytes，只在開啟時配置（預設關閉） |

@@ -550,7 +550,7 @@
     "candidatesPerProvider": 1500,
     "poolSize": 12,
     "speedTop": 16,
-    "speedSeconds": 5,
+    "speedSeconds": 2,
     "relativeSpeed": true,
     "latencyConcurrency": "auto",
     "probeConcurrency": "auto",

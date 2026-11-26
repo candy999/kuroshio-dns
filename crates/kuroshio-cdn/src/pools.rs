@@ -295,13 +295,40 @@ pub const CONN_FAIL_WINDOW_MS: u64 = util::HOUR_MS;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnFail {
     pub at: u64,
-    /// 網站名稱的雜湊（最多 [`CONN_FAIL_SITES`] 個）
-    pub sites: Vec<u32>,
+    /// 連不上的網站名稱（最多 [`CONN_FAIL_SITES`] 個；只在記憶體裡，暫停時寫進日誌，讓人確認是不同的網站）
+    pub sites: Vec<Box<str>>,
+}
+
+/// 日誌裡列出幾個網站名稱（「多個網站無法使用」與「幾個網站都連不上」）
+pub const LOG_SITES: usize = 3;
+/// 記著「不服務」網站名稱（給日誌用）的節點最多幾個：只在記憶體裡，滿了丟掉最早的
+pub const ZONE_NAMES_CAP: usize = 256;
+
+/// 日誌用的網站清單：「a.example.com、b.example.com、c.example.com 等」；記得的名稱比總數少時說明其他的沒有名稱
+pub(crate) fn sites_text(names: &[Box<str>], total: usize) -> String {
+    let shown: Vec<&str> = names.iter().take(LOG_SITES).map(|s| &**s).collect();
+    let mut t = shown.join("、");
+    let more = total.saturating_sub(shown.len());
+    if more > 0 {
+        if names.len() > shown.len() || shown.len() == LOG_SITES {
+            t.push_str(" 等");
+        } else if shown.is_empty() {
+            t = format!("{more} 個是之前記的，沒有名稱");
+        } else {
+            t.push_str(&format!("；另 {more} 個是之前記的，沒有名稱"));
+        }
+    }
+    t
 }
 
 /// 網站名稱的雜湊（FNV-1a，只用來分辨「是不是同一個網站」）
 fn site_hash(name: &str) -> u32 {
     name.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193))
+}
+
+/// 相容性紀錄判定為「特定產品專用」：2 個以上的網站不服務，而且比服務的次數的兩倍多
+fn restricted(z: &Zone) -> bool {
+    z.miss >= 2 && z.miss > z.hit.saturating_mul(2)
 }
 
 /// IP 的分類
@@ -625,6 +652,9 @@ pub struct Pools {
     saved_at: Option<String>,
     extra: Extra,
     pub zone: IndexMap<String, Zone>,
+    /// 相容性紀錄「不服務」的網站名稱（鍵同 `zone`，每個最多 [`LOG_SITES`] 個、最多 [`ZONE_NAMES_CAP`] 個節點）：
+    /// 只給「多個網站無法使用」的日誌用，不存檔（`zone` 存的是雜湊），重新啟動後從頭記
+    zone_names: IndexMap<String, Vec<Box<str>>>,
     pub dirty: bool,
     pub zone_dirty: bool,
     /// 節點不足、需要重建節點池的 CDN（由外層取出後通知排程）
@@ -643,6 +673,7 @@ impl Pools {
             saved_at: None,
             extra: Extra::default(),
             zone: IndexMap::new(),
+            zone_names: IndexMap::new(),
             dirty: false,
             zone_dirty: false,
             low_pool: Vec::new(),
@@ -889,12 +920,15 @@ impl Pools {
         if !self.zone.contains_key(&k) && self.zone.len() >= self.cfg.zone_max.max(16) {
             // 上限：丟掉最久沒更新的
             if let Some(i) = (0..self.zone.len()).min_by_key(|&i| self.zone[i].at.unwrap_or(0)) {
-                self.zone.shift_remove_index(i);
+                if let Some((old, _)) = self.zone.shift_remove_index(i) {
+                    self.zone_names.shift_remove(&old);
+                }
             }
         }
         let now = now_ms();
-        let z = self.zone.entry(k).or_default();
-        let mut warn_now = false;
+        let z = self.zone.entry(k.clone()).or_default();
+        let was = restricted(z);
+        let mut named = false;
         if ok {
             z.hit = z.hit.saturating_add(1);
         } else {
@@ -906,7 +940,7 @@ impl Pools {
             };
             if new_site {
                 z.miss = z.miss.saturating_add(1);
-                warn_now = z.miss == 2;
+                named = h.is_some();
                 if let Some(h) = h {
                     if z.sites.len() >= ZONE_SITES_MAX {
                         z.sites.remove(0);
@@ -916,9 +950,25 @@ impl Pools {
             }
         }
         z.at = Some(now);
+        let (now_restricted, miss, hit) = (restricted(z), z.miss, z.hit);
         self.zone_dirty = true;
-        if warn_now && self.is_restricted(provider, ip) {
-            warn!("{provider} 節點 {ip} 多個網站無法使用（可能是特定產品專用 IP），之後排到最後");
+        if named {
+            // 網站名稱只記前幾個（日誌用）；節點數有上限，滿了丟掉最早的
+            if !self.zone_names.contains_key(&k) && self.zone_names.len() >= ZONE_NAMES_CAP {
+                self.zone_names.shift_remove_index(0);
+            }
+            let names = self.zone_names.entry(k.clone()).or_default();
+            if names.len() < LOG_SITES {
+                names.push(site.into());
+            }
+        }
+        // 剛變成「特定產品專用」時寫一次（3.5.1：附上網站數與前幾個網站，才能確認是不同的網站）
+        if !was && now_restricted {
+            let names = self.zone_names.get(&k).map(Vec::as_slice).unwrap_or(&[]);
+            warn!(
+                "{provider} 節點 {ip} 有 {miss} 個網站無法使用（{}），可以用的 {hit} 次；可能是特定產品專用 IP，之後排到最後",
+                sites_text(names, miss as usize)
+            );
         }
     }
 
@@ -965,19 +1015,23 @@ impl Pools {
         if n > 0 {
             self.zone_dirty = true;
         }
+        let zone = &self.zone;
+        self.zone_names.retain(|k, _| zone.get(k).is_some_and(|z| z.miss > 0));
         n
     }
 
+    /// 記著的「不服務」網站名稱（日誌用，最多 [`LOG_SITES`] 個；測試與除錯用）
+    pub fn zone_site_names(&self, provider: &str, ip: IpAddr) -> Vec<Box<str>> {
+        self.zone_names.get(&format!("{provider}|{ip}")).cloned().unwrap_or_default()
+    }
+
     pub fn is_restricted(&self, provider: &str, ip: IpAddr) -> bool {
-        match self.zone_of(provider, ip) {
-            Some(z) => z.miss >= 2 && z.miss > z.hit * 2,
-            None => false,
-        }
+        self.zone_of(provider, ip).is_some_and(restricted)
     }
 
     pub fn zone_hit(&self, provider: &str, ip: IpAddr) -> bool {
         match self.zone_of(provider, ip) {
-            Some(z) => z.hit > 0 && !(z.miss >= 2 && z.miss > z.hit * 2),
+            Some(z) => z.hit > 0 && !restricted(z),
             None => false,
         }
     }
@@ -1399,21 +1453,25 @@ impl Pools {
                 d.conn_fails.remove(&old);
             }
         }
-        let h = site_hash(site);
         let c = d.conn_fails.entry(key).or_insert_with(|| ConnFail {
             at: now,
             sites: Vec::new(),
         });
-        if !c.sites.contains(&h) {
-            c.sites.push(h);
+        if !c.sites.iter().any(|s| &**s == site) {
+            c.sites.push(site.into());
         }
         if c.sites.len() < CONN_FAIL_SITES {
             return false;
         }
         let n = c.sites.len();
-        d.conn_fails.remove(&key);
-        // `mark_bad()` 照舊處理保留最後一段的 CDN：網段裡有節點池的節點就暫停那個節點，沒有就暫停整個 /24
-        self.mark_bad(provider, ip, &format!("{reason}（1 小時內 {n} 個網站都連不上）"));
+        let Some(c) = d.conn_fails.remove(&key) else { return false };
+        // `mark_bad()` 照舊處理保留最後一段的 CDN：網段裡有節點池的節點就暫停那個節點，沒有就暫停整個 /24。
+        // 3.5.1：附上是哪幾個網站（日誌與 `/api/cdn/pools` 的 `bad`），才能確認真的是不同的網站
+        self.mark_bad(
+            provider,
+            ip,
+            &format!("{reason}（1 小時內 {n} 個網站都連不上：{}）", sites_text(&c.sites, n)),
+        );
         true
     }
 

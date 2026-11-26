@@ -306,6 +306,9 @@ pub struct JobsConfig {
     pub candidates_per_provider: usize,
     pub pool_size: usize,
     pub speed_top: usize,
+    /// 每個節點收內容最多幾秒（`pool.speedSeconds`）；也要收到 8 MiB 或前 1 MiB 才停（`probe::download_sample`）。
+    /// 3.5.1 預設 5 → 2：MT7621 上 HTTPS 解密只跟得上約 2 MB/s，5 秒的上限等於每個節點都收滿 8 MiB（約 4 秒）；
+    /// 快的線路 8 MiB 本來就在 2 秒內收完，不受影響
     pub speed_seconds: u64,
     /// 測速的相對評分（3.5.0 B1，`pool.relativeSpeed`，預設開）：慢不慢跟同一家其他節點比、誤差範圍依傳輸時間、
     /// 排序先分級。關掉＝3.4.x（絕對的 1 MB/s、5% 門檻、直接比速度）
@@ -330,7 +333,7 @@ impl JobsConfig {
             candidates_per_provider: or(cfg, "pool.candidatesPerProvider", 1500.0) as usize,
             pool_size: or(cfg, "pool.poolSize", 12.0) as usize,
             speed_top: or(cfg, "pool.speedTop", 16.0) as usize,
-            speed_seconds: or(cfg, "pool.speedSeconds", 5.0) as u64,
+            speed_seconds: or(cfg, "pool.speedSeconds", 2.0) as u64,
             relative_speed: lite_value(kuroshio_config::get(cfg, "pool.relativeSpeed")) != Some(false),
             nearest_probe_top: or(cfg, "pool.nearestProbeTop", 1500.0) as usize,
             nearest_pops: or(cfg, "pool.nearestPops", 6.0) as usize,
