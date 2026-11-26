@@ -1044,13 +1044,18 @@ pub async fn route(st: &Arc<AppState>, path: &str, q: &HashMap<String, String>) 
             }
         }
         // 儀表板（LuCI、Windows 設定頁）：跟公開頁同一份統計，但排行不受 site.minClients 限制、列得比較多
-        "/api/dashboard" => ok(crate::site::dashboard_stats(
-            st,
-            q.get("range").map(String::as_str).unwrap_or("today"),
-            1,
-            crate::site::ADMIN_TOP,
-            crate::site::View::Admin,
-        )),
+        // 3.5.1：在 blocking 執行緒上算（CDN 網域的統計分批拿狀態鎖、批與批之間會停一下）
+        "/api/dashboard" => {
+            let (s2, range) = (st.clone(), q.get("range").cloned().unwrap_or_else(|| "today".into()));
+            match tokio::task::spawn_blocking(move || {
+                crate::site::dashboard_stats(&s2, &range, 1, crate::site::ADMIN_TOP, crate::site::View::Admin)
+            })
+            .await
+            {
+                Ok(v) => ok(v),
+                Err(e) => bad(&format!("統計中途結束：{e}"), 500),
+            }
+        }
         // 「為什麼沒換到台灣」（3.5.0）：只讀；CDN 沒開時也回答（說明沒開）
         "/api/cdn/explain" => {
             let Some(n) = q.get("name").map(|n| normalize(n)).filter(|n| !n.is_empty()) else {

@@ -1119,6 +1119,57 @@ pub fn prune_group(d: &Domain) -> u8 {
     }
 }
 
+/// 跨 CDN 結果的統計（[`Db::cross_summary`]）：一筆一筆加，分批走過全部網域時也能用（`Cdn::scan_domains`，3.5.1）
+#[derive(Debug, Default, Clone)]
+pub struct CrossSummary {
+    explored: u32,
+    ok: u32,
+    fail: u32,
+    none: u32,
+    /// 連線比較近、但握手沒有比較快而沒有採用的（3.5.0 B4、F13）
+    score_rejected: u32,
+    by_to: IndexMap<String, u32>,
+    by_from: IndexMap<String, (u32, u32)>,
+    also: IndexMap<String, u32>,
+}
+
+impl CrossSummary {
+    pub fn add(&mut self, e: &Domain) {
+        let Some(x) = &e.cross4 else { return };
+        let Some(v) = x.verdict.as_deref() else { return };
+        let from = x.from.as_deref().or(e.provider()).unwrap_or("?").to_string();
+        let f = self.by_from.entry(from).or_default();
+        if v == "none" {
+            self.none += 1;
+            return;
+        }
+        self.explored += 1;
+        f.0 += 1;
+        if v == "ok" {
+            self.ok += 1;
+            f.1 += 1;
+            *self.by_to.entry(x.to.as_deref().unwrap_or("?").to_string()).or_default() += 1;
+            for a in x.also.iter().flatten() {
+                *self.also.entry(a.clone()).or_default() += 1;
+            }
+        } else {
+            self.fail += 1;
+            if x.score.get().is_some() && x.orig_score.get().is_some() {
+                self.score_rejected += 1;
+            }
+        }
+    }
+
+    pub fn json(self) -> Value {
+        json!({
+            "explored": self.explored, "ok": self.ok, "fail": self.fail, "none": self.none,
+            "scoreRejected": self.score_rejected, "byTo": self.by_to,
+            "byFrom": self.by_from.into_iter().map(|(k, (e, o))| (k, json!({ "explored": e, "ok": o }))).collect::<serde_json::Map<_, _>>(),
+            "also": self.also,
+        })
+    }
+}
+
 /// 冷資料移出記憶體的結果
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Evicted {
@@ -2647,42 +2698,9 @@ impl Db {
 
     /// 跨 CDN 統計：試了幾個、成功幾個、各轉去哪一家
     pub fn cross_summary(&self) -> Value {
-        let (mut explored, mut ok, mut fail, mut none) = (0u32, 0u32, 0u32, 0u32);
-        // 連線比較近、但握手沒有比較快而沒有採用的（3.5.0 B4、F13）
-        let mut score_rejected = 0u32;
-        let mut by_to: IndexMap<String, u32> = IndexMap::new();
-        let mut by_from: IndexMap<String, (u32, u32)> = IndexMap::new();
-        let mut also: IndexMap<String, u32> = IndexMap::new();
-        for e in self.domains.values() {
-            let Some(x) = &e.cross4 else { continue };
-            let Some(v) = x.verdict.as_deref() else { continue };
-            let from = x.from.as_deref().or(e.provider()).unwrap_or("?").to_string();
-            let f = by_from.entry(from).or_default();
-            if v == "none" {
-                none += 1;
-                continue;
-            }
-            explored += 1;
-            f.0 += 1;
-            if v == "ok" {
-                ok += 1;
-                f.1 += 1;
-                *by_to.entry(x.to.as_deref().unwrap_or("?").to_string()).or_default() += 1;
-                for a in x.also.iter().flatten() {
-                    *also.entry(a.clone()).or_default() += 1;
-                }
-            } else {
-                fail += 1;
-                if x.score.get().is_some() && x.orig_score.get().is_some() {
-                    score_rejected += 1;
-                }
-            }
-        }
-        json!({
-            "explored": explored, "ok": ok, "fail": fail, "none": none, "scoreRejected": score_rejected, "byTo": by_to,
-            "byFrom": by_from.into_iter().map(|(k, (e, o))| (k, json!({ "explored": e, "ok": o }))).collect::<serde_json::Map<_, _>>(),
-            "also": also,
-        })
+        let mut acc = CrossSummary::default();
+        self.domains.values().for_each(|e| acc.add(e));
+        acc.json()
     }
 
     /// 分析摘要：各 CDN 有多少網域、多少原本繞國外、置換成功率

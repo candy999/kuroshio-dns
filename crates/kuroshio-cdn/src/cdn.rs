@@ -1085,16 +1085,31 @@ impl Cdn {
     /// 把所有分片依筆數切成好幾批（每批大約 [`BATCH_ENTRIES`] 筆、至少一片），每批拿一次狀態鎖呼叫
     /// `f(狀態, 這一批的分片)`，批與批之間放開鎖、停一下讓查詢先拿到鎖。`f` 回 false 就不做後面的（3.5.1）。
     /// 會停頓（`sleep`）：只在背景的 blocking 執行緒上用，不在 tokio 的工作執行緒上（那裡用 [`Cdn::in_batches_yield`]）
-    pub(crate) fn in_batches(&self, f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
-        self.batches(true, f)
+    pub(crate) fn in_batches(&self, mut f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
+        self.batches(true, |g, r| f(&mut *g, r))
     }
 
     /// 同 [`Cdn::in_batches`]，但批與批之間只讓出執行緒、不停頓：給 tokio 的工作執行緒上的唯讀加總用（狀態頁）
-    pub(crate) fn in_batches_yield(&self, f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
-        self.batches(false, f)
+    pub(crate) fn in_batches_yield(&self, mut f: impl FnMut(&State, std::ops::Range<usize>) -> bool) {
+        self.batches(false, |g, r| f(g, r))
     }
 
-    fn batches(&self, pause: bool, mut f: impl FnMut(&mut State, std::ops::Range<usize>) -> bool) {
+    /// 唯讀地分批走過全部網域（3.5.1；統計、分享、定時複驗用）：每批約 [`BATCH_ENTRIES`] 筆拿一次狀態鎖，
+    /// 批與批之間放開鎖、停 100 µs。順序跟 `st.db.domains.values()` 一次走完一樣（分片依序、片內依雜湊表的順序），
+    /// 所以結果跟一次拿著鎖做完相同；放開鎖的期間別人改的，走到那一片時看到的是改過的。
+    /// 會停頓：放在 blocking 執行緒上，或只給不常做的事用
+    pub fn scan_domains(&self, mut f: impl FnMut(&State, &db::Domain)) {
+        self.batches(true, |st, r| {
+            for i in r {
+                for d in st.db.domains.shard(i).values() {
+                    f(st, d);
+                }
+            }
+            true
+        })
+    }
+
+    fn batches(&self, pause: bool, mut f: impl FnMut(&mut StateGuard<'_>, std::ops::Range<usize>) -> bool) {
         let mut i = 0;
         loop {
             let (more, done) = {
@@ -2032,7 +2047,13 @@ impl Cdn {
 
     /// 跨 CDN 統計
     pub fn cross_summary(&self) -> Value {
-        self.state().db.cross_summary()
+        // 3.5.1：分批加總（每批拿一次鎖；在 tokio 的工作執行緒上，批與批之間只讓出）
+        let mut acc = db::CrossSummary::default();
+        self.in_batches_yield(|st, r| {
+            r.for_each(|i| st.db.domains.shard(i).values().for_each(|e| acc.add(e)));
+            true
+        });
+        acc.json()
     }
 
     /// 每小時：熱門且即將到期的「驗證通過」網域先重新驗證，避免掉回 10 秒試用；
@@ -2043,67 +2064,9 @@ impl Cdn {
     /// L13：多來源網域另一家的那一格（`src.alt`）用同樣的條件複驗（那一家最後回答在 3 天內）
     pub fn recheck(self: &Arc<Self>) -> usize {
         let now = now_ms();
-        let soon = now + util::HOUR_MS;
-        let recent = now.saturating_sub(3 * util::DAY_MS);
-        let mut tasks = Vec::new();
-        let sampled;
         // 3.5.1 L3：相容性紀錄（ip-zone）的「不服務」7 天沒有新的就消退（每小時一次，跟複驗一起）
         self.with_state(|st| st.pools.decay_zone(now));
-        {
-            let st = self.state();
-            let due = |v: Option<&db::Verdict>| v.is_some_and(|v| v.is("ok") && v.until.unwrap_or(0) < soon);
-            for e in st.db.domains.values() {
-                if e.best != Some(db::Strategy::Alias) && e.hits < 2 {
-                    continue;
-                }
-                if e.last_seen >= recent {
-                    if let Some(p) = e.provider().filter(|p| st.pools.has(p)) {
-                        for fam in [4u8, 6] {
-                            if due(e.verdict(fam)) {
-                                tasks.push(Task::Verify {
-                                    name: e.name.to_string(),
-                                    provider: p.to_string(),
-                                    family: fam,
-                                    orig: e.orig_ip(fam),
-                                });
-                            }
-                        }
-                    }
-                }
-                // L13：另一家的那一格
-                let Some(a) = e.src.as_ref().and_then(|s| s.alt.as_deref()) else {
-                    continue;
-                };
-                if a.last < recent {
-                    continue;
-                }
-                let Some(p) = a.provider.val().filter(|p| st.pools.has(p)) else {
-                    continue;
-                };
-                for (fam, v) in [(4u8, a.v4.as_deref()), (6, a.v6.as_deref())] {
-                    if due(v) {
-                        let orig = if fam == 4 {
-                            a.base
-                                .as_ref()
-                                .and_then(|b| b.ip)
-                                .filter(IpAddr::is_ipv4)
-                                .or_else(|| a.ips4.first().copied())
-                        } else {
-                            a.ips6.first().copied()
-                        };
-                        tasks.push(Task::Verify {
-                            name: e.name.to_string(),
-                            provider: p.to_string(),
-                            family: fam,
-                            orig,
-                        });
-                    }
-                }
-            }
-            let pick = self.reverify_pick(&st, now);
-            sampled = pick.len();
-            tasks.extend(pick);
-        }
+        let (tasks, sampled) = self.recheck_tasks(now);
         let n = tasks.len();
         if n > 0 {
             info!("定時複驗：{n} 個網域（其中輪流抽驗 {sampled} 個）");
@@ -2112,44 +2075,132 @@ impl Cdn {
         n
     }
 
+    /// 定時複驗要排的工作（快到期的在前、輪流抽驗的接在後面）與其中抽驗的個數。
+    /// 3.5.1：分批走過全部網域（每批拿一次鎖），結果跟一次拿著鎖做完一樣
+    pub(crate) fn recheck_tasks(&self, now: u64) -> (Vec<Task>, usize) {
+        let mut tasks = Vec::new();
+        let mut acc = ReverifyAcc::default();
+        self.scan_domains(|st, e| {
+            Self::recheck_one(st, e, now, &mut tasks);
+            self.reverify_one(st, e, now, &mut acc);
+        });
+        let pick = self.reverify_finish(acc);
+        let sampled = pick.len();
+        tasks.extend(pick);
+        (tasks, sampled)
+    }
+
+    /// 定時複驗看一個網域（[`Cdn::recheck`]）：快到期的驗證結果排進 `tasks`
+    pub(crate) fn recheck_one(st: &State, e: &db::Domain, now: u64, tasks: &mut Vec<Task>) {
+        let soon = now + util::HOUR_MS;
+        let recent = now.saturating_sub(3 * util::DAY_MS);
+        let due = |v: Option<&db::Verdict>| v.is_some_and(|v| v.is("ok") && v.until.unwrap_or(0) < soon);
+        if e.best != Some(db::Strategy::Alias) && e.hits < 2 {
+            return;
+        }
+        if e.last_seen >= recent {
+            if let Some(p) = e.provider().filter(|p| st.pools.has(p)) {
+                for fam in [4u8, 6] {
+                    if due(e.verdict(fam)) {
+                        tasks.push(Task::Verify {
+                            name: e.name.to_string(),
+                            provider: p.to_string(),
+                            family: fam,
+                            orig: e.orig_ip(fam),
+                        });
+                    }
+                }
+            }
+        }
+        // L13：另一家的那一格
+        let Some(a) = e.src.as_ref().and_then(|s| s.alt.as_deref()) else {
+            return;
+        };
+        if a.last < recent {
+            return;
+        }
+        let Some(p) = a.provider.val().filter(|p| st.pools.has(p)) else {
+            return;
+        };
+        for (fam, v) in [(4u8, a.v4.as_deref()), (6, a.v6.as_deref())] {
+            if due(v) {
+                let orig = if fam == 4 {
+                    a.base
+                        .as_ref()
+                        .and_then(|b| b.ip)
+                        .filter(IpAddr::is_ipv4)
+                        .or_else(|| a.ips4.first().copied())
+                } else {
+                    a.ips6.first().copied()
+                };
+                tasks.push(Task::Verify {
+                    name: e.name.to_string(),
+                    provider: p.to_string(),
+                    family: fam,
+                    orig,
+                });
+            }
+        }
+    }
+
     /// 輪流抽驗：判定「通過」要 24 小時才到期，期間節點一直健康、但某個網站開始不服務它
     /// （例如 Cloudflare 1034）時，會一路回壞掉的節點到到期為止。
     /// 每小時從「最近一天內有改寫（`best` = 換節點）、判定還有效、上次驗證超過一小時」的網域中，
     /// 抽「改寫中網域數 × `reverifyRatio`」個（限制在 `reverifyMin`～`reverifyMax`）重新驗證：
     /// 熱門程度 × 距上次驗證的時間越大越先（熱門的先驗，冷門的放久了也會輪到）。
-    /// 驗證失敗就跟判定過期一樣，馬上改回原始結果。即將到期的由 `recheck` 處理，這裡不重複
+    /// 驗證失敗就跟判定過期一樣，馬上改回原始結果。即將到期的由 `recheck` 處理，這裡不重複。
+    /// 這裡一次拿著鎖做完（測試比對用）；`recheck` 用同樣的步驟（`reverify_one` → `reverify_finish`）分批做
+    #[cfg(test)]
     pub(crate) fn reverify_pick(&self, st: &State, now: u64) -> Vec<Task> {
+        let mut acc = ReverifyAcc::default();
+        for e in st.db.domains.values() {
+            self.reverify_one(st, e, now, &mut acc);
+        }
+        self.reverify_finish(acc)
+    }
+
+    /// 輪流抽驗看一個網域：還有效的改寫算進 `active`，夠舊的列為候選
+    fn reverify_one(&self, st: &State, e: &db::Domain, now: u64, acc: &mut ReverifyAcc) {
         let c = &self.cfg;
         if c.reverify_ratio <= 0.0 || c.reverify_max == 0 {
-            return vec![];
+            return;
         }
         let active_since = now.saturating_sub(util::DAY_MS);
         let soon = now + util::HOUR_MS;
-        let mut active = 0usize;
-        // （優先度，網域，CDN，家族）
-        let mut cand: Vec<(f64, &db::Domain, &str, u8)> = Vec::new();
-        for e in st.db.domains.values() {
-            if e.last_seen < active_since || e.best != Some(db::Strategy::Alias) || e.policy() != db::Policy::Auto {
-                continue;
-            }
-            let Some(p) = e.provider() else { continue };
-            if !st.pools.has(p) {
-                continue;
-            }
-            for fam in [4u8, 6] {
-                let Some(v) = e.verdict(fam).filter(|v| v.is("ok") && v.valid(now)) else {
-                    continue;
-                };
-                active += 1;
-                let until = v.until.unwrap_or(0);
-                let age = now.saturating_sub(v.at.unwrap_or(0));
-                if until < soon || age < util::HOUR_MS {
-                    continue;
-                }
-                let score = (e.hits as f64 + 1.0) * (age as f64 / util::HOUR_MS as f64);
-                cand.push((score, e, p, fam));
-            }
+        if e.last_seen < active_since || e.best != Some(db::Strategy::Alias) || e.policy() != db::Policy::Auto {
+            return;
         }
+        let Some(p) = e.provider() else { return };
+        if !st.pools.has(p) {
+            return;
+        }
+        for fam in [4u8, 6] {
+            let Some(v) = e.verdict(fam).filter(|v| v.is("ok") && v.valid(now)) else {
+                continue;
+            };
+            acc.active += 1;
+            let until = v.until.unwrap_or(0);
+            let age = now.saturating_sub(v.at.unwrap_or(0));
+            if until < soon || age < util::HOUR_MS {
+                continue;
+            }
+            let score = (e.hits as f64 + 1.0) * (age as f64 / util::HOUR_MS as f64);
+            acc.cand.push((
+                score,
+                Task::Verify {
+                    name: e.name.to_string(),
+                    provider: p.to_string(),
+                    family: fam,
+                    orig: e.orig_ip(fam),
+                },
+            ));
+        }
+    }
+
+    /// 從候選裡抽（不拿鎖）
+    fn reverify_finish(&self, acc: ReverifyAcc) -> Vec<Task> {
+        let c = &self.cfg;
+        let ReverifyAcc { active, mut cand } = acc;
         if cand.is_empty() {
             return vec![];
         }
@@ -2165,15 +2216,15 @@ impl Cdn {
             cand.truncate(want);
         }
         cand.sort_by(|a, b| b.0.total_cmp(&a.0));
-        cand.into_iter()
-            .map(|(_, e, p, fam)| Task::Verify {
-                name: e.name.to_string(),
-                provider: p.to_string(),
-                family: fam,
-                orig: e.orig_ip(fam),
-            })
-            .collect()
+        cand.into_iter().map(|(_, t)| t).collect()
     }
+}
+
+/// 輪流抽驗的累計（[`Cdn::reverify_pick`]）：還有效的改寫數、（優先度，要排的工作）
+#[derive(Default)]
+struct ReverifyAcc {
+    active: usize,
+    cand: Vec<(f64, Task)>,
 }
 
 // ------------------------------------------------------------ 共用結果（串接模式，3.4.0）

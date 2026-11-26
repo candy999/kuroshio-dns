@@ -68,19 +68,43 @@ pub fn share_domains(
     prev: &SharedMemo,
     out: &mut Vec<LocalRecord>,
 ) -> (SharedMemo, Vec<(String, String)>) {
-    use kuroshio_community::share::{cross_key, site_key};
-    let mut memo: SharedMemo = HashMap::new();
-    let (mut sites, mut cross) = (0, 0);
-    for e in db.domains.values() {
-        let Some(p) = e.provider.val() else { continue };
-        if e.hits < MIN_HITS || !kuroshio_cdn::db::has_learning(e) || kuroshio_config::is_own_domain(&e.name, own_bases) {
-            continue;
+    let mut acc = ShareAcc::new(own_bases, now, out);
+    db.domains.values().for_each(|e| acc.add(e));
+    share_finish(acc, db, prev)
+}
+
+/// 挑要分享的網域（[`share_domains`]）：一筆一筆加，分批走過全部網域時也能用（`Cdn::scan_domains`，3.5.1）
+pub struct ShareAcc<'a> {
+    own_bases: &'a [String],
+    now: u64,
+    out: &'a mut Vec<LocalRecord>,
+    memo: SharedMemo,
+    sites: usize,
+    cross: usize,
+}
+
+impl<'a> ShareAcc<'a> {
+    pub fn new(own_bases: &'a [String], now: u64, out: &'a mut Vec<LocalRecord>) -> ShareAcc<'a> {
+        ShareAcc {
+            own_bases,
+            now,
+            out,
+            memo: HashMap::new(),
+            sites: 0,
+            cross: 0,
+        }
+    }
+
+    pub fn add(&mut self, e: &kuroshio_cdn::db::Domain) {
+        let Some(p) = e.provider.val() else { return };
+        if e.hits < MIN_HITS || !kuroshio_cdn::db::has_learning(e) || kuroshio_config::is_own_domain(&e.name, self.own_bases) {
+            return;
         }
         let mut bits = 0u8;
         for (fam, v) in [(4u8, &e.v4), (6u8, &e.v6)] {
             let Some(v) = v else { continue };
             let at = v.at.unwrap_or(0);
-            if sites >= MAX_SITES || v.verdict.as_deref() != Some("ok") || now.saturating_sub(at) > SINCE_MS {
+            if self.sites >= MAX_SITES || v.verdict.as_deref() != Some("ok") || self.now.saturating_sub(at) > SINCE_MS {
                 continue;
             }
             let ips: Vec<IpAddr> = v
@@ -94,9 +118,9 @@ pub fn share_domains(
             if ips.is_empty() {
                 continue;
             }
-            sites += 1;
+            self.sites += 1;
             bits |= if fam == 4 { SHARED_V4 } else { SHARED_V6 };
-            out.push(LocalRecord::Site {
+            self.out.push(LocalRecord::Site {
                 name: e.name.to_string(),
                 p: p.to_string(),
                 fam,
@@ -108,10 +132,10 @@ pub fn share_domains(
         if let Some(c) = &e.cross4 {
             let at = c.at.unwrap_or(0);
             let ips: Vec<IpAddr> = c.ips.clone().unwrap_or_default().into_iter().take(IPS_PER_ITEM).collect();
-            if cross < MAX_CROSS && c.verdict.as_deref() == Some("ok") && now.saturating_sub(at) <= SINCE_MS && !ips.is_empty() {
-                cross += 1;
+            if self.cross < MAX_CROSS && c.verdict.as_deref() == Some("ok") && self.now.saturating_sub(at) <= SINCE_MS && !ips.is_empty() {
+                self.cross += 1;
                 bits |= SHARED_CROSS;
-                out.push(LocalRecord::Cross {
+                self.out.push(LocalRecord::Cross {
                     name: e.name.to_string(),
                     from: c.from.as_deref().unwrap_or(p).to_string(),
                     to: c.to.as_deref().unwrap_or("").to_string(),
@@ -121,14 +145,20 @@ pub fn share_domains(
             }
         }
         if bits != 0 {
-            memo.insert(
+            self.memo.insert(
                 kuroshio_cdn::db::name_hash(&e.name),
                 (kuroshio_community::util::site_hash(&e.name), bits),
             );
         }
     }
+}
+
+/// 挑完之後（拿著狀態鎖，很快）：上一次分享、這次沒有的，只是移出記憶體的照樣保留
+pub fn share_finish(acc: ShareAcc<'_>, db: &kuroshio_cdn::db::Db, prev: &SharedMemo) -> (SharedMemo, Vec<(String, String)>) {
+    use kuroshio_community::share::{cross_key, site_key};
     // 上一次分享、這次沒有的：只是移出記憶體的照樣保留（記號也留著，讀回來或真的不在了再說）
     let mut kept = Vec::new();
+    let mut memo = acc.memo;
     if db.evicted_count() > 0 {
         for (nh, (h, bits)) in prev {
             if memo.contains_key(nh) || !db.is_evicted_hash(*nh) {
@@ -193,11 +223,15 @@ impl DataProvider for CdnData {
                         }
                     }
                 }
-                let mut memo = self.shared.lock().unwrap();
-                let (next, kept) = share_domains(&st.db, &self.own_bases, now, &memo, &mut out);
-                *memo = next;
-                *self.kept.lock().unwrap() = kept;
             });
+            // 3.5.1：分批走過全部網域（每批拿一次狀態鎖），結果跟一次做完一樣；10 分鐘一次
+            let mut acc = ShareAcc::new(&self.own_bases, now, &mut out);
+            cdn.scan_domains(|_, e| acc.add(e));
+            let st = cdn.state();
+            let mut memo = self.shared.lock().unwrap();
+            let (next, kept) = share_finish(acc, &st.db, &memo);
+            *memo = next;
+            *self.kept.lock().unwrap() = kept;
         }
         if let Some(m) = &self.upstreams {
             for u in m.auto_shared() {

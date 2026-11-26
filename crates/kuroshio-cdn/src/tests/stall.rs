@@ -195,6 +195,38 @@ fn stall_bench() {
     let (k, spent, worst) = with_probe(&c2, || flush(&c2, false));
     println!("接著寫 {k} 片：{:.0} ms，最久等鎖 {:.1} ms", ms(spent), ms(worst));
 
+    // 唯讀的全表掃描：定時複驗、統計（一次拿著鎖做完 → 分批）
+    let c4 = big_cdn("stall-bench-scan", n, kuroshio_config::defaults());
+    let now = now_ms();
+    let (_, spent, _) = with_probe(&c4, || {
+        let st = c4.state();
+        let mut t = Vec::new();
+        for e in st.db.domains.values() {
+            Cdn::recheck_one(&st, e, now, &mut t);
+        }
+        t.extend(c4.reverify_pick(&st, now));
+        t.len()
+    });
+    let (_, spent2, worst) = with_probe(&c4, || c4.recheck_tasks(now));
+    println!(
+        "定時複驗：一次做完拿著鎖 {:.1} ms；分批 {:.0} ms，最久等鎖 {:.2} ms",
+        ms(spent),
+        ms(spent2),
+        ms(worst)
+    );
+    let (_, spent, _) = with_probe(&c4, || c4.state().db.cross_summary());
+    let (_, spent2, worst) = with_probe(&c4, || {
+        let mut k = 0usize;
+        c4.scan_domains(|_, d| k += usize::from(d.base.is_some() || d.v4.is_some()));
+        k
+    });
+    println!(
+        "統計（掃一遍）：一次做完拿著鎖 {:.1} ms；分批 {:.0} ms，最久等鎖 {:.2} ms",
+        ms(spent),
+        ms(spent2),
+        ms(worst)
+    );
+
     // 載入（整理、淘汰）
     let t = Instant::now();
     let c3 = Cdn::load(&kuroshio_config::defaults(), c.paths.clone(), MockNet::new());
@@ -327,6 +359,70 @@ fn bulk_work_does_not_hold_the_state_lock() {
     assert!(worst < STALL_LIMIT, "磁碟預算淘汰 {} 筆：最久等鎖 {worst:?}", r.dropped);
     let (_, _, worst) = with_probe(&c2, || flush(&c2, false));
     assert!(worst < STALL_LIMIT, "淘汰後寫分片：最久等鎖 {worst:?}");
+
+    // 唯讀的全表掃描（3.5.1）：每小時的定時複驗、儀表板與公開頁的統計、社群分享、跨 CDN 統計
+    let c = big_cdn("stall-scan", n, kuroshio_config::defaults());
+    let ((tasks, _), _, worst) = with_probe(&c, || c.recheck_tasks(now_ms()));
+    assert!(!tasks.is_empty());
+    assert!(worst < STALL_LIMIT, "定時複驗：最久等鎖 {worst:?}");
+    let (k, _, worst) = with_probe(&c, || {
+        let mut k = 0usize;
+        c.scan_domains(|_, d| k += usize::from(d.v4.is_some()));
+        k
+    });
+    assert_eq!(k, n / 4);
+    assert!(worst < STALL_LIMIT, "統計（scan_domains）：最久等鎖 {worst:?}");
+    let (_, _, worst) = with_probe(&c, || c.cross_summary());
+    assert!(worst < STALL_LIMIT, "跨 CDN 統計：最久等鎖 {worst:?}");
+}
+
+#[test]
+fn batched_scans_match_one_shot() {
+    // 唯讀的分批掃描（定時複驗、統計、社群分享）：走過的順序跟一次走完一樣，結果相同
+    let c = big_cdn("scan-same", 20_000, kuroshio_config::defaults());
+    let now = now_ms();
+    c.with_state(|st| {
+        // 一部分「最近在改寫、判定還有效、上次驗證超過一小時」：輪流抽驗的候選；另外一些跨 CDN 結果
+        let names: Vec<Arc<str>> = st.db.domains.keys().cloned().collect();
+        for (k, name) in names.iter().enumerate() {
+            let d = st.db.domains.get_mut(name).unwrap();
+            if k % 5 == 0 {
+                d.last_seen = now - 3_600_000;
+                d.best = Some(crate::db::Strategy::Alias);
+                d.v4 = Some(Box::new(crate::db::Verdict {
+                    verdict: Some(crate::util::intern("ok")),
+                    until: Some(now + 20 * 3_600_000 - (k as u64 % 7) * 60_000),
+                    at: Some(now - 2 * 3_600_000 - (k as u64 % 11) * 60_000),
+                    ..Default::default()
+                }));
+            }
+            if k % 7 == 0 {
+                d.cross4 = Some(Box::new(crate::db::Cross {
+                    verdict: Some(crate::util::intern(if k % 2 == 0 { "ok" } else { "fail" })),
+                    to: Some(crate::util::intern(["cloudfront", "akamai"][k % 2])),
+                    ..Default::default()
+                }));
+            }
+        }
+    });
+    let order: Vec<String> = c.state().db.domains.keys().map(|k| k.to_string()).collect();
+    let mut seen = Vec::new();
+    c.scan_domains(|_, d| seen.push(d.name.to_string()));
+    assert_eq!(seen, order, "順序跟一次走完一樣");
+
+    let (batched, sampled) = c.recheck_tasks(now);
+    let one = {
+        let st = c.state();
+        let mut t = Vec::new();
+        for e in st.db.domains.values() {
+            Cdn::recheck_one(&st, e, now, &mut t);
+        }
+        t.extend(c.reverify_pick(&st, now));
+        t
+    };
+    assert!(sampled > 0 && batched.len() > sampled, "{} / {sampled}", batched.len());
+    assert_eq!(batched, one, "定時複驗");
+    assert_eq!(c.cross_summary(), c.state().db.cross_summary(), "跨 CDN 統計");
 }
 
 #[test]
