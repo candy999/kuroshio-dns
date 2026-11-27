@@ -253,47 +253,261 @@ impl CopyMeta {
 /// 不在設定裡、或停用中的清單，副本留多久（秒）：期間重新啟用不必重新下載（3.5.1）
 pub const COPY_GRACE_SECS: u64 = 7 * 86400;
 
-/// [`ListCopies::stream`] 送回來的一段
-pub enum CopyChunk {
-    Data(Vec<u8>),
-    /// 讀完了：內容雜湊對不對（false = 副本壞了）
-    End(bool),
+/// 解壓縮 zstd 的清單內容（本機副本、留在記憶體的內容），一段一段（64 KB）交給 `feed`，最後核對內容雜湊。
+/// `stop()` 回 true 時中途停下（回傳 false）。回傳有沒有完整讀到、雜湊對不對
+fn read_zstd(src: impl Read, hash: u64, feed: &mut dyn FnMut(&[u8]), stop: &dyn Fn() -> bool) -> bool {
+    let Ok(mut dec) = zstd::stream::read::Decoder::new(src) else {
+        return false;
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut n = 0u64;
+    loop {
+        if stop() {
+            return false;
+        }
+        match dec.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => {
+                h.write(&buf[..k]);
+                n += k as u64;
+                feed(&buf[..k]);
+            }
+            Err(_) => return false,
+        }
+    }
+    h.write_u64(n);
+    h.finish() == hash
 }
 
-/// zstd 壓縮的清單內容：解壓縮在 blocking 執行緒做，內容一段一段（64 KB）從 channel 送回來，最後核對內容雜湊。
-/// `open` 在 blocking 執行緒裡呼叫（打開檔案、或包一份記憶體裡的內容）
-fn stream_zstd<R, F>(open: F, hash: u64) -> tokio::sync::mpsc::Receiver<CopyChunk>
-where
-    R: Read,
-    F: FnOnce() -> Option<R> + Send + 'static,
-{
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    tokio::task::spawn_blocking(move || {
-        let ok = (|| {
-            let mut dec = zstd::stream::read::Decoder::new(open()?).ok()?;
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            let mut n = 0u64;
-            loop {
-                let mut buf = vec![0u8; 64 * 1024];
-                match dec.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(k) => {
-                        buf.truncate(k);
-                        h.write(&buf);
-                        n += k as u64;
-                        // 收的那一端不要了（重建取消）：停下來
-                        tx.blocking_send(CopyChunk::Data(buf)).ok()?;
+/// 在建置執行緒上打開 zstd 內容（打開檔案、或包一份記憶體裡的內容）
+type Opener = Box<dyn FnOnce() -> Option<Box<dyn Read>> + Send>;
+
+/// 下載時順便做的事（在建置執行緒上）：算內容雜湊、壓縮成本機副本、抽探測樣本
+struct Tap {
+    sink: CopySink,
+    samp: Option<crate::probesample::LineSampler>,
+}
+
+/// （內容雜湊，壓縮後的內容，探測樣本）
+type TapResult = (u64, Option<Vec<u8>>, Option<Vec<String>>);
+
+type Reply<T> = tokio::sync::oneshot::Sender<T>;
+
+/// 交給建置執行緒的工作（依序處理）
+enum Cmd {
+    /// 開始一份清單
+    List(ListSpec, Reply<Result<(), kuroshio_filter::BuildError>>),
+    /// 這份清單接下來下載的內容順便算雜湊、壓縮（`keep`）、抽樣（種子）
+    Tap { keep: bool, sample: Option<u64> },
+    /// 一段下載的內容
+    Feed(Vec<u8>),
+    /// 讀 zstd 內容（本機副本、留在記憶體的內容）；回覆有沒有完整讀到
+    Zstd(Opener, u64, Reply<bool>),
+    /// 這份清單從頭來（[`kuroshio_filter::SourceWriter::reset`]）
+    Reset,
+    /// 目前為止的規則數（[`kuroshio_filter::SourceWriter::rules`]）
+    Rules(Reply<u64>),
+    /// 收下 [`Cmd::Tap`] 的結果
+    Untap(Reply<Option<TapResult>>),
+    /// 這份清單結束
+    End,
+    /// 全部結束：建索引（排序、壓縮），交回過濾器
+    Finish,
+}
+
+/// 下載的內容湊到這麼多才交給建置執行緒一次（下載一次讀 16 KB）
+const FEED_CHUNK: usize = 64 * 1024;
+/// 交給建置執行緒、還沒處理的工作最多幾件（下載的內容最多積這麼多段，再多就讓下載先停）
+const BUILD_QUEUE: usize = 4;
+
+/// 清單層的建置（3.5.1）：解析、解壓縮、算雜湊、壓縮副本、抽樣、最後的排序全部在**一條**降低優先權的 blocking 執行緒上做
+/// （[`crate::app::LowPriority`]），回答查詢的 tokio 工作執行緒只負責下載、把內容轉交過去。
+///
+/// 以前解析在 tokio 的工作執行緒上：讀副本時內容一直都有（解壓縮比解析快），一次 poll 可以連續解析好幾段才讓出
+/// （x86 上 35 萬條規則一次最長 16～28 ms、合計約 110 ms 都在工作執行緒上；MT7621 慢幾十倍），
+/// D3 記憶體恢復重新啟用 7 份清單時，快取命中的查詢最慢等了 2,835 ms。
+///
+/// 上限：工作佇列 [`BUILD_QUEUE`] 件、每件最多 [`FEED_CHUNK`]（下載的內容不會在記憶體裡堆積）；
+/// 建置中途取消（重新載入、停止）時佇列關閉，執行緒最多再處理完手上的一段就結束，不做最後的排序
+struct BgBuild {
+    tx: tokio::sync::mpsc::Sender<Cmd>,
+    /// 建置執行緒（[`BgBuild::finish`] 或出錯時拿出來等它的結果）
+    done: Mutex<Option<tokio::task::JoinHandle<Option<Filter>>>>,
+}
+
+impl BgBuild {
+    fn start(opts: BuildOptions, reserve: usize) -> BgBuild {
+        let (tx, rx) = tokio::sync::mpsc::channel(BUILD_QUEUE);
+        let done = tokio::task::spawn_blocking(move || {
+            let _low = crate::app::LowPriority::enter();
+            bg_main(opts, reserve, rx)
+        });
+        BgBuild {
+            tx,
+            done: Mutex::new(Some(done)),
+        }
+    }
+
+    /// 建置執行緒不在了：佇列已經關閉（執行緒結束，或還沒開始就被取消）時拿它的結果當原因，
+    /// 重新載入、停止時取消的工作才認得出來（[`is_cancelled`]）
+    async fn gone(&self) -> anyhow::Error {
+        let h = if self.tx.is_closed() {
+            self.done.lock().unwrap().take()
+        } else {
+            None
+        };
+        match h {
+            Some(h) => match h.await {
+                Err(e) => e.into(),
+                Ok(_) => anyhow::anyhow!("建置過濾清單的執行緒中途結束"),
+            },
+            None => anyhow::anyhow!("建置過濾清單的執行緒中途結束"),
+        }
+    }
+
+    async fn send(&self, c: Cmd) -> anyhow::Result<()> {
+        match self.tx.send(c).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.gone().await),
+        }
+    }
+
+    async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Cmd) -> anyhow::Result<T> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send(make(tx)).await?;
+        match rx.await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(self.gone().await),
+        }
+    }
+
+    async fn list(&self, spec: ListSpec) -> anyhow::Result<()> {
+        Ok(self.ask(|r| Cmd::List(spec, r)).await??)
+    }
+
+    async fn rules(&self) -> anyhow::Result<u64> {
+        self.ask(Cmd::Rules).await
+    }
+
+    /// 讀 zstd 內容，回傳有沒有完整讀到（讀到一半壞掉時已經餵進去的部分要 [`Cmd::Reset`]）
+    async fn zstd(&self, open: Opener, hash: u64) -> anyhow::Result<bool> {
+        self.ask(|r| Cmd::Zstd(open, hash, r)).await
+    }
+
+    /// 讀本機副本（沒有副本回 false）
+    async fn copy(&self, c: &ListCopies, url: &str) -> anyhow::Result<bool> {
+        match c.opener(url) {
+            Some((open, hash)) => self.zstd(open, hash).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn finish(self) -> anyhow::Result<Filter> {
+        self.send(Cmd::Finish).await?;
+        let h = self.done.lock().unwrap().take();
+        match h {
+            Some(h) => h.await?.ok_or_else(|| anyhow::anyhow!("建置過濾清單的執行緒中途結束")),
+            None => Err(anyhow::anyhow!("建置過濾清單的執行緒中途結束")),
+        }
+    }
+}
+
+/// 下載的內容湊成 [`FEED_CHUNK`] 交給建置執行緒；佇列滿了下載就等（[`fetch::Sink::ready`]）
+struct FeedSink<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<Cmd>,
+    buf: Vec<u8>,
+}
+
+impl FeedSink<'_> {
+    async fn flush(&mut self) {
+        if !self.buf.is_empty() {
+            let b = std::mem::replace(&mut self.buf, Vec::with_capacity(FEED_CHUNK));
+            // 建置執行緒不在了：之後要回覆的工作會收到錯誤
+            let _ = self.tx.send(Cmd::Feed(b)).await;
+        }
+    }
+}
+
+impl fetch::Sink for FeedSink<'_> {
+    fn chunk(&mut self, d: &[u8]) -> anyhow::Result<()> {
+        self.buf.extend_from_slice(d);
+        Ok(())
+    }
+    async fn ready(&mut self) {
+        if self.buf.len() >= FEED_CHUNK {
+            self.flush().await;
+        }
+    }
+}
+
+/// 建置執行緒：依序處理工作，[`Cmd::Finish`] 時交回過濾器；佇列關閉（取消）時回 None
+fn bg_main(opts: BuildOptions, reserve: usize, mut rx: tokio::sync::mpsc::Receiver<Cmd>) -> Option<Filter> {
+    let mut b = FilterBuilder::new(opts);
+    if reserve > 0 {
+        b.reserve(reserve);
+    }
+    loop {
+        match rx.blocking_recv()? {
+            Cmd::List(spec, reply) => match b.list(spec) {
+                Ok(mut w) => {
+                    let _ = reply.send(Ok(()));
+                    bg_list(&mut w, &mut rx)?;
+                    w.end();
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
+            Cmd::Finish => return Some(b.finish()),
+            // 清單之外的工作（呼叫端不會送）：丟掉，要回覆的那一端會收到「中途結束」
+            _ => {}
+        }
+    }
+}
+
+/// 一份清單的工作，到 [`Cmd::End`] 為止；佇列關閉時回 None
+fn bg_list(w: &mut kuroshio_filter::SourceWriter<'_>, rx: &mut tokio::sync::mpsc::Receiver<Cmd>) -> Option<()> {
+    let mut tap: Option<Tap> = None;
+    loop {
+        match rx.blocking_recv()? {
+            Cmd::Feed(d) => {
+                w.feed(&d);
+                if let Some(t) = tap.as_mut() {
+                    t.sink.feed(&d);
+                    if let Some(p) = t.samp.as_mut() {
+                        p.feed(&d);
                     }
-                    Err(_) => return None,
                 }
             }
-            h.write_u64(n);
-            Some(h.finish() == hash)
-        })()
-        .unwrap_or(false);
-        let _ = tx.blocking_send(CopyChunk::End(ok));
-    });
-    rx
+            Cmd::Tap { keep, sample } => {
+                tap = Some(Tap {
+                    sink: CopySink::new(keep),
+                    samp: sample.map(crate::probesample::LineSampler::new),
+                })
+            }
+            Cmd::Untap(reply) => {
+                let r = tap.take().map(|t| {
+                    let (h, z) = t.sink.finish();
+                    (h, z, t.samp.map(|p| p.finish()))
+                });
+                let _ = reply.send(r);
+            }
+            Cmd::Zstd(open, hash, reply) => {
+                let ok = match open() {
+                    Some(src) => read_zstd(src, hash, &mut |c| w.feed(c), &|| rx.is_closed()),
+                    None => false,
+                };
+                let _ = reply.send(ok);
+            }
+            Cmd::Reset => w.reset(),
+            Cmd::Rules(reply) => {
+                let _ = reply.send(w.rules());
+            }
+            // 清單還沒結束就開始下一份、或要結束全部（呼叫端不會這樣送）：當成這份結束
+            Cmd::End | Cmd::List(..) | Cmd::Finish => return Some(()),
+        }
+    }
 }
 
 /// 下載到、但這時候存不了本機副本的清單（zstd）：留在記憶體，重建時讀它，不必再從網路下載（3.4.2）。
@@ -317,22 +531,6 @@ impl AsRef<[u8]> for HeldBytes {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
-}
-
-async fn feed_stream(mut rx: tokio::sync::mpsc::Receiver<CopyChunk>, w: &mut kuroshio_filter::SourceWriter<'_>) -> bool {
-    while let Some(m) = rx.recv().await {
-        match m {
-            CopyChunk::Data(d) => w.feed(&d),
-            CopyChunk::End(ok) => return ok,
-        }
-    }
-    false
-}
-
-/// 把副本邊收邊交給清單的寫入端（每一段之間讓出執行緒）。回傳有沒有完整讀到
-async fn feed_copy(c: &ListCopies, url: &str, w: &mut kuroshio_filter::SourceWriter<'_>) -> bool {
-    let Some(rx) = c.stream(url) else { return false };
-    feed_stream(rx, w).await
 }
 
 /// 過濾清單的本機副本（可省略的資料：空間大方時才留）
@@ -440,9 +638,8 @@ impl ListCopies {
         self.meta(url).is_some_and(|m| m.hash == hash) && self.available(url)
     }
 
-    /// 讀副本，但解壓縮在 blocking 執行緒做，內容一段一段（64 KB）從 channel 送回來：
-    /// 呼叫端在 async 裡邊收邊解析，每一段之間會讓出執行緒，重建大清單時 DNS 照常回答。沒有副本回傳 None
-    pub fn stream(&self, url: &str) -> Option<tokio::sync::mpsc::Receiver<CopyChunk>> {
+    /// 打開副本的方法與內容雜湊（[`read_zstd`]）：打開檔案留給呼叫的執行緒（建置執行緒）做。沒有副本回傳 None
+    fn opener(&self, url: &str) -> Option<(Opener, u64)> {
         let m = self.meta(url)?;
         let (pending, path) = {
             let p = self.persister.lock().unwrap();
@@ -450,46 +647,17 @@ impl ListCopies {
         };
         // 還沒寫到磁碟（登記之後要等下一輪快照）：讀記憶體裡的待寫內容。以前直接開檔，開不到就當成副本壞掉、
         // 整份重新下載（3.4.2 Windows 複驗：留在記憶體的清單存成副本後、下一輪快照前恢復清單，又全部下載一次）
-        if let Some(z) = pending {
-            return Some(stream_zstd(move || Some(std::io::Cursor::new(z)), m.hash));
-        }
-        Some(stream_zstd(move || std::fs::File::open(&path).ok(), m.hash))
+        let open: Opener = match pending {
+            Some(z) => Box::new(move || Some(Box::new(std::io::Cursor::new(z)) as Box<dyn Read>)),
+            None => Box::new(move || std::fs::File::open(&path).ok().map(|f| Box::new(f) as Box<dyn Read>)),
+        };
+        Some((open, m.hash))
     }
 
     /// 讀副本（解壓後一段一段交給 `feed`）。回傳有沒有讀到
     pub fn read(&self, url: &str, feed: &mut dyn FnMut(&[u8])) -> bool {
-        let Some(m) = self.meta(url) else { return false };
-        let (pending, path) = {
-            let p = self.persister.lock().unwrap();
-            (p.pending_bytes(&m.file), p.file_path(&m.file))
-        };
-        // 還沒寫到磁碟：讀待寫內容（同 `stream`）
-        let src: Box<dyn Read> = match pending {
-            Some(z) => Box::new(std::io::Cursor::new(z)),
-            None => match std::fs::File::open(&path) {
-                Ok(f) => Box::new(f),
-                Err(_) => return false,
-            },
-        };
-        let Ok(mut dec) = zstd::stream::read::Decoder::new(src) else {
-            return false;
-        };
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        let mut n = 0u64;
-        loop {
-            match dec.read(&mut buf) {
-                Ok(0) => break,
-                Ok(k) => {
-                    h.write(&buf[..k]);
-                    n += k as u64;
-                    feed(&buf[..k]);
-                }
-                Err(_) => return false,
-            }
-        }
-        h.write_u64(n);
-        h.finish() == m.hash
+        let Some((open, hash)) = self.opener(url) else { return false };
+        open().is_some_and(|src| read_zstd(src, hash, feed, &|| false))
     }
 
     /// 下載完成：內容有變（雜湊不同）才登記寫出新的副本；驗證資訊有變就更新索引。回傳有沒有登記新的副本。
@@ -1633,28 +1801,33 @@ impl FilterService {
         // 記憶體預算不在這裡套用：maxDomains 依清單順序累計，會先擠掉排在後面的保護清單（例如 TW165）。
         // 量過大小的清單在 `fit_allowance` 依停用順序先排除；第一次載入（還沒量過）只受等級的 maxDomains 限制
         let max_domains = self.opts.max_domains.saturating_sub(custom_n);
-        let mut b = FilterBuilder::new(BuildOptions {
+        let opts = BuildOptions {
             max_domains,
             // 每次查詢都要跑的規則：自訂規則的也算在內（查詢時兩層都要跑）
             max_unindexed: self.opts.max_unindexed.saturating_sub(custom_unindexed),
             ..self.opts
-        });
+        };
         // 依上次的規則數先預留：建置中的 Vec 不必倍增（倍增時尖峰最多多一倍）
         let expect: u64 = (0..self.sources.len()).filter(|&i| !ex[i]).map(|i| prev_sizes[i].1).sum();
-        if expect > 0 {
-            b.reserve((expect + expect / 20).min(max_domains) as usize);
-        }
+        let reserve = if expect > 0 {
+            (expect + expect / 20).min(max_domains) as usize
+        } else {
+            0
+        };
+        // 解析、解壓縮、排序都在降低優先權的建置執行緒上做（[`BgBuild`]），這裡只下載、轉交
+        let b = BgBuild::start(opts, reserve);
         let mut errors = Vec::new();
         let mut validators = Vec::new();
         for (i, s) in self.sources.iter().enumerate() {
             // 停用中的清單也佔一個位置（統計裡是 disabled），清單編號跟命中次數的對應才不會亂
-            let mut w = b.list(ListSpec {
+            b.list(ListSpec {
                 name: s.name.clone(),
                 category: s.category,
                 enabled: !ex[i],
-            })?;
+            })
+            .await?;
             if ex[i] {
-                w.end();
+                b.send(Cmd::End).await?;
                 validators.push(Validators::default());
                 continue;
             }
@@ -1667,21 +1840,21 @@ impl FilterService {
                 let held = self.held.lock().unwrap().get(&s.url).cloned();
                 if let Some(h) = held {
                     let z = h.z.clone();
-                    let rx = stream_zstd(move || Some(std::io::Cursor::new(HeldBytes(z))), h.hash);
-                    if feed_stream(rx, &mut w).await {
-                        w.end();
+                    let open: Opener = Box::new(move || Some(Box::new(std::io::Cursor::new(HeldBytes(z))) as Box<dyn Read>));
+                    if b.zstd(open, h.hash).await? {
+                        b.send(Cmd::End).await?;
                         validators.push(h.v);
                         continue;
                     }
                     // 壞掉（不該發生：收的時候驗過雜湊）：丟掉，改用本機副本或下載
                     self.held.lock().unwrap().remove(&s.url);
-                    w.reset();
+                    b.send(Cmd::Reset).await?;
                 }
                 if let Some(c) = copies.filter(|c| c.available(&s.url)) {
-                    if feed_copy(c, &s.url, &mut w).await {
+                    if b.copy(c, &s.url).await? {
                         // 舊版（3.3.2 以前）寫的副本沒有記規則數：讀到時補記（記憶體規劃、截斷檢查要用）
-                        c.note_rules(&s.url, w.rules());
-                        w.end();
+                        c.note_rules(&s.url, b.rules().await?);
+                        b.send(Cmd::End).await?;
                         let m = c.meta(&s.url).unwrap_or_else(|| unreachable!());
                         validators.push(Validators {
                             etag: m.etag,
@@ -1690,12 +1863,12 @@ impl FilterService {
                         continue;
                     }
                     // 副本壞掉：重新下載（這份清單的規則從頭來）
-                    w.reset();
+                    b.send(Cmd::Reset).await?;
                 }
             }
             if mode == Source::CopiesOnly {
                 // 只用副本：沒有副本的這次不載入，不在這時候下載
-                w.end();
+                b.send(Cmd::End).await?;
                 validators.push(Validators::default());
                 no_copy.push(i);
                 continue;
@@ -1706,27 +1879,28 @@ impl FilterService {
             // （3.4.2 Windows 壓力測試：恢復 7 份清單、每 30 秒一次，10 分鐘從網路收了 44.4 MB）
             let persist = copies.is_some_and(|c| c.wanted(estimate));
             let hold = copies.is_some() && !persist && self.held_room(&s.url, estimate);
-            let mut sink = CopySink::new(persist || hold);
             // 惡意網站探測（3.5.1）：存不了副本的可以抽樣清單，下載時順便抽（7 天一次，不另外下載）
-            let mut samp = self
-                .probe_snap_due(s, persist)
-                .then(|| crate::probesample::LineSampler::new(crate::probesample::seed_now()));
-            let r = fetch::get(&s.url, &Validators::default(), self.max_bytes, timeout, |c| {
-                w.feed(c);
-                sink.feed(c);
-                if let Some(p) = samp.as_mut() {
-                    p.feed(c);
-                }
-                Ok(())
+            let sample = self.probe_snap_due(s, persist).then(crate::probesample::seed_now);
+            b.send(Cmd::Tap {
+                keep: persist || hold,
+                sample,
             })
-            .await;
+            .await?;
+            let mut feed = FeedSink {
+                tx: &b.tx,
+                buf: Vec::with_capacity(FEED_CHUNK),
+            };
+            let r = fetch::get_into(&s.url, &Validators::default(), self.max_bytes, timeout, &mut feed).await;
+            // 最後不滿一段的也交出去（下載失敗時也一樣：跟以前一樣，已經收到的部分在這份清單裡）
+            feed.flush().await;
+            let rules = b.rules().await?;
             // 下載完成但規則數比上次少一大半：當成下載不完整（不換上、不存副本）
             let prev_rules = match prev_sizes[i].1 {
                 0 => copies.and_then(|c| c.meta(&s.url)).map_or(0, |m| m.rules),
                 n => n,
             };
             let r = match r {
-                Ok(Outcome::Done { .. }) => match suspicious_drop(prev_rules, w.rules()) {
+                Ok(Outcome::Done { .. }) => match suspicious_drop(prev_rules, rules) {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     None => r,
                 },
@@ -1734,13 +1908,13 @@ impl FilterService {
             };
             match r {
                 Ok(Outcome::Done { validators: v, .. }) => {
-                    let rules = w.rules();
-                    w.end();
-                    if let Some(p) = samp.take() {
-                        self.save_probe_snap(&s.url, p.finish());
+                    let tap = b.ask(Cmd::Untap).await?;
+                    b.send(Cmd::End).await?;
+                    let (h, z, names) = tap.unwrap_or((0, None, None));
+                    if let Some(names) = names {
+                        self.save_probe_snap(&s.url, names);
                     }
                     if let Some(c) = copies {
-                        let (h, z) = sink.finish();
                         if persist {
                             if c.offer(&s.url, h, z, &v, crate::persist::now_secs(), rules) || c.available_same(&s.url, h) {
                                 self.held.lock().unwrap().remove(&s.url);
@@ -1761,19 +1935,19 @@ impl FilterService {
                     validators.push(v)
                 }
                 Ok(Outcome::NotModified) => {
-                    w.end();
+                    b.send(Cmd::End).await?;
                     validators.push(Validators::default())
                 }
                 Err(e) => {
                     // 下載失敗：有本機副本就拿副本頂著（這份清單不會整份不見）
                     let fallback = match copies.filter(|c| c.available(&s.url)) {
                         Some(c) => {
-                            w.reset();
-                            feed_copy(c, &s.url, &mut w).await
+                            b.send(Cmd::Reset).await?;
+                            b.copy(c, &s.url).await?
                         }
                         None => false,
                     };
-                    w.end();
+                    b.send(Cmd::End).await?;
                     if fallback {
                         warn!("下載清單「{}」失敗：{e}；先用本機副本", s.name);
                     } else {
@@ -1785,8 +1959,8 @@ impl FilterService {
                 }
             }
         }
-        // 建索引（排序、壓縮）也是大量計算：放到 blocking 執行緒，不佔住回答查詢的執行緒
-        let f = tokio::task::spawn_blocking(move || b.finish()).await?;
+        // 建索引（排序、壓縮）也在建置執行緒上做完才交回來
+        let f = b.finish().await?;
         let st = f.stats();
         for s in st.over_budget() {
             if let SourceStatus::OverBudget { rules, remaining } = s.status {
@@ -1834,7 +2008,13 @@ impl FilterService {
             // 建的期間記憶體控制暫停了全部清單：不換上去
             anyhow::bail!("過濾清單已暫停（記憶體最低限度），這次建好的不使用");
         }
-        *self.lists.write().unwrap() = Arc::new(f);
+        // 換上新的只在鎖裡交換指標；舊的（可能有上萬條正規表示式要釋放）在鎖外、低優先權的 blocking 執行緒上丟掉，
+        // 查詢拿讀鎖不必等它
+        let old = std::mem::replace(&mut *self.lists.write().unwrap(), Arc::new(f));
+        drop(tokio::task::spawn_blocking(move || {
+            let _low = crate::app::LowPriority::enter();
+            drop(old);
+        }));
         *self.validators.lock().unwrap() = validators;
         *self.missing.lock().unwrap() = no_copy;
         let mut status = self.status.lock().unwrap();
@@ -2721,5 +2901,97 @@ mod tests {
         assert_eq!(pick_restore(&b, u64::MAX), 4);
         assert_eq!(pick_restore(&[], 100), 0);
         assert_eq!(pick_restore(&[u64::MAX, u64::MAX], u64::MAX), 1, "不溢位");
+    }
+
+    /// 數讀了多少位元組的來源
+    struct Counted(std::io::Cursor<Vec<u8>>, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Read for Counted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.fetch_add(n, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    /// 3.5.1：建置執行緒的工作照順序做，結果跟直接用 `SourceWriter` 一樣；重建被取消（佇列關閉）時
+    /// 讀到一半的副本不再讀下去、不做最後的排序，執行緒自己結束
+    #[tokio::test]
+    async fn bg_build_matches_direct_and_stops_when_cancelled() {
+        // 隨機的名稱（壓縮後還有好幾 MB，取消時看得出沒讀完）
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let text: String = (0..200_000)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                format!("||n{i}x{x:016x}.example.com^\n")
+            })
+            .collect();
+        let mut sink = CopySink::new(true);
+        sink.feed(text.as_bytes());
+        let (hash, z) = sink.finish();
+        let z = z.unwrap();
+        let open = |z: Vec<u8>, n: Arc<std::sync::atomic::AtomicUsize>| -> Opener {
+            Box::new(move || Some(Box::new(Counted(std::io::Cursor::new(z), n)) as Box<dyn Read>))
+        };
+
+        // 照順序：第一份讀 zstd、第二份下載（含一段讀壞的從頭來）、第三份停用
+        let b = BgBuild::start(BuildOptions::default(), 0);
+        b.list(ListSpec::new("一", Category::Ads)).await.unwrap();
+        assert!(b.zstd(open(z.clone(), Default::default()), hash).await.unwrap());
+        assert_eq!(b.rules().await.unwrap(), 200_000);
+        b.send(Cmd::End).await.unwrap();
+        b.list(ListSpec::new("二", Category::Telemetry)).await.unwrap();
+        assert!(!b.zstd(open(z.clone(), Default::default()), hash ^ 1).await.unwrap(), "雜湊不對");
+        b.send(Cmd::Reset).await.unwrap();
+        b.send(Cmd::Tap { keep: false, sample: None }).await.unwrap();
+        b.send(Cmd::Feed(b"||t1.example.net^\n||t2.exa".to_vec())).await.unwrap();
+        b.send(Cmd::Feed(b"mple.net^".to_vec())).await.unwrap();
+        assert_eq!(b.rules().await.unwrap(), 1, "最後一行還沒結束");
+        let (h, z2, names) = b.ask(Cmd::Untap).await.unwrap().unwrap();
+        assert!(z2.is_none() && names.is_none());
+        let mut want_h = CopySink::new(false);
+        want_h.feed(b"||t1.example.net^\n||t2.example.net^");
+        assert_eq!(h, want_h.finish().0, "下載內容的雜湊");
+        b.send(Cmd::End).await.unwrap();
+        let mut off = ListSpec::new("三", Category::Ads);
+        off.enabled = false;
+        b.list(off).await.unwrap();
+        b.send(Cmd::End).await.unwrap();
+        let got = b.finish().await.unwrap();
+
+        let mut fb = FilterBuilder::new(BuildOptions::default());
+        fb.add_list(ListSpec::new("一", Category::Ads), text.as_bytes()).unwrap();
+        fb.add_list(ListSpec::new("二", Category::Telemetry), b"||t1.example.net^\n||t2.example.net^")
+            .unwrap();
+        let mut off = ListSpec::new("三", Category::Ads);
+        off.enabled = false;
+        fb.add_list(off, b"||x.example^").unwrap();
+        let want = fb.finish();
+        assert_eq!(got.stats().lists, want.stats().lists);
+        assert_eq!(got.stats().by_category, want.stats().by_category);
+        for (a, w) in got.stats().sources.iter().zip(&want.stats().sources) {
+            assert_eq!((&a.name, a.status, a.domain_rules), (&w.name, w.status, w.domain_rules));
+        }
+        assert_eq!(got.check("t2.example.net", 1).unwrap().list, Some(1));
+        let last = text.lines().last().unwrap().trim_start_matches("||").trim_end_matches('^');
+        assert_eq!(got.check(last, 1).unwrap().list, Some(0));
+
+        // 取消：送出讀副本之後馬上丟掉（重建的 future 被丟掉時就是這樣），執行緒最多再讀一段就停、不交回過濾器
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let b = BgBuild::start(BuildOptions::default(), 0);
+        b.list(ListSpec::new("一", Category::Ads)).await.unwrap();
+        let h = b.done.lock().unwrap().take().unwrap();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        b.tx.send(Cmd::Zstd(open(z.clone(), read.clone()), hash, reply)).await.unwrap();
+        drop(b);
+        assert!(h.await.unwrap().is_none(), "不做最後的排序");
+        assert!(
+            read.load(Ordering::Relaxed) < z.len() / 2,
+            "沒有讀完整份副本（{} / {}）",
+            read.load(Ordering::Relaxed),
+            z.len()
+        );
     }
 }

@@ -100,8 +100,32 @@ pub struct Request<'a> {
     pub body: Option<&'a [u8]>,
 }
 
+/// 收下載內容的一端（[`get_into`]）：每收到一段交給 [`chunk`](Sink::chunk)，交完等 [`ready`](Sink::ready)
+/// 再讀下一段。`ready` 是背壓：收的那一端處理不完（例如交給背景執行緒解析）時讓下載先停，內容不會在記憶體裡堆積
+pub trait Sink {
+    fn chunk(&mut self, d: &[u8]) -> Result<()>;
+    /// 預設不等
+    fn ready(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
+/// 一般的 `on_chunk` 閉包：不等
+struct Each<F>(F);
+
+impl<F: FnMut(&[u8]) -> Result<()>> Sink for Each<F> {
+    fn chunk(&mut self, d: &[u8]) -> Result<()> {
+        (self.0)(d)
+    }
+}
+
 /// 下載 `url`，每收到一段資料就呼叫 `on_chunk`；`max` 是大小上限（位元組）
 pub async fn get(url: &str, prev: &Validators, max: u64, timeout: Duration, on_chunk: impl FnMut(&[u8]) -> Result<()>) -> Result<Outcome> {
+    get_into(url, prev, max, timeout, &mut Each(on_chunk)).await
+}
+
+/// 同 [`get`]，內容交給 `sink`，每一段交完等 [`Sink::ready`] 再讀下一段
+pub async fn get_into(url: &str, prev: &Validators, max: u64, timeout: Duration, sink: &mut impl Sink) -> Result<Outcome> {
     stream(
         url,
         &Request {
@@ -114,7 +138,7 @@ pub async fn get(url: &str, prev: &Validators, max: u64, timeout: Duration, on_c
         false,
         None,
         None,
-        on_chunk,
+        sink,
     )
     .await
 }
@@ -144,7 +168,18 @@ pub async fn get_status(
         headers: headers.to_vec(),
         body: None,
     };
-    if let Outcome::Done { status, .. } = stream(url, &r, &Validators::default(), max, timeout, true, None, Some(&mut st), on_chunk).await?
+    if let Outcome::Done { status, .. } = stream(
+        url,
+        &r,
+        &Validators::default(),
+        max,
+        timeout,
+        true,
+        None,
+        Some(&mut st),
+        &mut Each(on_chunk),
+    )
+    .await?
     {
         st.code = status;
     }
@@ -160,12 +195,11 @@ pub async fn request(url: &str, req: &Request<'_>, max: u64, timeout: Duration) 
 /// 多出口（多網卡、多條對外線路）時，用來偵測每個出口各自的公網 IP。
 pub async fn request_from(url: &str, req: &Request<'_>, max: u64, timeout: Duration, from: Option<&LocalBind>) -> Result<(u16, Vec<u8>)> {
     let mut body = Vec::new();
-    match stream(url, req, &Validators::default(), max, timeout, true, from, None, |c| {
+    let mut sink = Each(|c: &[u8]| {
         body.extend_from_slice(c);
         Ok(())
-    })
-    .await?
-    {
+    });
+    match stream(url, req, &Validators::default(), max, timeout, true, from, None, &mut sink).await? {
         Outcome::Done { status, .. } => Ok((status, body)),
         Outcome::NotModified => Ok((304, body)),
     }
@@ -181,7 +215,7 @@ async fn stream(
     any_status: bool,
     from: Option<&LocalBind>,
     mut early: Option<&mut Status>,
-    mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
+    sink: &mut impl Sink,
 ) -> Result<Outcome> {
     let mut url = url.to_string();
     for _ in 0..6 {
@@ -272,13 +306,16 @@ async fn stream(
         };
         let mut rest = buf[end..].to_vec();
         let mut total: u64 = 0;
-        let mut emit = |d: &[u8], total: &mut u64| -> Result<()> {
+        // 交一段給 sink，交完等它（背壓）
+        async fn emit(sink: &mut impl Sink, d: &[u8], total: &mut u64, max: u64) -> Result<()> {
             *total += d.len() as u64;
             if *total > max {
                 bail!("檔案超過上限 {} MB", max / 1_048_576);
             }
-            on_chunk(d)
-        };
+            sink.chunk(d)?;
+            sink.ready().await;
+            Ok(())
+        }
         if header("transfer-encoding")
             .map(|v| v.to_ascii_lowercase().contains("chunked"))
             .unwrap_or(false)
@@ -302,7 +339,7 @@ async fn stream(
                 loop {
                     let take = left.min(rest.len());
                     if take > 0 {
-                        emit(&rest[..take], &mut total)?;
+                        emit(sink, &rest[..take], &mut total, max).await?;
                         rest.drain(..take);
                         left -= take;
                     }
@@ -327,7 +364,7 @@ async fn stream(
         } else {
             let len = header("content-length").and_then(|v| v.parse::<u64>().ok());
             if !rest.is_empty() {
-                emit(&rest, &mut total)?;
+                emit(sink, &rest, &mut total, max).await?;
             }
             loop {
                 if len.map(|l| total >= l).unwrap_or(false) {
@@ -342,7 +379,7 @@ async fn stream(
                     }
                     break;
                 }
-                emit(&tmp[..n], &mut total)?;
+                emit(sink, &tmp[..n], &mut total, max).await?;
             }
         }
         return Ok(Outcome::Done {
