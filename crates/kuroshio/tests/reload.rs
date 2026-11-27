@@ -265,6 +265,103 @@ fn reload_keeps_list_layer_when_lists_unchanged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 3.5.1 D3：存不了本機副本（儲存空間不夠）的清單留在記憶體。改了清單設定（停用一份）重新載入時，
+/// 還在設定裡、沒有副本的清單內容交給下一輪：新的一輪第一次建好時就是完整的規則，不再問清單伺服器
+/// （以前清單有變就丟掉，約 20 秒後重新下載才換上，這段時間那份清單的規則不生效）；停用的那份不交
+#[test]
+fn reload_with_changed_lists_keeps_lists_without_copy() {
+    use kuroshio::resolver::FilterCheck;
+    let _g = serial();
+    let dir = tmp("held");
+    let (addr, hits) = list_server(1000);
+    // 保留量 90%：清單副本一律存不下（只能留在記憶體）
+    let base = json!({ "filter": { "lists": lists(addr, &["a", "b", "c"]) }, "cdn": { "enabled": false },
+                       "system": { "storageReservePercent": 90 } });
+    let held1 = generation_with(&config(&dir, base.clone()), 3000, |s| {
+        s.state.filter.as_ref().unwrap().held_stats().0
+    });
+    assert_eq!(held1, 3, "三份都存不了副本，留在記憶體");
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+    // 停用 c 之後重新載入
+    let mut over = base.clone();
+    over["filter"]["lists"][2]["enabled"] = json!(false);
+    let (rebuilds, rules, held, blocked) = generation_with(&config(&dir, over), 2000, |s| {
+        let f = s.state.filter.as_ref().unwrap();
+        (
+            f.rebuild_count(),
+            f.list_rules(),
+            f.held_stats().0,
+            f.check("b-999.example.com", 1).is_some_and(|v| v.block),
+        )
+    });
+    assert_eq!((rebuilds, rules), (1, 2000), "只建一次，第一次建好就有 a、b 的全部規則");
+    assert!(blocked);
+    assert_eq!(held, 2, "停用的那份不交");
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "沒有再問清單伺服器");
+
+    // 再改回來：c 沒有交下來，照開機排程（10～15 秒後）下載；a、b 照樣沿用
+    let (rules, held) = generation_with(&config(&dir, base), 2000, |s| {
+        let f = s.state.filter.as_ref().unwrap();
+        (f.list_rules(), f.held_stats().0)
+    });
+    assert_eq!((rules, held), (2000, 2), "c 還沒下載");
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 接手的清單照上一輪最後一次檢查的時間排下一次更新：用副本與記憶體裡的內容建好、1 分鐘後（照舊）
+/// 再等到更新間隔，不是一分鐘後就把每份清單都問一次
+#[test]
+fn lists_without_copy_keep_check_schedule_after_reload() {
+    use kuroshio::resolver::FilterCheck;
+    let _g = serial();
+    let dir = tmp("held-sched");
+    let (addr, hits) = list_server(300);
+    let state = dir.join("state");
+    let small = || {
+        let mut p = kuroshio::persist::Persister::new(
+            &state,
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        p.set_free_probe(|_| Some(1 << 20));
+        Arc::new(std::sync::Mutex::new(p))
+    };
+    let cfg = |names: &[&str]| kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": lists(addr, names) } }));
+    runtime().block_on(async {
+        let f1 = kuroshio::filtering::FilterService::from_cfg(&cfg(&["a", "b"]), &dir).unwrap();
+        f1.set_copies(small());
+        assert!(f1.update_lists(false).await.unwrap());
+        assert_eq!(f1.held_stats().0, 2);
+        f1.hand_over_lists(&state);
+        drop(f1);
+        let f2 = kuroshio::filtering::FilterService::from_cfg(&cfg(&["a"]), &dir).unwrap();
+        f2.set_copies(small());
+        assert!(!f2.adopt_lists(&state), "清單有變：清單層不接手");
+        assert_eq!(f2.held_stats().0, 1, "只接手還在設定裡的");
+        let sleeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = sleeps.clone();
+        let hooks = kuroshio::filtering::BootHooks {
+            sleep: Box::new(move |d| {
+                rec.lock().unwrap().push(d);
+                Box::pin(async {})
+            }),
+            synced: Box::new(|| true),
+            pressure: Box::new(|| kuroshio::sysinfo::Pressure::Normal),
+            jitter_ms: 0,
+        };
+        assert_eq!(f2.boot(&hooks).await, 0);
+        assert_eq!(f2.rebuild_count(), 1);
+        assert!(f2.check("a-299.example.com", 1).unwrap().block);
+        let s = sleeps.lock().unwrap().clone();
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!(s[0], kuroshio::filtering::ALL_COPIES_WAIT);
+        assert!(s[1] > Duration::from_secs(24 * 3600 - 120), "等到更新間隔：{s:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "沒有再問清單伺服器");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------- 重新載入的交接那一刻（3.5.1）----------------
 
 /// 假的上游（一般執行緒，跨好幾個執行環境）：A 查詢回 198.51.100.10（TTL 300），每筆延遲 `delay`；回傳（位址, 收到幾筆）

@@ -329,7 +329,13 @@ pub struct Persister {
     elapsed_probe: Option<ElapsedProbe>,
     /// 最近一次關機寫入的統計（測試、日誌用）
     last_shutdown: Option<ShutdownFlush>,
+    /// 寫的時候空間不夠、沒寫的可省略檔（名稱，內容；合計最多 [`DROPPED_OPTIONAL_MAX`]）：
+    /// 過濾清單收回記憶體（[`Persister::take_dropped_optional`]），不必再下載一次
+    dropped_optional: Vec<(String, Vec<u8>)>,
 }
+
+/// 沒寫的可省略檔最多留多少給擁有者收回（合計；超過就丟最舊的）
+pub const DROPPED_OPTIONAL_MAX: u64 = 8 << 20;
 
 /// 一次關機寫入：重要變動與只有計數變動的各有幾份待寫、幾份來不及寫
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -411,6 +417,7 @@ impl Persister {
             extra_files: Vec::new(),
             deleted: Vec::new(),
             staged_tmp: Vec::new(),
+            dropped_optional: Vec::new(),
         }
         .with_fs_total()
     }
@@ -516,6 +523,7 @@ impl Persister {
     /// （一般與 .zst 兩種格式都刪）。回傳刪掉的 bytes
     pub fn discard(&mut self, name: &str) -> u64 {
         self.entries.remove(name);
+        self.dropped_optional.retain(|(n, _)| n != name);
         let p = self.path(name);
         let mut freed = 0;
         for f in [statefile::zst_path(&p), p] {
@@ -526,6 +534,12 @@ impl Persister {
             }
         }
         freed
+    }
+
+    /// 寫的時候空間不夠、沒寫的可省略檔（[`Persister::room_for`]）交還給擁有者：過濾清單把內容收回記憶體，
+    /// 不必再從網路下載一次。拿走之後這裡就不留
+    pub fn take_dropped_optional(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.dropped_optional)
     }
 
     /// 登記最新內容（還不寫）；內容跟已寫入的一樣就什麼都不做
@@ -724,9 +738,14 @@ impl Persister {
             self.deleted.push((now, rel.clone(), sizes.get(rel).copied().unwrap_or(0)));
         }
         for rel in gone {
-            // 這份快照被刪掉了：下次登記時就算內容沒變也要重寫
-            let name = rel.trim_end_matches(".zst");
-            if let Some(e) = self.entries.get_mut(name) {
+            // 這份快照被刪掉了：下次登記時就算內容沒變也要重寫。登記的名稱是「磁碟上的名稱」或「壓縮的再去掉 .zst」：
+            // 過濾清單副本的名稱本身就以 .zst 結尾、不再壓縮。以前一律去掉結尾所有的 .zst，對不到副本的登記，
+            // 副本被刪掉之後同樣內容再登記會被當成「已經寫過」而不寫
+            let name = match rel.strip_suffix(".zst") {
+                Some(base) if !self.entries.contains_key(rel.as_str()) && (self.compress)(base) => base.to_string(),
+                _ => rel,
+            };
+            if let Some(e) = self.entries.get_mut(&name) {
                 e.written_hash = None;
                 e.written_size = 0;
             }
@@ -762,11 +781,22 @@ impl Persister {
             if free >= required {
                 return true;
             }
-            // 放不下就不留在記憶體：丟掉這份待寫內容（只是少了本機副本）
-            self.entries.remove(name);
+            // 放不下就不留在這裡：待寫內容交還給擁有者（過濾清單收回記憶體，[`Persister::take_dropped_optional`]），
+            // 只是少了本機副本
+            if let Some(Pending {
+                data: Data::Bytes(_, d), ..
+            }) = self.entries.remove(name).and_then(|e| e.pending)
+            {
+                self.dropped_optional.retain(|(n, _)| n != name);
+                self.dropped_optional.push((name.to_string(), d));
+                let mut total: u64 = self.dropped_optional.iter().map(|(_, d)| d.len() as u64).sum();
+                while total > DROPPED_OPTIONAL_MAX && !self.dropped_optional.is_empty() {
+                    total -= self.dropped_optional.remove(0).1.len() as u64;
+                }
+            }
             self.stats.skipped += 1;
             info!(
-                "儲存空間不夠留清單副本（剩 {} KB、需要 {} KB）：{name} 不存，之後照常下載",
+                "儲存空間不夠留清單副本（剩 {} KB、需要 {} KB）：{name} 不存，內容交回過濾清單留在記憶體（不必重新下載）",
                 free / 1024,
                 required.div_ceil(1024)
             );
@@ -1937,6 +1967,47 @@ mod tests {
         p.stage_with("cdn/pools.json", Snapshot::Bytes(vec![5; 1000]), Opts::default(), t + 7 * 3600);
         assert_eq!(p.flush(t + 7 * 3600).unwrap(), 1);
         assert!(p.is_pending("stats.json") && !p.is_pending("cdn/pools.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 3.5.1 D3：過濾清單的副本（名稱本身就以 .zst 結尾、不再壓縮）被空間不足刪掉之後，同樣的內容再登記要重寫
+    /// （以前對不到登記，被當成「已經寫過」）；寫的時候放不下的副本內容交還給擁有者，不是直接丟掉
+    #[test]
+    #[allow(clippy::disallowed_types)] // 測試只在 64 位元的 CI 上跑；正式程式碼不能用（32 位元 MIPS 沒有 64 位元原子操作）
+    fn optional_copy_rewritten_after_delete_and_dropped_content_returned() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tmpdir("optional-back");
+        std::fs::create_dir_all(dir.join("filter-lists")).unwrap();
+        // 保留 2 MB（遲滯 1 MB → 線在 3 MB）
+        let free = Arc::new(AtomicU64::new(10 * MB));
+        let f2 = free.clone();
+        let mut p = Persister::new(&dir, Policy::new(StorageClass::Flash, 0, 4096).with_storage_reserve(2, 0, 0));
+        p.set_fs_total(Some(100 * MB));
+        p.set_free_probe(move |_| Some(f2.load(Ordering::SeqCst)));
+        let t = 9_100 * 86400;
+        let a = "filter-lists/a.txt.zst";
+        p.stage_with(a, Snapshot::Bytes(vec![1; 1000]), Opts::default(), t);
+        assert_eq!(p.flush(t).unwrap(), 1);
+        assert!(dir.join(a).exists());
+        // 空間不足：副本被刪掉
+        free.store(2_800_000, Ordering::SeqCst);
+        p.check_space();
+        assert!(!dir.join(a).exists());
+        // 空間回來，同樣的內容再登記：要重寫
+        free.store(10 * MB, Ordering::SeqCst);
+        p.stage_with(a, Snapshot::Bytes(vec![1; 1000]), Opts::default(), t + 7 * 3600);
+        assert!(p.is_pending(a), "被刪掉之後同樣內容也要重寫");
+        assert_eq!(p.flush(t + 7 * 3600).unwrap(), 1);
+        assert!(dir.join(a).exists());
+        // 寫的時候放不下（登記之後空間被別的用掉）：不寫，內容交還
+        let b = "filter-lists/b.txt.zst";
+        p.stage_with(b, Snapshot::Bytes(vec![2; 200_000]), Opts::default(), t + 8 * 3600);
+        free.store(3 * MB + 100_000, Ordering::SeqCst);
+        assert_eq!(p.flush(t + 8 * 3600).unwrap(), 0);
+        assert!(!p.is_pending(b) && !dir.join(b).exists());
+        assert!(dir.join(a).exists(), "不刪別的副本讓位");
+        assert_eq!(p.take_dropped_optional(), vec![(b.to_string(), vec![2; 200_000])]);
+        assert!(p.take_dropped_optional().is_empty(), "拿走之後不留");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

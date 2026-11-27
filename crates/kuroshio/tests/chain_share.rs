@@ -1232,6 +1232,47 @@ async fn held_list_persisted_when_room_returns() {
     );
 }
 
+/// 3.5.1 D3（CHN: anti-AD）：下載時看起來放得下、登記了副本，真的寫的時候空間已經被別的用掉（日誌「儲存空間不夠留
+/// 清單副本」）。以前那份內容直接丟掉、索引還記著：既沒有副本也不在記憶體裡，之後每次重建、重新載入都要重新下載。
+/// 現在內容收回記憶體、索引拿掉，重建時讀記憶體裡那份
+#[tokio::test]
+async fn copy_dropped_at_write_time_stays_in_memory() {
+    use kuroshio::resolver::FilterCheck;
+    use std::sync::atomic::AtomicUsize;
+    let body: String = (0..3000).map(|i| format!("||ads{i}.example.net^\n")).collect();
+    let (srv, downloads) = list_server(body).await;
+    let url = format!("http://{srv}/a.txt");
+    let cfg = kuroshio_config::with_overrides(&json!({ "filter": { "customRules": [], "lists": [
+        { "name": "A", "url": url, "category": "ads" }
+    ] } }));
+    let d = tmpdir("held-dropped");
+    let free = Arc::new(AtomicUsize::new(1 << 34));
+    let pers = {
+        let mut p = kuroshio::persist::Persister::new(
+            d.0.join("state"),
+            kuroshio::persist::Policy::new(kuroshio::sysinfo::StorageClass::Disk, 0, 4096),
+        );
+        let f = free.clone();
+        p.set_free_probe(move |_| Some(f.load(Ordering::SeqCst) as u64));
+        Arc::new(Mutex::new(p))
+    };
+    let f = kuroshio::filtering::FilterService::from_cfg(&cfg, &d.0).unwrap();
+    f.set_copies(pers.clone());
+    assert!(f.update_lists(false).await.unwrap());
+    assert!(f.copies().unwrap().meta(&url).is_some(), "下載時放得下：登記了副本");
+    assert_eq!(f.stats()["heldCopies"]["count"], 0);
+    // 寫的時候空間不夠了
+    free.store(1 << 20, Ordering::SeqCst);
+    pers.lock().unwrap().flush_all(kuroshio::persist::now_secs()).unwrap();
+    assert_eq!(f.reclaim_dropped(), 1, "沒寫成的內容收回記憶體");
+    assert!(f.copies().unwrap().meta(&url).is_none(), "索引拿掉：不再當成有副本");
+    assert_eq!(f.lists_without_copy(), Some(1));
+    assert_eq!(f.stats()["heldCopies"]["count"], 1);
+    f.rebuild_from_copies().await.unwrap();
+    assert!(f.check("ads2999.example.net", 1).unwrap().block);
+    assert_eq!(downloads.load(Ordering::SeqCst), 1, "重建讀記憶體裡那份，不再下載");
+}
+
 /// 正式的匯入端：評測結果寫到 `upstream.autoStateFile`、Manager 重讀（明文拿掉），`autoUpstreams.source` 是 chain；
 /// 種子資料的評測結果上游不分享
 #[tokio::test]

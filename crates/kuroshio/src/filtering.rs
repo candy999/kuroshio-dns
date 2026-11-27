@@ -511,15 +511,17 @@ fn bg_list(w: &mut kuroshio_filter::SourceWriter<'_>, rx: &mut tokio::sync::mpsc
 }
 
 /// 下載到、但這時候存不了本機副本的清單（zstd）：留在記憶體，重建時讀它，不必再從網路下載（3.4.2）。
-/// 不存檔；空間與記憶體都夠了之後存成本機副本（[`FilterService::persist_held`]）
+/// 不存檔；空間與記憶體都夠了之後存成本機副本（[`FilterService::persist_held`]）。
+/// 重新載入設定時交給下一輪（清單有變也交，只交還在新設定裡的；[`FilterService::adopt_lists`]）
 #[derive(Clone)]
 struct Held {
     hash: u64,
     z: Arc<Vec<u8>>,
     v: Validators,
-    /// 這份內容是什麼時候下載的（Unix 秒）：存成本機副本時當成「上次檢查更新」的時間，
-    /// 重新啟動後才會照更新間隔檢查，不會一分鐘後就把剛下載過的清單整份再問一次（3.4.3，Windows 複驗 G3）
-    fetched: u64,
+    /// 上次確認這份內容是最新的時間（Unix 秒：下載的時候、之後檢查更新沒變的時候）。
+    /// 存成本機副本時當成「上次檢查更新」的時間，重新啟動後才會照更新間隔檢查，不會一分鐘後就把剛下載過的清單
+    /// 整份再問一次（3.4.3，Windows 複驗 G3）；重新載入後也照這個時間排下一次更新
+    checked: u64,
 }
 
 /// 記憶體裡最多留多少（壓縮後合計）
@@ -663,15 +665,37 @@ impl ListCopies {
     /// 下載完成：內容有變（雜湊不同）才登記寫出新的副本；驗證資訊有變就更新索引。回傳有沒有登記新的副本。
     /// 實際壓縮後的大小現在放不下（不刪別的副本）就不登記：小 Flash 上不會每天寫一份、刪一份
     pub fn offer(&self, url: &str, hash: u64, compressed: Option<Vec<u8>>, v: &Validators, now: u64, rules: u64) -> bool {
+        let mut z = compressed;
+        self.offer_take(url, hash, &mut z, v, now, rules)
+    }
+
+    /// 同 [`offer`](Self::offer)，但只有真的登記寫出時才拿走 `compressed`：沒登記（放不下）時呼叫端拿回內容，
+    /// 可以改留在記憶體
+    fn offer_take(&self, url: &str, hash: u64, compressed: &mut Option<Vec<u8>>, v: &Validators, now: u64, rules: u64) -> bool {
         let mut idx = self.index.lock().unwrap();
-        let same = idx.get(url).is_some_and(|m| m.hash == hash);
+        let indexed = idx.get(url).is_some_and(|m| m.hash == hash);
+        // 索引記著同樣的內容，但檔案不在（也不在等寫出）：當成沒有副本，重新登記。以前只比索引裡的雜湊：
+        // 副本曾經沒寫成（寫的時候空間不夠、被空間不足刪掉、關機來不及寫）之後，內容不變的清單永遠不會再存
+        // （3.5.1 D3：只有 969 bytes 的清單，索引裡有、資料夾裡沒有檔案，每次都重新下載）
+        let same = indexed
+            && idx.get(url).is_some_and(|m| {
+                let p = self.persister.lock().unwrap();
+                p.is_pending(&m.file) || p.file_path(&m.file).exists()
+            });
         let mut staged = false;
         if !same {
-            let Some(z) = compressed else { return false };
-            if !self.persister.lock().unwrap().has_room_for_optional(z.len() as u64) {
+            let Some(size) = compressed.as_ref().map(|z| z.len() as u64) else {
+                return false;
+            };
+            if !self.persister.lock().unwrap().has_room_for_optional(size) {
                 return false;
             }
+            let Some(z) = compressed.take() else { return false };
             let file = url_id(url);
+            if indexed {
+                // 寫入器可能還記著「這份內容已經寫過」（檔案之後才不見）：清掉，這次一定寫
+                self.persister.lock().unwrap().discard(&file);
+            }
             let checked = idx.get(url).map_or(0, |m| m.checked);
             let used = idx.get(url).map_or(0, |m| m.used);
             idx.insert(
@@ -723,13 +747,58 @@ impl ListCopies {
 
     /// 這幾份清單「最早」的上次檢查時間；有一份沒有副本或沒記過就是 None（照舊開機後就檢查）
     pub fn last_checked(&self, urls: &[&str]) -> Option<u64> {
-        let idx = self.index.lock().unwrap();
         let mut min: Option<u64> = None;
         for u in urls {
-            let c = idx.get(*u).map(|m| m.checked).filter(|&c| c > 0)?;
+            let c = self.checked_at(u)?;
             min = Some(min.map_or(c, |m: u64| m.min(c)));
         }
         min
+    }
+
+    /// 這份清單的上次檢查時間（索引裡沒有或沒記過是 None）
+    pub fn checked_at(&self, url: &str) -> Option<u64> {
+        self.index.lock().unwrap().get(url).map(|m| m.checked).filter(|&c| c > 0)
+    }
+
+    /// 寫快照時空間不夠、沒寫出去的副本（[`crate::persist::Persister::take_dropped_optional`]）收回來：
+    /// 索引拿掉（不再當成有副本；磁碟上如果還有舊內容的檔一起刪掉——索引已經記成新的內容，留著也讀不了），
+    /// 回傳（網址, 內容）讓過濾服務留在記憶體。以前內容直接丟掉、索引還記著：下一次重建、重新載入都要重新下載
+    fn reclaim(&self) -> Vec<(String, Held)> {
+        let dropped = self.persister.lock().unwrap().take_dropped_optional();
+        if dropped.is_empty() {
+            return Vec::new();
+        }
+        let mut idx = self.index.lock().unwrap();
+        let mut out = Vec::new();
+        for (file, z) in dropped {
+            let Some(url) = idx.iter().find(|(_, m)| m.file == file).map(|(u, _)| u.clone()) else {
+                continue;
+            };
+            let Some(m) = idx.remove(&url) else { continue };
+            out.push((
+                url,
+                Held {
+                    hash: m.hash,
+                    z: Arc::new(z),
+                    v: Validators {
+                        etag: m.etag,
+                        last_modified: m.last_modified,
+                    },
+                    checked: m.checked.max(m.at),
+                },
+            ));
+        }
+        if out.is_empty() {
+            return out;
+        }
+        let body = Self::index_json(&idx);
+        drop(idx);
+        let mut p = self.persister.lock().unwrap();
+        for (url, _) in &out {
+            p.discard(&url_id(url));
+        }
+        p.stage(COPY_INDEX, body);
+        out
     }
 
     /// 補記規則數（索引裡是 0 的時候）。索引內容沒變時快照寫入器不會重寫
@@ -853,21 +922,29 @@ pub struct FilterService {
     adopted: AtomicBool,
 }
 
-/// 重新載入設定時交給下一輪的清單層（3.5.1）：清單與建置選項都沒變就沿用已經建好的過濾器，
-/// 不重新讀副本、不重新解析、不重新下載。以前每次重新載入（例如只改 `filter.blockedTtl`）都把 34 萬條規則
-/// 整份重建一次，D3 上每次要 25 秒，建置時的大量小配置也讓 musl 的 RSS 一路往上（3.5.1 測試版 D3）
+/// 重新載入設定時交給下一輪的東西（3.5.1）：
+///
+/// - 清單層（[`LayerHandoff`]）：清單與建置選項都沒變就沿用已經建好的過濾器
+/// - 沒有本機副本、留在記憶體的清單內容（[`Held`]）：清單有變也交，新的一輪第一次建的時候就用它，不必重新下載
 struct ListsHandoff {
-    /// 清單與建置選項（[`FilterService::layer_key`]）
-    key: String,
     /// 快照目錄（另一個實例不接手）
     dir: PathBuf,
     at: std::time::Instant,
+    layer: Option<LayerHandoff>,
+    held: HashMap<String, Held>,
+}
+
+/// 建好的清單層：清單與建置選項都沒變就沿用，不重新讀副本、不重新解析、不重新下載。以前每次重新載入
+/// （例如只改 `filter.blockedTtl`）都把 34 萬條規則整份重建一次，D3 上每次要 25 秒，建置時的大量小配置
+/// 也讓 musl 的 RSS 一路往上（3.5.1 測試版 D3）
+struct LayerHandoff {
+    /// 清單與建置選項（[`FilterService::layer_key`]）
+    key: String,
     lists: Arc<Filter>,
     validators: Vec<Validators>,
     sizes: Vec<(u64, u64)>,
     status: Value,
     missing: Vec<usize>,
-    held: HashMap<String, Held>,
 }
 
 static LISTS_HANDOFF: Mutex<Option<ListsHandoff>> = Mutex::new(None);
@@ -1041,51 +1118,165 @@ impl FilterService {
         format!("{:?}|{:?}", self.sources, self.opts)
     }
 
-    /// 這一輪結束（重新載入設定）：把建好的清單層交給下一輪（[`FilterService::adopt_lists`]）。
-    /// 正在重建、有清單被記憶體控制停用或暫停中、還沒有任何清單時不交：下一輪照舊從副本或下載重建
+    /// 這一輪結束（重新載入設定，快照寫完之後）：把建好的清單層與留在記憶體的清單內容交給下一輪
+    /// （[`FilterService::adopt_lists`]）。
+    ///
+    /// - 清單層：正在重建、有清單被記憶體控制停用或暫停中、還沒有任何清單時不交（下一輪照舊從副本或下載重建）
+    /// - 沒有本機副本的清單內容：寫快照時空間不夠、退回來的副本先收回來；關機寫快照來不及寫的副本（還在等寫出）
+    ///   也一起交。合計最多 [`HELD_MAX`]
     pub fn hand_over_lists(&self, dir: &Path) {
-        let Ok(_g) = self.rebuild_lock.try_lock() else { return };
-        if self.all_suspended() || !self.unloaded.lock().unwrap().is_empty() {
-            return;
-        }
-        let lists = self.lists.read().unwrap().clone();
-        if lists.stats().lists == 0 {
+        self.reclaim_dropped();
+        let held = self.held_for_handoff();
+        let layer = self.layer_for_handoff();
+        if layer.is_none() && held.is_empty() {
             return;
         }
         let h = ListsHandoff {
-            key: self.layer_key(),
             dir: dir.to_path_buf(),
             at: std::time::Instant::now(),
+            layer,
+            held,
+        };
+        *LISTS_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+
+    fn layer_for_handoff(&self) -> Option<LayerHandoff> {
+        let _g = self.rebuild_lock.try_lock().ok()?;
+        if self.all_suspended() || !self.unloaded.lock().unwrap().is_empty() {
+            return None;
+        }
+        let lists = self.lists.read().unwrap().clone();
+        if lists.stats().lists == 0 {
+            return None;
+        }
+        Some(LayerHandoff {
+            key: self.layer_key(),
             lists,
             validators: self.validators.lock().unwrap().clone(),
             sizes: self.sizes.lock().unwrap().clone(),
             status: self.status.lock().unwrap().clone(),
             missing: self.missing.lock().unwrap().clone(),
-            held: self.held.lock().unwrap().clone(),
-        };
-        *LISTS_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+        })
     }
 
-    /// 新的一輪（在 [`spawn`](Self::spawn) 之前）：上一輪交出的清單層，清單與建置選項都相同就直接接手
-    /// （同一份 `Arc<Filter>`，不重建）。不同、過期、別的快照目錄就丟掉（舊的先放掉，再照舊重建，尖峰不會變成兩份）。
-    /// 回傳有沒有接手
+    /// 交給下一輪的清單內容：留在記憶體的，加上副本還在等寫出、磁碟上沒有的（下一輪的快照寫入器是新的，
+    /// 這些待寫內容不會跟過去）。留在記憶體的是同一份內容（`Arc`），不複製
+    fn held_for_handoff(&self) -> HashMap<String, Held> {
+        let mut out = self.held.lock().unwrap().clone();
+        let Some(c) = self.copies.get() else { return out };
+        let mut used: u64 = out.values().map(|h| h.z.len() as u64).sum();
+        for s in &self.sources {
+            if out.contains_key(&s.url) {
+                continue;
+            }
+            let Some(m) = c.meta(&s.url) else { continue };
+            let z = {
+                let p = c.persister.lock().unwrap();
+                if p.file_path(&m.file).exists() {
+                    continue;
+                }
+                p.pending_bytes(&m.file)
+            };
+            let Some(z) = z.filter(|z| used + z.len() as u64 <= HELD_MAX) else {
+                continue;
+            };
+            used += z.len() as u64;
+            out.insert(
+                s.url.clone(),
+                Held {
+                    hash: m.hash,
+                    z: Arc::new(z),
+                    v: Validators {
+                        etag: m.etag,
+                        last_modified: m.last_modified,
+                    },
+                    checked: m.checked.max(m.at),
+                },
+            );
+        }
+        out
+    }
+
+    /// 新的一輪（在 [`spawn`](Self::spawn) 之前）接手上一輪交出的東西（同一個快照目錄、60 秒內）：
+    ///
+    /// - 清單與建置選項都相同：直接接手清單層（同一份 `Arc<Filter>`，不重建），回傳 true
+    /// - 清單有變：清單層丟掉（舊的先放掉，再照舊重建，尖峰不會變成兩份）；沒有本機副本、留在記憶體的清單內容
+    ///   只接手還在新設定裡的（合計最多 [`HELD_MAX`]），新的一輪第一次建的時候就用它，不必重新下載
+    ///   （3.5.1 D3：停用一份清單後重新載入，沒有副本的清單要約 20 秒後才重新下載、換上，這段時間它的規則不生效）
+    ///
+    /// 過期、別的快照目錄就全部丟掉
     pub fn adopt_lists(&self, dir: &Path) -> bool {
         let Some(h) = LISTS_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return false;
         };
-        if h.at.elapsed() > LISTS_HANDOFF_TTL || h.dir != dir || h.key != self.layer_key() {
+        if h.at.elapsed() > LISTS_HANDOFF_TTL || h.dir != dir {
             return false;
         }
-        let rules = h.lists.stats().lists;
-        *self.lists.write().unwrap() = h.lists;
-        *self.validators.lock().unwrap() = h.validators;
-        *self.sizes.lock().unwrap() = h.sizes;
-        *self.status.lock().unwrap() = h.status;
-        *self.missing.lock().unwrap() = h.missing;
-        *self.held.lock().unwrap() = h.held;
-        self.adopted.store(true, Ordering::Relaxed);
-        info!("重新載入：過濾清單沒有變，沿用上一輪建好的清單（{rules} 條，不重新解析）");
-        true
+        match h.layer {
+            Some(l) if l.key == self.layer_key() => {
+                let rules = l.lists.stats().lists;
+                *self.lists.write().unwrap() = l.lists;
+                *self.validators.lock().unwrap() = l.validators;
+                *self.sizes.lock().unwrap() = l.sizes;
+                *self.status.lock().unwrap() = l.status;
+                *self.missing.lock().unwrap() = l.missing;
+                *self.held.lock().unwrap() = h.held;
+                self.adopted.store(true, Ordering::Relaxed);
+                info!("重新載入：過濾清單沒有變，沿用上一輪建好的清單（{rules} 條，不重新解析）");
+                true
+            }
+            layer => {
+                // 舊的清單層先放掉，再接手清單內容
+                drop(layer);
+                self.adopt_held(h.held);
+                false
+            }
+        }
+    }
+
+    /// 清單有變的重新載入：上一輪留在記憶體的清單內容，只留還在新設定裡的（依設定順序，合計最多 [`HELD_MAX`]；
+    /// 記憶體不足時不留，跟下載時一樣）。磁碟上已經有同樣內容的副本就不必留
+    fn adopt_held(&self, mut from: HashMap<String, Held>) {
+        if from.is_empty() || crate::app::pressure() == crate::sysinfo::Pressure::Critical {
+            return;
+        }
+        let copies = self.copies.get();
+        let mut held = self.held.lock().unwrap();
+        let mut used: u64 = held.values().map(|h| h.z.len() as u64).sum();
+        let mut n = 0usize;
+        for s in &self.sources {
+            let Some(h) = from.remove(&s.url) else { continue };
+            if held.contains_key(&s.url) || copies.is_some_and(|c| c.available_same(&s.url, h.hash)) {
+                continue;
+            }
+            let size = h.z.len() as u64;
+            if used + size > HELD_MAX {
+                continue;
+            }
+            used += size;
+            held.insert(s.url.clone(), h);
+            n += 1;
+        }
+        if n > 0 {
+            info!("重新載入：{n} 份沒有本機副本的清單沿用上一輪留在記憶體的內容（不重新下載，照原本的時間檢查更新）");
+        }
+    }
+
+    /// 寫快照時空間不夠、退回來的清單副本（[`ListCopies::reclaim`]）留在記憶體（合計最多 [`HELD_MAX`]）：
+    /// 之後的重建、重新載入都讀這份，不必重新下載。快照寫完之後、每次重建之前呼叫。回傳留下幾份
+    pub fn reclaim_dropped(&self) -> usize {
+        let Some(c) = self.copies.get() else { return 0 };
+        let mut n = 0;
+        for (url, h) in c.reclaim() {
+            if self.sources.iter().any(|s| s.url == url) && self.held_room(&url, h.z.len() as u64) {
+                self.held.lock().unwrap().insert(url, h);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            info!("過濾清單：{n} 份存不了副本的清單留在記憶體（重建時不必重新下載）");
+        }
+        n
     }
 
     /// 目前的清單層（測試用：重新載入前後是不是同一份）
@@ -1306,9 +1497,9 @@ impl FilterService {
                 .map_or(0, |i| self.sizes.lock().unwrap()[i].1);
             let staged = c.offer(&url, h.hash, Some(h.z.as_ref().clone()), &h.v, now, rules);
             if staged || c.available_same(&url, h.hash) {
-                // 內容是 `fetched` 那時下載的：記成上次檢查時間（沒記的話索引是 0，重新啟動一分鐘後就整份檢查）
-                if h.fetched > 0 {
-                    c.note_checked(&[url.as_str()], h.fetched.min(now));
+                // 內容在 `checked` 那時確認過是最新的：記成上次檢查時間（沒記的話索引是 0，重新啟動一分鐘後就整份檢查）
+                if h.checked > 0 {
+                    c.note_checked(&[url.as_str()], h.checked.min(now));
                 }
                 self.held.lock().unwrap().remove(&url);
                 n += 1;
@@ -1339,24 +1530,22 @@ impl FilterService {
     pub async fn build_from_copies(&self) -> bool {
         let Some(c) = self.copies.get() else { return false };
         let _g = self.rebuild_lock.lock().await;
+        self.reclaim_dropped();
         let ex = self.excluded();
-        let any = (0..self.sources.len())
-            .filter(|&i| !ex[i])
-            .any(|i| c.available(&self.sources[i].url));
+        // 留在記憶體的（重新載入時上一輪交下來的）也算：第一次建就用它
+        let any = {
+            let held = self.held.lock().unwrap();
+            (0..self.sources.len())
+                .filter(|&i| !ex[i])
+                .any(|i| held.contains_key(&self.sources[i].url) || c.available(&self.sources[i].url))
+        };
         if self.sources.is_empty() || !any || self.all_suspended() {
             return false;
         }
         match self.rebuild_mode(Source::CopiesOnly, &[]).await {
             Ok(_) => {
-                let mut v = self.validators.lock().unwrap();
-                for (i, s) in self.sources.iter().enumerate() {
-                    if let Some(m) = c.meta(&s.url) {
-                        v[i] = Validators {
-                            etag: m.etag,
-                            last_modified: m.last_modified,
-                        };
-                    }
-                }
+                // 驗證資訊由重建接上（副本的、留在記憶體的）。以前這裡另外照索引蓋一次：索引有、檔案不在的清單
+                // 也接上舊的驗證資訊，下一次更新先問一次「有沒有變」、回 304 還是要整份下載
                 let missing = self.missing.lock().unwrap().len();
                 if missing > 0 {
                     info!("過濾清單：用本機副本先建好，{missing} 份沒有副本");
@@ -1512,11 +1701,18 @@ impl FilterService {
         }
     }
 
-    /// 記下這幾份清單剛檢查過更新
+    /// 記下這幾份清單剛檢查過更新（本機副本記在索引；留在記憶體的記在 [`Held::checked`]）
     fn note_checked(&self, active: &[usize]) {
+        let now = crate::persist::now_secs();
         if let Some(c) = self.copies.get() {
             let urls: Vec<&str> = active.iter().map(|&i| self.sources[i].url.as_str()).collect();
-            c.note_checked(&urls, crate::persist::now_secs());
+            c.note_checked(&urls, now);
+        }
+        let mut held = self.held.lock().unwrap();
+        for &i in active {
+            if let Some(h) = held.get_mut(&self.sources[i].url).filter(|h| h.checked < now) {
+                h.checked = now;
+            }
         }
     }
 
@@ -1547,7 +1743,16 @@ impl FilterService {
         if urls.is_empty() {
             return None;
         }
-        let last = c.last_checked(&urls)?;
+        // 每份清單的上次檢查時間：留在記憶體的看它自己記的（沒有副本、索引裡沒有），其他看副本的索引
+        let last = {
+            let held = self.held.lock().unwrap();
+            let mut min: Option<u64> = None;
+            for u in &urls {
+                let t = held.get(*u).map(|h| h.checked).filter(|&t| t > 0).or_else(|| c.checked_at(u))?;
+                min = Some(min.map_or(t, |m: u64| m.min(t)));
+            }
+            min?
+        };
         // 時間倒退（還沒對時、或改過系統時間）：照舊馬上檢查
         if last > now {
             return None;
@@ -1784,6 +1989,8 @@ impl FilterService {
     /// 重建清單層。`mode` 見 [`Source`]；`reuse[i]` = 剛問過沒變（有副本就讀副本，不重新下載）
     async fn rebuild_mode(&self, mode: Source, reuse: &[bool]) -> anyhow::Result<(u64, u64)> {
         self.rebuilds.fetch_add(1, Ordering::Relaxed);
+        // 寫快照時存不下、退回來的副本先收回記憶體：這次重建就讀它
+        self.reclaim_dropped();
         let timeout = Duration::from_secs(30);
         let current = self.lists.read().unwrap().clone();
         let have = current.stats().lists > 0;
@@ -1915,19 +2122,20 @@ impl FilterService {
                         self.save_probe_snap(&s.url, names);
                     }
                     if let Some(c) = copies {
-                        if persist {
-                            if c.offer(&s.url, h, z, &v, crate::persist::now_secs(), rules) || c.available_same(&s.url, h) {
-                                self.held.lock().unwrap().remove(&s.url);
-                            }
-                        } else if let Some(z) = z.filter(|z| hold && self.held_room(&s.url, z.len() as u64)) {
-                            // 估計值可能比實際小（沒存過副本的清單估 1 MiB）：用壓縮後的實際大小再檢查一次上限
+                        let mut z = z;
+                        let now = crate::persist::now_secs();
+                        if persist && (c.offer_take(&s.url, h, &mut z, &v, now, rules) || c.available_same(&s.url, h)) {
+                            self.held.lock().unwrap().remove(&s.url);
+                        } else if let Some(z) = z.filter(|z| (persist || hold) && self.held_room(&s.url, z.len() as u64)) {
+                            // 估計值可能比實際小（沒存過副本的清單估 1 MiB）：用壓縮後的實際大小再檢查一次上限。
+                            // 本來要存副本、但實際大小放不下的也留在記憶體（以前直接丟掉，下一次重建又整份下載）
                             self.held.lock().unwrap().insert(
                                 s.url.clone(),
                                 Held {
                                     hash: h,
                                     z: Arc::new(z),
                                     v: v.clone(),
-                                    fetched: crate::persist::now_secs(),
+                                    checked: now,
                                 },
                             );
                         }
@@ -2049,7 +2257,7 @@ impl FilterService {
             st.sources
                 .iter()
                 .zip(&self.sources)
-                .filter(|(s, src)| s.status == SourceStatus::Loaded && c.meta(&src.url).is_none())
+                .filter(|(s, src)| s.status == SourceStatus::Loaded && !c.available(&src.url))
                 .count(),
         )
     }
@@ -2684,6 +2892,86 @@ mod copy_tests {
         // 儲存空間不夠（低於保留量 + 遲滯）時不留副本（記憶體能不能長大由記憶體控制決定，見 memgov 的測試）
         p.lock().unwrap().set_free_probe(|_| Some(1 << 20));
         assert!(!c.wanted(1000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.5.1 D3（blocklistproject smart-tv，969 bytes）：索引裡有、資料夾裡沒有檔案的副本（曾經沒寫成、
+    /// 或被空間不足刪掉），內容沒變也要重新存。以前只比索引裡的雜湊：當成「一樣、不用存」，之後永遠沒有副本、
+    /// 每次重建都重新下載，日誌也沒有「空間不夠」那一行
+    #[test]
+    fn copy_restored_when_index_has_it_but_file_is_gone() {
+        let dir = std::env::temp_dir().join(format!("kuroshio-listcopy-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Arc::new(Mutex::new(Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096))));
+        p.lock().unwrap().set_free_probe(|_| Some(10 << 30));
+        let c = ListCopies::new(p.clone());
+        let url = "https://lists.example.com/smart-tv.txt";
+        let copy = || {
+            let mut s = CopySink::new(true);
+            s.feed(b"||tv.example.com^\n||tv.example.net^\n");
+            s.finish()
+        };
+        let (h, z) = copy();
+        let v = Validators::default();
+        let now = crate::persist::now_secs();
+        assert!(c.offer(url, h, z, &v, now, 2));
+        p.lock().unwrap().flush_all(now).unwrap();
+        let file = p.lock().unwrap().file_path(&c.meta(url).unwrap().file);
+        assert!(file.exists());
+        // 檔案不見了（索引還在）
+        std::fs::remove_file(&file).unwrap();
+        assert!(c.meta(url).is_some() && !c.available(url));
+        // 同樣的內容再下載一次：重新存（寫入器記著「寫過」也要清掉，真的寫出去）
+        let (h2, z2) = copy();
+        assert_eq!(h, h2);
+        assert!(c.offer(url, h2, z2, &v, now + 60, 2), "檔案不在：重新登記");
+        assert!(c.available_same(url, h));
+        p.lock().unwrap().flush_all(now + 60).unwrap();
+        assert!(file.exists(), "寫出去了");
+        let mut back = Vec::new();
+        assert!(c.read(url, &mut |b| back.extend_from_slice(b)));
+        assert_eq!(back, b"||tv.example.com^\n||tv.example.net^\n");
+        // 檔案在：照舊不重寫
+        let (h3, z3) = copy();
+        assert!(!c.offer(url, h3, z3, &v, now + 120, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 寫快照時空間不夠、沒寫成的副本：內容收回來（[`ListCopies::reclaim`]），索引拿掉（不再當成有副本）
+    #[test]
+    #[allow(clippy::disallowed_types)] // 測試只在 64 位元的 CI 上跑；正式程式碼不能用（32 位元 MIPS 沒有 64 位元原子操作）
+    fn dropped_copy_reclaimed_and_unindexed() {
+        use std::sync::atomic::AtomicU64;
+        let dir = std::env::temp_dir().join(format!("kuroshio-listcopy-reclaim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let free = Arc::new(AtomicU64::new(10 << 30));
+        let f2 = free.clone();
+        let p = Arc::new(Mutex::new(Persister::new(&dir, Policy::new(StorageClass::Disk, 0, 4096))));
+        p.lock().unwrap().set_free_probe(move |_| Some(f2.load(Ordering::SeqCst)));
+        let c = ListCopies::new(p.clone());
+        let url = "https://lists.example.net/anti-ad.txt";
+        let mut s = CopySink::new(true);
+        s.feed(&b"||ad.example.net^\n".repeat(100));
+        let (h, z) = s.finish();
+        let zl = z.as_ref().unwrap().len();
+        let v = Validators {
+            etag: Some("\"x1\"".into()),
+            last_modified: None,
+        };
+        let now = crate::persist::now_secs();
+        assert!(c.offer(url, h, z, &v, now, 100), "登記的時候放得下");
+        // 寫的時候空間被別的用掉了
+        free.store(1 << 20, Ordering::SeqCst);
+        p.lock().unwrap().flush_all(now).unwrap();
+        assert!(!c.available(url), "沒寫成");
+        let back = c.reclaim();
+        assert_eq!(back.len(), 1);
+        let (u, held) = &back[0];
+        assert_eq!(u, url);
+        assert_eq!((held.hash, held.z.len(), held.v.etag.as_deref()), (h, zl, Some("\"x1\"")));
+        assert!(held.checked >= now);
+        assert!(c.meta(url).is_none(), "索引拿掉：不再當成有副本");
+        assert!(c.reclaim().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1725,7 +1725,8 @@ impl Started {
     /// [`Started::shutdown_reload`]，交出快取之前先停止監聽、等處理中的查詢做完
     pub fn shutdown(&self) {
         self.hand_over_state();
-        self.shutdown_within(crate::persist::SHUTDOWN_BUDGET)
+        self.shutdown_within(crate::persist::SHUTDOWN_BUDGET);
+        self.hand_over_lists();
     }
 
     /// 重新載入設定時結束這一輪（`main.rs` 的 `generation`；3.5.1）：
@@ -1736,6 +1737,7 @@ impl Started {
     pub async fn shutdown_reload(&self) {
         self.hand_over_state();
         self.flush_within(crate::persist::SHUTDOWN_BUDGET);
+        self.hand_over_lists();
         let t0 = Instant::now();
         let (loops, left) = self.state.resolver.serving.quiesce(crate::server::QUIESCE_MAX).await;
         let ms = t0.elapsed().as_millis();
@@ -1749,11 +1751,15 @@ impl Started {
         hand_over_cache(&self.state.cfg, &self.state.resolver);
     }
 
-    /// 重新載入時交給下一輪的狀態（快取以外）：背景工作、上游狀態、過濾清單層
+    /// 重新載入時交給下一輪的狀態（快取、過濾清單以外）：背景工作、上游狀態
     fn hand_over_state(&self) {
         self.hand_over_jobs();
         self.hand_over_upstreams();
-        // 3.5.1：建好的過濾清單層交給下一輪（清單沒變就不重建）
+    }
+
+    /// 3.5.1：建好的過濾清單層（清單沒變就不重建）與沒有本機副本的清單內容（清單有變也交）交給下一輪。
+    /// 在快照寫完之後：寫的時候空間不夠、沒寫成的副本也收回來一起交，下一輪不必重新下載
+    fn hand_over_lists(&self) {
         if let Some(f) = &self.state.filter {
             f.hand_over_lists(&persist_dir(&self.state.cfg));
         }
@@ -2224,6 +2230,7 @@ fn spawn_persist_loop(
     sources: Vec<SnapSource>,
     reserve: crate::memgov::Reserve,
     cdn: Option<Arc<kuroshio_cdn::Cdn>>,
+    filter: Option<std::sync::Weak<crate::filtering::FilterService>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -2252,6 +2259,10 @@ fn spawn_persist_loop(
             .await;
             if let Err(e) = r {
                 warn!("寫入快照的工作中途結束：{e}");
+            }
+            // 寫的時候空間不夠、沒寫成的清單副本收回記憶體（重建、重新載入時不必重新下載）
+            if let Some(f) = filter.as_ref().and_then(std::sync::Weak::upgrade) {
+                f.reclaim_dropped();
             }
         }
     });
@@ -2481,7 +2492,13 @@ pub async fn start(cfg: &Value) -> Result<Started> {
         let c = c.clone();
         snap_sources.push(bytes_source(move || c.snapshots()));
     }
-    spawn_persist_loop(persister.clone(), snap_sources.clone(), reserve.clone(), cdn.clone());
+    spawn_persist_loop(
+        persister.clone(),
+        snap_sources.clone(),
+        reserve.clone(),
+        cdn.clone(),
+        filter.as_ref().map(Arc::downgrade),
+    );
     // 3.5.1 N1：記憶體回不來時離峰原地重新啟動（只有 Linux：用 execve 保留同一個 PID）
     let restart = cfg!(target_os = "linux") && get(cfg, "system.memoryRestart").and_then(Value::as_bool).unwrap_or(true);
     let memgov = governor_on.then(|| {
