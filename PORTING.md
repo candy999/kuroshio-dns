@@ -6,7 +6,7 @@
 
 | 你的環境 | 建議 | 誰負責測試 |
 |---|---|---|
-| OpenWrt 24.10 / 25.12 | 官方套件（Releases 的 `kuroshio-openwrt-*.zip`），見 [README](README.md#安裝) | 我們（CI） |
+| OpenWrt 24.10 / 25.12 | 官方套件（Releases 的 `kuroshio-openwrt-*.zip`），見 [安裝與升級](docs/guide/install.md#openwrt) | 我們（CI） |
 | Windows 10 / 11、Windows Server | Windows 版，見 [Windows 使用說明](docs/windows.md) | 我們（CI） |
 | 能跑 Docker 的 Linux、NAS（群暉、威聯通、Unraid）、VPS | **Docker 映像**，見 [Docker 說明](docs/docker.md) | 我們（CI） |
 | 第三方路由器韌體、不能跑 Docker 的 Linux | **通用 Linux 包**＋本文件，整合腳本由平台維護者撰寫 | 平台維護者 |

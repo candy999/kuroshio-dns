@@ -1,6 +1,6 @@
 # 給協助開發的 AI（與人）
 
-動手之前先讀 [docs/principles.md](docs/principles.md)：黑潮的核心理念、六條原則、兩個特別情境（上下游都是黑潮、上游或業者劫持），以及改東西之前的檢查清單。功能細節在 [README.md](README.md) 與 [docs/spec/](docs/spec/README.md)。
+動手之前先讀 [docs/principles.md](docs/principles.md)：黑潮的核心理念、六條原則、兩個特別情境（上下游都是黑潮、上游或業者劫持），以及改東西之前的檢查清單。功能細節在 [docs/guide/](docs/guide/README.md)（使用者指南）與 [docs/spec/](docs/spec/README.md)（規格）；首頁 [README.md](README.md) 只放概要與連結。
 
 最常走偏的地方（詳見原則文件）：
 
