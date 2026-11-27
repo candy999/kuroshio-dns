@@ -151,7 +151,7 @@ Synology（Container Manager）沒有用 `compose.yml` 時：停止容器 →「
 
 ### 主路由器也跑黑潮時（串接）
 
-NAS 或小主機接在一台跑黑潮、而且把 53 埠接走（積極劫持）的路由器後面時，容器裡的黑潮會在路徑檢查時認出「一般 DNS 被路由器上的黑潮接走」。兩台都是 3.4.0 以上時自動串接：直接用路由器算好的評測結果與 CDN 節點池，容器裡不再自己跑每日評測與 CDN 掃描。不用設定；`docker exec kuroshio kuroshio chain status` 看狀態，設定頁「狀態」分頁的「串接」區塊也看得到。不想串接就在 `config.json` 加 `"upstream": { "chain": false }`（會自己重做評測、CDN 掃描、下載清單，重複使用網路）。細節見 [README 的「串接模式」](../README.md#串接模式兩台黑潮340)。
+NAS 或小主機接在一台跑黑潮、而且把 53 埠接走（積極劫持）的路由器後面時，容器裡的黑潮會在路徑檢查時認出「一般 DNS 被路由器上的黑潮接走」。兩台都是 3.4.0 以上時自動串接：直接用路由器算好的評測結果與 CDN 節點池，容器裡不再自己跑每日評測與 CDN 掃描。不用設定；`docker exec kuroshio kuroshio chain status` 看狀態，設定頁「狀態」分頁的「串接」區塊也看得到。不想串接就在 `config.json` 加 `"upstream": { "chain": false }`（會自己重做評測、CDN 掃描、下載清單，重複使用網路）。細節見[串接模式](guide/chain.md)。
 
 host 網路下沒有 IPv6 路由時，路徑檢查會自動只用 IPv4 連上游；確定不用 IPv6 也可以設 `"upstream": { "ipv6": "0" }`。
 

@@ -1,6 +1,37 @@
 # 建置說明
 
-各平台的執行檔都由 GitHub Actions（[`.github/workflows/rust.yml`](../.github/workflows/rust.yml)）編譯、實際執行測試後才打包。這份說明 CI 怎麼編、自己怎麼編，以及 MIPS 用的 nightly 怎麼更新。
+各平台的執行檔都由 GitHub Actions（[`.github/workflows/rust.yml`](../.github/workflows/rust.yml)）編譯、實際執行測試後才打包。這份說明 CI 怎麼編、自己怎麼編，以及 MIPS 用的 nightly 怎麼更新。動手改東西之前先讀[核心理念與設計原則](principles.md)。
+
+## 開發
+
+```sh
+cargo test
+cargo run -- run -c config.json
+cargo run -- query example.com -s 8.8.8.8
+```
+
+推之前要過：`cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy -p kuroshio --all-targets --features acme -- -D warnings`、`cargo test --workspace`。改了設定頁、公開頁或儀表板的，另外跑 `node tools/check-data-assets.js`、`node tools/site-e2e.js`、`node tools/admin-e2e.js`；改了文件的，跑 `node tools/check-doc-links.js` 檢查連結與錨點。
+
+| 資料夾 | 內容 |
+|---|---|
+| `crates/kuroshio` | 主程式（監聽、轉發、管理 API、記憶體控制、存檔、指令列） |
+| `crates/kuroshio-config` | 設定結構、預設值、UCI 轉換 |
+| `crates/kuroshio-proto` | DNS 封包工具 |
+| `crates/kuroshio-net` | 上游連線（UDP / TCP / DoT / DoH / DoQ / DoH3）、TLS、下載、測速 |
+| `crates/kuroshio-filter` | 過濾引擎 |
+| `crates/kuroshio-cdn` | CDN 台灣節點 |
+| `crates/kuroshio-jobs` | 排程與背景工作（每日評測、台灣 IP 清單…） |
+| `crates/kuroshio-community` | 社群共享 |
+| `openwrt/` | OpenWrt 套件與 LuCI |
+| `windows/` | Windows 版說明 |
+| `linux/` | Linux 通用版說明 |
+| `docker/` | 容器映像檔、Compose 範例、映像檔測試 |
+| `data/` | 設定頁、公開頁、共用儀表板、種子資料、評測名單、CDN 官方範圍、台灣 IP 公版 |
+| `rules/` | 預設自訂過濾規則 |
+| `tools/` | 設定頁與公開頁的測試、儀表板範例資料、文件連結檢查、原始碼包 |
+| `docs/guide/` | 使用者指南 |
+| `docs/spec/` | 規格 |
+| `docs/release-notes/` | 各版的 Release 說明 |
 
 ## 工具鏈
 
